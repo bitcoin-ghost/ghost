@@ -104,20 +104,31 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
 
     mempool_opts.persist_v1_dat = argsman.GetBoolArg("-persistmempoolv1", mempool_opts.persist_v1_dat);
 
-    // Ghost Reaper configuration
+    // Ghost Reaper configuration.
+    //
+    // The master `-ghostreaper` flag sets the default value for every per-vector
+    // toggle. Each `-ghostreaper-reject*` flag overrides its detector independently:
+    // a detector runs iff its per-vector flag is true (after defaulting from
+    // the master). This lets operators run any subset of detectors, e.g.
+    // `-ghostreaper=disabled -ghostreaper-rejectannex=1` enables only the
+    // annex check.
     {
         const std::string reaper_mode = argsman.GetArg("-ghostreaper", "enabled");
-        if (reaper_mode == "disabled") {
-            mempool_opts.ghost_reaper.mode = GhostReaperMode::Disabled;
-        } else {
-            mempool_opts.ghost_reaper.mode = GhostReaperMode::Enabled;
-        }
+        const bool master_default = (reaper_mode != "disabled");
+
+        auto& reaper = mempool_opts.ghost_reaper;
+        reaper.reject_inscription  = argsman.GetBoolArg("-ghostreaper-rejectinscription",  master_default);
+        reaper.reject_dropstuffing = argsman.GetBoolArg("-ghostreaper-rejectdropstuffing", master_default);
+        reaper.reject_fakepubkey   = argsman.GetBoolArg("-ghostreaper-rejectfakepubkey",   master_default);
+        reaper.reject_annex        = argsman.GetBoolArg("-ghostreaper-rejectannex",        master_default);
+        reaper.reject_opreturn     = argsman.GetBoolArg("-ghostreaper-rejectopreturn",     master_default);
+        reaper.reject_runestone    = argsman.GetBoolArg("-ghostreaper-rejectrunestone",    master_default);
 
         if (argsman.IsArgSet("-ghostreaper-maxopreturn")) {
-            mempool_opts.ghost_reaper.max_op_return_bytes = argsman.GetIntArg("-ghostreaper-maxopreturn", 83);
+            reaper.max_op_return_bytes = argsman.GetIntArg("-ghostreaper-maxopreturn", 83);
         }
         if (argsman.IsArgSet("-ghostreaper-mindropsize")) {
-            mempool_opts.ghost_reaper.min_drop_size = argsman.GetIntArg("-ghostreaper-mindropsize", 76);
+            reaper.min_drop_size = argsman.GetIntArg("-ghostreaper-mindropsize", 76);
         }
     }
 

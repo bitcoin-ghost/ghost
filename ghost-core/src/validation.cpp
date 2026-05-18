@@ -907,8 +907,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-witness-nonstandard");
     }
 
-    // Ghost Reaper: reject dead-code patterns before expensive signature checks
-    if (m_pool.m_opts.ghost_reaper.mode != GhostReaperMode::Disabled) {
+    // Ghost Reaper: reject dead-code patterns before expensive signature checks.
+    // Per-vector toggles inside the config decide which detectors fire; the
+    // call is a fast no-op when all detectors are disabled.
+    {
         std::string reaper_reason;
         if (!IsGhostReaperClean(tx, m_pool.m_opts.ghost_reaper, reaper_reason)) {
             return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reaper_reason);

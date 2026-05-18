@@ -717,7 +717,13 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     SetupChainParamsBaseOptions(argsman);
 
     argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (test networks only; default: %u)", DEFAULT_ACCEPT_NON_STD_TXN), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
-    argsman.AddArg("-ghostreaper", "Ghost Reaper dead-code filter (default: enabled). Set to 'disabled' to turn off.", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-ghostreaper", "Ghost Reaper dead-code filter master switch (default: enabled). Sets the default value for every per-vector toggle; individual -ghostreaper-reject* flags override per detector.", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-ghostreaper-rejectinscription", "Ghost Reaper: reject witness scripts containing OP_FALSE OP_IF ... OP_ENDIF inscription envelopes (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-ghostreaper-rejectdropstuffing", "Ghost Reaper: reject witness scripts with a large push followed by OP_DROP/OP_2DROP (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-ghostreaper-rejectfakepubkey", "Ghost Reaper: reject bare multisig outputs whose pubkey pushes have invalid prefixes (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-ghostreaper-rejectannex", "Ghost Reaper: reject P2TR inputs carrying a witness annex (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-ghostreaper-rejectopreturn", "Ghost Reaper: reject outputs whose OP_RETURN payload exceeds -ghostreaper-maxopreturn (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-ghostreaper-rejectrunestone", "Ghost Reaper: reject outputs encoding a Runestone (OP_RETURN OP_13 ...) (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-ghostreaper-maxopreturn=<n>", strprintf("Maximum OP_RETURN data bytes before Reaper rejection (default: %u)", 83), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-ghostreaper-mindropsize=<n>", strprintf("Minimum push size for drop stuffing detection (default: %u)", 76), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-incrementalrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define cost of relay, used for mempool limiting and replacement policy. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_INCREMENTAL_RELAY_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);

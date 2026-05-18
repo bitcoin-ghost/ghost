@@ -296,33 +296,30 @@ bool CheckRunestone(const CTransaction& tx, std::string& reason)
 
 bool IsGhostReaperClean(const CTransaction& tx, const GhostReaperConfig& config, std::string& reason)
 {
-    if (config.mode == GhostReaperMode::Disabled) {
-        return true;
-    }
+    // Each detector runs only when its per-vector toggle is enabled.
+    // Order: cheapest checks first.
 
-    // Run all six detectors. Order: cheapest checks first.
-
-    if (!CheckOversizedOpReturn(tx, config.max_op_return_bytes, reason)) {
+    if (config.reject_opreturn && !CheckOversizedOpReturn(tx, config.max_op_return_bytes, reason)) {
         return false;
     }
 
-    if (!CheckRunestone(tx, reason)) {
+    if (config.reject_runestone && !CheckRunestone(tx, reason)) {
         return false;
     }
 
-    if (!CheckFakeMultisigPubkeys(tx, reason)) {
+    if (config.reject_fakepubkey && !CheckFakeMultisigPubkeys(tx, reason)) {
         return false;
     }
 
-    if (!CheckAnnexPresence(tx, reason)) {
+    if (config.reject_annex && !CheckAnnexPresence(tx, reason)) {
         return false;
     }
 
-    if (!CheckDropStuffing(tx, config.min_drop_size, reason)) {
+    if (config.reject_dropstuffing && !CheckDropStuffing(tx, config.min_drop_size, reason)) {
         return false;
     }
 
-    if (!CheckInscriptionEnvelope(tx, reason)) {
+    if (config.reject_inscription && !CheckInscriptionEnvelope(tx, reason)) {
         return false;
     }
 

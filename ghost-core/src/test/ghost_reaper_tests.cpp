@@ -432,6 +432,19 @@ BOOST_AUTO_TEST_CASE(normal_opreturn_not_runestone)
 // IsGhostReaperClean (integration)
 // ============================================================================
 
+/** Build a config with every detector disabled. */
+GhostReaperConfig AllDisabled()
+{
+    GhostReaperConfig cfg;
+    cfg.reject_inscription  = false;
+    cfg.reject_dropstuffing = false;
+    cfg.reject_fakepubkey   = false;
+    cfg.reject_annex        = false;
+    cfg.reject_opreturn     = false;
+    cfg.reject_runestone    = false;
+    return cfg;
+}
+
 BOOST_AUTO_TEST_CASE(clean_tx_passes_all)
 {
     CMutableTransaction mtx = MakeBaseTx();
@@ -441,13 +454,12 @@ BOOST_AUTO_TEST_CASE(clean_tx_passes_all)
     mtx.vin[0].scriptWitness.stack.push_back(sig);
 
     CTransaction tx(mtx);
-    GhostReaperConfig config;
-    config.mode = GhostReaperMode::Enabled;
+    GhostReaperConfig config; // default: all detectors enabled
     std::string reason;
     BOOST_CHECK(IsGhostReaperClean(tx, config, reason));
 }
 
-BOOST_AUTO_TEST_CASE(disabled_mode_passes_everything)
+BOOST_AUTO_TEST_CASE(all_detectors_disabled_passes_everything)
 {
     CMutableTransaction mtx = MakeBaseTx();
 
@@ -458,13 +470,12 @@ BOOST_AUTO_TEST_CASE(disabled_mode_passes_everything)
     mtx.vin[0].scriptWitness.stack.push_back(witness_elem);
 
     CTransaction tx(mtx);
-    GhostReaperConfig config;
-    config.mode = GhostReaperMode::Disabled;
+    GhostReaperConfig config = AllDisabled();
     std::string reason;
     BOOST_CHECK(IsGhostReaperClean(tx, config, reason));
 }
 
-BOOST_AUTO_TEST_CASE(strict_mode_rejects_inscription)
+BOOST_AUTO_TEST_CASE(default_config_rejects_inscription)
 {
     CMutableTransaction mtx = MakeBaseTx();
 
@@ -474,8 +485,7 @@ BOOST_AUTO_TEST_CASE(strict_mode_rejects_inscription)
     mtx.vin[0].scriptWitness.stack.push_back(witness_elem);
 
     CTransaction tx(mtx);
-    GhostReaperConfig config;
-    config.mode = GhostReaperMode::Enabled;
+    GhostReaperConfig config; // default: all detectors enabled
     std::string reason;
     BOOST_CHECK(!IsGhostReaperClean(tx, config, reason));
     BOOST_CHECK_EQUAL(reason, "ghost-reaper-inscription-envelope");
@@ -494,7 +504,6 @@ BOOST_AUTO_TEST_CASE(custom_opreturn_limit)
 
     CTransaction tx(mtx);
     GhostReaperConfig config;
-    config.mode = GhostReaperMode::Enabled;
 
     // Default limit (83) — should pass
     std::string reason;
@@ -519,7 +528,6 @@ BOOST_AUTO_TEST_CASE(custom_drop_size_threshold)
 
     CTransaction tx(mtx);
     GhostReaperConfig config;
-    config.mode = GhostReaperMode::Enabled;
 
     // Default min_drop_size (76) — 50-byte push should pass
     std::string reason;
@@ -529,6 +537,81 @@ BOOST_AUTO_TEST_CASE(custom_drop_size_threshold)
     config.min_drop_size = 30;
     BOOST_CHECK(!IsGhostReaperClean(tx, config, reason));
     BOOST_CHECK_EQUAL(reason, "ghost-reaper-drop-stuffing");
+}
+
+// ============================================================================
+// Per-vector toggles
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(per_vector_inscription_toggle)
+{
+    CMutableTransaction mtx = MakeBaseTx();
+    std::vector<unsigned char> witness_elem = {
+        0x00, 0x63, 0x05, 'h', 'e', 'l', 'l', 'o', 0x68
+    };
+    mtx.vin[0].scriptWitness.stack.push_back(witness_elem);
+    CTransaction tx(mtx);
+
+    GhostReaperConfig config; // defaults: all true
+    std::string reason;
+    BOOST_CHECK(!IsGhostReaperClean(tx, config, reason));
+
+    config.reject_inscription = false;
+    BOOST_CHECK(IsGhostReaperClean(tx, config, reason));
+}
+
+BOOST_AUTO_TEST_CASE(per_vector_runestone_toggle)
+{
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].scriptPubKey = CScript() << OP_RETURN << OP_13
+                                         << std::vector<unsigned char>(10, 0x01);
+    CTransaction tx(mtx);
+
+    GhostReaperConfig config;
+    std::string reason;
+    BOOST_CHECK(!IsGhostReaperClean(tx, config, reason));
+    BOOST_CHECK_EQUAL(reason, "ghost-reaper-runestone");
+
+    config.reject_runestone = false;
+    BOOST_CHECK(IsGhostReaperClean(tx, config, reason));
+}
+
+BOOST_AUTO_TEST_CASE(per_vector_annex_toggle)
+{
+    CMutableTransaction mtx = MakeBaseTx();
+    std::vector<unsigned char> sig(64, 0x30);
+    std::vector<unsigned char> annex = {0x50, 0x01, 0x02};
+    mtx.vin[0].scriptWitness.stack.push_back(sig);
+    mtx.vin[0].scriptWitness.stack.push_back(annex);
+    CTransaction tx(mtx);
+
+    GhostReaperConfig config;
+    std::string reason;
+    BOOST_CHECK(!IsGhostReaperClean(tx, config, reason));
+
+    config.reject_annex = false;
+    BOOST_CHECK(IsGhostReaperClean(tx, config, reason));
+}
+
+BOOST_AUTO_TEST_CASE(per_vector_disable_runestone_still_catches_inscription)
+{
+    // Build a tx with BOTH a runestone output AND an inscription witness.
+    // With reject_runestone=false the runestone is allowed, but the
+    // inscription must still be detected.
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].scriptPubKey = CScript() << OP_RETURN << OP_13
+                                         << std::vector<unsigned char>(4, 0x01);
+    std::vector<unsigned char> witness_elem = {
+        0x00, 0x63, 0x05, 'h', 'e', 'l', 'l', 'o', 0x68
+    };
+    mtx.vin[0].scriptWitness.stack.push_back(witness_elem);
+    CTransaction tx(mtx);
+
+    GhostReaperConfig config;
+    config.reject_runestone = false;
+    std::string reason;
+    BOOST_CHECK(!IsGhostReaperClean(tx, config, reason));
+    BOOST_CHECK_EQUAL(reason, "ghost-reaper-inscription-envelope");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

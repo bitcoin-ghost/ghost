@@ -9,15 +9,26 @@
 
 #include <string>
 
-/** Ghost Reaper operating mode */
-enum class GhostReaperMode {
-    Disabled,   //!< No Reaper filtering
-    Enabled,    //!< Dead-code filtering active (default)
-};
-
-/** Configuration for Ghost Reaper mempool filter */
+/** Configuration for Ghost Reaper mempool filter.
+ *
+ * Each detector is independently toggleable. The master CLI flag
+ * `-ghostreaper=enabled|disabled` sets the default value for every per-vector
+ * toggle at startup, but individual `-ghostreaper-reject*` flags override
+ * per-detector when explicitly set. A detector runs iff its `reject_*` flag
+ * is true. */
 struct GhostReaperConfig {
-    GhostReaperMode mode{GhostReaperMode::Enabled};
+    /** Reject inputs containing OP_FALSE OP_IF ... OP_ENDIF inscription envelopes */
+    bool reject_inscription{true};
+    /** Reject inputs with large push followed by OP_DROP/OP_2DROP */
+    bool reject_dropstuffing{true};
+    /** Reject bare multisig outputs whose pubkey pushes have invalid prefixes */
+    bool reject_fakepubkey{true};
+    /** Reject P2TR inputs carrying a witness annex */
+    bool reject_annex{true};
+    /** Reject outputs with OP_RETURN payloads exceeding max_op_return_bytes */
+    bool reject_opreturn{true};
+    /** Reject outputs encoding a Runestone (OP_RETURN OP_13 ...) */
+    bool reject_runestone{true};
     /** Maximum OP_RETURN data payload in bytes (default 83, matching Bitcoin Core relay default) */
     unsigned int max_op_return_bytes{83};
     /** Minimum push size to trigger drop stuffing detection (default 76) */
