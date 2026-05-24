@@ -1,5 +1,4 @@
 # Bitcoin Ghost
-
 <div align="center">
 
 ```
