@@ -1,0 +1,4 @@
+git clone https://github.com/bitcoin-ghost/ghost
+cd ghost && git checkout v1.0.0
+cargo build --release --workspace
+Binaries land in target/release/. Full build instructions, dependencies, and Guix manifest in the repo README.
