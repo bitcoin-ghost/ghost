@@ -4,6 +4,7 @@ Contributions are welcome. This is Bitcoin infrastructure -- correctness matters
 
 ## Development Setup
 
+## Development Setup
 ### Requirements
 
 - Rust 1.75+ (stable toolchain)
@@ -104,9 +105,9 @@ You will receive a response within 48 hours.
 
 Before making changes, read [docs/protocols/ARCHITECTURE.md](docs/protocols/ARCHITECTURE.md) to understand the system design. Key areas:
 
-- `bins/ghost-pool/` -- Main pool binary (mining, consensus, payouts)
-- `crates/` -- Library crates (consensus, verification, storage, etc.)
-- `ghost-core/` -- Bitcoin Core fork (separate build system)
+ `bins/ghost-pool/` -- Main pool binary (mining, consensus, payouts)
+ `crates/` -- Library crates (consensus, verification, storage, etc.)
+ `ghost-core/` -- Bitcoin Core fork (separate build system)
 
 ## License
 
