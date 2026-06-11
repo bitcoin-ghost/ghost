@@ -7,6 +7,14 @@ Wants=sri-pool.service
 Type=simple
 User=ghost
 Group=ghost
+# Readiness gate: After=/Wants= only orders *start*, not readiness. pool_sv2
+# listens before it has fetched its first template from ghost-pool, and the
+# translator gives up after 3 upstream retries (CouldNotInitiateSystem) if it
+# connects too early — relying on Restart=always to recover, which churns.
+# Wait (up to ~60s) for pool_sv2's monitoring API to answer, then a short
+# settle for the first template, before connecting. Always exits 0 so it can
+# never block startup indefinitely.
+ExecStartPre=/bin/sh -c 'i=0; while [ $i -lt 30 ]; do /usr/bin/curl -sf -m2 http://127.0.0.1:9090/api/v1/clients >/dev/null 2>&1 && { sleep 10; exit 0; }; sleep 2; i=$((i+1)); done; exit 0'
 ExecStart=/opt/ghost/bin/translator_sv2 --config /etc/ghost/translator-config.toml
 Restart=always
 RestartSec=5
