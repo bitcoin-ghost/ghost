@@ -569,7 +569,12 @@
         results.forEach(function (r) {
           if (!r) return;
           online++;
-          hash += r.total_hashrate || 0;
+          // Sum per-node `local_hashrate_th` (each node's own contribution),
+          // NOT `total_hashrate` — post-PR#27 every node reports the mesh-wide
+          // pool total there, so summing across 4 nodes ~4x's the real figure.
+          hash += (typeof r.local_hashrate_th === 'number')
+            ? r.local_hashrate_th
+            : (r.total_hashrate || 0);
           if (r.block_height && r.block_height > height) height = r.block_height;
           var a = r.active_miners || 0;
           if (a > maxActive) maxActive = a;
