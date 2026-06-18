@@ -234,6 +234,10 @@ pub struct MeshNetwork {
     /// to gossip the local active set so peers can compute a deduplicated
     /// mesh-wide active miner count.
     active_miner_hashes_fn: Option<Arc<dyn Fn() -> Vec<[u8; 16]> + Send + Sync>>,
+    /// Application-provided callback returning this node's own realized
+    /// hashrate (TH/s) over a trailing window. Gossiped in health pings so
+    /// peers can SUM one term per node into a pool-wide total.
+    local_hashrate_fn: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
     /// Hardware-derived effective capacity advertised in health pings.
     /// `0` means we haven't computed it yet (mesh started before capacity
     /// init); peers treat it as unknown and skip utilisation routing for us.
@@ -1046,6 +1050,7 @@ impl MeshNetwork {
             noise_pool,
             miner_count_fn: None,
             active_miner_hashes_fn: None,
+            local_hashrate_fn: None,
             max_capacity: AtomicU32::new(0),
         })
     }
@@ -1091,6 +1096,37 @@ impl MeshNetwork {
             }
         }
         set.len()
+    }
+
+    /// Set a callback providing this node's own realized hashrate (TH/s) over a
+    /// trailing window, gossiped in health pings for mesh-wide summation.
+    pub fn set_local_hashrate_provider(&mut self, f: Arc<dyn Fn() -> f64 + Send + Sync>) {
+        self.local_hashrate_fn = Some(f);
+    }
+
+    /// Compute the mesh-wide pool hashrate (TH/s): this node's own realized
+    /// hashrate plus the most recent value reported by every peer whose
+    /// `last_seen` is within `freshness_secs`.
+    ///
+    /// This is a plain sum of one term per node — NOT a per-miner dedup —
+    /// because every share is recorded on exactly one node (scoped by
+    /// `received_by` at the source), so the per-node values are disjoint and
+    /// cannot double-count. The result is therefore identical on every node,
+    /// and a miner migrating between nodes shifts work from one term to another
+    /// without changing the total. (The earlier per-miner `local`-always-wins
+    /// approach produced inconsistent, inflated totals under migration.)
+    pub fn mesh_total_hashrate(&self, freshness_secs: u64) -> f64 {
+        let local = self.local_hashrate_fn.as_ref().map(|f| f()).unwrap_or(0.0);
+        let peers = self.peers.get_connected_peers(freshness_secs);
+        Self::compute_mesh_total_hashrate(local, peers.iter().map(|p| p.local_hashrate_th))
+    }
+
+    /// Pure sum behind [`Self::mesh_total_hashrate`], split out for unit
+    /// testing without a live `MeshNetwork`. Negative inputs are clamped to 0
+    /// so a stray `-0.0`/garbage term can't drag the total below zero.
+    pub(crate) fn compute_mesh_total_hashrate(local: f64, peers: impl Iterator<Item = f64>) -> f64 {
+        let total = local.max(0.0) + peers.map(|hr| hr.max(0.0)).sum::<f64>();
+        total.max(0.0)
     }
 
     /// Create a new mesh network (infallible, panics on failure)
@@ -2537,6 +2573,15 @@ impl MeshNetwork {
             // Create and broadcast health ping with actual node capabilities
             // Include PoW proof for Sybil resistance
             let pow_proof = self.identity.pow_proof().map(|p| (p.nonce, p.difficulty));
+            // Active miner id-hashes feed the deduped mesh-wide active count;
+            // `local_hashrate_th` is this node's own realized hashrate, summed
+            // (one term per node) into the pool-wide total.
+            let active_miner_id_hashes = self
+                .active_miner_hashes_fn
+                .as_ref()
+                .map(|f| f())
+                .unwrap_or_default();
+            let local_hashrate_th = self.local_hashrate_fn.as_ref().map(|f| f()).unwrap_or(0.0);
             let ping = ghost_common::types::HealthPing {
                 node_id: self.identity.node_id(),
                 public_address: String::new(), // S-7: Don't broadcast IP in cleartext ZMQ
@@ -2550,11 +2595,8 @@ impl MeshNetwork {
                     .unwrap_or(self.peers.peer_count() as u32),
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
                 pow_proof,
-                active_miner_id_hashes: self
-                    .active_miner_hashes_fn
-                    .as_ref()
-                    .map(|f| f())
-                    .unwrap_or_default(),
+                active_miner_id_hashes,
+                local_hashrate_th,
                 max_capacity: self.max_capacity.load(Ordering::Relaxed),
             };
 
@@ -3691,5 +3733,47 @@ mod tests {
             message_type_requires_noise(MessageType::MpcParametersResponse),
             "MpcParametersResponse must use Noise"
         );
+    }
+
+    #[test]
+    fn mesh_hashrate_sums_one_term_per_node() {
+        // Local node 1.0 + two peers 2.0, 3.0 => 6.0. One term per node.
+        let total = MeshNetwork::compute_mesh_total_hashrate(1.0, [2.0, 3.0].into_iter());
+        assert!((total - 6.0).abs() < 1e-9, "expected 6.0, got {total}");
+    }
+
+    #[test]
+    fn mesh_hashrate_total_invariant_under_migration() {
+        // The whole point of the redesign: a miner migrating between two nodes
+        // shifts work from one node's term to another's; the fleet total is
+        // unchanged and identical regardless of where the miner sits. We model
+        // a 4-node fleet whose true total is 10.0 and move 2.0 of hashrate from
+        // node B to node C — the sum must stay 10.0 in both arrangements.
+        let before = MeshNetwork::compute_mesh_total_hashrate(1.0, [5.0, 1.0, 3.0].into_iter());
+        let after = MeshNetwork::compute_mesh_total_hashrate(1.0, [3.0, 3.0, 3.0].into_iter());
+        assert!((before - 10.0).abs() < 1e-9, "before={before}");
+        assert!((after - 10.0).abs() < 1e-9, "after={after}");
+        assert!(
+            (before - after).abs() < 1e-9,
+            "migration must not change the total: {before} vs {after}"
+        );
+    }
+
+    #[test]
+    fn mesh_hashrate_old_peer_contributes_zero() {
+        // Backward compat: an older peer that doesn't report hashrate sends the
+        // serde-default 0.0, so it simply adds nothing.
+        let total = MeshNetwork::compute_mesh_total_hashrate(4.0, [0.0, 0.0].into_iter());
+        assert!(
+            (total - 4.0).abs() < 1e-9,
+            "expected only local 4.0, got {total}"
+        );
+    }
+
+    #[test]
+    fn mesh_hashrate_clamps_negative_terms() {
+        // A stray -0.0 / garbage term can't drag the total below the real sum.
+        let total = MeshNetwork::compute_mesh_total_hashrate(-0.0, [5.0, -2.0].into_iter());
+        assert!((total - 5.0).abs() < 1e-9, "expected 5.0, got {total}");
     }
 }

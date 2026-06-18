@@ -2351,6 +2351,40 @@ impl Database {
         })
     }
 
+    /// This node's own realized hashrate (TH/s) over a trailing `window_secs`,
+    /// as a windowed rate: `SUM(work) * 2^32 / window_secs / 1e12`.
+    ///
+    /// Scoped to shares THIS node received directly via `received_by` — local
+    /// shares store `received_by = hex(node_id[..8])` (16 hex chars), whereas
+    /// replicated peer share-proofs store the 8-char `hex(origin[..4])`, so the
+    /// filter excludes replicated rows. This is essential: each node sums only
+    /// its own work, and the mesh total (sum of these across nodes) therefore
+    /// counts every share exactly once. A fixed `window_secs` denominator (not
+    /// `now - first_seen`) keeps the value stable and additive across nodes —
+    /// a miner present for only part of the window contributes proportionally,
+    /// which is correct for a fleet rate and avoids the per-miner elapsed-clamp
+    /// that over-reported bursty/transient miners under load-balancer churn.
+    pub fn local_hashrate_th(&self, window_secs: i64, received_by: &str) -> GhostResult<f64> {
+        self.with_connection(|conn| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let cutoff = now - window_secs;
+            let total_work: f64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(work), 0.0)
+                     FROM shares
+                     WHERE timestamp >= ?1 AND valid = 1 AND received_by = ?2",
+                    params![cutoff, received_by],
+                    |row| row.get::<_, f64>(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let window = window_secs.max(1) as f64;
+            Ok(total_work * 4294967296.0 / window / 1e12)
+        })
+    }
+
     /// Count miners whose `last_seen` is within the given window (seconds).
     ///
     /// Used for stable "active miners" reporting that's independent of round
@@ -8730,6 +8764,54 @@ mod tests {
             .expect("LOW-STOR-8: Failed to get shares by round");
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].miner_id, "abc123");
+    }
+
+    #[test]
+    fn test_local_hashrate_th_excludes_replicated_peer_shares() {
+        // The mesh-wide pool hashrate sums each node's local_hashrate_th. For
+        // that sum to count every share exactly once, each node must count ONLY
+        // shares it received directly — NOT replicated peer share-proofs (which
+        // the origin node already counts). Local shares store the 16-hex
+        // received_by; replicated ones store the 8-hex origin id. This guards
+        // the double-count bug the earlier per-miner design missed.
+        let db = Database::in_memory().expect("create in-memory db");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        const SELF_ID: &str = "fb71fee87bb05169"; // hex(node_id[..8]) — local
+        let mk = |hash: &str, work: f64, rx: &str| ShareRecord {
+            id: None,
+            round_id: 1,
+            miner_id: "m".to_string(),
+            difficulty: work,
+            work,
+            share_hash: hash.to_string(),
+            timestamp: now - 60,
+            received_by: rx.to_string(),
+            valid: true,
+        };
+        db.insert_share(&mk("a", 1000.0, SELF_ID)).unwrap();
+        db.insert_share(&mk("b", 1000.0, SELF_ID)).unwrap();
+        db.insert_share(&mk("c", 5000.0, "849bcece")).unwrap(); // replicated peer
+
+        let window = 600i64;
+        let hr = db.local_hashrate_th(window, SELF_ID).unwrap();
+        let expected = 2000.0 * 4294967296.0 / window as f64 / 1e12; // local work only
+        assert!(
+            (hr - expected).abs() < 1e-12,
+            "local-only hashrate wrong: {hr} vs {expected}"
+        );
+        let with_peer = 7000.0 * 4294967296.0 / window as f64 / 1e12;
+        assert!(
+            (hr - with_peer).abs() > 1e-12,
+            "must NOT include replicated peer shares"
+        );
+        // Unknown received_by (no local shares) reports 0.
+        assert_eq!(
+            db.local_hashrate_th(window, "deadbeefdeadbeef").unwrap(),
+            0.0
+        );
     }
 
     #[test]

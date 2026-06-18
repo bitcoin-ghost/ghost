@@ -857,9 +857,13 @@ impl HealthPingHandler {
         // even when the peer address hasn't changed — these are live metrics.
         self.peers
             .update_health_metrics(&envelope.sender, ping.miner_count, ping.capabilities);
-        // Active miner_id hashes used for mesh-wide deduplicated counting.
-        self.peers
-            .update_active_miner_hashes(&envelope.sender, ping.active_miner_id_hashes.clone());
+        // Active miner_id hashes (mesh-wide dedup count) + this node's own
+        // realized hashrate (summed across the mesh for the pool total).
+        self.peers.update_active_miner_hashes(
+            &envelope.sender,
+            ping.active_miner_id_hashes.clone(),
+            ping.local_hashrate_th,
+        );
         // Hardware-derived capacity used by the LB for utilisation routing.
         self.peers
             .update_max_capacity(&envelope.sender, ping.max_capacity);
