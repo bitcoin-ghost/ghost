@@ -145,7 +145,12 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
       - name: Generate coverage
-        run: cargo llvm-cov $WORKSPACE_EXCLUDES --lcov --output-path lcov.info
+        # Match the Test job's selection (`--lib --bins`). The default `--tests`
+        # also runs the `[[test]]` integration targets, several of which need
+        # external infrastructure (a real bitcoin-core/ghostd node, a running
+        # stratum server, a live cluster) that isn't available in CI — those
+        # are exercised separately, not in the coverage gate.
+        run: cargo llvm-cov $WORKSPACE_EXCLUDES --lib --bins --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
