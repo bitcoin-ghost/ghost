@@ -101,6 +101,11 @@ const EXIT_CODE_RESTART: i32 = 100;
 /// See `tasks/plan_payout_address_grouping.md` for the full rollout.
 pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 
+/// Trailing window for the per-node realized hashrate gossiped in health pings
+/// and summed into the mesh-wide pool total. 10 minutes smooths small-miner
+/// share variance while still tracking real changes within a few minutes.
+const MESH_HASHRATE_WINDOW_SECS: i64 = 600;
+
 /// H-8 SECURITY: Static storage for ZMQ subscriber to prevent memory leak.
 /// Previously used std::mem::forget which intentionally leaked memory.
 /// Using OnceLock ensures the subscriber lives for the program lifetime
@@ -976,6 +981,21 @@ async fn main() -> Result<()> {
         db_for_active_hashes
             .active_miner_id_hashes(300)
             .unwrap_or_default()
+    }));
+
+    // Gossip THIS node's own realized hashrate (10-min trailing window) so
+    // peers can sum one term per node into a pool-wide total that's stable
+    // under load-balancer migration. Scoped by `received_by = hex(node_id[..8])`
+    // so only shares this node received directly count — replicated peer
+    // share-proofs are excluded, which is what keeps the mesh sum from
+    // double-counting (each share counted once, by its origin node).
+    let self_received_by = hex::encode(&identity.node_id()[..8]);
+    let db_for_local_hr = Arc::clone(&db);
+    let self_rx_for_provider = self_received_by.clone();
+    mesh_inner.set_local_hashrate_provider(Arc::new(move || {
+        db_for_local_hr
+            .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_provider)
+            .unwrap_or(0.0)
     }));
 
     let mesh = Arc::new(mesh_inner);
@@ -3173,6 +3193,23 @@ async fn main() -> Result<()> {
     let mesh_for_active = Arc::clone(&mesh);
     verification_state = verification_state
         .with_mesh_active_miners(move || mesh_for_active.mesh_active_miner_count(60) as u32);
+
+    // Mesh-wide pool hashrate (TH/s) — sum of every node's own realized
+    // hashrate (60s peer freshness). One term per node, scoped by received_by
+    // at source, so it can't double-count and is identical on every node.
+    let mesh_for_hashrate = Arc::clone(&mesh);
+    verification_state = verification_state
+        .with_mesh_total_hashrate(move || mesh_for_hashrate.mesh_total_hashrate(60));
+
+    // This node's own contribution to that total, surfaced as `local_hashrate_th`
+    // so the per-node and mesh figures reconcile (same windowed value it gossips).
+    let db_for_local_hr_route = Arc::clone(&db);
+    let self_rx_for_route = self_received_by.clone();
+    verification_state = verification_state.with_local_hashrate(move || {
+        db_for_local_hr_route
+            .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_route)
+            .unwrap_or(0.0)
+    });
 
     // Advertise this node's hardware-derived capacity via /api/internal/pool-nodes
     // so the colocated translator's load balancer routes by utilisation %.

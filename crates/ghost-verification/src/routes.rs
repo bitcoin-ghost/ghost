@@ -1581,6 +1581,14 @@ async fn api_mining_status_handler(
         .and_then(|db| db.count_active_miners(300).ok())
         .unwrap_or(0);
     let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
+    // Pool-wide hashrate (sum of every node's own realized hashrate) is the
+    // figure operators expect: it stays put when the load balancer migrates a
+    // miner between nodes. Falls back to the node-local sum on older deploys
+    // without the mesh provider. `local_hashrate_th` shows this node's own
+    // contribution (the same windowed value it gossips), so the per-node and
+    // mesh figures reconcile.
+    let mesh_hashrate_th = state.mesh_total_hashrate().unwrap_or(total_hashrate_th);
+    let local_hashrate_th = state.local_hashrate().unwrap_or(total_hashrate_th);
 
     Json(serde_json::json!({
         // Backend fields
@@ -1589,7 +1597,7 @@ async fn api_mining_status_handler(
         "block_height": health.block_height,
         "round_id": health.round_id,
         "miner_count": health.miner_count,
-        "total_hashrate": total_hashrate_th,
+        "total_hashrate": mesh_hashrate_th,
         "shares_this_round": health.capabilities.total_shares,
         "difficulty": 1.0,
         "best_hash": null,
@@ -1598,8 +1606,10 @@ async fn api_mining_status_handler(
         "enabled": true,
         "private_mining": config.private_mining.unwrap_or(false),
         "public_mining": health.capabilities.public_mining,
-        "hashrate_th": total_hashrate_th,
-        "connected_miners": health.miner_count,
+        "hashrate_th": mesh_hashrate_th,
+        "local_hashrate_th": local_hashrate_th,
+        "connected_miners": mesh_active_miners,
+        "local_connected_miners": health.miner_count,
         "active_miners": active_miners,
         "mesh_active_miners": mesh_active_miners,
         "shares_submitted": shares_submitted,

@@ -940,6 +940,16 @@ pub struct VerificationState {
     /// count that's stable across the round rotations and load-balancer
     /// hopping that make per-VM counts misleading when summed.
     get_mesh_active_miners: Option<Box<dyn Fn() -> u32 + Send + Sync>>,
+    /// Mesh-wide pool hashrate (TH/s): sum of every node's own realized
+    /// hashrate (one term per node, scoped by `received_by` at source so it
+    /// can't double-count), so load-balancer migrations don't crater or inflate
+    /// the figure. None on older deploys without the mesh provider wired up —
+    /// callers fall back to the node-local value.
+    get_mesh_total_hashrate: Option<Box<dyn Fn() -> f64 + Send + Sync>>,
+    /// This node's own realized hashrate (TH/s) over the trailing window — the
+    /// exact term it contributes to `get_mesh_total_hashrate`. Surfaced as
+    /// `local_hashrate_th` so the per-node and mesh figures reconcile.
+    get_local_hashrate: Option<Box<dyn Fn() -> f64 + Send + Sync>>,
     /// Signal to trigger graceful restart (set by config update API)
     /// When true, main.rs will initiate shutdown and exit with code 100
     pub restart_signal: Arc<AtomicBool>,
@@ -1109,6 +1119,8 @@ impl VerificationState {
             get_pool_peers: None,
             get_reaper_stats: None,
             get_mesh_active_miners: None,
+            get_mesh_total_hashrate: None,
+            get_local_hashrate: None,
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
@@ -1589,6 +1601,30 @@ impl VerificationState {
     /// callback has been wired up (older deploys without the mesh provider).
     pub fn mesh_active_miners(&self) -> Option<u32> {
         self.get_mesh_active_miners.as_ref().map(|f| f())
+    }
+
+    /// Set the mesh-wide pool hashrate (TH/s) callback.
+    pub fn with_mesh_total_hashrate(mut self, f: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
+        self.get_mesh_total_hashrate = Some(Box::new(f));
+        self
+    }
+
+    /// Returns the mesh-wide pool hashrate (TH/s), or None if no callback has
+    /// been wired up (older deploys without the mesh provider).
+    pub fn mesh_total_hashrate(&self) -> Option<f64> {
+        self.get_mesh_total_hashrate.as_ref().map(|f| f())
+    }
+
+    /// Set this node's own realized-hashrate (TH/s) callback.
+    pub fn with_local_hashrate(mut self, f: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
+        self.get_local_hashrate = Some(Box::new(f));
+        self
+    }
+
+    /// Returns this node's own realized hashrate (TH/s) — its contribution to
+    /// the mesh total — or None if no callback has been wired up.
+    pub fn local_hashrate(&self) -> Option<f64> {
+        self.get_local_hashrate.as_ref().map(|f| f())
     }
 
     /// Set archive handler

@@ -352,6 +352,16 @@ pub struct HealthPing {
     /// that don't include it deserialize to an empty Vec.
     #[serde(default, with = "ghost_common_active_hashes")]
     pub active_miner_id_hashes: Vec<[u8; 16]>,
+    /// This node's own realized hashrate (TH/s) over a trailing window,
+    /// computed from shares THIS node received directly (scoped by
+    /// `received_by`, so replicated peer share-proofs aren't counted). Peers
+    /// SUM these across the mesh for a pool-wide total: shares are partitioned
+    /// by node, so the sum can't double-count and is identical on every node,
+    /// and a miner migrating between nodes shifts work from one term to another
+    /// without changing the total. `#[serde(default)]` for backward
+    /// compatibility — older nodes that don't send it contribute 0.
+    #[serde(default)]
+    pub local_hashrate_th: f64,
     /// Hardware-derived effective miner capacity. Translator's load balancer
     /// uses `miner_count / max_capacity` to compute utilisation and route
     /// new arrivals to the under-utilised peer. 0 = pre-update node (treated
@@ -837,5 +847,48 @@ mod tests {
         let json = serde_json::to_string(&addr).unwrap();
         let parsed: TreasuryAddress = serde_json::from_str(&json).unwrap();
         assert_eq!(addr, parsed);
+    }
+
+    fn sample_health_ping() -> HealthPing {
+        HealthPing {
+            node_id: [7u8; 32],
+            public_address: String::new(),
+            block_height: 0,
+            round_id: 0,
+            capabilities: NodeCapabilities::new(),
+            miner_count: 2,
+            timestamp: 1,
+            pow_proof: None,
+            active_miner_id_hashes: vec![[1u8; 16], [2u8; 16]],
+            local_hashrate_th: 4.0,
+            max_capacity: 0,
+        }
+    }
+
+    #[test]
+    fn health_ping_hashrate_roundtrip() {
+        let ping = sample_health_ping();
+        let json = serde_json::to_string(&ping).unwrap();
+        let back: HealthPing = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.local_hashrate_th, 4.0);
+        assert_eq!(back.active_miner_id_hashes.len(), 2);
+    }
+
+    #[test]
+    fn health_ping_deserializes_without_hashrate_field() {
+        // Emulate an OLDER node's ping that predates `local_hashrate_th`:
+        // serialize, strip the field, and confirm it defaults to 0.0 (and the
+        // rest of the ping is unaffected). Proves the wire change is additive.
+        let ping = sample_health_ping();
+        let mut v = serde_json::to_value(&ping).unwrap();
+        assert!(v
+            .as_object_mut()
+            .unwrap()
+            .remove("local_hashrate_th")
+            .is_some());
+        let back: HealthPing = serde_json::from_value(v).unwrap();
+        assert_eq!(back.local_hashrate_th, 0.0);
+        assert_eq!(back.active_miner_id_hashes.len(), 2);
+        assert_eq!(back.miner_count, 2);
     }
 }

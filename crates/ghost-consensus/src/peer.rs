@@ -214,11 +214,20 @@ impl PeerManager {
         }
     }
 
-    /// Replace the active miner_id hash list for a peer with the most recent
-    /// from a health ping. Used for mesh-wide deduplicated active counting.
-    pub fn update_active_miner_hashes(&self, node_id: &NodeId, hashes: Vec<[u8; 16]>) {
+    /// Replace the active miner_id hash list and the peer's own realized
+    /// hashrate with the most recent from a health ping. The hashes feed the
+    /// mesh-wide deduplicated active count; `local_hashrate_th` is summed
+    /// (one term per node) for the pool-wide hashrate. Older peers that don't
+    /// report hashrate pass `0.0`.
+    pub fn update_active_miner_hashes(
+        &self,
+        node_id: &NodeId,
+        hashes: Vec<[u8; 16]>,
+        local_hashrate_th: f64,
+    ) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
             peer.active_miner_id_hashes = hashes;
+            peer.local_hashrate_th = local_hashrate_th;
         }
     }
 
@@ -314,6 +323,10 @@ pub struct Peer {
     /// last ~5 min, from the most recent health ping. Used for mesh-wide
     /// deduplicated active-miner counting.
     pub active_miner_id_hashes: Vec<[u8; 16]>,
+    /// This peer's own realized hashrate (TH/s) over a trailing window, from
+    /// its most recent health ping. Summed across the mesh (one term per node)
+    /// for the pool-wide hashrate. 0 for older peers that don't report it.
+    pub local_hashrate_th: f64,
     /// Peer's hardware-derived effective miner capacity, advertised in its
     /// health pings. The translator's load balancer divides `miner_count`
     /// by this value to compute utilisation and pick the under-utilised
@@ -342,6 +355,7 @@ impl Peer {
             messages_sent: 0,
             miner_count: 0,
             active_miner_id_hashes: Vec::new(),
+            local_hashrate_th: 0.0,
             max_capacity: 0,
         }
     }
