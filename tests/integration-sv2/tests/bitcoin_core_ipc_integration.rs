@@ -7,6 +7,11 @@ use jd_client_sv2::config::ConfigJDCMode;
 use stratum_apps::stratum_core::{common_messages_sv2::*, job_declaration_sv2::*};
 
 // Pool propagates block via IPC
+// Requires a real bitcoin-core/ghostd binary with IPC (`start_bitcoin_core`),
+// which isn't available in CI — the Test job runs only `--lib --bins` + selected
+// integration targets, but `cargo llvm-cov` (Coverage) runs `--tests` and would
+// otherwise fail here. Run locally with `--ignored` against a built node.
+#[ignore = "requires a bitcoin-core/ghostd IPC harness; run with --ignored"]
 #[tokio::test]
 async fn pool_propagates_block_with_bitcoin_core_ipc() {
     start_tracing();
@@ -46,6 +51,8 @@ async fn pool_propagates_block_with_bitcoin_core_ipc() {
 }
 
 // JDC propagates block via IPC (PushSolution blocked to ensure IPC path)
+// See note above: needs a real bitcoin-core/ghostd IPC harness, not in CI.
+#[ignore = "requires a bitcoin-core/ghostd IPC harness; run with --ignored"]
 #[tokio::test]
 async fn jdc_propagates_block_with_bitcoin_core_ipc() {
     start_tracing();
@@ -125,6 +132,8 @@ async fn jdc_propagates_block_with_bitcoin_core_ipc() {
 }
 
 // JDC solo mining mode with BitcoinCoreIpc (mode = SOLOMINING, no upstreams)
+// See note above: needs a real bitcoin-core/ghostd IPC harness, not in CI.
+#[ignore = "requires a bitcoin-core/ghostd IPC harness; run with --ignored"]
 #[tokio::test]
 async fn jdc_solo_mining_with_bitcoin_core_ipc() {
     start_tracing();
