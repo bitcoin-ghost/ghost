@@ -184,6 +184,12 @@ pub struct VotingSession {
     pub timeout_ms: u64,
     /// Eligible voters (node IDs)
     pub eligible_voters: HashSet<NodeId>,
+    /// GHOST-04: minimum voters this session requires for BFT — the floor used
+    /// at formation, and the threshold the mid-session invalidation check uses
+    /// to decide whether the session is still decidable. Stored (rather than
+    /// using the const) so a smaller bootstrap floor than MIN_VOTERS_FOR_BFT
+    /// doesn't get instantly suspended by the const-based check.
+    min_voters: usize,
     /// Votes received (stores full vote including signature for equivocation detection)
     pub votes: HashMap<NodeId, Vote>,
     /// Result (if decided)
@@ -276,6 +282,7 @@ impl VotingSession {
             started: Instant::now(),
             timeout_ms, // MED-CONS-1: Use the validated timeout directly (no clamping)
             eligible_voters,
+            min_voters,
             votes: HashMap::new(),
             result: None,
             equivocations: Vec::new(),
@@ -553,11 +560,14 @@ impl VotingSession {
         // Remove their vote if present
         let had_vote = self.votes.remove(node_id).is_some();
 
-        // H-13: Check if remaining voters dropped below minimum for BFT
-        if self.eligible_voters.len() < Self::MIN_VOTERS_FOR_BFT {
+        // H-13: Check if remaining voters dropped below minimum for BFT.
+        // GHOST-04: use this session's own min_voters, not the const, so a
+        // session formed with a smaller bootstrap floor isn't instantly
+        // suspended.
+        if self.eligible_voters.len() < self.min_voters {
             tracing::warn!(
                 remaining = self.eligible_voters.len(),
-                min_required = Self::MIN_VOTERS_FOR_BFT,
+                min_required = self.min_voters,
                 round_id = self.round_id,
                 voter = hex::encode(&node_id[..8]),
                 "H-13: Voter count dropped below minimum after invalidation — suspending session"
@@ -1031,6 +1041,27 @@ mod tests {
             VotingSession::MIN_VOTERS_FOR_BFT,
         )
         .expect("Test session should have enough voters")
+    }
+
+    /// GHOST-04: a 4-elder bootstrap set forms a session at a floor of 4 (so
+    /// mainnet payout consensus can actually run before the elder set reaches
+    /// 7), with a 3-of-4 (67%) quorum; a 3-voter set is rejected against that
+    /// floor (fails closed). Previously the hard floor of 7 made this impossible.
+    #[test]
+    fn test_ghost04_bootstrap_floor_of_four() {
+        let four: HashSet<NodeId> = (0..4u8).map(|i| [i; 32]).collect();
+        let session = VotingSession::new(1, [0u8; 32], VoteType::PayoutApproval, four, 5000, 4)
+            .expect("session forms at the 4-elder bootstrap floor");
+        assert_eq!(session.threshold(), 3, "67% of 4 = 3 (f=1)");
+
+        let three: HashSet<NodeId> = (0..3u8).map(|i| [i; 32]).collect();
+        assert!(
+            matches!(
+                VotingSession::new(2, [0u8; 32], VoteType::PayoutApproval, three, 5000, 4),
+                Err(GhostError::InsufficientVoters { .. })
+            ),
+            "a 3-voter set must be rejected against a floor of 4"
+        );
     }
 
     #[test]

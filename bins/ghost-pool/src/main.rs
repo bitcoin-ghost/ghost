@@ -1232,10 +1232,20 @@ async fn main() -> Result<()> {
     // Create vote handler with callbacks and shared ban manager
     // 4.5 SECURITY: Rate limiter persistence is now enabled by default to prevent
     // attackers from bypassing rate limits by triggering node restarts.
-    // BFT voter threshold: mainnet requires 7 (f=2), non-mainnet allows 3 (f=1)
+    // GHOST-04: adapt the BFT voter floor to the registered elder set, clamped
+    // to [4, 7]. At the bootstrap 4-elder set this is 4 (f=1, 3-of-4 quorum) so
+    // payout consensus can actually FORM — a hard floor of 7 made mainnet payout
+    // voting impossible below 7 elders. It rises to 7 (f=2) as the set grows,
+    // capped at the long-term target; requiring the full registered set (up to
+    // 7) keeps a small-N quorum from being unsafe. NOTE: computed once at start;
+    // restart after the elder set changes materially.
     let rate_limiter_path = data_dir.join("rate_limiter.json");
     let vote_config = VoteHandlerConfig {
-        min_voters_for_bft: if is_mainnet_round { 7 } else { 3 },
+        min_voters_for_bft: if is_mainnet_round {
+            (db.get_mpc_elder_count().unwrap_or(0) as usize).clamp(4, 7)
+        } else {
+            3
+        },
         ..VoteHandlerConfig::default()
     };
     // Create proposal store callback so remote nodes store proposal data
