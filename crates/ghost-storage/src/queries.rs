@@ -5253,6 +5253,25 @@ impl Database {
         })
     }
 
+    /// GHOST-10: online fraction (0.0..=1.0) for the trailing window.
+    ///
+    /// Downtime manifests as MISSING `uptime_samples` rows (gaps), not
+    /// `was_online = 0` rows — only `true` is ever recorded — so the old
+    /// `online / total` was always ~1.0 and the 95% gatekeeper meant nothing.
+    /// Measure liveness instead as online samples vs the number EXPECTED at the
+    /// 10s sampling cadence (the self-uptime task and the health-ping interval
+    /// are both 10s) over the window, capped at 1.0. A node down 10% of the
+    /// window thus shows ~0.9 and fails the gatekeeper.
+    fn uptime_ratio(online: i64, since: i64) -> f64 {
+        const UPTIME_SAMPLE_INTERVAL_SECS: i64 = 10;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(since);
+        let expected = ((now - since) / UPTIME_SAMPLE_INTERVAL_SECS).max(1);
+        (online as f64 / expected as f64).clamp(0.0, 1.0)
+    }
+
     /// Get uptime percentage for a node over trailing period
     /// Returns percentage (0.0 to 1.0)
     pub fn get_uptime_percent(&self, node_id: &str, since: i64) -> GhostResult<f64> {
@@ -5275,11 +5294,9 @@ impl Database {
                 })
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
-            let (online, total) = result;
-            if total == 0 {
-                return Ok(0.0);
-            }
-            Ok(online as f64 / total as f64)
+            let (online, _total) = result;
+            // GHOST-10: time-based expected denominator, not online/total.
+            Ok(Self::uptime_ratio(online, since))
         })
     }
 
@@ -5312,8 +5329,8 @@ impl Database {
             if total == 0 {
                 return Ok(None);
             }
-            // Convert to 0-100 percentage
-            let percent = ((online as f64 / total as f64) * 100.0).round() as u32;
+            // GHOST-10: time-based expected denominator, not online/total.
+            let percent = (Self::uptime_ratio(online, since) * 100.0).round() as u32;
             Ok(Some(percent.min(100)))
         })
     }
