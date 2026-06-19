@@ -320,21 +320,31 @@ pub fn load_trusted_params() -> ZkResult<()> {
     let note_spend_params_path = base_path.join("note_spend_params_current.bin");
     if note_spend_params_path.exists() {
         let actual_hash = compute_params_file_hash(&note_spend_params_path)?;
-        if let Some(expected) = expected_hashes.get("BLOCK") {
-            if &actual_hash != expected {
-                return Err(ZkError::InvalidParams(format!(
-                    "2.4 HIGH: Note spend parameter hash mismatch! \
-                     Expected: {}, Got: {}. \
-                     Parameters may be corrupted or tampered.",
-                    hex::encode(expected),
-                    hex::encode(actual_hash)
-                )));
-            }
-            tracing::info!(
-                hash = %hex::encode(actual_hash),
-                "2.4 HIGH: Note spend parameters hash verified"
-            );
+        // GHOST-06: fail closed. Previously a MISSING BLOCK hash silently skipped
+        // verification, so a tampered trusted-setup file would load unchecked in
+        // production. In zk-production the param file present without a pinned
+        // BLOCK hash is a hard error.
+        let expected = expected_hashes.get("BLOCK").ok_or_else(|| {
+            ZkError::InvalidParams(
+                "GHOST-06: note_spend params present but ZK_PARAMS_HASH has no BLOCK entry — \
+                 refusing to load unverified trusted-setup parameters. \
+                 Set ZK_PARAMS_HASH=BLOCK:<sha256hex> from the ceremony output."
+                    .to_string(),
+            )
+        })?;
+        if &actual_hash != expected {
+            return Err(ZkError::InvalidParams(format!(
+                "2.4 HIGH: Note spend parameter hash mismatch! \
+                 Expected: {}, Got: {}. \
+                 Parameters may be corrupted or tampered.",
+                hex::encode(expected),
+                hex::encode(actual_hash)
+            )));
         }
+        tracing::info!(
+            hash = %hex::encode(actual_hash),
+            "2.4 HIGH: Note spend parameters hash verified"
+        );
     }
 
     tracing::info!(
