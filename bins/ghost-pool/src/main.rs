@@ -1447,6 +1447,61 @@ async fn main() -> Result<()> {
     mesh.register_handler(Arc::clone(&share_proof_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
+    // GHOST-03: ledger convergence. Periodically advertise the shares we hold for
+    // the current round; peers reply with the signed proofs we were missing
+    // (drop/partition) and we apply them (re-verifying the GHOST-09 signature).
+    // `broadcast()` is async but the handler's send is sync, so outbound
+    // convergence frames go through an mpsc channel drained by a spawned task.
+    let (conv_tx, mut conv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    {
+        let mesh_for_conv = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            while let Some(bytes) = conv_rx.recv().await {
+                match mesh_for_conv
+                    .create_envelope_raw(ghost_consensus::MessageType::ShareConvergence, bytes)
+                {
+                    Ok(envelope) => {
+                        if let Err(e) = mesh_for_conv.broadcast(envelope).await {
+                            tracing::debug!(error = %e, "GHOST-03: convergence broadcast failed");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "GHOST-03: convergence envelope failed"),
+                }
+            }
+        });
+    }
+    let conv_send: ghost_pool::convergence::ConvergenceSendFn = {
+        let conv_tx = conv_tx.clone();
+        Arc::new(move |bytes| {
+            conv_tx.try_send(bytes).map_err(|e| {
+                ghost_common::error::GhostError::P2PMessage(format!("convergence channel: {e}"))
+            })
+        })
+    };
+    let convergence_handler = Arc::new(
+        ghost_pool::convergence::ConvergenceHandler::new(Arc::clone(&round_manager))
+            .with_send(conv_send),
+    );
+    mesh.register_handler(Arc::clone(&convergence_handler)
+        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+    {
+        let conv_handler = Arc::clone(&convergence_handler);
+        let rm_for_conv = Arc::clone(&round_manager);
+        let conv_tx = conv_tx.clone();
+        tokio::spawn(async move {
+            const CONVERGENCE_INTERVAL_SECS: u64 = 30;
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
+            loop {
+                ticker.tick().await;
+                let round_id = rm_for_conv.current_round_id();
+                if let Ok(bytes) = conv_handler.request_bytes(round_id) {
+                    let _ = conv_tx.send(bytes).await;
+                }
+            }
+        });
+    }
+
     // Register GhostGlyph handler for visual identity P2P messages
     let glyph_handler = Arc::new(ghost_pool::glyph_handler::GlyphRegistrationHandler::new(
         Arc::clone(&db),
