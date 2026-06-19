@@ -78,7 +78,16 @@ impl ShareProofHandler {
         // carry a valid signature by `received_by` over its canonical bytes,
         // otherwise it's a forged or relayed credit (e.g. a relay re-crediting
         // itself) and is dropped before it can inflate any node's shares.
-        if !proof.has_valid_received_by_signature() {
+        //
+        // GATED on CLUSTER_ENFORCEMENT_HEIGHT: pre-activation the fleet is still
+        // partly running the pre-audit binary that emits UNSIGNED proofs, so
+        // enforcing here would silently drop those nodes' shares and diverge the
+        // ledger. Until the gate height we therefore accept them; nodes already
+        // sign their own shares (always-on) so the converged state is primed for
+        // the moment the gate fires fleet-wide.
+        if self.round_manager.current_height() >= crate::CLUSTER_ENFORCEMENT_HEIGHT
+            && !proof.has_valid_received_by_signature()
+        {
             warn!(
                 from_node = %hex::encode(&proof.received_by[..4]),
                 round_id = proof.round_id,

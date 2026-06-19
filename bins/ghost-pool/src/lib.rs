@@ -75,6 +75,24 @@ pub mod share_handler;
 /// GHOST-03: ledger convergence (share-set reconciliation) between mesh nodes.
 pub mod convergence;
 
+/// Chain height at which the security-audit cluster's ENFORCEMENT activates
+/// fleet-wide. Mirrors `PAYOUT_ADDRESS_GROUPING_HEIGHT`: baking the activation as
+/// a deterministic block-height gate (not a flag) means every node — running the
+/// same binary — flips at the exact same chain position, so the fleet can roll
+/// the binary out canary-style with NO mixed-version enforcement window.
+///
+/// Before this height the binary still SIGNS shares, converges ledgers and
+/// propagates equivocation bans (all additive, mixed-version-safe), but it does
+/// NOT yet drop unsigned shares (GHOST-09) or reject a mismatched payout split
+/// (GHOST-02) — making it behaviour-identical to the pre-audit binary in a mixed
+/// mesh. After it, both enforcements are live everywhere at once.
+///
+/// PLACEHOLDER — the operator MUST set this to roughly `(current tip + ~150)`
+/// (~24h of blocks past expected full-roll completion) in the activation build.
+/// The default is far enough in the future that an accidental deploy stays in
+/// the safe, non-enforcing dark mode.
+pub const CLUSTER_ENFORCEMENT_HEIGHT: u64 = 999_999_999;
+
 /// GhostGlyph P2P handler for visual identity registration.
 pub mod glyph_handler;
 
