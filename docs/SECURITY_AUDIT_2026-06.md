@@ -21,19 +21,19 @@ forgeable) · **MEDIUM** (correctness/robustness) · **LOW** (hygiene/docs).
 
 | ID | Sev | Component | One-line | Status |
 |----|-----|-----------|----------|--------|
-| GHOST-01 | HIGH | ghost-verification | Capability challenges are forgeable; verifier trusts challenger's `passed` boolean with no re-execution | OPEN |
-| GHOST-02 | HIGH | ghost-consensus | Payout-proposal validators don't recompute the split vs their own ledger; no proposer-authorization check | OPEN |
-| GHOST-03 | HIGH | ghost-consensus | `ShareConvergence` is dead code — no ledger-convergence protocol; gossip-only | OPEN |
-| GHOST-04 | CRITICAL | ghost-consensus | Live elder set = 4 < mainnet `MIN_VOTERS_FOR_BFT = 7` → payout BFT cannot reach quorum | OPEN |
-| GHOST-05 | HIGH | ghost-pay | L2 peg-in mints shielded value with no on-chain deposit verification (custodial) | OPEN |
-| GHOST-06 | MEDIUM | ghost-mpc | `verify_contribution` not called on consensus-approval path; no min-contribution / full hash-pin | OPEN |
-| GHOST-07 | MEDIUM | ghost-pool / verification | `/api/internal/*` binds `0.0.0.0`; secret set on mainnet but bind is over-broad | OPEN |
-| GHOST-08 | HIGH | ghost-zkp | `test_accept_all()` (returns `Ok(true)`) compiled into production verifiers | OPEN |
-| GHOST-09 | MEDIUM | ghost-consensus | `received_by` (node-reward credit) is unauthenticated → credit theft | OPEN |
-| GHOST-10 | MEDIUM | ghost-verification | Uptime gatekeeper only ever records `was_online=true` (no offline samples) | OPEN |
-| GHOST-11 | MEDIUM | ghost-consensus | Equivocation bans are in-memory only; equivocating elder stays an eligible voter | OPEN |
-| GHOST-12 | MEDIUM | ghost-reconciliation | `MIN_BATCH_SIZE = 1` (comment: "MAINNET: raise back to 10") destroys batch anonymity | OPEN |
-| GHOST-13 | LOW | docs | Doc/reality drift (missing `docs/`, dust→treasury, P2WSH-not-P2TR, MiMC-not-Pedersen, Reaper=BitcoinPure, README stats) | OPEN |
+| GHOST-01 | HIGH | ghost-verification | Capability challenges are forgeable; verifier trusts challenger's `passed` boolean with no re-execution | PARTIAL — Reaper/BitcoinPure negative control added + tested (PR #35); PublicMining handshake, GhostPay root-check, and the cross-mesh collusion fix remain (wire-format) |
+| GHOST-02 | HIGH | ghost-consensus | Payout-proposal validators don't recompute the split vs their own ledger; no proposer-authorization check | OPEN — payout-integrity cluster (needs GHOST-03 + multi-node harness) |
+| GHOST-03 | HIGH | ghost-consensus | `ShareConvergence` is dead code — no ledger-convergence protocol; gossip-only | OPEN — payout-integrity cluster (wire-format; needs harness) |
+| GHOST-04 | CRITICAL | ghost-consensus | Live elder set = 4 < mainnet `MIN_VOTERS_FOR_BFT = 7` → payout BFT cannot reach quorum | FIXED (PR #38) — adaptive floor `clamp(4,7)`; DO NOT deploy in isolation (cluster) |
+| GHOST-05 | HIGH | ghost-pay | L2 peg-in mints shielded value with no on-chain deposit verification (custodial) | FIXED (PR #37) — `confirm_lock_funding` verifies the UTXO via `gettxout`; `shield_balance` requires Active lock. Remaining: mandatory `lock_id` (behaviour change) |
+| GHOST-06 | MEDIUM | ghost-mpc | `verify_contribution` not called on consensus-approval path; no min-contribution / full hash-pin | PARTIAL (PR #36) — load now fails closed without a pinned BLOCK hash. Remaining: `verify_contribution` on the apply path (needs ceremony harness; future-join only) |
+| GHOST-07 | MEDIUM | ghost-pool / verification | `/api/internal/*` binds `0.0.0.0`; secret set on mainnet but bind is over-broad | RESOLVED — no change needed (already fail-closed on mainnet; secret set; bind required for mesh load-balancer polling) |
+| GHOST-08 | HIGH | ghost-zkp | `test_accept_all()` (returns `Ok(true)`) compiled into production verifiers | FIXED (PR #33, merged) — bypass branch compiled out under `zk-production` |
+| GHOST-09 | MEDIUM | ghost-consensus | `received_by` (node-reward credit) is unauthenticated → credit theft | OPEN — ShareProof has NO signature field; fix is a wire-format change (sign + verify gossiped proof). Payout-integrity cluster |
+| GHOST-10 | MEDIUM | ghost-verification | Uptime gatekeeper only ever records `was_online=true` (no offline samples) | FIXED (PR #34, merged) — time-based liveness denominator |
+| GHOST-11 | MEDIUM | ghost-consensus | Equivocation bans are in-memory only; equivocating elder stays an eligible voter | OPEN — persistence is local but propagation is wire-format. Payout-integrity cluster |
+| GHOST-12 | MEDIUM | ghost-reconciliation | `MIN_BATCH_SIZE = 1` (comment: "MAINNET: raise back to 10") destroys batch anonymity | FIXED (PR #33, merged) — `MIN_BATCH_SIZE = 10` |
+| GHOST-13 | LOW | docs | Doc/reality drift (missing `docs/`, dust→treasury, P2WSH-not-P2TR, MiMC-not-Pedersen, Reaper=BitcoinPure, README stats) | RESOLVED — this audit doc is the corrected reference; CLAUDE.md (gitignored, local) dust note also corrected |
 
 ---
 
@@ -176,3 +176,40 @@ bite precisely when independent, untrusted operators arrive — which is the pro
 **Close GHOST-01 and GHOST-02 first:** they are the load-bearing wall for "nodes taking back
 control," because together they decide whether honest nodes can be made to ratify a dishonest
 payout or a farmed reward pool.
+
+---
+
+## Remediation status (2026-06-19)
+
+9 of 13 findings are resolved or have a landed fix-PR; the remaining 4 are one coupled cluster.
+
+- **Merged to `main`:** GHOST-08, GHOST-10, GHOST-12 (PRs #33, #34) + this audit doc (#32).
+- **Fix PRs open:** GHOST-01 partial (#35), GHOST-06 partial (#36), GHOST-05 (#37), GHOST-04 (#38).
+- **Resolved without code change:** GHOST-07, GHOST-13.
+
+### The payout-integrity cluster — GHOST-02, GHOST-03, GHOST-09, GHOST-11
+
+These four are **not independent patches**; they are one design that must ship and be validated
+together, because each is a change to the **gossiped consensus wire format** and they interlock:
+
+1. **GHOST-09 (signed shares)** is the foundation: `ShareProof` currently has *no* signature field,
+   so `received_by` (and `miner_id`, `work`) are forgeable. Add a node signature over the proof and
+   verify it on the gossip-receive path before crediting. *Wire-format change.*
+2. **GHOST-03 (ledger convergence)** builds on signed shares: nodes exchange signed share-set
+   digests and backfill gaps so their share ledgers actually agree before a payout vote. *Wire-format.*
+3. **GHOST-02 (proposal recompute)** depends on GHOST-03: validators recompute the payout split
+   from their *own* converged ledger and reject a proposal that doesn't match, plus check the
+   proposer is the real block-finder. Without GHOST-03 this would reject honest proposals.
+4. **GHOST-11 (ban propagation)** gates voter eligibility on a gossiped, persisted equivocation
+   record so a banned elder can't keep voting on one node's view. *Wire-format (propagation).*
+5. **GHOST-04 (#38)** already lets the quorum *form* at 4 elders — but quorum without 1–3 means
+   votes still ratify on internal checks only, so #38 must NOT deploy ahead of this cluster.
+
+**Why these aren't shipped here:** per this repo's "no half-fixes / validate before done" rule,
+blind-deploying wire-format consensus changes to the live mainnet mesh — with no multi-node test
+harness to prove honest nodes still converge and don't stall payouts — would be reckless. The
+required first step is a **regtest multi-node harness** (≥4 ghost-pool nodes, real mesh, fault
+injection) that can demonstrate: signed shares converge, an honest proposal is ratified, a forged
+`received_by` / dishonest split / divergent ledger is rejected, and a banned equivocator loses its
+vote. The cluster is then implemented against that harness and canaried (VM4 → VM3 → VM2 → VM1)
+exactly like every other consensus deploy.
