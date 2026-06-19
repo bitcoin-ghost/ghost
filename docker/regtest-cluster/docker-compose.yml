@@ -1,0 +1,101 @@
+# Audit-cluster regtest dry-run — 4 real ghost-pool nodes + a regtest ghostd,
+# full mesh, CLUSTER_ENFORCEMENT_HEIGHT gate ON. Run BEFORE any mainnet deploy.
+# See README.md for the runbook; tasks/plan_audit_cluster_deploy.md §3 for why.
+#
+#   cd docker/regtest-cluster && docker compose up -d
+#
+# Build the ghost-pool image WITHOUT --features zk-production (regtest needs no
+# MPC params). The image must contain bash + gettext (envsubst) for the
+# entrypoint — see README §Build.
+
+x-pool-common: &pool-common
+  image: bitcoin-ghost/ghost-pool:regtest
+  entrypoint: ["/usr/bin/env", "bash", "/entrypoint.sh"]
+  restart: "no"
+  depends_on:
+    bitcoind:
+      condition: service_started
+  environment:
+    BITCOIN_RPC_USER: ghost
+    BITCOIN_RPC_PASSWORD: ghostpass
+    # Replace with `bitcoin-cli -regtest getnewaddress` output before `up`:
+    TREASURY_ADDRESS: ${TREASURY_ADDRESS:?set TREASURY_ADDRESS to a regtest bcrt1 address}
+  volumes:
+    - ./pool.template.toml:/etc/ghost/pool.template.toml:ro
+    - ./entrypoint.sh:/entrypoint.sh:ro
+
+services:
+  bitcoind:
+    image: bitcoin-ghost/ghostd:regtest    # the ghost-core fork in regtest mode
+    container_name: rc-bitcoind
+    command:
+      - -regtest
+      - -server=1
+      - -txindex=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=ghost
+      - -rpcpassword=ghostpass
+      - -zmqpubhashblock=tcp://0.0.0.0:28332
+      - -zmqpubhashtx=tcp://0.0.0.0:28333
+      - -fallbackfee=0.0002
+    ports:
+      - "18443:18443"   # RPC (for driving the dry-run from the host)
+
+  pool1:
+    <<: *pool-common
+    container_name: rc-pool1
+    environment:
+      NODE_NAME: pool1
+      SEED_NODES: '"pool2:8559", "pool3:8559", "pool4:8559"'
+      GENESIS_ARG: "--genesis"          # genesis node bootstraps the elder set
+      BITCOIN_RPC_USER: ghost
+      BITCOIN_RPC_PASSWORD: ghostpass
+      TREASURY_ADDRESS: ${TREASURY_ADDRESS}
+    ports:
+      - "8080:8080"
+
+  pool2:
+    <<: *pool-common
+    container_name: rc-pool2
+    depends_on:
+      bitcoind: { condition: service_started }
+      pool1:    { condition: service_started }   # start after genesis (≥60s, see README)
+    environment:
+      NODE_NAME: pool2
+      SEED_NODES: '"pool1:8559", "pool3:8559", "pool4:8559"'
+      BITCOIN_RPC_USER: ghost
+      BITCOIN_RPC_PASSWORD: ghostpass
+      TREASURY_ADDRESS: ${TREASURY_ADDRESS}
+    ports:
+      - "8081:8080"
+
+  pool3:
+    <<: *pool-common
+    container_name: rc-pool3
+    depends_on:
+      bitcoind: { condition: service_started }
+      pool1:    { condition: service_started }
+    environment:
+      NODE_NAME: pool3
+      SEED_NODES: '"pool1:8559", "pool2:8559", "pool4:8559"'
+      BITCOIN_RPC_USER: ghost
+      BITCOIN_RPC_PASSWORD: ghostpass
+      TREASURY_ADDRESS: ${TREASURY_ADDRESS}
+    ports:
+      - "8082:8080"
+
+  pool4:
+    <<: *pool-common
+    container_name: rc-pool4
+    depends_on:
+      bitcoind: { condition: service_started }
+      pool1:    { condition: service_started }
+    environment:
+      NODE_NAME: pool4
+      SEED_NODES: '"pool1:8559", "pool2:8559", "pool3:8559"'
+      BITCOIN_RPC_USER: ghost
+      BITCOIN_RPC_PASSWORD: ghostpass
+      TREASURY_ADDRESS: ${TREASURY_ADDRESS}
+    ports:
+      - "8083:8080"
