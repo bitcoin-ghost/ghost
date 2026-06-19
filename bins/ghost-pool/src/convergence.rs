@@ -49,6 +49,7 @@ pub type ConvergenceSendFn = Arc<dyn Fn(Vec<u8>) -> GhostResult<()> + Send + Syn
 pub struct ConvergenceHandler {
     round_manager: Arc<RoundManager>,
     send: Option<ConvergenceSendFn>,
+    db: Option<Arc<ghost_storage::Database>>,
 }
 
 impl ConvergenceHandler {
@@ -56,12 +57,21 @@ impl ConvergenceHandler {
         Self {
             round_manager,
             send: None,
+            db: None,
         }
     }
 
     /// Attach the mesh broadcast used to reply to requests in production.
     pub fn with_send(mut self, send: ConvergenceSendFn) -> Self {
         self.send = Some(send);
+        self
+    }
+
+    /// Attach the database so backfilled proofs also adopt their signed payout
+    /// address (GHOST-02 / Option A), keeping addresses converged on the
+    /// convergence path as well as the gossip path.
+    pub fn with_db(mut self, db: Arc<ghost_storage::Database>) -> Self {
+        self.db = Some(db);
         self
     }
 
@@ -110,6 +120,12 @@ impl ConvergenceHandler {
             }
             if self.round_manager.handle_share_proof(proof.clone()).is_ok() {
                 applied += 1;
+                // GHOST-02 / Option A: adopt the backfilled proof's signed payout
+                // address (first-writer-wins) so addresses converge here too.
+                if let (Some(db), Some(addr)) = (&self.db, &proof.payout_address) {
+                    let miner_hex = hex::encode(&proof.miner_id[..8]);
+                    let _ = db.adopt_miner_address(&miner_hex, addr);
+                }
             }
         }
         applied

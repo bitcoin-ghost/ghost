@@ -1480,7 +1480,8 @@ async fn main() -> Result<()> {
     };
     let convergence_handler = Arc::new(
         ghost_pool::convergence::ConvergenceHandler::new(Arc::clone(&round_manager))
-            .with_send(conv_send),
+            .with_send(conv_send)
+            .with_db(Arc::clone(&db)),
     );
     mesh.register_handler(Arc::clone(&convergence_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
@@ -3193,6 +3194,34 @@ async fn main() -> Result<()> {
         Arc::clone(&template_processor),
         Arc::clone(&qualification_provider_for_health), // Reuse provider from health_handler
     )?);
+
+    // GHOST-02: install the ledger-recompute validator on the vote handler now
+    // that the PayoutHandler exists. A peer's payout proposal is vote-approved
+    // only if its split matches what THIS node recomputes from its own converged
+    // share ledger (GHOST-03) and converged payout addresses (Option A).
+    {
+        let ph = Arc::clone(&payout_handler);
+        let rm = Arc::clone(&round_manager);
+        let db_for_validator = Arc::clone(&db);
+        let validator: ghost_consensus::vote_handler::ProposalValidateFn =
+            Arc::new(move |proposal: &ghost_common::types::PayoutProposal| {
+                let local_work = rm.get_miner_work_scaled(proposal.round_id);
+                let treasury_state = match db_for_validator.get_treasury_balance() {
+                    Ok(balance) => {
+                        let threshold_ts = db_for_validator
+                            .get_treasury_threshold_reached()
+                            .ok()
+                            .flatten()
+                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                            .map(|dt| dt.with_timezone(&chrono::Utc));
+                        TreasuryState::from_stored(balance, threshold_ts)
+                    }
+                    Err(_) => TreasuryState::new(),
+                };
+                ph.validate_proposal_split(proposal, &local_work, &treasury_state)
+            });
+        vote_handler.set_proposal_validator(validator);
+    }
 
     // Start verification HTTP server
     let rpc_for_verification = Arc::clone(&rpc);

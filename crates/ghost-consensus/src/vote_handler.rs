@@ -535,6 +535,11 @@ pub type ProposalStoreFn = Arc<dyn Fn(PayoutProposal) + Send + Sync>;
 /// Arguments: (revoked_node_id_hex, elder_position, reason)
 pub type RevocationFn = Arc<dyn Fn(&str, u32, &str) -> GhostResult<()> + Send + Sync>;
 
+/// GHOST-02: ledger-recompute validator. Lets the pool layer (which owns the
+/// share ledger + payout maths) gate vote-approval by recomputing the proposal's
+/// split from this node's own converged ledger. Returns `Err(reason)` to reject.
+pub type ProposalValidateFn = Arc<dyn Fn(&PayoutProposal) -> Result<(), String> + Send + Sync>;
+
 /// Rate limit configuration for P2P messages
 ///
 /// Default: 100 messages burst, 20/second sustained per node
@@ -627,6 +632,11 @@ pub struct VoteHandler {
     proposal_store_fn: Option<ProposalStoreFn>,
     /// Callback for executing elder revocation when BFT consensus reaches 67%+
     revocation_fn: Option<RevocationFn>,
+    /// GHOST-02: optional ledger-recompute validator; when set, a proposal must
+    /// also match this node's own recomputed split to be vote-approved. Behind a
+    /// lock so it can be installed after construction (the pool's PayoutHandler
+    /// is built later than the VoteHandler).
+    ledger_validator_fn: RwLock<Option<ProposalValidateFn>>,
     /// Tracked revocation proposals: proposal_hash -> (node_id_hex, reason)
     revocation_proposals: RwLock<HashMap<[u8; 32], (String, String)>>,
 }
@@ -664,6 +674,7 @@ impl VoteHandler {
             known_best_height: RwLock::new(None),
             proposal_store_fn: None,
             revocation_fn: None,
+            ledger_validator_fn: RwLock::new(None),
             revocation_proposals: RwLock::new(HashMap::new()),
         }
     }
@@ -951,6 +962,14 @@ impl VoteHandler {
         self
     }
 
+    /// GHOST-02: install a ledger-recompute validator (after construction, since
+    /// the pool's PayoutHandler is built later). When set, a proposal must pass
+    /// it — the node's own recomputed split — in addition to the internal
+    /// structural checks before this node will vote to approve.
+    pub fn set_proposal_validator(&self, f: ProposalValidateFn) {
+        *self.ledger_validator_fn.write() = Some(f);
+    }
+
     /// Propose revocation of an offline elder.
     /// Creates a deterministic VotingSession, casts our approve vote, and
     /// returns a serialized VoteMessage for broadcast. Returns None if
@@ -1193,6 +1212,19 @@ impl VoteHandler {
                 "Rejecting payout proposal"
             );
             return false;
+        }
+        // GHOST-02: recompute the split against this node's own converged ledger.
+        // An honest proposer's split is reproduced exactly; an inflated/shorted/
+        // fabricated one is not, and is rejected before voting.
+        if let Some(validate) = self.ledger_validator_fn.read().as_ref() {
+            if let Err(reason) = validate(proposal) {
+                warn!(
+                    round_id = proposal.round_id,
+                    reason = %reason,
+                    "GHOST-02: rejecting payout proposal — split does not match local ledger"
+                );
+                return false;
+            }
         }
         true
     }
