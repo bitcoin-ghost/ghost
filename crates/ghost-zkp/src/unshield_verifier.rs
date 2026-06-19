@@ -18,6 +18,7 @@ use crate::unshield_prover::{UnshieldProof, UnshieldPublicInputs};
 pub struct GhostUnshieldVerifier {
     prepared_vk: Option<Arc<PreparedVerifyingKey<Bls12>>>,
     prover_id: [u8; 32],
+    #[cfg_attr(feature = "zk-production", allow(dead_code))]
     accept_all: bool,
 }
 
@@ -41,6 +42,10 @@ impl GhostUnshieldVerifier {
     }
 
     /// Create a test verifier that accepts all proofs unconditionally.
+    /// GHOST-08: the accept-all bypass it sets is compiled out under
+    /// `zk-production`, so in mainnet builds this is inert — real verification
+    /// still runs. Kept available (not cfg-gated) so cross-crate tests compile
+    /// under `--all-features`.
     pub fn test_accept_all() -> Self {
         Self {
             prepared_vk: None,
@@ -57,6 +62,8 @@ impl GhostUnshieldVerifier {
     /// Verify an unshield proof
     #[instrument(skip_all)]
     pub fn verify(&self, proof: &UnshieldProof) -> ZkResult<bool> {
+        // GHOST-08: compiled out under `zk-production` (mainnet always verifies).
+        #[cfg(not(feature = "zk-production"))]
         if self.accept_all {
             return Ok(true);
         }
@@ -114,6 +121,8 @@ impl GhostUnshieldVerifier {
         proof_bytes: &[u8],
         public_inputs: &UnshieldPublicInputs,
     ) -> ZkResult<bool> {
+        // GHOST-08: compiled out under `zk-production` (mainnet always verifies).
+        #[cfg(not(feature = "zk-production"))]
         if self.accept_all {
             return Ok(true);
         }
