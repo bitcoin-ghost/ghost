@@ -117,10 +117,27 @@ Only with every box ticked should the gated rolling deploy (`plan` §4) proceed.
 
 ---
 
-### Status / caveats
-This is a **scaffold** — the compose + configs + runbook are written from the
-config schema and the deploy plan, **not yet run end-to-end here**. Expect to
-tune: the Dockerfile features/COPY for the regtest binary, the exact share-
-submission path (translator vs direct endpoint), and the mesh discovery timing.
-File issues against this directory as you shake it out; the in-process harness
-remains the deterministic source of truth for the consensus *logic*.
+### Status / caveats — partially shaken out 2026-06-20
+The binary side was **validated against the real ghost-pool** in a local 4-process
+regtest run; the config schema here reflects what that surfaced (the docker
+template earlier was stale). Confirmed working: the node **boots, starts the P2P
+mesh, discovers all 3 peers, runs MPC genesis on `--genesis`, serves `/health`
+(healthy), and the gate is active once the chain passes height 100.**
+
+Three issues showed up running 4 nodes on **one host at `127.0.0.1`** — all of
+which this container-per-node layout avoids (each container = its own netns, DNS
+name and `$HOME`):
+1. **Shared identity** — `key_path` isn't honoured for *generation*; a node falls
+   back to `~/.ghost/node.key`, so 4 processes sharing one `$HOME` get the *same*
+   node id. Separate containers each generate their own. (Belt-and-braces: run
+   `--generate-identity` once per node volume before first start.)
+2. **Port 8443 collision** — the verification-HTTPS port is fixed (not in the
+   offsettable p2p set), so 4 same-host processes fight over it. One per container
+   is fine.
+3. **M-11 SSRF** — peer health-checks refuse `127.0.0.1`; with container DNS
+   names (`pool2`, …) or the VMs' public IPs this doesn't trigger.
+
+Still to shake out before sign-off: the Dockerfile regtest build (features/COPY),
+the share-submission path (translator vs direct endpoint), and driving a full
+round to a payout. The in-process harness remains the deterministic source of
+truth for the consensus *logic*; this cluster is for the transport + happy path.

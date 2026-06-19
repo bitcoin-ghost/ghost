@@ -20,6 +20,9 @@ zmq_hashblock = "tcp://bitcoind:28332"
 zmq_hashtx = "tcp://bitcoind:28333"
 
 [network]
+# 32-byte hex consensus signing key (required for mining_mode=PublicPool);
+# the entrypoint generates one per node.
+signing_key = "${SIGNING_KEY}"
 # Container DNS name — peers dial this for the mesh.
 public_address = "${NODE_NAME}"
 # The OTHER three nodes' discovery endpoints (set per-service in compose).
@@ -53,7 +56,9 @@ prune_height = 0
 # A valid REGTEST address (bcrt1…). Replace with one from
 # `bitcoin-cli -regtest getnewaddress`.
 treasury_address = "${TREASURY_ADDRESS}"
+treasury_fee_percent = 1.0
 min_payout_sats = 10000
+payout_interval_blocks = 100
 
 [ghost_pay]
 enabled = false   # L2 is out of scope for the cluster (consensus) dry-run

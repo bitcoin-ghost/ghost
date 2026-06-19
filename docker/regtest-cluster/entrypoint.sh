@@ -10,6 +10,7 @@ set -euo pipefail
 GENESIS_ARG="${GENESIS_ARG:-}"
 
 mkdir -p /var/lib/ghost/data
+export SIGNING_KEY="${SIGNING_KEY:-$(head -c 32 /dev/urandom | xxd -p -c 32)}"
 envsubst < /etc/ghost/pool.template.toml > /etc/ghost/config.toml
 
 echo "[$NODE_NAME] starting ghost-pool (genesis='${GENESIS_ARG}') on regtest"
