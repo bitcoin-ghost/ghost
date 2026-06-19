@@ -3203,8 +3203,8 @@ async fn main() -> Result<()> {
         let ph = Arc::clone(&payout_handler);
         let rm = Arc::clone(&round_manager);
         let db_for_validator = Arc::clone(&db);
-        let validator: ghost_consensus::vote_handler::ProposalValidateFn =
-            Arc::new(move |proposal: &ghost_common::types::PayoutProposal| {
+        let validator: ghost_consensus::vote_handler::ProposalValidateFn = Arc::new(
+            move |proposal: &ghost_common::types::PayoutProposal| {
                 let local_work = rm.get_miner_work_scaled(proposal.round_id);
                 let treasury_state = match db_for_validator.get_treasury_balance() {
                     Ok(balance) => {
@@ -3218,8 +3218,26 @@ async fn main() -> Result<()> {
                     }
                     Err(_) => TreasuryState::new(),
                 };
-                ph.validate_proposal_split(proposal, &local_work, &treasury_state)
-            });
+                let result = ph.validate_proposal_split(proposal, &local_work, &treasury_state);
+                // GATED on CLUSTER_ENFORCEMENT_HEIGHT: pre-activation the fleet's
+                // ledgers/addresses haven't fully converged (old nodes don't sign
+                // or converge), so a recompute mismatch is expected and must NOT
+                // block consensus. We still recompute and log it for visibility,
+                // and only enforce (reject) once the gate fires fleet-wide.
+                if proposal.block_height >= ghost_pool::CLUSTER_ENFORCEMENT_HEIGHT {
+                    result
+                } else {
+                    if let Err(reason) = &result {
+                        tracing::warn!(
+                            reason = %reason,
+                            height = proposal.block_height,
+                            "GHOST-02 (pre-gate): split mismatch — would reject after CLUSTER_ENFORCEMENT_HEIGHT"
+                        );
+                    }
+                    Ok(())
+                }
+            },
+        );
         vote_handler.set_proposal_validator(validator);
     }
 

@@ -53,7 +53,7 @@ struct ClusterNode {
 }
 
 impl ClusterNode {
-    fn new() -> Self {
+    fn new(height: u64) -> Self {
         let identity = Arc::new(NodeIdentity::generate());
         let node_id = identity.node_id();
         let db = Arc::new(Database::in_memory().expect("in-memory db"));
@@ -65,6 +65,10 @@ impl ClusterNode {
         };
         let round_manager = Arc::new(RoundManager::new(node_id, cfg));
         round_manager.set_template_id(TEST_TEMPLATE_ID);
+        // start_round(1) sets the node's current chain height, which drives the
+        // CLUSTER_ENFORCEMENT_HEIGHT gate for GHOST-09 (and creates round 1, the
+        // round all harness shares target).
+        round_manager.start_round(height);
         let share_handler = Arc::new(ShareProofHandler::new(
             Arc::clone(&round_manager),
             Arc::clone(&db),
@@ -103,8 +107,15 @@ pub struct TestMeshCluster {
 }
 
 impl TestMeshCluster {
+    /// Cluster at/above CLUSTER_ENFORCEMENT_HEIGHT — GHOST-09 enforcement ON.
     pub fn new(n: usize) -> Self {
-        let nodes = (0..n).map(|_| ClusterNode::new()).collect();
+        Self::new_at_height(n, ghost_pool::CLUSTER_ENFORCEMENT_HEIGHT)
+    }
+
+    /// Cluster pinned to a specific chain height — to exercise the enforcement
+    /// gate (below the gate height, GHOST-09 enforcement is OFF for rollout safety).
+    pub fn new_at_height(n: usize, height: u64) -> Self {
+        let nodes = (0..n).map(|_| ClusterNode::new(height)).collect();
         Self {
             nodes,
             connected: vec![vec![true; n]; n],
@@ -347,5 +358,22 @@ async fn ghost03_convergence_rejects_forged_backfill() {
     assert!(
         !cluster.node_ledger_has(1, 1, diff1_share_hash(6)),
         "the forged share never enters node 1's ledger"
+    );
+}
+
+/// Cluster enforcement gate: BELOW `CLUSTER_ENFORCEMENT_HEIGHT`, GHOST-09
+/// enforcement is OFF (rollout safety) — an unsigned share from a not-yet-
+/// upgraded node is still accepted, so a mixed-version mesh keeps converging.
+/// At/above the gate (the default cluster) that same unsigned share is dropped —
+/// see `ghost09_unsigned_share_is_dropped_clusterwide`.
+#[tokio::test]
+async fn cluster_gate_pre_activation_accepts_unsigned_shares() {
+    let cluster = TestMeshCluster::new_at_height(4, ghost_pool::CLUSTER_ENFORCEMENT_HEIGHT - 1);
+    let miner = [0xE7; 32];
+    cluster.gossip_unsigned_share(0, miner, 7).await;
+    assert_eq!(
+        cluster.peers_with_share(0, miner),
+        3,
+        "pre-activation an unsigned share is accepted, so a mixed-version mesh keeps converging"
     );
 }
