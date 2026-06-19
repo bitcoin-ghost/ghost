@@ -481,6 +481,70 @@ fn build_test_transaction() -> Option<String> {
     Some(serialize_hex(&tx))
 }
 
+/// GHOST-01: Build a randomized DIRTY (data-carrier) transaction for the policy
+/// NEGATIVE CONTROL.
+///
+/// The positive challenge ([`build_test_transaction`]) only checks a node can
+/// recognise a clean T0 tx — which a node that filters NOTHING (classifies
+/// everything as T0) trivially passes, so the +2 "Reaper / BitcoinPure"
+/// capability proved nothing about actual filtering. This builds a transaction
+/// carrying a 100-byte OP_RETURN payload (well above the 83-byte data-carrier
+/// limit), which any honest BitcoinPure/Reaper node must classify as non-T0 and
+/// REFUSE to accept (`accepted = false`). A node that misclassifies it as T0,
+/// or accepts it (e.g. a `full_open` profile), fails the negative control and
+/// does not qualify for the capability.
+///
+/// Returns `None` (fail closed) if cryptographic randomness is unavailable.
+fn build_dirty_test_transaction() -> Option<String> {
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::locktime::absolute::LockTime;
+    use bitcoin::script::{Builder, PushBytesBuf, ScriptBuf};
+    use bitcoin::transaction::{Transaction, Version};
+    use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Txid, Witness};
+
+    let mut rng_bytes = [0u8; 128];
+    if getrandom::getrandom(&mut rng_bytes).is_err() {
+        warn!("M-12: Failed to get randomness, skipping policy negative control (fail closed)");
+        return None;
+    }
+    let txid = Txid::from_raw_hash(sha256d::Hash::hash(&rng_bytes[..32]));
+
+    // 100 random bytes of OP_RETURN data — unambiguously a data carrier.
+    let payload = PushBytesBuf::try_from(rng_bytes[28..128].to_vec()).ok()?;
+    let op_return = Builder::new()
+        .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+        .push_slice(&payload)
+        .into_script();
+
+    // A normal P2WPKH output keeps the tx otherwise well-formed.
+    let mut pkh = [0u8; 20];
+    pkh.copy_from_slice(&rng_bytes[8..28]);
+    let p2wpkh = Builder::new().push_int(0).push_slice(pkh).into_script();
+
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: p2wpkh,
+            },
+            TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: op_return,
+            },
+        ],
+    };
+    Some(serialize_hex(&tx))
+}
+
 /// LOW-VER-3: Per-target challenge tracker for rate limiting
 /// Tracks recent challenges to ensure even distribution across targets
 struct ChallengeTracker {
@@ -1404,9 +1468,22 @@ impl VerificationTask {
         our_id_hex: &str,
         timestamp: i64,
     ) -> Result<(), String> {
-        // M-12 FIX: Build valid T0 transaction for policy classification challenge
-        // Fail closed if cryptographic randomness unavailable
-        let test_tx_hex = match build_test_transaction() {
+        // GHOST-01: randomly send a clean T0 tx OR a dirty data-carrier tx
+        // (negative control). A node qualifies for Reaper/BitcoinPure only if it
+        // both classifies clean txs as exactly T0 AND classifies the dirty tx as
+        // non-T0 and refuses it — i.e. proves it actually filters spam, not just
+        // that it can recognise a clean tx (which a no-op classifier passes).
+        let dirty = {
+            let mut b = [0u8; 1];
+            getrandom::getrandom(&mut b).ok();
+            b[0] & 1 == 1
+        };
+        let built = if dirty {
+            build_dirty_test_transaction()
+        } else {
+            build_test_transaction()
+        };
+        let test_tx_hex = match built {
             Some(tx) => tx,
             None => {
                 warn!(
@@ -1416,11 +1493,17 @@ impl VerificationTask {
                 return Ok(());
             }
         };
-        debug!(tx_hex_len = test_tx_hex.len(), tx_hex_prefix = %&test_tx_hex[..40.min(test_tx_hex.len())], "Built test transaction");
+        let expected_tier = if dirty { "non-T0" } else { "T0" };
+        debug!(
+            dirty,
+            tx_hex_len = test_tx_hex.len(),
+            expected_tier,
+            "Built policy challenge transaction"
+        );
 
         let challenge_data = serde_json::json!({
-            "tx_type": "T0",
-            "expected_tier": "T0",
+            "tx_type": if dirty { "dirty" } else { "T0" },
+            "expected_tier": expected_tier,
         })
         .to_string();
 
@@ -1431,17 +1514,17 @@ impl VerificationTask {
 
         let (passed, tier, response_data) = match result {
             Ok(resp) => {
-                // MED-VER-2: Require EXACT tier match for policy verification
-                // Success if:
-                // 1. Response parsed successfully (success=true)
-                // 2. Classification exists and is EXACTLY T0 (our test transaction is T0)
-                // Previously accepted T0 OR T1, allowing nodes to misclassify simple txs
                 let tier = resp.classification.as_ref().map(|c| c.tier.clone());
-                let tier_ok = tier
-                    .as_ref()
-                    .map(|t| t == "T0") // MED-VER-2: EXACTLY T0, not T0 OR T1
-                    .unwrap_or(false);
-                let passed = resp.success && tier_ok;
+                let passed = if dirty {
+                    // GHOST-01 negative control: a real filtering node classifies
+                    // the data-carrier tx as non-T0 AND does not accept it.
+                    let non_t0 = tier.as_ref().map(|t| t != "T0").unwrap_or(false);
+                    resp.success && non_t0 && !resp.accepted
+                } else {
+                    // MED-VER-2: clean tx must classify EXACTLY T0 (not T0 OR T1).
+                    let tier_ok = tier.as_ref().map(|t| t == "T0").unwrap_or(false);
+                    resp.success && tier_ok
+                };
 
                 (
                     passed,
@@ -2227,5 +2310,55 @@ mod tests {
             result.unwrap_err().contains("too old"),
             "Error should mention old timestamp"
         );
+    }
+
+    /// GHOST-01: the negative-control dirty tx must be classified non-T0 AND
+    /// rejected by a real BitcoinPure policy engine, and the clean tx accepted
+    /// as T0 — against the SAME `ghost_policy` engine the verifier target uses.
+    /// This is what makes the +2 Reaper/BitcoinPure capability prove actual
+    /// filtering instead of merely recognising a clean tx.
+    #[test]
+    fn test_policy_negative_control_against_real_classifier() {
+        use ghost_policy::{PolicyDecision, PolicyEngine};
+
+        let decode = |hex_str: &str| -> bitcoin::Transaction {
+            let bytes = hex::decode(hex_str).expect("valid hex");
+            bitcoin::consensus::deserialize(&bytes).expect("valid tx")
+        };
+
+        // Dirty (data-carrier) tx → must be REJECTED and classified non-T0.
+        let dirty_hex = build_dirty_test_transaction().expect("rng available");
+        let dirty_tx = decode(&dirty_hex);
+        let mut engine = PolicyEngine::bitcoin_pure();
+        match engine.evaluate(&dirty_tx) {
+            PolicyDecision::Reject { classification, .. } => {
+                assert_ne!(
+                    classification.tier.to_string(),
+                    "T0",
+                    "data-carrier tx must not be tier T0"
+                );
+            }
+            PolicyDecision::Accept { classification, .. } => panic!(
+                "BitcoinPure accepted a 100-byte OP_RETURN data carrier (tier {}) — negative control broken",
+                classification.tier
+            ),
+        }
+
+        // Clean tx → must be ACCEPTED and classified exactly T0.
+        let clean_hex = build_test_transaction().expect("rng available");
+        let clean_tx = decode(&clean_hex);
+        let mut engine = PolicyEngine::bitcoin_pure();
+        match engine.evaluate(&clean_tx) {
+            PolicyDecision::Accept { classification, .. } => {
+                assert_eq!(
+                    classification.tier.to_string(),
+                    "T0",
+                    "clean financial tx must classify as T0"
+                );
+            }
+            PolicyDecision::Reject { reason, .. } => {
+                panic!("BitcoinPure rejected a clean T0 tx: {reason}")
+            }
+        }
     }
 }
