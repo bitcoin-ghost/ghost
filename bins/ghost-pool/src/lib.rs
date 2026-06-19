@@ -72,6 +72,9 @@ pub mod treasury;
 /// P2P share proof handling for cross-node share propagation.
 pub mod share_handler;
 
+/// GHOST-03: ledger convergence (share-set reconciliation) between mesh nodes.
+pub mod convergence;
+
 /// GhostGlyph P2P handler for visual identity registration.
 pub mod glyph_handler;
 

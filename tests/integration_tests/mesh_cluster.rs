@@ -20,7 +20,10 @@ use chrono::Utc;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::types::{NodeId, ShareProof};
 use ghost_consensus::mesh::MessageHandler;
-use ghost_consensus::message::{MessageEnvelope, MessageType, ShareProofMessage};
+use ghost_consensus::message::{
+    MessageEnvelope, MessageType, ShareConvergenceResponse, ShareProofMessage,
+};
+use ghost_pool::convergence::ConvergenceHandler;
 use ghost_pool::round::{RoundConfig, RoundManager};
 use ghost_pool::share_handler::ShareProofHandler;
 use ghost_storage::Database;
@@ -80,6 +83,15 @@ impl ClusterNode {
     fn has_recorded_miner(&self, miner_id: [u8; 32]) -> bool {
         let hex = hex::encode(&miner_id[..8]);
         self.db.get_miner_stats(&hex).ok().flatten().is_some()
+    }
+
+    /// True once this node's share LEDGER (the `RoundManager`, the consensus-
+    /// relevant state) holds `share_hash` for `round_id`. Set by both gossip and
+    /// GHOST-03 convergence backfill.
+    fn ledger_has(&self, round_id: u64, share_hash: [u8; 32]) -> bool {
+        self.round_manager
+            .round_share_hashes(round_id)
+            .contains(&share_hash)
     }
 }
 
@@ -187,6 +199,36 @@ impl TestMeshCluster {
     fn peer_has_share(&self, peer: usize, miner_id: [u8; 32]) -> bool {
         self.nodes[peer].has_recorded_miner(miner_id)
     }
+
+    /// True if `node`'s share ledger holds `share_hash` for `round_id`.
+    fn node_ledger_has(&self, node: usize, round_id: u64, share_hash: [u8; 32]) -> bool {
+        self.nodes[node].ledger_has(round_id, share_hash)
+    }
+
+    /// GHOST-03: run a convergence exchange — `requester` advertises the shares
+    /// it holds for `round_id`, `responder` replies with the signed proofs the
+    /// requester is missing, and the requester applies them. Returns the number
+    /// of shares backfilled.
+    pub fn converge(&self, requester: usize, responder: usize, round_id: u64) -> usize {
+        let req = ConvergenceHandler::new(Arc::clone(&self.nodes[requester].round_manager));
+        let resp = ConvergenceHandler::new(Arc::clone(&self.nodes[responder].round_manager));
+        let request = req.build_request(round_id);
+        let response = resp.handle_request(&request);
+        req.apply_response(&response)
+    }
+
+    /// Feed `node` a single proof as if it arrived in a convergence response
+    /// (used to prove forged backfills are rejected). Returns the number applied.
+    pub fn apply_backfill(&self, node: usize, proof: ShareProof) -> usize {
+        let handler = ConvergenceHandler::new(Arc::clone(&self.nodes[node].round_manager));
+        let resp = ShareConvergenceResponse {
+            round_id: proof.round_id,
+            share_count: 1,
+            total_work: proof.work,
+            missing_shares: vec![proof],
+        };
+        handler.apply_response(&resp)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,5 +291,61 @@ async fn partition_blocks_delivery_to_severed_node() {
     assert!(
         !cluster.peer_has_share(2, miner),
         "node 2 is partitioned from node 0 and must not receive the share"
+    );
+}
+
+/// GHOST-03: a node that missed a gossiped share (partition) reconciles its
+/// share ledger with a peer that has it, and backfills the exact signed proof.
+#[tokio::test]
+async fn ghost03_convergence_backfills_partitioned_node() {
+    let mut cluster = TestMeshCluster::new(4);
+    cluster.partition(0, 2); // node 2 will miss node 0's broadcast
+    let miner = [0xE5; 32];
+    let nonce = 5;
+    let share_hash = diff1_share_hash(nonce);
+
+    cluster.gossip_honest_share(0, miner, nonce).await;
+
+    // Precondition: a connected peer holds it; the partitioned node does not.
+    assert!(
+        cluster.node_ledger_has(1, 1, share_hash),
+        "connected peer 1 holds the share in its ledger"
+    );
+    assert!(
+        !cluster.node_ledger_has(2, 1, share_hash),
+        "partitioned node 2 is missing the share before convergence"
+    );
+
+    // GHOST-03: node 2 converges with node 1 → backfills exactly the missing share.
+    let applied = cluster.converge(2, 1, 1);
+    assert_eq!(
+        applied, 1,
+        "convergence backfills exactly the one missing share"
+    );
+    assert!(
+        cluster.node_ledger_has(2, 1, share_hash),
+        "node 2's ledger contains the share after convergence"
+    );
+}
+
+/// GHOST-03 safety: convergence cannot smuggle in a forged share. A response
+/// carrying a proof whose `received_by` signature is invalid is rejected by
+/// `apply_response` (GHOST-09 re-checked on the backfill path), not applied.
+#[tokio::test]
+async fn ghost03_convergence_rejects_forged_backfill() {
+    let cluster = TestMeshCluster::new(2);
+    let attacker = NodeIdentity::generate();
+    // Proof claims node 0's received_by but is signed by an unrelated key.
+    let mut proof = cluster.base_proof(0, [0xF6; 32], 6);
+    proof.sign(&attacker);
+
+    let applied = cluster.apply_backfill(1, proof);
+    assert_eq!(
+        applied, 0,
+        "a forged backfilled proof must be rejected by convergence (GHOST-09)"
+    );
+    assert!(
+        !cluster.node_ledger_has(1, 1, diff1_share_hash(6)),
+        "the forged share never enters node 1's ledger"
     );
 }

@@ -293,6 +293,11 @@ pub struct RoundManager {
     /// Persisting to database would add latency to every share submission
     /// without meaningful security benefit given the round-scoped design.
     submitted_shares: RwLock<HashMap<RoundId, std::collections::HashSet<[u8; 32]>>>,
+    /// GHOST-03: full signed proofs for retained rounds, keyed by round then
+    /// share hash. Kept so a node that missed a gossiped share (drop/partition)
+    /// can be served the exact signed proof during ledger convergence. Pruned
+    /// with the round, exactly like `submitted_shares`.
+    recent_proofs: RwLock<HashMap<RoundId, HashMap<[u8; 32], ShareProof>>>,
     /// Per-miner rate limiting (H6 security fix)
     miner_rate_limits: RwLock<HashMap<String, MinerRateLimitEntry>>,
     /// L-7: Per-miner cumulative tolerance tracking per round
@@ -331,6 +336,7 @@ impl RoundManager {
             event_tx,
             our_node_id,
             submitted_shares: RwLock::new(HashMap::new()),
+            recent_proofs: RwLock::new(HashMap::new()),
             miner_rate_limits: RwLock::new(HashMap::new()),
             miner_tolerance_tracker: RwLock::new(HashMap::new()),
             cross_round_tolerance: RwLock::new(CrossRoundToleranceTracker::default()),
@@ -388,9 +394,11 @@ impl RoundManager {
         {
             let mut submitted = self.submitted_shares.write();
             let mut tolerance = self.miner_tolerance_tracker.write();
+            let mut proofs = self.recent_proofs.write();
             for old_round in to_remove {
                 submitted.remove(&old_round);
                 tolerance.remove(&old_round);
+                proofs.remove(&old_round); // GHOST-03: prune retained proofs too
             }
         }
 
@@ -706,6 +714,14 @@ impl RoundManager {
             cross_round.record_round_participation(&miner_id);
         }
 
+        // GHOST-03: retain the full signed proof so it can be re-served to a peer
+        // that missed it (drop/partition) during ledger convergence.
+        self.recent_proofs
+            .write()
+            .entry(proof.round_id)
+            .or_default()
+            .insert(proof.share_hash, proof.clone());
+
         debug!(
             round_id = proof.round_id,
             miner = %miner_id,
@@ -715,6 +731,42 @@ impl RoundManager {
         );
 
         Ok(())
+    }
+
+    /// GHOST-03: the share hashes this node currently holds for `round_id`.
+    pub fn round_share_hashes(&self, round_id: RoundId) -> Vec<[u8; 32]> {
+        self.recent_proofs
+            .read()
+            .get(&round_id)
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// GHOST-03: (share_count, total_work) this node holds for `round_id`.
+    pub fn round_share_summary(&self, round_id: RoundId) -> (u64, f64) {
+        match self.recent_proofs.read().get(&round_id) {
+            Some(m) => (m.len() as u64, m.values().map(|p| p.work).sum()),
+            None => (0, 0.0),
+        }
+    }
+
+    /// GHOST-03: full signed proofs this node holds for `round_id` that are NOT
+    /// in `their_hashes` — i.e. exactly the shares a converging peer is missing.
+    pub fn proofs_missing_from(
+        &self,
+        round_id: RoundId,
+        their_hashes: &std::collections::HashSet<[u8; 32]>,
+    ) -> Vec<ShareProof> {
+        self.recent_proofs
+            .read()
+            .get(&round_id)
+            .map(|m| {
+                m.iter()
+                    .filter(|(h, _)| !their_hashes.contains(*h))
+                    .map(|(_, p)| p.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Register a node's capabilities
