@@ -3482,7 +3482,7 @@ async fn main() -> Result<()> {
             share_hash_bytes[..len].copy_from_slice(&decoded[..len]);
         }
 
-        let proof = ghost_common::types::ShareProof {
+        let mut proof = ghost_common::types::ShareProof {
             round_id,
             miner_id: miner_hash,
             difficulty: share.work,
@@ -3492,7 +3492,11 @@ async fn main() -> Result<()> {
             received_by: identity_for_shares.node_id(),
             template_id: rm_for_shares.current_template_id(),
             payout_address: share.payout_address.clone(),
+            signature: None,
         };
+        // GHOST-09: sign as the receiving node so peers can authenticate the
+        // node-reward credit and reject relayed/forged `received_by`.
+        proof.sign(identity_for_shares.as_ref());
 
         if let Err(e) = share_broadcast_tx.try_send(proof) {
             tracing::warn!(error = %e, "Share broadcast channel full or closed");

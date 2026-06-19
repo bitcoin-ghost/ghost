@@ -260,6 +260,56 @@ pub struct ShareProof {
     /// Payout address for the miner (needed by remote nodes that haven't seen this miner)
     #[serde(default)]
     pub payout_address: Option<String>,
+    /// GHOST-09: ed25519 signature by `received_by` over [`ShareProof::signing_bytes`].
+    /// Authenticates the node-reward credit recipient so a relayed proof can't be
+    /// re-credited to a different node. `None` on pre-GHOST-09 proofs, which fail
+    /// verification (secure by default). Stored as bytes for serde simplicity.
+    #[serde(default)]
+    pub signature: Option<Vec<u8>>,
+}
+
+impl ShareProof {
+    /// GHOST-09: canonical bytes the `received_by` node signs. Binds every
+    /// credit-relevant field, so a relay that mutates `received_by` (or the
+    /// share being credited) invalidates the signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut m = Vec::with_capacity(120);
+        m.extend_from_slice(&self.round_id.to_le_bytes());
+        m.extend_from_slice(&self.miner_id);
+        m.extend_from_slice(&self.work.to_le_bytes());
+        m.extend_from_slice(&self.share_hash);
+        m.extend_from_slice(&self.timestamp.to_le_bytes());
+        m.extend_from_slice(&self.received_by);
+        if let Some(ref t) = self.template_id {
+            m.extend_from_slice(t);
+        }
+        m
+    }
+
+    /// GHOST-09: sign this proof as the receiving node. `received_by` must equal
+    /// `identity.node_id()` for the signature to verify on the receive side.
+    pub fn sign(&mut self, identity: &crate::identity::NodeIdentity) {
+        self.signature = Some(identity.sign(&self.signing_bytes()).to_vec());
+    }
+
+    /// GHOST-09: consume-and-sign convenience (builder/test ergonomics).
+    pub fn signed(mut self, identity: &crate::identity::NodeIdentity) -> Self {
+        self.sign(identity);
+        self
+    }
+
+    /// GHOST-09: true iff the proof carries a valid signature by `received_by`.
+    /// Unsigned (`None`) or malformed signatures return false — secure by default.
+    pub fn has_valid_received_by_signature(&self) -> bool {
+        let Some(ref sig) = self.signature else {
+            return false;
+        };
+        let Ok(sig) = <[u8; 64]>::try_from(sig.as_slice()) else {
+            return false;
+        };
+        crate::identity::verify_signature(&self.received_by, &self.signing_bytes(), &sig)
+            .unwrap_or(false)
+    }
 }
 
 /// Payout proposal for consensus
@@ -890,5 +940,67 @@ mod tests {
         assert_eq!(back.local_hashrate_th, 0.0);
         assert_eq!(back.active_miner_id_hashes.len(), 2);
         assert_eq!(back.miner_count, 2);
+    }
+
+    // ---- GHOST-09: ShareProof received_by authentication ----
+
+    fn ghost09_base_proof(received_by: NodeId) -> ShareProof {
+        ShareProof {
+            round_id: 7,
+            miner_id: [9u8; 32],
+            difficulty: 1000.0,
+            work: 1000.0,
+            share_hash: [3u8; 32],
+            timestamp: 1_700_000_000,
+            received_by,
+            template_id: Some([4u8; 32]),
+            payout_address: None,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn ghost09_honest_signed_proof_verifies() {
+        let node = crate::identity::NodeIdentity::generate();
+        let proof = ghost09_base_proof(node.node_id()).signed(&node);
+        assert!(proof.has_valid_received_by_signature());
+    }
+
+    #[test]
+    fn ghost09_unsigned_proof_rejected() {
+        let node = crate::identity::NodeIdentity::generate();
+        let proof = ghost09_base_proof(node.node_id()); // signature: None
+        assert!(
+            !proof.has_valid_received_by_signature(),
+            "an unsigned proof must not authenticate (secure by default)"
+        );
+    }
+
+    #[test]
+    fn ghost09_forged_received_by_rejected() {
+        // Attacker signs with their OWN key but claims received_by = victim to
+        // steal the victim's node-reward credit.
+        let attacker = crate::identity::NodeIdentity::generate();
+        let victim = crate::identity::NodeIdentity::generate();
+        let mut proof = ghost09_base_proof(victim.node_id());
+        proof.sign(&attacker);
+        assert!(
+            !proof.has_valid_received_by_signature(),
+            "an attacker cannot sign as the victim received_by"
+        );
+    }
+
+    #[test]
+    fn ghost09_relay_mutating_received_by_invalidates_signature() {
+        // A relay re-credits a valid proof to itself in flight.
+        let origin = crate::identity::NodeIdentity::generate();
+        let relay = crate::identity::NodeIdentity::generate();
+        let mut proof = ghost09_base_proof(origin.node_id()).signed(&origin);
+        assert!(proof.has_valid_received_by_signature());
+        proof.received_by = relay.node_id();
+        assert!(
+            !proof.has_valid_received_by_signature(),
+            "mutating received_by must break the origin's signature"
+        );
     }
 }
