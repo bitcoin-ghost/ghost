@@ -18,7 +18,9 @@ use crate::types::GROTH16_PROOF_SIZE;
 pub struct GhostNoteVerifier {
     prepared_vk: Option<Arc<PreparedVerifyingKey<Bls12>>>,
     prover_id: [u8; 32],
-    /// Accept all proofs unconditionally (for external crate tests only)
+    /// Accept all proofs unconditionally (for external crate tests only).
+    /// GHOST-08: never read under `zk-production` — the bypass is compiled out.
+    #[cfg_attr(feature = "zk-production", allow(dead_code))]
     accept_all: bool,
 }
 
@@ -43,6 +45,8 @@ impl GhostNoteVerifier {
 
     /// Create a test verifier that accepts all proofs unconditionally.
     /// For use in external crate tests where `#[cfg(test)]` doesn't propagate.
+    /// GHOST-08: unavailable under `zk-production` (mainnet) builds.
+    #[cfg(not(feature = "zk-production"))]
     pub fn test_accept_all() -> Self {
         Self {
             prepared_vk: None,
@@ -59,7 +63,10 @@ impl GhostNoteVerifier {
     /// Verify a note spend proof
     #[instrument(skip_all)]
     pub fn verify(&self, proof: &GhostNoteSpendProof) -> ZkResult<bool> {
-        // Test mode: accept all proofs unconditionally (for cross-crate tests)
+        // GHOST-08: the accept-all test bypass is compiled out under
+        // `zk-production`, so a mainnet build always runs real verification
+        // regardless of how the verifier was constructed.
+        #[cfg(not(feature = "zk-production"))]
         if self.accept_all {
             return Ok(true);
         }
@@ -119,7 +126,10 @@ impl GhostNoteVerifier {
         proof_bytes: &[u8],
         public_inputs: &GhostNoteSpendPublicInputs,
     ) -> ZkResult<bool> {
-        // Test mode: accept all proofs unconditionally (for cross-crate tests)
+        // GHOST-08: the accept-all test bypass is compiled out under
+        // `zk-production`, so a mainnet build always runs real verification
+        // regardless of how the verifier was constructed.
+        #[cfg(not(feature = "zk-production"))]
         if self.accept_all {
             return Ok(true);
         }

@@ -19,6 +19,7 @@ use crate::types::GROTH16_PROOF_SIZE;
 pub struct GhostConsolidateVerifier {
     prepared_vk: Option<Arc<PreparedVerifyingKey<Bls12>>>,
     prover_id: [u8; 32],
+    #[cfg_attr(feature = "zk-production", allow(dead_code))]
     accept_all: bool,
 }
 
@@ -42,6 +43,8 @@ impl GhostConsolidateVerifier {
     }
 
     /// Create a test verifier that accepts all proofs unconditionally.
+    /// GHOST-08: unavailable under `zk-production` (mainnet) builds.
+    #[cfg(not(feature = "zk-production"))]
     pub fn test_accept_all() -> Self {
         Self {
             prepared_vk: None,
@@ -58,6 +61,8 @@ impl GhostConsolidateVerifier {
     /// Verify a consolidation proof
     #[instrument(skip_all)]
     pub fn verify(&self, proof: &ConsolidationProof) -> ZkResult<bool> {
+        // GHOST-08: compiled out under `zk-production` (mainnet always verifies).
+        #[cfg(not(feature = "zk-production"))]
         if self.accept_all {
             return Ok(true);
         }
@@ -115,6 +120,8 @@ impl GhostConsolidateVerifier {
         proof_bytes: &[u8],
         public_inputs: &ConsolidationPublicInputs,
     ) -> ZkResult<bool> {
+        // GHOST-08: compiled out under `zk-production` (mainnet always verifies).
+        #[cfg(not(feature = "zk-production"))]
         if self.accept_all {
             return Ok(true);
         }
