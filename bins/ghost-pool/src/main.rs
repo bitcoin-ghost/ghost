@@ -1229,6 +1229,39 @@ async fn main() -> Result<()> {
     let ban_manager = Arc::new(BanManager::new());
     info!("Shared BanManager created for cross-handler ban enforcement");
 
+    // GHOST-11: re-apply equivocation bans persisted before this restart, so a
+    // restart doesn't silently un-ban an equivocator that is still inside its
+    // ban window. (Bans are otherwise in-memory only.)
+    {
+        const EQUIVOCATION_BAN_WINDOW_SECS: i64 = 600;
+        let now = chrono::Utc::now().timestamp();
+        match db.get_recent_equivocators(now - EQUIVOCATION_BAN_WINDOW_SECS) {
+            Ok(equivocators) => {
+                let mut restored = 0usize;
+                for (node_id, detected_at) in equivocators {
+                    let remaining = (detected_at + EQUIVOCATION_BAN_WINDOW_SECS) - now;
+                    if remaining > 0 {
+                        ban_manager.ban_for_duration(
+                            node_id,
+                            ghost_consensus::ban_manager::BanReason::Equivocation,
+                            std::time::Duration::from_secs(remaining as u64),
+                        );
+                        restored += 1;
+                    }
+                }
+                if restored > 0 {
+                    info!(
+                        restored,
+                        "GHOST-11: re-applied persisted equivocation bans on startup"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "GHOST-11: failed to load persisted equivocation bans")
+            }
+        }
+    }
+
     // Create vote handler with callbacks and shared ban manager
     // 4.5 SECURITY: Rate limiter persistence is now enabled by default to prevent
     // attackers from bypassing rate limits by triggering node restarts.

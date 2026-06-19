@@ -5570,6 +5570,38 @@ impl Database {
         })
     }
 
+    /// GHOST-11: distinct equivocators with a proof detected at/after
+    /// `since_unix`, and their latest detection time. Used to re-apply
+    /// equivocation bans on startup — bans are otherwise in-memory and silently
+    /// lost on restart, letting an equivocator vote again within its ban window.
+    pub fn get_recent_equivocators(&self, since_unix: i64) -> GhostResult<Vec<([u8; 32], i64)>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT node_id, MAX(detected_at) FROM equivocation_proofs
+                     WHERE detected_at >= ?1 GROUP BY node_id",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_unix], |row| {
+                    let blob: Vec<u8> = row.get(0)?;
+                    let detected: i64 = row.get(1)?;
+                    Ok((blob, detected))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (blob, detected) = r.map_err(|e| GhostError::Database(e.to_string()))?;
+                if blob.len() == 32 {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(&blob);
+                    out.push((id, detected));
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Get equivocation proofs for a node
     ///
     /// Returns all stored equivocation proofs for forensic analysis.

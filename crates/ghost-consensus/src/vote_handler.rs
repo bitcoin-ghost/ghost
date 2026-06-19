@@ -47,7 +47,10 @@ use crate::mesh::MessageHandler;
 use crate::message::{
     EquivocationProofMessage, MessageEnvelope, MessageType, PayoutProposalMessage, VoteMessage,
 };
-use crate::voting::{compute_vote_signing_message, Vote, VoteResult, VotingManager, VotingSession};
+use crate::voting::{
+    compute_vote_signing_message, Vote, VoteEquivocationProof, VoteResult, VotingManager,
+    VotingSession,
+};
 
 /// Rate limiter for P2P messages to prevent DoS attacks
 ///
@@ -853,6 +856,50 @@ impl VoteHandler {
             .invalidate_voter_in_all_sessions(&node_id);
     }
 
+    /// GHOST-11: process a peer's equivocation proof. The two conflicting votes
+    /// are verified INDEPENDENTLY (both signed by the named equivocator over the
+    /// same round+proposal, with opposite decisions) — so a malicious reporter
+    /// cannot frame an honest node. On success the equivocator is banned here
+    /// too, so a node banned on one mesh member becomes banned on all of them.
+    fn handle_equivocation_proof(&self, msg: EquivocationProofMessage) {
+        if msg.equivocator == self.identity.node_id() {
+            return; // ignore reports against ourselves
+        }
+        if self.is_banned(&msg.equivocator) {
+            return; // already banned — nothing to do
+        }
+        let (Ok(vote1), Ok(vote2)) = (
+            serde_json::from_slice::<Vote>(&msg.vote1_data),
+            serde_json::from_slice::<Vote>(&msg.vote2_data),
+        ) else {
+            return; // malformed vote payloads
+        };
+        if vote1.voter != msg.equivocator || vote2.voter != msg.equivocator {
+            return; // votes are not from the named equivocator
+        }
+        let proof = VoteEquivocationProof {
+            voter: msg.equivocator,
+            round_id: msg.round_id,
+            proposal_hash: msg.proposal_hash,
+            vote1,
+            vote2,
+            detected_at: msg.timestamp,
+        };
+        if !proof.verify() {
+            warn!(
+                equivocator = %hex::encode(&msg.equivocator[..8]),
+                "GHOST-11: rejecting unverifiable equivocation proof from peer"
+            );
+            return;
+        }
+        warn!(
+            equivocator = %hex::encode(&msg.equivocator[..8]),
+            round_id = msg.round_id,
+            "GHOST-11: banning node on a peer-propagated, independently-verified equivocation"
+        );
+        self.ban_node(msg.equivocator);
+    }
+
     /// Check if a node is currently banned
     ///
     /// Checks shared BanManager if available (C1 fix), otherwise local tracking.
@@ -1517,6 +1564,7 @@ impl VoteHandler {
                         let mut proof_msg = EquivocationProofMessage::new(
                             sender,
                             vote_msg.round_id,
+                            proof.proposal_hash,
                             "payout_vote".to_string(),
                             vote1_data,
                             vote2_data,
@@ -1749,6 +1797,14 @@ impl MessageHandler for VoteHandler {
                     .map_err(|e| ghost_common::error::GhostError::Serialization(e.to_string()))?;
 
                 self.handle_proposal(proposal_msg.proposal)?;
+            }
+
+            MessageType::EquivocationProof => {
+                // GHOST-11: a peer reports an equivocation. Verify it
+                // independently and, if valid, ban the equivocator here too.
+                let msg: EquivocationProofMessage = serde_json::from_slice(&envelope.payload)
+                    .map_err(|e| ghost_common::error::GhostError::Serialization(e.to_string()))?;
+                self.handle_equivocation_proof(msg);
             }
 
             _ => {
@@ -2303,6 +2359,81 @@ mod tests {
             restored.bucket_count(),
             3,
             "from_persisted should restore all persisted buckets"
+        );
+    }
+
+    /// GHOST-11: a peer's independently-verifiable equivocation proof bans the
+    /// equivocator here too — cross-node ban propagation.
+    #[test]
+    fn ghost11_verified_equivocation_proof_bans_node() {
+        let handler = VoteHandler::new(
+            Arc::new(NodeIdentity::generate()),
+            Arc::new(VotingManager::new(100)),
+        );
+        let equivocator = NodeIdentity::generate();
+        let round_id = 1u64;
+        let proposal_hash = [9u8; 32];
+        let sign_vote = |approve: bool| -> Vote {
+            let m = compute_vote_signing_message(
+                round_id,
+                &proposal_hash,
+                &equivocator.node_id(),
+                approve,
+            );
+            Vote::new(equivocator.node_id(), approve, equivocator.sign(&m))
+        };
+
+        let msg = EquivocationProofMessage::new(
+            equivocator.node_id(),
+            round_id,
+            proposal_hash,
+            "payout_vote".to_string(),
+            serde_json::to_vec(&sign_vote(true)).unwrap(),
+            serde_json::to_vec(&sign_vote(false)).unwrap(),
+            NodeIdentity::generate().node_id(),
+        );
+
+        assert!(!handler.is_banned(&equivocator.node_id()));
+        handler.handle_equivocation_proof(msg);
+        assert!(
+            handler.is_banned(&equivocator.node_id()),
+            "a verified equivocation propagated from a peer must ban the node"
+        );
+    }
+
+    /// GHOST-11 safety: a forged report (the conflicting votes are NOT signed by
+    /// the accused) cannot frame an honest node — verification fails, no ban.
+    #[test]
+    fn ghost11_forged_equivocation_proof_does_not_ban() {
+        let handler = VoteHandler::new(
+            Arc::new(NodeIdentity::generate()),
+            Arc::new(VotingManager::new(100)),
+        );
+        let victim = NodeIdentity::generate();
+        let attacker = NodeIdentity::generate();
+        let round_id = 1u64;
+        let proposal_hash = [9u8; 32];
+        // Votes claim to be the victim's, but are signed by the attacker.
+        let forge = |approve: bool| -> Vote {
+            let m =
+                compute_vote_signing_message(round_id, &proposal_hash, &victim.node_id(), approve);
+            Vote::new(victim.node_id(), approve, attacker.sign(&m))
+        };
+
+        let msg = EquivocationProofMessage::new(
+            victim.node_id(),
+            round_id,
+            proposal_hash,
+            "payout_vote".to_string(),
+            serde_json::to_vec(&forge(true)).unwrap(),
+            serde_json::to_vec(&forge(false)).unwrap(),
+            attacker.node_id(),
+        );
+
+        handler.handle_equivocation_proof(msg);
+        assert!(
+            !handler.is_banned(&victim.node_id()),
+            "a forged equivocation (votes not signed by the accused) must NOT ban the victim"
         );
     }
 

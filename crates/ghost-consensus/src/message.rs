@@ -683,6 +683,11 @@ pub struct EquivocationProofMessage {
     pub equivocator: [u8; 32],
     /// Round in which equivocation occurred
     pub round_id: u64,
+    /// GHOST-11: proposal hash both conflicting votes were cast on. Lets a
+    /// receiver verify the equivocator's two signatures INDEPENDENTLY of the
+    /// reporter (so a malicious reporter can't frame an honest node).
+    #[serde(with = "ghost_common::serde_hex::bytes32", default)]
+    pub proposal_hash: [u8; 32],
     /// Type of vote (e.g., "payout_vote", "zk_vote")
     pub vote_type: String,
     /// First vote (serialized VoteMessage or similar)
@@ -701,9 +706,11 @@ pub struct EquivocationProofMessage {
 
 impl EquivocationProofMessage {
     /// Create a new equivocation proof message
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         equivocator: [u8; 32],
         round_id: u64,
+        proposal_hash: [u8; 32],
         vote_type: String,
         vote1_data: Vec<u8>,
         vote2_data: Vec<u8>,
@@ -712,6 +719,7 @@ impl EquivocationProofMessage {
         Self {
             equivocator,
             round_id,
+            proposal_hash,
             vote_type,
             vote1_data,
             vote2_data,
@@ -728,6 +736,7 @@ impl EquivocationProofMessage {
         hasher.update(b"EquivocationProof/v1");
         hasher.update(self.equivocator);
         hasher.update(self.round_id.to_le_bytes());
+        hasher.update(self.proposal_hash);
         hasher.update(self.vote_type.as_bytes());
         hasher.update(&self.vote1_data);
         hasher.update(&self.vote2_data);
