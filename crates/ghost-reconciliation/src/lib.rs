@@ -77,9 +77,11 @@ pub use rules::*;
 pub use settlement::*;
 pub use transaction::*;
 
-/// Default minimum settlements per batch
-/// MAINNET: raise back to 10
-pub const MIN_BATCH_SIZE: usize = 1;
+/// Default minimum settlements per batch.
+/// GHOST-12: a batch of 1 reveals its sole participant — the minimum batch is
+/// the anonymity floor for a settlement, so it must be >=10 on mainnet. (Had
+/// been dropped to 1 for testing.)
+pub const MIN_BATCH_SIZE: usize = 10;
 
 /// Default maximum settlements per batch
 pub const MAX_BATCH_SIZE: usize = 1000;

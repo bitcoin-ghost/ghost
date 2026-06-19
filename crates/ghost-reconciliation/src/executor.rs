@@ -1139,10 +1139,11 @@ mod tests {
     fn test_should_form_batch_min_size() {
         let mut executor = BatchExecutor::new(Network::Regtest, "bcrt1qtest".to_string());
 
-        // With MIN_BATCH_SIZE=1, no settlements → should NOT form batch
+        // No settlements → should NOT form batch
         assert!(!executor.should_form_batch());
 
-        // Even 1 settlement should form a batch (epoch-driven settlement)
+        // GHOST-12: a single low-value settlement is BELOW MIN_BATCH_SIZE (10)
+        // and must NOT form a batch on its own (anonymity floor).
         let settlement = Settlement::new(
             "ghost10".to_string(),
             test_lock_id(0),
@@ -1151,7 +1152,7 @@ mod tests {
         )
         .unwrap();
         executor.add_settlement(settlement).unwrap();
-        assert!(executor.should_form_batch());
+        assert!(!executor.should_form_batch());
 
         // Multiple settlements also form batch
         for i in 1..10 {

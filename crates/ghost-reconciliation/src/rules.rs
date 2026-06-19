@@ -255,9 +255,10 @@ mod tests {
     fn test_batch_rules() {
         let rules = BatchRules::default();
 
-        // Any settlement count >= MIN_BATCH_SIZE (1) forms batch
+        // GHOST-12: MIN_BATCH_SIZE is now 10 (anonymity floor). >= 10 forms;
+        // a single low-value settlement does NOT (would reveal its participant).
         assert!(rules.should_form_batch(10, 1_000_000, 0));
-        assert!(rules.should_form_batch(1, 1_000_000, 0));
+        assert!(!rules.should_form_batch(1, 1_000_000, 0));
 
         // Zero settlements never form batch
         assert!(!rules.should_form_batch(0, 1_000_000, 0));
