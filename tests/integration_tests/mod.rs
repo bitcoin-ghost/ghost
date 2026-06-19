@@ -50,6 +50,7 @@ pub mod helpers;
 pub mod historical_bugs;
 pub mod hypothetical_bugs;
 pub mod l2_nullifier_route;
+pub mod mesh_cluster;
 pub mod policy_enforcement;
 pub mod pool_cycle;
 pub mod round_management;

@@ -841,6 +841,7 @@ dependencies = [
  "ghost-keys",
  "ghost-locks",
  "ghost-policy",
+ "ghost-pool",
  "ghost-reconciliation",
  "ghost-storage",
  "ghost-template",
