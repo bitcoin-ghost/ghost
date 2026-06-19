@@ -753,6 +753,61 @@ impl PayoutProposalCreator {
         Ok(proposal)
     }
 
+    /// GHOST-02: recompute the miner split from THIS node's own converged ledger
+    /// (and converged payout addresses — Option A) and confirm the proposal
+    /// matches. A proposer that inflates its own miners, shorts others, or
+    /// fabricates work produces a split honest validators (sharing the converged
+    /// ledger + addresses) will not reproduce, so it is rejected before voting.
+    ///
+    /// Reuses the exact production computation (`calculate_miner_payouts`), so
+    /// there is no reimplementation that could drift and false-reject an honest
+    /// proposal — the only inputs that vary are this node's own ledger and the
+    /// proposal's economic figures.
+    pub fn validate_proposal_split(
+        &self,
+        proposal: &PayoutProposal,
+        local_miner_work: &[(String, u128)],
+        treasury_state: &TreasuryState,
+    ) -> Result<(), String> {
+        // The treasury decay is year-granular; the proposal timestamp is within
+        // seconds of the block, so it yields the same decay_year (hence the same
+        // fee split) the proposer used.
+        let block_time =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(proposal.timestamp as i64, 0)
+                .unwrap_or_else(chrono::Utc::now);
+        let fee_dist = FeeDistribution::calculate(
+            proposal.subsidy,
+            proposal.tx_fees,
+            treasury_state,
+            block_time,
+        );
+        let (expected, _dust) = self
+            .calculate_miner_payouts(local_miner_work, fee_dist.miner_pool)
+            .map_err(|e| format!("GHOST-02: recompute failed: {e}"))?;
+
+        let expected_map = Self::address_amount_map(&expected);
+        let proposal_map = Self::address_amount_map(&proposal.miner_payouts);
+        if expected_map != proposal_map {
+            return Err(format!(
+                "GHOST-02: miner split does not match local recompute \
+                 ({} expected payout addresses vs {} in proposal)",
+                expected_map.len(),
+                proposal_map.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Address-grouped (address -> total amount) view of a payout set, for the
+    /// GHOST-02 comparison. Ordered so the comparison is independent of entry order.
+    fn address_amount_map(entries: &[PayoutEntry]) -> std::collections::BTreeMap<Vec<u8>, u64> {
+        let mut m = std::collections::BTreeMap::new();
+        for e in entries {
+            *m.entry(e.address.clone()).or_insert(0u64) += e.amount;
+        }
+        m
+    }
+
     /// Calculate miner payouts proportional to work
     /// Returns (payouts, dust_amount) where dust is redirected to node reward pool
     ///
@@ -1317,6 +1372,19 @@ impl PayoutHandler {
 
     /// Handle a block found event by creating and submitting a payout proposal
     ///
+    /// GHOST-02: validate a peer's payout proposal by recomputing the miner
+    /// split from this node's own converged ledger. Delegates to the proposal
+    /// creator (which owns the payout maths). Returns `Err(reason)` to reject.
+    pub fn validate_proposal_split(
+        &self,
+        proposal: &PayoutProposal,
+        local_miner_work: &[(String, u128)],
+        treasury_state: &TreasuryState,
+    ) -> Result<(), String> {
+        self.creator
+            .validate_proposal_split(proposal, local_miner_work, treasury_state)
+    }
+
     /// H-MINE-1 SECURITY: The QualifiedCapabilityProvider is REQUIRED in the constructor.
     /// Node rewards will only be distributed to nodes with VERIFIED capabilities,
     /// never to nodes with merely CLAIMED capabilities.
@@ -1479,6 +1547,75 @@ mod tests {
 
     fn test_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::generate())
+    }
+
+    // ---- GHOST-02: proposal split recompute ----
+
+    fn ghost02_creator() -> PayoutProposalCreator {
+        let config = PayoutConfig {
+            treasury_address: Some(vec![1u8; 20]),
+            network: ghost_common::config::BitcoinNetwork::Regtest,
+            ..Default::default()
+        };
+        let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+        PayoutProposalCreator::new(test_identity(), config, db).expect("creator")
+    }
+
+    fn ghost02_proposal(subsidy: u64, miner_payouts: Vec<PayoutEntry>) -> PayoutProposal {
+        PayoutProposal {
+            proposal_hash: [0u8; 32],
+            round_id: 1,
+            block_hash: [0u8; 32],
+            block_height: 100,
+            proposer: [0u8; 32],
+            miner_payouts,
+            node_payouts: vec![],
+            treasury_amount: 0,
+            treasury_address: vec![1u8; 20],
+            tx_fees: 0,
+            subsidy,
+            timestamp: 1_700_000_000,
+            tx_fees_unallocated: 0,
+        }
+    }
+
+    #[test]
+    fn ghost02_rejects_payout_unsupported_by_local_ledger() {
+        let creator = ghost02_creator();
+        let ts = TreasuryState::new();
+        // This node's ledger is empty → no miner is owed anything for the round.
+        let local_work: Vec<(String, u128)> = vec![];
+        // The proposal nonetheless claims a 1 BTC miner payout.
+        let proposal = ghost02_proposal(
+            5_000_000_000,
+            vec![PayoutEntry {
+                address: vec![2u8; 22],
+                amount: 100_000_000,
+                recipient_id: [3u8; 32],
+                payout_type: PayoutType::Mining,
+            }],
+        );
+        assert!(
+            creator
+                .validate_proposal_split(&proposal, &local_work, &ts)
+                .is_err(),
+            "GHOST-02: a payout the local ledger does not support must be rejected"
+        );
+    }
+
+    #[test]
+    fn ghost02_accepts_split_matching_local_recompute() {
+        let creator = ghost02_creator();
+        let ts = TreasuryState::new();
+        // Empty ledger → the only honest split is the empty one.
+        let local_work: Vec<(String, u128)> = vec![];
+        let proposal = ghost02_proposal(5_000_000_000, vec![]);
+        assert!(
+            creator
+                .validate_proposal_split(&proposal, &local_work, &ts)
+                .is_ok(),
+            "GHOST-02: an empty split matches an empty-ledger recompute"
+        );
     }
 
     #[test]

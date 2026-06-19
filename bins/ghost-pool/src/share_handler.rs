@@ -111,7 +111,7 @@ impl ShareProofHandler {
 
         let miner_hex = hex::encode(&proof.miner_id[..8]);
         let from_node = hex::encode(&proof.received_by[..4]);
-        let _payout_address = proof.payout_address.clone(); // M-06: Not used for remote proofs
+        let payout_address = proof.payout_address.clone(); // GHOST-02/Option A: adopted below
         let round_id = proof.round_id;
         let share_hash = hex::encode(proof.share_hash);
         let work = proof.work;
@@ -157,10 +157,19 @@ impl ShareProofHandler {
                     }
                 }
 
-                // M-06: Do NOT update miner payout address from remote P2P share proofs.
-                // A malicious node could broadcast share proofs with a legitimate miner's ID
-                // but substitute their own payout address, redirecting that miner's payouts.
-                // Payout addresses are only trusted from local stratum connections (main.rs).
+                // GHOST-02 / Option A: adopt the miner's payout address from this
+                // GHOST-09-SIGNED proof, first-writer-wins. This is what lets
+                // payout addresses converge across nodes so validators can
+                // reproduce the proposer's address-grouped split (GHOST-02).
+                // The original M-06 concern (a node substituting its own address
+                // for a legitimate miner) is contained: the proof is signature-
+                // verified above, and `adopt_miner_address` never overwrites an
+                // already-established address.
+                if let Some(addr) = &payout_address {
+                    if let Err(e) = self.db.adopt_miner_address(&miner_hex, addr) {
+                        warn!(miner = %miner_hex, error = %e, "GHOST-02: failed to adopt signed payout address");
+                    }
+                }
 
                 debug!(
                     miner = %miner_hex,

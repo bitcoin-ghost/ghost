@@ -2503,6 +2503,36 @@ impl Database {
         })
     }
 
+    /// GHOST-02 / Option A: adopt a miner's payout address from a GHOST-09-signed
+    /// share proof, FIRST-WRITER-WINS. The address is set only if the miner has
+    /// none yet; an established address is never overwritten by a later (possibly
+    /// conflicting) signed proof. This is what lets payout addresses converge
+    /// across nodes — so validators can reproduce the proposer's address-grouped
+    /// split (GHOST-02) — without reintroducing the M-06 address-hijack vector.
+    pub fn adopt_miner_address(&self, miner_id: &str, payout_address: &str) -> GhostResult<()> {
+        if payout_address.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        let encrypted_address = self.encrypt_address(payout_address)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO miners (miner_id, payout_address, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(miner_id) DO UPDATE SET
+                     payout_address = CASE
+                         WHEN miners.payout_address IS NULL OR miners.payout_address = ''
+                         THEN excluded.payout_address
+                         ELSE miners.payout_address
+                     END,
+                     last_seen = excluded.last_seen",
+                params![miner_id, encrypted_address, now],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Increment miner share count and work
     ///
     /// MED-STOR-1: Uses saturating arithmetic to prevent overflow. If values would overflow,
