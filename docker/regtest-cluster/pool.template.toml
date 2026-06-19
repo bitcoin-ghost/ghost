@@ -1,0 +1,59 @@
+# Ghost Pool — regtest dry-run config TEMPLATE.
+# The entrypoint runs `envsubst` over this file, so ${VARS} below are filled in
+# per-node from each service's environment in docker-compose.yml.
+#
+# This cluster exists to run the audit-cluster dry-run from
+# tasks/plan_audit_cluster_deploy.md §3 BEFORE any mainnet deploy:
+# 4 real ghost-pool binaries on a regtest chain, full mesh, gate ON.
+
+[identity]
+key_path = "/var/lib/ghost/node.key"   # generated on first start, per-node volume
+display_name = "${NODE_NAME}"
+
+[bitcoin]
+rpc_host = "bitcoind"
+rpc_port = 18443                        # regtest default RPC port
+rpc_user = "${BITCOIN_RPC_USER}"
+rpc_password = "${BITCOIN_RPC_PASSWORD}"
+network = "regtest"                     # regtest → no zk-production / MPC params needed
+zmq_hashblock = "tcp://bitcoind:28332"
+zmq_hashtx = "tcp://bitcoind:28333"
+
+[network]
+# Container DNS name — peers dial this for the mesh.
+public_address = "${NODE_NAME}"
+# The OTHER three nodes' discovery endpoints (set per-service in compose).
+seed_nodes = [${SEED_NODES}]
+sv2_port = 34255
+sv1_port = 3333
+http_port = 8080
+max_miners = 1000
+public_mining = true
+
+[network.p2p]
+share_propagation = 8555
+block_announcement = 8556
+consensus_voting = 8557
+health_monitoring = 8558
+discovery = 8559
+elder_management = 8560
+payout_proposal = 8561
+payout_transaction = 8562
+
+[policy]
+profile = "bitcoin_pure"
+
+[storage]
+db_path = "/var/lib/ghost/data"
+wal_mode = true
+archive_mode = true
+prune_height = 0
+
+[pool]
+# A valid REGTEST address (bcrt1…). Replace with one from
+# `bitcoin-cli -regtest getnewaddress`.
+treasury_address = "${TREASURY_ADDRESS}"
+min_payout_sats = 10000
+
+[ghost_pay]
+enabled = false   # L2 is out of scope for the cluster (consensus) dry-run

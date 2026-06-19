@@ -12,7 +12,7 @@
 //! 3. The requester applies each missing proof through the normal path, which
 //!    re-verifies the GHOST-09 `received_by` signature before crediting.
 //!
-//! The full signed proofs are re-servable because [`RoundManager`] retains them
+//! The full signed proofs are re-servable because `RoundManager` retains them
 //! per round (see `recent_proofs`). Without that, a node could only detect
 //! divergence, not repair it.
 
