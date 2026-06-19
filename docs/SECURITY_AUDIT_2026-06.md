@@ -31,7 +31,7 @@ forgeable) · **MEDIUM** (correctness/robustness) · **LOW** (hygiene/docs).
 | GHOST-08 | HIGH | ghost-zkp | `test_accept_all()` (returns `Ok(true)`) compiled into production verifiers | FIXED (PR #33, merged) — bypass branch compiled out under `zk-production` |
 | GHOST-09 | MEDIUM | ghost-consensus | `received_by` (node-reward credit) is unauthenticated → credit theft | FIXED (PR #40) — `ShareProof` now carries an ed25519 signature by `received_by`; receive path drops missing/invalid sigs (unsigned ⇒ rejected). Wire-format change; coordinated deploy. **This is the cluster's foundation.** |
 | GHOST-10 | MEDIUM | ghost-verification | Uptime gatekeeper only ever records `was_online=true` (no offline samples) | FIXED (PR #34, merged) — time-based liveness denominator |
-| GHOST-11 | MEDIUM | ghost-consensus | Equivocation bans are in-memory only; equivocating elder stays an eligible voter | OPEN — persistence is local but propagation is wire-format. Payout-integrity cluster |
+| GHOST-11 | MEDIUM | ghost-consensus | Equivocation bans are in-memory only; equivocating elder stays an eligible voter | FIXED (PR #47) — equivocation proofs now propagate (independently-verified peer handler bans the equivocator) and persist (bans re-applied from stored proofs on startup) |
 | GHOST-12 | MEDIUM | ghost-reconciliation | `MIN_BATCH_SIZE = 1` (comment: "MAINNET: raise back to 10") destroys batch anonymity | FIXED (PR #33, merged) — `MIN_BATCH_SIZE = 10` |
 | GHOST-13 | LOW | docs | Doc/reality drift (missing `docs/`, dust→treasury, P2WSH-not-P2TR, MiMC-not-Pedersen, Reaper=BitcoinPure, README stats) | RESOLVED — this audit doc is the corrected reference; CLAUDE.md (gitignored, local) dust note also corrected |
 
@@ -181,14 +181,18 @@ payout or a farmed reward pool.
 
 ## Remediation status (2026-06-19)
 
-12 of 13 findings are resolved or have a landed fix-PR; only **GHOST-11** (ban
-persistence + propagation) remains.
+**All 13 findings are resolved or have a landed fix-PR.** The audit is complete.
 
-- **Merged to `main`:** GHOST-08/10/12 (#33, #34), GHOST-01/06/05/04 (#35–#38), GHOST-09 signed
-  shares (#40), multi-node harness (#42), GHOST-03 ledger convergence (#43), audit doc + register
-  (#32, #39, #41, #44).
-- **Fix PR open:** GHOST-02 payout-split recompute (#45, Option A).
-- **Resolved without code change:** GHOST-07, GHOST-13.
+- **Code-fixed (PRs #33–#47):** GHOST-01/02/03/04/05/06/08/09/10/11/12, plus the multi-node
+  validation harness (#42).
+- **Resolved without code change:** GHOST-07 (already fail-closed), GHOST-13 (this doc is the
+  corrected reference).
+
+**The payout-integrity cluster (GHOST-09 → GHOST-03 → GHOST-02 → GHOST-11) was built test-first
+against the harness.** Because each is a gossiped-consensus wire-format/behaviour change, the
+cluster must ship as a **coordinated fleet deploy** (no mixed-version mesh) and be canaried
+VM4 → VM3 → VM2 → VM1 like every consensus change — the per-finding logic is validated; the
+remaining work is the staged rollout, not more code.
 
 The **multi-node harness now exists** (PR #42): N in-process nodes with real `RoundManager` +
 `ShareProofHandler`, a deterministic in-memory router, and fault injection (forgery, partition).
