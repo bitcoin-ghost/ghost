@@ -2405,6 +2405,54 @@ async fn confirm_lock_funding(
         })));
     }
 
+    // GHOST-05: verify the funding deposit ON-CHAIN before activating the lock.
+    // Previously the lock flipped pending->active on the client-asserted txid
+    // with no verification, so shielded L2 value could be minted against a
+    // deposit that doesn't exist, pays a different script, is insufficient, or
+    // is unconfirmed. `gettxout` confirms the output is a real, unspent UTXO
+    // (no -txindex needed) and lets us check it pays THIS lock's script for at
+    // least the lock amount, with at least one confirmation.
+    const MIN_FUNDING_CONFIRMATIONS: i64 = 1;
+    let utxo = state
+        .rpc
+        .get_tx_out(&req.funding_txid, req.funding_vout, true)
+        .await
+        .map_err(|e| {
+            error!(lock_id = %id, txid = %req.funding_txid, error = %e, "confirm_lock_funding: gettxout RPC failed");
+            StatusCode::BAD_GATEWAY
+        })?;
+    let utxo = match utxo {
+        Some(u) => u,
+        None => {
+            warn!(lock_id = %id, txid = %req.funding_txid, vout = req.funding_vout, "GHOST-05: funding UTXO not found or already spent");
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    };
+    if !utxo
+        .script_pubkey
+        .hex
+        .eq_ignore_ascii_case(&existing.output_script)
+    {
+        warn!(lock_id = %id, expected = %existing.output_script, got = %utxo.script_pubkey.hex, "GHOST-05: funding output script does not match the lock");
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let onchain_sats = (utxo.value * 1e8).round() as u64;
+    if onchain_sats < existing.amount_sats {
+        warn!(lock_id = %id, expected_sats = existing.amount_sats, got_sats = onchain_sats, "GHOST-05: funding output value below lock amount");
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    if utxo.confirmations < MIN_FUNDING_CONFIRMATIONS {
+        warn!(lock_id = %id, confirmations = utxo.confirmations, "GHOST-05: funding output not yet confirmed");
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    info!(
+        lock_id = %id,
+        txid = %req.funding_txid,
+        sats = onchain_sats,
+        confirmations = utxo.confirmations,
+        "GHOST-05: funding UTXO verified on-chain (script + value + confirmations)"
+    );
+
     state
         .db
         .update_ghost_lock_funding(&id, &req.funding_txid, req.funding_vout)
@@ -4398,6 +4446,23 @@ async fn shield_balance(
                             "error": format!(
                                 "Shield amount {} does not match expected {} (denomination {} - wraith_fee {})",
                                 req.amount_sats, expected, lock.amount_sats, lock.wraith_fee_sats
+                            )
+                        })),
+                    ));
+                }
+                // GHOST-05: only shield against a lock whose on-chain deposit has
+                // been verified — confirm_lock_funding sets Active only after
+                // checking the funding UTXO (script + value + confirmations).
+                // Without this, shielded value could be minted against a lock
+                // that was never actually funded.
+                if lock.state != ghost_storage::GhostLockState::Active {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "Lock {} is not active (state {}); fund and confirm it on-chain before shielding",
+                                lock_id,
+                                lock.state.as_str()
                             )
                         })),
                     ));
