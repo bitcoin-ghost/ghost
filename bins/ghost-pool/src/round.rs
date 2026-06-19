@@ -1573,6 +1573,7 @@ mod tests {
             received_by: node_id,
             template_id: Some(template_id),
             payout_address: None,
+            signature: None,
         };
 
         // First submission should succeed

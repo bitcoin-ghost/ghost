@@ -74,6 +74,19 @@ impl ShareProofHandler {
             return Ok(());
         }
 
+        // GHOST-09: authenticate the node-reward credit. A remote proof must
+        // carry a valid signature by `received_by` over its canonical bytes,
+        // otherwise it's a forged or relayed credit (e.g. a relay re-crediting
+        // itself) and is dropped before it can inflate any node's shares.
+        if !proof.has_valid_received_by_signature() {
+            warn!(
+                from_node = %hex::encode(&proof.received_by[..4]),
+                round_id = proof.round_id,
+                "GHOST-09: dropping share proof with missing/invalid received_by signature"
+            );
+            return Ok(());
+        }
+
         // Timestamp freshness check
         let now = Utc::now().timestamp();
         let ts = proof.timestamp as i64;
@@ -234,6 +247,7 @@ mod tests {
             received_by: our_node_id, // Our own node
             template_id: Some([4u8; 32]),
             payout_address: None,
+            signature: None, // skipped before the GHOST-09 gate (own share)
         };
         let msg = ShareProofMessage { proof };
         let payload = serde_json::to_vec(&msg).expect("test serialization");
@@ -246,7 +260,8 @@ mod tests {
     #[tokio::test]
     async fn test_rejects_stale_timestamp() {
         let our_node_id = [1u8; 32];
-        let other_node_id = [2u8; 32];
+        let other = ghost_common::identity::NodeIdentity::generate();
+        let other_node_id = other.node_id();
         let db = Arc::new(Database::in_memory().expect("in-memory db"));
         let rm = Arc::new(RoundManager::new(
             our_node_id,
@@ -265,7 +280,10 @@ mod tests {
             received_by: other_node_id,
             template_id: Some([5u8; 32]),
             payout_address: None,
+            signature: None,
         };
+        // GHOST-09: sign as `other` so the proof passes the receive-path gate.
+        let proof = proof.signed(&other);
         let msg = ShareProofMessage { proof };
         let payload = serde_json::to_vec(&msg).expect("test serialization");
         let envelope = make_envelope(MessageType::ShareProof, payload);
@@ -277,7 +295,8 @@ mod tests {
     #[tokio::test]
     async fn test_rejects_future_timestamp() {
         let our_node_id = [1u8; 32];
-        let other_node_id = [2u8; 32];
+        let other = ghost_common::identity::NodeIdentity::generate();
+        let other_node_id = other.node_id();
         let db = Arc::new(Database::in_memory().expect("in-memory db"));
         let rm = Arc::new(RoundManager::new(
             our_node_id,
@@ -297,7 +316,10 @@ mod tests {
             received_by: other_node_id,
             template_id: Some([5u8; 32]),
             payout_address: None,
+            signature: None,
         };
+        // GHOST-09: sign as `other` so the proof passes the receive-path gate.
+        let proof = proof.signed(&other);
         let msg = ShareProofMessage { proof };
         let payload = serde_json::to_vec(&msg).expect("test serialization");
         let envelope = make_envelope(MessageType::ShareProof, payload);
@@ -309,7 +331,8 @@ mod tests {
     #[tokio::test]
     async fn test_valid_share_accepted_and_recorded() {
         let our_node_id = [1u8; 32];
-        let other_node_id = [2u8; 32];
+        let other = ghost_common::identity::NodeIdentity::generate();
+        let other_node_id = other.node_id();
         let db = Arc::new(Database::in_memory().expect("in-memory db"));
         let rm = Arc::new(RoundManager::new(
             our_node_id,
@@ -328,7 +351,10 @@ mod tests {
             received_by: other_node_id,
             template_id: Some([5u8; 32]),
             payout_address: None,
+            signature: None,
         };
+        // GHOST-09: sign as `other` so the proof passes the receive-path gate.
+        let proof = proof.signed(&other);
         let msg = ShareProofMessage { proof };
         let payload = serde_json::to_vec(&msg).expect("test serialization");
         let envelope = make_envelope(MessageType::ShareProof, payload);
@@ -344,7 +370,8 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_share_silently_ignored() {
         let our_node_id = [1u8; 32];
-        let other_node_id = [2u8; 32];
+        let other = ghost_common::identity::NodeIdentity::generate();
+        let other_node_id = other.node_id();
         let db = Arc::new(Database::in_memory().expect("in-memory db"));
         let rm = Arc::new(RoundManager::new(
             our_node_id,
@@ -362,7 +389,10 @@ mod tests {
             received_by: other_node_id,
             template_id: Some([5u8; 32]),
             payout_address: None,
+            signature: None,
         };
+        // GHOST-09: sign as `other` so the proof passes the receive-path gate.
+        let proof = proof.signed(&other);
         let msg = ShareProofMessage { proof };
         let payload = serde_json::to_vec(&msg).expect("test serialization");
 
@@ -385,7 +415,8 @@ mod tests {
     #[tokio::test]
     async fn test_miner_stats_incremented_on_valid_share() {
         let our_node_id = [1u8; 32];
-        let other_node_id = [2u8; 32];
+        let other = ghost_common::identity::NodeIdentity::generate();
+        let other_node_id = other.node_id();
         let db = Arc::new(Database::in_memory().expect("in-memory db"));
         let rm = Arc::new(RoundManager::new(
             our_node_id,
@@ -406,7 +437,9 @@ mod tests {
             received_by: other_node_id,
             template_id: Some([8u8; 32]),
             payout_address: None,
+            signature: None,
         };
+        let proof = proof.signed(&other);
         let msg = ShareProofMessage { proof };
         let payload = serde_json::to_vec(&msg).expect("test serialization");
 
