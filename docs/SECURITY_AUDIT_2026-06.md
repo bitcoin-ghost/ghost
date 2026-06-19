@@ -23,7 +23,7 @@ forgeable) · **MEDIUM** (correctness/robustness) · **LOW** (hygiene/docs).
 |----|-----|-----------|----------|--------|
 | GHOST-01 | HIGH | ghost-verification | Capability challenges are forgeable; verifier trusts challenger's `passed` boolean with no re-execution | PARTIAL — Reaper/BitcoinPure negative control added + tested (PR #35); PublicMining handshake, GhostPay root-check, and the cross-mesh collusion fix remain (wire-format) |
 | GHOST-02 | HIGH | ghost-consensus | Payout-proposal validators don't recompute the split vs their own ledger; no proposer-authorization check | OPEN — payout-integrity cluster (needs GHOST-03 + multi-node harness) |
-| GHOST-03 | HIGH | ghost-consensus | `ShareConvergence` is dead code — no ledger-convergence protocol; gossip-only | OPEN — payout-integrity cluster (wire-format; needs harness) |
+| GHOST-03 | HIGH | ghost-consensus | `ShareConvergence` is dead code — no ledger-convergence protocol; gossip-only | FIXED (PR #43) — convergence implemented + wired live (mesh handler + 30s request); `RoundManager` retains signed proofs; backfill re-verifies GHOST-09. Tested via the harness. Wire-format; coordinated deploy |
 | GHOST-04 | CRITICAL | ghost-consensus | Live elder set = 4 < mainnet `MIN_VOTERS_FOR_BFT = 7` → payout BFT cannot reach quorum | FIXED (PR #38) — adaptive floor `clamp(4,7)`; DO NOT deploy in isolation (cluster) |
 | GHOST-05 | HIGH | ghost-pay | L2 peg-in mints shielded value with no on-chain deposit verification (custodial) | FIXED (PR #37) — `confirm_lock_funding` verifies the UTXO via `gettxout`; `shield_balance` requires Active lock. Remaining: mandatory `lock_id` (behaviour change) |
 | GHOST-06 | MEDIUM | ghost-mpc | `verify_contribution` not called on consensus-approval path; no min-contribution / full hash-pin | PARTIAL (PR #36) — load now fails closed without a pinned BLOCK hash. Remaining: `verify_contribution` on the apply path (needs ceremony harness; future-join only) |
@@ -181,15 +181,19 @@ payout or a farmed reward pool.
 
 ## Remediation status (2026-06-19)
 
-10 of 13 findings are resolved or have a landed fix-PR; the remaining 3 (GHOST-02, GHOST-03,
-GHOST-11) are one coupled cluster, now built on the GHOST-09 foundation.
+11 of 13 findings are resolved or have a landed fix-PR; the remaining 2 (GHOST-02, GHOST-11)
+build on the GHOST-09 + GHOST-03 layers now in place.
 
 - **Merged to `main`:** GHOST-08, GHOST-10, GHOST-12 (#33, #34), GHOST-01/06/05/04 (#35–#38),
-  audit doc + register (#32, #39).
-- **Fix PR open:** GHOST-09 signed shares (#40) — the cluster foundation.
+  GHOST-09 signed shares (#40, cluster foundation), audit doc + register (#32, #39, #41).
+- **Fix PRs open:** GHOST-03 ledger convergence (#43); multi-node harness (#42, the validation rig).
 - **Resolved without code change:** GHOST-07, GHOST-13.
 
-### The payout-integrity cluster — GHOST-02, GHOST-03, GHOST-11 (foundation GHOST-09 ✅)
+The **multi-node harness now exists** (PR #42): N in-process nodes with real `RoundManager` +
+`ShareProofHandler`, a deterministic in-memory router, and fault injection (forgery, partition).
+Each remaining fix is now built test-first against it (failing scenario → fix → green).
+
+### The payout-integrity cluster — GHOST-02, GHOST-11 (GHOST-09 ✅, GHOST-03 ✅, harness ✅)
 
 These four are **not independent patches**; they are one design that must ship and be validated
 together, because each is a change to the **gossiped consensus wire format** and they interlock:
