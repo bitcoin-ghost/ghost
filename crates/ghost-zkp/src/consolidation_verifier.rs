@@ -43,8 +43,10 @@ impl GhostConsolidateVerifier {
     }
 
     /// Create a test verifier that accepts all proofs unconditionally.
-    /// GHOST-08: unavailable under `zk-production` (mainnet) builds.
-    #[cfg(not(feature = "zk-production"))]
+    /// GHOST-08: the accept-all bypass it sets is compiled out under
+    /// `zk-production`, so in mainnet builds this is inert — real verification
+    /// still runs. Kept available (not cfg-gated) so cross-crate tests compile
+    /// under `--all-features`.
     pub fn test_accept_all() -> Self {
         Self {
             prepared_vk: None,
