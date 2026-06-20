@@ -112,6 +112,34 @@ impl PeerManager {
             return;
         }
 
+        // Reconcile by host: one physical host belongs to one identity. If a
+        // DIFFERENT node_id already holds this exact host, it is a superseded
+        // bootstrap placeholder — the seed-connect path ("Connecting to peer")
+        // registers peers with a temp node_id = hash(address) until the real
+        // identity is learned via discovery (on a different port). Remove the
+        // stale entry so the real identity can take the slot. Without this,
+        // co-located nodes (all on one /24 — a docker bridge or any test
+        // cluster) exhaust MAX_PEERS_PER_SUBNET with placeholders and the real
+        // identities are rejected below, leaving peers that HealthPings (keyed
+        // by the real node_id) can never refresh — so they age out of
+        // get_connected_peers and encrypted broadcasts reach zero peers.
+        // Matching the EXACT host (not the /24) keeps Sybil protection intact:
+        // genuinely distinct hosts still count toward the subnet limit.
+        let new_host = extract_host_from_address(&peer.public_address);
+        if !new_host.is_empty() {
+            let superseded: Vec<NodeId> = peers
+                .iter()
+                .filter(|(nid, p)| {
+                    **nid != peer.node_id
+                        && extract_host_from_address(&p.public_address) == new_host
+                })
+                .map(|(nid, _)| *nid)
+                .collect();
+            for nid in superseded {
+                peers.remove(&nid);
+            }
+        }
+
         if peers.len() >= self.max_peers {
             return;
         }
@@ -490,6 +518,52 @@ mod tests {
         manager.upsert_peer(peer);
 
         assert_eq!(manager.peer_count(), 1);
+    }
+
+    #[test]
+    fn test_upsert_reconciles_same_host_placeholder() {
+        // Regression: the seed-connect path creates bootstrap *placeholder* peers
+        // with a temp node_id = hash(address) (mesh.rs "Connecting to peer"). When
+        // many nodes share one /24 (e.g. a docker bridge, or any co-located test
+        // cluster), three such placeholders fill MAX_PEERS_PER_SUBNET (=3). The
+        // real identity for the same host, learned later via discovery on a
+        // different port, was then REJECTED by the subnet limit and never landed —
+        // and HealthPings (keyed by the real node_id) could never refresh the
+        // surviving placeholder, which aged out of get_connected_peers, so the
+        // encrypted broadcast reached zero peers. upsert_peer must reconcile by
+        // host: a real identity supersedes the same-host placeholder.
+        let mgr = PeerManager::new([0u8; 32], 100);
+        for i in 10u8..13 {
+            let mut p = Peer::new([i; 32], format!("172.30.0.{}:8555", i));
+            p.state = PeerState::Connected;
+            mgr.upsert_peer(p);
+        }
+        assert_eq!(mgr.get_all_peers().len(), 3, "three placeholders fill the /24 quota");
+
+        // Real identity for the same host as the first placeholder (172.30.0.10),
+        // discovered on the discovery port (:8559) with a different node_id.
+        let real_id = [99u8; 32];
+        let mut real = Peer::new(real_id, "172.30.0.10:8559".to_string());
+        real.state = PeerState::Connected;
+        mgr.upsert_peer(real);
+
+        let all = mgr.get_all_peers();
+        assert!(
+            all.iter().any(|p| p.node_id == real_id),
+            "real identity must supersede the same-host placeholder despite the subnet limit"
+        );
+        assert!(
+            !all.iter().any(|p| p.node_id == [10u8; 32]),
+            "the superseded same-host placeholder must be removed"
+        );
+        // A genuinely new host in the same /24 is still capped (Sybil protection intact).
+        let mut sybil = Peer::new([200u8; 32], "172.30.0.99:8555".to_string());
+        sybil.state = PeerState::Connected;
+        mgr.upsert_peer(sybil);
+        assert!(
+            !mgr.get_all_peers().iter().any(|p| p.node_id == [200u8; 32]),
+            "a new distinct host in a full /24 must still be rejected (Sybil cap holds)"
+        );
     }
 
     #[test]
