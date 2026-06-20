@@ -31,9 +31,10 @@ use ghost_storage::Database;
 /// Shared test template every node accepts (so share-proof validation passes).
 const TEST_TEMPLATE_ID: [u8; 32] = [0x7c; 32];
 
-/// A difficulty-1.0 share hash: exactly 32 leading zero bits (`bytes[28..32] = 0`)
-/// then a non-zero byte, which `DifficultyCalculator::difficulty_from_hash` maps
-/// to `2^(32-32) = 1.0`. The low 8 bytes carry a unique nonce (never examined by
+/// A valid share hash for pool difficulty 1.0: `bytes[28..32] = 0` and
+/// `bytes[27] = 0xFF`, which `DifficultyCalculator::difficulty_from_hash` maps to
+/// ~1.004 (0xFFFF*2^208 / (0xFF*2^216)) — comfortably above the pool minimum of
+/// 1.0, so it is accepted PoW. The low 8 bytes carry a unique nonce (never examined by
 /// the leading-zero count) so each share is distinct and not deduplicated.
 fn diff1_share_hash(nonce: u64) -> [u8; 32] {
     let mut h = [0u8; 32];

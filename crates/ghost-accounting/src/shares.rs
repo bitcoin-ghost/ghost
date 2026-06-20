@@ -407,36 +407,32 @@ impl DifficultyCalculator {
     ///
     /// Lower hash values = higher difficulty
     pub fn difficulty_from_hash(hash: &[u8; 32]) -> f64 {
-        // Bitcoin uses little-endian, but hashes are typically displayed big-endian
-        // The hash is treated as a 256-bit number
-
-        // Find the first non-zero byte (counting leading zeros)
-        let mut leading_zeros = 0;
-        for byte in hash.iter().rev() {
-            if *byte == 0 {
-                leading_zeros += 8;
-            } else {
-                leading_zeros += byte.leading_zeros() as usize;
-                break;
-            }
+        // The hash is a 256-bit number with its most-significant byte at index 31
+        // (the PoW leading zeros sit at the high-index end). The share's difficulty
+        // is the standard pool difficulty `diff1_target / hash_value`, where the
+        // difficulty-1 target (pdiff) is 0xFFFF * 2^208.
+        //
+        // This uses the FULL hash value, not just the leading-zero count. The old
+        // leading-zeros approximation (2^(leading_zeros-32)) ignored everything
+        // after the first non-zero byte and so under-counted by up to ~2x — which
+        // made C4 verify_share_difficulty reject valid gossiped shares whose `work`
+        // (the standard difficulty reported by the SV2/SRI layer) exceeded the
+        // approximation. f64 has ~52 bits of mantissa, ample for the difficulty
+        // comparison (which carries a 0.1% tolerance); the low bits of the hash do
+        // not affect the result.
+        let mut hash_value = 0.0_f64;
+        for &byte in hash.iter().rev() {
+            hash_value = hash_value * 256.0 + byte as f64;
         }
 
-        // If all zeros (shouldn't happen), return max difficulty
-        if leading_zeros >= 256 {
+        // All-zero hash (shouldn't occur in practice) — treat as maximal difficulty.
+        if hash_value == 0.0 {
             return f64::MAX;
         }
 
-        // Calculate approximate difficulty
-        // Each leading zero bit doubles the difficulty
-        // Base difficulty 1 corresponds to target with 32 leading zero bits (4 zero bytes)
-        // H-20: Use saturating subtraction to prevent overflow on edge cases
-        let diff_bits = (leading_zeros as i32).saturating_sub(32);
-
-        if diff_bits >= 0 {
-            2.0_f64.powi(diff_bits)
-        } else {
-            1.0 / 2.0_f64.powi(-diff_bits)
-        }
+        // diff1_target (pdiff) = 0xFFFF * 2^208. Both factors are exact in f64.
+        let diff1_target = 65535.0_f64 * 2.0_f64.powi(208);
+        diff1_target / hash_value
     }
 
     /// Verify that a share hash meets the claimed difficulty
@@ -520,6 +516,48 @@ mod tests {
         assert!(!calc.meets_share_difficulty(500.0));
         assert!(!calc.is_valid_block(500_000.0));
         assert!(calc.is_valid_block(1_500_000.0));
+    }
+
+    #[test]
+    fn test_difficulty_from_hash_is_precise_not_leading_zero_underestimate() {
+        // Regression: difficulty_from_hash was a leading-zeros approximation
+        // (2^(leading_zeros-32)) that under-counts by up to ~2x because it ignores
+        // everything after the first non-zero byte. The SV2/SRI layer reports the
+        // STANDARD difficulty as `work`, so C4 verify_share_difficulty rejected
+        // valid gossiped shares whose leading-zero count understated them — every
+        // share dropped on the elders, every payout rejected by GHOST-02.
+        //
+        // The difficulty-1 target (pdiff) is 0xFFFF * 2^208; a hash equal to it has
+        // difficulty exactly 1.0.
+        let mut diff1 = [0u8; 32];
+        diff1[26] = 0xFF;
+        diff1[27] = 0xFF;
+        let d1 = DifficultyCalculator::difficulty_from_hash(&diff1);
+        assert!((d1 - 1.0).abs() < 1e-6, "diff-1 target → 1.0, got {d1}");
+
+        // A hash AT the difficulty-1.5 target: 0xAAAA * 2^208 (0xFFFF / 1.5 = 0xAAAA).
+        // Precise difficulty = 1.5. The old leading-zeros formula gave only 1.0
+        // (32 leading zero bits, then 0xAA), so verify_share_difficulty(_, 1.5)
+        // wrongly REJECTED it.
+        let mut h = [0u8; 32];
+        h[26] = 0xAA;
+        h[27] = 0xAA;
+        let d = DifficultyCalculator::difficulty_from_hash(&h);
+        assert!((d - 1.5).abs() < 0.01, "diff-1.5 target → ~1.5, got {d}");
+
+        let calc = DifficultyCalculator::new(1.0, 1_000_000.0);
+        assert!(
+            calc.verify_share_difficulty(&h, 1.5),
+            "a hash meeting the claimed standard difficulty must pass C4 \
+             (regression: leading-zeros under-count rejected it)"
+        );
+        // And a hash that genuinely does NOT meet the claimed difficulty is rejected.
+        let mut easy = [0u8; 32];
+        easy[27] = 0xFF; // difficulty ~1.0
+        assert!(
+            !calc.verify_share_difficulty(&easy, 4.0),
+            "a hash below the claimed difficulty must still be rejected"
+        );
     }
 
     /// SEC-SHARE-TEST-1: Verify that negative work values are rejected
