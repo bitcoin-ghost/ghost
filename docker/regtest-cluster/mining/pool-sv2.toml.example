@@ -1,0 +1,22 @@
+authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+cert_validity_sec = 3600
+listen_address = "0.0.0.0:34256"
+coinbase_reward_script = "addr(bcrt1qxq57rf3y0qu2dv3lxxsfv4sgmx4lcy89yna58g)"
+server_id = 1
+pool_signature = "Ghost RC Pool"
+shares_per_minute = 60.0
+share_batch_size = 10
+supported_extensions = []
+required_extensions = []
+monitoring_address = "127.0.0.1:9090"
+
+[share_webhook]
+url = "http://127.0.0.1:8080/api/internal/shares"
+batch_size = 1
+batch_timeout_ms = 500
+max_retries = 3
+
+[template_provider_type.Sv2Tp]
+address = "127.0.0.1:8442"
+public_key = "9cEG16RXVctVvz3idNecxdPAiRYRc6ewb4XkbvSK9DJmFfNKAjz"
