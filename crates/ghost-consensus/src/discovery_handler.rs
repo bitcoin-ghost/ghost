@@ -445,7 +445,7 @@ fn is_private_or_local_ip(ip_str: &str, is_ipv6: bool) -> bool {
 /// - Invalid ports
 ///
 /// Only accepts valid IPv4 or IPv6 addresses with reasonable ports.
-fn validate_peer_address(address: &str) -> bool {
+fn validate_peer_address(address: &str, allow_private: bool) -> bool {
     // Must not be empty
     if address.is_empty() {
         return false;
@@ -487,7 +487,7 @@ fn validate_peer_address(address: &str) -> bool {
     };
 
     // Reject private/local addresses
-    if is_private_or_local_ip(&ip_str, is_ipv6) {
+    if !allow_private && is_private_or_local_ip(&ip_str, is_ipv6) {
         warn!(
             address = %address,
             "Rejecting private/local IP address"
@@ -578,6 +578,10 @@ pub struct DiscoveryHandler {
     address_rate_limiter: AddressRateLimiter,
     /// Message counter for periodic rate limiter cleanup
     message_count: std::sync::atomic::AtomicU64,
+    /// Allow private/loopback peer IPs. FALSE on mainnet (the SSRF/hijack guard
+    /// stays on); set TRUE on test networks (regtest/testnet/signet) so a local
+    /// or containerised cluster can actually form a mesh.
+    allow_private_peers: bool,
 }
 
 impl DiscoveryHandler {
@@ -591,6 +595,7 @@ impl DiscoveryHandler {
             address_owners: RwLock::new(HashMap::new()),
             connect_callback: None,
             ban_manager: None,
+            allow_private_peers: false,
             rate_limiter: RateLimiter::new(
                 DISCOVERY_MAX_TOKENS,
                 DISCOVERY_RATE_LIMIT,
@@ -616,6 +621,14 @@ impl DiscoveryHandler {
     /// When set, discovery messages from banned nodes are silently ignored.
     pub fn with_ban_manager(mut self, ban_manager: Arc<BanManager>) -> Self {
         self.ban_manager = Some(ban_manager);
+        self
+    }
+
+    /// Allow private/loopback peer IPs. Pass `true` ONLY on test networks
+    /// (regtest/testnet/signet) so a local/containerised cluster can mesh; leave
+    /// `false` on mainnet, where rejecting them is the SSRF/hijack guard.
+    pub fn with_private_peers_allowed(mut self, allow: bool) -> Self {
+        self.allow_private_peers = allow;
         self
     }
 
@@ -820,7 +833,7 @@ impl DiscoveryHandler {
                 return Ok(());
             }
 
-            if !validate_peer_address(&normalized_address) {
+            if !validate_peer_address(&normalized_address, self.allow_private_peers) {
                 warn!(
                     sender = %sender_id_hex,
                     address = %discovery_msg.public_address,
@@ -941,7 +954,7 @@ impl DiscoveryHandler {
             }
 
             // SEC-P2P-4/H-P2P-4: Validate addresses from peer list
-            if !validate_peer_address(&peer_normalized) {
+            if !validate_peer_address(&peer_normalized, self.allow_private_peers) {
                 warn!(
                     sender = %sender_id_hex,
                     peer_address = %peer_normalized,
@@ -1080,43 +1093,43 @@ mod tests {
     fn test_invalid_address_rejected() {
         // Empty address
         assert!(
-            !validate_peer_address(""),
+            !validate_peer_address("", false),
             "Empty address should be rejected"
         );
 
         // No port
         assert!(
-            !validate_peer_address("1.2.3.4"),
+            !validate_peer_address("1.2.3.4", false),
             "Address without port should be rejected"
         );
 
         // Invalid port (not a number)
         assert!(
-            !validate_peer_address("1.2.3.4:abc"),
+            !validate_peer_address("1.2.3.4:abc", false),
             "Non-numeric port should be rejected"
         );
 
         // Port zero
         assert!(
-            !validate_peer_address("1.2.3.4:0"),
+            !validate_peer_address("1.2.3.4:0", false),
             "Port zero should be rejected"
         );
 
         // Port too low (privileged)
         assert!(
-            !validate_peer_address("1.2.3.4:80"),
+            !validate_peer_address("1.2.3.4:80", false),
             "Privileged port should be rejected"
         );
 
         // Port too high
         assert!(
-            !validate_peer_address("1.2.3.4:65535"),
+            !validate_peer_address("1.2.3.4:65535", false),
             "Port > 65000 should be rejected"
         );
 
         // Valid public address should be accepted
         assert!(
-            validate_peer_address("8.8.8.8:8559"),
+            validate_peer_address("8.8.8.8:8559", false),
             "Valid public address should be accepted"
         );
     }
@@ -1126,32 +1139,60 @@ mod tests {
     fn test_loopback_address_rejected() {
         // Loopback addresses
         assert!(
-            !validate_peer_address("127.0.0.1:8559"),
+            !validate_peer_address("127.0.0.1:8559", false),
             "127.0.0.1 should be rejected"
         );
         assert!(
-            !validate_peer_address("localhost:8559"),
+            !validate_peer_address("localhost:8559", false),
             "localhost should be rejected"
         );
 
         // Private network addresses (RFC 1918)
         assert!(
-            !validate_peer_address("192.168.1.1:8559"),
+            !validate_peer_address("192.168.1.1:8559", false),
             "192.168.x.x should be rejected"
         );
         assert!(
-            !validate_peer_address("10.0.0.1:8559"),
+            !validate_peer_address("10.0.0.1:8559", false),
             "10.x.x.x should be rejected"
         );
         assert!(
-            !validate_peer_address("172.16.0.1:8559"),
+            !validate_peer_address("172.16.0.1:8559", false),
             "172.16.x.x should be rejected"
         );
 
         // Bind-all address
         assert!(
-            !validate_peer_address("0.0.0.0:8559"),
+            !validate_peer_address("0.0.0.0:8559", false),
             "0.0.0.0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_private_addresses_accepted_on_test_networks() {
+        // With allow_private = true (set on regtest/testnet/signet, never mainnet),
+        // private/loopback peers are accepted so a local/containerised cluster can
+        // form its mesh. Mainnet still passes false (covered above).
+        assert!(
+            validate_peer_address("127.0.0.1:8559", true),
+            "loopback should be accepted when allow_private"
+        );
+        assert!(
+            validate_peer_address("172.30.0.12:8555", true),
+            "docker-range private IP should be accepted when allow_private"
+        );
+        assert!(
+            validate_peer_address("192.168.1.50:8559", true),
+            "RFC1918 private IP should be accepted when allow_private"
+        );
+        // allow_private must NOT relax the non-IP / malformed guards.
+        assert!(
+            !validate_peer_address("evil.example.com:8559", true),
+            "domain names stay rejected even when allow_private"
+        );
+        assert!(
+            !validate_peer_address("10.0.0.1:0", true),
+            "port 0 stays rejected even when allow_private"
         );
     }
 
@@ -1339,15 +1380,15 @@ mod tests {
     #[test]
     fn test_domain_names_rejected() {
         assert!(
-            !validate_peer_address("example.com:8559"),
+            !validate_peer_address("example.com:8559", false),
             "Domain names should be rejected"
         );
         assert!(
-            !validate_peer_address("node1.ghost.io:8559"),
+            !validate_peer_address("node1.ghost.io:8559", false),
             "Domain names should be rejected"
         );
         assert!(
-            !validate_peer_address("my-node.local:8559"),
+            !validate_peer_address("my-node.local:8559", false),
             "Domain names should be rejected"
         );
     }
@@ -1356,12 +1397,12 @@ mod tests {
     #[test]
     fn test_ipv4_accepted() {
         assert!(
-            validate_peer_address("8.8.8.8:8559"),
+            validate_peer_address("8.8.8.8:8559", false),
             "Valid IPv4 should be accepted"
         );
         // Use a real public IP, not TEST-NET range
         assert!(
-            validate_peer_address("1.1.1.1:8555"),
+            validate_peer_address("1.1.1.1:8555", false),
             "Valid IPv4 should be accepted"
         );
     }
@@ -1371,7 +1412,7 @@ mod tests {
     fn test_ipv6_accepted() {
         // Use real global unicast addresses, not documentation range
         assert!(
-            validate_peer_address("[2607:f8b0:4004:800::200e]:8559"),
+            validate_peer_address("[2607:f8b0:4004:800::200e]:8559", false),
             "Valid IPv6 with brackets should be accepted"
         );
     }
@@ -1380,7 +1421,7 @@ mod tests {
     #[test]
     fn test_ipv6_loopback_rejected() {
         assert!(
-            !validate_peer_address("[::1]:8559"),
+            !validate_peer_address("[::1]:8559", false),
             "IPv6 loopback should be rejected"
         );
     }
@@ -1389,7 +1430,7 @@ mod tests {
     #[test]
     fn test_ipv6_link_local_rejected() {
         assert!(
-            !validate_peer_address("[fe80::1]:8559"),
+            !validate_peer_address("[fe80::1]:8559", false),
             "IPv6 link-local should be rejected"
         );
     }
@@ -1431,17 +1472,17 @@ mod tests {
     fn test_l9_test_net_rejected() {
         // TEST-NET-1 (192.0.2.0/24)
         assert!(
-            !validate_peer_address("192.0.2.1:8559"),
+            !validate_peer_address("192.0.2.1:8559", false),
             "TEST-NET-1 should be rejected"
         );
         // TEST-NET-2 (198.51.100.0/24)
         assert!(
-            !validate_peer_address("198.51.100.1:8559"),
+            !validate_peer_address("198.51.100.1:8559", false),
             "TEST-NET-2 should be rejected"
         );
         // TEST-NET-3 (203.0.113.0/24)
         assert!(
-            !validate_peer_address("203.0.113.1:8559"),
+            !validate_peer_address("203.0.113.1:8559", false),
             "TEST-NET-3 should be rejected"
         );
     }
@@ -1451,15 +1492,15 @@ mod tests {
     fn test_l9_cgnat_rejected() {
         // 100.64.0.0/10 (Carrier-grade NAT)
         assert!(
-            !validate_peer_address("100.64.0.1:8559"),
+            !validate_peer_address("100.64.0.1:8559", false),
             "CGNAT should be rejected"
         );
         assert!(
-            !validate_peer_address("100.100.100.100:8559"),
+            !validate_peer_address("100.100.100.100:8559", false),
             "CGNAT should be rejected"
         );
         assert!(
-            !validate_peer_address("100.127.255.255:8559"),
+            !validate_peer_address("100.127.255.255:8559", false),
             "CGNAT upper bound should be rejected"
         );
     }
@@ -1468,11 +1509,11 @@ mod tests {
     #[test]
     fn test_l9_multicast_rejected() {
         assert!(
-            !validate_peer_address("224.0.0.1:8559"),
+            !validate_peer_address("224.0.0.1:8559", false),
             "Multicast should be rejected"
         );
         assert!(
-            !validate_peer_address("239.255.255.255:8559"),
+            !validate_peer_address("239.255.255.255:8559", false),
             "Multicast should be rejected"
         );
     }
@@ -1481,11 +1522,11 @@ mod tests {
     #[test]
     fn test_l9_future_reserved_rejected() {
         assert!(
-            !validate_peer_address("240.0.0.1:8559"),
+            !validate_peer_address("240.0.0.1:8559", false),
             "Future reserved should be rejected"
         );
         assert!(
-            !validate_peer_address("250.0.0.1:8559"),
+            !validate_peer_address("250.0.0.1:8559", false),
             "Future reserved should be rejected"
         );
     }
@@ -1495,11 +1536,11 @@ mod tests {
     fn test_l9_benchmark_rejected() {
         // 198.18.0.0/15 (Benchmark testing)
         assert!(
-            !validate_peer_address("198.18.0.1:8559"),
+            !validate_peer_address("198.18.0.1:8559", false),
             "Benchmark range should be rejected"
         );
         assert!(
-            !validate_peer_address("198.19.255.255:8559"),
+            !validate_peer_address("198.19.255.255:8559", false),
             "Benchmark range should be rejected"
         );
     }
@@ -1509,11 +1550,11 @@ mod tests {
     fn test_l9_ipv6_doc_rejected() {
         // 2001:db8::/32 (Documentation)
         assert!(
-            !validate_peer_address("[2001:db8::1]:8559"),
+            !validate_peer_address("[2001:db8::1]:8559", false),
             "IPv6 documentation range should be rejected"
         );
         assert!(
-            !validate_peer_address("[2001:db8:1234::1]:8559"),
+            !validate_peer_address("[2001:db8:1234::1]:8559", false),
             "IPv6 documentation range should be rejected"
         );
     }
@@ -1522,7 +1563,7 @@ mod tests {
     #[test]
     fn test_l9_ipv6_multicast_rejected() {
         assert!(
-            !validate_peer_address("[ff02::1]:8559"),
+            !validate_peer_address("[ff02::1]:8559", false),
             "IPv6 multicast should be rejected"
         );
     }
@@ -1532,7 +1573,7 @@ mod tests {
     fn test_l9_6to4_rejected() {
         // 2002::/16 (6to4 tunneling, deprecated)
         assert!(
-            !validate_peer_address("[2002::1]:8559"),
+            !validate_peer_address("[2002::1]:8559", false),
             "6to4 tunneling should be rejected"
         );
     }
@@ -1542,17 +1583,17 @@ mod tests {
     fn test_l9_public_ips_accepted() {
         // Google DNS
         assert!(
-            validate_peer_address("8.8.8.8:8559"),
+            validate_peer_address("8.8.8.8:8559", false),
             "Google DNS should be accepted"
         );
         // Cloudflare DNS
         assert!(
-            validate_peer_address("1.1.1.1:8559"),
+            validate_peer_address("1.1.1.1:8559", false),
             "Cloudflare DNS should be accepted"
         );
         // Random public IP
         assert!(
-            validate_peer_address("93.184.216.34:8559"),
+            validate_peer_address("93.184.216.34:8559", false),
             "Public IP should be accepted"
         );
     }
