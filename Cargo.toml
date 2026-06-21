@@ -82,7 +82,7 @@ exclude = []
 # Use scripts/build-all-wallets.sh to build all wallet types.
 
 [workspace.package]
-version = "1.8.0"
+version = "1.10.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Bitcoin Ghost Team"]

@@ -24,7 +24,7 @@
   <img src="https://img.shields.io/badge/Rust-1.75+-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust" />
   <a href="https://github.com/bitcoin-ghost/ghost/actions"><img src="https://img.shields.io/github/actions/workflow/status/bitcoin-ghost/ghost/ci.yml?style=for-the-badge&label=CI" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="License" /></a>
-  <img src="https://img.shields.io/badge/version-1.8.0-green?style=for-the-badge" alt="Version" />
+  <img src="https://img.shields.io/badge/version-1.10.0-green?style=for-the-badge" alt="Version" />
 </p>
 
 <p>
