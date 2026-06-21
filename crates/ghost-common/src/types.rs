@@ -268,6 +268,20 @@ pub struct ShareProof {
     pub signature: Option<Vec<u8>>,
 }
 
+/// Map an `f64` to the value it deserializes to after a serde_json round-trip.
+///
+/// serde_json's f64 (de)serialization is not guaranteed bit-exact, so a value
+/// signed before serialization can deserialize ~1 ULP off on a peer. This
+/// round-trip is idempotent, so applying it on both the signer and the verifier
+/// yields the identical value that actually crossed the wire — used by
+/// `ShareProof::signing_bytes` so GHOST-09 signatures survive gossip.
+fn canonical_json_f64(x: f64) -> f64 {
+    serde_json::to_string(&x)
+        .ok()
+        .and_then(|s| serde_json::from_str::<f64>(&s).ok())
+        .unwrap_or(x)
+}
+
 impl ShareProof {
     /// GHOST-09: canonical bytes the `received_by` node signs. Binds every
     /// credit-relevant field, so a relay that mutates `received_by` (or the
@@ -276,7 +290,15 @@ impl ShareProof {
         let mut m = Vec::with_capacity(120);
         m.extend_from_slice(&self.round_id.to_le_bytes());
         m.extend_from_slice(&self.miner_id);
-        m.extend_from_slice(&self.work.to_le_bytes());
+        // GHOST-09: `work` is an f64 and the proof is gossiped as JSON, but
+        // serde_json's f64 (de)serialization is NOT guaranteed bit-exact (it can
+        // differ by ~1 ULP). Committing to the raw bits would make a verifier's
+        // recomputed signing_bytes differ from the signer's and reject every
+        // share — and then GHOST-02 rejects every payout for lack of shares.
+        // Commit to the JSON-canonical value instead: the round-trip is
+        // idempotent, so signer and verifier agree on the value that crossed the
+        // wire regardless of the original f64's exact bits.
+        m.extend_from_slice(&canonical_json_f64(self.work).to_le_bytes());
         m.extend_from_slice(&self.share_hash);
         m.extend_from_slice(&self.timestamp.to_le_bytes());
         m.extend_from_slice(&self.received_by);
@@ -714,6 +736,39 @@ impl From<&str> for TreasuryAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_share_proof_signature_survives_json_roundtrip() {
+        // GHOST-09 over real transport: a ShareProof signed by `received_by` must
+        // still verify after a serde_json round-trip (gossip serializes the proof
+        // inside ShareProofMessage). If any signed field doesn't round-trip
+        // bit-exactly, peers drop the share as "invalid received_by signature".
+        let id = crate::identity::NodeIdentity::generate();
+        let mut proof = ShareProof {
+            round_id: 7,
+            miner_id: [3u8; 32],
+            difficulty: 2.3305991803113107e-07,
+            work: 2.3305991803113107e-07,
+            share_hash: [5u8; 32],
+            timestamp: 1_781_964_482,
+            received_by: id.node_id(),
+            template_id: Some([9u8; 32]),
+            payout_address: Some("bcrt1qexample".to_string()),
+            signature: None,
+        };
+        proof.sign(&id);
+        assert!(
+            proof.has_valid_received_by_signature(),
+            "signature must be valid immediately after signing"
+        );
+
+        let json = serde_json::to_vec(&proof).expect("serialize");
+        let proof2: ShareProof = serde_json::from_slice(&json).expect("deserialize");
+        assert!(
+            proof2.has_valid_received_by_signature(),
+            "signature must still verify after a serde_json round-trip (gossip path)"
+        );
+    }
 
     #[test]
     fn test_node_capabilities_shares() {

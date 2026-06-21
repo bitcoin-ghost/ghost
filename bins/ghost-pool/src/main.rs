@@ -3614,10 +3614,23 @@ async fn main() -> Result<()> {
         hasher.update(share.miner_id.as_bytes());
         let miner_hash: [u8; 32] = hasher.finalize().into();
 
+        // The SV2/SRI layer reports share_hash in big-endian DISPLAY order (PoW
+        // leading zeros at the front). The pool's difficulty machinery
+        // (DifficultyCalculator::difficulty_from_hash / C4) and the in-process
+        // harness both read the hash in INTERNAL (little-endian) order, with the
+        // leading zeros at the HIGH-index end. Store it internal so cross-node C4
+        // validation on the elders reads the real difficulty instead of a
+        // near-zero one (which made them reject every gossiped share).
         let mut share_hash_bytes = [0u8; 32];
         if let Ok(decoded) = hex::decode(&share.share_hash) {
-            let len = decoded.len().min(32);
-            share_hash_bytes[..len].copy_from_slice(&decoded[..len]);
+            if decoded.len() == 32 {
+                for (i, b) in decoded.iter().rev().enumerate() {
+                    share_hash_bytes[i] = *b; // display (big-endian) -> internal (little-endian)
+                }
+            } else {
+                let len = decoded.len().min(32);
+                share_hash_bytes[..len].copy_from_slice(&decoded[..len]);
+            }
         }
 
         let mut proof = ghost_common::types::ShareProof {

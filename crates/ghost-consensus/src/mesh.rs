@@ -1509,6 +1509,22 @@ impl MeshNetwork {
 
     /// Broadcast a message to all peers
     pub async fn broadcast(&self, envelope: MessageEnvelope) -> GhostResult<usize> {
+        // ZMQ PUB/SUB broadcast messages (HealthPing, Discovery — and every
+        // message type when Noise is disabled) are published on the PUB socket
+        // exactly once, independent of the known-peer set: the publisher fans
+        // them out to every topic-subscribed peer, so one enqueue reaches all.
+        //
+        // Iterating get_connected_peers() here was a self-isolation deadlock:
+        // with zero peers it published ZERO times, and since a peer's liveness
+        // is only refreshed by *received* HealthPings, a node that aged out all
+        // peers stopped emitting HealthPings and could never be re-discovered or
+        // refresh its own set. Publishing unconditionally lets it recover.
+        if !self.should_use_noise(envelope.msg_type) {
+            self.publish_zmq_broadcast(&envelope)?;
+            return Ok(1);
+        }
+
+        // Sensitive messages use point-to-point Noise to each known peer.
         let peers = self.peers.get_connected_peers(60);
         let mut sent = 0;
 
@@ -1830,6 +1846,35 @@ impl MeshNetwork {
     ///
     /// Automatically routes messages through Noise encryption for sensitive message types
     /// (MPC, Elder, Payout, ZK, etc.) or ZMQ for broadcast messages (Discovery, HealthPing).
+    /// Publish a ZMQ broadcast envelope on the PUB socket exactly once.
+    ///
+    /// The publisher task ignores the per-message endpoint and routes purely by
+    /// the topic prefix, so a single enqueue reaches every connected subscriber.
+    /// This is deliberately independent of `get_connected_peers()` so HealthPing
+    /// and Discovery keep flowing even when this node has momentarily lost all
+    /// peers — which is exactly how it recovers and re-populates its peer set.
+    fn publish_zmq_broadcast(&self, envelope: &MessageEnvelope) -> GhostResult<()> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err(GhostError::NotRunning("Mesh network not running".into()));
+        }
+        let data = envelope
+            .serialize()
+            .map_err(|e| GhostError::Serialization(e.to_string()))?;
+        // Endpoint is ignored by the publisher; it routes by topic prefix.
+        match self.outbound_tx.try_send((String::new(), data)) {
+            Ok(_) => {
+                self.messages_sent.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(GhostError::P2PMessage(
+                "M-8: Outbound channel full - apply backpressure".to_string(),
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(GhostError::NotRunning("Outbound channel closed".into()))
+            }
+        }
+    }
+
     pub async fn send_to_peer(&self, peer: &Peer, envelope: &MessageEnvelope) -> GhostResult<()> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(GhostError::NotRunning("Mesh network not running".into()));
@@ -2700,14 +2745,10 @@ impl MeshNetwork {
         info!(address = %address, "Connecting to peer");
 
         // Generate a temporary node ID from the address hash
-        // (actual node ID will be learned from first health ping received)
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        address.hash(&mut hasher);
-        let hash = hasher.finish();
-        let mut temp_node_id = [0u8; 32];
-        temp_node_id[..8].copy_from_slice(&hash.to_le_bytes());
-        temp_node_id[8..16].copy_from_slice(&hash.to_be_bytes());
+        // (actual node ID will be learned from first health ping received).
+        // Shared derivation so upsert_peer's same-host reconcile recognises this
+        // exact stub and retires it when the real identity arrives.
+        let temp_node_id = crate::peer::placeholder_node_id(address);
 
         // Create a new peer entry - mark as Connected initially
         // (stale detection will mark disconnected if we don't hear from them)
@@ -3565,6 +3606,55 @@ mod tests {
 
         let result = MeshNetwork::try_new(identity, config);
         assert!(result.is_ok(), "M-2: Disabled Noise should always succeed");
+    }
+
+    #[tokio::test]
+    async fn test_zmq_broadcast_publishes_with_zero_peers() {
+        // Regression (self-isolation deadlock): ZMQ PUB/SUB broadcast messages
+        // (HealthPing, Discovery) must be published on the PUB socket even when
+        // this node currently knows zero connected peers — the publisher fans
+        // them out to every topic-subscribed peer, so a single publish suffices.
+        //
+        // The previous broadcast() iterated get_connected_peers() and called
+        // send_to_peer once per peer, so with zero peers it published ZERO
+        // times. A node that aged out all its peers (HealthPings are only
+        // refreshed by *received* HealthPings) therefore stopped emitting
+        // HealthPings entirely and could never be re-discovered or refresh its
+        // own peer set — a permanent, unrecoverable isolation.
+        let identity = Arc::new(NodeIdentity::generate());
+        let mut config = MeshConfig::default();
+        config.noise_enabled = false; // exercise the ZMQ (plaintext) broadcast path
+        config.noise_required = false;
+        let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+        mesh.running.store(true, Ordering::SeqCst);
+
+        // Precondition: genuinely zero connected peers.
+        assert_eq!(
+            mesh.peers.get_connected_peers(60).len(),
+            0,
+            "precondition: no connected peers"
+        );
+
+        let envelope = mesh
+            .create_envelope_raw(MessageType::HealthPing, vec![0u8; 4])
+            .expect("create envelope");
+        let published = mesh.broadcast(envelope).await.expect("broadcast ok");
+
+        assert_eq!(
+            published, 1,
+            "HealthPing must publish exactly once with zero peers (regression: was 0 → deadlock)"
+        );
+
+        // The publish actually reached the outbound channel feeding the PUB socket.
+        let mut rx = mesh
+            .outbound_rx
+            .write()
+            .take()
+            .expect("outbound rx present");
+        assert!(
+            rx.try_recv().is_ok(),
+            "a PUB-socket message must be enqueued even with zero peers"
+        );
     }
 
     #[test]

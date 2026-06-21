@@ -262,6 +262,120 @@ mod tests {
     }
 
     #[test]
+    fn remote_share_with_senders_template_is_accepted_local_stays_validated() {
+        // M-MINE-1 validates the template against THIS node's templates. A gossiped
+        // share (received_by = another node) was mined against the SENDER's coinbase
+        // template — which this node cannot know — so M-MINE-1 must NOT reject it:
+        // its trust anchors are the GHOST-09 signature (the signer vouches), C4 PoW,
+        // and C5 dedup, and the signer already validated its own template. Without
+        // this, every cross-node share is dropped as StaleTemplate and GHOST-02
+        // rejects every payout once enforcement activates.
+        let unknown_template = [0x33u8; 32]; // NOT the node's TPL
+
+        // Remote share: received_by = a different node, signed by it, sender's template.
+        let remote_signer = NodeIdentity::generate();
+        let mut remote = ShareProof {
+            round_id: 1,
+            miner_id: [9u8; 32],
+            difficulty: 1.0,
+            work: 1.0,
+            share_hash: diff1_hash(101),
+            timestamp: 0,
+            received_by: remote_signer.node_id(),
+            template_id: Some(unknown_template),
+            payout_address: None,
+            signature: None,
+        };
+        remote.sign(&remote_signer);
+        let rm = round_manager(); // template = TPL, our_node_id = (internal)
+        assert!(
+            rm.handle_share_proof(remote.clone()).is_ok(),
+            "a gossiped share carrying the sender's (locally-unknown) template must be accepted"
+        );
+        assert!(rm.round_share_hashes(1).contains(&remote.share_hash));
+
+        // Local share: received_by = self, unknown template → STILL stale-rejected.
+        let local_id = NodeIdentity::generate();
+        let cfg = RoundConfig {
+            share_difficulty: 1.0,
+            network_difficulty: 1_000_000.0,
+            ..RoundConfig::default()
+        };
+        let rm_local = Arc::new(RoundManager::new(local_id.node_id(), cfg));
+        rm_local.set_template_id(TPL);
+        let mut local = ShareProof {
+            round_id: 1,
+            miner_id: [9u8; 32],
+            difficulty: 1.0,
+            work: 1.0,
+            share_hash: diff1_hash(102),
+            timestamp: 0,
+            received_by: local_id.node_id(),
+            template_id: Some(unknown_template),
+            payout_address: None,
+            signature: None,
+        };
+        local.sign(&local_id);
+        assert!(
+            matches!(
+                rm_local.handle_share_proof(local),
+                Err(crate::round::ShareError::StaleTemplate)
+            ),
+            "a LOCAL share (received_by == self) with an unknown template is still stale-rejected"
+        );
+    }
+
+    #[test]
+    fn remote_share_work_consistency_uses_absolute_model_not_pool_min() {
+        // M-9 work-consistency must validate proof.work against proof.difficulty
+        // (the ABSOLUTE model: work == difficulty, exactly as the SRI/local path
+        // `record_share` credits it), NOT proof.difficulty / share_difficulty. The
+        // relative model assumes a pool minimum of 1; with the PRODUCTION DEFAULT
+        // share_difficulty=1000 it computed calculated_work = work/1000 and rejected
+        // every gossiped share, making the elders hold 0 shares and GHOST-02 reject
+        // every payout once enforcement activates. C4 already proves the hash meets
+        // proof.difficulty, so work==difficulty is fully PoW-bounded.
+        let producer = NodeIdentity::generate();
+        let cfg = RoundConfig {
+            share_difficulty: 1000.0, // PRODUCTION DEFAULT (round_manager() uses 1.0 and hides the bug)
+            network_difficulty: 1_000_000.0,
+            ..RoundConfig::default()
+        };
+        let rm = Arc::new(RoundManager::new(NodeIdentity::generate().node_id(), cfg));
+        rm.set_template_id(TPL);
+
+        let mut p = ShareProof {
+            round_id: 1,
+            miner_id: [9u8; 32],
+            difficulty: 1.0,
+            work: 1.0, // absolute: work == difficulty (what the SRI sets)
+            share_hash: diff1_hash(50),
+            timestamp: 0,
+            received_by: producer.node_id(),
+            template_id: Some(TPL),
+            payout_address: None,
+            signature: None,
+        };
+        p.sign(&producer);
+        assert!(
+            rm.handle_share_proof(p.clone()).is_ok(),
+            "a gossiped share with work==difficulty must pass M-9 regardless of the local share_difficulty"
+        );
+
+        // A share that claims more work than its difficulty justifies is still rejected.
+        let mut inflated = p.clone();
+        inflated.work = 10.0; // 10x the claimed difficulty
+        inflated.sign(&producer);
+        assert!(
+            matches!(
+                rm.handle_share_proof(inflated),
+                Err(crate::round::ShareError::WorkValueTooHigh { .. })
+            ),
+            "claiming work that exceeds the difficulty is still rejected (no inflation)"
+        );
+    }
+
+    #[test]
     fn proofs_missing_from_excludes_known_hashes() {
         let producer = NodeIdentity::generate();
         let rm = round_manager();
