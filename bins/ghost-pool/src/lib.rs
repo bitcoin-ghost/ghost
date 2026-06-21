@@ -87,11 +87,14 @@ pub mod convergence;
 /// (GHOST-02) — making it behaviour-identical to the pre-audit binary in a mixed
 /// mesh. After it, both enforcements are live everywhere at once.
 ///
-/// PLACEHOLDER — the operator MUST set this to roughly `(current tip + ~150)`
-/// (~24h of blocks past expected full-roll completion) in the activation build.
-/// The default is far enough in the future that an accidental deploy stays in
-/// the safe, non-enforcing dark mode.
-pub const CLUSTER_ENFORCEMENT_HEIGHT: u64 = 999_999_999;
+/// ACTIVATION HEIGHT — set for the audit-cluster rollout. Chosen at `954_736`
+/// (the chain tip when this was cut) + ~464 blocks ≈ 77h of headroom, leaving
+/// well over 24h between the completion of the canary roll (VM4→VM1, a few hours)
+/// and the gate firing, so the whole fleet is on the audit binary in dark mode
+/// before enforcement turns on everywhere at once. If the deploy slips far enough
+/// that the tip approaches this height before the roll completes, bump this value
+/// and rebuild — the binary must reach every VM while still below the gate.
+pub const CLUSTER_ENFORCEMENT_HEIGHT: u64 = 955_200;
 
 /// GhostGlyph P2P handler for visual identity registration.
 pub mod glyph_handler;
