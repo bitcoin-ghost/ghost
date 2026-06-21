@@ -2745,14 +2745,10 @@ impl MeshNetwork {
         info!(address = %address, "Connecting to peer");
 
         // Generate a temporary node ID from the address hash
-        // (actual node ID will be learned from first health ping received)
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        address.hash(&mut hasher);
-        let hash = hasher.finish();
-        let mut temp_node_id = [0u8; 32];
-        temp_node_id[..8].copy_from_slice(&hash.to_le_bytes());
-        temp_node_id[8..16].copy_from_slice(&hash.to_be_bytes());
+        // (actual node ID will be learned from first health ping received).
+        // Shared derivation so upsert_peer's same-host reconcile recognises this
+        // exact stub and retires it when the real identity arrives.
+        let temp_node_id = crate::peer::placeholder_node_id(address);
 
         // Create a new peer entry - mark as Connected initially
         // (stale detection will mark disconnected if we don't hear from them)

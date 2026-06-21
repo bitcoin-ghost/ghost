@@ -59,6 +59,25 @@ fn extract_host_from_address(address: &str) -> String {
     address.to_string()
 }
 
+/// Compute the deterministic bootstrap-placeholder node_id for a seed address.
+///
+/// `MeshNetwork::connect_peer` registers a not-yet-identified seed peer under a
+/// temporary node_id derived purely from its address, until the real identity is
+/// learned from the first health ping. This is the single source of that
+/// derivation: `connect_peer` calls it to mint the stub, and `upsert_peer`'s
+/// same-host reconcile calls it to recognise such a stub by exact identity — so a
+/// real peer sharing a host is never mistaken for (and evicted as) a placeholder.
+pub(crate) fn placeholder_node_id(address: &str) -> NodeId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    address.hash(&mut hasher);
+    let hash = hasher.finish();
+    let mut node_id = [0u8; 32];
+    node_id[..8].copy_from_slice(&hash.to_le_bytes());
+    node_id[8..16].copy_from_slice(&hash.to_be_bytes());
+    node_id
+}
+
 /// Extract the /24 subnet prefix from an address string.
 /// Returns `Some("a.b.c")` for IPv4 addresses, `None` for IPv6 or unparseable.
 fn extract_ipv4_subnet(address: &str) -> Option<String> {
@@ -112,19 +131,25 @@ impl PeerManager {
             return;
         }
 
-        // Reconcile by host: one physical host belongs to one identity. If a
-        // DIFFERENT node_id already holds this exact host, it is a superseded
-        // bootstrap placeholder — the seed-connect path ("Connecting to peer")
-        // registers peers with a temp node_id = hash(address) until the real
-        // identity is learned via discovery (on a different port). Remove the
-        // stale entry so the real identity can take the slot. Without this,
-        // co-located nodes (all on one /24 — a docker bridge or any test
-        // cluster) exhaust MAX_PEERS_PER_SUBNET with placeholders and the real
-        // identities are rejected below, leaving peers that HealthPings (keyed
-        // by the real node_id) can never refresh — so they age out of
-        // get_connected_peers and encrypted broadcasts reach zero peers.
-        // Matching the EXACT host (not the /24) keeps Sybil protection intact:
-        // genuinely distinct hosts still count toward the subnet limit.
+        // Reconcile a superseded bootstrap placeholder for this host. The
+        // seed-connect path ("Connecting to peer") registers peers with a temp
+        // node_id = placeholder_node_id(address) until the real identity is
+        // learned via discovery (on a different port). Keyed purely by node_id,
+        // the placeholder and the later real identity for the same host become
+        // two entries — and on a shared /24 (a docker bridge or any co-located
+        // cluster) three such placeholders exhaust MAX_PEERS_PER_SUBNET, so the
+        // real identities are rejected below and never land. HealthPings, keyed
+        // by the real node_id, can never refresh the placeholders, which age out
+        // of get_connected_peers, leaving encrypted broadcasts with zero peers.
+        //
+        // Remove ONLY a same-host entry that is itself a placeholder — i.e. whose
+        // node_id matches the address-derived stub. A same-host entry with any
+        // other node_id is a real peer and is left untouched: PeerManager indexes
+        // by node_id and deliberately allows duplicate addresses, with address-
+        // hijack protection living one layer up in DiscoveryHandler. Evicting a
+        // real peer here would itself be a hijack vector (a later claimant
+        // displacing the rightful owner of an address), so the reconcile is
+        // strictly scoped to the bootstrap stub it was written to retire.
         let new_host = extract_host_from_address(&peer.public_address);
         if !new_host.is_empty() {
             let superseded: Vec<NodeId> = peers
@@ -132,6 +157,7 @@ impl PeerManager {
                 .filter(|(nid, p)| {
                     **nid != peer.node_id
                         && extract_host_from_address(&p.public_address) == new_host
+                        && **nid == placeholder_node_id(&p.public_address)
                 })
                 .map(|(nid, _)| *nid)
                 .collect();
@@ -533,8 +559,12 @@ mod tests {
         // encrypted broadcast reached zero peers. upsert_peer must reconcile by
         // host: a real identity supersedes the same-host placeholder.
         let mgr = PeerManager::new([0u8; 32], 100);
-        for i in 10u8..13 {
-            let mut p = Peer::new([i; 32], format!("172.30.0.{}:8555", i));
+        // Genuine bootstrap stubs: node_id is the address-derived placeholder,
+        // exactly as connect_peer mints them — three fill the /24 quota.
+        let placeholder_addrs: Vec<String> =
+            (10u8..13).map(|i| format!("172.30.0.{}:8555", i)).collect();
+        for addr in &placeholder_addrs {
+            let mut p = Peer::new(placeholder_node_id(addr), addr.clone());
             p.state = PeerState::Connected;
             mgr.upsert_peer(p);
         }
@@ -557,7 +587,8 @@ mod tests {
             "real identity must supersede the same-host placeholder despite the subnet limit"
         );
         assert!(
-            !all.iter().any(|p| p.node_id == [10u8; 32]),
+            !all.iter()
+                .any(|p| p.node_id == placeholder_node_id("172.30.0.10:8555")),
             "the superseded same-host placeholder must be removed"
         );
         // A genuinely new host in the same /24 is still capped (Sybil protection intact).
@@ -567,6 +598,45 @@ mod tests {
         assert!(
             !mgr.get_all_peers().iter().any(|p| p.node_id == [200u8; 32]),
             "a new distinct host in a full /24 must still be rejected (Sybil cap holds)"
+        );
+    }
+
+    #[test]
+    fn test_upsert_does_not_evict_real_same_host_peer() {
+        // Hijack-safety: the same-host reconcile must retire ONLY address-derived
+        // placeholders, never a real peer. Two distinct real identities sharing an
+        // address both survive — PeerManager indexes by node_id and allows
+        // duplicate addresses; address-hijack protection is one layer up in
+        // DiscoveryHandler. This mirrors integration test 941 at the unit level so
+        // a future reconcile change can't silently reintroduce the eviction vector.
+        let mgr = PeerManager::new([0xFFu8; 32], 100);
+
+        let real_a = [10u8; 32];
+        let real_b = [20u8; 32];
+        // Neither node_id is the address-derived placeholder for this host.
+        assert_ne!(real_a, placeholder_node_id("1.2.3.4:8555"));
+        assert_ne!(real_b, placeholder_node_id("1.2.3.4:8555"));
+
+        let mut pa = Peer::new(real_a, "1.2.3.4:8555".to_string());
+        pa.state = PeerState::Connected;
+        mgr.upsert_peer(pa);
+        let mut pb = Peer::new(real_b, "1.2.3.4:8555".to_string());
+        pb.state = PeerState::Connected;
+        mgr.upsert_peer(pb);
+
+        let all = mgr.get_all_peers();
+        assert!(
+            all.iter().any(|p| p.node_id == real_a),
+            "first real peer at the shared host must NOT be evicted by the second"
+        );
+        assert!(
+            all.iter().any(|p| p.node_id == real_b),
+            "second real peer at the shared host must be admitted"
+        );
+        assert_eq!(
+            mgr.peer_count(),
+            2,
+            "two real peers may share an address; the reconcile only retires placeholders"
         );
     }
 
