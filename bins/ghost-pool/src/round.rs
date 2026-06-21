@@ -561,9 +561,16 @@ impl RoundManager {
             }
         };
 
-        // M-MINE-1: Validate template is current or recent
-        // This prevents accepting shares for old/stale templates
-        if !self.is_valid_template(&template_id) {
+        // M-MINE-1: Validate template is current or recent — but ONLY for shares
+        // THIS node received/signed (received_by == our_node_id). A gossiped share
+        // (received_by = another node) was mined against the SENDER's coinbase
+        // template, which this node cannot know or validate; its trust anchors are
+        // the GHOST-09 signature (the signer vouches for the credit), C4 PoW, and
+        // C5 dedup, and the signer already validated its own template before
+        // signing. Enforcing the local-template check on remote shares would drop
+        // every cross-node share as stale and make GHOST-02 reject every payout
+        // once enforcement activates.
+        if proof.received_by == self.our_node_id && !self.is_valid_template(&template_id) {
             warn!(
                 template_id = %hex::encode(&template_id[..8]),
                 round_id = proof.round_id,
@@ -579,39 +586,41 @@ impl RoundManager {
             return Err(ShareError::InvalidShareHash);
         }
 
-        // C4: Verify work consistency - calculated work should match claimed work
-        // M-9 SECURITY FIX: Reduced tolerance from 0.1% to 0.01%
+        // C4: Verify work consistency - claimed work must match the claimed difficulty.
+        // M-9 SECURITY FIX: tight 0.01% tolerance limits any gaming to ≤0.1% pool
+        // inflation per round; combined with L-7 cumulative tracking (1% cap/miner)
+        // this prevents meaningful inflation.
         //
-        // Previous 0.1% per-share tolerance allowed systematic gaming:
-        // - 1000 shares/round * 0.1% = 1% total pool inflation possible
-        // - Attackers could claim 1.001x their actual work on every share
-        //
-        // New 0.01% tolerance limits total gaming potential to:
-        // - 1000 shares/round * 0.01% = 0.1% maximum pool inflation
-        // - This is acceptable for floating-point rounding tolerance
-        //
-        // Combined with L-7 cumulative tolerance tracking (1% cap per miner),
-        // this prevents any meaningful payout inflation.
-        let calculated_work = diff_calc.calculate_work(proof.difficulty);
+        // The work model is ABSOLUTE: a share's work == its difficulty, exactly as
+        // the SRI/local path `record_share` credits it (and as main.rs builds the
+        // proof: `difficulty = work = share.work`). C4 above already proved the hash
+        // meets `proof.difficulty`, so binding `proof.work` to `proof.difficulty`
+        // bounds the credited work by real PoW. The previous relative model
+        // (`difficulty / share_difficulty`) assumed a pool minimum of 1; with the
+        // production default share_difficulty it computed `work/1000` and rejected
+        // EVERY gossiped share, leaving elders with 0 shares so GHOST-02 rejected
+        // every payout once enforcement activated. Validate against difficulty
+        // directly so the cross-node ledger matches the local ledger.
+        let expected_work = proof.difficulty;
         // M3: Guard against NaN/Inf from degenerate difficulty values
-        if !calculated_work.is_finite() || calculated_work <= 0.0 {
+        if !expected_work.is_finite() || expected_work <= 0.0 {
             return Err(ShareError::WorkValueTooHigh {
                 got: proof.work,
-                max: calculated_work,
+                max: expected_work,
             });
         }
-        let per_share_tolerance = calculated_work * 0.0001; // M-9: 0.01% tolerance (was 0.1%)
-        let work_difference = proof.work - calculated_work;
+        let per_share_tolerance = expected_work * 0.0001; // M-9: 0.01% tolerance
+        let work_difference = proof.work - expected_work;
         if work_difference.abs() > per_share_tolerance {
             tracing::warn!(
                 claimed_work = proof.work,
-                calculated_work = calculated_work,
+                expected_work = expected_work,
                 tolerance = per_share_tolerance,
-                "M-9: Share proof work mismatch exceeds 0.01% tolerance"
+                "M-9: Share proof work does not match claimed difficulty (>0.01% tolerance)"
             );
             return Err(ShareError::WorkValueTooHigh {
                 got: proof.work,
-                max: calculated_work,
+                max: expected_work,
             });
         }
 
@@ -655,7 +664,7 @@ impl RoundManager {
             let tracker = tolerance_trackers.entry(proof.round_id).or_default();
 
             if let Err(exploitation_percent) =
-                tracker.record_tolerance(&miner_id, calculated_work, work_difference)
+                tracker.record_tolerance(&miner_id, expected_work, work_difference)
             {
                 // M-29: Record this tolerance limit hit in cross-round tracker
                 {
@@ -701,9 +710,14 @@ impl RoundManager {
             .entry(proof.round_id)
             .or_insert_with(|| RoundShares::new(proof.round_id, 0));
 
-        // Add miner work using the CALCULATED work, not claimed work
+        // Credit the miner with proof.work (absolute model: work == difficulty,
+        // validated above and PoW-bounded by C4). This MUST match what the local
+        // SRI path `record_share` credits (raw `share.work`); recording the
+        // relative `calculate_work` value here instead diverged the cross-node
+        // ledger by a factor of `share_difficulty`, so GHOST-02's recompute never
+        // matched the proposer once enforcement activated.
         let miner_id = hex::encode(&proof.miner_id[..8]);
-        round.add_miner_work(&miner_id, calculated_work);
+        round.add_miner_work(&miner_id, proof.work);
 
         // Credit the node that received it
         round.increment_node_shares(&proof.received_by);
@@ -725,7 +739,7 @@ impl RoundManager {
         debug!(
             round_id = proof.round_id,
             miner = %miner_id,
-            work = calculated_work,
+            work = proof.work,
             from_node = ?hex::encode(&proof.received_by[..4]),
             "Processed share proof (verified)"
         );
