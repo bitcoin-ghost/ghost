@@ -1,0 +1,22 @@
+downstream_address = "0.0.0.0"
+downstream_port = 3333
+max_supported_version = 2
+min_supported_version = 2
+downstream_extranonce2_size = 4
+user_identity = "ghost_miner"
+aggregate_channels = false
+supported_extensions = []
+required_extensions = []
+monitoring_address = "0.0.0.0:9092"
+
+[downstream_difficulty_config]
+min_individual_miner_hashrate = 1000.0
+shares_per_minute = 60.0
+enable_vardiff = true
+idle_timeout_secs = 600
+job_keepalive_interval_secs = 60
+
+[[upstreams]]
+address = "172.30.0.11"
+port = 34256
+authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"

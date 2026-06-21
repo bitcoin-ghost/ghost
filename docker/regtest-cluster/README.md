@@ -117,6 +117,45 @@ Only with every box ticked should the gated rolling deploy (`plan` §4) proceed.
 
 ---
 
+### ⛔ Hard blocker found 2026-06-20 — the mesh rejects private IPs by design
+
+A real-binary cluster **cannot form its consensus mesh on a local/docker/private
+network.** `discovery_handler::validate_peer_address` → `is_private_or_local_ip`
+**rejects every loopback/private peer address** (127.x, 10.x, 172.16/12,
+192.168.x) with `Rejecting invalid peer address from discovery` (same family as
+the M-11 SSRF rule that refuses `127.0.0.1`). So peers never enter each other's
+Noise peer set, MPC contributions broadcast to `sent=0`, the ceremony stalls at
+**Elder #1 only**, and there is no BFT quorum — hence no payout.
+
+This is *why* the production validation framework (`tests/cluster_chaos`) targets
+the **real VMs with public IPs**, not a local cluster. To run THIS regtest
+cluster to a payout you must either:
+1. give the nodes **public/routable IPs** (4 separate hosts), or
+2. run a **throwaway dry-run binary patched** to allow private IPs in
+   `validate_peer_address` (test-only; never ship it), or
+3. accept that the **in-process harness** (`tests/integration_tests/mesh_cluster.rs`)
+   is the deterministic consensus check, and use this cluster only for the
+   transport/boot smoke test.
+
+Also note: the `ghostd` binary used here lacks ZMQ (`getzmqnotifications` →
+method-not-found), so block notifications come via RPC polling only; and the
+SV2 mining stack (translator + a miner) still needs wiring to drive a real
+block → payout.
+
+### What DID validate (real binary, container-per-node)
+boots; per-node config schema confirmed (see below); distinct identities;
+TLS/RPC + ZMQ localhost requirements satisfied via a `socat` sidecar; P2P mesh
+*reachable* (peers can dial each other); **MPC genesis runs and pool1 becomes
+Elder #1**; `/health` healthy. The wall is purely the private-IP discovery rule.
+
+### Config schema (validated against the real binary)
+`[network]` requires `signing_key` (64-hex) and an **IP** `public_address`
+(hostnames are rejected). `[pool]` requires `payout_interval_blocks` +
+`treasury_fee_percent`. `[ghost_pay]` must be **absent** (it defaults) or fully
+populated (`enabled=false` alone fails on `missing field virtual_block_secs`).
+`seed_nodes` use the `:8555` share-propagation port. RPC/ZMQ endpoints must be
+`localhost` (TLS otherwise) — proxy a remote ghostd to `127.0.0.1` per node.
+
 ### Status / caveats — partially shaken out 2026-06-20
 The binary side was **validated against the real ghost-pool** in a local 4-process
 regtest run; the config schema here reflects what that surfaced (the docker

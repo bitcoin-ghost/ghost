@@ -1466,7 +1466,10 @@ async fn main() -> Result<()> {
             public_address.clone(),
             Arc::clone(mesh.peers()),
         )
-        .with_connect_callback(connect_callback),
+        .with_connect_callback(connect_callback)
+        // Mainnet keeps the SSRF/hijack guard (rejects private/loopback peers);
+        // test networks allow them so a local/containerised cluster can mesh.
+        .with_private_peers_allowed(!is_mainnet_round),
     );
     mesh.register_handler(Arc::clone(&discovery_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
