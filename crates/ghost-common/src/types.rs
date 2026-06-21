@@ -770,8 +770,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn test_node_capabilities_shares() {
         let mut caps = NodeCapabilities::new();

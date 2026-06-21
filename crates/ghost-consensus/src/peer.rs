@@ -538,7 +538,11 @@ mod tests {
             p.state = PeerState::Connected;
             mgr.upsert_peer(p);
         }
-        assert_eq!(mgr.get_all_peers().len(), 3, "three placeholders fill the /24 quota");
+        assert_eq!(
+            mgr.get_all_peers().len(),
+            3,
+            "three placeholders fill the /24 quota"
+        );
 
         // Real identity for the same host as the first placeholder (172.30.0.10),
         // discovered on the discovery port (:8559) with a different node_id.
