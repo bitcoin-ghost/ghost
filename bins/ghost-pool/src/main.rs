@@ -3337,10 +3337,20 @@ async fn main() -> Result<()> {
     });
 
     // Mesh-wide deduplicated active miner count. Unions local active miner_id
-    // hashes with the most-recent set from each connected peer (60s freshness).
+    // hashes with the most-recent set from each connected peer.
+    //
+    // The freshness window must match the 300s miner-activity window the local
+    // and gossiped sets are computed over (`active_miner_id_hashes(300)`), NOT a
+    // tight 60s. At 60s a peer that simply missed a few ~10s health pings (jitter,
+    // GC, momentary load) was excluded entirely, dropping ALL of its active miners
+    // from the union — so a node would report e.g. 4 of 5 miners, and since the
+    // figure is gossip-derived the whole mesh could undercount at once. Dedup is by
+    // miner_id hash, so a wider window cannot double-count, and a disconnected miner
+    // still ages out at the source node's 300s `last_seen`, so the count stays
+    // honest while becoming robust to transient ping loss.
     let mesh_for_active = Arc::clone(&mesh);
     verification_state = verification_state
-        .with_mesh_active_miners(move || mesh_for_active.mesh_active_miner_count(60) as u32);
+        .with_mesh_active_miners(move || mesh_for_active.mesh_active_miner_count(300) as u32);
 
     // Mesh-wide pool hashrate (TH/s) — sum of every node's own realized
     // hashrate (60s peer freshness). One term per node, scoped by received_by

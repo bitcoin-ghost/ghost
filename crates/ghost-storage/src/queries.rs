@@ -2333,8 +2333,20 @@ impl Database {
                 .unwrap_or_default()
                 .as_secs() as i64)
                 - window_secs;
+            // Only LOCALLY-CONNECTED miners — those whose miner_id is a real SV1
+            // identity `payout_address.worker` (always contains '.'). The `miners`
+            // table also accumulates the converged cross-node share ledger, where
+            // a replicated share-proof records the miner under `hex(SHA256(id)[..8])`
+            // (16 bare hex chars, no '.'). Counting those would double-count every
+            // miner: once as its full id on its home node, once as the gossip hash
+            // on every node — so 5 real miners read as 10. Each miner connects to
+            // exactly one node, so the mesh union of per-node LOCAL sets is the
+            // true distinct count. (Mirrors the `received_by` scoping in
+            // `local_hashrate_th` that keeps the mesh hashrate from double-counting.)
             let mut stmt = conn
-                .prepare("SELECT miner_id FROM miners WHERE last_seen > ?1")
+                .prepare(
+                    "SELECT miner_id FROM miners WHERE last_seen > ?1 AND instr(miner_id, '.') > 0",
+                )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             let rows = stmt
                 .query_map(params![cutoff], |row| row.get::<_, String>(0))
@@ -2399,9 +2411,13 @@ impl Database {
                 .unwrap_or_default()
                 .as_secs() as i64)
                 - window_secs;
+            // Count only locally-connected miners (real `address.worker` ids).
+            // The `miners` table also holds the converged cross-node share ledger,
+            // where replicated proofs are keyed by `hex(SHA256(id)[..8])` (no '.');
+            // counting those double-counts each miner (see `active_miner_id_hashes`).
             let count: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM miners WHERE last_seen > ?1",
+                    "SELECT COUNT(*) FROM miners WHERE last_seen > ?1 AND instr(miner_id, '.') > 0",
                     params![cutoff],
                     |row| row.get(0),
                 )
@@ -9770,6 +9786,48 @@ mod tests {
             db.get_total_reserved_for_lock("lock1", current_time)
                 .expect("LOW-STOR-8: Failed to get reserved for lock1 after delete"),
             0
+        );
+    }
+
+    #[test]
+    fn test_active_miner_count_excludes_gossiped_ledger_rows() {
+        // Regression: 5 miners read as 10. Each miner is stored under its full SV1
+        // id `address.worker` on its home node AND under `hex(SHA256(id)[..8])` in
+        // the converged cross-node share ledger on every node. Counting both
+        // double-counts every miner. Active-miner counting must include only the
+        // locally-connected `address.worker` rows (which contain '.').
+        let db = Database::in_memory().expect("create in-memory db");
+        let now_s = chrono::Utc::now().timestamp();
+
+        let mk = |miner_id: &str| MinerRecord {
+            miner_id: miner_id.to_string(),
+            payout_address: String::new(),
+            first_seen: now_s - 100,
+            last_seen: now_s - 10, // well within a 300s window
+            connected_node: None,
+            total_shares: 1,
+            total_work: 1000.0,
+            blocks_won: 0,
+            total_payouts_sats: 0,
+            avg_hashrate_ths: 0.0,
+        };
+
+        // One real locally-connected miner...
+        db.upsert_miner(&mk("bc1qexampleaddr.bitaxe1"))
+            .expect("insert local miner");
+        // ...and its gossip-ledger twin (hex(SHA256(full_id)[..8]), no '.').
+        db.upsert_miner(&mk("67eb564b74d01ed4"))
+            .expect("insert gossiped row");
+
+        assert_eq!(
+            db.count_active_miners(300).expect("count"),
+            1,
+            "only the locally-connected miner counts; the gossip-ledger row must not double it"
+        );
+        assert_eq!(
+            db.active_miner_id_hashes(300).expect("hashes").len(),
+            1,
+            "the mesh-union hash set must contain only the locally-connected miner"
         );
     }
 
