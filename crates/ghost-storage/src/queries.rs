@@ -915,11 +915,20 @@ impl Database {
         limit: u32,
     ) -> GhostResult<Vec<(String, String, i64, f64)>> {
         self.with_connection(|conn| {
+            // Only real `address.worker` miners (instr(miner_id,'.')>0). The
+            // shares table also holds replicated cross-node proofs keyed by the
+            // bare hex(SHA256(id)) gossip-ledger id, whose share_hash is stored in
+            // INTERNAL little-endian order (leading zeros at the high-index end,
+            // for cross-node C4) — so the quasar, which counts leading hex zeros
+            // from the FRONT, reads them as 0 bits and renders dead-center dots
+            // that never emanate. They are also duplicates of each miner's own
+            // local (display-order) shares, which the home node already serves.
+            // Excluding them leaves one correctly-oriented particle per real share.
             let mut stmt = conn
                 .prepare(
                     "SELECT miner_id, share_hash, timestamp, work
                      FROM shares
-                     WHERE timestamp > ?1 AND valid = 1
+                     WHERE timestamp > ?1 AND valid = 1 AND instr(miner_id, '.') > 0
                      ORDER BY timestamp ASC
                      LIMIT ?2",
                 )
@@ -9898,6 +9907,15 @@ mod tests {
             .expect("single")
             .unwrap();
         assert_eq!(single.miner_id, "bc1qexampleaddr.bitaxe3");
+
+        // The quasar feed must likewise exclude the gossip twin — its share_hash
+        // is stored internal-order (no leading zeros) and would render as a
+        // dead-center 0-bit dot, and it's a duplicate of the real share anyway.
+        let recent = db
+            .get_recent_valid_shares(now_s - 3600, 100)
+            .expect("recent");
+        assert_eq!(recent.len(), 1, "quasar feed must exclude the gossip twin");
+        assert_eq!(recent[0].0, "bc1qexampleaddr.bitaxe3");
     }
 
     #[test]
