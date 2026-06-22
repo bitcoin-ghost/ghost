@@ -597,9 +597,12 @@ impl Database {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
+                    // Only real `address.worker` miners so the best share is
+                    // attributed to the miner, not its bare hex(SHA256(id))
+                    // gossip-ledger twin (see get_leaderboard_best_hash).
                     "SELECT share_hash, miner_id, timestamp, difficulty
                      FROM shares
-                     WHERE timestamp >= ?1 AND valid = 1
+                     WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
                      ORDER BY share_hash ASC
                      LIMIT 1",
                 )
@@ -635,12 +638,17 @@ impl Database {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
+                    // instr(miner_id,'.') > 0 keeps only real `address.worker`
+                    // miners. The shares table also holds replicated cross-node
+                    // proofs keyed by the bare `hex(SHA256(id)[..8])` ledger id
+                    // (no '.'); without this they appear as phantom leaderboard
+                    // rows — the same miner duplicated under its gossip hash.
                     "SELECT s.miner_id, s.share_hash, s.timestamp, s.difficulty
                      FROM shares s
                      INNER JOIN (
                          SELECT miner_id, MIN(share_hash) AS best_hash
                          FROM shares
-                         WHERE timestamp >= ?1 AND valid = 1
+                         WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
                          GROUP BY miner_id
                      ) b ON s.miner_id = b.miner_id AND s.share_hash = b.best_hash
                      WHERE s.timestamp >= ?1 AND s.valid = 1
@@ -679,9 +687,11 @@ impl Database {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
+                    // Only real `address.worker` miners; exclude the bare
+                    // hex(SHA256(id)) gossip-ledger ids (see get_leaderboard_best_hash).
                     "SELECT miner_id, COUNT(*) AS share_count, SUM(work) AS total_work
                      FROM shares
-                     WHERE timestamp >= ?1 AND valid = 1
+                     WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
                      GROUP BY miner_id
                      ORDER BY total_work DESC
                      LIMIT ?2",
@@ -1128,9 +1138,11 @@ impl Database {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
+                    // Only real `address.worker` miners; exclude the bare
+                    // hex(SHA256(id)) gossip-ledger ids (see get_leaderboard_best_hash).
                     "SELECT miner_id, total_shares, total_work
                      FROM miners
-                     WHERE total_shares > 0 AND last_seen >= ?2
+                     WHERE total_shares > 0 AND last_seen >= ?2 AND instr(miner_id, '.') > 0
                      ORDER BY total_work DESC
                      LIMIT ?1",
                 )
@@ -9829,6 +9841,63 @@ mod tests {
             1,
             "the mesh-union hash set must contain only the locally-connected miner"
         );
+    }
+
+    #[test]
+    fn test_leaderboard_excludes_gossiped_ledger_rows() {
+        // The shares table holds both real local shares (miner_id `address.worker`)
+        // and replicated cross-node proofs keyed by the bare hex(SHA256(id)) ledger
+        // id. The leaderboard must list only real miners — otherwise the same miner
+        // appears twice (once under its hex gossip twin).
+        let db = Database::in_memory().expect("create in-memory db");
+        let now_s = chrono::Utc::now().timestamp();
+
+        let share = |miner_id: &str, hash: &str, work: f64| ShareRecord {
+            id: None,
+            round_id: 1,
+            miner_id: miner_id.to_string(),
+            difficulty: work,
+            work,
+            share_hash: hash.to_string(),
+            timestamp: now_s - 60,
+            received_by: "node1".to_string(),
+            valid: true,
+        };
+        // Real miner with a strong best hash...
+        db.insert_share(&share(
+            "bc1qexampleaddr.bitaxe3",
+            "000000000000000732a94aee7325d02fd49adbe4f89f9cfcb11ebf0bd33bc26b",
+            2000.0,
+        ))
+        .expect("insert real share");
+        // ...and its gossip-ledger twin (bare hex id, no '.').
+        db.insert_share(&share(
+            "30bcad707233de9d",
+            "0001a496881607bf16a91a3fbada1bcd0fa6e3e2b7d4c5a6978899aabbccddee",
+            2000.0,
+        ))
+        .expect("insert gossiped share");
+
+        let best = db
+            .get_leaderboard_best_hash(now_s - 3600, 10)
+            .expect("best");
+        assert_eq!(best.len(), 1, "leaderboard must list only the real miner");
+        assert_eq!(best[0].0, "bc1qexampleaddr.bitaxe3");
+
+        let shares = db.get_leaderboard_shares(now_s - 3600, 10).expect("shares");
+        assert_eq!(
+            shares.len(),
+            1,
+            "shares-contributed must exclude the gossip twin"
+        );
+        assert_eq!(shares[0].0, "bc1qexampleaddr.bitaxe3");
+
+        // The single best share is attributed to the real miner, not the hex twin.
+        let single = db
+            .get_best_share_since(now_s - 3600)
+            .expect("single")
+            .unwrap();
+        assert_eq!(single.miner_id, "bc1qexampleaddr.bitaxe3");
     }
 
     #[test]
