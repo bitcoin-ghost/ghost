@@ -860,7 +860,9 @@ async fn shares_handler(State(state): State<Arc<VerificationState>>) -> impl Int
                     serde_json::json!({
                         "round_id": s.round_id,
                         "miner_id": s.miner_id,
-                        "difficulty": s.difficulty,
+                        // Achieved difficulty from the hash (the score). `work` is
+                        // the stored vardiff target used for payout/hashrate.
+                        "difficulty": share_difficulty_from_hash_hex(&s.share_hash),
                         "work": s.work,
                         "share_hash": s.share_hash,
                         "timestamp": s.timestamp,
@@ -2565,7 +2567,11 @@ async fn api_pool_records_handler(
                     "leading_hex_zeros": leading_hex_zeros,
                     "miner_id_redacted": redacted,
                     "timestamp": best.timestamp,
-                    "difficulty": best.difficulty,
+                    // Achieved difficulty from the hash (the score), NOT the stored
+                    // vardiff target. `assigned_difficulty` keeps the old value for
+                    // any consumer that wants the share's pool-credit work.
+                    "difficulty": share_difficulty_from_hash_hex(&best.share_hash),
+                    "assigned_difficulty": best.difficulty,
                 }
             }))
         }
@@ -2680,6 +2686,9 @@ async fn api_pool_leaderboard_handler(
                 "share_hash": hash,
                 "leading_zero_bits": leading_hex_zeros * 4,
                 "timestamp": ts,
+                // Achieved difficulty from the hash (the score). `claimed_difficulty`
+                // is the stored vardiff target, kept for back-compat.
+                "difficulty": share_difficulty_from_hash_hex(&hash),
                 "claimed_difficulty": difficulty,
             })
         })
@@ -2719,6 +2728,41 @@ async fn api_pool_leaderboard_handler(
 /// historical shares table still holds signet/testnet translator
 /// entries. They outrank real miners on lifetime work just because
 /// they've been up longer, which isn't useful to show.
+/// Achieved difficulty of a share, derived from its hash — the standard pool
+/// "best share" / score metric (`diff1_target / hash_value`).
+///
+/// The `shares.difficulty`/`shares.work` DB columns store the SV2/SRI-assigned
+/// *vardiff target* (used for payout and hashrate accounting), NOT how good the
+/// share's hash actually was — so a lucky 60-leading-zero-bit share is stored as
+/// e.g. ~1.5K, six orders of magnitude below its true ~600M difficulty. Any stat
+/// that means "how good was this share" must therefore be computed from the hash.
+///
+/// `share_hash` is stored/served big-endian (leading hex zeros at the front =
+/// higher difficulty), so this mirrors the web client's `hashToDifficulty`
+/// (`BigInt('0x'+hash)`) exactly — most-significant byte first — giving backend
+/// and frontend identical numbers and reading historical rows correctly with no
+/// migration. (Note: `DifficultyCalculator::difficulty_from_hash` uses the
+/// opposite, internal little-endian byte order, so it is deliberately NOT reused
+/// here.) The difficulty-1 target (pdiff) is `0xFFFF * 2^208`.
+///
+/// Returns 0.0 for a hash that isn't 32 bytes of hex (treated as "unknown").
+fn share_difficulty_from_hash_hex(share_hash_hex: &str) -> f64 {
+    let bytes = match hex::decode(share_hash_hex) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return 0.0,
+    };
+    // Big-endian: byte[0] is most-significant.
+    let mut hash_value = 0.0_f64;
+    for &byte in bytes.iter() {
+        hash_value = hash_value * 256.0 + byte as f64;
+    }
+    if hash_value == 0.0 {
+        return f64::MAX;
+    }
+    let diff1_target = 65535.0_f64 * 2.0_f64.powi(208);
+    diff1_target / hash_value
+}
+
 fn is_system_miner(miner_id: &str) -> bool {
     let worker = miner_id.rsplit_once('.').map(|(_, w)| w).unwrap_or("");
     let lower = worker.to_ascii_lowercase();
@@ -7043,6 +7087,31 @@ async fn api_system_mempool_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_share_difficulty_from_hash_hex() {
+        // The difficulty-1 target (pdiff) is 0xFFFF * 2^208 → difficulty 1.0.
+        // In the big-endian hash string that is 0xFFFF after 8 leading hex zeros.
+        let diff1 = "00000000ffff0000000000000000000000000000000000000000000000000000";
+        let d1 = share_difficulty_from_hash_hex(diff1);
+        assert!((d1 - 1.0).abs() < 1e-6, "diff-1 target hex → 1.0, got {d1}");
+
+        // A real best-share hash with many leading zeros must read as a LARGE
+        // achieved difficulty — the regression returned the ~1.5K vardiff target
+        // instead. This exact hash mapped to ≈596.69M live (and via the web
+        // client's hashToDifficulty), pinning byte order + formula together.
+        let big = "000000000000000732a94aee7325d02fd49adbe4f89f9cfcb11ebf0bd33bc26b";
+        let d = share_difficulty_from_hash_hex(big);
+        assert!(
+            (d - 596_688_523.7).abs() / 596_688_523.7 < 1e-6,
+            "best-share hash must match the web client's 596.69M, got {d}"
+        );
+
+        // Malformed / wrong-length input is treated as unknown (0.0), never a panic.
+        assert_eq!(share_difficulty_from_hash_hex(""), 0.0);
+        assert_eq!(share_difficulty_from_hash_hex("not-hex"), 0.0);
+        assert_eq!(share_difficulty_from_hash_hex("00ff"), 0.0);
+    }
 
     #[test]
     fn test_archive_query() {
