@@ -1,10 +1,19 @@
-# ghost-light-wallet
+# Light wallet CLI
 
 *A lightweight command-line wallet that connects to Ghost nodes via the GSP protocol. No blockchain download required.*
 
+:::warning Superseded by the Wraith wallet
+The standalone `ghost-light-wallet` binary described below has been **retired**. The light/CLI wallet is now part of the **Wraith wallet** (`apps/wraith-wallet/`), which ships a CLI, a background daemon and a desktop GUI from one core:
+
+- **Crate:** `wraith-wallet-cli` &nbsp;→&nbsp; **binary:** `wraith`
+- **Build:** `cargo build --release -p wraith-wallet-cli`
+
+The command examples further down reflect the older `ghost-light-wallet` interface and may not match the `wraith` CLI one-for-one. Treat this page as conceptual (GSP connection, Ghost Keys, no full node) until it's rewritten against the `wraith` command set.
+:::
+
 ## Overview
 
-The `ghost-light-wallet` binary (built from the `ghost-light-wallet-cli` crate) is a self-custody Bitcoin wallet designed for users who don't want to run a full node. It connects to Ghost Service Provider (GSP) servers via WebSocket to query balances, submit transactions, and interact with Ghost Pay.
+The light wallet is a self-custody Bitcoin wallet designed for users who don't want to run a full node. It connects to Ghost Service Provider (GSP) servers via WebSocket to query balances, submit transactions, and interact with Ghost Pay.
 
 :::info Key Features
 - No blockchain download - connects via GSP WebSocket
@@ -31,8 +40,8 @@ curl -sSL https://get.bitcoinghost.org/wallet.sh | bash
 git clone https://github.com/bitcoin-ghost/ghost
 cd ghost
 
-# Build the light wallet CLI (crate is `ghost-light-wallet-cli`, binary is `ghost-light-wallet`)
-cargo build --release -p ghost-light-wallet-cli
+# Build the Wraith wallet CLI (crate is `wraith-wallet-cli`, binary is `wraith`)
+cargo build --release -p wraith-wallet-cli
 
 # Binary is at:
 ./target/release/ghost-light-wallet

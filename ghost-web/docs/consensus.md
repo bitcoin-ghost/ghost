@@ -39,6 +39,13 @@ Ghost Network (Full Mesh)
 | 8558 | Health Monitoring | PUB/SUB |
 | 8559 | Discovery Service | REQ/REP |
 | 8560 | Elder Management | PUB/SUB |
+| 8561 | Payout Proposal | PUB/SUB |
+| 8562 | Payout Transaction | PUB/SUB |
+| 8563 | Encrypted P2P (Noise) | point-to-point |
+
+Ports 8555–8562 carry the plaintext ZMQ PUB/SUB and REQ/REP traffic; sensitive
+message types (MPC, Elder, Payout, ZK) are additionally tunnelled over an
+encrypted Noise channel on **8563**.
 
 ## ZMQ Protocol
 
@@ -54,17 +61,19 @@ Ghost uses ZeroMQ for low-latency peer-to-peer communication:
 ### Message Format
 
 ```bash
-GhostMessage {
-  version: u8,              // Protocol version
+MessageEnvelope {
   msg_type: MessageType,    // Share, Block, Vote, etc.
+  sender:    [u8; 32],      // Node ID (Ed25519 public key)
   timestamp: u64,           // Unix timestamp (ms)
-  sender_id: [u8; 32],      // Node ID
-  payload: Vec<u8>,         // Serialized message
-  signature: Vec<u8>,       // secp256k1 signature
+  sequence:  u64,           // Per-sender sequence number (dedup / replay guard)
+  signature: [u8; 64],      // Ed25519 signature over the payload
+  payload:   Vec<u8>,       // JSON-serialized message
 }
 ```
 
-All messages are signed with secp256k1 signatures to prevent forgery.
+All messages are signed with **Ed25519** (the node identity key) to prevent
+forgery. (Bitcoin transactions — coinbase payouts, treasury spends — are signed
+with secp256k1, as Bitcoin requires; the P2P/consensus layer uses Ed25519.)
 
 ## Share Consensus
 
@@ -129,11 +138,11 @@ All nodes calculate PayoutProposal
         ↓ (1-2 seconds)
 All nodes broadcast proposals (port 8561)
         ↓
+Each validator RECOMPUTES the split from its own ledger
+        ↓
 All nodes vote on proposals (port 8557)
         ↓ (5 second timeout)
-67% consensus reached → PayoutTransaction created
-        ↓
-OR no 67% → median calculation used
+67% approve → PayoutTransaction created
 ```
 
 ### 67% Supermajority
@@ -144,15 +153,16 @@ Payout proposals require 67% agreement. If achieved:
 - Finding node creates payout transaction
 - All nodes verify and relay to Bitcoin network
 
-### Median Fallback
+### Deterministic split — validators recompute, not median
 
-If no proposal gets 67%, nodes calculate the median:
-
-- For each miner, take median of all proposed amounts
-- For each node, take median of all proposed rewards
-- Use median values as the consensus payout
-
-This ensures payouts always happen, even without perfect agreement.
+There is no "median of proposals" fallback. Instead, every validator
+**recomputes the payout split from its own converged share ledger** and rejects
+a proposal that doesn't match before voting (GHOST-02). Because all honest nodes
+converge on the same share set (GHOST-03 ledger convergence) and the split is a
+deterministic function of that set + the registered payout addresses, honest
+nodes independently arrive at the **same** answer — so an honest proposal gets
+67% by construction, and a manipulated one is rejected outright rather than
+averaged in.
 
 ## Byzantine Fault Tolerance
 
@@ -165,11 +175,11 @@ Ghost consensus is designed to resist Byzantine (malicious) nodes:
 | Share Consensus | All honest nodes agree on valid shares if 67% are honest |
 | Payout Consensus | Correct payouts enforced by honest majority |
 | Elder Consensus | Elder list immutable, revocation requires 67% witness |
-| Liveness | System never deadlocks (median fallback) |
+| Liveness | System never deadlocks; honest nodes converge on the same ledger + split |
 
 ### Cryptographic Security
 
-- **secp256k1 signatures** — All messages authenticated
+- **Ed25519 signatures** — All P2P/consensus messages authenticated (node identity key)
 - **Merkle proofs** — Share inclusion verifiable
 - **Hash chains** — State history tamper-proof
 
@@ -185,7 +195,7 @@ Ghost consensus is designed to resist Byzantine (malicious) nodes:
 
 **Attack:** Malicious nodes propose inflated payouts for themselves.
 
-**Defense:** 67% honest majority overrules bad proposals. Median fallback prevents deadlock.
+**Defense:** every validator recomputes the payout split from its own converged ledger and rejects a proposal that doesn't match (GHOST-02), so an inflated proposal never reaches 67% — it's rejected, not averaged in.
 
 ### Elder Sybil Attack
 
@@ -202,3 +212,36 @@ Ghost consensus is designed to resist Byzantine (malicious) nodes:
 :::warning 33% Limit
 If more than 33% of nodes are malicious, consensus guarantees break down. This is a fundamental limit of BFT systems. Ghost relies on economic incentives (node rewards) to keep the majority honest.
 :::
+
+## Hardened cross-node enforcement
+
+The consensus above describes *how* nodes agree. A second layer **enforces** that
+agreement so a single dishonest node can't credit itself for work it didn't
+receive or push through a payout split nobody else computed. Four enforcement
+properties run on the mesh:
+
+| ID | Enforces |
+| --- | --- |
+| **GHOST-09** | Every `ShareProof` carries an Ed25519 signature by the node that received it (`received_by`). Unsigned or wrongly-signed share proofs are **dropped** — you cannot claim node-reward credit for a share you didn't actually receive. |
+| **GHOST-02** | Payout-proposal validators recompute the split from their **own** converged ledger and **reject** a proposal whose split doesn't match — proposers can't inflate their own cut. |
+| **GHOST-03** | **Ledger convergence**: nodes reconcile their signed-share sets (a ~30s request loop + backfill that re-verifies GHOST-09), so every honest node holds the same share set before a payout is computed. |
+| **GHOST-11** | Equivocation (a node signing two conflicting things) is detected, **banned**, and the ban is propagated and persisted across the fleet. |
+
+### Why it activates at a block height (not a flag)
+
+Turning these on is a **wire-format** change — an old node and a new node must
+not disagree about whether an unsigned share is valid mid-rollout. So activation
+is gated on a **block height**, `CLUSTER_ENFORCEMENT_HEIGHT`, exactly like the
+earlier `PAYOUT_ADDRESS_GROUPING_HEIGHT`:
+
+- **Before the height** the binary still signs shares, converges ledgers and
+  propagates equivocation bans (all additive and mixed-version-safe), but it does
+  **not** yet drop unsigned shares or reject a mismatched split. This lets the
+  fleet roll the new binary out canary-style with no mixed-version enforcement
+  window.
+- **At the height** both enforcements (GHOST-09 drop + GHOST-02 reject) switch on
+  **everywhere at once**, deterministically, because every node runs the same
+  constant.
+
+This is the same pattern Bitcoin uses for soft-fork activation: deploy first in a
+dormant state, flip at an agreed height.

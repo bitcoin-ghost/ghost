@@ -43,7 +43,7 @@ Net effect: each translator has a real-time map of every pool node's miner count
 
 ## The proxy decision
 
-When a new SV1 miner connects to a pool node's translator on port 3333, the translator runs `should_proxy()` from `crates/translator/src/lib/load_balancer.rs`:
+When a new SV1 miner connects to a pool node's translator on port 3333, the translator runs `should_proxy()` from `bins/translator-sv2/src/lib/load_balancer.rs`:
 
 ```rust
 async fn should_proxy(
@@ -186,4 +186,4 @@ The mesh-driven approach has tradeoffs (no global health probing, no geo-aware r
 | `crates/ghost-verification/src/routes.rs` | `/api/internal/pool-nodes` endpoint that exposes the peer list |
 | `crates/ghost-consensus/src/peer.rs` | Mesh peer manager that tracks `last_seen` |
 
-The SV2 translator with TLV + load-balancer support is a downstream fork of the Stratum Reference Implementation, deployed to the pool VMs but not vendored in this repo. Its source (the `should_proxy` decision, `spawn_proxy` TCP forwarder, and SV1 connection handler shown above) lives at [github.com/bitcoin-ghost/translator-sv2](https://github.com/bitcoin-ghost/translator-sv2). Only the consensus / mesh side of the load balancer (the peer-list endpoint and mesh peer manager) is in the main `ghost` repo.
+The SV2 translator with TLV + load-balancer support began as a downstream fork of the Stratum Reference Implementation. It is now **amalgamated in-tree** in the main `ghost` repo at `bins/translator-sv2/` (the `should_proxy` decision, `spawn_proxy` TCP forwarder, and SV1 connection handler shown above all live under `bins/translator-sv2/src/lib/`), alongside the consensus / mesh side of the load balancer (the peer-list endpoint and mesh peer manager). The only external dependency is the SV2 protocol library (`stratum-core`), pinned by git rev.

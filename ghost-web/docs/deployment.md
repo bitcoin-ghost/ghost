@@ -347,7 +347,7 @@ INFO  Coinbase tag:   - G H O S T - PublicPool
 INFO  Loaded ZK params:  note_spend_vk (sha256: …)
 INFO  Loaded ZK params:  payout_vk (sha256: …)
 INFO  Loaded ZK params:  unshield_vk (sha256: …)
-INFO  Connected to bitcoind  network=mainnet  block_height=946700
+INFO  Connected to ghostd  network=mainnet  block_height=946700
 INFO  Mesh listening on tcp://0.0.0.0:8563  (Noise)
 INFO  Stratum V1 listening on 0.0.0.0:3333
 INFO  Stratum V2 listening on 0.0.0.0:34255
