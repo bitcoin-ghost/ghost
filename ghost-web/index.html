@@ -578,7 +578,13 @@
           if (r.block_height && r.block_height > height) height = r.block_height;
           var a = r.active_miners || 0;
           if (a > maxActive) maxActive = a;
-          if (typeof r.mesh_active_miners === 'number') mesh = r.mesh_active_miners;
+          // Take the MAX across nodes (matches pool.html): mesh_active_miners is
+          // the deduped pool-wide count, so the highest reporting node is the most
+          // complete view — a node briefly mid-gossip undercounts. Overwriting with
+          // each node's value showed whichever node was last, e.g. a transient 1.
+          if (typeof r.mesh_active_miners === 'number') {
+            if (mesh === null || r.mesh_active_miners > mesh) mesh = r.mesh_active_miners;
+          }
         });
         // Don't blank tiles if every fetch failed AND we already had good
         // data — a single 4-VM rate-limit burst shouldn't reset the view.

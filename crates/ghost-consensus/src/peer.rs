@@ -125,9 +125,33 @@ impl PeerManager {
     pub fn upsert_peer(&self, peer: Peer) {
         let mut peers = self.peers.write();
 
-        // Allow updates to existing peers unconditionally
-        if peers.contains_key(&peer.node_id) {
-            peers.insert(peer.node_id, peer);
+        // Allow updates to existing peers, but PRESERVE the live metrics that
+        // only ever arrive via health-ping updaters (update_active_miner_hashes /
+        // update_health_metrics / update_max_capacity). The discovery + connect
+        // paths rebuild a peer with `Peer::new` (metrics at their defaults) and
+        // upsert on every re-announce; a wholesale insert therefore WIPED the
+        // gossiped active-miner hashes and hashrate every discovery tick, so the
+        // mesh-wide active-miner count and pool hashrate flapped (dropping to this
+        // node's local-only contribution between pings — e.g. 1 of 5). Carry each
+        // field over whenever the incoming value is the default (empty/zero), so a
+        // genuine ping update still applies but a re-announce can't clobber it.
+        // Also keep the earliest first_seen.
+        if let Some(existing) = peers.get(&peer.node_id) {
+            let mut merged = peer;
+            if merged.active_miner_id_hashes.is_empty() {
+                merged.active_miner_id_hashes = existing.active_miner_id_hashes.clone();
+            }
+            if merged.local_hashrate_th == 0.0 {
+                merged.local_hashrate_th = existing.local_hashrate_th;
+            }
+            if merged.miner_count == 0 {
+                merged.miner_count = existing.miner_count;
+            }
+            if merged.max_capacity == 0 {
+                merged.max_capacity = existing.max_capacity;
+            }
+            merged.first_seen = merged.first_seen.min(existing.first_seen);
+            peers.insert(merged.node_id, merged);
             return;
         }
 
@@ -637,6 +661,50 @@ mod tests {
             mgr.peer_count(),
             2,
             "two real peers may share an address; the reconcile only retires placeholders"
+        );
+    }
+
+    #[test]
+    fn test_upsert_preserves_gossiped_metrics_on_reannounce() {
+        // Regression (mesh count flapping 1↔5): the discovery path rebuilds a peer
+        // with Peer::new (empty metrics) and upserts on every re-announce. A
+        // wholesale insert wiped the health-ping-populated active-miner hashes /
+        // hashrate until the next ping, so the deduped mesh count dropped to this
+        // node's local-only contribution between ticks. upsert_peer must preserve
+        // those gossip-only fields when the incoming peer carries defaults.
+        let mgr = PeerManager::new([0u8; 32], 100);
+        let pid = [7u8; 32];
+
+        let mut p = Peer::new(pid, "1.2.3.4:8555".to_string());
+        p.state = PeerState::Connected;
+        mgr.upsert_peer(p);
+
+        // A health ping populates the gossip metrics.
+        let hashes = vec![[1u8; 16], [2u8; 16], [3u8; 16]];
+        mgr.update_active_miner_hashes(&pid, hashes.clone(), 4.5);
+        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default());
+        mgr.update_max_capacity(&pid, 64);
+
+        // Discovery re-announces the SAME peer with a freshly-built (empty) Peer.
+        let mut reannounce = Peer::new(pid, "1.2.3.4:8555".to_string());
+        reannounce.state = PeerState::Connected;
+        mgr.upsert_peer(reannounce);
+
+        let got = mgr.get_peer(&pid).expect("peer still present");
+        assert_eq!(
+            got.active_miner_id_hashes, hashes,
+            "re-announce must NOT wipe the gossiped active-miner hashes"
+        );
+        assert_eq!(got.local_hashrate_th, 4.5, "hashrate preserved");
+        assert_eq!(got.miner_count, 3, "miner_count preserved");
+        assert_eq!(got.max_capacity, 64, "max_capacity preserved");
+
+        // A genuine ping update with new values still applies (not stuck).
+        mgr.update_active_miner_hashes(&pid, vec![[9u8; 16]], 1.0);
+        assert_eq!(
+            mgr.get_peer(&pid).unwrap().active_miner_id_hashes,
+            vec![[9u8; 16]],
+            "a real ping update must still overwrite"
         );
     }
 
