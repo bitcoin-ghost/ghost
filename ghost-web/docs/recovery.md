@@ -274,7 +274,7 @@ sqlite3 /home/ghost/.ghost/ghost-pay/ghost-pay.db \
 2. Check if it's still unspent on chain:
 
    ```bash
-   bitcoin-cli gettxout <TXID> <VOUT>
+   ghost-cli gettxout <TXID> <VOUT>
    ```
 
 3. If unspent, the session coordinator constructs a recovery transaction spending the funding UTXO back to participants using the known session keys. The ghost-pay binary exposes a `wraith recover --session-id <ID>` subcommand that builds and broadcasts the refund transaction; run it on the coordinator node (or any elder with read access to the same `ghost-pay.db`).
