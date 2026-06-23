@@ -49,6 +49,23 @@ pub struct Upstream {
     address: SocketAddr,
 }
 
+#[cfg(test)]
+impl Upstream {
+    /// Minimal instance for unit-testing message handlers that only read the
+    /// incoming message. The channels are unbounded and never driven, and the
+    /// address is a stub — handlers that touch the live connection must not use
+    /// this.
+    pub(crate) fn for_test() -> Self {
+        let (us_tx, us_rx) = unbounded();
+        let (cm_tx, cm_rx) = unbounded();
+        Self {
+            upstream_channel_state: UpstreamChannelState::new(us_rx, us_tx, cm_tx, cm_rx),
+            required_extensions: vec![],
+            address: "127.0.0.1:0".parse().unwrap(),
+        }
+    }
+}
+
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Upstream {
     /// Creates a new upstream connection by attempting to connect to configured servers.

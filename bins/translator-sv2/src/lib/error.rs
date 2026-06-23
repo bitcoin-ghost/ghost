@@ -201,6 +201,9 @@ pub enum TproxyErrorKind {
     InvalidKey,
     /// Downstream not found with given downstream_id
     DownstreamNotPresent(DownstreamId),
+    /// Upstream sent a `Reconnect` control message — drop and reconnect to the
+    /// configured upstream (the server-supplied redirect target is ignored).
+    UpstreamRequestedReconnect,
 }
 
 impl std::error::Error for TproxyErrorKind {}
@@ -278,6 +281,7 @@ impl fmt::Display for TproxyErrorKind {
                 f,
                 "downstream not found with downstream_id: {downstream_id}"
             ),
+            UpstreamRequestedReconnect => write!(f, "upstream requested reconnect"),
         }
     }
 }
