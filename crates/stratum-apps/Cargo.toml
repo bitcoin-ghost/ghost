@@ -1,6 +1,6 @@
 [package]
 name = "stratum-apps"
-version = "0.3.1"
+version.workspace = true
 authors = ["The Stratum V2 Developers"]
 edition = "2021"
 readme = "README.md"
