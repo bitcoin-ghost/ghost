@@ -215,8 +215,10 @@ mod unix {
         /// by `LocksConfirm` to attach the funding txid).
         prepared_locks: RwLock<HashMap<String, PreparedLockMeta>>,
         /// Monotonic counter for the wallet's own recovery-key derivation
-        /// indices. Independent of any operator-side index. Resets on
-        /// daemon restart in v1; persistence is a follow-on.
+        /// indices. Independent of any operator-side index. On wallet unlock it
+        /// is advanced past the highest `recovery_index` persisted in
+        /// `locks.json` (via `fetch_max`), so it never re-issues an index an
+        /// existing lock already uses across a daemon restart.
         next_recovery_index: AtomicU32,
         /// Optional bitcoind RPC URL. Required for the LocksRecover
         /// (unilateral exit) path — wallet talks directly to bitcoind,
@@ -400,6 +402,21 @@ mod unix {
                 tracing::warn!(?path, error = %e, "locks file is corrupt — ignoring");
                 HashMap::new()
             }
+        }
+    }
+
+    /// Advance `counter` past the highest `recovery_index` present in `locks`,
+    /// monotonically (`fetch_max` never lowers it). Called on every wallet
+    /// unlock so a daemon restart never re-issues a recovery-derivation index an
+    /// existing lock already uses — which would re-derive the same recovery key
+    /// and break the lock's unilateral-exit guarantee. No-op when `locks` is
+    /// empty.
+    fn advance_recovery_index_past_locks(
+        counter: &AtomicU32,
+        locks: &HashMap<String, PreparedLockMeta>,
+    ) {
+        if let Some(max_idx) = locks.values().map(|m| m.recovery_index).max() {
+            counter.fetch_max(max_idx + 1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -2791,6 +2808,14 @@ mod unix {
                                     for (k, v) in restored {
                                         guard.insert(k, v);
                                     }
+                                    // Advance the recovery-index counter past every
+                                    // index already committed to disk so a restart
+                                    // never re-issues (and thus re-derives) a recovery
+                                    // key an existing lock already uses.
+                                    advance_recovery_index_past_locks(
+                                        &state.next_recovery_index,
+                                        &guard,
+                                    );
                                     tracing::info!(wallet = %name, "restored prepared locks from disk");
                                 }
                                 Response::WalletUnlocked
@@ -3743,6 +3768,49 @@ mod unix {
             let dir = tempfile::tempdir().unwrap();
             let restored = super::load_locks_for_wallet(dir.path(), "missing");
             assert!(restored.is_empty());
+        }
+
+        #[test]
+        fn recovery_index_advances_past_persisted_locks() {
+            use std::sync::atomic::Ordering::SeqCst;
+
+            // Regression: the counter reset to 0 each boot, so after a restart a
+            // freshly-prepared lock re-issued an index an existing lock already
+            // used — re-deriving the same recovery key.
+            let counter = AtomicU32::new(0);
+            let mut map = HashMap::new();
+            let mut a = fixture_meta("alice", "lock-A");
+            a.recovery_index = 4;
+            let mut b = fixture_meta("alice", "lock-B");
+            b.recovery_index = 9; // highest
+            let mut c = fixture_meta("alice", "lock-C");
+            c.recovery_index = 2;
+            map.insert("lock-A".to_string(), a);
+            map.insert("lock-B".to_string(), b);
+            map.insert("lock-C".to_string(), c);
+
+            super::advance_recovery_index_past_locks(&counter, &map);
+            assert_eq!(
+                counter.load(SeqCst),
+                10,
+                "counter must sit one past the highest persisted recovery_index"
+            );
+
+            // Monotonic: a second wallet with lower indices must not lower it.
+            let mut map2 = HashMap::new();
+            let mut d = fixture_meta("bob", "lock-D");
+            d.recovery_index = 3;
+            map2.insert("lock-D".to_string(), d);
+            super::advance_recovery_index_past_locks(&counter, &map2);
+            assert_eq!(
+                counter.load(SeqCst),
+                10,
+                "fetch_max must never lower the counter"
+            );
+
+            // Empty set is a no-op.
+            super::advance_recovery_index_past_locks(&counter, &HashMap::new());
+            assert_eq!(counter.load(SeqCst), 10);
         }
 
         #[test]
