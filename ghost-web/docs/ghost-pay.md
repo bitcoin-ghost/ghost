@@ -16,7 +16,9 @@ Ghost Pay always settles to Bitcoin. There is no "Ghost coin" or separate token.
 
 ### Fees
 
-Ghost Pay charges a flat **0.1% fee** on payments. The fee is split between the Treasury and Node Reward Pool using the same control-decay ratio as the mining pool fee. After ossification, 100% of Ghost Pay fees go to the Node Reward Pool.
+Ghost Pay charges a flat **10-satoshi fee per L2 transfer** (`L2_TRANSFER_FEE_SATS`) — a fixed amount per payment, not a percentage. It's enforced inside the zero-knowledge spend circuit itself (the transfer's change output is `note_value − amount − 10`), so it can't be bypassed and changing it would require an MPC ceremony reset. The collected fees are split between the Treasury and Node Reward Pool using the same control-decay ratio as the mining-pool fee; after ossification, 100% of Ghost Pay fees go to the Node Reward Pool.
+
+> **Settlement (L1) fees are separate.** Withdrawing a lock to the base chain pays the normal Bitcoin network fee (sat/vB) scaled by a settlement-class multiplier — Economy ×0.5, Standard ×1.0, Express ×1.5. The optional Wraith mixing service may also deduct a per-denomination service fee at L2.
 
 ## How It Works
 
