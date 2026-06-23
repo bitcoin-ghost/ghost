@@ -1,6 +1,6 @@
 [package]
 name = "jd_server_sv2"
-version = "0.1.2"
+version.workspace = true
 authors = ["The Stratum V2 Developers"]
 edition = "2021"
 description = "Sv2 Job Declaration Server"
@@ -16,10 +16,10 @@ name = "jd_server_sv2"
 path = "src/lib/mod.rs"
 
 [dependencies]
-stratum-apps = { version = "0.3.0", path = "../../crates/stratum-apps", features = ["jd_server"] }
+stratum-apps = { path = "../../crates/stratum-apps", features = ["jd_server"] }
 async-channel = "1.5.1"
 
-bitcoin_core_sv2 = { version = "0.1.0", path = "../../crates/bitcoin-core-sv2" }
+bitcoin_core_sv2 = { path = "../../crates/bitcoin-core-sv2" }
 serde = { version = "1.0.89", features = ["derive", "alloc"], default-features = false }
 tracing = { version = "0.1" }
 tokio = { version = "1.44.1", features = ["full"] }

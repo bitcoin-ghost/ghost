@@ -1,6 +1,6 @@
 [package]
 name = "translator_sv2"
-version = "0.2.4"
+version.workspace = true
 authors = ["The Stratum V2 Developers"]
 edition = "2021"
 description = "SV1 to SV2 translation proxy"
@@ -20,7 +20,7 @@ name = "translator_sv2"
 path = "src/main.rs"
 
 [dependencies]
-stratum-apps = { version = "0.3.0", path = "../../crates/stratum-apps", features = ["translator"] }
+stratum-apps = { path = "../../crates/stratum-apps", features = ["translator"] }
 async-channel = "1.5.1"
 serde = { version = "1.0.89", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0.64", default-features = false, features = ["alloc"] }

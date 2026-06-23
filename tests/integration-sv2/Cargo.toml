@@ -14,10 +14,10 @@ keywords = ["stratum", "mining", "bitcoin", "protocol"]
 exclude = ["resources/high_diff_chain.tar.gz"]
 
 [dependencies]
-stratum-apps = { version = "0.3.0", path = "../../crates/stratum-apps", features = ["network", "config"] }
-jd_client_sv2 = { version = "0.1.3", path = "../../bins/jd-client-sv2" }
-pool_sv2 = { version = "0.2.1", path = "../../bins/pool-sv2" }
-translator_sv2 = { version = "0.2.1", path = "../../bins/translator-sv2" }
+stratum-apps = { path = "../../crates/stratum-apps", features = ["network", "config"] }
+jd_client_sv2 = { path = "../../bins/jd-client-sv2" }
+pool_sv2 = { path = "../../bins/pool-sv2" }
+translator_sv2 = { path = "../../bins/translator-sv2" }
 async-channel = { version = "1.5.1", default-features = false }
 corepc-node = { version = "0.7.0", default-features = false, features = ["28_0"] }
 ureq = "2.12"
