@@ -80,7 +80,8 @@ pub mod epoch;
 pub mod service;
 pub mod sortition;
 pub use beacon::{
-    beacon_from_round, commit_for, compute_beacon, reveal_is_valid, BeaconRound, Commitment, Reveal,
+    beacon_from_round, commit_for, compute_beacon, reveal_is_valid, BeaconRound, BeaconRoundState,
+    Commitment, Reveal,
 };
 pub use beacon_schedule::{
     anchor_height_for_epoch, is_commit_height, is_reveal_height, phase_for_height, BeaconPhase,
