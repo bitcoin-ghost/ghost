@@ -20,6 +20,15 @@ pub(super) fn is_mining_authorize(msg: &Message) -> bool {
     }
 }
 
+/// Check if Sv1 message is mining.subscribe
+pub(super) fn is_mining_subscribe(msg: &Message) -> bool {
+    if let json_rpc::Message::StandardRequest(r) = &msg {
+        r.method == "mining.subscribe"
+    } else {
+        false
+    }
+}
+
 /// Check if Sv1 message is mining.configure (BIP310 version-rolling negotiation).
 /// Stateless handshake message that needs an immediate response — must NOT be
 /// queued behind channel-open or the miner deadlocks waiting for the configure
