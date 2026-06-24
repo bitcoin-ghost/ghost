@@ -74,7 +74,11 @@ pub use lite_session::{
 
 pub mod remix;
 
+pub mod beacon;
 pub mod sortition;
+pub use beacon::{
+    beacon_from_round, commit_for, compute_beacon, reveal_is_valid, BeaconRound, Commitment, Reveal,
+};
 pub use remix::{
     RemixEnrolment, RemixError, RemixId, RemixQueue, RemixStatus, DEFAULT_QUEUE_TIMEOUT_SECS,
     DEFAULT_REMIX_COUNT, MAX_REMIX_COUNT,
