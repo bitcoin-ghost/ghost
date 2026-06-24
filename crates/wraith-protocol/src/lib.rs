@@ -77,6 +77,7 @@ pub mod remix;
 pub mod beacon;
 pub mod beacon_schedule;
 pub mod epoch;
+pub mod service;
 pub mod sortition;
 pub use beacon::{
     beacon_from_round, commit_for, compute_beacon, reveal_is_valid, BeaconRound, Commitment, Reveal,
@@ -92,6 +93,7 @@ pub use remix::{
     RemixEnrolment, RemixError, RemixId, RemixQueue, RemixStatus, DEFAULT_QUEUE_TIMEOUT_SECS,
     DEFAULT_REMIX_COUNT, MAX_REMIX_COUNT,
 };
+pub use service::{CoordinatorView, EndpointMap};
 pub use sortition::{
     elect_coordinators, rank_of, shard_for, verify_election, CoordinatorNodeId, ElectedCoordinator,
 };
