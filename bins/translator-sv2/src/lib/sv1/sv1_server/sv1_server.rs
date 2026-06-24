@@ -7,7 +7,7 @@ use crate::{
         downstream::{downstream::Downstream, SubmitShareWithChannelId},
         sv1_server::{
             channel::Sv1ServerChannelState, is_mining_authorize, is_mining_configure,
-            is_mining_subscribe, KEEPALIVE_JOB_ID_DELIMITER,
+            KEEPALIVE_JOB_ID_DELIMITER,
         },
     },
     utils::AGGREGATED_CHANNEL_ID,
@@ -467,29 +467,35 @@ impl Sv1Server {
             // BEFORE authorize — too early to know the user_identity.
             //
             // New flow:
-            //   - `mining.subscribe`: process immediately. The subscribe response carries the
-            //     extranonce1 from `data.extranonce1`, which is pre-initialised to a per-
-            //     downstream placeholder by `DownstreamData::new`. The miner gets a fast
-            //     response and won't time out. We update extranonce1 to the real value once
-            //     the upstream channel opens, and notify the miner via SV1
-            //     `mining.set_extranonce`.
+            //   - `mining.subscribe`: QUEUE it until the channel opens, then process it so its
+            //     response carries the REAL channel-allocated extranonce. The subscribe response
+            //     (`[subscriptions, extranonce1, extranonce2_size]`) is built from
+            //     `data.extranonce1` — which is the real value by the time the queue is drained
+            //     (set on `OpenExtendedMiningChannelSuccess` before queued-message processing).
+            //     This is the correctness fix for stock SV1 miners: `mining.set_extranonce` is an
+            //     OPTIONAL extension (a miner must send `mining.extranonce.subscribe` to opt in),
+            //     so the previous "respond with an 8-byte placeholder, then post-hoc
+            //     set_extranonce" path silently broke every miner with extranonce-subscribe OFF —
+            //     their shares were built against the placeholder and 100% rejected. Delivering
+            //     the real extranonce in the subscribe response itself works for ALL miners,
+            //     opted-in or not, with no mid-stream re-key. The channel opens within ~100ms of
+            //     subscribe (the miner pipelines subscribe+authorize), so deferring the response
+            //     does not risk a subscribe timeout.
             //   - `mining.authorize`: process immediately so `data.user_identity` /
             //     `data.authorized_worker_name` are populated, then trigger
-            //     `handle_open_channel_request`.
+            //     `handle_open_channel_request`. (Authorize, not subscribe, opens the channel —
+            //     so queuing subscribe does NOT block the open: the miner pipelines them.)
             //   - `mining.configure`: process immediately. BIP310 version-rolling negotiation
             //     is stateless — the miner sends configure first to learn the version mask,
             //     then sends subscribe/authorize. If we queue configure waiting for the
             //     channel to open, some Bitaxe firmware (BM1370 v2.12.0 observed) waits for
-            //     the configure response before sending subscribe at all, which deadlocks:
-            //     no channel can open until authorize, no authorize until subscribe, no
-            //     subscribe until configure responds.
+            //     the configure response before sending subscribe at all, which deadlocks.
             //   - Anything else: queue until the channel is open (existing behaviour).
             //
             // Aggregated mode is unaffected — every downstream still piggybacks on the single
             // shared upstream channel that the channel_manager already opened, so this branch
             // simply falls through for `mining.submit` etc. once the channel exists.
-            let process_immediately = is_mining_subscribe(&downstream_message)
-                || is_mining_authorize(&downstream_message)
+            let process_immediately = is_mining_authorize(&downstream_message)
                 || is_mining_configure(&downstream_message);
             if !process_immediately {
                 debug!(
@@ -790,7 +796,22 @@ impl Sv1Server {
                     if self.config.downstream_difficulty_config.enable_vardiff
                         && !self.vardiff.contains_key(&downstream_id)
                     {
-                        let vardiff = VardiffState::new().expect("Failed to create vardiffstate");
+                        // Floor vardiff at the configured per-miner hashrate, NOT the
+                        // library default of 1.0 H/s. With the 1.0 H/s floor, a fresh
+                        // connection whose first shares fail validation during the
+                        // extranonce handoff window reads as "0 shares/min", and vardiff
+                        // halves the difficulty every tick down to ~1.0 H/s → target ≈ 2^256
+                        // → difficulty ≈ 2e-10. The miner then floods sub-diff-1 shares that
+                        // record 0 work and never earn. Flooring at min_individual_miner_hashrate
+                        // (e.g. 500 GH/s → diff ~1164) keeps a struggling new miner at a sane
+                        // difficulty so it self-corrects once the connect window settles. The
+                        // floor never binds for healthy miners (their hashrate is far above it).
+                        let vardiff = VardiffState::new_with_min(
+                            self.config
+                                .downstream_difficulty_config
+                                .min_individual_miner_hashrate as f32,
+                        )
+                        .expect("Failed to create vardiffstate");
                         self.vardiff
                             .insert(downstream_id, Arc::new(Mutex::new(vardiff)));
                     }
