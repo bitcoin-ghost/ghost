@@ -181,6 +181,106 @@ pub fn beacon_from_round(
     }
 }
 
+/// Stateful accumulator for one epoch's beacon round. A node holds one of these
+/// during the commit/reveal windows for the epoch being prepared, ingesting
+/// commit and reveal messages as they arrive over the mesh, then finalises the
+/// beacon once the reveal window closes. It is the live counterpart to the
+/// one-shot [`beacon_from_round`] — same validation rules, fed incrementally.
+///
+/// Validation is enforced on ingest: a node commits at most once, and a reveal
+/// is accepted only if the node committed and the reveal opens that commitment.
+/// So `finalize` always reflects a clean round, and "committed but never revealed"
+/// nodes surface as `withholders`.
+#[derive(Debug, Clone)]
+pub struct BeaconRoundState {
+    epoch: u64,
+    commitments: BTreeMap<CoordinatorNodeId, [u8; 32]>,
+    reveals: BTreeMap<CoordinatorNodeId, [u8; 32]>,
+}
+
+impl BeaconRoundState {
+    /// A fresh round for `epoch`.
+    pub fn new(epoch: u64) -> Self {
+        Self {
+            epoch,
+            commitments: BTreeMap::new(),
+            reveals: BTreeMap::new(),
+        }
+    }
+
+    /// The epoch this round is preparing.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Record a node's commitment. First commitment per node wins (a node commits
+    /// once per epoch); a second/conflicting commitment from the same node is
+    /// rejected. Returns whether it was accepted.
+    pub fn add_commitment(&mut self, node_id: CoordinatorNodeId, commit: [u8; 32]) -> bool {
+        if self.commitments.contains_key(&node_id) {
+            return false;
+        }
+        self.commitments.insert(node_id, commit);
+        true
+    }
+
+    /// Record a reveal. Accepted only if the node committed, `r` opens that
+    /// commitment, and it hasn't already revealed. Returns whether it was accepted.
+    pub fn add_reveal(&mut self, node_id: CoordinatorNodeId, r: [u8; 32]) -> bool {
+        if self.reveals.contains_key(&node_id) {
+            return false;
+        }
+        match self.commitments.get(&node_id) {
+            Some(commit) if reveal_is_valid(self.epoch, &node_id, &r, commit) => {
+                self.reveals.insert(node_id, r);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How many nodes have committed.
+    pub fn committed_count(&self) -> usize {
+        self.commitments.len()
+    }
+
+    /// How many nodes have validly revealed (these are the beacon's contributors).
+    pub fn revealed_count(&self) -> usize {
+        self.reveals.len()
+    }
+
+    /// True once at least one valid reveal exists — the point past which the
+    /// beacon is unbiasable by any party that doesn't control that contributor.
+    pub fn has_contributors(&self) -> bool {
+        !self.reveals.is_empty()
+    }
+
+    /// Finalise the beacon for this epoch with the chain `anchor`, yielding the
+    /// beacon plus the contributor and withholder lists.
+    pub fn finalize(&self, anchor: &[u8; 32]) -> BeaconRound {
+        let valid: Vec<Reveal> = self
+            .reveals
+            .iter()
+            .map(|(node_id, r)| Reveal {
+                node_id: *node_id,
+                r: *r,
+            })
+            .collect();
+        let contributors: Vec<CoordinatorNodeId> = self.reveals.keys().copied().collect();
+        let withholders: Vec<CoordinatorNodeId> = self
+            .commitments
+            .keys()
+            .filter(|id| !self.reveals.contains_key(*id))
+            .copied()
+            .collect();
+        BeaconRound {
+            beacon: compute_beacon(self.epoch, anchor, &valid),
+            contributors,
+            withholders,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +432,96 @@ mod tests {
         let one = beacon_from_round(e, &anchor(1), &c, &r);
         assert_eq!(one.contributors, vec![node(0)]);
         assert_ne!(one.beacon, empty.beacon);
+    }
+
+    // ── BeaconRoundState (stateful accumulator) ──────────────────────────────
+
+    #[test]
+    fn round_state_commit_then_reveal_rules() {
+        let e = 5u64;
+        let mut st = BeaconRoundState::new(e);
+        let (n0, r0) = (node(0), secret(0));
+        let c0 = commit_for(e, &n0, &r0);
+
+        // commit accepted once
+        assert!(st.add_commitment(n0, c0));
+        assert!(
+            !st.add_commitment(n0, c0),
+            "no second commitment from a node"
+        );
+        assert_eq!(st.committed_count(), 1);
+
+        // reveal must open the commitment
+        assert!(!st.add_reveal(n0, secret(9)), "wrong secret rejected");
+        assert!(st.add_reveal(n0, r0), "correct secret accepted");
+        assert!(!st.add_reveal(n0, r0), "no double reveal");
+        assert_eq!(st.revealed_count(), 1);
+        assert!(st.has_contributors());
+
+        // a reveal with no commitment is rejected
+        assert!(!st.add_reveal(node(1), secret(1)));
+    }
+
+    #[test]
+    fn round_state_finalize_matches_one_shot() {
+        // The stateful path must produce the byte-identical beacon to the one-shot
+        // beacon_from_round for the same valid round.
+        let e = 9u64;
+        let (commits, reveals) = round(e, 6);
+        let anchor = anchor(4);
+
+        let mut st = BeaconRoundState::new(e);
+        for c in &commits {
+            assert!(st.add_commitment(c.node_id, c.commit));
+        }
+        for rv in &reveals {
+            assert!(st.add_reveal(rv.node_id, rv.r));
+        }
+        let stateful = st.finalize(&anchor);
+        let one_shot = beacon_from_round(e, &anchor, &commits, &reveals);
+        assert_eq!(stateful.beacon, one_shot.beacon);
+        assert_eq!(stateful.contributors, one_shot.contributors);
+        assert_eq!(stateful.withholders, one_shot.withholders);
+    }
+
+    #[test]
+    fn round_state_ingest_order_independent() {
+        let e = 3u64;
+        let (commits, reveals) = round(e, 5);
+        let anchor = anchor(2);
+
+        let mut a = BeaconRoundState::new(e);
+        for c in &commits {
+            a.add_commitment(c.node_id, c.commit);
+        }
+        for rv in &reveals {
+            a.add_reveal(rv.node_id, rv.r);
+        }
+
+        // feed the second one in reverse order
+        let mut b = BeaconRoundState::new(e);
+        for c in commits.iter().rev() {
+            b.add_commitment(c.node_id, c.commit);
+        }
+        for rv in reveals.iter().rev() {
+            b.add_reveal(rv.node_id, rv.r);
+        }
+        assert_eq!(a.finalize(&anchor).beacon, b.finalize(&anchor).beacon);
+    }
+
+    #[test]
+    fn round_state_tracks_withholders() {
+        let e = 4u64;
+        let mut st = BeaconRoundState::new(e);
+        for i in 0u8..5 {
+            st.add_commitment(node(i), commit_for(e, &node(i), &secret(i)));
+        }
+        // everyone reveals except node 2
+        for i in [0u8, 1, 3, 4] {
+            assert!(st.add_reveal(node(i), secret(i)));
+        }
+        let out = st.finalize(&anchor(0));
+        assert_eq!(out.contributors.len(), 4);
+        assert_eq!(out.withholders, vec![node(2)]);
     }
 }
