@@ -75,9 +75,13 @@ pub use lite_session::{
 pub mod remix;
 
 pub mod beacon;
+pub mod epoch;
 pub mod sortition;
 pub use beacon::{
     beacon_from_round, commit_for, compute_beacon, reveal_is_valid, BeaconRound, Commitment, Reveal,
+};
+pub use epoch::{
+    canonical_roster, epoch_for_height, snapshot_height_for_epoch, EpochCoordinators, EPOCH_BLOCKS,
 };
 pub use remix::{
     RemixEnrolment, RemixError, RemixId, RemixQueue, RemixStatus, DEFAULT_QUEUE_TIMEOUT_SECS,
