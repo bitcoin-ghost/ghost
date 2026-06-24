@@ -73,9 +73,14 @@ pub use lite_session::{
 };
 
 pub mod remix;
+
+pub mod sortition;
 pub use remix::{
     RemixEnrolment, RemixError, RemixId, RemixQueue, RemixStatus, DEFAULT_QUEUE_TIMEOUT_SECS,
     DEFAULT_REMIX_COUNT, MAX_REMIX_COUNT,
+};
+pub use sortition::{
+    elect_coordinators, rank_of, shard_for, verify_election, CoordinatorNodeId, ElectedCoordinator,
 };
 
 /// Session type determines fee structure
