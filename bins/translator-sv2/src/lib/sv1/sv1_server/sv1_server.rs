@@ -790,7 +790,22 @@ impl Sv1Server {
                     if self.config.downstream_difficulty_config.enable_vardiff
                         && !self.vardiff.contains_key(&downstream_id)
                     {
-                        let vardiff = VardiffState::new().expect("Failed to create vardiffstate");
+                        // Floor vardiff at the configured per-miner hashrate, NOT the
+                        // library default of 1.0 H/s. With the 1.0 H/s floor, a fresh
+                        // connection whose first shares fail validation during the
+                        // extranonce handoff window reads as "0 shares/min", and vardiff
+                        // halves the difficulty every tick down to ~1.0 H/s → target ≈ 2^256
+                        // → difficulty ≈ 2e-10. The miner then floods sub-diff-1 shares that
+                        // record 0 work and never earn. Flooring at min_individual_miner_hashrate
+                        // (e.g. 500 GH/s → diff ~1164) keeps a struggling new miner at a sane
+                        // difficulty so it self-corrects once the connect window settles. The
+                        // floor never binds for healthy miners (their hashrate is far above it).
+                        let vardiff = VardiffState::new_with_min(
+                            self.config
+                                .downstream_difficulty_config
+                                .min_individual_miner_hashrate as f32,
+                        )
+                        .expect("Failed to create vardiffstate");
                         self.vardiff
                             .insert(downstream_id, Arc::new(Mutex::new(vardiff)));
                     }
