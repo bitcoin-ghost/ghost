@@ -3,7 +3,7 @@
 //! Increment 4 of `tasks/plan_decentralised_coordinators.md`: feed the PURE
 //! election library (`wraith_protocol::{sortition, epoch, service}`) with live
 //! node state (the elder roster, the chain height, and a per-epoch beacon
-//! anchor) and expose the resulting [`CoordinatorView`] read-only.
+//! anchor) and expose the resulting `CoordinatorView` read-only.
 //!
 //! ## What this increment deliberately does NOT do
 //!
@@ -13,7 +13,7 @@
 //! - emits or changes any consensus message.
 //!
 //! It is gated behind `[coordinator] wraith_election_enabled` (default false).
-//! When the flag is off the [`CoordinatorElection`] is never constructed and
+//! When the flag is off the `CoordinatorElection` is never constructed and
 //! every accessor returns the inert "disabled" answer, so worst case this is
 //! dead code behind a default-false flag with zero effect on the node.
 //!
@@ -33,8 +33,8 @@ use sha2::{Digest, Sha256};
 
 use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_consensus::mesh::MeshNetwork;
 use ghost_common::types::NodeCapabilities;
+use ghost_consensus::mesh::MeshNetwork;
 
 use wraith_protocol::epoch::canonical_roster;
 use wraith_protocol::service::{CoordinatorView, EndpointMap};
@@ -65,7 +65,7 @@ pub const fn epoch_for_height(height: u64) -> u64 {
 /// The chain height whose anchor freezes epoch `E` — the first block of epoch
 /// `E` (`E * K`). Using the epoch-start block (rather than a far-future one)
 /// keeps the anchor reachable the moment the epoch begins; its grinding
-/// resistance is addressed by the security note on [`derive_beacon`].
+/// resistance is addressed by the security note on `derive_beacon`.
 pub const fn anchor_height_for_epoch(epoch: u64) -> u64 {
     epoch.saturating_mul(COORDINATOR_EPOCH_BLOCKS)
 }
@@ -74,7 +74,7 @@ pub const fn anchor_height_for_epoch(epoch: u64) -> u64 {
 /// agrees on: `SHA256(domain ‖ epoch_le ‖ anchor_hash)`.
 ///
 /// SECURITY: the anchor used here is the block hash at the epoch-start height
-/// (see [`CoordinatorElection::beacon_for_epoch`]). A miner who finds that block
+/// (see `CoordinatorElection::beacon_for_epoch`). A miner who finds that block
 /// can choose among the candidate hashes it could publish, so this interim
 /// anchor's grinding-resistance is BOUNDED — adequate for a read-only,
 /// role-inactive view, but NOT the endgame. The unbiasable beacon is the
@@ -114,7 +114,7 @@ struct Cached {
 /// Live coordinator-election service for ghost-pool.
 ///
 /// Constructed only when `wraith_election_enabled` is true. Holds the inputs it
-/// needs to (re)compute a [`CoordinatorView`] each time the epoch changes, and
+/// needs to (re)compute a `CoordinatorView` each time the epoch changes, and
 /// caches the latest view for the read-only accessors and the HTTP endpoint.
 pub struct CoordinatorElection {
     /// This node's own id, and whether it is itself an elder (so it can be in
@@ -131,7 +131,7 @@ pub struct CoordinatorElection {
 
 impl CoordinatorElection {
     /// Build the service from live handles. Call only when the config flag is
-    /// on; see [`maybe_new`].
+    /// on; see `maybe_new`.
     pub fn new(
         identity: &NodeIdentity,
         capabilities: &NodeCapabilities,
@@ -190,7 +190,7 @@ impl CoordinatorElection {
         Some(derive_beacon(epoch, &anchor))
     }
 
-    /// Recompute and cache the [`CoordinatorView`] for the epoch `current_height`
+    /// Recompute and cache the `CoordinatorView` for the epoch `current_height`
     /// falls in — but only when the epoch has actually changed since the last
     /// cached view (cheap no-op otherwise). Safe to call on every new block /
     /// round advance. Returns the (possibly unchanged) current epoch.
@@ -278,10 +278,7 @@ impl CoordinatorElection {
             .filter_map(|id| view.my_seat(&id).map(|seat| (seat, id)))
             .collect();
         seated.sort_unstable_by_key(|(seat, _)| *seat);
-        seated
-            .into_iter()
-            .map(|(_, id)| hex::encode(id))
-            .collect()
+        seated.into_iter().map(|(_, id)| hex::encode(id)).collect()
     }
 }
 
@@ -399,7 +396,8 @@ mod tests {
     fn self_as_coordinator_detection_matches_the_view() {
         let roster: Vec<_> = (0u8..30).map(node).collect();
         let beacon = derive_beacon(2, &[5u8; 32]);
-        let view = CoordinatorView::build(2, &beacon, &roster, EndpointMap::new(), COORDINATOR_SEATS);
+        let view =
+            CoordinatorView::build(2, &beacon, &roster, EndpointMap::new(), COORDINATOR_SEATS);
         // For every roster member, am_i_coordinator agrees with my_seat.is_some.
         let mut seated_count = 0;
         for id in &roster {
