@@ -114,4 +114,9 @@ pub mod capacity;
 /// total, plus per-DeadCodeType counters. Read by `/api/v1/reaper/status`.
 pub mod reaper_stats;
 
+/// Decentralised Wraith coordinator election — live wiring (read-only, gated
+/// off by default). Computes and publishes the per-epoch coordinator draw via
+/// `wraith-protocol`; activates no role and changes no consensus message.
+pub mod coordinator_election;
+
 // L2 uses NullifierRouteHandler from ghost-consensus (sender-side proofs).

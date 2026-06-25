@@ -114,6 +114,27 @@ pub struct NodeConfig {
     pub reaper: ReaperSettings,
     /// Registry configuration (optional, for load balancer registration)
     pub registry: Option<RegistryConfig>,
+    /// Decentralised Wraith coordinator-election configuration.
+    ///
+    /// Read-only and gated OFF by default: when `wraith_election_enabled` is
+    /// false the election service is never constructed and has zero effect on
+    /// the node (`tasks/plan_decentralised_coordinators.md`, increment 4).
+    #[serde(default)]
+    pub coordinator: CoordinatorConfig,
+}
+
+/// Decentralised Wraith coordinator-election settings.
+///
+/// This increment only *computes and exposes* the election read-only; it never
+/// activates a coordinator role, touches `coordinator_redundancy`, or changes
+/// any Wraith mixing or consensus message. With `wraith_election_enabled =
+/// false` (the default) it is inert.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoordinatorConfig {
+    /// Compute the per-epoch coordinator election and expose it read-only via
+    /// `GET /api/v1/pool/coordinator`. Default false — dead code when off.
+    #[serde(default)]
+    pub wraith_election_enabled: bool,
 }
 
 /// Configuration validation error

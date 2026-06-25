@@ -226,6 +226,13 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/pool/recent_shares",
             get(api_pool_recent_shares_handler),
         )
+        // Read-only decentralised-coordinator election view. Returns
+        // `{enabled:false}` unless the operator turns on
+        // `[coordinator] wraith_election_enabled`.
+        .route(
+            "/api/v1/pool/coordinator",
+            get(api_pool_coordinator_handler),
+        )
         // Treasury + decentralisation-phase state for the Core page.
         // Exposes balance / 21-BTC threshold / decay year / fee split so
         // the website can render the Bootstrap → Decentralising →
@@ -7077,6 +7084,17 @@ async fn api_reaper_status_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
     Json(state.reaper_stats())
+}
+
+/// Read-only decentralised-coordinator election view
+/// (`tasks/plan_decentralised_coordinators.md`). Returns
+/// `{enabled, epoch, seats, my_seat, elected:[hex node ids]}` when the operator
+/// has turned on `[coordinator] wraith_election_enabled`, else `{enabled:false}`.
+/// This endpoint activates nothing — it only reports the public election draw.
+async fn api_pool_coordinator_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    Json(state.coordinator_status())
 }
 
 /// Detect whether the operator has installed the per-node mempool.space stack

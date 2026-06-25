@@ -51,6 +51,7 @@ ghost-consensus = { workspace = true }
 ghost-accounting = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-verification = { workspace = true }
+wraith-protocol = { workspace = true }
 ghost-template = { workspace = true }
 ghost-glyph = { workspace = true }
 

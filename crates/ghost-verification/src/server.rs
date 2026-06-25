@@ -934,6 +934,11 @@ pub struct VerificationState {
     /// concrete `ReaperStats` type lives in `bins/ghost-pool` and we don't
     /// want a reverse dep from ghost-verification.
     get_reaper_stats: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
+    /// Coordinator-election snapshot callback (pre-serialized JSON to avoid a
+    /// reverse-dependency on the `wraith-protocol`/`ghost-pool` election types).
+    /// Returns `{enabled, epoch, seats, my_seat, elected}` when the feature is
+    /// on, or `{enabled:false}` when off / not wired. Read-only.
+    get_coordinator_status: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Mesh-wide deduplicated active miner count callback. Returns the size
     /// of the union of locally-active miner_id hashes and every connected
     /// peer's most-recent reported set, giving an exact pool-wide active
@@ -1125,6 +1130,7 @@ impl VerificationState {
             internal_auth: None,
             get_pool_peers: None,
             get_reaper_stats: None,
+            get_coordinator_status: None,
             get_mesh_active_miners: None,
             get_mesh_total_hashrate: None,
             get_local_hashrate: None,
@@ -1596,6 +1602,25 @@ impl VerificationState {
         f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
     ) -> Self {
         self.get_reaper_stats = Some(Box::new(f));
+        self
+    }
+
+    /// Coordinator-election snapshot for `/api/v1/pool/coordinator`, or
+    /// `{enabled:false}` when the feature is off / not wired. Read-only.
+    pub fn coordinator_status(&self) -> serde_json::Value {
+        self.get_coordinator_status
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_else(|| serde_json::json!({ "enabled": false }))
+    }
+
+    /// Set the coordinator-election snapshot callback (pre-serialized JSON to
+    /// avoid a reverse-dependency on `wraith-protocol`/`ghost-pool`).
+    pub fn with_coordinator_status(
+        mut self,
+        f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
+    ) -> Self {
+        self.get_coordinator_status = Some(Box::new(f));
         self
     }
 
