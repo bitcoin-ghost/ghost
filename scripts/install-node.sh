@@ -18,8 +18,9 @@ GHOST_VERSION="v1.10.3"
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
 POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-# TODO(hosting): publish a signed ghost-core (ghostd) release and set this.
-GHOSTD_URL="${GHOSTD_URL:-https://github.com/bitcoin-ghost/ghost-core/releases/download/${GHOST_VERSION}/ghostd-x86_64-linux-gnu}"
+GHOSTD_URL="${GHOSTD_URL:-https://get.bitcoinghost.org/bin/ghostd}"
+GHOSTD_SHA256="c05c8588925860b5e50296b2fbaa5004e0569f280b623fa91d39611aac7fc73a"
+RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
 # ZK params are auto-fetched from peers on first run; this is the pinned hash.
 ZK_PARAMS_HASH="BLOCK:fa9db2b79ee55bd181c33943a466aad24e58618c7cf1e2f23daf91462115ce77"
 # Bootstrap peers (the current Elders). The node discovers the rest via gossip.
@@ -110,7 +111,7 @@ curl -fsSLO "${RELEASE_BASE}/${POOL_TARBALL}"
 curl -fsSLO "${RELEASE_BASE}/SHA256SUMS.txt"
 curl -fsSLO "${RELEASE_BASE}/SHA256SUMS.txt.asc"
 # Verify the GPG signature over the checksums, then the checksum of our tarball.
-curl -fsSL "https://github.com/bitcoin-ghost.gpg" 2>/dev/null | gpg --import 2>/dev/null || true
+curl -fsSL "$RELEASE_KEY_URL" 2>/dev/null | gpg --import 2>/dev/null || true
 if ! gpg --list-keys "$GPG_KEY_FP" >/dev/null 2>&1; then
   echo "WARNING: release signing key ${GPG_KEY_FP} not available; cannot verify signature." >&2
 else
@@ -119,8 +120,9 @@ fi
 grep " ${POOL_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${POOL_TARBALL}."
 tar -xzf "$POOL_TARBALL"
 install -m755 -o root -g root "$(find . -name ghost-pool -type f | head -1)" /opt/ghost/bin/ghost-pool
-# ghostd
-curl -fsSL "$GHOSTD_URL" -o ghostd || err "Could not download ghostd from ${GHOSTD_URL} (see TODO in installer)."
+# ghostd (pinned checksum)
+curl -fsSL "$GHOSTD_URL" -o ghostd || err "Could not download ghostd from ${GHOSTD_URL}."
+echo "${GHOSTD_SHA256}  ghostd" | sha256sum -c - || err "ghostd checksum verification FAILED."
 install -m755 -o root -g root ghostd /opt/ghost/bin/ghostd
 cd /
 
