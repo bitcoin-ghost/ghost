@@ -2487,16 +2487,21 @@ async fn api_miner_history_handler(
     }))
 }
 
-/// Public pool records — best (lowest-value, most-leading-zeros) share
-/// submitted to THIS node within the requested time window.
+/// Public pool records — best (rarest, lowest-value) valid share for the
+/// requested window, converged across the MESH.
 ///
-/// The website fans out to every node and takes the min across them to get
-/// a pool-wide best. No mesh gossip required; each node serves its own view.
+/// Each node stores only its own miners' shares, so the pool-wide record can
+/// live on any node. Every node gossips its per-window best in its health ping
+/// (`HealthPing::best_records`), so this handler merges the local DB best with
+/// every connected peer's gossiped best and returns the rarest across all of
+/// them. That makes the record stable + correct on first load: it no longer
+/// flickers when the record-holding node is momentarily unreachable, and the
+/// website's fan-out + min still returns the same value (now from any node).
 ///
 /// `?window=` accepts `block | day | week | month`. Defaults to `day`.
 /// "Block" is approximated as the last 10 minutes (average block interval)
 /// rather than looking up the actual network tip time — keeps the handler
-/// synchronous and DB-only.
+/// synchronous and DB-only for the local term.
 ///
 /// The miner ID is returned in redacted form to preserve privacy while
 /// still giving enough of a handle to recognise one's own worker.
@@ -2539,52 +2544,93 @@ async fn api_pool_records_handler(
         }));
     };
 
-    match db.get_best_share_since(since_ts) {
-        Ok(None) => Json(serde_json::json!({
-            "window": window_name,
-            "since_ts": since_ts,
-            "found": false,
-        })),
-        Ok(Some(best)) => {
-            // Count leading '0' hex chars (each = 4 binary leading zeros).
-            // This is a coarse signal; the hash itself is the definitive
-            // record, but "47 zeros" reads better than a hex blob in tiles.
-            let leading_hex_zeros = best.share_hash.chars().take_while(|c| *c == '0').count();
-            let leading_zero_bits = leading_hex_zeros * 4;
-            // Redact miner_id: `bc1q...tip.worker` keeps enough for the
-            // miner themself to recognise while shedding most of the
-            // address. Format: first 6 chars, ellipsis, last 4 chars of
-            // the address portion, then `.worker` intact.
-            let redacted = redact_miner_id(&best.miner_id);
-
-            Json(serde_json::json!({
-                "window": window_name,
-                "since_ts": since_ts,
-                "found": true,
-                "best": {
-                    "share_hash": best.share_hash,
-                    "leading_zero_bits": leading_zero_bits,
-                    "leading_hex_zeros": leading_hex_zeros,
-                    "miner_id_redacted": redacted,
-                    "timestamp": best.timestamp,
-                    // Achieved difficulty from the hash (the score), NOT the stored
-                    // vardiff target. `assigned_difficulty` keeps the old value for
-                    // any consumer that wants the share's pool-credit work.
-                    "difficulty": share_difficulty_from_hash_hex(&best.share_hash),
-                    "assigned_difficulty": best.difficulty,
-                }
-            }))
-        }
+    // Local term: this node's own best for the window, from SQLite. We keep the
+    // stored vardiff target separately so the response can still expose
+    // `assigned_difficulty` when the local share wins (peers only gossip the
+    // achieved difficulty, so that field is null when a peer's record wins).
+    let local_best = match db.get_best_share_since(since_ts) {
+        Ok(best) => best,
         Err(e) => {
             error!(error = %e, "Failed to query best share");
-            Json(serde_json::json!({
+            return Json(serde_json::json!({
                 "window": window_name,
                 "since_ts": since_ts,
                 "found": false,
                 "error": "Database error",
-            }))
+            }));
+        }
+    };
+
+    // Candidate winner so far: the rarest `share_hash` seen. `assigned_diff`
+    // is Some only for the local share. Hashes are fixed-width zero-padded hex,
+    // so string `<` matches numeric order (smaller = rarer).
+    let mut winning_hash: Option<String> = None;
+    let mut winning_redacted = String::new();
+    let mut winning_timestamp: i64 = 0;
+    let mut winning_assigned_diff: Option<f64> = None;
+
+    if let Some(best) = local_best {
+        winning_hash = Some(best.share_hash.clone());
+        winning_redacted = redact_miner_id(&best.miner_id);
+        winning_timestamp = best.timestamp;
+        winning_assigned_diff = Some(best.difficulty);
+    }
+
+    // Mesh term: every connected peer's gossiped best for THIS window. The
+    // miner_id is already redacted at the source. A peer record beats the
+    // current winner only when its hash is strictly smaller (rarer).
+    if let Some(peer_records) = state.mesh_best_records() {
+        for rec in peer_records {
+            if rec.window != window_name || rec.share_hash.is_empty() {
+                continue;
+            }
+            let beats = winning_hash
+                .as_ref()
+                .map(|w| rec.share_hash < *w)
+                .unwrap_or(true);
+            if beats {
+                winning_hash = Some(rec.share_hash);
+                winning_redacted = rec.miner_id_redacted;
+                winning_timestamp = rec.timestamp;
+                // A peer's record carries no stored vardiff target.
+                winning_assigned_diff = None;
+            }
         }
     }
+
+    let Some(share_hash) = winning_hash else {
+        return Json(serde_json::json!({
+            "window": window_name,
+            "since_ts": since_ts,
+            "found": false,
+        }));
+    };
+
+    // Recompute the leading-zero presentation from the WINNING hash (the local
+    // and peer hashes use the same big-endian zero-padded hex encoding).
+    // Each leading '0' hex char = 4 binary leading zeros — a coarse signal;
+    // the hash itself is the definitive record but reads worse in tiles.
+    let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
+    let leading_zero_bits = leading_hex_zeros * 4;
+
+    Json(serde_json::json!({
+        "window": window_name,
+        "since_ts": since_ts,
+        "found": true,
+        "best": {
+            "share_hash": share_hash,
+            "leading_zero_bits": leading_zero_bits,
+            "leading_hex_zeros": leading_hex_zeros,
+            "miner_id_redacted": winning_redacted,
+            "timestamp": winning_timestamp,
+            // Achieved difficulty from the hash (the score), NOT the stored
+            // vardiff target. `assigned_difficulty` keeps the stored value for
+            // any consumer that wants the share's pool-credit work — null when
+            // a peer's record wins (peers don't gossip their vardiff target).
+            "difficulty": share_difficulty_from_hash_hex(&share_hash),
+            "assigned_difficulty": winning_assigned_diff,
+        }
+    }))
 }
 
 /// Public leaderboard for the pool page. Returns both the best-hash
@@ -2746,7 +2792,10 @@ async fn api_pool_leaderboard_handler(
 /// here.) The difficulty-1 target (pdiff) is `0xFFFF * 2^208`.
 ///
 /// Returns 0.0 for a hash that isn't 32 bytes of hex (treated as "unknown").
-fn share_difficulty_from_hash_hex(share_hash_hex: &str) -> f64 {
+/// Achieved difficulty for a 64-char big-endian hex share hash (`diff1_target
+/// / hash_value`). Returns 0.0 for malformed input. `pub` so the ping builder
+/// in ghost-pool derives the same score it would here.
+pub fn share_difficulty_from_hash_hex(share_hash_hex: &str) -> f64 {
     let bytes = match hex::decode(share_hash_hex) {
         Ok(b) if b.len() == 32 => b,
         _ => return 0.0,
@@ -2769,7 +2818,10 @@ fn is_system_miner(miner_id: &str) -> bool {
     lower.contains("translator") || lower == "proxy"
 }
 
-fn redact_miner_id(id: &str) -> String {
+/// Redact a `address.worker` miner_id for public display: first 6 + ellipsis +
+/// last 4 of the address portion, worker kept intact. `pub` so the ping builder
+/// in ghost-pool redacts gossiped records identically to this endpoint.
+pub fn redact_miner_id(id: &str) -> String {
     let (addr, worker) = match id.find('.') {
         Some(i) => (&id[..i], &id[i..]), // worker has leading '.'
         None => (id, ""),

@@ -106,6 +106,40 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// share variance while still tracking real changes within a few minutes.
 const MESH_HASHRATE_WINDOW_SECS: i64 = 600;
 
+/// Records windows gossiped in health pings: `(name, cutoff_secs)`. MUST match
+/// the windows the `/api/v1/pool/records` endpoint serves so the gossiped best
+/// merges 1:1 with the local DB best per window.
+const RECORD_WINDOWS: [(&str, i64); 4] = [
+    ("block", 600),
+    ("day", 86_400),
+    ("week", 604_800),
+    ("month", 2_592_000),
+];
+
+/// Build this node's best (rarest) valid share per records window from the
+/// local DB, shaped exactly like the `/api/v1/pool/records` response (redacted
+/// miner_id, achieved difficulty from the hash). Gossiped in health pings so
+/// the mesh converges on the pool-wide rarest record per window. Windows with
+/// no local share are omitted (a receiving node just won't get a term from us).
+fn build_local_best_records(
+    db: &ghost_storage::Database,
+) -> Vec<ghost_common::types::WindowBestRecord> {
+    let now_s = chrono::Utc::now().timestamp();
+    let mut out = Vec::with_capacity(RECORD_WINDOWS.len());
+    for (window, cutoff) in RECORD_WINDOWS {
+        if let Ok(Some(best)) = db.get_best_share_since(now_s - cutoff) {
+            out.push(ghost_common::types::WindowBestRecord {
+                window: window.to_string(),
+                difficulty: ghost_verification::share_difficulty_from_hash_hex(&best.share_hash),
+                miner_id_redacted: ghost_verification::redact_miner_id(&best.miner_id),
+                share_hash: best.share_hash,
+                timestamp: best.timestamp,
+            });
+        }
+    }
+    out
+}
+
 /// H-8 SECURITY: Static storage for ZMQ subscriber to prevent memory leak.
 /// Previously used std::mem::forget which intentionally leaked memory.
 /// Using OnceLock ensures the subscriber lives for the program lifetime
@@ -996,6 +1030,17 @@ async fn main() -> Result<()> {
         db_for_local_hr
             .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_provider)
             .unwrap_or(0.0)
+    }));
+
+    // Gossip THIS node's best (rarest) valid share per records window so every
+    // node converges on the pool-wide rarest record per window. Without this,
+    // the record lives on whichever node received it and the website's fan-out
+    // flickers when that node is momentarily unreachable. Each entry mirrors the
+    // shape the `/api/v1/pool/records` endpoint returns (redacted miner_id,
+    // achieved difficulty) so a receiving node can serve it verbatim.
+    let db_for_best_records = Arc::clone(&db);
+    mesh_inner.set_best_records_provider(Arc::new(move || {
+        build_local_best_records(&db_for_best_records)
     }));
 
     let mesh = Arc::new(mesh_inner);
@@ -3368,6 +3413,16 @@ async fn main() -> Result<()> {
             .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_route)
             .unwrap_or(0.0)
     });
+
+    // Mesh-wide best records per window — every connected peer's gossiped best,
+    // reduced to one winner per window. The records endpoint merges this with
+    // the local DB best so the pool-wide rarest record survives the
+    // record-holding node being momentarily unreachable. 300s peer freshness
+    // (matches the active-miner window) so a couple of missed ~10s pings don't
+    // drop a peer's record from the merge.
+    let mesh_for_best_records = Arc::clone(&mesh);
+    verification_state = verification_state
+        .with_mesh_best_records(move || mesh_for_best_records.mesh_best_records(300));
 
     // Advertise this node's hardware-derived capacity via /api/internal/pool-nodes
     // so the colocated translator's load balancer routes by utilisation %.

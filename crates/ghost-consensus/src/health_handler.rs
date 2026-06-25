@@ -867,6 +867,10 @@ impl HealthPingHandler {
         // Hardware-derived capacity used by the LB for utilisation routing.
         self.peers
             .update_max_capacity(&envelope.sender, ping.max_capacity);
+        // Best (rarest) share per records window — merged with the local DB
+        // best so `/api/v1/pool/records` returns the mesh-wide rarest record.
+        self.peers
+            .update_best_records(&envelope.sender, ping.best_records.clone());
 
         // Persist to database if available
         if let Some(ref db) = self.db {

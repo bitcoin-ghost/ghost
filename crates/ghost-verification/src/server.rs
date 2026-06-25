@@ -31,7 +31,7 @@ use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::types::NodeCapabilities;
+use ghost_common::types::{NodeCapabilities, WindowBestRecord};
 use ghost_policy::{PolicyEngine, PolicyProfile};
 use ghost_storage::Database;
 use std::path::PathBuf;
@@ -950,6 +950,13 @@ pub struct VerificationState {
     /// exact term it contributes to `get_mesh_total_hashrate`. Surfaced as
     /// `local_hashrate_th` so the per-node and mesh figures reconcile.
     get_local_hashrate: Option<Box<dyn Fn() -> f64 + Send + Sync>>,
+    /// Mesh-wide best (rarest) records per window: the connected peers'
+    /// gossiped `best_records`, already reduced to one winner per window.
+    /// The records endpoint merges this with the local DB best so it returns
+    /// the pool-wide rarest record even when the record-holding node is
+    /// momentarily unreachable. None on older deploys without the provider —
+    /// callers fall back to the node-local DB record only.
+    get_mesh_best_records: Option<Box<dyn Fn() -> Vec<WindowBestRecord> + Send + Sync>>,
     /// Signal to trigger graceful restart (set by config update API)
     /// When true, main.rs will initiate shutdown and exit with code 100
     pub restart_signal: Arc<AtomicBool>,
@@ -1121,6 +1128,7 @@ impl VerificationState {
             get_mesh_active_miners: None,
             get_mesh_total_hashrate: None,
             get_local_hashrate: None,
+            get_mesh_best_records: None,
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
@@ -1625,6 +1633,21 @@ impl VerificationState {
     /// the mesh total — or None if no callback has been wired up.
     pub fn local_hashrate(&self) -> Option<f64> {
         self.get_local_hashrate.as_ref().map(|f| f())
+    }
+
+    /// Set the mesh-wide best-records-per-window callback.
+    pub fn with_mesh_best_records(
+        mut self,
+        f: impl Fn() -> Vec<WindowBestRecord> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_mesh_best_records = Some(Box::new(f));
+        self
+    }
+
+    /// Returns the connected peers' best records per window (already reduced to
+    /// one winner per window), or None if no callback has been wired up.
+    pub fn mesh_best_records(&self) -> Option<Vec<WindowBestRecord>> {
+        self.get_mesh_best_records.as_ref().map(|f| f())
     }
 
     /// Set archive handler
