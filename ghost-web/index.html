@@ -565,16 +565,21 @@
             .then(function (r) { clearTimeout(t); return r.ok ? r.json() : null; })
             .catch(function () { clearTimeout(t); return null; });
         }));
-        var online = 0, hash = 0, height = 0, mesh = null, maxActive = 0;
+        var online = 0, hash = 0, meshHash = null, sumLocal = 0, height = 0, mesh = null, maxActive = 0;
         results.forEach(function (r) {
           if (!r) return;
           online++;
-          // Sum per-node `local_hashrate_th` (each node's own contribution),
-          // NOT `total_hashrate` — post-PR#27 every node reports the mesh-wide
-          // pool total there, so summing across 4 nodes ~4x's the real figure.
-          hash += (typeof r.local_hashrate_th === 'number')
-            ? r.local_hashrate_th
-            : (r.total_hashrate || 0);
+          // Pool hashrate: prefer the mesh-wide `total_hashrate` (the SAME pool
+          // total on every post-PR#27 node) via MAX across responders — NOT the
+          // sum. Summing 4 equal mesh values ~4x's it; the mesh figure from any
+          // ONE responding node is the correct total, so a dropped fetch no longer
+          // swings the headline (the old per-node `local_hashrate_th` SUM needed
+          // all 4, and one dominant miner made a single miss crater it). `sumLocal`
+          // is a pre-PR#27 fallback only.
+          if (typeof r.total_hashrate === 'number') {
+            if (meshHash === null || r.total_hashrate > meshHash) meshHash = r.total_hashrate;
+          }
+          if (typeof r.local_hashrate_th === 'number') sumLocal += r.local_hashrate_th;
           if (r.block_height && r.block_height > height) height = r.block_height;
           var a = r.active_miners || 0;
           if (a > maxActive) maxActive = a;
@@ -586,6 +591,9 @@
             if (mesh === null || r.mesh_active_miners > mesh) mesh = r.mesh_active_miners;
           }
         });
+        // Mesh-wide total from any single responder; per-node sum only as a
+        // pre-PR#27 fallback. Robust to partial fetch failures.
+        hash = (meshHash !== null) ? meshHash : sumLocal;
         // Don't blank tiles if every fetch failed AND we already had good
         // data — a single 4-VM rate-limit burst shouldn't reset the view.
         var allFailed = (online === 0);

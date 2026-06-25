@@ -242,7 +242,7 @@
     <h2 class="section-title">In line to get paid.</h2>
     <p class="section-lead">
       The ledger. Every share you submit accumulates on your unpaid balance.
-      When a block is found the top 1000 miners by unpaid work (filtered to
+      When a block is found the top 200 miners by unpaid work (filtered to
       those above the 546-sat dust threshold) get included in the coinbase,
       proportional to their share. Everyone else keeps their ledger intact
       and carries it forward to compete for the next block. Unpaid shares
@@ -629,18 +629,23 @@
         dbg('poll skip · 0/4 nodes — preserving last view');
         return;
       }
-      var hashrate = 0, blocks = 0, height = 0, mesh = null, maxActive = 0;
+      var hashrate = 0, meshHashrate = null, sumLocal = 0, blocks = 0, height = 0, mesh = null, maxActive = 0;
       results.forEach(function (r) {
         if (!r) return;
-        // Sum each node's OWN hashrate (`local_hashrate_th`), not
-        // `total_hashrate`. Post-PR#27 every node reports the mesh-wide pool
-        // total in `total_hashrate` (so all 4 agree), and summing those would
-        // multiply the real figure by ~4. `local_hashrate_th` is the per-node
-        // contribution and sums to the true total. Fall back to
-        // `total_hashrate` for any pre-PR#27 node (there it is still node-local).
-        hashrate += (typeof r.local_hashrate_th === 'number')
-          ? r.local_hashrate_th
-          : (r.total_hashrate || 0);
+        // Pool hashrate: prefer the mesh-wide `total_hashrate` (every post-PR#27
+        // node reports the SAME pool-wide figure, built from gossiped per-node
+        // rates) and take the MAX across responders — NOT the sum. Summing 4
+        // equal mesh values ~4x's it; and a node missing a peer reports low, so
+        // max picks the most complete view. Using the mesh figure means ONE
+        // responding node yields the correct total, so a single dropped fetch no
+        // longer craters the headline. The old `local_hashrate_th` SUM needed all
+        // 4 nodes, and with one dominant miner a single miss swung the total to a
+        // fraction (the "sometimes 3 TH/s" bug). `sumLocal` is kept only as a
+        // pre-PR#27 fallback for any node that doesn't report a mesh figure.
+        if (typeof r.total_hashrate === 'number') {
+          if (meshHashrate === null || r.total_hashrate > meshHashrate) meshHashrate = r.total_hashrate;
+        }
+        if (typeof r.local_hashrate_th === 'number') sumLocal += r.local_hashrate_th;
         blocks += r.blocks_found || 0;
         if (r.block_height && r.block_height > height) height = r.block_height;
         var a = r.active_miners || 0;
@@ -649,6 +654,9 @@
           if (mesh === null || r.mesh_active_miners > mesh) mesh = r.mesh_active_miners;
         }
       });
+      // Mesh-wide total from any single responder; per-node sum only if no node
+      // reported a mesh figure. Robust to partial fetch failures.
+      hashrate = (meshHashrate !== null) ? meshHashrate : sumLocal;
       // Detect block events by comparing against the previous tick:
       //   blocks_found increment → we mined a block (green flash)
       //   block_height increment with blocks_found flat → someone else
@@ -762,6 +770,24 @@
       var prev = bestPerWindow[r.window];
       if (!prev || r.data.best.share_hash < prev.share_hash) {
         bestPerWindow[r.window] = r.data.best;
+      }
+    });
+    // Temporal latch — fixes the records flicker. A "best in window" record can
+    // only IMPROVE until it ages out of its window. Each node holds only its own
+    // miners' shares, so a given record (e.g. the 1.63G on vm3) lives on ONE
+    // node; when that node is rate-limited in a 60s cycle the 16-way fan-out
+    // returns a worse value, which must NOT clobber a still-valid record. Keep
+    // the cached best unless the fresh one is genuinely rarer, or the cached one
+    // has aged out of its window (then let fresh data legitimately replace it).
+    var __nowSec = Math.floor(Date.now() / 1000);
+    var REC_WINDOW_SECS = { block: 600, day: 86400, week: 604800, month: 2592000 };
+    REC_WINDOWS.forEach(function (w) {
+      var cached = lastRecords[w];
+      if (!cached || cached.timestamp == null) return;
+      if ((__nowSec - cached.timestamp) >= (REC_WINDOW_SECS[w] || 2592000)) return; // aged out
+      var fresh = bestPerWindow[w];
+      if (!fresh || cached.share_hash < fresh.share_hash) {
+        bestPerWindow[w] = cached; // fresh missing or worse → keep the valid record
       }
     });
     // Enforce window monotonicity: wider windows are supersets of narrower
