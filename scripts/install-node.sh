@@ -241,7 +241,50 @@ log "Generating node identity"
 sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_PARAMS_HASH="$ZK_PARAMS_HASH" \
   /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
 
-# ─────────────────────────── 8. systemd units ────────────────────────────────
+# ───────────────────────── 8. sync gate (auto) ───────────────────────────────
+# Start ghost-pool only AFTER ghostd finishes its initial sync. An unsynced node
+# participating in checkpoint consensus just spams "wrong proposer" and can't
+# vote — so we gate it. On a normal reboot ghostd is already synced, so the gate
+# returns almost immediately.
+log "Installing sync gate"
+cat > /opt/ghost/bin/wait-for-ghostd-sync.sh <<'EOF'
+#!/usr/bin/env bash
+set -u
+CONF=/etc/bitcoin/bitcoin.conf
+RPCUSER=$(grep -m1 '^rpcuser=' "$CONF" | cut -d= -f2-)
+RPCPW=$(grep -m1 '^rpcpassword=' "$CONF" | cut -d= -f2-)
+echo "[ghost-pool-gate] waiting for ghostd to finish initial sync..."
+while true; do
+  RESP=$(curl -s --max-time 8 --user "$RPCUSER:$RPCPW" \
+    --data '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
+    http://127.0.0.1:8332/ 2>/dev/null)
+  IBD=$(echo "$RESP" | grep -oE '"initialblockdownload":[[:space:]]*(true|false)' | grep -oE 'true|false')
+  if [ "$IBD" = "false" ]; then
+    echo "[ghost-pool-gate] ghostd synced — starting ghost-pool"
+    systemctl start ghost-pool
+    exit 0
+  fi
+  sleep 30
+done
+EOF
+chmod 755 /opt/ghost/bin/wait-for-ghostd-sync.sh
+cat > /etc/systemd/system/ghost-pool-gate.service <<'EOF'
+[Unit]
+Description=Ghost Pool sync gate (starts ghost-pool once ghostd is synced)
+After=ghostd.service network-online.target
+Wants=network-online.target
+[Service]
+# Type=simple so the installer's `systemctl start` returns immediately — a
+# blocking oneshot would hang the install for the hours-long initial sync.
+Type=simple
+ExecStart=/opt/ghost/bin/wait-for-ghostd-sync.sh
+Restart=on-failure
+RestartSec=30
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ─────────────────────────── 9. systemd units ────────────────────────────────
 log "Installing systemd units"
 REAPER_FLAGS=""
 [[ "$REAPER" == "true" ]] && REAPER_FLAGS="-ghostreaper=enabled -ghostreaper-rejectinscription=1 -ghostreaper-rejectdropstuffing=1 -ghostreaper-rejectfakepubkey=1 -ghostreaper-rejectannex=1 -ghostreaper-rejectopreturn=1 -ghostreaper-rejectrunestone=1 -ghostreaper-maxopreturn=82 -ghostreaper-mindropsize=76"
@@ -292,22 +335,24 @@ ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus
 ufw --force enable      >/dev/null 2>&1
 
-# ─────────────────────────────── 10. start ───────────────────────────────────
+# ─────────────────────────────── 11. start ───────────────────────────────────
 log "Starting services"
 systemctl daemon-reload
-systemctl enable --now ghostd    >/dev/null 2>&1
+systemctl enable --now ghostd >/dev/null 2>&1
+# ghost-pool is NOT started here — the gate starts it once ghostd is synced.
+# ghost-pool.service is installed but left disabled; the (enabled) gate owns it.
+systemctl enable --now ghost-pool-gate >/dev/null 2>&1
 sleep 5
-systemctl enable --now ghost-pool >/dev/null 2>&1
-sleep 10
 
 NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_PARAMS_HASH="$ZK_PARAMS_HASH" /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
 cat <<EOF
 
   ✅ Bitcoin Ghost node installed.
      ${NODE_ID}
-     ghostd:     $(systemctl is-active ghostd)   (syncing — full IBD takes hours; check: journalctl -u ghostd -f)
-     ghost-pool: $(systemctl is-active ghost-pool)   (mesh: curl -s localhost:8080/health)
+     ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: journalctl -u ghostd -f)
+     ghost-pool-gate: $(systemctl is-active ghost-pool-gate)  (waiting for sync, then auto-starts ghost-pool)
 
-  Your node joins the mesh now and registers as an Elder if slots remain (first 101).
-  Full consensus participation begins once ghostd finishes syncing.
+  ghost-pool starts AUTOMATICALLY once ghostd finishes syncing — then your node
+  joins the mesh and registers as an Elder if slots remain (first 101).
+  Watch the gate:  journalctl -u ghost-pool-gate -f
 EOF
