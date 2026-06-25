@@ -64,6 +64,21 @@ pub struct TranslatorConfig {
     /// less-loaded peers discovered via the local ghost-pool mesh.
     #[serde(default)]
     pub load_balancer: Option<crate::load_balancer::LoadBalancerConfig>,
+    /// Optional port for an opt-in TLS stratum listener.
+    ///
+    /// When `tls_port`, `tls_cert_path` and `tls_key_path` are all set, the translator binds a
+    /// second listener on this port and terminates TLS for connecting miners (e.g. AxeOS/Bitaxe
+    /// with "Connection Security: TLS" enabled), feeding accepted connections through the same
+    /// downstream path as the plain-TCP listener. If any of the three are unset, no TLS listener
+    /// is created and behaviour is unchanged.
+    #[serde(default)]
+    pub tls_port: Option<u16>,
+    /// Path to the PEM-encoded certificate chain for the TLS listener.
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// Path to the PEM-encoded private key for the TLS listener.
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -122,6 +137,9 @@ impl TranslatorConfig {
             monitoring_address,
             monitoring_cache_refresh_secs,
             load_balancer: None,
+            tls_port: None,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 

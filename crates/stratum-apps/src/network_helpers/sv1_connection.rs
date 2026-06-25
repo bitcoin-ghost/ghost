@@ -1,10 +1,7 @@
 use async_channel::{unbounded, Receiver, Sender};
 use futures::StreamExt;
 use stratum_core::sv1_api::json_rpc;
-use tokio::{
-    io::{AsyncWriteExt, BufReader, BufWriter},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf};
 use tokio_util::{
     codec::{FramedRead, LinesCodec},
     sync::CancellationToken,
@@ -56,8 +53,17 @@ impl ConnectionState {
 const MAX_LINE_LENGTH: usize = 1 << 16;
 
 impl ConnectionSV1 {
-    pub async fn new(stream: TcpStream, cancellation_token: CancellationToken) -> Self {
-        let (read_half, write_half) = stream.into_split();
+    /// Creates a new [`ConnectionSV1`] over any bidirectional async stream.
+    ///
+    /// Generic over `S` so the same connection-handling path serves both the plain-TCP
+    /// listener (`S = TcpStream`) and the opt-in TLS listener (`S = TlsStream<TcpStream>`).
+    /// The stream is split with [`tokio::io::split`] rather than the `TcpStream`-specific
+    /// `into_split`, which keeps the plain-TCP behaviour byte-for-byte identical.
+    pub async fn new<S>(stream: S, cancellation_token: CancellationToken) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (read_half, write_half) = tokio::io::split(stream);
         let (sender_incoming, receiver_incoming) = unbounded();
         let (sender_outgoing, receiver_outgoing) = unbounded();
 
@@ -94,8 +100,8 @@ impl ConnectionSV1 {
         }
     }
 
-    async fn run_reader(
-        reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    async fn run_reader<R: AsyncRead + Unpin>(
+        reader: BufReader<ReadHalf<R>>,
         sender: Sender<json_rpc::Message>,
     ) {
         let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
@@ -120,8 +126,8 @@ impl ConnectionSV1 {
         }
     }
 
-    async fn run_writer(
-        mut writer: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    async fn run_writer<W: AsyncWrite + Unpin>(
+        mut writer: BufWriter<WriteHalf<W>>,
         receiver: Receiver<json_rpc::Message>,
     ) {
         while let Ok(msg) = receiver.recv().await {
@@ -168,7 +174,7 @@ impl ConnectionSV1 {
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
 
