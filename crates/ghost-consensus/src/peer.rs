@@ -26,7 +26,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use ghost_common::types::{NodeCapabilities, NodeId};
+use ghost_common::types::{NodeCapabilities, NodeId, WindowBestRecord};
 
 /// L-3 FIX: Extract host portion from an address, handling both IPv4 and IPv6 formats.
 ///
@@ -149,6 +149,9 @@ impl PeerManager {
             }
             if merged.max_capacity == 0 {
                 merged.max_capacity = existing.max_capacity;
+            }
+            if merged.best_records.is_empty() {
+                merged.best_records = existing.best_records.clone();
             }
             merged.first_seen = merged.first_seen.min(existing.first_seen);
             peers.insert(merged.node_id, merged);
@@ -309,6 +312,16 @@ impl PeerManager {
         }
     }
 
+    /// Replace the peer's best-records-per-window list with the most recent
+    /// from a health ping. Merged with the local DB best (and every other
+    /// peer's) to converge on the mesh-wide rarest record per window. Older
+    /// peers that don't report it pass an empty Vec.
+    pub fn update_best_records(&self, node_id: &NodeId, best_records: Vec<WindowBestRecord>) {
+        if let Some(peer) = self.peers.write().get_mut(node_id) {
+            peer.best_records = best_records;
+        }
+    }
+
     /// Mark peer as disconnected
     ///
     /// P2P4-L1: Logs peer disconnection for observability
@@ -412,6 +425,11 @@ pub struct Peer {
     /// (legacy or pre-update node) — treated as "unknown" and excluded
     /// from utilisation-based routing.
     pub max_capacity: u32,
+    /// This peer's best (rarest) valid share per records window, from its most
+    /// recent health ping. Merged with the local DB best (and every other
+    /// peer's) so the `/api/v1/pool/records` endpoint returns the mesh-wide
+    /// rarest record per window. Empty for older peers that don't report it.
+    pub best_records: Vec<WindowBestRecord>,
 }
 
 impl Peer {
@@ -435,6 +453,7 @@ impl Peer {
             active_miner_id_hashes: Vec::new(),
             local_hashrate_th: 0.0,
             max_capacity: 0,
+            best_records: Vec::new(),
         }
     }
 
@@ -684,6 +703,14 @@ mod tests {
         mgr.update_active_miner_hashes(&pid, hashes.clone(), 4.5);
         mgr.update_health_metrics(&pid, 3, NodeCapabilities::default());
         mgr.update_max_capacity(&pid, 64);
+        let records = vec![WindowBestRecord {
+            window: "day".to_string(),
+            share_hash: "0".repeat(10) + &"a".repeat(54),
+            difficulty: 1024.0,
+            timestamp: 1,
+            miner_id_redacted: "bc1q…abcd.w1".to_string(),
+        }];
+        mgr.update_best_records(&pid, records.clone());
 
         // Discovery re-announces the SAME peer with a freshly-built (empty) Peer.
         let mut reannounce = Peer::new(pid, "1.2.3.4:8555".to_string());
@@ -698,6 +725,10 @@ mod tests {
         assert_eq!(got.local_hashrate_th, 4.5, "hashrate preserved");
         assert_eq!(got.miner_count, 3, "miner_count preserved");
         assert_eq!(got.max_capacity, 64, "max_capacity preserved");
+        assert_eq!(
+            got.best_records, records,
+            "re-announce must NOT wipe the gossiped best records"
+        );
 
         // A genuine ping update with new values still applies (not stuck).
         mgr.update_active_miner_hashes(&pid, vec![[9u8; 16]], 1.0);

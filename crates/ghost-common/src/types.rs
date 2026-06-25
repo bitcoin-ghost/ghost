@@ -440,6 +440,41 @@ pub struct HealthPing {
     /// as unknown / excluded from utilisation routing).
     #[serde(default)]
     pub max_capacity: u32,
+    /// This node's best (rarest) valid share per public records window
+    /// (`block | day | week | month`). Gossiped so every node knows the
+    /// global best per window and the `/api/v1/pool/records` endpoint can
+    /// return the mesh-wide rarest record instead of only its local one —
+    /// without that, the pool-wide record lives on a single node and the
+    /// website (which fans out and takes the min) flickers whenever that
+    /// node is momentarily unreachable. `#[serde(default)]` for backward
+    /// compatibility — older nodes that don't send it deserialise to an
+    /// empty Vec, and newer nodes simply ignore peers that omit it.
+    #[serde(default)]
+    pub best_records: Vec<WindowBestRecord>,
+}
+
+/// One node's best (rarest) valid share in a public records window.
+///
+/// Carried in [`HealthPing::best_records`] so every node can converge on the
+/// mesh-wide rarest record per window. The `share_hash` is the canonical
+/// record (lower = rarer); all other fields are derived presentation data
+/// already shaped the way the records API returns them, so a receiving node
+/// can serve a peer's record verbatim without re-querying.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct WindowBestRecord {
+    /// Records window this record belongs to: `block | day | week | month`.
+    pub window: String,
+    /// 64-char zero-padded big-endian hex of the share hash. Fixed width, so
+    /// lexicographic string comparison matches numeric order (lower = rarer).
+    pub share_hash: String,
+    /// Achieved difficulty derived from `share_hash` (the score), matching the
+    /// `difficulty` the records API returns.
+    pub difficulty: f64,
+    /// Unix-seconds timestamp of the share.
+    pub timestamp: i64,
+    /// Redacted miner_id (e.g. `bc1q7z…y492.avalon1`), already shaped the same
+    /// way the records API redacts — never the raw miner_id.
+    pub miner_id_redacted: String,
 }
 
 /// Hex-encoded serialization for the active miner-id hash list.
@@ -967,6 +1002,13 @@ mod tests {
             active_miner_id_hashes: vec![[1u8; 16], [2u8; 16]],
             local_hashrate_th: 4.0,
             max_capacity: 0,
+            best_records: vec![WindowBestRecord {
+                window: "day".to_string(),
+                share_hash: "0".repeat(8) + &"f".repeat(56),
+                difficulty: 4096.0,
+                timestamp: 1,
+                miner_id_redacted: "bc1q7z…y492.avalon1".to_string(),
+            }],
         }
     }
 
@@ -995,6 +1037,29 @@ mod tests {
         assert_eq!(back.local_hashrate_th, 0.0);
         assert_eq!(back.active_miner_id_hashes.len(), 2);
         assert_eq!(back.miner_count, 2);
+    }
+
+    #[test]
+    fn health_ping_best_records_roundtrip() {
+        let ping = sample_health_ping();
+        let json = serde_json::to_string(&ping).unwrap();
+        let back: HealthPing = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.best_records, ping.best_records);
+    }
+
+    #[test]
+    fn health_ping_deserializes_without_best_records_field() {
+        // Emulate an OLDER node's ping that predates `best_records`: serialize,
+        // strip the field, and confirm it defaults to an empty Vec (and the
+        // rest of the ping is unaffected). Proves the wire change is additive
+        // so a mixed-version rolling deploy stays compatible.
+        let ping = sample_health_ping();
+        let mut v = serde_json::to_value(&ping).unwrap();
+        assert!(v.as_object_mut().unwrap().remove("best_records").is_some());
+        let back: HealthPing = serde_json::from_value(v).unwrap();
+        assert!(back.best_records.is_empty());
+        assert_eq!(back.miner_count, 2);
+        assert_eq!(back.active_miner_id_hashes.len(), 2);
     }
 
     // ---- GHOST-09: ShareProof received_by authentication ----

@@ -238,6 +238,11 @@ pub struct MeshNetwork {
     /// hashrate (TH/s) over a trailing window. Gossiped in health pings so
     /// peers can SUM one term per node into a pool-wide total.
     local_hashrate_fn: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
+    /// Application-provided callback returning this node's best (rarest) valid
+    /// share per records window. Gossiped in health pings so every node can
+    /// converge on the mesh-wide rarest record per window.
+    best_records_fn:
+        Option<Arc<dyn Fn() -> Vec<ghost_common::types::WindowBestRecord> + Send + Sync>>,
     /// Hardware-derived effective capacity advertised in health pings.
     /// `0` means we haven't computed it yet (mesh started before capacity
     /// init); peers treat it as unknown and skip utilisation routing for us.
@@ -1051,6 +1056,7 @@ impl MeshNetwork {
             miner_count_fn: None,
             active_miner_hashes_fn: None,
             local_hashrate_fn: None,
+            best_records_fn: None,
             max_capacity: AtomicU32::new(0),
         })
     }
@@ -1102,6 +1108,46 @@ impl MeshNetwork {
     /// trailing window, gossiped in health pings for mesh-wide summation.
     pub fn set_local_hashrate_provider(&mut self, f: Arc<dyn Fn() -> f64 + Send + Sync>) {
         self.local_hashrate_fn = Some(f);
+    }
+
+    /// Set a callback providing this node's best (rarest) valid share per
+    /// records window, gossiped in health pings so the mesh converges on the
+    /// global rarest record per window. Without this, health pings carry an
+    /// empty list.
+    pub fn set_best_records_provider(
+        &mut self,
+        f: Arc<dyn Fn() -> Vec<ghost_common::types::WindowBestRecord> + Send + Sync>,
+    ) {
+        self.best_records_fn = Some(f);
+    }
+
+    /// Collect the best (rarest) record per window across the mesh: every
+    /// connected peer's most-recent gossiped `best_records` whose `last_seen`
+    /// is within `freshness_secs`. Returns one winner per window — the share
+    /// with the lexicographically smallest `share_hash` (fixed-width zero-
+    /// padded hex, so string order == numeric order, lower = rarer).
+    ///
+    /// This is the PEER contribution only; the caller merges it with the local
+    /// DB best (the local node serves its own record straight from SQLite).
+    pub fn mesh_best_records(
+        &self,
+        freshness_secs: u64,
+    ) -> Vec<ghost_common::types::WindowBestRecord> {
+        use std::collections::HashMap;
+        let mut best: HashMap<String, ghost_common::types::WindowBestRecord> = HashMap::new();
+        for peer in self.peers.get_connected_peers(freshness_secs) {
+            for rec in peer.best_records {
+                match best.get(&rec.window) {
+                    // Smaller hash = rarer share. Ignore empty/garbage hashes.
+                    Some(existing) if existing.share_hash <= rec.share_hash => {}
+                    _ if rec.share_hash.is_empty() => {}
+                    _ => {
+                        best.insert(rec.window.clone(), rec);
+                    }
+                }
+            }
+        }
+        best.into_values().collect()
     }
 
     /// Compute the mesh-wide pool hashrate (TH/s): this node's own realized
@@ -2627,6 +2673,13 @@ impl MeshNetwork {
                 .map(|f| f())
                 .unwrap_or_default();
             let local_hashrate_th = self.local_hashrate_fn.as_ref().map(|f| f()).unwrap_or(0.0);
+            // This node's best (rarest) share per records window, gossiped so
+            // the mesh converges on the global rarest record per window.
+            let best_records = self
+                .best_records_fn
+                .as_ref()
+                .map(|f| f())
+                .unwrap_or_default();
             let ping = ghost_common::types::HealthPing {
                 node_id: self.identity.node_id(),
                 public_address: String::new(), // S-7: Don't broadcast IP in cleartext ZMQ
@@ -2643,6 +2696,7 @@ impl MeshNetwork {
                 active_miner_id_hashes,
                 local_hashrate_th,
                 max_capacity: self.max_capacity.load(Ordering::Relaxed),
+                best_records,
             };
 
             match self.create_envelope(
