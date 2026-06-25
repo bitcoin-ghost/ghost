@@ -32,6 +32,15 @@ pub(super) fn is_mining_configure(msg: &Message) -> bool {
     }
 }
 
+/// Check if Sv1 message is mining.subscribe.
+pub(super) fn is_mining_subscribe(msg: &Message) -> bool {
+    if let json_rpc::Message::StandardRequest(r) = &msg {
+        r.method == "mining.subscribe"
+    } else {
+        false
+    }
+}
+
 /// Extracts the worker-identifier portion of an SV1 `mining.authorize` username for use as the
 /// per-downstream identity that flows into the Worker-Specific Hashrate Tracking TLV.
 ///

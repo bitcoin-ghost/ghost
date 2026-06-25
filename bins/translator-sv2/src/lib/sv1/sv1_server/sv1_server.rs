@@ -7,7 +7,7 @@ use crate::{
         downstream::{downstream::Downstream, SubmitShareWithChannelId},
         sv1_server::{
             channel::Sv1ServerChannelState, is_mining_authorize, is_mining_configure,
-            KEEPALIVE_JOB_ID_DELIMITER,
+            is_mining_subscribe, KEEPALIVE_JOB_ID_DELIMITER,
         },
     },
     utils::AGGREGATED_CHANNEL_ID,
@@ -506,9 +506,71 @@ impl Sv1Server {
                     data.queued_sv1_handshake_messages
                         .push(downstream_message.clone())
                 });
+
+                // mining.subscribe timeout fallback (serializer safety).
+                //
+                // PIPELINING miners (AxeOS/bitaxe) fire subscribe + authorize back-to-back, so
+                // the channel opens within ~100ms and the queued subscribe is answered with the
+                // REAL extranonce by the channel-open path (no set_extranonce needed). But
+                // SERIALIZING miners (cgminer / Avalon) wait for the subscribe RESPONSE before
+                // sending authorize — and the channel only opens on authorize. Queuing subscribe
+                // with no fallback deadlocks them: no response → no authorize → no channel → no
+                // response. After ~1.5s with no channel, answer subscribe with the placeholder
+                // extranonce so the serializer proceeds; the channel then opens and the existing
+                // set_extranonce path corrects the extranonce (serializing miners support that
+                // extension). The channel-open path and this timer both claim the queued subscribe
+                // atomically under the data lock, so exactly one of them answers it.
+                if is_mining_subscribe(&downstream_message) {
+                    let server = self.clone();
+                    let did = downstream_id;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        let Some(downstream) =
+                            server.downstreams.get(&did).map(|r| r.value().clone())
+                        else {
+                            return;
+                        };
+                        // Claim the queued subscribe iff the channel still hasn't opened (i.e. the
+                        // open path hasn't already answered it — a pipelining miner).
+                        let subscribe_msg = downstream.downstream_data.super_safe_lock(|data| {
+                            if data.channel_id.is_some() {
+                                return None;
+                            }
+                            data.queued_sv1_handshake_messages
+                                .iter()
+                                .position(|m| is_mining_subscribe(m))
+                                .map(|pos| data.queued_sv1_handshake_messages.remove(pos))
+                        });
+                        if let Some(msg) = subscribe_msg {
+                            info!(
+                                "Down: subscribe-response timeout for downstream {} — serializing \
+                                 miner waiting on subscribe before authorize; answering with \
+                                 placeholder extranonce (set_extranonce corrects it on channel open)",
+                                did
+                            );
+                            match server.clone().handle_message(Some(did), msg) {
+                                Ok(Some(resp)) => {
+                                    if let Err(e) = downstream
+                                        .downstream_channel_state
+                                        .downstream_sv1_sender
+                                        .send(resp.into())
+                                        .await
+                                    {
+                                        warn!("Down: failed to send fallback subscribe response to downstream {}: {:?}", did, e);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    error!("Down: error building fallback subscribe response for downstream {}: {:?}", did, e);
+                                }
+                            }
+                        }
+                    });
+                }
+
                 return Ok(());
             }
-            // For subscribe/authorize: fall through to the normal handle_message path below.
+            // For authorize/configure: fall through to the normal handle_message path below.
             // Authorize-triggered channel open happens in the post-response block.
         }
 
