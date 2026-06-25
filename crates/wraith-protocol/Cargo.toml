@@ -26,7 +26,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Two-phase mixing protocol for Ghost Pay privacy"
+description = "Single-round atomic CoinJoin protocol for Ghost Pay privacy"
 
 [dependencies]
 # Serialization
