@@ -204,6 +204,181 @@ impl Sv1Server {
         }
     }
 
+    /// Registers a freshly accepted downstream connection and spawns its tasks.
+    ///
+    /// Generic over the stream type `S` so it serves both the plain-TCP listener
+    /// (`S = TcpStream`) and the opt-in TLS listener (`S = TlsStream<TcpStream>`) through one
+    /// code path. Everything from constructing the [`ConnectionSV1`] onwards is identical for
+    /// both transports; the load-balancer capacity gate and utilisation routing run earlier,
+    /// in the accept loop, because they operate on the raw `TcpStream` before TLS termination.
+    #[allow(clippy::too_many_arguments)]
+    async fn register_downstream<S>(
+        self: &Arc<Self>,
+        stream: S,
+        addr: SocketAddr,
+        cancellation_token: &CancellationToken,
+        fallback_coordinator: &FallbackCoordinator,
+        status_sender: &Sender<Status>,
+        task_manager: &Arc<TaskManager>,
+        first_target: Target,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        info!("New SV1 downstream connection from {}", addr);
+        let connection_token = cancellation_token.child_token();
+        let connection = ConnectionSV1::new(stream, connection_token.clone()).await;
+        let downstream_id = self.downstream_id_factory.fetch_add(1, Ordering::Relaxed);
+        let (sv1_server_sender, sv1_server_receiver) = async_channel::unbounded();
+        self.sv1_server_channel_state
+            .sv1_server_to_downstream_sender
+            .super_safe_lock(|map| map.insert(downstream_id, sv1_server_sender));
+
+        let downstream = Downstream::new(
+            downstream_id,
+            connection.sender().clone(),
+            connection.receiver().clone(),
+            self.sv1_server_channel_state
+                .downstream_to_sv1_server_sender
+                .clone(),
+            sv1_server_receiver,
+            first_target,
+            Some(
+                self.config
+                    .downstream_difficulty_config
+                    .min_individual_miner_hashrate,
+            ),
+            connection_token.clone(),
+        );
+        self.downstreams.insert(downstream_id, downstream.clone());
+        // NB: vardiff state is intentionally NOT inserted here. The channel
+        // is opened lazily after the first message, so a freshly accepted
+        // connection has `channel_id == None`. Inserting vardiff now makes
+        // the 60s vardiff loop iterate channel-less connections every tick —
+        // port scanners that complete the TCP handshake but never subscribe
+        // sit here for their whole lifetime — which logged a spurious error
+        // per tick. Vardiff is now registered at channel-open instead; see
+        // the `OpenExtendedMiningChannelSuccess` handler.
+        info!(
+            "Downstream {} registered successfully (channel will be opened after first message)",
+            downstream_id
+        );
+
+        // Start downstream tasks immediately, but defer channel opening until first message
+        let status_sender = StatusSender::Downstream {
+            downstream_id,
+            tx: status_sender.clone(),
+        };
+        Downstream::run_downstream_tasks(
+            downstream,
+            cancellation_token.clone(),
+            fallback_coordinator.clone(),
+            status_sender,
+            task_manager.clone(),
+        );
+
+        // Zombie-connection reaper. A connection that completes the TCP
+        // handshake but never opens a channel — internet port scanners and
+        // half-open probes hitting the public stratum port — would otherwise
+        // linger in the downstreams/sender maps holding a socket for its
+        // whole lifetime. Give it a generous grace period to open a channel
+        // (real miners subscribe+authorize within seconds); if it still has
+        // no channel_id after that, close the socket and clean up the maps.
+        // handle_downstream_disconnect is idempotent, so it is safe even if
+        // the connection's own error path also fires.
+        const CHANNELLESS_REAP_TIMEOUT: Duration = Duration::from_secs(120);
+        let reaper = self.clone();
+        let reaper_token = connection_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CHANNELLESS_REAP_TIMEOUT).await;
+            let still_channelless = match reaper.downstreams.get(&downstream_id) {
+                Some(d) => d
+                    .downstream_data
+                    .super_safe_lock(|data| data.channel_id.is_none()),
+                None => return, // already disconnected and cleaned up
+            };
+            if still_channelless {
+                warn!(
+                    "Reaping downstream {} — no channel opened within {}s (likely a scanner/probe)",
+                    downstream_id,
+                    CHANNELLESS_REAP_TIMEOUT.as_secs()
+                );
+                reaper_token.cancel();
+                reaper.handle_downstream_disconnect(downstream_id).await;
+            }
+        });
+    }
+
+    /// Builds the opt-in TLS listener.
+    ///
+    /// Returns `(Some(acceptor), Some(listener))` only when `tls_port`, `tls_cert_path` and
+    /// `tls_key_path` are all configured; otherwise `(None, None)` so the TLS accept arm stays
+    /// inert and the plain-TCP behaviour is unchanged. The certificate chain and private key are
+    /// loaded from PEM files and used to build a `rustls` server config with no client-auth.
+    async fn build_tls_listener(
+        self: Arc<Self>,
+    ) -> std::io::Result<(Option<tokio_rustls::TlsAcceptor>, Option<TcpListener>)> {
+        use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        use std::io::{Error, ErrorKind};
+
+        let (Some(tls_port), Some(cert_path), Some(key_path)) = (
+            self.config.tls_port,
+            self.config.tls_cert_path.as_ref(),
+            self.config.tls_key_path.as_ref(),
+        ) else {
+            return Ok((None, None));
+        };
+
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("loading TLS cert {cert_path}: {e}"),
+                )
+            })?
+            .collect::<Result<_, _>>()
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("parsing TLS cert {cert_path}: {e}"),
+                )
+            })?;
+        let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("loading TLS key {key_path}: {e}"),
+            )
+        })?;
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("building TLS config: {e}")))?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        // Bind the TLS listener on the same interface as the plain listener, on `tls_port`.
+        let tls_addr = SocketAddr::new(self.listener_addr.ip(), tls_port);
+        let listener = TcpListener::bind(tls_addr).await.map_err(|e| {
+            error!("Failed to bind TLS listener to {}: {}", tls_addr, e);
+            e
+        })?;
+        info!("Translator Proxy: TLS listening on {}", tls_addr);
+
+        Ok((Some(acceptor), Some(listener)))
+    }
+
+    /// Accepts on an optional TLS listener.
+    ///
+    /// When `listener` is `None` (no TLS configured) this future never resolves, so the
+    /// corresponding `tokio::select!` arm is permanently inert.
+    async fn accept_optional(
+        listener: Option<&TcpListener>,
+    ) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        match listener {
+            Some(l) => l.accept().await,
+            None => std::future::pending().await,
+        }
+    }
+
     /// Starts the SV1 server and begins accepting connections.
     ///
     /// This method:
@@ -254,6 +429,15 @@ impl Sv1Server {
         })?;
 
         info!("Translator Proxy: listening on {}", self.listener_addr);
+
+        // Opt-in TLS listener. Only created when `tls_port`, `tls_cert_path` and `tls_key_path`
+        // are all configured; otherwise `tls_listener` stays `None` and the TLS accept arm is
+        // inert, leaving the plain-TCP path completely unchanged.
+        let (tls_acceptor, tls_listener) = self
+            .clone()
+            .build_tls_listener()
+            .await
+            .map_err(TproxyError::shutdown)?;
 
         let sv1_status_sender = StatusSender::Sv1Server(status_sender.clone());
         let task_manager_clone = task_manager.clone();
@@ -316,84 +500,71 @@ impl Sv1Server {
                                     }
                                 }
 
-                                info!("New SV1 downstream connection from {}", addr);
-                                let connection_token = cancellation_token.child_token();
-                                let connection = ConnectionSV1::new(
+                                self.register_downstream(
                                     stream,
-                                    connection_token.clone(),
-                                ).await;
-                                let downstream_id = self.downstream_id_factory.fetch_add(1, Ordering::Relaxed);
-                                let (sv1_server_sender, sv1_server_receiver) = async_channel::unbounded();
-                                self.sv1_server_channel_state.sv1_server_to_downstream_sender.super_safe_lock(|map| map.insert(downstream_id, sv1_server_sender));
-
-                                let downstream = Downstream::new(
-                                    downstream_id,
-                                    connection.sender().clone(),
-                                    connection.receiver().clone(),
-                                    self.sv1_server_channel_state.downstream_to_sv1_server_sender.clone(),
-                                    sv1_server_receiver,
+                                    addr,
+                                    &cancellation_token,
+                                    &fallback_coordinator,
+                                    &status_sender,
+                                    &task_manager,
                                     first_target,
-                                    Some(self.config.downstream_difficulty_config.min_individual_miner_hashrate),
-                                    connection_token.clone(),
-                                );
-                                self.downstreams.insert(downstream_id, downstream.clone());
-                                // NB: vardiff state is intentionally NOT inserted here. The channel
-                                // is opened lazily after the first message, so a freshly accepted
-                                // connection has `channel_id == None`. Inserting vardiff now makes
-                                // the 60s vardiff loop iterate channel-less connections every tick —
-                                // port scanners that complete the TCP handshake but never subscribe
-                                // sit here for their whole lifetime — which logged a spurious error
-                                // per tick. Vardiff is now registered at channel-open instead; see
-                                // the `OpenExtendedMiningChannelSuccess` handler.
-                                info!("Downstream {} registered successfully (channel will be opened after first message)", downstream_id);
-
-
-                                // Start downstream tasks immediately, but defer channel opening until first message
-                                let status_sender = StatusSender::Downstream {
-                                    downstream_id,
-                                    tx: status_sender.clone(),
-                                };
-                                Downstream::run_downstream_tasks(
-                                    downstream,
-                                    cancellation_token.clone(),
-                                    fallback_coordinator.clone(),
-                                    status_sender,
-                                    task_manager.clone(),
-                                );
-
-                                // Zombie-connection reaper. A connection that completes the TCP
-                                // handshake but never opens a channel — internet port scanners and
-                                // half-open probes hitting the public stratum port — would otherwise
-                                // linger in the downstreams/sender maps holding a socket for its
-                                // whole lifetime. Give it a generous grace period to open a channel
-                                // (real miners subscribe+authorize within seconds); if it still has
-                                // no channel_id after that, close the socket and clean up the maps.
-                                // handle_downstream_disconnect is idempotent, so it is safe even if
-                                // the connection's own error path also fires.
-                                const CHANNELLESS_REAP_TIMEOUT: Duration = Duration::from_secs(120);
-                                let reaper = self.clone();
-                                let reaper_token = connection_token.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(CHANNELLESS_REAP_TIMEOUT).await;
-                                    let still_channelless = match reaper.downstreams.get(&downstream_id) {
-                                        Some(d) => d
-                                            .downstream_data
-                                            .super_safe_lock(|data| data.channel_id.is_none()),
-                                        None => return, // already disconnected and cleaned up
-                                    };
-                                    if still_channelless {
-                                        warn!(
-                                            "Reaping downstream {} — no channel opened within {}s (likely a scanner/probe)",
-                                            downstream_id,
-                                            CHANNELLESS_REAP_TIMEOUT.as_secs()
-                                        );
-                                        reaper_token.cancel();
-                                        reaper.handle_downstream_disconnect(downstream_id).await;
-                                    }
-                                });
+                                ).await;
                             }
                             Err(e) => {
                                 warn!("Failed to accept new connection: {:?}", e);
+                            }
+                        }
+                    }
+                    // Opt-in TLS listener. `accept_optional` resolves to `Pending` forever when no
+                    // TLS listener is configured, so this arm is inert in the default deployment.
+                    result = Self::accept_optional(tls_listener.as_ref()) => {
+                        match result {
+                            Ok((tcp, addr)) => {
+                                // Load-balancer capacity gate + utilisation routing run on the raw
+                                // TCP stream before TLS termination — identical to the plain path,
+                                // and the byte-level proxy stays transparent (the target VM
+                                // terminates TLS) when a connection is forwarded.
+                                if let Some(ref lb) = self.load_balancer {
+                                    if lb.should_reject_for_capacity().await {
+                                        warn!(
+                                            "Rejecting TLS connection from {}: local capacity at/above reject threshold",
+                                            addr
+                                        );
+                                        lb.record_capacity_rejection();
+                                        drop(tcp);
+                                        continue;
+                                    }
+                                    let local_count = self.downstreams.len();
+                                    if let Some(target) = lb.should_proxy(local_count, addr.ip()).await {
+                                        info!("Proxying new TLS connection from {} to {}", addr, target);
+                                        lb.spawn_proxy(tcp, target);
+                                        continue;
+                                    }
+                                }
+
+                                // Terminate TLS, then feed the decrypted stream through the same
+                                // downstream path as the plain listener. `acceptor` is `Some`
+                                // whenever `tls_listener` is `Some`.
+                                let Some(ref acceptor) = tls_acceptor else { continue };
+                                match acceptor.accept(tcp).await {
+                                    Ok(tls_stream) => {
+                                        self.register_downstream(
+                                            tls_stream,
+                                            addr,
+                                            &cancellation_token,
+                                            &fallback_coordinator,
+                                            &status_sender,
+                                            &task_manager,
+                                            first_target,
+                                        ).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("TLS handshake failed for {}: {:?}", addr, e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to accept new TLS connection: {:?}", e);
                             }
                         }
                     }

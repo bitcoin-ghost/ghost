@@ -15,15 +15,24 @@ Cases:
                   policy), not silently accepted.
   version-rolling mining.configure (BIP310/AsicBoost, Antminer S19) -> must negotiate
                   a version-rolling mask.
+  tls             AxeOS/Bitaxe with "Connection Security: TLS": same serializer handshake
+                  but over a TLS-wrapped socket against the opt-in TLS port. The cert is NOT
+                  validated (check_hostname=False, CERT_NONE) so the case works with the
+                  canary's real Let's Encrypt cert OR a self-signed test cert. SKIPPED unless
+                  a TLS port is supplied (4th arg or GHOST_TLS_PORT), since TLS is opt-in.
 
-Usage:  python3 sv1_handshake_smoke.py [HOST] [PORT] [USER]
-Exit 0 iff all cases pass.
+Usage:  python3 sv1_handshake_smoke.py [HOST] [PORT] [USER] [TLS_PORT]
+        GHOST_TLS_PORT=3334 python3 sv1_handshake_smoke.py   # alternative for the TLS port
+Exit 0 iff all cases pass (the TLS case is skipped, not failed, when no TLS port is set).
 """
-import socket, json, sys, time
+import os, socket, ssl, json, sys, time
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 PORT = int(sys.argv[2] if len(sys.argv) > 2 else 3333)
 USER = sys.argv[3] if len(sys.argv) > 3 else "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492.synthtest"
+# Opt-in TLS port. From the 4th positional arg or the GHOST_TLS_PORT env var; unset -> skip.
+_tls_arg = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("GHOST_TLS_PORT")
+TLS_PORT = int(_tls_arg) if _tls_arg else None
 PLACEHOLDER = "0000000000000000"
 
 
@@ -119,6 +128,27 @@ def test_version_rolling():
     return bool(ok)
 
 
+def test_tls_serializer():
+    # Same serializer handshake (subscribe -> WAIT) as test_serializer, but over TLS.
+    # The cert is NOT validated: AxeOS "TLS (System certificate)" would validate the chain,
+    # but here we only prove the TLS listener terminates and drives the SAME downstream path.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection((HOST, TLS_PORT), timeout=10)
+    s = ctx.wrap_socket(raw, server_hostname=HOST)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
+    # Deliberately do NOT send authorize — a deadlocked translator never replies.
+    t0 = time.time()
+    msgs = recv_until(s, 4.0, lambda m: m.get("id") == 1 and "result" in m)
+    dt = time.time() - t0
+    got = any(m.get("id") == 1 and "result" in m for m in msgs)
+    s.close()
+    print(f"  [tls]             {'PASS' if got else 'FAIL'} — subscribe answered over TLS in "
+          f"{dt:.2f}s ({'no deadlock' if got else 'DEADLOCK — no response over TLS'})")
+    return got
+
+
 def main():
     print(f"SV1 handshake smoke test vs {HOST}:{PORT}")
     results = {
@@ -127,6 +157,11 @@ def main():
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),
     }
+    if TLS_PORT is not None:
+        print(f"  (TLS case vs {HOST}:{TLS_PORT})")
+        results["tls"] = test_tls_serializer()
+    else:
+        print("  [tls]             SKIP — no TLS port set (pass 4th arg or GHOST_TLS_PORT)")
     print()
     bad = [k for k, v in results.items() if not v]
     if bad:
