@@ -3436,6 +3436,28 @@ async fn main() -> Result<()> {
         serde_json::to_value(reaper_stats_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
     });
 
+    // Decentralised Wraith coordinator election (read-only, gated off by
+    // default). Constructed ONLY when `[coordinator] wraith_election_enabled`
+    // is true; otherwise `None` and the service is inert (zero effect on the
+    // node). It computes/publishes the per-epoch draw — it activates NO
+    // coordinator role and changes no consensus message.
+    let coordinator_election = ghost_pool::coordinator_election::CoordinatorElection::maybe_new(
+        config.coordinator.wraith_election_enabled,
+        &identity,
+        &capabilities,
+        Arc::clone(&mesh),
+        Arc::clone(&rpc),
+    );
+    {
+        let coord_for_api = coordinator_election.clone();
+        verification_state = verification_state.with_coordinator_status(move || {
+            coord_for_api
+                .as_ref()
+                .map(|c| c.status_json())
+                .unwrap_or_else(ghost_pool::coordinator_election::disabled_status_json)
+        });
+    }
+
     // Configure archive handler if archive mode enabled
     if capabilities.archive_mode {
         let archive_handler = RpcArchiveHandler::new(Arc::clone(&rpc_for_verification));
@@ -5192,6 +5214,9 @@ async fn main() -> Result<()> {
     // Note: Job notifications to miners now handled by SRI via TDP
     let rm_notify = Arc::clone(&round_manager);
     let tp_for_template_events = Arc::clone(&template_processor);
+    // Coordinator-election recompute hook (read-only). `None` when the feature
+    // is off → the recompute below is skipped entirely.
+    let coord_for_events = coordinator_election.clone();
 
     tokio::spawn(async move {
         while let Ok(event) = template_events_early.recv().await {
@@ -5199,6 +5224,13 @@ async fn main() -> Result<()> {
                 TemplateEvent::NewWork { job_id: _, height } => {
                     // Start new round (SRI gets jobs via TDP automatically)
                     rm_notify.start_round(height);
+
+                    // Refresh the coordinator-election view if the epoch has
+                    // changed (cheap no-op within an epoch; a no-op entirely
+                    // when the feature is off). Read-only — activates nothing.
+                    if let Some(ref coord) = coord_for_events {
+                        coord.refresh_for_height(height).await;
+                    }
 
                     // M-MINE-1: Update template ID for share validation
                     // The template ID is the prev_block_hash which uniquely identifies the template
