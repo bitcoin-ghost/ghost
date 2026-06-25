@@ -1,60 +1,60 @@
 # Wraith
 
-*A two-phase coordinator-blinded CoinJoin. Public Bitcoin UTXOs go in, Ghost Locks come out, and no one — not even the protocol coordinator — knows which input maps to which output.*
+*A single-round, coordinator-blinded CoinJoin. Public Bitcoin UTXOs go in, mixed outputs come out in one atomic transaction, and no one — not even the protocol coordinator — knows which input maps to which output.*
 
 ## The problem
 
-If you take a public BTC balance and just create a Ghost Lock with it, the chain shows the link: address X spent N satoshis to a Ghost Lock UTXO. Anyone watching the chain can correlate. The privacy you get from Ghost Pay's L2 starts the moment you're inside; it doesn't apply to the deposit transaction itself.
+If you take a public BTC balance and just move it into Ghost Pay, the chain shows the link: address X spent N satoshis to your deposit UTXO. Anyone watching the chain can correlate. The privacy you get from Ghost Pay's L2 starts the moment you're inside; it doesn't apply to the deposit transaction itself.
 
-CoinJoin is the standard fix — many users sign one transaction with many inputs and many identical outputs, breaking the input→output link. Single-phase CoinJoin works, but it has known weaknesses: amount-analysis attacks, timing-correlation attacks against the coordinator, and the basic problem that with only N participants the anonymity set is exactly N.
+CoinJoin is the standard fix — many users sign one transaction with many inputs and many equal-value outputs, breaking the input→output link. The basic weakness is the coordinator: if it can see which output belongs to which participant, it can deanonymise the whole round.
 
-Wraith does CoinJoin in two phases on purpose, and uses Schnorr blind signatures so the coordinator literally can't see which output it's signing for. The result is an anonymity set that's combinatorial in size, not linear.
+Wraith closes that gap with Schnorr blind signatures, so the coordinator validates that a participant is entitled to an output without ever seeing *which* output. One round is one transaction: N participants in, N equal-denomination outputs out, all in a single atomic broadcast.
 
 ## What Wraith does
 
 ```
-Phase 1 (Split):    N participants × 1 input    →   N × OPP intermediate Ghost Locks
-Phase 2 (Merge):    N × OPP intermediates       →   N final Ghost Locks
+One round = one transaction:
+
+  inputs  (N, one per participant)   →   N × equal-denomination mixed outputs
+                                          + per-participant change (where needed)
+                                          + 1 service-fee output (Mix rounds only)
+                                          + 1 OP_RETURN marker
 ```
 
-`OPP` is "outputs per participant" — between 2 and 10 depending on tier. Each user puts in one UTXO, gets back one final Ghost Lock, but the path between is a fan-out / fan-in that's impossible to trace from the outside.
+Each participant contributes one input UTXO and receives one mixed output of the tier's fixed denomination. Anything above `denomination + fees` comes straight back as a change output in the same transaction, so a user never has to split a UTXO ahead of time.
 
-The intermediate phase is what makes the math work:
+The outputs are shuffled with a `ChaCha20` RNG seeded from the session ID plus fresh CSPRNG entropy, so once the transaction is built no one — not even the coordinator — can recover the input→mixed-output mapping from output ordering. The privacy guarantee covers the **mixed** outputs; change outputs go back to an address the participant controls and are linkable to that participant by design.
 
-- After Phase 1, the chain shows N×OPP intermediate UTXOs of identical denomination, indistinguishable from each other.
-- A user's path through the system is one specific subset of OPP intermediates (the ones that came from their input and feed their output).
-- The number of valid mappings between inputs and outputs grows combinatorially with N and OPP. With 250 participants and OPP=5, the valid-mapping space is astronomically large; brute-force correlation isn't viable.
+There is no second phase, no intermediate UTXOs, and no outputs-per-participant fan-out. The mixing happens once, atomically, in the transaction every participant signs.
 
 ## Tiers
 
-Different denominations get different participant counts and OPP values. Phase 2 transaction size is the binding constraint (90 000 vbyte budget per Bitcoin's standardness rules), and Phase 2 has OPP inputs per participant — so larger denominations need fewer participants but more outputs each:
+A tier is a fixed mixed-output denomination. You pick the tier whose denomination you want your post-mix output to be; the rest of your input returns as change in the same transaction.
 
-| Tier | Balance range | Participants | OPP | Intermediate UTXOs | Typical wait |
-|---|---|---|---|---|---|
-| Micro | 0.001 – 0.01 BTC | 500 | 2 | 1 000 | ~12 h |
-| Small | 0.01 – 0.1 BTC | 320 | 4 | 1 280 | ~24 h |
-| Medium | 0.1 – 1 BTC | 260 | 5 | 1 300 | ~2 d |
-| Standard | 1 – 10 BTC | 250 | 5 | 1 250 | ~3 d |
-| Large | 10 – 50 BTC | 170 | 8 | 1 360 | ~5 d |
-| Whale | 50+ BTC | 140 | 10 | 1 400 | ~7 d |
+| Tier id | Denomination | Min participants | Max participants |
+|---|---|---|---|
+| `100k_sats` | 100 000 sats | 5 | 20 |
+| `1m_sats` | 1 000 000 sats | 5 | 30 |
+| `10m_sats` | 10 000 000 sats | 5 | 50 |
+| `100m_sats` | 100 000 000 sats | 5 | 100 |
 
-The wait time is dominated by participant collection. A Wraith session needs at least the tier's participant count before it starts — the coordinator pools requests until threshold, then runs both phases. For Micro tier this happens within hours; for Whale tier you might wait a week for enough peers at the same denomination.
+Every tier needs **5 participants minimum** before a round can broadcast — the same floor Whirlpool uses, well-tested for fill rate versus anonymity set. The per-tier maximum keeps the on-chain transaction comfortably inside Bitcoin's 100 KB standardness limit (the largest tier at full fill is roughly 14 KB).
 
-OPP values `{2, 4, 5, 8, 10}` divide every denomination cleanly — no rounding, no leftover sats.
+Denominations are exact powers of ten, so a remix downgrade (one `1m_sats` output into ten `100k_sats` outputs) divides without remainder.
 
 ## Schnorr blind signatures
 
-This is the protocol's trick. The coordinator validates that a participant is authorised to receive an output, but never sees which output. The math:
+This is the protocol's core trick. The coordinator issues a one-use signing token to each authorised participant, but the blinding means it never sees the message it signed — and the message is the recipient address.
 
 ```
-Step 1: Nonce exchange
-  Coordinator: k ←$- secp256k1, R = k·G          ← random per participant
+Step 1: Nonce
+  Coordinator: k ←$- secp256k1, R = k·G          ← random per participant, bound to ghost_id
   Coordinator → Participant: R
 
 Step 2: Blinding + challenge
   Participant: α, β ←$- secp256k1               ← random blinding factors
                R' = R + α·G + β·X                ← blinded nonce (X = coordinator pubkey)
-               c  = H(R' ‖ X ‖ m)                ← Fiat-Shamir challenge over the recipient address m
+               c  = H(X ‖ R' ‖ m)                ← BIP-340 challenge over the recipient address m
                c' = c + β                         ← blinded challenge
   Participant → Coordinator: c'
 
@@ -67,87 +67,81 @@ Step 4: Unblinding
   Final token: (R', s') is a valid Schnorr signature on m
 ```
 
-What the coordinator sees: random `c'` values. What the coordinator never sees: the message `m` (the recipient address), the blinded nonce `R'`, or the unblinded signature `(R', s')` that ends up on chain.
+What the coordinator sees: a random blinded challenge `c'`. What the coordinator never sees: the message `m` (the recipient address), the blinded nonce `R'`, or the unblinded signature `(R', s')`.
 
-When the participant later submits the signed token at the output address, the coordinator can verify the signature is valid (came from a legitimate session participant) but can't tell *which* participant produced it. That's the unlinkability property.
+When the participant later presents the mixed-output address with its unblinded token — over a separate, anonymised connection — the coordinator can verify the token is a valid signature from this session (so the address belongs in the round) but cannot tell *which* participant produced it. That is the unlinkability property.
 
-## A worked example
+The nonce is bound to the requesting participant's `ghost_id` and is single-use, so one participant cannot hijack another's nonce. Coordinator nonces expire after a configurable window (default one hour) and are rate-limited per participant to prevent memory-exhaustion attacks.
 
-Imagine a Standard-tier session: 250 participants, OPP = 5.
+## Session lifecycle
 
-**Phase 1 (Split):**
-```
-Tx in:  250 inputs × ~1 BTC each (each participant's funding UTXO)
-Tx out: 1250 outputs × 0.2 BTC each (250 × 5 intermediate Ghost Locks)
-```
+A wallet calls `find_or_create(tier)`: the coordinator either returns an open session at that tier or spins up a new one. The session then walks a fixed state machine:
 
-After confirmation, the chain shows 1 250 identical 0.2 BTC P2TR outputs. To correlate input X with the 5 specific outputs that belong to it, an attacker needs information that the coordinator never had and the participants never published.
+| State | What happens |
+|---|---|
+| **Filling** | Open for new participants. Stays open for the fill window (default 5 minutes) after the minimum is reached, up to the tier maximum. |
+| **Locked** | The minimum was met and the round is full or the fill window expired. No new participants. The coordinator builds the round transaction. |
+| **Signing** | The unsigned transaction is published; participants submit their input witnesses. |
+| **Broadcasting** | All witnesses collected; the assembled transaction is broadcast to the network. |
+| **Complete** | The transaction is on chain. |
+| **Failed** | The round aborted (e.g. fill window expired without quorum, or a round-wide no-sign). |
 
-**Phase 2 (Merge):**
-```
-Tx in:  1250 inputs × 0.2 BTC each (each participant's 5 intermediates)
-Tx out: 250 outputs × 1 BTC each (final Ghost Locks, one per participant)
-```
+If a session in Filling never reaches the 5-participant minimum by the time the fill window expires, it transitions to Failed and every escrowed bond is refunded. The coordinator runs as an active node with standby replicas that mirror its session registry via idempotent gossip events, so a coordinator failover doesn't lose in-flight rounds.
 
-After Phase 2, the chain shows 250 identical 1 BTC Ghost Locks. The user who put in 1.0027 BTC at the start is now the holder of one specific 1 BTC Ghost Lock — but linking their original input to that specific output requires breaking the combinatorial mixing, which isn't computationally feasible at this participant count.
+## Bonds, dropout, and refunds
 
-The 0.0027 BTC overhead is fees: 2 000 sats service fee + ~5 000 sats mining cost share for two transactions. ~0.27 % overhead at this denomination.
+Griefing is the failure mode that hurts a single-round CoinJoin: a participant fills a slot, lets the round assemble, then refuses to sign — wasting everyone else's time. Wraith deters this with a small bond rather than re-running the whole round.
 
-## Fee structure
+At registration each participant escrows `bond_sats` — **0.5 % of the tier denomination** — into Ghost Pay's L2 ledger. The bond is held for the life of the round and resolved when the round closes:
 
-Two components, both transparent:
+| Outcome | Resolution |
+|---|---|
+| Round completed (transaction broadcast) | **Refund** — every participant's bond returns in full. |
+| Participant withdrew during the open Filling window | **Refund** — changing your mind before commitment isn't griefing. |
+| Round voided (≥ 80 % of a Locked round missed Signing) | **Refund** — a wholesale failure isn't any one participant's fault. |
+| Coordinator aborted (malformed state, failover loss) | **Refund** — not the participant's fault. |
+| Participant joined a Locked round but failed to sign in time | **Slash** — this is the actual griefing case. |
 
-**Service fee** (fixed per denomination, charged on Mix sessions only):
+So the only way to lose a bond is to commit to a round (pass Filling) and then disappear during Signing. When that happens to *some* of a round's participants, the no-signers are slashed and the participants who did sign in time are refunded as a voided round; when it happens *wholesale*, everyone is refunded.
 
-| Denomination | Output | Service fee | Overhead |
-|---|---|---|---|
-| Micro | 100 000 sats | 500 sats | 0.5 % |
-| Small | 1 000 000 sats | 2 000 sats | 0.2 % |
-| Medium | 10 000 000 sats | 5 000 sats | 0.05 % |
-| Large | 100 000 000 sats | 10 000 sats | 0.01 % |
+The bond lives in the L2 ledger behind a small abstraction, so the protocol crate never depends on Ghost Pay directly and tests can swap in a mock ledger.
 
-**Mining cost** (Bitcoin transaction fee, split evenly across participants). Varies with current fee rate. At 10 sat/vB:
+## Fees
 
-| Denomination | Mining cost / participant | Total overhead |
+Two transparent components:
+
+**Service fee** — a fixed 0.5 % of the denomination per participant, aggregated into a single output paid to the coordinator pool's fee address. Charged on Mix rounds only.
+
+| Tier | Denomination | Service fee |
 |---|---|---|
-| Micro | ~3 000 sats | ~3.5 % |
-| Small | ~5 000 sats | ~0.7 % |
-| Medium | ~6 000 sats | ~0.1 % |
-| Large | ~7 000 sats | ~0.02 % |
+| `100k_sats` | 100 000 sats | 500 sats |
+| `1m_sats` | 1 000 000 sats | 5 000 sats |
+| `10m_sats` | 10 000 000 sats | 50 000 sats |
+| `100m_sats` | 100 000 000 sats | 500 000 sats |
 
-Wallets show the full breakdown — service fee + projected mining cost — before the user commits to joining a session.
+**Mining cost** — the Bitcoin transaction fee, split across participants. Each participant pre-pays a share computed against the tier's worst case (smallest round, default 10 sat/vB) so the round always covers its fee even if it broadcasts at the floor; larger rounds slightly overpay, which only makes the transaction more attractive to miners. The full mining surplus is collected directly from participant inputs.
 
-**Jump sessions** (key rotation only — see [Locks](#locks) for context) charge no service fee, only the mining cost share. Used when a user wants to refresh their Ghost Lock keys without paying the privacy-mix premium.
+Wallets show the service fee plus projected mining cost before the user commits to joining a round.
 
-## Session timing
-
-| Phase | Timeout | Notes |
-|---|---|---|
-| Participant collection | 24 h | Pool requests until threshold (or session expires unfilled) |
-| Input collection | 2 h | Collect UTXOs from confirmed participants |
-| Signing coordination | 1 h | Blind-signature exchange + transaction signing |
-| On-chain confirmation | 6 h | Wait for ≥6 confirmations of each phase |
-| Overall session | 7 d | Hard cap from start to final confirmation |
-
-If a session times out at any phase, refunds are issued; nobody loses funds beyond the gas spent.
+**Jump rounds** (`SessionType::Jump`) skip the service-fee output entirely — they pay only the mining cost. A Jump round is used to rotate the keys behind a balance through a CoinJoin without paying the privacy-mix premium.
 
 ## What Wraith protects against
 
 | Attacker | Outcome |
 |---|---|
-| Passive chain observer | **Strong protection.** Cannot determine input→output mapping. The combinatorial space at full tier (e.g. 250×5) is computationally infeasible to brute-force. |
-| Coordinator-on-the-side | **Strong protection.** Schnorr blind signatures mean even the coordinator literally never sees which output it's signing. |
-| Sybil attack on participant pool | **Moderate protection.** If an attacker controls 90 % of session participants, the anonymity set shrinks to the honest minority. Tier minimums are calibrated so even with significant Sybil dilution, anonymity remains meaningful. |
-| Timing analysis (cross-session) | **Moderate protection.** A user who Wraiths immediately after receiving a public payment leaks correlation through timing. Best practice is to wait, vary timing, or chain multiple sessions. |
-| Amount-correlation across sessions | **Strong protection if denominations match.** A user who Wraiths exactly 1 BTC in a Standard session, holds for a week, then Wraiths 1 BTC out — the two sessions are unlinkable as long as the holder period is longer than typical session times. |
+| Passive chain observer | **Strong protection.** The mixed outputs are equal-denomination and shuffled; the input→mixed-output mapping isn't recoverable from the transaction. |
+| Coordinator-on-the-side | **Strong protection.** Schnorr blind signatures mean the coordinator never sees which output it authorised, and the output shuffle is seeded with entropy it can't predict. |
+| Sybil attack on the participant pool | **Moderate protection.** If an attacker controls most of a round's slots, the anonymity set shrinks to the honest minority. The bond requirement raises the cost of filling rounds with sybils, and on mainnet the bond is real L2 money — the dev/regtest auto-escrow mode is explicitly disabled in production. |
+| Timing analysis (cross-session) | **Moderate protection.** Mixing immediately after receiving a public payment leaks correlation through timing. Best practice is to wait, vary timing, or chain rounds. |
+| Amount correlation across rounds | **Strong protection when denominations match.** Equal-denomination outputs across separate rounds, held for a period longer than typical round times, are unlinkable. |
 
 ## What Wraith doesn't do
 
-- **It doesn't hide the existence of mixing.** A Phase 1 transaction with 250 inputs and 1 250 identical-amount outputs is visibly a CoinJoin. The OP_RETURN marker (v3: 32-byte opaque hash) confirms it as Wraith specifically. Anyone watching the chain knows mixing happened — they just can't tell which user mapped to which output.
-- **It doesn't help if you spend the output non-privately afterwards.** A clean Ghost Lock spent immediately to a known address re-correlates. Wraith only protects the input→output linkage of one session; downstream privacy is the wallet's responsibility.
-- **It doesn't work for arbitrary amounts.** Standard denominations only. If you have 0.073 BTC, you'll Wraith multiple Small denominations and the wallet handles change. There's no "0.073 BTC tier".
-- **It doesn't run online forever.** A full Whale-tier session can take a week. The wallet handles the long-running coordination, but the participant has to keep the signing key reachable until Phase 2 confirms.
-- **It isn't free.** Service fees + mining costs are real. For Micro tier the overhead can be ~3.5%; for Large tier it's effectively rounding error. Plan according to denomination.
+- **It doesn't hide the existence of mixing.** A transaction with many inputs and many equal-amount outputs is visibly a CoinJoin, and the `OP_RETURN` marker (`WL01` + session ID) tags it as Wraith specifically. Observers know mixing happened — they just can't tell which user mapped to which output.
+- **It doesn't help if you spend the output non-privately afterwards.** A mixed output spent immediately to a known address re-correlates. Wraith protects the input→output linkage of one round; downstream privacy is the wallet's responsibility.
+- **It doesn't work for arbitrary amounts.** Fixed denominations only — the four powers-of-ten tiers. A balance that doesn't land on a denomination is mixed at the largest tier it affords, with the remainder returned as change; the wallet handles the rest.
+- **It isn't instant.** A round waits for at least 5 participants at the same tier and denomination. Common tiers fill fast; rarer high denominations may wait longer for enough peers.
+- **It isn't free.** Service fee (Mix rounds) plus a mining-cost share. For the smallest tier the overhead is a fraction of a percent; for the largest it's effectively rounding error.
 
 ## Privacy stack context
 
@@ -165,8 +159,10 @@ Wraith is the layer that breaks the on-chain trail between your public Bitcoin a
 
 | File | Purpose |
 |---|---|
-| `crates/wraith-protocol/src/coordinator.rs` | Session coordinator, blind signatures, participant matching |
-| `crates/wraith-protocol/src/session.rs` | Per-session participant state machine |
-| `crates/wraith-protocol/src/executor.rs` | Round execution / transaction broadcast |
+| `crates/wraith-protocol/src/single_round.rs` | Single-round transaction builder (`LiteRoundBuilder`) |
+| `crates/wraith-protocol/src/lite_session.rs` | Session registry + lifecycle state machine |
 | `crates/wraith-protocol/src/blind.rs` | Schnorr blind-signature primitives |
-| `crates/wraith-protocol/src/denomination.rs` | Tier constants, OPP values |
+| `crates/wraith-protocol/src/tier.rs` | Tier denominations, participant caps, fee + bond rates |
+| `crates/wraith-protocol/src/bond.rs` | Bond types + L2 escrow trait |
+| `crates/wraith-protocol/src/coordinator_redundancy.rs` | Active/standby coordinator replication |
+| `bins/wraith-coordinator/src/` | Coordinator service: round assembly, witness collection, broadcast |
