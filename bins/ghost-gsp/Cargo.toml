@@ -32,6 +32,10 @@ readme = "README.md"
 [[bin]]
 name = "ghost-gsp"
 path = "src/main.rs"
+# The library crate `ghost-gsp` (crates/ghost-gsp) also documents as `ghost_gsp`,
+# so documenting this binary target collides on target/doc/ghost_gsp/ and races
+# `cargo doc` to an I/O error. Binary entry-points carry no useful rustdoc; skip them.
+doc = false
 
 [dependencies]
 # Workspace crates
