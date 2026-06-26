@@ -77,9 +77,15 @@ mod tests {
     #[test]
     fn none_when_disabled_empty_or_unadvertised() {
         // Disabled election.
-        assert_eq!(pick_seat_endpoint(&status(false, json!([])), &[0u8; 32]), None);
+        assert_eq!(
+            pick_seat_endpoint(&status(false, json!([])), &[0u8; 32]),
+            None
+        );
         // No coordinators seated.
-        assert_eq!(pick_seat_endpoint(&status(true, json!([])), &[0u8; 32]), None);
+        assert_eq!(
+            pick_seat_endpoint(&status(true, json!([])), &[0u8; 32]),
+            None
+        );
         // Single seat whose owner hasn't advertised an endpoint yet.
         let s = status(true, json!([{"node_id":"aa","seat":0,"endpoint":null}]));
         assert_eq!(pick_seat_endpoint(&s, &[0u8; 32]), None);

@@ -138,7 +138,9 @@ impl CoordinatorSupervisor {
                     }
                 },
                 (Some(_), None) => {
-                    error!("coordinator: bond_ledger_url set without bond_ledger_token; not activating");
+                    error!(
+                    "coordinator: bond_ledger_url set without bond_ledger_token; not activating"
+                );
                     return;
                 }
                 _ => None,
@@ -210,7 +212,11 @@ impl CoordinatorSupervisor {
 mod tests {
     use super::*;
 
-    fn cfg(enabled: bool, network: Network, bond_ledger_url: Option<&str>) -> CoordinatorRoleConfig {
+    fn cfg(
+        enabled: bool,
+        network: Network,
+        bond_ledger_url: Option<&str>,
+    ) -> CoordinatorRoleConfig {
         CoordinatorRoleConfig {
             enabled,
             network,
@@ -229,7 +235,9 @@ mod tests {
         // Refused: activating on mainnet with no bond ledger.
         assert!(mainnet_activation_refusal(&cfg(true, Network::Bitcoin, None)).is_some());
         // Allowed: mainnet WITH a bond ledger.
-        assert!(mainnet_activation_refusal(&cfg(true, Network::Bitcoin, Some("http://bond"))).is_none());
+        assert!(
+            mainnet_activation_refusal(&cfg(true, Network::Bitcoin, Some("http://bond"))).is_none()
+        );
         // Allowed: not activating (disabled) — gate doesn't apply.
         assert!(mainnet_activation_refusal(&cfg(false, Network::Bitcoin, None)).is_none());
         // Allowed: test nets may run without a real bond ledger.

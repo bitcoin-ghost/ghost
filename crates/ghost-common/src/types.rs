@@ -860,7 +860,11 @@ mod tests {
             elder_status: true,
             coordinator: true,
         };
-        assert_eq!(caps.total_shares(), 15, "coordinator must not change the share total");
+        assert_eq!(
+            caps.total_shares(),
+            15,
+            "coordinator must not change the share total"
+        );
 
         // But a coordinator-only node still "has a capability".
         caps = NodeCapabilities::new();
@@ -874,7 +878,8 @@ mod tests {
         // A health ping from a pre-coordinator build omits the field entirely;
         // it must still deserialize (as coordinator = false), not error.
         let legacy = r#"{"archive_mode":true,"ghost_pay":false,"public_mining":true,"reaper":false,"elder_status":false}"#;
-        let caps: NodeCapabilities = serde_json::from_str(legacy).expect("legacy caps must deserialize");
+        let caps: NodeCapabilities =
+            serde_json::from_str(legacy).expect("legacy caps must deserialize");
         assert!(!caps.coordinator);
         assert!(caps.archive_mode && caps.public_mining);
 
@@ -1092,7 +1097,10 @@ mod tests {
         ping.coordinator_endpoint = Some("abc123def456.onion:9100".to_string());
         let back: HealthPing =
             serde_json::from_str(&serde_json::to_string(&ping).unwrap()).unwrap();
-        assert_eq!(back.coordinator_endpoint.as_deref(), Some("abc123def456.onion:9100"));
+        assert_eq!(
+            back.coordinator_endpoint.as_deref(),
+            Some("abc123def456.onion:9100")
+        );
 
         // An older node's ping omits the field entirely → defaults to None,
         // proving the wire change is additive.
