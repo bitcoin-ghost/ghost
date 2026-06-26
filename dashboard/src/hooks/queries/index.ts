@@ -45,6 +45,3 @@ export * from './useHazeQueries';
 
 // Shroud queries
 export * from './useShroudQueries';
-
-// Glyph queries
-export * from './useGlyphQueries';

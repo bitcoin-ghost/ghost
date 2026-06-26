@@ -13,8 +13,6 @@ import HazeWizard from "./HazeWizard";
 import ShroudWizard from "./ShroudWizard";
 import MempoolPolicyWizard from "./MempoolPolicyWizard";
 import GhostIdWizard from "./GhostIdWizard";
-import CreateLockWizard from "./CreateLockWizard";
-import WithdrawWizard from "./WithdrawWizard";
 
 export default function WizardsSettingsPage() {
   const [initialSetupOpen, setInitialSetupOpen] = useState(false);
@@ -27,8 +25,6 @@ export default function WizardsSettingsPage() {
   const [shroudOpen, setShroudOpen] = useState(false);
   const [mempoolPolicyOpen, setMempoolPolicyOpen] = useState(false);
   const [ghostIdOpen, setGhostIdOpen] = useState(false);
-  const [createLockOpen, setCreateLockOpen] = useState(false);
-  const [withdrawOpen, setWithdrawOpen] = useState(false);
 
   return (
     <>
@@ -65,12 +61,6 @@ export default function WizardsSettingsPage() {
           <Button variant="outline" size="lg" onClick={() => setGhostIdOpen(true)} className="w-full">
             Ghost ID
           </Button>
-          <Button variant="outline" size="lg" onClick={() => setCreateLockOpen(true)} className="w-full">
-            Create Lock
-          </Button>
-          <Button variant="outline" size="lg" onClick={() => setWithdrawOpen(true)} className="w-full">
-            Withdraw
-          </Button>
         </div>
       </Card>
 
@@ -84,8 +74,6 @@ export default function WizardsSettingsPage() {
       <ShroudWizard isOpen={shroudOpen} onClose={() => setShroudOpen(false)} />
       <MempoolPolicyWizard isOpen={mempoolPolicyOpen} onClose={() => setMempoolPolicyOpen(false)} />
       <GhostIdWizard isOpen={ghostIdOpen} onClose={() => setGhostIdOpen(false)} />
-      <CreateLockWizard isOpen={createLockOpen} onClose={() => setCreateLockOpen(false)} />
-      <WithdrawWizard isOpen={withdrawOpen} onClose={() => setWithdrawOpen(false)} />
     </>
   );
 }

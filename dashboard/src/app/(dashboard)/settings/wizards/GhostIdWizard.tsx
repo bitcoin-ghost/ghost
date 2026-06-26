@@ -1,14 +1,11 @@
 'use client';
 
-import { useWizard, WizardStep } from '@/hooks/useWizard';
-import { WizardDialog } from '@/components/ui/Wizard';
-import { Input } from '@/components/ui/Input';
+import { useEffect, useState } from 'react';
+import { Dialog } from '@/components/ui/Dialog';
+import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-
-interface GhostIdData {
-  label: string;
-}
+import { getGhostId } from '@/lib/api/ghostpay';
 
 interface GhostIdWizardProps {
   isOpen: boolean;
@@ -18,129 +15,109 @@ interface GhostIdWizardProps {
 export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
   const toast = useToast();
 
-  const steps: WizardStep<GhostIdData>[] = [
-    {
-      id: 'info',
-      title: 'Ghost ID',
-      description: 'Create a pseudonymous L2 identity',
-    },
-    {
-      id: 'generate',
-      title: 'Configure',
-      description: 'Set an optional label for your Ghost ID',
-      validate: (data) => {
-        if (data.label && data.label.length > 32) {
-          return 'Label must be 32 characters or less';
-        }
-        return null;
-      },
-    },
-    {
-      id: 'confirm',
-      title: 'Confirm',
-      description: 'Generate your Ghost ID',
-      onSubmit: async () => {
-        toast.success(
-          'Ghost ID Created',
-          'Your Ghost ID has been generated and is ready for L2 transactions'
-        );
-        onClose();
-      },
-    },
-  ];
+  const [ghostId, setGhostId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
-  const wizard = useWizard<GhostIdData>({
-    steps,
-    initialData: { label: '' },
-  });
+  useEffect(() => {
+    if (!isOpen) return;
+
+    let cancelled = false;
+    setIsLoading(true);
+    setError(null);
+    setCopied(false);
+
+    getGhostId()
+      .then((result) => {
+        if (cancelled) return;
+        const id = result.ghost_id?.trim();
+        if (!id) {
+          setError('The node did not return a Ghost ID.');
+          setGhostId(null);
+        } else {
+          setGhostId(id);
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : 'Unable to retrieve the node Ghost ID.');
+        setGhostId(null);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
+
+  const handleCopy = async () => {
+    if (!ghostId) return;
+    try {
+      await navigator.clipboard.writeText(ghostId);
+      setCopied(true);
+      toast.success('Copied', 'Ghost ID copied to clipboard.');
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error('Copy Failed', 'Could not copy the Ghost ID to the clipboard.');
+    }
+  };
 
   return (
-    <WizardDialog
+    <Dialog
       isOpen={isOpen}
       onClose={onClose}
-      title="Ghost ID Setup"
-      wizard={wizard}
+      title="Ghost ID"
+      description="The node's L2 receive address, derived from its node keypair."
       size="md"
+      footer={
+        <Button variant="ghost" onClick={onClose}>
+          Close
+        </Button>
+      }
     >
-      {(data, setData) => (
-        <div className="space-y-6">
-          {wizard.currentStep === 0 && (
-            <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-2">About Ghost ID</h4>
-                <p className="text-sm text-gray-400">
-                  A Ghost ID is your pseudonymous identity on the L2 network. It is derived
-                  from your node keys and used to receive L2 payments, create and manage
-                  Ghost Locks, and sign L2 transactions.
-                </p>
-              </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-2">What you can do with a Ghost ID</h4>
-                <ul className="space-y-2 text-sm text-gray-400">
-                  <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
-                    Receive L2 payments from other Ghost users
-                  </li>
-                  <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
-                    Create timelocked Ghost Locks for savings
-                  </li>
-                  <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
-                    Withdraw to L1 Bitcoin addresses
-                  </li>
-                  <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
-                    Sign and verify L2 transactions
-                  </li>
-                </ul>
-              </div>
+      <div className="space-y-4">
+        <div className="p-4 rounded-lg bg-gray-800/50">
+          <p className="text-sm text-gray-400">
+            This is the single Ghost ID derived from this node&apos;s keypair. Other Ghost users
+            can send L2 payments to it. It is read-only here -- L2 actions live in the Ghost
+            Wallet app.
+          </p>
+        </div>
+
+        <div className="p-4 rounded-lg bg-gray-800/50">
+          <div className="flex items-center justify-between mb-2">
+            <h4 className="text-gray-100 font-medium">Receive Address</h4>
+            <Badge variant="info">Node Keypair</Badge>
+          </div>
+
+          {isLoading && (
+            <div className="flex items-center gap-3 py-2">
+              <div className="w-5 h-5 rounded-full border-2 border-gray-600 border-t-orange-500 animate-spin" />
+              <span className="text-sm text-gray-400">Retrieving Ghost ID...</span>
             </div>
           )}
 
-          {wizard.currentStep === 1 && (
-            <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <Input
-                  label="Ghost ID Label (optional)"
-                  type="text"
-                  value={data.label}
-                  onChange={(e) => setData({ label: e.target.value })}
-                  placeholder="e.g. My Node, Savings, Business"
-                />
-                <p className="text-sm text-gray-400 mt-2">
-                  A human-readable label to identify this Ghost ID. This is stored locally
-                  and not shared on the network.
-                </p>
-              </div>
+          {!isLoading && error && (
+            <div className="p-3 rounded-lg bg-red-900/20 border border-red-800">
+              <p className="text-sm text-red-300">{error}</p>
             </div>
           )}
 
-          {wizard.currentStep === 2 && (
-            <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Ready to Generate</h4>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Label</span>
-                    <span className="text-gray-100">{data.label || '(none)'}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Derivation</span>
-                    <Badge variant="info">Node Keypair</Badge>
-                  </div>
-                </div>
-              </div>
-              <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                <p className="text-sm text-orange-300">
-                  Click Finish to generate your Ghost ID. The ID will be derived from your
-                  node keypair and registered on the L2 network.
-                </p>
-              </div>
+          {!isLoading && !error && ghostId && (
+            <div className="flex items-center gap-2">
+              <code className="flex-1 break-all rounded bg-gray-900/70 px-3 py-2 text-sm text-orange-300">
+                {ghostId}
+              </code>
+              <Button variant="secondary" size="sm" onClick={handleCopy}>
+                {copied ? 'Copied' : 'Copy'}
+              </Button>
             </div>
           )}
         </div>
-      )}
-    </WizardDialog>
+      </div>
+    </Dialog>
   );
 }
