@@ -21,6 +21,7 @@ interface ReaperStats {
     fake_pubkey_curve_point: number;
     annex_present: number;
     oversized_op_return: number;
+    dust_flood: number;
     excess_witness_data: number;
     excess_stack_items: number;
     legacy_scriptsig_data: number;
@@ -60,6 +61,11 @@ const DETECTION_VECTORS = [
     key: "oversized_op_return" as const,
     name: "Oversized OP_RETURN",
     desc: "Flags OP_RETURN outputs exceeding standard relay limits, used for embedding large data payloads.",
+  },
+  {
+    key: "dust_flood" as const,
+    name: "Dust-flood (UTXO spam)",
+    desc: "Rejects 1-in/1-out transactions whose sole non-OP_RETURN output sits at or below the dust-flood threshold, the signature of UTXO-set flooding spam.",
   },
   {
     key: "annex_present" as const,

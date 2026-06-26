@@ -62,6 +62,7 @@ export interface ReaperSettings {
   // Node-only (ghostd mempool reaper)
   reject_opreturn: boolean;
   reject_runestone: boolean;
+  reject_dustflood: boolean;
   // Pool-only (template reaper)
   reject_unreachable_code: boolean;
   reject_excess_witness: boolean;
@@ -70,6 +71,7 @@ export interface ReaperSettings {
   // Thresholds
   max_op_return_bytes: number;
   min_drop_size: number;
+  dustflood_threshold: number;
   min_excess_witness_bytes: number;
   legacy_max_push_bytes: number;
 }
@@ -102,12 +104,14 @@ export const REAPER_DEFAULTS: ReaperSettings = {
   reject_annex: true,
   reject_opreturn: true,
   reject_runestone: true,
+  reject_dustflood: true,
   reject_unreachable_code: true,
   reject_excess_witness: true,
   reject_legacy_data_stuffing: true,
   validate_pubkey_curve_point: true,
   max_op_return_bytes: 82,
   min_drop_size: 76,
+  dustflood_threshold: 330,
   min_excess_witness_bytes: 500,
   legacy_max_push_bytes: 80,
 };

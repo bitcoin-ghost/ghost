@@ -26,6 +26,7 @@ const SHARED: Vector[] = [
 const NODE_ONLY: Vector[] = [
   { key: 'reject_opreturn', label: 'Oversized OP_RETURN', desc: 'OP_RETURN payloads larger than the max below' },
   { key: 'reject_runestone', label: 'Runestones', desc: 'Runestone protocol outputs (OP_RETURN OP_13)' },
+  { key: 'reject_dustflood', label: 'Dust-flood (UTXO spam)', desc: '1-in/1-out txs whose sole non-OP_RETURN output is at/below the dust-flood threshold below' },
 ];
 const POOL_ONLY: Vector[] = [
   { key: 'reject_unreachable_code', label: 'Unreachable code', desc: 'Witness code after an OP_RETURN opcode' },
@@ -154,6 +155,8 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
                 onChange={(e) => setData({ max_op_return_bytes: Number(e.target.value) })} disabled={!data.enabled} />
               <Input label="Min drop-stuffing push size (shared)" type="number" value={data.min_drop_size}
                 onChange={(e) => setData({ min_drop_size: Number(e.target.value) })} disabled={!data.enabled} />
+              <Input label="Dust-flood threshold (sats)" type="number" value={data.dustflood_threshold}
+                onChange={(e) => setData({ dustflood_threshold: Number(e.target.value) })} disabled={!data.enabled} />
               <Input label="Min excess-witness bytes (pool)" type="number" value={data.min_excess_witness_bytes}
                 onChange={(e) => setData({ min_excess_witness_bytes: Number(e.target.value) })} disabled={!data.enabled} />
               <Input label="Legacy max push bytes (pool)" type="number" value={data.legacy_max_push_bytes}
