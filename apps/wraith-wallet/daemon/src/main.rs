@@ -9,6 +9,10 @@
 //! `WalletSelect`, and lost when the daemon restarts. Wallet-scoped commands
 //! (`WalletDerive`, `WalletAuthInfo`, `LightReceive`) target the active wallet.
 
+/// Channel-agnostic picker for resolving an elected coordinator's endpoint
+/// (fetch path lands with the GUI toggle; see the module docs).
+mod coordinator_resolve;
+
 #[cfg(not(unix))]
 fn main() {
     eprintln!("wraithd: only Unix-like platforms are supported in phase 0");
