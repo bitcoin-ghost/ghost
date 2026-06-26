@@ -1376,6 +1376,12 @@ pub struct ReaperSettings {
     /// Reject Runestone protocol outputs (OP_RETURN OP_13).
     #[serde(default = "default_true")]
     pub reject_runestone: bool,
+    /// Reject 1-in/1-out transactions whose sole non-OP_RETURN output is at/below the dust-flood threshold (UTXO-flood spam).
+    #[serde(default = "default_true")]
+    pub reject_dustflood: bool,
+    /// Sole-output value (sats) at/below which a 1-in/1-out tx is treated as dust-flood spam.
+    #[serde(default = "default_dustflood_threshold")]
+    pub dust_flood_threshold: u64,
 
     // --- Pool-only detectors (Rust template reaper) ---
     /// Reject witness code after an OP_RETURN opcode.
@@ -1415,6 +1421,9 @@ fn default_max_op_return_bytes() -> usize {
 fn default_min_drop_size() -> usize {
     76
 }
+fn default_dustflood_threshold() -> u64 {
+    330
+}
 fn default_min_excess_witness_bytes() -> usize {
     500
 }
@@ -1432,6 +1441,8 @@ impl Default for ReaperSettings {
             reject_annex: true,
             reject_opreturn: true,
             reject_runestone: true,
+            reject_dustflood: true,
+            dust_flood_threshold: default_dustflood_threshold(),
             reject_unreachable_code: true,
             reject_excess_witness: true,
             reject_legacy_data_stuffing: true,
@@ -1472,7 +1483,15 @@ impl ReaperSettings {
             format!("-ghostreaper-rejectannex={}", b(self.reject_annex)),
             format!("-ghostreaper-rejectopreturn={}", b(self.reject_opreturn)),
             format!("-ghostreaper-rejectrunestone={}", b(self.reject_runestone)),
+            format!(
+                "-ghostreaper-rejectdustflood={}",
+                b(self.reject_dustflood)
+            ),
             format!("-ghostreaper-maxopreturn={}", self.max_op_return_bytes),
+            format!(
+                "-ghostreaper-dustfloodthreshold={}",
+                self.dust_flood_threshold
+            ),
             format!("-ghostreaper-mindropsize={}", self.min_drop_size),
         ]
     }
@@ -1638,6 +1657,8 @@ mod tests {
         assert!(flags.contains(&"-ghostreaper-rejectannex=1".to_string()));
         assert!(flags.contains(&"-ghostreaper-rejectopreturn=1".to_string()));
         assert!(flags.contains(&"-ghostreaper-rejectrunestone=1".to_string()));
+        assert!(flags.contains(&"-ghostreaper-rejectdustflood=1".to_string()));
+        assert!(flags.contains(&"-ghostreaper-dustfloodthreshold=330".to_string()));
         assert!(flags.contains(&"-ghostreaper-maxopreturn=82".to_string()));
         assert!(flags.contains(&"-ghostreaper-mindropsize=76".to_string()));
         // Pool-only vectors must NOT leak into ghostd flags.

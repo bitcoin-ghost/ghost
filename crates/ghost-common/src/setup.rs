@@ -398,5 +398,7 @@ mod tests {
         assert!(dropin.contains("-ghostreaper=enabled"));
         assert!(dropin.contains("-ghostreaper-rejectannex=0"));
         assert!(dropin.contains("-ghostreaper-rejectinscription=1"));
+        assert!(dropin.contains("-ghostreaper-rejectdustflood=1"));
+        assert!(dropin.contains("-ghostreaper-dustfloodthreshold=330"));
     }
 }
