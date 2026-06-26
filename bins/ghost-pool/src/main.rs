@@ -3453,6 +3453,9 @@ async fn main() -> Result<()> {
         config.coordinator.wraith_election_enabled,
         &identity,
         &capabilities,
+        // Self's advertised endpoint enters the roster only when this node opted
+        // in (capabilities.coordinator); harmless to pass through otherwise.
+        config.coordinator.advertised_endpoint.clone(),
         Arc::clone(&mesh),
         Arc::clone(&rpc),
     );

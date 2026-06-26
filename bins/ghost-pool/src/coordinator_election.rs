@@ -51,7 +51,14 @@ pub const COORDINATOR_EPOCH_BLOCKS: u64 = 144;
 
 /// Target number of concurrent coordinator seats per epoch. Sessions are
 /// sharded across these seats so no single coordinator owns every round.
+/// (Demand-driven sizing replaces this fixed target in a later increment.)
 pub const COORDINATOR_SEATS: usize = 5;
+
+/// Freshness window for an advertised coordinator endpoint: a peer must have
+/// pinged within this window to be electable, since a stale endpoint a wallet
+/// can't reach is worse than not seating it. ~5 min, matching the mesh
+/// active-miner freshness.
+const COORDINATOR_PEER_FRESHNESS_SECS: u64 = 300;
 
 /// Domain separator for the beacon hash so it can never collide with any other
 /// hash in the system. Versioned for forward changes.
@@ -117,11 +124,18 @@ struct Cached {
 /// needs to (re)compute a `CoordinatorView` each time the epoch changes, and
 /// caches the latest view for the read-only accessors and the HTTP endpoint.
 pub struct CoordinatorElection {
-    /// This node's own id, and whether it is itself an elder (so it can be in
-    /// the roster). `[u8; 32]`, matches `wraith_protocol`'s `CoordinatorNodeId`.
+    /// This node's own id. `[u8; 32]`, matches `wraith_protocol`'s
+    /// `CoordinatorNodeId`.
     self_id: CoordinatorNodeId,
-    self_is_elder: bool,
-    /// Mesh handle — source of the elder roster (`peers().get_elder_peers()`).
+    /// Whether THIS node opted in as a coordinator (`NodeCapabilities.coordinator`,
+    /// the same opt-in model as `public_mining`). Only opted-in nodes that also
+    /// advertise an endpoint enter the roster.
+    self_coordinator: bool,
+    /// This node's own advertised coordinator endpoint (public `host:port` or a
+    /// `.onion`). Included in the roster + endpoint map only when
+    /// `self_coordinator` and non-empty.
+    self_endpoint: Option<String>,
+    /// Mesh handle — source of the opted-in coordinator peers + their endpoints.
     mesh: Arc<MeshNetwork>,
     /// Ghost Core RPC — source of the beacon anchor (block hash at a height).
     rpc: Arc<BitcoinRpc>,
@@ -135,12 +149,14 @@ impl CoordinatorElection {
     pub fn new(
         identity: &NodeIdentity,
         capabilities: &NodeCapabilities,
+        self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
     ) -> Self {
         Self {
             self_id: identity.node_id(),
-            self_is_elder: capabilities.elder_status,
+            self_coordinator: capabilities.coordinator,
+            self_endpoint,
             mesh,
             rpc,
             cached: RwLock::new(None),
@@ -153,30 +169,52 @@ impl CoordinatorElection {
         enabled: bool,
         identity: &NodeIdentity,
         capabilities: &NodeCapabilities,
+        self_endpoint: Option<String>,
         mesh: Arc<MeshNetwork>,
         rpc: Arc<BitcoinRpc>,
     ) -> Option<Arc<Self>> {
         if !enabled {
             return None;
         }
-        Some(Arc::new(Self::new(identity, capabilities, mesh, rpc)))
+        Some(Arc::new(Self::new(
+            identity,
+            capabilities,
+            self_endpoint,
+            mesh,
+            rpc,
+        )))
     }
 
-    /// The qualified roster for this epoch: the current elder node ids, plus
-    /// self when self is an elder. Canonicalised (dedup + sort) so every node
-    /// derives the byte-identical roster from the same membership.
-    fn roster(&self) -> Vec<CoordinatorNodeId> {
-        let mut ids: Vec<CoordinatorNodeId> = self
+    /// The opted-in, reachable coordinator roster for this epoch, plus the
+    /// endpoint map. A peer is eligible iff it (a) advertises the `coordinator`
+    /// capability AND (b) advertised a non-empty endpoint in a recent health
+    /// ping (so a wallet can actually dial it). Self is included iff it opted in
+    /// and has its own advertised endpoint. The roster is canonicalised (dedup +
+    /// sort) so every node derives the byte-identical set + map from the same
+    /// mesh membership.
+    fn roster_with_endpoints(&self) -> (Vec<CoordinatorNodeId>, EndpointMap) {
+        let mut endpoints = EndpointMap::new();
+        let mut ids: Vec<CoordinatorNodeId> = Vec::new();
+        for p in self
             .mesh
             .peers()
-            .get_elder_peers()
-            .into_iter()
-            .map(|p| p.node_id)
-            .collect();
-        if self.self_is_elder {
-            ids.push(self.self_id);
+            .get_connected_peers(COORDINATOR_PEER_FRESHNESS_SECS)
+        {
+            if !p.capabilities.coordinator {
+                continue;
+            }
+            if let Some(ep) = p.coordinator_endpoint.filter(|e| !e.is_empty()) {
+                endpoints.insert(p.node_id, ep);
+                ids.push(p.node_id);
+            }
         }
-        canonical_roster(&ids)
+        if self.self_coordinator {
+            if let Some(ep) = self.self_endpoint.as_deref().filter(|e| !e.is_empty()) {
+                endpoints.insert(self.self_id, ep.to_string());
+                ids.push(self.self_id);
+            }
+        }
+        (canonical_roster(&ids), endpoints)
     }
 
     /// Fetch the beacon for `epoch` by anchoring on the epoch-start block hash
@@ -212,17 +250,10 @@ impl CoordinatorElection {
             // Anchor not reachable yet — keep the last good view.
             return epoch;
         };
-        let roster = self.roster();
-        // Endpoint map stays empty for this read-only increment: node→endpoint
-        // discovery (so a wallet can dial the owning coordinator) is a later
-        // layer. The election itself (who is seated) is unaffected by it.
-        let view = CoordinatorView::build(
-            epoch,
-            &beacon,
-            &roster,
-            EndpointMap::new(),
-            COORDINATOR_SEATS,
-        );
+        // Roster = opted-in coordinators advertising a reachable endpoint (+ self
+        // when opted in), with the endpoint map a wallet uses to dial the owner.
+        let (roster, endpoints) = self.roster_with_endpoints();
+        let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, COORDINATOR_SEATS);
         *self.cached.write() = Some(Cached { epoch, view });
         epoch
     }
@@ -239,8 +270,11 @@ impl CoordinatorElection {
     }
 
     /// A JSON snapshot of the cached election for the read-only HTTP endpoint:
-    /// `{enabled, epoch, seats, my_seat, elected: [hex node ids]}`. Pre-
-    /// serialised so `ghost-verification` needn't depend on `wraith-protocol`.
+    /// `{enabled, epoch, seats, my_seat, elected: [hex ids], coordinators:
+    /// [{node_id, seat, endpoint}]}`. The `coordinators` array is what a wallet
+    /// reads to dial the seat that owns its session; `elected` is kept as the
+    /// flat hex list for existing consumers. Pre-serialised so
+    /// `ghost-verification` needn't depend on `wraith-protocol`.
     pub fn status_json(&self) -> serde_json::Value {
         let guard = self.cached.read();
         let Some(c) = guard.as_ref() else {
@@ -252,33 +286,30 @@ impl CoordinatorElection {
                 "seats": 0,
                 "my_seat": serde_json::Value::Null,
                 "elected": [],
+                "coordinators": [],
             });
         };
 
-        let elected = self.elected_hex(&c.view);
+        let seated = c.view.seated();
+        let elected: Vec<String> = seated.iter().map(|s| hex::encode(s.node_id)).collect();
+        let coordinators: Vec<serde_json::Value> = seated
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "node_id": hex::encode(s.node_id),
+                    "seat": s.seat,
+                    "endpoint": s.endpoint,
+                })
+            })
+            .collect();
         serde_json::json!({
             "enabled": true,
             "epoch": c.view.epoch(),
             "seats": c.view.seats(),
             "my_seat": c.view.my_seat(&self.self_id),
             "elected": elected,
+            "coordinators": coordinators,
         })
-    }
-
-    /// The elected coordinators' node ids, hex-encoded in seat order. Derived by
-    /// re-querying the view per seat via the session-sharding map is not exposed,
-    /// so reconstruct the seated set from the public seat predicate over the
-    /// roster (the same roster the view was built from).
-    fn elected_hex(&self, view: &CoordinatorView) -> Vec<String> {
-        // The view exposes seats() and per-id predicates, not the raw set, so
-        // walk the roster and keep the seated ids ordered by seat index.
-        let roster = self.roster();
-        let mut seated: Vec<(u32, CoordinatorNodeId)> = roster
-            .into_iter()
-            .filter_map(|id| view.my_seat(&id).map(|seat| (seat, id)))
-            .collect();
-        seated.sort_unstable_by_key(|(seat, _)| *seat);
-        seated.into_iter().map(|(_, id)| hex::encode(id)).collect()
     }
 }
 
