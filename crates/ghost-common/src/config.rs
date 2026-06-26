@@ -1483,10 +1483,7 @@ impl ReaperSettings {
             format!("-ghostreaper-rejectannex={}", b(self.reject_annex)),
             format!("-ghostreaper-rejectopreturn={}", b(self.reject_opreturn)),
             format!("-ghostreaper-rejectrunestone={}", b(self.reject_runestone)),
-            format!(
-                "-ghostreaper-rejectdustflood={}",
-                b(self.reject_dustflood)
-            ),
+            format!("-ghostreaper-rejectdustflood={}", b(self.reject_dustflood)),
             format!("-ghostreaper-maxopreturn={}", self.max_op_return_bytes),
             format!(
                 "-ghostreaper-dustfloodthreshold={}",
