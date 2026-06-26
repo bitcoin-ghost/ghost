@@ -544,6 +544,10 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "heavy minerd-subprocess benchmark; flaky on macOS CI runners (runs on ubuntu)"
+    )]
     async fn test_measure_hashrate() {
         let minerd_process = MinerdProcess::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), false)
             .await

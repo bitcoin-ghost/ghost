@@ -450,6 +450,10 @@ mod tests {
     use crate::utils::get_available_address;
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "heavy bitcoin template-provider integration; flaky on macOS CI runners (runs on ubuntu)"
+    )]
     async fn test_create_mempool_transaction() {
         let address = get_available_address();
         let port = address.port();
