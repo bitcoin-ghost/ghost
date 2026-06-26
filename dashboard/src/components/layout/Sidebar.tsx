@@ -16,7 +16,6 @@ import {
   EyeOff,
   Skull,
   Globe,
-  Grid3x3,
   HeartPulse,
   ScrollText,
   Users,
@@ -93,7 +92,6 @@ const GROUPS: NavGroup[] = [
   {
     label: "identity",
     items: [
-      { href: "/glyphs", label: "Glyphs", icon: <Grid3x3 {...ICON} /> },
       { href: "/elders", label: "Elders & MPC", icon: <Users {...ICON} /> },
     ],
   },

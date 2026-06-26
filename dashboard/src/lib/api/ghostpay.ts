@@ -1,5 +1,5 @@
 // Ghost Pay API endpoints
-import { fetchApi } from './client';
+import { fetchApi, fetchWithTimeout } from './client';
 import type {
   GhostPayStatus,
   WraithSessionsResponse,
@@ -13,6 +13,43 @@ import type {
   GhostPayPayoutHistoryResponse,
   PayoutHistoryTimeFilter,
 } from '@/types/api';
+
+// The Ghost ID (and other key material) is served by the ghost-pay backend,
+// reached through the dedicated ghostpay-proxy route which signs the request.
+function getGhostPayProxyBase(): string {
+  if (typeof window !== 'undefined') {
+    return window.location.origin;
+  }
+  return 'http://localhost:3000';
+}
+
+async function fetchGhostPay<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const proxyUrl = `${getGhostPayProxyBase()}/api/ghostpay-proxy${endpoint}`;
+
+  const response = await fetchWithTimeout(proxyUrl, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ error: 'Unknown error' }));
+    throw new Error(err.error || `API error: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+// Node Ghost ID (the node's single derived L2 receive address).
+export interface GhostIdResponse {
+  ghost_id: string;
+}
+
+export async function getGhostId(): Promise<GhostIdResponse> {
+  return fetchGhostPay<GhostIdResponse>('/api/v1/keys/ghost-id');
+}
 
 // Ghost Pay Status
 export async function getGhostPayStatus(): Promise<GhostPayStatus> {
@@ -145,25 +182,3 @@ export async function getGhostPayPayoutHistory(
   );
 }
 
-// Lock reconciliation (settle lock to L1)
-export async function reconcileLock(lockId: string, config: {
-  destination_address: string;
-  settlement_class?: 'standard' | 'batched';
-}): Promise<{ success: boolean; withdrawal_id?: number; message: string }> {
-  return fetchApi(`/api/v1/locks/${lockId}/reconcile`, {
-    method: 'POST',
-    body: JSON.stringify(config),
-  });
-}
-
-// Send L2 instant payment
-export async function sendL2Payment(config: {
-  recipient: string;
-  amount_sats: number;
-  memo?: string;
-}): Promise<{ success: boolean; payment_id?: string; message: string }> {
-  return fetchApi('/api/v1/payments/send', {
-    method: 'POST',
-    body: JSON.stringify(config),
-  });
-}

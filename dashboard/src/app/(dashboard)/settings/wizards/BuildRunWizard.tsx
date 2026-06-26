@@ -5,8 +5,10 @@ import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-import { useRestartNode } from '@/hooks/queries';
+import { useStartService, useStopService, useRestartService } from '@/hooks/queries';
 import { fetchApi } from '@/lib/api/client';
+
+const NODE_SERVICE = 'ghost-pool';
 
 interface PreflightCheck {
   label: string;
@@ -46,7 +48,9 @@ const ACTION_OPTIONS = [
 ];
 
 export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps) {
-  const restartNode = useRestartNode();
+  const startService = useStartService();
+  const stopService = useStopService();
+  const restartService = useRestartService();
   const toast = useToast();
 
   const [checks, setChecks] = useState<PreflightCheck[]>([
@@ -79,15 +83,37 @@ export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps)
       title: 'Confirm',
       description: 'Confirm the action to execute',
       onSubmit: async (data) => {
-        await restartNode.mutateAsync();
+        let result;
+        switch (data.action) {
+          case 'start':
+            result = await startService.mutateAsync(NODE_SERVICE);
+            break;
+          case 'stop':
+            result = await stopService.mutateAsync(NODE_SERVICE);
+            break;
+          case 'restart':
+            result = await restartService.mutateAsync(NODE_SERVICE);
+            break;
+        }
+
+        const actionLabels = { start: 'Started', stop: 'Stopped', restart: 'Restarted' } as const;
+
+        if (result?.success === false) {
+          toast.error(
+            `Node ${data.action.charAt(0).toUpperCase() + data.action.slice(1)} Failed`,
+            result.message || `The node ${data.action} command did not complete.`
+          );
+          throw new Error(result.message || `Failed to ${data.action} the node.`);
+        }
+
         toast.success(
-          `Node ${data.action === 'start' ? 'Started' : data.action === 'restart' ? 'Restarted' : 'Stopped'}`,
-          `The node ${data.action} command has been executed successfully.`
+          `Node ${actionLabels[data.action]}`,
+          result?.message || `The node ${data.action} command has been executed successfully.`
         );
         onClose();
       },
     },
-  ], [restartNode, toast, onClose]);
+  ], [startService, stopService, restartService, toast, onClose]);
 
   const wizard = useWizard<BuildRunData>({
     steps,
