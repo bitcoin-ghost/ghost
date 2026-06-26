@@ -1,5 +1,5 @@
 // Ghost Pay API endpoints
-import { fetchApi } from './client';
+import { fetchApi, fetchWithTimeout } from './client';
 import type {
   GhostPayStatus,
   WraithSessionsResponse,
@@ -156,14 +156,96 @@ export async function reconcileLock(lockId: string, config: {
   });
 }
 
-// Send L2 instant payment
+// ---------------------------------------------------------------------------
+// Pay-node write routes
+//
+// The L2 payment-send and read-only ghost-id routes live on the ghost-pay
+// node (port 8800), reached through the dashboard's `/api/ghostpay-proxy`
+// route (which HMAC-signs the request). This is a DIFFERENT backend from the
+// read-only `/api/proxy` (ghost-pool, port 8080) used by the getters above,
+// so these functions must go through their own proxy base — mirroring the
+// helper in `glyph.ts`.
+// ---------------------------------------------------------------------------
+
+function getGhostPayProxyBase(): string {
+  if (typeof window !== 'undefined') {
+    return window.location.origin;
+  }
+  return 'http://localhost:3000';
+}
+
+async function fetchGhostPay<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const proxyUrl = `${getGhostPayProxyBase()}/api/ghostpay-proxy${endpoint}`;
+
+  const response = await fetchWithTimeout(proxyUrl, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+    throw new Error(error.error || `API error: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+export interface GhostIdInfo {
+  ghost_id: string;
+  scan_pubkey: string;
+  spend_pubkey: string;
+}
+
+// Read the node's Ghost ID (derived from the operator's keys).
+// GET /api/v1/keys/ghost-id  (ghost-pay, read-only)
+export async function getGhostId(): Promise<GhostIdInfo> {
+  return fetchGhostPay<GhostIdInfo>('/api/v1/keys/ghost-id');
+}
+
+export interface SendL2PaymentResponse {
+  success: boolean;
+  error?: string;
+  payment_id?: string;
+  sender?: string;
+  recipient?: string;
+  amount_sats?: number;
+  memo?: string | null;
+  status?: string;
+  proof_required?: boolean;
+  message?: string;
+  // Returned on the "insufficient balance" business failure.
+  available_sats?: number;
+  requested_sats?: number;
+}
+
+// Send an L2 instant payment.
+//
+// POST /api/v1/payments/send  (ghost-pay, port 8800 via the ghostpay-proxy).
+// This is a ONE-SHOT call — the L2 transfer is recorded immediately; there
+// is no prepare→submit handshake (an off-chain transfer produces no on-chain
+// tx and needs no per-payment sighash). The handler returns HTTP 200 with
+// `{ success: false, error }` for business failures (insufficient balance,
+// zero amount, missing recipient/keys), so callers must check `success`.
+//
+// `sender_ghost_id` identifies the paying wallet; the dashboard supplies the
+// node's own Ghost ID (read via `getGhostId`) since the operator pays from
+// their node's Ghost Pay balance.
 export async function sendL2Payment(config: {
+  sender_ghost_id: string;
   recipient: string;
   amount_sats: number;
   memo?: string;
-}): Promise<{ success: boolean; payment_id?: string; message: string }> {
-  return fetchApi('/api/v1/payments/send', {
+}): Promise<SendL2PaymentResponse> {
+  return fetchGhostPay<SendL2PaymentResponse>('/api/v1/payments/send', {
     method: 'POST',
-    body: JSON.stringify(config),
+    body: JSON.stringify({
+      sender_ghost_id: config.sender_ghost_id,
+      recipient: config.recipient,
+      amount_sats: config.amount_sats,
+      memo: config.memo,
+    }),
   });
 }

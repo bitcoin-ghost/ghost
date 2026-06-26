@@ -11,6 +11,8 @@ import {
   joinWraithSession,
   requestLockSettlement,
   useLockInMix as apiUseLockInMix,
+  getGhostId,
+  sendL2Payment,
 } from '@/lib/api/ghostpay';
 import type { PayoutHistoryTimeFilter } from '@/types/api';
 
@@ -26,7 +28,17 @@ export const ghostPayKeys = {
   settlementStatus: () => [...ghostPayKeys.all, 'settlement-status'] as const,
   payoutHistory: (timeFilter: PayoutHistoryTimeFilter) =>
     [...ghostPayKeys.all, 'payout-history', timeFilter] as const,
+  ghostId: () => [...ghostPayKeys.all, 'ghost-id'] as const,
 };
+
+export function useGhostId(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: ghostPayKeys.ghostId(),
+    queryFn: getGhostId,
+    enabled: options?.enabled ?? true,
+    staleTime: Infinity,
+  });
+}
 
 export function useGhostPayStatus(options?: { refetchInterval?: number }) {
   return useQuery({
@@ -103,6 +115,29 @@ export function useUseLockInMix() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ghostPayKeys.locks() });
       queryClient.invalidateQueries({ queryKey: ghostPayKeys.wraith() });
+    },
+  });
+}
+
+export function useSendL2Payment() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (config: {
+      senderGhostId: string;
+      recipient: string;
+      amountSats: number;
+      memo?: string;
+    }) =>
+      sendL2Payment({
+        sender_ghost_id: config.senderGhostId,
+        recipient: config.recipient,
+        amount_sats: config.amountSats,
+        memo: config.memo,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ghostPayKeys.payments() });
+      queryClient.invalidateQueries({ queryKey: ghostPayKeys.status() });
     },
   });
 }

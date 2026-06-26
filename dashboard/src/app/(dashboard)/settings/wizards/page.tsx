@@ -15,6 +15,8 @@ import MempoolPolicyWizard from "./MempoolPolicyWizard";
 import GhostIdWizard from "./GhostIdWizard";
 import CreateLockWizard from "./CreateLockWizard";
 import WithdrawWizard from "./WithdrawWizard";
+import SendPaymentWizard from "./SendPaymentWizard";
+import GlyphWizard from "./GlyphWizard";
 
 export default function WizardsSettingsPage() {
   const [initialSetupOpen, setInitialSetupOpen] = useState(false);
@@ -29,6 +31,8 @@ export default function WizardsSettingsPage() {
   const [ghostIdOpen, setGhostIdOpen] = useState(false);
   const [createLockOpen, setCreateLockOpen] = useState(false);
   const [withdrawOpen, setWithdrawOpen] = useState(false);
+  const [sendPaymentOpen, setSendPaymentOpen] = useState(false);
+  const [glyphOpen, setGlyphOpen] = useState(false);
 
   return (
     <>
@@ -71,6 +75,12 @@ export default function WizardsSettingsPage() {
           <Button variant="outline" size="lg" onClick={() => setWithdrawOpen(true)} className="w-full">
             Withdraw
           </Button>
+          <Button variant="outline" size="lg" onClick={() => setSendPaymentOpen(true)} className="w-full">
+            Send Payment
+          </Button>
+          <Button variant="outline" size="lg" onClick={() => setGlyphOpen(true)} className="w-full">
+            Glyph
+          </Button>
         </div>
       </Card>
 
@@ -86,6 +96,8 @@ export default function WizardsSettingsPage() {
       <GhostIdWizard isOpen={ghostIdOpen} onClose={() => setGhostIdOpen(false)} />
       <CreateLockWizard isOpen={createLockOpen} onClose={() => setCreateLockOpen(false)} />
       <WithdrawWizard isOpen={withdrawOpen} onClose={() => setWithdrawOpen(false)} />
+      <SendPaymentWizard isOpen={sendPaymentOpen} onClose={() => setSendPaymentOpen(false)} />
+      <GlyphWizard isOpen={glyphOpen} onClose={() => setGlyphOpen(false)} />
     </>
   );
 }
