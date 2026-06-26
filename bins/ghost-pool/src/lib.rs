@@ -119,4 +119,6 @@ pub mod reaper_stats;
 /// `wraith-protocol`; activates no role and changes no consensus message.
 pub mod coordinator_election;
 
+pub mod coordinator_supervisor;
+
 // L2 uses NullifierRouteHandler from ghost-consensus (sender-side proofs).

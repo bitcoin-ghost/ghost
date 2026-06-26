@@ -3469,6 +3469,43 @@ async fn main() -> Result<()> {
         });
     }
 
+    // In-process coordinator activation (Inc 4). Off unless
+    // `[coordinator] coordinator_role_enabled`; on mainnet it is refused unless a
+    // real bond ledger is configured (secure-by-default). When elected, the node
+    // runs the coordinator on `coordinator_port`; the supervisor is reconciled
+    // against the election each epoch flip below.
+    let coordinator_supervisor = {
+        let coord_network = match config.bitcoin.network {
+            ghost_common::config::BitcoinNetwork::Mainnet => bitcoin::Network::Bitcoin,
+            ghost_common::config::BitcoinNetwork::Signet => bitcoin::Network::Signet,
+            ghost_common::config::BitcoinNetwork::Testnet => bitcoin::Network::Testnet,
+            ghost_common::config::BitcoinNetwork::Regtest => bitcoin::Network::Regtest,
+        };
+        let listen: std::net::SocketAddr =
+            format!("0.0.0.0:{}", config.coordinator.coordinator_port)
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid coordinator listen addr: {e}"))?;
+        let role_cfg = ghost_pool::coordinator_supervisor::CoordinatorRoleConfig {
+            enabled: config.coordinator.coordinator_role_enabled,
+            network: coord_network,
+            listen,
+            bond_ledger_url: config.coordinator.bond_ledger_url.clone(),
+            bond_ledger_token: config.coordinator.bond_ledger_token.clone(),
+            fee_address: config.coordinator.coordinator_fee_address.clone(),
+            ghostd_rpc_url: format!(
+                "http://{}:{}",
+                config.bitcoin.rpc_host, config.bitcoin.rpc_port
+            ),
+            ghostd_rpc_user: config.bitcoin.rpc_user.clone(),
+            ghostd_rpc_password: config.bitcoin.rpc_password.clone(),
+        };
+        ghost_pool::coordinator_supervisor::CoordinatorSupervisor::maybe_new(
+            role_cfg,
+            Arc::clone(&mesh),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?
+    };
+
     // Configure archive handler if archive mode enabled
     if capabilities.archive_mode {
         let archive_handler = RpcArchiveHandler::new(Arc::clone(&rpc_for_verification));
@@ -5228,6 +5265,10 @@ async fn main() -> Result<()> {
     // Coordinator-election recompute hook (read-only). `None` when the feature
     // is off → the recompute below is skipped entirely.
     let coord_for_events = coordinator_election.clone();
+    // Activation supervisor — reconciled against the election so an elected node
+    // runs the coordinator (and a node that lost its seat stops). `None` when
+    // role activation is off.
+    let supervisor_for_events = coordinator_supervisor.clone();
 
     tokio::spawn(async move {
         while let Ok(event) = template_events_early.recv().await {
@@ -5241,6 +5282,12 @@ async fn main() -> Result<()> {
                     // when the feature is off). Read-only — activates nothing.
                     if let Some(ref coord) = coord_for_events {
                         coord.refresh_for_height(height).await;
+                        // Start/stop the in-process coordinator to match the
+                        // freshly-recomputed election (no-op when role activation
+                        // is off or the seat is unchanged).
+                        if let Some(ref sup) = supervisor_for_events {
+                            sup.reconcile(coord.am_i_coordinator()).await;
+                        }
                     }
 
                     // M-MINE-1: Update template ID for share validation
