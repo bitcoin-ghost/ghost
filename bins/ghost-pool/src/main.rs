@@ -824,6 +824,7 @@ async fn main() -> Result<()> {
         public_mining: is_public_mining, // Derived from mining_mode
         reaper: config.reaper.enabled,
         elder_status: false,
+        coordinator: config.coordinator.coordinator_enabled, // opt-in Wraith coordinator role
     };
 
     // Register node with database

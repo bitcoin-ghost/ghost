@@ -812,6 +812,7 @@ mod tests {
             public_mining: true,
             reaper: true,
             elder_status: true,
+            coordinator: false,
         };
         // Set first_seen far in the past for max reliability (30+ days)
         peer.first_seen = peer.first_seen.saturating_sub(86400 * 31);
@@ -868,6 +869,7 @@ mod tests {
             public_mining: true,
             reaper: true,
             elder_status: true,
+            coordinator: false,
         };
         peer_high.first_seen = peer_high.first_seen.saturating_sub(86400 * 31);
 

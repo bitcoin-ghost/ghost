@@ -129,12 +129,45 @@ pub struct NodeConfig {
 /// activates a coordinator role, touches `coordinator_redundancy`, or changes
 /// any Wraith mixing or consensus message. With `wraith_election_enabled =
 /// false` (the default) it is inert.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatorConfig {
     /// Compute the per-epoch coordinator election and expose it read-only via
     /// `GET /api/v1/pool/coordinator`. Default false — dead code when off.
     #[serde(default)]
     pub wraith_election_enabled: bool,
+    /// Opt in to being an eligible Wraith coordinator — the same opt-in model as
+    /// `public_mining` for miners. When true the node advertises itself as
+    /// coordinator-capable to the mesh and may be elected. Earns the mixing
+    /// service fee, not 5-4-3-2-1 shares. Default false.
+    #[serde(default)]
+    pub coordinator_enabled: bool,
+    /// The reachable coordinator endpoint this node advertises: a public
+    /// `host:port` or a `.onion` hidden service. Operator-controlled so home
+    /// operators can advertise Tor instead of doxxing an IP. Required (non-empty)
+    /// before the node can actually be elected — no endpoint means wallets have
+    /// nowhere to dial.
+    #[serde(default)]
+    pub advertised_endpoint: Option<String>,
+    /// Port the in-process coordinator binds when this node is elected to a seat.
+    #[serde(default = "default_coordinator_port")]
+    pub coordinator_port: u16,
+}
+
+/// Default port for the in-process Wraith coordinator (matches the standalone
+/// `wraith-coordinator` binary's default).
+fn default_coordinator_port() -> u16 {
+    9100
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            wraith_election_enabled: false,
+            coordinator_enabled: false,
+            advertised_endpoint: None,
+            coordinator_port: default_coordinator_port(),
+        }
+    }
 }
 
 /// Configuration validation error
