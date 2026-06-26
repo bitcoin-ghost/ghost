@@ -3413,6 +3413,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "async-trait",
+ "axum 0.7.9",
  "binary_sv2 5.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitcoin",
  "bs58 0.4.0",
@@ -3456,6 +3457,7 @@ dependencies = [
  "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
+ "wraith-coordinator",
  "wraith-protocol",
 ]
 
@@ -10540,6 +10542,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wraith-protocol",
  "wraith-wallet-core",
  "wraith-wallet-ipc",
 ]
