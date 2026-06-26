@@ -1,10 +1,12 @@
 'use client';
 
+import { useMutation } from '@tanstack/react-query';
 import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Input } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
+import { getGhostId } from '@/lib/api/ghostpay';
 
 interface GhostIdData {
   label: string;
@@ -17,12 +19,16 @@ interface GhostIdWizardProps {
 
 export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
   const toast = useToast();
+  // The node's Ghost ID is deterministically derived from its keypair — there
+  // is no separate "generate"/"register" write endpoint. This wizard surfaces
+  // the real, already-derived identity via the read-only ghost-id route.
+  const revealGhostId = useMutation({ mutationFn: getGhostId });
 
   const steps: WizardStep<GhostIdData>[] = [
     {
       id: 'info',
       title: 'Ghost ID',
-      description: 'Create a pseudonymous L2 identity',
+      description: 'Reveal your pseudonymous L2 identity',
     },
     {
       id: 'generate',
@@ -38,13 +44,21 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
     {
       id: 'confirm',
       title: 'Confirm',
-      description: 'Generate your Ghost ID',
-      onSubmit: async () => {
-        toast.success(
-          'Ghost ID Created',
-          'Your Ghost ID has been generated and is ready for L2 transactions'
-        );
-        onClose();
+      description: 'Reveal your Ghost ID',
+      onSubmit: async (data) => {
+        try {
+          const result = await revealGhostId.mutateAsync();
+          const labelSuffix = data.label ? ` (${data.label})` : '';
+          toast.success(
+            'Ghost ID Ready',
+            `Your node Ghost ID${labelSuffix} is ${result.ghost_id}`
+          );
+          onClose();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to retrieve Ghost ID';
+          toast.error('Ghost ID Unavailable', message);
+          throw err;
+        }
       },
     },
   ];
@@ -119,7 +133,7 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
               <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Ready to Generate</h4>
+                <h4 className="text-gray-100 font-medium mb-3">Ready to Reveal</h4>
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-gray-400">Label</span>
@@ -133,8 +147,8 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
               </div>
               <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
                 <p className="text-sm text-orange-300">
-                  Click Finish to generate your Ghost ID. The ID will be derived from your
-                  node keypair and registered on the L2 network.
+                  Click Finish to reveal your Ghost ID. The ID is derived deterministically
+                  from your node keypair — it already exists and is ready for L2 transactions.
                 </p>
               </div>
             </div>

@@ -5,8 +5,13 @@ import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-import { useRestartNode } from '@/hooks/queries';
+import { useStartService, useStopService, useRestartService } from '@/hooks/queries';
 import { fetchApi } from '@/lib/api/client';
+
+// The dashboard's node-control wizard targets the ghost-pool service — the
+// primary node process the watchdog manages. This name must be one of the
+// watchdog's allowed services (ghost-pool, ghost-core, ghost-pay).
+const NODE_SERVICE = 'ghost-pool';
 
 interface PreflightCheck {
   label: string;
@@ -46,7 +51,9 @@ const ACTION_OPTIONS = [
 ];
 
 export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps) {
-  const restartNode = useRestartNode();
+  const startService = useStartService();
+  const stopService = useStopService();
+  const restartService = useRestartService();
   const toast = useToast();
 
   const [checks, setChecks] = useState<PreflightCheck[]>([
@@ -79,15 +86,32 @@ export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps)
       title: 'Confirm',
       description: 'Confirm the action to execute',
       onSubmit: async (data) => {
-        await restartNode.mutateAsync();
-        toast.success(
-          `Node ${data.action === 'start' ? 'Started' : data.action === 'restart' ? 'Restarted' : 'Stopped'}`,
-          `The node ${data.action} command has been executed successfully.`
-        );
-        onClose();
+        try {
+          const mutation =
+            data.action === 'start'
+              ? startService
+              : data.action === 'stop'
+                ? stopService
+                : restartService;
+          const result = await mutation.mutateAsync(NODE_SERVICE);
+          // The watchdog returns HTTP 200 with { success: false, message }
+          // when systemctl itself fails — surface that as an error.
+          if (!result.success) {
+            throw new Error(result.message || `Failed to ${data.action} the node`);
+          }
+          toast.success(
+            `Node ${data.action === 'start' ? 'Started' : data.action === 'restart' ? 'Restarted' : 'Stopped'}`,
+            result.message || `The node ${data.action} command has been executed successfully.`
+          );
+          onClose();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : `Failed to ${data.action} the node`;
+          toast.error('Node Control Failed', message);
+          throw err;
+        }
       },
     },
-  ], [restartNode, toast, onClose]);
+  ], [startService, stopService, restartService, toast, onClose]);
 
   const wizard = useWizard<BuildRunData>({
     steps,

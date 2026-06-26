@@ -11,6 +11,14 @@ import {
   joinWraithSession,
   requestLockSettlement,
   useLockInMix as apiUseLockInMix,
+  createLock,
+  reconcileLock,
+  getGhostId,
+} from '@/lib/api/ghostpay';
+import type {
+  LockDenomination,
+  TimelockTier,
+  SettlementClass,
 } from '@/lib/api/ghostpay';
 import type { PayoutHistoryTimeFilter } from '@/types/api';
 
@@ -26,7 +34,17 @@ export const ghostPayKeys = {
   settlementStatus: () => [...ghostPayKeys.all, 'settlement-status'] as const,
   payoutHistory: (timeFilter: PayoutHistoryTimeFilter) =>
     [...ghostPayKeys.all, 'payout-history', timeFilter] as const,
+  ghostId: () => [...ghostPayKeys.all, 'ghost-id'] as const,
 };
+
+export function useGhostId(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: ghostPayKeys.ghostId(),
+    queryFn: getGhostId,
+    enabled: options?.enabled ?? true,
+    staleTime: Infinity,
+  });
+}
 
 export function useGhostPayStatus(options?: { refetchInterval?: number }) {
   return useQuery({
@@ -103,6 +121,42 @@ export function useUseLockInMix() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ghostPayKeys.locks() });
       queryClient.invalidateQueries({ queryKey: ghostPayKeys.wraith() });
+    },
+  });
+}
+
+export function useCreateLock() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (config: { denomination: LockDenomination; timelock_tier: TimelockTier }) =>
+      createLock(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ghostPayKeys.locks() });
+    },
+  });
+}
+
+export function useReconcileLock() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      lockId,
+      destinationAddress,
+      settlementClass,
+    }: {
+      lockId: string;
+      destinationAddress: string;
+      settlementClass: SettlementClass;
+    }) =>
+      reconcileLock(lockId, {
+        destination_address: destinationAddress,
+        settlement_class: settlementClass,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ghostPayKeys.locks() });
+      queryClient.invalidateQueries({ queryKey: ghostPayKeys.settlement() });
     },
   });
 }

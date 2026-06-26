@@ -1,5 +1,5 @@
 // Ghost Pay API endpoints
-import { fetchApi } from './client';
+import { fetchApi, fetchWithTimeout } from './client';
 import type {
   GhostPayStatus,
   WraithSessionsResponse,
@@ -145,25 +145,145 @@ export async function getGhostPayPayoutHistory(
   );
 }
 
-// Lock reconciliation (settle lock to L1)
+// ---------------------------------------------------------------------------
+// Pay-node write routes
+//
+// Lock creation, lock reconciliation, L2 payment send and the read-only
+// ghost-id all live on the ghost-pay node (port 8800), reached through the
+// dashboard's `/api/ghostpay-proxy` route (which HMAC-signs the request).
+// This is a DIFFERENT backend from the read-only `/api/proxy` (ghost-pool,
+// port 8080) used by the getters above, so these functions must go through
+// their own proxy base — mirroring `glyph.ts`.
+// ---------------------------------------------------------------------------
+
+function getGhostPayProxyBase(): string {
+  if (typeof window !== 'undefined') {
+    return window.location.origin;
+  }
+  return 'http://localhost:3000';
+}
+
+async function fetchGhostPay<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const proxyUrl = `${getGhostPayProxyBase()}/api/ghostpay-proxy${endpoint}`;
+
+  const response = await fetchWithTimeout(proxyUrl, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options?.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+    throw new Error(error.error || `API error: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/** Denomination tiers accepted by ghost-pay's `Denomination::from_sats`. */
+export type LockDenomination = 'micro' | 'tiny' | 'small' | 'medium' | 'large';
+
+/** Timelock tiers accepted by ghost-pay's lock creation route. */
+export type TimelockTier = 'short' | 'standard' | 'long';
+
+/** Settlement classes accepted by ghost-pay's `reconcile_lock` handler. */
+export type SettlementClass = 'express' | 'standard' | 'economy';
+
+const DENOMINATION_SATS: Record<LockDenomination, number> = {
+  micro: 10_000,
+  tiny: 100_000,
+  small: 1_000_000,
+  medium: 10_000_000,
+  large: 100_000_000,
+};
+
+/** Lock summary returned in the `lock` field of the create-lock response. */
+export interface CreatedLockInfo {
+  id: string;
+  state?: string;
+  amount_sats: number;
+  denomination?: string;
+  timelock_tier?: string;
+  address: string;
+  creation_height?: number;
+}
+
+export interface CreateLockResponse {
+  success: boolean;
+  lock: CreatedLockInfo;
+}
+
+// Create a Ghost Lock on the pay node.
+// POST /api/v1/locks/create  (ghost-pay)
+export async function createLock(config: {
+  denomination: LockDenomination;
+  timelock_tier: TimelockTier;
+}): Promise<CreateLockResponse> {
+  return fetchGhostPay<CreateLockResponse>('/api/v1/locks/create', {
+    method: 'POST',
+    body: JSON.stringify({
+      amount_sats: DENOMINATION_SATS[config.denomination],
+      timelock_tier: config.timelock_tier,
+    }),
+  });
+}
+
+export interface ReconcileLockResponse {
+  success: boolean;
+  error?: string;
+  withdrawal_id?: number;
+  lock_id?: string;
+  settlement_amount?: number;
+  fee_sats?: number;
+  settlement_class?: string;
+  destination_address?: string;
+  message?: string;
+}
+
+// Reconcile (settle) a Ghost Lock to an L1 address.
+// POST /api/v1/locks/:id/reconcile  (ghost-pay)
 export async function reconcileLock(lockId: string, config: {
   destination_address: string;
-  settlement_class?: 'standard' | 'batched';
-}): Promise<{ success: boolean; withdrawal_id?: number; message: string }> {
-  return fetchApi(`/api/v1/locks/${lockId}/reconcile`, {
+  settlement_class?: SettlementClass;
+}): Promise<ReconcileLockResponse> {
+  return fetchGhostPay<ReconcileLockResponse>(`/api/v1/locks/${lockId}/reconcile`, {
+    method: 'POST',
+    body: JSON.stringify({
+      destination_address: config.destination_address,
+      settlement_class: config.settlement_class ?? 'standard',
+    }),
+  });
+}
+
+export interface SendL2PaymentResponse {
+  success: boolean;
+  payment_id?: string;
+  message?: string;
+}
+
+// Send an L2 instant payment.
+// POST /api/v1/payments/send  (ghost-pay)
+export async function sendL2Payment(config: {
+  recipient: string;
+  amount_sats: number;
+  memo?: string;
+}): Promise<SendL2PaymentResponse> {
+  return fetchGhostPay<SendL2PaymentResponse>('/api/v1/payments/send', {
     method: 'POST',
     body: JSON.stringify(config),
   });
 }
 
-// Send L2 instant payment
-export async function sendL2Payment(config: {
-  recipient: string;
-  amount_sats: number;
-  memo?: string;
-}): Promise<{ success: boolean; payment_id?: string; message: string }> {
-  return fetchApi('/api/v1/payments/send', {
-    method: 'POST',
-    body: JSON.stringify(config),
-  });
+export interface GhostIdInfo {
+  ghost_id: string;
+  scan_pubkey: string;
+  spend_pubkey: string;
+}
+
+// Read the node's Ghost ID (derived from the operator's keys).
+// GET /api/v1/keys/ghost-id  (ghost-pay, read-only)
+export async function getGhostId(): Promise<GhostIdInfo> {
+  return fetchGhostPay<GhostIdInfo>('/api/v1/keys/ghost-id');
 }

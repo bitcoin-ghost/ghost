@@ -5,8 +5,8 @@ import { WizardDialog } from '@/components/ui/Wizard';
 import { Input } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-
-type SettlementClass = 'standard' | 'priority' | 'batch';
+import { useReconcileLock } from '@/hooks/queries';
+import type { SettlementClass } from '@/lib/api/ghostpay';
 
 interface WithdrawData {
   lock_id: string;
@@ -14,10 +14,12 @@ interface WithdrawData {
   settlement_class: SettlementClass;
 }
 
+// Settlement classes accepted by ghost-pay's reconcile_lock handler:
+// "express" (highest fee, fastest), "standard", "economy" (lowest fee).
 const SETTLEMENT_CLASSES: { value: SettlementClass; label: string; desc: string }[] = [
+  { value: 'express', label: 'Express', desc: 'Highest priority, fastest inclusion' },
   { value: 'standard', label: 'Standard', desc: 'Next checkpoint (~10 min)' },
-  { value: 'priority', label: 'Priority', desc: 'Immediate inclusion' },
-  { value: 'batch', label: 'Batch', desc: 'Aggregate with others (lower fees)' },
+  { value: 'economy', label: 'Economy', desc: 'Aggregate with others (lower fees)' },
 ];
 
 function isValidBech32Address(addr: string): boolean {
@@ -31,6 +33,7 @@ interface WithdrawWizardProps {
 
 export default function WithdrawWizard({ isOpen, onClose }: WithdrawWizardProps) {
   const toast = useToast();
+  const reconcileLock = useReconcileLock();
 
   const steps: WizardStep<WithdrawData>[] = [
     {
@@ -68,12 +71,28 @@ export default function WithdrawWizard({ isOpen, onClose }: WithdrawWizardProps)
       title: 'Confirm',
       description: 'Review and submit withdrawal',
       onSubmit: async (data) => {
-        const cls = SETTLEMENT_CLASSES.find((c) => c.value === data.settlement_class);
-        toast.success(
-          'Withdrawal Submitted',
-          `Lock ${data.lock_id} withdrawal to ${data.destination_address.slice(0, 12)}... via ${cls?.label} settlement`
-        );
-        onClose();
+        try {
+          const result = await reconcileLock.mutateAsync({
+            lockId: data.lock_id.trim(),
+            destinationAddress: data.destination_address.trim(),
+            settlementClass: data.settlement_class,
+          });
+          // The reconcile route returns HTTP 200 with { success: false, error }
+          // for business failures (lock not active/funded, pending withdrawal).
+          if (!result.success) {
+            throw new Error(result.error || 'Lock reconciliation was rejected');
+          }
+          const cls = SETTLEMENT_CLASSES.find((c) => c.value === data.settlement_class);
+          toast.success(
+            'Withdrawal Submitted',
+            `Lock ${data.lock_id} settling ${result.settlement_amount ?? 0} sats to ${data.destination_address.slice(0, 12)}... via ${cls?.label} (fee ${result.fee_sats ?? 0} sats, withdrawal #${result.withdrawal_id ?? '?'})`
+          );
+          onClose();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to submit withdrawal';
+          toast.error('Withdrawal Failed', message);
+          throw err;
+        }
       },
     },
   ];

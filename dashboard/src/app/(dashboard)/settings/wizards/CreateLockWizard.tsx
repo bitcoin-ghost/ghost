@@ -5,9 +5,21 @@ import { WizardDialog } from '@/components/ui/Wizard';
 import { Input } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
+import { useCreateLock } from '@/hooks/queries';
+import type { LockDenomination, TimelockTier } from '@/lib/api/ghostpay';
 
-type Denomination = 'micro' | 'tiny' | 'small' | 'medium' | 'large';
+type Denomination = LockDenomination;
 type Timelock = '1w' | '1m' | '3m' | '6m' | '1y';
+
+// ghost-pay exposes three timelock tiers; map the friendlier UI durations
+// onto them (shorter durations → short tier, longer → long tier).
+const TIMELOCK_TIERS: Record<Timelock, TimelockTier> = {
+  '1w': 'short',
+  '1m': 'standard',
+  '3m': 'standard',
+  '6m': 'long',
+  '1y': 'long',
+};
 
 interface CreateLockData {
   denomination: Denomination;
@@ -38,6 +50,7 @@ interface CreateLockWizardProps {
 
 export default function CreateLockWizard({ isOpen, onClose }: CreateLockWizardProps) {
   const toast = useToast();
+  const createLock = useCreateLock();
 
   const steps: WizardStep<CreateLockData>[] = [
     {
@@ -66,12 +79,22 @@ export default function CreateLockWizard({ isOpen, onClose }: CreateLockWizardPr
       title: 'Confirm',
       description: 'Review and create the lock',
       onSubmit: async (data) => {
-        const denom = DENOMINATIONS.find((d) => d.value === data.denomination);
-        toast.success(
-          'Ghost Lock Created',
-          `${denom?.label} lock (${denom?.sats}) created with ${data.timelock} timelock`
-        );
-        onClose();
+        try {
+          const result = await createLock.mutateAsync({
+            denomination: data.denomination,
+            timelock_tier: TIMELOCK_TIERS[data.timelock],
+          });
+          const denom = DENOMINATIONS.find((d) => d.value === data.denomination);
+          toast.success(
+            'Ghost Lock Created',
+            `${denom?.label} lock ${result.lock.id} created. Fund the address ${result.lock.address} to activate it.`
+          );
+          onClose();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to create lock';
+          toast.error('Lock Creation Failed', message);
+          throw err;
+        }
       },
     },
   ];
