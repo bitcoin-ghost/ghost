@@ -983,6 +983,13 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         ports: config.network.p2p.clone(),
         capabilities,
+        // Advertise a coordinator endpoint ONLY when opted in — otherwise a
+        // stray config value would falsely mark us coordinator-reachable.
+        advertised_coordinator_endpoint: if config.coordinator.coordinator_enabled {
+            config.coordinator.advertised_endpoint.clone()
+        } else {
+            None
+        },
         // C-1: Noise Protocol configuration for encrypted P2P
         // Read from config (mainnet validation ensures this is true on mainnet)
         noise_enabled: config.network.noise_enabled,

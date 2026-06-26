@@ -459,6 +459,15 @@ pub struct HealthPing {
     /// empty Vec, and newer nodes simply ignore peers that omit it.
     #[serde(default)]
     pub best_records: Vec<WindowBestRecord>,
+    /// If this node has opted in as a Wraith coordinator
+    /// (`capabilities.coordinator`), the reachable endpoint a wallet should dial
+    /// to mix with it: a public `host:port` or a `.onion`. This is a DELIBERATE,
+    /// operator-chosen advertisement (unlike `public_address`, which is withheld
+    /// per S-7) — a coordinator is useless if unreachable, and operators wanting
+    /// privacy advertise a Tor hidden service instead of an IP. `None` for nodes
+    /// that haven't opted in. `#[serde(default)]` for backward compatibility.
+    #[serde(default)]
+    pub coordinator_endpoint: Option<String>,
 }
 
 /// One node's best (rarest) valid share in a public records window.
@@ -1055,6 +1064,7 @@ mod tests {
                 timestamp: 1,
                 miner_id_redacted: "bc1q7z…y492.avalon1".to_string(),
             }],
+            coordinator_endpoint: None,
         }
     }
 
@@ -1065,6 +1075,23 @@ mod tests {
         let back: HealthPing = serde_json::from_str(&json).unwrap();
         assert_eq!(back.local_hashrate_th, 4.0);
         assert_eq!(back.active_miner_id_hashes.len(), 2);
+    }
+
+    #[test]
+    fn health_ping_coordinator_endpoint_roundtrip_and_back_compat() {
+        // Present-and-set survives a round-trip.
+        let mut ping = sample_health_ping();
+        ping.coordinator_endpoint = Some("abc123def456.onion:9100".to_string());
+        let back: HealthPing =
+            serde_json::from_str(&serde_json::to_string(&ping).unwrap()).unwrap();
+        assert_eq!(back.coordinator_endpoint.as_deref(), Some("abc123def456.onion:9100"));
+
+        // An older node's ping omits the field entirely → defaults to None,
+        // proving the wire change is additive.
+        let mut v = serde_json::to_value(&sample_health_ping()).unwrap();
+        v.as_object_mut().unwrap().remove("coordinator_endpoint");
+        let back: HealthPing = serde_json::from_value(v).unwrap();
+        assert_eq!(back.coordinator_endpoint, None);
     }
 
     #[test]

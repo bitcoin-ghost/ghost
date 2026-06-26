@@ -855,8 +855,12 @@ impl HealthPingHandler {
 
         // Update miner_count and capabilities from the health ping on every tick,
         // even when the peer address hasn't changed — these are live metrics.
-        self.peers
-            .update_health_metrics(&envelope.sender, ping.miner_count, ping.capabilities);
+        self.peers.update_health_metrics(
+            &envelope.sender,
+            ping.miner_count,
+            ping.capabilities,
+            ping.coordinator_endpoint.clone(),
+        );
         // Active miner_id hashes (mesh-wide dedup count) + this node's own
         // realized hashrate (summed across the mesh for the pool total).
         self.peers.update_active_miner_hashes(

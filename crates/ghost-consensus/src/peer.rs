@@ -153,6 +153,9 @@ impl PeerManager {
             if merged.best_records.is_empty() {
                 merged.best_records = existing.best_records.clone();
             }
+            if merged.coordinator_endpoint.is_none() {
+                merged.coordinator_endpoint = existing.coordinator_endpoint.clone();
+            }
             merged.first_seen = merged.first_seen.min(existing.first_seen);
             peers.insert(merged.node_id, merged);
             return;
@@ -279,10 +282,17 @@ impl PeerManager {
         node_id: &NodeId,
         miner_count: u32,
         capabilities: ghost_common::types::NodeCapabilities,
+        coordinator_endpoint: Option<String>,
     ) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
             peer.miner_count = miner_count;
             peer.capabilities = capabilities;
+            // Only overwrite a known endpoint with a freshly-advertised one;
+            // never clobber a good endpoint with `None` (a ping where the peer
+            // momentarily omitted it / hasn't re-advertised yet).
+            if coordinator_endpoint.is_some() {
+                peer.coordinator_endpoint = coordinator_endpoint;
+            }
         }
     }
 
@@ -430,6 +440,11 @@ pub struct Peer {
     /// peer's) so the `/api/v1/pool/records` endpoint returns the mesh-wide
     /// rarest record per window. Empty for older peers that don't report it.
     pub best_records: Vec<WindowBestRecord>,
+    /// If this peer opted in as a Wraith coordinator, the endpoint it advertised
+    /// in its most recent health ping (public `host:port` or a `.onion`). Source
+    /// of the coordinator-election `EndpointMap`. `None` until the peer advertises
+    /// one (or for peers that haven't opted in).
+    pub coordinator_endpoint: Option<String>,
 }
 
 impl Peer {
@@ -454,6 +469,7 @@ impl Peer {
             local_hashrate_th: 0.0,
             max_capacity: 0,
             best_records: Vec::new(),
+            coordinator_endpoint: None,
         }
     }
 
@@ -701,7 +717,7 @@ mod tests {
         // A health ping populates the gossip metrics.
         let hashes = vec![[1u8; 16], [2u8; 16], [3u8; 16]];
         mgr.update_active_miner_hashes(&pid, hashes.clone(), 4.5);
-        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default());
+        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default(), None);
         mgr.update_max_capacity(&pid, 64);
         let records = vec![WindowBestRecord {
             window: "day".to_string(),

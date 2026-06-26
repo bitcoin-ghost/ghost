@@ -92,6 +92,11 @@ pub struct MeshConfig {
     pub max_seen_messages: usize,
     /// Node capabilities to advertise in health pings
     pub capabilities: ghost_common::types::NodeCapabilities,
+    /// Wraith coordinator endpoint to advertise in health pings when this node
+    /// has opted in (`coordinator` capability). A public `host:port` or a
+    /// `.onion`. `None` for nodes that haven't opted in — they advertise no
+    /// endpoint and so are never elected.
+    pub advertised_coordinator_endpoint: Option<String>,
     /// C-1: Enable Noise Protocol for transport encryption
     ///
     /// When enabled, sensitive P2P messages (shares, blocks, votes, payouts)
@@ -155,6 +160,7 @@ impl Default for MeshConfig {
             health_ping_interval_secs: 10,
             max_seen_messages: 100_000, // Cap at 100k messages (~3.2MB with 32-byte IDs)
             capabilities: ghost_common::types::NodeCapabilities::default(),
+            advertised_coordinator_endpoint: None,
             // C-1: Enable Noise by default for secure-by-default operation
             noise_enabled: true,
             noise_port: DEFAULT_NOISE_PORT,
@@ -2697,6 +2703,9 @@ impl MeshNetwork {
                 local_hashrate_th,
                 max_capacity: self.max_capacity.load(Ordering::Relaxed),
                 best_records,
+                // Static, operator-chosen advertisement (read from config, never
+                // mutated at runtime), so reading from self.config is fine.
+                coordinator_endpoint: self.config.advertised_coordinator_endpoint.clone(),
             };
 
             match self.create_envelope(
