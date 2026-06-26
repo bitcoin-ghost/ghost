@@ -60,6 +60,32 @@ pub const COORDINATOR_SEATS: usize = 5;
 /// active-miner freshness.
 const COORDINATOR_PEER_FRESHNESS_SECS: u64 = 300;
 
+/// Demand-driven seat sizing. Recent mixing sessions per seat before another
+/// seat is added; minimum seats whenever any coordinator is eligible (so there
+/// is always at least one, for liveness); and a hard ceiling. All tunable.
+const TARGET_SESSIONS_PER_SEAT: u64 = 50;
+const MIN_SEATS: usize = 1;
+const MAX_SEATS: usize = 16;
+
+/// Size the coordinator seat count for an epoch from the frozen, mesh-summed
+/// recent session `demand` and the number of `eligible` coordinators.
+///
+/// `ceil(demand / TARGET_SESSIONS_PER_SEAT)`, floored at `MIN_SEATS` and capped
+/// by both `MAX_SEATS` and the eligible set (can't seat more coordinators than
+/// exist). Coarse buckets (one seat per `TARGET_SESSIONS_PER_SEAT`) make the
+/// result robust to small per-node differences in the demand snapshot: nodes
+/// only disagree on the count near a bucket edge, and even then the only cost is
+/// a briefly-suboptimal session spread, never a safety issue (the CoinJoin is
+/// atomic + blind-signed whichever seat runs it). Pure + deterministic so every
+/// node computes the same seats from the same frozen inputs.
+pub fn seats_for_demand(demand: u64, eligible: usize) -> usize {
+    if eligible == 0 {
+        return 0;
+    }
+    let by_demand = (demand.div_ceil(TARGET_SESSIONS_PER_SEAT) as usize).max(MIN_SEATS);
+    by_demand.min(MAX_SEATS).min(eligible)
+}
+
 /// Domain separator for the beacon hash so it can never collide with any other
 /// hash in the system. Versioned for forward changes.
 const BEACON_DOMAIN: &[u8] = b"ghost/wraith/coordinator-beacon/v1";
@@ -192,9 +218,13 @@ impl CoordinatorElection {
     /// and has its own advertised endpoint. The roster is canonicalised (dedup +
     /// sort) so every node derives the byte-identical set + map from the same
     /// mesh membership.
-    fn roster_with_endpoints(&self) -> (Vec<CoordinatorNodeId>, EndpointMap) {
+    /// Returns the canonical roster, the endpoint map, and the summed recent
+    /// session `demand` across the eligible set (incl. self) — the frozen input
+    /// to [`seats_for_demand`].
+    fn roster_with_endpoints(&self) -> (Vec<CoordinatorNodeId>, EndpointMap, u64) {
         let mut endpoints = EndpointMap::new();
         let mut ids: Vec<CoordinatorNodeId> = Vec::new();
+        let mut demand: u64 = 0;
         for p in self
             .mesh
             .peers()
@@ -203,18 +233,21 @@ impl CoordinatorElection {
             if !p.capabilities.coordinator {
                 continue;
             }
+            let sessions = p.coordinator_sessions;
             if let Some(ep) = p.coordinator_endpoint.filter(|e| !e.is_empty()) {
                 endpoints.insert(p.node_id, ep);
                 ids.push(p.node_id);
+                demand = demand.saturating_add(sessions as u64);
             }
         }
         if self.self_coordinator {
             if let Some(ep) = self.self_endpoint.as_deref().filter(|e| !e.is_empty()) {
                 endpoints.insert(self.self_id, ep.to_string());
                 ids.push(self.self_id);
+                demand = demand.saturating_add(self.mesh.coordinator_sessions() as u64);
             }
         }
-        (canonical_roster(&ids), endpoints)
+        (canonical_roster(&ids), endpoints, demand)
     }
 
     /// Fetch the beacon for `epoch` by anchoring on the epoch-start block hash
@@ -252,8 +285,12 @@ impl CoordinatorElection {
         };
         // Roster = opted-in coordinators advertising a reachable endpoint (+ self
         // when opted in), with the endpoint map a wallet uses to dial the owner.
-        let (roster, endpoints) = self.roster_with_endpoints();
-        let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, COORDINATOR_SEATS);
+        // Seats are sized from the frozen, mesh-summed recent session demand —
+        // this recompute only runs when the epoch flips, so the snapshot is the
+        // per-epoch freeze.
+        let (roster, endpoints, demand) = self.roster_with_endpoints();
+        let seats = seats_for_demand(demand, roster.len());
+        let view = CoordinatorView::build(epoch, &beacon, &roster, endpoints, seats);
         *self.cached.write() = Some(Cached { epoch, view });
         epoch
     }
@@ -449,5 +486,29 @@ mod tests {
         let view = CoordinatorView::build(1, &beacon, &[], EndpointMap::new(), COORDINATOR_SEATS);
         assert_eq!(view.seats(), 0);
         assert!(!view.am_i_coordinator(&node(0)));
+    }
+
+    #[test]
+    fn seats_scale_with_demand_and_clamp() {
+        // No eligible coordinators → no seats, regardless of demand.
+        assert_eq!(seats_for_demand(1000, 0), 0);
+        // Any eligibility floors at MIN_SEATS even at zero demand.
+        assert_eq!(seats_for_demand(0, 5), MIN_SEATS);
+        // One seat per TARGET_SESSIONS_PER_SEAT, rounding up at the bucket edge.
+        assert_eq!(seats_for_demand(TARGET_SESSIONS_PER_SEAT, 10), 1);
+        assert_eq!(seats_for_demand(TARGET_SESSIONS_PER_SEAT + 1, 10), 2);
+        assert_eq!(seats_for_demand(TARGET_SESSIONS_PER_SEAT * 2, 10), 2);
+        // Capped by the eligible set …
+        assert_eq!(seats_for_demand(10_000, 3), 3);
+        // … and by MAX_SEATS when plenty are eligible.
+        assert_eq!(seats_for_demand(10_000_000, 100), MAX_SEATS);
+    }
+
+    #[test]
+    fn seats_for_demand_is_deterministic() {
+        // Same frozen inputs → identical seats on every node (no path dependence).
+        for (d, e) in [(0u64, 1usize), (75, 8), (260, 4), (999, 50)] {
+            assert_eq!(seats_for_demand(d, e), seats_for_demand(d, e));
+        }
     }
 }

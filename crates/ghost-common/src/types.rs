@@ -468,6 +468,13 @@ pub struct HealthPing {
     /// that haven't opted in. `#[serde(default)]` for backward compatibility.
     #[serde(default)]
     pub coordinator_endpoint: Option<String>,
+    /// If this node is an active coordinator, the number of Wraith mixing
+    /// sessions it handled over a recent trailing window. Summed across the mesh
+    /// at each epoch boundary to size the next epoch's coordinator seat count
+    /// (demand-driven scaling). 0 for non-coordinators and idle coordinators.
+    /// `#[serde(default)]` for backward compatibility.
+    #[serde(default)]
+    pub coordinator_sessions: u32,
 }
 
 /// One node's best (rarest) valid share in a public records window.
@@ -1065,6 +1072,7 @@ mod tests {
                 miner_id_redacted: "bc1q7z…y492.avalon1".to_string(),
             }],
             coordinator_endpoint: None,
+            coordinator_sessions: 0,
         }
     }
 

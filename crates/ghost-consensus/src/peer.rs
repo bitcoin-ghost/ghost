@@ -156,6 +156,9 @@ impl PeerManager {
             if merged.coordinator_endpoint.is_none() {
                 merged.coordinator_endpoint = existing.coordinator_endpoint.clone();
             }
+            if merged.coordinator_sessions == 0 {
+                merged.coordinator_sessions = existing.coordinator_sessions;
+            }
             merged.first_seen = merged.first_seen.min(existing.first_seen);
             peers.insert(merged.node_id, merged);
             return;
@@ -283,6 +286,7 @@ impl PeerManager {
         miner_count: u32,
         capabilities: ghost_common::types::NodeCapabilities,
         coordinator_endpoint: Option<String>,
+        coordinator_sessions: u32,
     ) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
             peer.miner_count = miner_count;
@@ -293,6 +297,11 @@ impl PeerManager {
             if coordinator_endpoint.is_some() {
                 peer.coordinator_endpoint = coordinator_endpoint;
             }
+            // Session load is a live gauge — always take the latest, including 0
+            // (an active coordinator that went idle legitimately reports 0). The
+            // upsert/re-announce path preserves it instead, so a bare re-announce
+            // can't reset it to 0 between pings.
+            peer.coordinator_sessions = coordinator_sessions;
         }
     }
 
@@ -445,6 +454,11 @@ pub struct Peer {
     /// of the coordinator-election `EndpointMap`. `None` until the peer advertises
     /// one (or for peers that haven't opted in).
     pub coordinator_endpoint: Option<String>,
+    /// If this peer is an active coordinator, the Wraith mixing sessions it
+    /// reported handling recently (most recent health ping). Summed across the
+    /// eligible set at the epoch boundary to size the seat count. 0 when idle or
+    /// not a coordinator.
+    pub coordinator_sessions: u32,
 }
 
 impl Peer {
@@ -470,6 +484,7 @@ impl Peer {
             max_capacity: 0,
             best_records: Vec::new(),
             coordinator_endpoint: None,
+            coordinator_sessions: 0,
         }
     }
 
@@ -717,7 +732,7 @@ mod tests {
         // A health ping populates the gossip metrics.
         let hashes = vec![[1u8; 16], [2u8; 16], [3u8; 16]];
         mgr.update_active_miner_hashes(&pid, hashes.clone(), 4.5);
-        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default(), None);
+        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default(), None, 0);
         mgr.update_max_capacity(&pid, 64);
         let records = vec![WindowBestRecord {
             window: "day".to_string(),

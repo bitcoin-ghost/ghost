@@ -860,6 +860,7 @@ impl HealthPingHandler {
             ping.miner_count,
             ping.capabilities,
             ping.coordinator_endpoint.clone(),
+            ping.coordinator_sessions,
         );
         // Active miner_id hashes (mesh-wide dedup count) + this node's own
         // realized hashrate (summed across the mesh for the pool total).
