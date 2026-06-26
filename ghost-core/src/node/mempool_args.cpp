@@ -123,12 +123,16 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
         reaper.reject_annex        = argsman.GetBoolArg("-ghostreaper-rejectannex",        master_default);
         reaper.reject_opreturn     = argsman.GetBoolArg("-ghostreaper-rejectopreturn",     master_default);
         reaper.reject_runestone    = argsman.GetBoolArg("-ghostreaper-rejectrunestone",    master_default);
+        reaper.reject_dustflood    = argsman.GetBoolArg("-ghostreaper-rejectdustflood",    master_default);
 
         if (argsman.IsArgSet("-ghostreaper-maxopreturn")) {
             reaper.max_op_return_bytes = argsman.GetIntArg("-ghostreaper-maxopreturn", 83);
         }
         if (argsman.IsArgSet("-ghostreaper-mindropsize")) {
             reaper.min_drop_size = argsman.GetIntArg("-ghostreaper-mindropsize", 76);
+        }
+        if (argsman.IsArgSet("-ghostreaper-dustfloodthreshold")) {
+            reaper.dust_flood_threshold = argsman.GetIntArg("-ghostreaper-dustfloodthreshold", 330);
         }
     }
 

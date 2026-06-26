@@ -614,4 +614,112 @@ BOOST_AUTO_TEST_CASE(per_vector_disable_runestone_still_catches_inscription)
     BOOST_CHECK_EQUAL(reason, "ghost-reaper-inscription-envelope");
 }
 
+// ============================================================================
+// CheckDustFlood
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(dustflood_at_dust_floor_rejected)
+{
+    // 1-in/1-out, sole output at the 294-sat P2WPKH dust floor → UTXO-flood spam.
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 294;
+    CTransaction tx(mtx);
+    std::string reason;
+    BOOST_CHECK(!CheckDustFlood(tx, 330, reason));
+    BOOST_CHECK_EQUAL(reason, "ghost-reaper-dustflood");
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_at_threshold_rejected)
+{
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 330;
+    CTransaction tx(mtx);
+    std::string reason;
+    BOOST_CHECK(!CheckDustFlood(tx, 330, reason));
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_just_above_threshold_accepted)
+{
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 331;
+    CTransaction tx(mtx);
+    std::string reason;
+    BOOST_CHECK(CheckDustFlood(tx, 330, reason));
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_legit_small_payment_accepted)
+{
+    // 546 sats — a genuine small payment, above the floor, not flooded.
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 546;
+    CTransaction tx(mtx);
+    std::string reason;
+    BOOST_CHECK(CheckDustFlood(tx, 330, reason));
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_two_outputs_with_dust_change_accepted)
+{
+    // A payment plus a sub-dust change output → not the 1-in/1-out flood shape.
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 50000;
+    mtx.vout.resize(2);
+    mtx.vout[1].nValue = 294;
+    mtx.vout[1].scriptPubKey = CScript() << OP_TRUE;
+    CTransaction tx(mtx);
+    std::string reason;
+    BOOST_CHECK(CheckDustFlood(tx, 330, reason));
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_op_return_output_skipped)
+{
+    // 1-in/1-out but the sole output is OP_RETURN (unspendable) → not flooded.
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 0;
+    mtx.vout[0].scriptPubKey = CScript() << OP_RETURN
+                                         << std::vector<unsigned char>{0x01, 0x02};
+    CTransaction tx(mtx);
+    std::string reason;
+    BOOST_CHECK(CheckDustFlood(tx, 330, reason));
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_two_inputs_accepted)
+{
+    // Two inputs consolidating into one small output → not the flood shape.
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vin.resize(2);
+    mtx.vin[1].prevout.hash.SetNull();
+    mtx.vin[1].prevout.n = 1;
+    mtx.vin[1].nSequence = CTxIn::SEQUENCE_FINAL;
+    mtx.vout[0].nValue = 294;
+    CTransaction tx(mtx);
+    std::string reason;
+    BOOST_CHECK(CheckDustFlood(tx, 330, reason));
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_disabled_via_config_accepted)
+{
+    // With reject_dustflood off (and other detectors off), the spam passes.
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 294;
+    CTransaction tx(mtx);
+    GhostReaperConfig config;
+    config.reject_dustflood = false;
+    config.reject_inscription = config.reject_dropstuffing = config.reject_fakepubkey =
+        config.reject_annex = config.reject_opreturn = config.reject_runestone = false;
+    std::string reason;
+    BOOST_CHECK(IsGhostReaperClean(tx, config, reason));
+}
+
+BOOST_AUTO_TEST_CASE(dustflood_via_isghostreaperclean_rejected)
+{
+    // Full path with default config (all detectors on, threshold 330).
+    CMutableTransaction mtx = MakeBaseTx();
+    mtx.vout[0].nValue = 294;
+    CTransaction tx(mtx);
+    GhostReaperConfig config;
+    std::string reason;
+    BOOST_CHECK(!IsGhostReaperClean(tx, config, reason));
+    BOOST_CHECK_EQUAL(reason, "ghost-reaper-dustflood");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

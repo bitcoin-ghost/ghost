@@ -294,6 +294,31 @@ bool CheckRunestone(const CTransaction& tx, std::string& reason)
     return true;
 }
 
+bool CheckDustFlood(const CTransaction& tx, CAmount threshold, std::string& reason)
+{
+    // Dust-flood spam is a 1-in/1-out transaction whose sole output sits at or
+    // below the dust floor. Paying a dedicated transaction to create a single
+    // sub-dust output is economically irrational for a genuine payment — the
+    // fee to later spend that output exceeds its value — so the pattern exists
+    // only to bloat the UTXO set. We require ALL of: exactly one input, exactly
+    // one output, a value at/below the threshold, and a non-OP_RETURN output
+    // (OP_RETURN is provably unspendable, never a UTXO-flood vector, and is
+    // already covered by the OP_RETURN/Runestone detectors). This keeps genuine
+    // small payments — which carry a change output or sit above the floor —
+    // clean, surgically targeting the spam without a blunt dust-fee bump.
+    if (tx.vin.size() == 1 && tx.vout.size() == 1) {
+        const CTxOut& out = tx.vout[0];
+        const bool is_op_return = !out.scriptPubKey.empty() && out.scriptPubKey[0] == 0x6a;
+        if (!is_op_return && out.nValue <= threshold) {
+            reason = "ghost-reaper-dustflood";
+            LogPrintLevel(BCLog::REAPER, BCLog::Level::Info, "Reaper: rejected tx %s — dust-flood 1-in/1-out output %d sats <= %d threshold\n",
+                     tx.GetHash().ToString(), out.nValue, threshold);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool IsGhostReaperClean(const CTransaction& tx, const GhostReaperConfig& config, std::string& reason)
 {
     // Each detector runs only when its per-vector toggle is enabled.
@@ -304,6 +329,10 @@ bool IsGhostReaperClean(const CTransaction& tx, const GhostReaperConfig& config,
     }
 
     if (config.reject_runestone && !CheckRunestone(tx, reason)) {
+        return false;
+    }
+
+    if (config.reject_dustflood && !CheckDustFlood(tx, config.dust_flood_threshold, reason)) {
         return false;
     }
 
