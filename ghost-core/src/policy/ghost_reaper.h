@@ -29,10 +29,14 @@ struct GhostReaperConfig {
     bool reject_opreturn{true};
     /** Reject outputs encoding a Runestone (OP_RETURN OP_13 ...) */
     bool reject_runestone{true};
+    /** Reject 1-in/1-out transactions whose sole output sits at/below the dust-flood floor (UTXO-flood spam) */
+    bool reject_dustflood{true};
     /** Maximum OP_RETURN data payload in bytes (default 83, matching Bitcoin Core relay default) */
     unsigned int max_op_return_bytes{83};
     /** Minimum push size to trigger drop stuffing detection (default 76) */
     unsigned int min_drop_size{76};
+    /** Sole-output value (sats) at/below which a 1-in/1-out tx is treated as dust-flood spam (default 330) */
+    CAmount dust_flood_threshold{330};
 };
 
 /**
@@ -87,5 +91,15 @@ bool CheckOversizedOpReturn(const CTransaction& tx, unsigned int max_bytes, std:
  * 0x5d are NOT Runestones.
  */
 bool CheckRunestone(const CTransaction& tx, std::string& reason);
+
+/**
+ * Check for dust-flood spam: a 1-in/1-out transaction whose sole, non-OP_RETURN
+ * output is at or below the dust-flood threshold. Such a transaction is
+ * economically irrational for a genuine payment (the fee to spend the output
+ * exceeds its value) and serves only to bloat the UTXO set. Legitimate small
+ * payments carry change or sit above the dust floor, so they are not flagged.
+ * @param[in] threshold  Sole-output value (sats) at/below which the tx is flooded
+ */
+bool CheckDustFlood(const CTransaction& tx, CAmount threshold, std::string& reason);
 
 #endif // BITCOIN_POLICY_GHOST_REAPER_H
