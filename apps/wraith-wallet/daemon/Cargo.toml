@@ -15,6 +15,8 @@ wraith-wallet-core = { workspace = true }
 wraith-wallet-ipc = { workspace = true }
 # Coordinator-seat sharding (shard_for) for resolving an elected coordinator.
 wraith-protocol = { workspace = true }
+# Shard-key derivation (SHA256) for coordinator resolution.
+sha2 = { workspace = true }
 ghost-gsp-proto = { workspace = true }
 ghost-keys = { workspace = true }
 bitcoin = { workspace = true }
