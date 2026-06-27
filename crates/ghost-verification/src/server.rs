@@ -866,6 +866,45 @@ pub struct PoolPeerInfo {
     pub max_capacity: u32,
 }
 
+/// One mesh node as surfaced by the public `/api/v1/pool/mesh-nodes`
+/// endpoint. Carries only the gossiped, already-public fields a peer
+/// advertises in its health pings, so the website can render the live
+/// node list (self + every connected peer) without hard-coding the
+/// original VM set. Filled by a callback in `bins/ghost-pool` from each
+/// `Peer` returned by `PeerManager::get_connected_peers`, keeping the
+/// `ghost-consensus` peer type out of this crate's public surface.
+///
+/// `elder` is the peer's elder *status* (registration order), while the
+/// `cap_elder` capability mirrors the same bit as advertised in the
+/// node's capability set; both are surfaced so the frontend can show the
+/// elder badge consistently with the other capability flags.
+#[derive(Debug, Clone)]
+pub struct MeshNodeInfo {
+    /// Node ID (hex).
+    pub node_id: String,
+    /// Public address (`host:port`) the peer advertises. May be empty if
+    /// the peer has not published one yet.
+    pub address: String,
+    /// Whether this node is an elder (registration order).
+    pub elder: bool,
+    /// Archive-mode capability.
+    pub cap_archive: bool,
+    /// Ghost Pay (L2) capability.
+    pub cap_ghost_pay: bool,
+    /// Public-mining capability.
+    pub cap_public_mining: bool,
+    /// Reaper strict-mode capability.
+    pub cap_reaper: bool,
+    /// Elder-status capability bit (mirrors `elder`).
+    pub cap_elder: bool,
+    /// The node's own realized hashrate (TH/s) over its trailing window.
+    pub hashrate_th: f64,
+    /// Miners currently connected to this node.
+    pub miner_count: u32,
+    /// Whether the node is considered healthy/reachable on the mesh.
+    pub healthy: bool,
+}
+
 pub struct VerificationState {
     /// Node ID (hex)
     pub node_id: String,
@@ -962,6 +1001,13 @@ pub struct VerificationState {
     /// momentarily unreachable. None on older deploys without the provider —
     /// callers fall back to the node-local DB record only.
     get_mesh_best_records: Option<Box<dyn Fn() -> Vec<WindowBestRecord> + Send + Sync>>,
+    /// Live mesh node list: every connected peer (NOT self) from
+    /// `PeerManager::get_connected_peers`, mapped to `MeshNodeInfo`. Backs the
+    /// public `/api/v1/pool/mesh-nodes` endpoint so the website renders the
+    /// whole mesh from one node instead of a hard-coded VM list. The handler
+    /// prepends this node (self) from local state. None on deploys without the
+    /// provider wired — the endpoint then returns just self.
+    get_mesh_nodes: Option<Box<dyn Fn() -> Vec<MeshNodeInfo> + Send + Sync>>,
     /// Signal to trigger graceful restart (set by config update API)
     /// When true, main.rs will initiate shutdown and exit with code 100
     pub restart_signal: Arc<AtomicBool>,
@@ -1135,6 +1181,7 @@ impl VerificationState {
             get_mesh_total_hashrate: None,
             get_local_hashrate: None,
             get_mesh_best_records: None,
+            get_mesh_nodes: None,
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
@@ -1673,6 +1720,26 @@ impl VerificationState {
     /// one winner per window), or None if no callback has been wired up.
     pub fn mesh_best_records(&self) -> Option<Vec<WindowBestRecord>> {
         self.get_mesh_best_records.as_ref().map(|f| f())
+    }
+
+    /// Set the live mesh-node-list callback (connected peers, not self).
+    pub fn with_mesh_nodes(
+        mut self,
+        f: impl Fn() -> Vec<MeshNodeInfo> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_mesh_nodes = Some(Box::new(f));
+        self
+    }
+
+    /// Returns the connected peers as `MeshNodeInfo` (self excluded), or an
+    /// empty vec if no callback has been wired up. The `mesh-nodes` handler
+    /// prepends this node from local state, so an empty result still yields a
+    /// one-element (self-only) response rather than a failure.
+    pub fn mesh_nodes(&self) -> Vec<MeshNodeInfo> {
+        self.get_mesh_nodes
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default()
     }
 
     /// Set archive handler
