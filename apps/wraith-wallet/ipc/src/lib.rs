@@ -349,7 +349,7 @@ pub enum Request {
     /// seat. Reply: [`Response::WraithCoordinatorResolved`]. Falls back to a
     /// manual coordinator URL when this yields no endpoint.
     WraithResolveCoordinator {
-        tier_id: u32,
+        tier_id: String,
     },
     WraithMixOneShot {
         coordinator_url: String,

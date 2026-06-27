@@ -3407,7 +3407,7 @@ mod unix {
                     ) {
                         Ok(client) => match client.coordinator_election().await {
                             Ok(election) => crate::coordinator_resolve::resolve_from_election(
-                                &election, tier_id,
+                                &election, &tier_id,
                             ),
                             Err(e) => {
                                 tracing::debug!(error = %e, "resolve coordinator: election fetch failed");

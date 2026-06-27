@@ -46,11 +46,12 @@ pub fn pick_seat_endpoint(status: &serde_json::Value, shard_key: &[u8; 32]) -> O
 /// `(tier_id, epoch)`. Sharding on (tier, epoch) — rather than a per-mix session
 /// id, which doesn't exist until the coordinator creates it — makes every wallet
 /// wanting the same denomination in the same epoch converge on the SAME seat, for
-/// a larger anonymity set. `SHA256(domain || tier_le || epoch_le)`.
-pub fn shard_key_for_tier_epoch(tier_id: u32, epoch: u64) -> [u8; 32] {
+/// a larger anonymity set. `tier_id` is the protocol's string tier id.
+/// `SHA256(domain || tier_id_bytes || epoch_le)`.
+pub fn shard_key_for_tier_epoch(tier_id: &str, epoch: u64) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(SHARD_KEY_DOMAIN);
-    h.update(tier_id.to_le_bytes());
+    h.update(tier_id.as_bytes());
     h.update(epoch.to_le_bytes());
     h.finalize().into()
 }
@@ -62,7 +63,7 @@ pub fn shard_key_for_tier_epoch(tier_id: u32, epoch: u64) -> [u8; 32] {
 /// (no I/O) so the daemon handler is a thin fetch around it.
 pub fn resolve_from_election(
     election: &serde_json::Value,
-    tier_id: u32,
+    tier_id: &str,
 ) -> (Option<String>, Option<u64>) {
     let epoch = election.get("epoch").and_then(|e| e.as_u64());
     let endpoint =
@@ -122,17 +123,17 @@ mod tests {
     fn shard_key_is_deterministic_and_separates_tier_and_epoch() {
         // Stable for the same (tier, epoch) → wallets converge.
         assert_eq!(
-            shard_key_for_tier_epoch(2, 100),
-            shard_key_for_tier_epoch(2, 100)
+            shard_key_for_tier_epoch("0.01btc", 100),
+            shard_key_for_tier_epoch("0.01btc", 100)
         );
         // Different tier OR epoch → different key.
         assert_ne!(
-            shard_key_for_tier_epoch(2, 100),
-            shard_key_for_tier_epoch(3, 100)
+            shard_key_for_tier_epoch("0.01btc", 100),
+            shard_key_for_tier_epoch("0.1btc", 100)
         );
         assert_ne!(
-            shard_key_for_tier_epoch(2, 100),
-            shard_key_for_tier_epoch(2, 101)
+            shard_key_for_tier_epoch("0.01btc", 100),
+            shard_key_for_tier_epoch("0.01btc", 101)
         );
     }
 
@@ -146,7 +147,7 @@ mod tests {
                 {"node_id":"bb","seat":1,"endpoint":"http://b:9100"},
             ]
         });
-        let (ep, epoch) = resolve_from_election(&s, 2);
+        let (ep, epoch) = resolve_from_election(&s, "0.01btc");
         assert_eq!(epoch, Some(42));
         assert!(matches!(
             ep.as_deref(),
@@ -155,9 +156,9 @@ mod tests {
 
         // No epoch (election pending) → no endpoint, caller falls back.
         let pending = json!({ "enabled": true, "epoch": null, "coordinators": [] });
-        assert_eq!(resolve_from_election(&pending, 2), (None, None));
+        assert_eq!(resolve_from_election(&pending, "0.01btc"), (None, None));
         // Disabled → nothing.
         let off = json!({ "enabled": false });
-        assert_eq!(resolve_from_election(&off, 2), (None, None));
+        assert_eq!(resolve_from_election(&off, "0.01btc"), (None, None));
     }
 }
