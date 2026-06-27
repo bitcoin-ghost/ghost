@@ -338,14 +338,61 @@ ufw allow 8333/tcp      >/dev/null 2>&1   # bitcoin P2P
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus
-# Stratum ports are exposed ONLY when this node accepts public miners. Open
-# Stratum V1 and V2 together so any ASIC connects — legacy V1 hardware on 3333,
-# native SV2 firmware (encrypted) on 34255. A private/solo node opens neither.
-if [[ "$PUBLIC_MINING" == "true" ]]; then
-  ufw allow 3333/tcp    >/dev/null 2>&1   # stratum v1
-  ufw allow 34255/tcp   >/dev/null 2>&1   # stratum v2
-fi
 ufw --force enable      >/dev/null 2>&1
+
+# Stratum V1 (3333) + V2 (34255) are exposed ONLY when this node accepts public
+# miners. Instead of a static rule baked at install time, a tiny reconcile
+# service follows `mining_mode` in pool.toml, and a .path unit re-runs it
+# whenever the config changes — so toggling public mining later (dashboard /
+# ghost-setup / hand edit) updates the firewall live, with no manual ufw step.
+log "Installing mining-firewall reconcile (stratum ports follow mining_mode)"
+cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+CONF="${GHOST_POOL_CONF:-/etc/ghost/pool.toml}"
+PORTS=(3333 34255)
+public="no"
+if [[ -r "$CONF" ]]; then
+  if grep -qE '^[[:space:]]*public_mining[[:space:]]*=[[:space:]]*true([[:space:]]|$)' "$CONF" 2>/dev/null \
+   || grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?public_pool"?' "$CONF" 2>/dev/null; then
+    public="yes"
+  fi
+fi
+if [[ "$public" == "yes" ]]; then
+  for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
+  logger -t ghost-mining-firewall "public mining ON -> Stratum 3333+34255 OPEN"
+else
+  for p in "${PORTS[@]}"; do ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true; done
+  logger -t ghost-mining-firewall "public mining OFF -> Stratum 3333+34255 CLOSED"
+fi
+EOF
+chmod 755 /opt/ghost/bin/reconcile-mining-firewall.sh
+
+cat > /etc/systemd/system/ghost-mining-firewall.service <<'EOF'
+[Unit]
+Description=Ghost mining firewall reconcile (Stratum V1+V2 ports follow mining_mode)
+After=ufw.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/opt/ghost/bin/reconcile-mining-firewall.sh
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/ghost-mining-firewall.path <<'EOF'
+[Unit]
+Description=Watch pool.toml and reconcile the Stratum firewall when mining_mode changes
+[Path]
+PathModified=/etc/ghost/pool.toml
+Unit=ghost-mining-firewall.service
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload >/dev/null 2>&1
+systemctl enable --now ghost-mining-firewall.path >/dev/null 2>&1
+/opt/ghost/bin/reconcile-mining-firewall.sh >/dev/null 2>&1 || true   # apply initial state
 
 # ─────────────────────────────── 11. start ───────────────────────────────────
 log "Starting services"
