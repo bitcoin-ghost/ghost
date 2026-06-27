@@ -490,6 +490,15 @@ pub struct VerificationResultMessage {
     pub challenge_data: String,
     /// Response details (JSON, capability-specific)
     pub response_data: Option<String>,
+    /// The TARGET's own signed response (`SignedResponse<…>` JSON), when the
+    /// target returned one. This — not `response_data` (which the challenger
+    /// authors) — is what lets a recipient RE-DERIVE the verdict against its own
+    /// ground truth: the recipient verifies this is signed by `target_node_id`,
+    /// then checks the attested response against its own Bitcoin Core / policy
+    /// engine and overrides `passed`. `#[serde(default)]` so older peers that
+    /// omit it still deserialize (backward-compatible fleet deploy).
+    #[serde(default)]
+    pub target_signed_response: Option<String>,
     /// Timestamp when challenge was issued
     pub timestamp: i64,
     /// Challenger's signature over (target_node_id || capability || passed || timestamp)

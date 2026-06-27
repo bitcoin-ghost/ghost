@@ -514,6 +514,119 @@ impl VerificationClient {
         Ok(format!("{}://{}{}", self.scheme(), host, path))
     }
 
+    /// Extract the bare host (no port) from a `host:port` style address.
+    ///
+    /// Handles IPv4 (`1.2.3.4:8080` -> `1.2.3.4`), bracketed IPv6
+    /// (`[2001:db8::1]:8080` -> `2001:db8::1`), bare IPv6 (`2001:db8::1` kept
+    /// whole), and bare hostnames. Returns `None` when no host can be
+    /// determined (empty input).
+    fn extract_host_part(address: &str) -> Option<&str> {
+        let addr = address.trim();
+        if addr.is_empty() {
+            return None;
+        }
+        let host = if addr.starts_with('[') {
+            // Bracketed IPv6, possibly with a trailing :port
+            addr.trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or(addr)
+        } else if addr.contains("::") || addr.matches(':').count() > 1 {
+            // Bare IPv6 (multiple colons) — there is no host:port split here,
+            // the whole thing is the host.
+            addr
+        } else {
+            // IPv4 or hostname, optionally with :port
+            addr.split(':').next().unwrap_or(addr)
+        };
+        let host = host.trim();
+        if host.is_empty() {
+            None
+        } else {
+            Some(host)
+        }
+    }
+
+    /// CONSENSUS SECURITY: Independent stratum-port reachability probe.
+    ///
+    /// This replaces the old self-attestation path, where the challenger asked
+    /// the target's `/verify/stratum` HTTP endpoint and the TARGET scanned its
+    /// OWN `/proc/net/tcp` for a LISTEN socket — a lying target could simply
+    /// self-report "up". Here the CHALLENGER itself opens a TCP connection to
+    /// the target's public stratum port and directly observes reachability, so
+    /// the verdict reflects the truth the challenger sees, not a relayed claim.
+    ///
+    /// `node_address` is the peer's mesh/HTTP address (`host:port` form); only
+    /// the host is used, combined with the supplied public stratum `port`
+    /// (Stratum V1 `3333`). The probe uses the client's configured timeout.
+    ///
+    /// Returns:
+    /// - `Some(true)`  — TCP connect succeeded ⇒ reachable ⇒ pass.
+    /// - `Some(false)` — connection refused or timed out ⇒ unreachable ⇒ fail
+    ///   (a genuinely-down node must fail).
+    /// - `None`        — INCONCLUSIVE: the target host could not be determined
+    ///   or resolved (challenger-side / unknown address). The caller MUST NOT
+    ///   record a verdict in this case — it mirrors the RPC-unavailable archive
+    ///   path which skips rather than recording a false fail.
+    pub async fn probe_stratum_port(&self, node_address: &str, port: u16) -> Option<bool> {
+        use tokio::net::TcpStream;
+
+        // Determine the target host. An undeterminable host is inconclusive.
+        let host = match Self::extract_host_part(node_address) {
+            Some(h) => h,
+            None => {
+                debug!(
+                    address = %node_address,
+                    "Stratum probe: could not determine target host (inconclusive, skipping)"
+                );
+                return None;
+            }
+        };
+
+        // Resolve host:port to concrete socket addresses. A resolution failure
+        // is a challenger-side / unknown-address condition: inconclusive, never
+        // a false fail.
+        let target = format!("{host}:{port}");
+        let addrs = match tokio::net::lookup_host(&target).await {
+            Ok(iter) => iter.collect::<Vec<_>>(),
+            Err(e) => {
+                debug!(
+                    target = %target,
+                    error = %e,
+                    "Stratum probe: host resolution failed (inconclusive, skipping)"
+                );
+                return None;
+            }
+        };
+        let addr = match addrs.into_iter().next() {
+            Some(a) => a,
+            None => {
+                debug!(
+                    target = %target,
+                    "Stratum probe: host resolved to no addresses (inconclusive, skipping)"
+                );
+                return None;
+            }
+        };
+
+        // Open a real TCP connection. Success ⇒ reachable; a definitive connect
+        // failure (refused) or a timeout ⇒ unreachable ⇒ fail.
+        match tokio::time::timeout(self.config.timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(_stream)) => {
+                debug!(target = %target, "Stratum probe: reachable (TCP connect succeeded)");
+                Some(true)
+            }
+            Ok(Err(e)) => {
+                debug!(target = %target, error = %e, "Stratum probe: unreachable (connect failed)");
+                Some(false)
+            }
+            Err(_elapsed) => {
+                debug!(target = %target, "Stratum probe: unreachable (connect timed out)");
+                Some(false)
+            }
+        }
+    }
+
     /// Get health status of a node
     pub async fn health(&self, node_address: &str) -> GhostResult<HealthResponse> {
         let url = self.build_url(node_address, "/health?unsigned=true")?;
@@ -544,14 +657,24 @@ impl VerificationClient {
         Ok(health)
     }
 
-    /// Verify archive capability
+    /// Verify archive capability.
+    ///
+    /// Returns the parsed [`ArchiveResponse`] together with the RAW
+    /// `SignedResponse<ArchiveResponse>` JSON when the target returned a signed
+    /// response (`Some`), or `None` when it returned an unsigned one.
+    ///
+    /// SECURITY: unlike the other capability probes, the archive path requests
+    /// the SIGNED response (it does NOT pass `unsigned=true`). The raw signed
+    /// JSON is threaded into the broadcast so that every recipient can RE-DERIVE
+    /// the verdict from the target's own signature instead of trusting the
+    /// challenger's `passed` flag (see `ghost-pool` `ChainReVerifier`).
     pub async fn verify_archive(
         &self,
         node_address: &str,
         block_hash: Option<&str>,
         txid: Option<&str>,
-    ) -> GhostResult<ArchiveResponse> {
-        let mut params = vec!["unsigned=true".to_string()];
+    ) -> GhostResult<(ArchiveResponse, Option<String>)> {
+        let mut params: Vec<String> = Vec::new();
         if let Some(hash) = block_hash {
             params.push(format!("block={}", hash));
         }
@@ -559,10 +682,12 @@ impl VerificationClient {
             params.push(format!("tx={}", tx));
         }
 
-        let url = self.build_url(
-            node_address,
-            &format!("/verify/archive?{}", params.join("&")),
-        )?;
+        let path = if params.is_empty() {
+            "/verify/archive".to_string()
+        } else {
+            format!("/verify/archive?{}", params.join("&"))
+        };
+        let url = self.build_url(node_address, &path)?;
 
         debug!(url = %url, "Verifying archive capability");
 
@@ -571,36 +696,72 @@ impl VerificationClient {
             GhostError::VerificationTimeout("Archive verification request failed".to_string())
         })?;
 
-        // Archive endpoint returns {"signed": bool, "response": ArchiveResponse}
+        // Archive endpoint returns {"signed": bool, "response": <T>} where T is a
+        // `SignedResponse<ArchiveResponse>` when signed==true, else a bare
+        // `ArchiveResponse`.
         let wrapper: serde_json::Value = response.json().await.map_err(|e| {
             debug!("Archive verification response parse error: {}", e);
             GhostError::InvalidVerificationResponse("Invalid archive response format".to_string())
         })?;
 
+        let signed_flag = wrapper
+            .get("signed")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+
         let inner = wrapper.get("response").ok_or_else(|| {
             GhostError::InvalidVerificationResponse("Missing 'response' field".to_string())
         })?;
 
-        let result: ArchiveResponse = serde_json::from_value(inner.clone()).map_err(|e| {
-            debug!("Archive response deserialization error: {}", e);
-            GhostError::InvalidVerificationResponse("Invalid archive response data".to_string())
-        })?;
+        if signed_flag {
+            // `inner` is a SignedResponse<ArchiveResponse>; the ArchiveResponse is
+            // its `payload`. Capture the raw signed JSON verbatim so the target's
+            // signature stays verifiable end-to-end by recipients.
+            let raw_signed = serde_json::to_string(inner).map_err(|e| {
+                debug!("Archive signed response re-serialization error: {}", e);
+                GhostError::InvalidVerificationResponse(
+                    "Invalid signed archive response".to_string(),
+                )
+            })?;
 
-        Ok(result)
+            let payload = inner.get("payload").ok_or_else(|| {
+                GhostError::InvalidVerificationResponse(
+                    "Signed archive response missing 'payload'".to_string(),
+                )
+            })?;
+
+            let result: ArchiveResponse = serde_json::from_value(payload.clone()).map_err(|e| {
+                debug!("Archive payload deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid archive response data".to_string())
+            })?;
+
+            Ok((result, Some(raw_signed)))
+        } else {
+            let result: ArchiveResponse = serde_json::from_value(inner.clone()).map_err(|e| {
+                debug!("Archive response deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid archive response data".to_string())
+            })?;
+
+            Ok((result, None))
+        }
     }
 
-    /// Verify policy capability
+    /// Verify policy capability.
+    ///
+    /// Returns `(PolicyResponse, Option<raw_signed_json>)`. We request a SIGNED
+    /// response (no `unsigned=true`) so recipients of the broadcast can RE-DERIVE
+    /// the verdict against their own policy engine + the target's signature
+    /// instead of trusting the challenger's `passed`. The second element is the
+    /// raw `SignedResponse<PolicyResponse>` JSON verbatim (when the target signed),
+    /// so the target's signature stays verifiable end-to-end.
     pub async fn verify_policy(
         &self,
         node_address: &str,
         tx_hex: &str,
-    ) -> GhostResult<PolicyResponse> {
+    ) -> GhostResult<(PolicyResponse, Option<String>)> {
         let url = self.build_url(
             node_address,
-            &format!(
-                "/verify/policy?tx={}&unsigned=true",
-                urlencoding::encode(tx_hex)
-            ),
+            &format!("/verify/policy?tx={}", urlencoding::encode(tx_hex)),
         )?;
 
         debug!(url = %url, "Verifying policy capability");
@@ -610,23 +771,54 @@ impl VerificationClient {
             GhostError::VerificationTimeout("Policy verification request failed".to_string())
         })?;
 
-        // Policy endpoint returns {"signed": bool, "response": PolicyResponse}
+        // Policy endpoint returns {"signed": bool, "response": <T>} where T is a
+        // `SignedResponse<PolicyResponse>` when signed==true, else a bare
+        // `PolicyResponse`.
         let wrapper: serde_json::Value = response.json().await.map_err(|e| {
             debug!("Policy verification response parse error: {}", e);
             GhostError::InvalidVerificationResponse("Invalid policy response format".to_string())
         })?;
 
-        // Extract the inner response object
+        let signed_flag = wrapper
+            .get("signed")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+
         let inner = wrapper.get("response").ok_or_else(|| {
             GhostError::InvalidVerificationResponse("Missing 'response' field".to_string())
         })?;
 
-        let result: PolicyResponse = serde_json::from_value(inner.clone()).map_err(|e| {
-            debug!("Policy response deserialization error: {}", e);
-            GhostError::InvalidVerificationResponse("Invalid policy response data".to_string())
-        })?;
+        if signed_flag {
+            // `inner` is a SignedResponse<PolicyResponse>; the PolicyResponse is
+            // its `payload`. Capture the raw signed JSON verbatim so the target's
+            // signature stays verifiable end-to-end by recipients.
+            let raw_signed = serde_json::to_string(inner).map_err(|e| {
+                debug!("Policy signed response re-serialization error: {}", e);
+                GhostError::InvalidVerificationResponse(
+                    "Invalid signed policy response".to_string(),
+                )
+            })?;
 
-        Ok(result)
+            let payload = inner.get("payload").ok_or_else(|| {
+                GhostError::InvalidVerificationResponse(
+                    "Signed policy response missing 'payload'".to_string(),
+                )
+            })?;
+
+            let result: PolicyResponse = serde_json::from_value(payload.clone()).map_err(|e| {
+                debug!("Policy payload deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid policy response data".to_string())
+            })?;
+
+            Ok((result, Some(raw_signed)))
+        } else {
+            let result: PolicyResponse = serde_json::from_value(inner.clone()).map_err(|e| {
+                debug!("Policy response deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid policy response data".to_string())
+            })?;
+
+            Ok((result, None))
+        }
     }
 
     /// Verify stratum capability
@@ -793,7 +985,7 @@ impl VerificationClient {
         if result.claimed_capabilities.archive_mode {
             if let Some(hash) = test_block_hash {
                 match self.verify_archive(node_address, Some(hash), None).await {
-                    Ok(resp) => result.archive_verified = resp.success,
+                    Ok((resp, _signed)) => result.archive_verified = resp.success,
                     Err(e) => result.errors.push(format!("Archive: {}", e)),
                 }
             }
@@ -803,7 +995,7 @@ impl VerificationClient {
         if result.claimed_capabilities.reaper {
             if let Some(tx) = test_tx_hex {
                 match self.verify_policy(node_address, tx).await {
-                    Ok(resp) => result.policy_verified = resp.success,
+                    Ok((resp, _signed)) => result.policy_verified = resp.success,
                     Err(e) => result.errors.push(format!("Policy: {}", e)),
                 }
             }
@@ -1156,6 +1348,80 @@ mod tests {
         assert!(!VerificationClient::is_internal_address(
             "2001:4860:4860::8888"
         )); // Google DNS
+    }
+
+    #[test]
+    fn test_extract_host_part() {
+        // IPv4 with and without port
+        assert_eq!(
+            VerificationClient::extract_host_part("1.2.3.4:8080"),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            VerificationClient::extract_host_part("1.2.3.4"),
+            Some("1.2.3.4")
+        );
+        // Bracketed IPv6 with port
+        assert_eq!(
+            VerificationClient::extract_host_part("[2001:db8::1]:8080"),
+            Some("2001:db8::1")
+        );
+        // Bare IPv6 (no port) kept whole
+        assert_eq!(
+            VerificationClient::extract_host_part("2001:db8::1"),
+            Some("2001:db8::1")
+        );
+        // Hostname with port
+        assert_eq!(
+            VerificationClient::extract_host_part("node.example.org:8080"),
+            Some("node.example.org")
+        );
+        // Empty -> None (inconclusive)
+        assert_eq!(VerificationClient::extract_host_part(""), None);
+        assert_eq!(VerificationClient::extract_host_part("   "), None);
+    }
+
+    #[tokio::test]
+    async fn test_probe_stratum_port_reachable_and_refused() {
+        use tokio::net::TcpListener;
+
+        // CONSENSUS SECURITY: the independent probe must return TRUE for a
+        // listening socket (reachable) and FALSE for a closed port (refused).
+        let client = VerificationClient::new().unwrap();
+
+        // Bind a throwaway listener on an ephemeral loopback port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+
+        // Positive: a real LISTEN socket is observed as reachable.
+        let reachable = client.probe_stratum_port("127.0.0.1", listen_port).await;
+        assert_eq!(
+            reachable,
+            Some(true),
+            "a listening socket must probe as reachable (pass)"
+        );
+
+        // Negative: drop the listener so the port is closed, then probe it.
+        // connect() to a closed loopback port is refused immediately -> false.
+        drop(listener);
+        let refused = client.probe_stratum_port("127.0.0.1", listen_port).await;
+        assert_eq!(
+            refused,
+            Some(false),
+            "a closed port must probe as unreachable (fail)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_stratum_port_inconclusive_on_empty_host() {
+        // An undeterminable target host is INCONCLUSIVE -> None, never a false
+        // fail (the caller must skip rather than record passed=false).
+        let client = VerificationClient::new().unwrap();
+        let inconclusive = client.probe_stratum_port("", 3333).await;
+        assert_eq!(
+            inconclusive, None,
+            "empty address -> inconclusive (None), not a false fail"
+        );
     }
 
     #[test]

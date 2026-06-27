@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::types::NodeId;
+use ghost_policy::PolicyProfile;
 use ghost_storage::Database;
 
 use crate::client::VerificationClient;
@@ -114,6 +115,12 @@ pub struct VerificationBroadcast {
     pub response_data: Option<String>,
     /// Timestamp
     pub timestamp: i64,
+    /// The TARGET's own signed response (`SignedResponse<…>` JSON) for
+    /// capabilities that support recipient-side re-derivation (currently
+    /// archive). `None` for all other capabilities. Threaded into the
+    /// `VerificationResultMessage.target_signed_response` field at broadcast.
+    #[serde(default)]
+    pub target_signed_response: Option<String>,
 }
 
 /// CRIT-VER-2: Signed verification broadcast for P2P transmission
@@ -614,6 +621,15 @@ pub struct VerificationTask {
     broadcast_tx: Option<VerificationBroadcastSender>,
     /// Bitcoin RPC for fetching real block data
     rpc: Option<Arc<BitcoinRpc>>,
+    /// CONSENSUS SECURITY: policy profile used to classify our own policy-challenge
+    /// transactions. The challenger derives its OWN ground-truth `(tier, accepted)`
+    /// from this engine and compares the target's signed classification against it
+    /// via [`crate::challenge::validate_policy_response`] — the SAME comparator a
+    /// recipient runs when re-deriving the verdict, so challenger and recipients
+    /// agree exactly on a homogeneous fleet. Defaults to `bitcoin_pure` (the policy
+    /// the +2 BitcoinPure capability attests); overridden per-node via
+    /// [`VerificationTask::with_policy`] from the node's configured profile.
+    policy: PolicyProfile,
     /// LOW-VER-3: Track challenges per target for even distribution
     challenge_tracker: std::sync::Mutex<ChallengeTracker>,
 }
@@ -653,6 +669,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -697,6 +714,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -735,6 +753,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -776,6 +795,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -800,6 +820,7 @@ impl VerificationTask {
             config,
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -840,6 +861,15 @@ impl VerificationTask {
     /// Set the Bitcoin RPC client for fetching real block data
     pub fn with_rpc(mut self, rpc: Arc<BitcoinRpc>) -> Self {
         self.rpc = Some(rpc);
+        self
+    }
+
+    /// CONSENSUS SECURITY: set the policy profile used to classify our own
+    /// policy-challenge transactions, so the challenger's verdict is derived from
+    /// the SAME comparator/engine a recipient uses to re-derive it. Should be the
+    /// node's configured profile (the one served by its `/verify/policy` endpoint).
+    pub fn with_policy(mut self, policy: PolicyProfile) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -1220,9 +1250,12 @@ impl VerificationTask {
             .verify_archive(&peer.http_address, Some(&block_hash), None)
             .await;
 
-        // C-2 FIX: Validate block data authenticity, not just success flag
-        let (passed, response_data) = match result {
-            Ok(resp) => {
+        // C-2 FIX: Validate block data authenticity, not just success flag.
+        // `target_signed_response` is the TARGET's own signed `ArchiveResponse`
+        // JSON; it is threaded into the broadcast so recipients can re-derive the
+        // verdict against their own chain instead of trusting our `passed`.
+        let (passed, response_data, target_signed_response) = match result {
+            Ok((resp, signed_raw)) => {
                 // C-2 FIX: Perform merkle root validation
                 let validation_result = self.validate_archive_response(
                     &resp,
@@ -1239,11 +1272,15 @@ impl VerificationTask {
                     "validation": validation_result.1,
                 });
 
-                (validation_result.0, Some(response_json.to_string()))
+                (
+                    validation_result.0,
+                    Some(response_json.to_string()),
+                    signed_raw,
+                )
             }
             Err(e) => {
                 debug!(error = %e, "Archive verification failed");
-                (false, Some(format!("{{\"error\":\"{}\"}}", e)))
+                (false, Some(format!("{{\"error\":\"{}\"}}", e)), None)
             }
         };
 
@@ -1282,6 +1319,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            target_signed_response,
         )
         .await;
 
@@ -1357,7 +1395,10 @@ impl VerificationTask {
 
     /// C-2 FIX: Validate archive response against expected values
     ///
-    /// Returns (passed, validation_details)
+    /// Returns (passed, validation_details). Delegates to the shared
+    /// [`crate::challenge::validate_archive_response`] free function so the
+    /// challenger path and the recipient re-derivation path (`ghost-pool`'s
+    /// `ChainReVerifier`) run byte-identical comparison logic.
     fn validate_archive_response(
         &self,
         resp: &crate::challenge::ArchiveResponse,
@@ -1365,97 +1406,12 @@ impl VerificationTask {
         expected_height: u64,
         expected_merkle_root: Option<&str>,
     ) -> (bool, String) {
-        // Basic check: response must indicate success
-        if !resp.success {
-            return (false, "Response indicates failure".to_string());
-        }
-
-        // C-2 FIX: Block data must be present
-        let block_data = match &resp.block_data {
-            Some(data) => data,
-            None => {
-                return (false, "C-2: No block data in response".to_string());
-            }
-        };
-
-        // C-2 FIX: Block hash must match what we requested
-        if block_data.hash.to_lowercase() != expected_hash.to_lowercase() {
-            return (
-                false,
-                format!(
-                    "C-2: Block hash mismatch: got {}, expected {}",
-                    block_data.hash, expected_hash
-                ),
-            );
-        }
-
-        // C-2 FIX: Height must match
-        if block_data.height != expected_height {
-            return (
-                false,
-                format!(
-                    "C-2: Block height mismatch: got {}, expected {}",
-                    block_data.height, expected_height
-                ),
-            );
-        }
-
-        // C-2 FIX: Validate merkle root format (64 hex chars)
-        if block_data.merkle_root.len() != 64
-            || !block_data
-                .merkle_root
-                .chars()
-                .all(|c| c.is_ascii_hexdigit())
-        {
-            return (
-                false,
-                format!(
-                    "C-2: Invalid merkle root format: {}",
-                    block_data.merkle_root
-                ),
-            );
-        }
-
-        // C-2 FIX: If we have expected merkle root from our RPC, cross-check it
-        if let Some(expected_mr) = expected_merkle_root {
-            if block_data.merkle_root.to_lowercase() != expected_mr.to_lowercase() {
-                return (
-                    false,
-                    format!(
-                        "C-2: Merkle root mismatch: got {}, expected {}",
-                        block_data.merkle_root, expected_mr
-                    ),
-                );
-            }
-        }
-
-        // C-2 FIX: Validate tx_count is reasonable (at least 1 for coinbase)
-        if block_data.tx_count == 0 {
-            return (false, "C-2: Block has zero transactions".to_string());
-        }
-
-        // C-2 FIX + LOW-VER-4 FIX: Validate timestamp for historical blocks
-        // Archive verification is for HISTORICAL blocks, so timestamps must be in the past.
-        // The 2-hour future tolerance was for new blocks being mined, but archive challenges
-        // request blocks that already exist in the chain - they cannot have future timestamps.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // LOW-VER-4 FIX: Historical blocks must have timestamp <= now
-        // Only allow minimal clock skew (60 seconds) to account for verification timing
-        if block_data.timestamp > now + 60 {
-            return (
-                false,
-                format!(
-                    "LOW-VER-4: Historical block timestamp {} is in the future (now: {})",
-                    block_data.timestamp, now
-                ),
-            );
-        }
-
-        (true, "Validation passed".to_string())
+        crate::challenge::validate_archive_response(
+            resp,
+            expected_hash,
+            expected_height,
+            expected_merkle_root,
+        )
     }
 
     /// Verify policy capability
@@ -1494,16 +1450,49 @@ impl VerificationTask {
             }
         };
         let expected_tier = if dirty { "non-T0" } else { "T0" };
+
+        // CONSENSUS SECURITY: derive OUR OWN ground-truth classification of the
+        // exact tx we are about to send, using OUR policy engine. The verdict is
+        // then `our classification == the target's signed classification`, via the
+        // SAME comparator a recipient runs — so the challenger's recorded verdict
+        // and a recipient's re-derived verdict agree on a homogeneous fleet. The
+        // clean/dirty split only controls which tx we build (positive vs negative
+        // control); the engine, not a "non-T0" wildcard, decides the ground truth.
+        let our_tx: bitcoin::Transaction = match hex::decode(&test_tx_hex)
+            .ok()
+            .and_then(|b| bitcoin::consensus::deserialize(&b).ok())
+        {
+            Some(tx) => tx,
+            None => {
+                // We just built this tx; failing to round-trip it is a local bug,
+                // not a peer fault. Skip rather than broadcast a bogus verdict.
+                warn!(
+                    peer = %peer_id_hex[..8],
+                    "Failed to deserialize own policy-challenge tx, skipping"
+                );
+                return Ok(());
+            }
+        };
+        let our_decision = ghost_policy::PolicyEngine::new(self.policy.clone()).evaluate(&our_tx);
+        let our_tier = our_decision.tier().to_string();
+        let our_accepted = our_decision.is_accepted();
+
         debug!(
             dirty,
             tx_hex_len = test_tx_hex.len(),
             expected_tier,
-            "Built policy challenge transaction"
+            our_tier = %our_tier,
+            our_accepted,
+            "Built policy challenge transaction (own classification derived)"
         );
 
+        // CONSENSUS SECURITY: broadcast the tx_hex we used so recipients can BIND
+        // the target's signed classification to it (txid recompute must match the
+        // signed `tx_txid`). tx_type/expected_tier remain for diagnostics.
         let challenge_data = serde_json::json!({
             "tx_type": if dirty { "dirty" } else { "T0" },
             "expected_tier": expected_tier,
+            "tx_hex": test_tx_hex,
         })
         .to_string();
 
@@ -1512,19 +1501,17 @@ impl VerificationTask {
             .verify_policy(&peer.http_address, &test_tx_hex)
             .await;
 
-        let (passed, tier, response_data) = match result {
-            Ok(resp) => {
+        // `target_signed_response` is the TARGET's own signed `PolicyResponse`
+        // JSON; it is threaded into the broadcast so recipients can re-derive the
+        // verdict against their own policy engine instead of trusting our `passed`.
+        let (passed, tier, response_data, target_signed_response) = match result {
+            Ok((resp, signed_raw)) => {
+                // Same comparator the recipient uses — zero divergence. The
+                // target's signed classification is checked against OUR engine's
+                // classification of the SAME tx.
+                let (passed, _detail) =
+                    crate::challenge::validate_policy_response(&resp, &our_tier, our_accepted);
                 let tier = resp.classification.as_ref().map(|c| c.tier.clone());
-                let passed = if dirty {
-                    // GHOST-01 negative control: a real filtering node classifies
-                    // the data-carrier tx as non-T0 AND does not accept it.
-                    let non_t0 = tier.as_ref().map(|t| t != "T0").unwrap_or(false);
-                    resp.success && non_t0 && !resp.accepted
-                } else {
-                    // MED-VER-2: clean tx must classify EXACTLY T0 (not T0 OR T1).
-                    let tier_ok = tier.as_ref().map(|t| t == "T0").unwrap_or(false);
-                    resp.success && tier_ok
-                };
 
                 (
                     passed,
@@ -1538,11 +1525,12 @@ impl VerificationTask {
                         })
                         .to_string(),
                     ),
+                    signed_raw,
                 )
             }
             Err(e) => {
                 warn!(error = %e, peer = %peer_id_hex[..8], "Policy verification failed");
-                (false, None, Some(format!("{{\"error\":\"{}\"}}", e)))
+                (false, None, Some(format!("{{\"error\":\"{}\"}}", e)), None)
             }
         };
 
@@ -1590,13 +1578,25 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            target_signed_response,
         )
         .await;
 
         Ok(())
     }
 
-    /// Verify stratum capability
+    /// Verify stratum capability via an INDEPENDENT probe.
+    ///
+    /// CONSENSUS SECURITY: the challenger itself opens a TCP connection to the
+    /// peer's public Stratum V1 port and observes reachability directly, rather
+    /// than relaying the target's self-attestation (the target scanning its own
+    /// `/proc/net/tcp`). A lying target can no longer self-report "up": only
+    /// what THIS challenger can actually reach becomes the recorded `passed`.
+    ///
+    /// An INCONCLUSIVE probe (target host undeterminable / unresolvable, i.e. a
+    /// challenger-side condition) is SKIPPED — no row is stored and nothing is
+    /// broadcast — mirroring the RPC-unavailable archive path. We never record
+    /// a false fail for an inconclusive probe.
     ///
     /// CRIT-VER-3: Returns Result - DB write failures are propagated to caller
     async fn verify_stratum(
@@ -1606,40 +1606,51 @@ impl VerificationTask {
         our_id_hex: &str,
         timestamp: i64,
     ) -> Result<(), String> {
-        use crate::challenge::StratumProtocol;
+        use ghost_common::constants::SV1_STRATUM_PORT;
+
+        let short_id = &peer_id_hex[..8];
 
         let challenge_data = serde_json::json!({
-            "protocol": "sv2",
+            "protocol": "sv1",
+            "probe": "independent_tcp_connect",
+            "port": SV1_STRATUM_PORT,
         })
         .to_string();
 
-        let result = self
+        // Independent reachability probe by THIS challenger.
+        let start = std::time::Instant::now();
+        let probe = self
             .client
-            .verify_stratum(&peer.http_address, StratumProtocol::Sv2)
+            .probe_stratum_port(&peer.http_address, SV1_STRATUM_PORT)
             .await;
+        let latency_ms = Some(start.elapsed().as_millis() as u32);
 
-        let short_id = &peer_id_hex[..8];
-        let (passed, connected, latency_ms, response_data) = match result {
-            Ok(resp) => (
-                resp.success && resp.connected,
-                resp.connected,
-                resp.latency_ms,
-                Some(
-                    serde_json::json!({
-                        "success": resp.success,
-                        "connected": resp.connected,
-                        "latency_ms": resp.latency_ms,
-                    })
-                    .to_string(),
-                ),
-            ),
-            Err(e) => {
-                warn!(peer = %short_id, error = %e, "Stratum verification failed");
-                (false, false, None, Some(format!("{{\"error\":\"{}\"}}", e)))
+        let (passed, connected) = match probe {
+            Some(reachable) => (reachable, reachable),
+            None => {
+                // Inconclusive (challenger-side / unknown address). Do NOT
+                // record a verdict — skip this cycle, exactly like the
+                // RPC-unavailable archive path.
+                warn!(
+                    peer = %short_id,
+                    address = %peer.http_address,
+                    "Stratum probe inconclusive (target address undeterminable) - skipping, no verdict recorded"
+                );
+                return Ok(());
             }
         };
 
-        info!(peer = %short_id, passed = passed, connected = connected, "Stratum verification complete");
+        let response_data = Some(
+            serde_json::json!({
+                "reachable": connected,
+                "port": SV1_STRATUM_PORT,
+                "probe": "independent_tcp_connect",
+                "latency_ms": latency_ms,
+            })
+            .to_string(),
+        );
+
+        info!(peer = %short_id, passed = passed, connected = connected, "Stratum verification complete (independent probe)");
 
         // H-1 FIX: Verify identity before DB write to prevent challenger ID spoofing
         self.require_identity_verified()?;
@@ -1665,6 +1676,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            None,
         )
         .await;
 
@@ -1808,6 +1820,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            None,
         )
         .await;
 
@@ -2004,6 +2017,7 @@ impl VerificationTask {
     /// Broadcast a verification result via P2P
     ///
     /// MED-VER-7/VER-4: Validates timestamp before broadcasting to prevent stale/future results
+    #[allow(clippy::too_many_arguments)]
     async fn broadcast_result(
         &self,
         target_node_id: NodeId,
@@ -2012,6 +2026,7 @@ impl VerificationTask {
         challenge_data: String,
         response_data: Option<String>,
         timestamp: i64,
+        target_signed_response: Option<String>,
     ) {
         // MED-VER-7/VER-4 FIX: Clock sanity check before broadcasting
         // VER-4: Standardized on 30 seconds max future tolerance (matches verification_handler.rs)
@@ -2054,6 +2069,7 @@ impl VerificationTask {
                 challenge_data,
                 response_data,
                 timestamp,
+                target_signed_response,
             };
 
             if let Err(e) = tx.send(broadcast).await {
@@ -2102,6 +2118,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
+            target_signed_response: None,
         };
 
         let signed = SignedVerificationBroadcast::new(broadcast.clone(), test_signing_fn);
@@ -2144,6 +2161,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
+            target_signed_response: None,
         };
 
         let mut signed = SignedVerificationBroadcast::new(broadcast, test_signing_fn);
@@ -2180,6 +2198,7 @@ mod tests {
             challenge_data: r#"{"block_hash":"hash1","block_height":100}"#.to_string(),
             response_data: None,
             timestamp,
+            target_signed_response: None,
         };
 
         let broadcast2 = VerificationBroadcast {
@@ -2190,6 +2209,7 @@ mod tests {
             challenge_data: r#"{"block_hash":"hash2","block_height":200}"#.to_string(),
             response_data: None,
             timestamp,
+            target_signed_response: None,
         };
 
         let signed1 = SignedVerificationBroadcast::new(broadcast1, test_signing_fn);
@@ -2223,6 +2243,7 @@ mod tests {
                 .unwrap()
                 .as_secs() as i64
                 + 300, // 5 minutes in the future
+            target_signed_response: None,
         };
 
         let signed = SignedVerificationBroadcast::new(broadcast, test_signing_fn);
@@ -2301,6 +2322,7 @@ mod tests {
                 .unwrap()
                 .as_secs() as i64
                 - 700, // 11+ minutes in the past
+            target_signed_response: None,
         };
 
         let signed = SignedVerificationBroadcast::new(broadcast, test_signing_fn);

@@ -102,6 +102,119 @@ pub struct TxData {
     pub output_count: usize,
 }
 
+/// C-2 FIX: Validate an archive response against expected ground-truth values.
+///
+/// Returns `(passed, validation_details)`.
+///
+/// This is the single source of truth for archive verdict comparison. It is
+/// called both by the CHALLENGER (`task.rs`, against its own RPC at challenge
+/// time) and by RECIPIENTS of a broadcast result (`ghost-pool`'s
+/// `ChainReVerifier`, against their own RPC when re-deriving the verdict). Both
+/// paths run identical logic so there is zero divergence between the verdict a
+/// challenger records and the verdict a recipient re-derives.
+///
+/// SECURITY: `expected_hash`, `expected_height` and `expected_merkle_root` MUST
+/// come from the caller's own trusted source (its Bitcoin Core), never from the
+/// untrusted party whose response is being judged.
+pub fn validate_archive_response(
+    resp: &ArchiveResponse,
+    expected_hash: &str,
+    expected_height: u64,
+    expected_merkle_root: Option<&str>,
+) -> (bool, String) {
+    // Basic check: response must indicate success
+    if !resp.success {
+        return (false, "Response indicates failure".to_string());
+    }
+
+    // C-2 FIX: Block data must be present
+    let block_data = match &resp.block_data {
+        Some(data) => data,
+        None => {
+            return (false, "C-2: No block data in response".to_string());
+        }
+    };
+
+    // C-2 FIX: Block hash must match what we requested
+    if block_data.hash.to_lowercase() != expected_hash.to_lowercase() {
+        return (
+            false,
+            format!(
+                "C-2: Block hash mismatch: got {}, expected {}",
+                block_data.hash, expected_hash
+            ),
+        );
+    }
+
+    // C-2 FIX: Height must match
+    if block_data.height != expected_height {
+        return (
+            false,
+            format!(
+                "C-2: Block height mismatch: got {}, expected {}",
+                block_data.height, expected_height
+            ),
+        );
+    }
+
+    // C-2 FIX: Validate merkle root format (64 hex chars)
+    if block_data.merkle_root.len() != 64
+        || !block_data
+            .merkle_root
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return (
+            false,
+            format!(
+                "C-2: Invalid merkle root format: {}",
+                block_data.merkle_root
+            ),
+        );
+    }
+
+    // C-2 FIX: If we have expected merkle root from our RPC, cross-check it
+    if let Some(expected_mr) = expected_merkle_root {
+        if block_data.merkle_root.to_lowercase() != expected_mr.to_lowercase() {
+            return (
+                false,
+                format!(
+                    "C-2: Merkle root mismatch: got {}, expected {}",
+                    block_data.merkle_root, expected_mr
+                ),
+            );
+        }
+    }
+
+    // C-2 FIX: Validate tx_count is reasonable (at least 1 for coinbase)
+    if block_data.tx_count == 0 {
+        return (false, "C-2: Block has zero transactions".to_string());
+    }
+
+    // C-2 FIX + LOW-VER-4 FIX: Validate timestamp for historical blocks
+    // Archive verification is for HISTORICAL blocks, so timestamps must be in the past.
+    // The 2-hour future tolerance was for new blocks being mined, but archive challenges
+    // request blocks that already exist in the chain - they cannot have future timestamps.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // LOW-VER-4 FIX: Historical blocks must have timestamp <= now
+    // Only allow minimal clock skew (60 seconds) to account for verification timing
+    if block_data.timestamp > now + 60 {
+        return (
+            false,
+            format!(
+                "LOW-VER-4: Historical block timestamp {} is in the future (now: {})",
+                block_data.timestamp, now
+            ),
+        );
+    }
+
+    (true, "Validation passed".to_string())
+}
+
 /// Policy challenge request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyChallenge {
@@ -124,8 +237,81 @@ pub struct PolicyResponse {
     pub accepted: bool,
     /// Rejection reason (if not accepted)
     pub rejection_reason: Option<String>,
+    /// CONSENSUS SECURITY: Bitcoin txid (`tx.compute_txid()`) of the transaction
+    /// the target actually classified. Set by the server INSIDE the signed
+    /// payload so a recipient can BIND this classification to the exact tx the
+    /// challenger broadcast: the recipient recomputes the txid of the challenger-
+    /// supplied `tx_hex` and requires it to equal `tx_txid` before trusting the
+    /// verdict. Without this, a colluder could pair a valid target-signed
+    /// classification with a DIFFERENT `tx_hex` to force a spurious mismatch and
+    /// grief the target. `#[serde(default)]` for backward-compatible deserialization
+    /// of responses from peers that predate this field.
+    #[serde(default)]
+    pub tx_txid: Option<String>,
     /// Error message (if failed)
     pub error: Option<String>,
+}
+
+/// CONSENSUS SECURITY: Compare a TARGET-signed [`PolicyResponse`] against the
+/// caller's own ground-truth classification of the SAME transaction.
+///
+/// Returns `(passed, validation_details)`.
+///
+/// This is the single source of truth for policy verdict comparison, mirroring
+/// [`validate_archive_response`]. It is called both by the CHALLENGER (`task.rs`,
+/// against its own [`ghost_policy::PolicyEngine`] at challenge time) and by
+/// RECIPIENTS of a broadcast result (`ghost-pool`'s `ChainReVerifier`, against
+/// their own engine when re-deriving the verdict). Both paths run identical
+/// logic, so there is zero divergence between the verdict a challenger records
+/// and the verdict a recipient re-derives.
+///
+/// The target classified correctly (`passed = true`) iff:
+///   1. it reported `success = true`,
+///   2. its classification tier equals the caller's `recipient_tier`, and
+///   3. its `accepted` flag equals the caller's `recipient_accepted`.
+///
+/// SECURITY: `recipient_tier` and `recipient_accepted` MUST be the caller's OWN
+/// classification of the same transaction (from its own policy engine), never a
+/// value taken from the untrusted party whose response is being judged.
+pub fn validate_policy_response(
+    target_resp: &PolicyResponse,
+    recipient_tier: &str,
+    recipient_accepted: bool,
+) -> (bool, String) {
+    // The target must claim success — a failed evaluation tells us nothing.
+    if !target_resp.success {
+        return (false, "Response indicates failure".to_string());
+    }
+
+    // The target must have produced a classification.
+    let target_tier = match target_resp.classification.as_ref() {
+        Some(c) => c.tier.as_str(),
+        None => return (false, "No classification in response".to_string()),
+    };
+
+    // Tier must match the caller's own classification of the same tx.
+    if !target_tier.eq_ignore_ascii_case(recipient_tier) {
+        return (
+            false,
+            format!(
+                "Tier mismatch: target classified {}, our engine classified {}",
+                target_tier, recipient_tier
+            ),
+        );
+    }
+
+    // Accept/reject decision must match the caller's own decision.
+    if target_resp.accepted != recipient_accepted {
+        return (
+            false,
+            format!(
+                "Accept decision mismatch: target accepted={}, our engine accepted={}",
+                target_resp.accepted, recipient_accepted
+            ),
+        );
+    }
+
+    (true, "Validation passed".to_string())
 }
 
 /// Policy classification result

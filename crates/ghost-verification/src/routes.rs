@@ -1170,6 +1170,7 @@ async fn policy_handler(
                     classification: None,
                     accepted: false,
                     rejection_reason: Some("Input too large".to_string()),
+                    tx_txid: None,
                     error: Some(format!(
                         "Transaction hex too large: {} bytes (max {})",
                         query.tx.len(),
@@ -1221,6 +1222,7 @@ async fn policy_handler(
                         classification: None,
                         accepted: false,
                         rejection_reason: None,
+                        tx_txid: None,
                         error: Some(e.to_string()),
                     }
                 })),

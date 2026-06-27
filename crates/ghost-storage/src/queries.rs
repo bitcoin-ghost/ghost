@@ -5302,6 +5302,113 @@ impl Database {
         })
     }
 
+    // =========================================================================
+    // PER-CHALLENGER MAJORITY QUERIES (anti-griefing for liveness probes)
+    //
+    // CONSENSUS SECURITY: Stratum and GhostPay are liveness checks with NO
+    // chain ground truth, so a stored verdict cannot be re-derived the way
+    // Archive/Policy now are. A colluding minority that is merely >5% of a
+    // target's challengers could otherwise sign `passed=0` and drag an honest
+    // node under the per-challenge percentage gate to deny its rewards.
+    //
+    // These queries collapse the verdict to ONE VOTE PER DISTINCT CHALLENGER:
+    // each challenger's vote is the majority of THAT challenger's own results,
+    // then we count how many distinct challengers voted pass vs total. The
+    // caller (`get_qualified_capabilities_with_rates`) then requires a STRICT
+    // majority of distinct challengers. This makes a <50% colluding minority
+    // unable to grief OR inflate, and is flood-resistant: a single challenger
+    // spamming thousands of rows still contributes exactly one vote.
+    // =========================================================================
+
+    /// Per-challenger majority verdict for the stratum capability.
+    ///
+    /// Returns `(challengers_pass, challengers_total)` where:
+    /// - `challengers_total` is the number of DISTINCT challengers that issued
+    ///   at least one stratum challenge against `node_id` since `since`.
+    /// - `challengers_pass` is how many of those distinct challengers had a
+    ///   MAJORITY of their own results pass (`SUM(passed) * 2 >= COUNT(*)`).
+    ///
+    /// One vote per challenger: a single challenger flooding the table cannot
+    /// inflate or suppress the count beyond its own one vote.
+    pub fn get_stratum_challenger_majority(
+        &self,
+        node_id: &str,
+        since: i64,
+    ) -> GhostResult<(u32, u32)> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        SUM(CASE WHEN c_pass * 2 >= c_total THEN 1 ELSE 0 END) AS challengers_pass,
+                        COUNT(*) AS challengers_total
+                     FROM (
+                        SELECT challenger_id,
+                               SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) AS c_pass,
+                               COUNT(*) AS c_total
+                        FROM stratum_challenges
+                        WHERE node_id = ?1 AND timestamp >= ?2
+                        GROUP BY challenger_id
+                     )",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let result = stmt
+                .query_row(params![node_id, since], |row| {
+                    let pass: Option<i64> = row.get(0)?;
+                    let total: i64 = row.get(1)?;
+                    Ok((
+                        i64_to_u32_count(pass.unwrap_or(0), "stratum_challengers_pass")?,
+                        i64_to_u32_count(total, "stratum_challengers_total")?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(result)
+        })
+    }
+
+    /// Per-challenger majority verdict for the GhostPay capability.
+    ///
+    /// Identical aggregation to [`Self::get_stratum_challenger_majority`] over
+    /// the `ghostpay_challenges` table. Returns `(challengers_pass,
+    /// challengers_total)`.
+    pub fn get_ghostpay_challenger_majority(
+        &self,
+        node_id: &str,
+        since: i64,
+    ) -> GhostResult<(u32, u32)> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        SUM(CASE WHEN c_pass * 2 >= c_total THEN 1 ELSE 0 END) AS challengers_pass,
+                        COUNT(*) AS challengers_total
+                     FROM (
+                        SELECT challenger_id,
+                               SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) AS c_pass,
+                               COUNT(*) AS c_total
+                        FROM ghostpay_challenges
+                        WHERE node_id = ?1 AND timestamp >= ?2
+                        GROUP BY challenger_id
+                     )",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let result = stmt
+                .query_row(params![node_id, since], |row| {
+                    let pass: Option<i64> = row.get(0)?;
+                    let total: i64 = row.get(1)?;
+                    Ok((
+                        i64_to_u32_count(pass.unwrap_or(0), "ghostpay_challengers_pass")?,
+                        i64_to_u32_count(total, "ghostpay_challengers_total")?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(result)
+        })
+    }
+
     /// Record an uptime sample for a node
     pub fn record_uptime_sample(
         &self,
@@ -5490,10 +5597,18 @@ impl Database {
 
     /// M-16 FIX: Get qualified capabilities with per-capability pass rates
     ///
-    /// A capability is qualified if:
+    /// Archive and Policy are qualified if:
     /// 1. Node passes uptime gatekeeper (95% over lookback period)
     /// 2. Capability has min_challenges or more challenges
     /// 3. Pass rate is >= the capability-specific threshold
+    ///
+    /// CONSENSUS SECURITY: Stratum and GhostPay (liveness probes with no chain
+    /// ground truth) instead qualify on a per-CHALLENGER MAJORITY — at least
+    /// `min_challenges` DISTINCT challengers reported AND a strict majority of
+    /// those distinct challengers voted pass. The `stratum_pass_rate` and
+    /// `ghostpay_pass_rate` arguments therefore no longer gate those two (they
+    /// remain in the signature for the legacy uniform-rate caller and the
+    /// Archive/Policy path).
     ///
     /// H-4: This function safely handles division by zero by checking total > 0
     /// before computing pass rate. If total is 0, the capability is not qualified.
@@ -5517,7 +5632,13 @@ impl Database {
             total > 0 && total >= min_challenges && (passed as f64 / total as f64) >= min_rate
         };
 
-        // M-16 FIX: Check each capability with its own pass rate threshold
+        // M-16 FIX: Check each capability with its own pass rate threshold.
+        //
+        // Archive and Policy keep the per-challenge percentage gate: every
+        // stored verdict for those two is RE-DERIVED by the recipient from the
+        // target's own signed response against chain/engine ground truth
+        // (anti-griefing Increments 1 & 2), so an individual `passed` flag is
+        // already trustworthy and the SUM/COUNT rate is honest.
         let archive_qualified = {
             let (passed, total) = self.get_archive_pass_rate(node_id, since)?;
             is_qualified(passed, total, archive_pass_rate)
@@ -5528,14 +5649,30 @@ impl Database {
             is_qualified(passed, total, policy_pass_rate)
         };
 
+        // CONSENSUS SECURITY: Stratum and GhostPay are liveness probes with no
+        // chain ground truth — a stored verdict cannot be re-derived — so the
+        // per-challenge SUM/COUNT gate is replaced by a per-CHALLENGER MAJORITY.
+        // A capability qualifies iff a STRICT majority of the DISTINCT
+        // challengers that probed this node voted pass (and at least
+        // `min_challenges` distinct challengers reported). This denies a <50%
+        // colluding minority the ability to grief (sign `passed=0` to drag an
+        // honest node under) or inflate, and is flood-resistant (one vote per
+        // challenger). `stratum_pass_rate`/`ghostpay_pass_rate` no longer gate
+        // these two; see `STRATUM_PASS_RATE`/`GHOSTPAY_PASS_RATE` in
+        // `ghost-common`. The `min_unique_challengers` Sybil check in
+        // `qualification.rs` still applies on top of this.
+        let _ = (stratum_pass_rate, ghostpay_pass_rate);
+
         let stratum_qualified = {
-            let (passed, total) = self.get_stratum_pass_rate(node_id, since)?;
-            is_qualified(passed, total, stratum_pass_rate)
+            let (challengers_pass, challengers_total) =
+                self.get_stratum_challenger_majority(node_id, since)?;
+            challengers_total >= min_challenges && challengers_pass * 2 > challengers_total
         };
 
         let ghostpay_qualified = {
-            let (passed, total) = self.get_ghostpay_pass_rate(node_id, since)?;
-            is_qualified(passed, total, ghostpay_pass_rate)
+            let (challengers_pass, challengers_total) =
+                self.get_ghostpay_challenger_majority(node_id, since)?;
+            challengers_total >= min_challenges && challengers_pass * 2 > challengers_total
         };
 
         // Elder status is based on is_elder flag in the nodes table
@@ -10595,5 +10732,221 @@ mod tests {
         let cm2 = test_commitment(&pixels, "ghost1bob");
         db.insert_glyph_claim("ghost1bob", &pixels, &bh, &cm2, now + 90001)
             .expect("Re-claim should succeed after expiry");
+    }
+
+    // =========================================================================
+    // PER-CHALLENGER MAJORITY (anti-griefing for stratum / ghostpay)
+    // =========================================================================
+
+    /// Insert a raw stratum_challenges row with an explicit timestamp so tests
+    /// can place rows on distinct days (the daily unique index requires it).
+    fn insert_stratum_row(db: &Database, node: &str, challenger: &str, passed: bool, ts: i64) {
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO stratum_challenges
+                 (node_id, challenger_id, connected, latency_ms, passed, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![node, challenger, passed, 1i64, passed, ts],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .expect("insert stratum row");
+    }
+
+    /// Insert a raw ghostpay_challenges row with an explicit timestamp.
+    fn insert_ghostpay_row(db: &Database, node: &str, challenger: &str, passed: bool, ts: i64) {
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO ghostpay_challenges
+                 (node_id, challenger_id, endpoint, response_valid, passed, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![node, challenger, "ghostpay", passed, passed, ts],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .expect("insert ghostpay row");
+    }
+
+    #[test]
+    fn test_stratum_challenger_majority_griefing_defeated() {
+        // 10 honest challengers (passed=1) + 2 colluders (passed=0).
+        // Honest majority must win: the <50% colluding minority cannot grief.
+        let db = Database::in_memory().expect("db");
+        let node = "a".repeat(64);
+        let now = chrono::Utc::now().timestamp();
+        let since = now - 7 * 86_400;
+
+        for i in 0..10 {
+            insert_stratum_row(&db, &node, &format!("honest{i}"), true, now);
+        }
+        for i in 0..2 {
+            insert_stratum_row(&db, &node, &format!("colluder{i}"), false, now);
+        }
+
+        let (pass, total) = db
+            .get_stratum_challenger_majority(&node, since)
+            .expect("majority query");
+        assert_eq!(
+            (pass, total),
+            (10, 12),
+            "10 honest pass, 12 total challengers"
+        );
+        assert!(
+            pass * 2 > total,
+            "strict majority of challengers passed -> qualified"
+        );
+
+        // Now flip the balance: 7 colluders vs 5 honest on a different node.
+        let node2 = "b".repeat(64);
+        for i in 0..5 {
+            insert_stratum_row(&db, &node2, &format!("honest{i}"), true, now);
+        }
+        for i in 0..7 {
+            insert_stratum_row(&db, &node2, &format!("colluder{i}"), false, now);
+        }
+        let (pass2, total2) = db
+            .get_stratum_challenger_majority(&node2, since)
+            .expect("majority query");
+        assert_eq!((pass2, total2), (5, 12), "5 honest pass, 12 total");
+        assert!(pass2 * 2 <= total2, "no strict majority -> NOT qualified");
+    }
+
+    #[test]
+    fn test_ghostpay_challenger_majority_griefing_defeated() {
+        // GhostPay equivalent of the stratum griefing test.
+        let db = Database::in_memory().expect("db");
+        let node = "c".repeat(64);
+        let now = chrono::Utc::now().timestamp();
+        let since = now - 7 * 86_400;
+
+        for i in 0..10 {
+            insert_ghostpay_row(&db, &node, &format!("honest{i}"), true, now);
+        }
+        for i in 0..2 {
+            insert_ghostpay_row(&db, &node, &format!("colluder{i}"), false, now);
+        }
+        let (pass, total) = db
+            .get_ghostpay_challenger_majority(&node, since)
+            .expect("majority query");
+        assert_eq!((pass, total), (10, 12));
+        assert!(pass * 2 > total, "honest majority -> qualified");
+
+        // 7 colluders vs 5 honest -> not qualified.
+        let node2 = "d".repeat(64);
+        for i in 0..5 {
+            insert_ghostpay_row(&db, &node2, &format!("honest{i}"), true, now);
+        }
+        for i in 0..7 {
+            insert_ghostpay_row(&db, &node2, &format!("colluder{i}"), false, now);
+        }
+        let (pass2, total2) = db
+            .get_ghostpay_challenger_majority(&node2, since)
+            .expect("majority query");
+        assert_eq!((pass2, total2), (5, 12));
+        assert!(
+            pass2 * 2 <= total2,
+            "minority cannot grief but cannot pass either"
+        );
+    }
+
+    #[test]
+    fn test_stratum_challenger_majority_flood_resistance() {
+        // ONE colluder floods 100 passed=0 rows (across 100 distinct days),
+        // 3 honest challengers each cast one passed=1. Per-challenger
+        // aggregation = the flood is exactly ONE vote.
+        let db = Database::in_memory().expect("db");
+        let node = "e".repeat(64);
+        let now = chrono::Utc::now().timestamp();
+        // Wide window so all 100 daily rows fall inside it.
+        let since = now - 200 * 86_400;
+
+        for i in 0..100 {
+            // Distinct day per row to satisfy the (node, challenger, day) index.
+            insert_stratum_row(&db, &node, "flooder", false, now - i * 86_400);
+        }
+        for i in 0..3 {
+            insert_stratum_row(&db, &node, &format!("honest{i}"), true, now);
+        }
+
+        let (pass, total) = db
+            .get_stratum_challenger_majority(&node, since)
+            .expect("majority query");
+        assert_eq!(
+            (pass, total),
+            (3, 4),
+            "flooder counts as 1 (failing) challenger; 3 honest pass -> (3,4)"
+        );
+        assert!(pass * 2 > total, "flood cannot suppress -> qualified");
+    }
+
+    #[test]
+    fn test_stratum_challenger_majority_fraud_down_node() {
+        // A genuinely-down node: every honest challenger observes "down"
+        // (passed=0). Majority fail -> NOT qualified (fraud closed).
+        let db = Database::in_memory().expect("db");
+        let node = "f".repeat(64);
+        let now = chrono::Utc::now().timestamp();
+        let since = now - 7 * 86_400;
+
+        for i in 0..10 {
+            insert_stratum_row(&db, &node, &format!("honest{i}"), false, now);
+        }
+        let (pass, total) = db
+            .get_stratum_challenger_majority(&node, since)
+            .expect("majority query");
+        assert_eq!((pass, total), (0, 10));
+        assert!(
+            pass * 2 <= total,
+            "down node fails the majority -> NOT qualified"
+        );
+    }
+
+    #[test]
+    fn test_qualified_capabilities_uses_stratum_majority() {
+        // End-to-end: get_qualified_capabilities_with_rates must qualify
+        // public_mining off the per-challenger MAJORITY, not a percentage gate.
+        // 7 honest (passed=1) + 5 colluders (passed=0) -> 12 challengers, 7 pass.
+        // Per-challenge SUM/COUNT would be 7/12 = 58% (below the old 95% gate),
+        // yet the strict per-challenger majority (7 of 12) qualifies it.
+        let db = Database::in_memory().expect("db");
+        let node = "1".repeat(64);
+        let now = chrono::Utc::now().timestamp();
+        let since = now - 7 * 86_400;
+
+        for i in 0..7 {
+            insert_stratum_row(&db, &node, &format!("honest{i}"), true, now);
+        }
+        for i in 0..5 {
+            insert_stratum_row(&db, &node, &format!("colluder{i}"), false, now);
+        }
+
+        // min_challenges = 5 (>= would be satisfied by 12 distinct challengers).
+        let caps = db
+            .get_qualified_capabilities_with_rates(&node, since, 5, 0.95, 0.90, 0.95, 0.95)
+            .expect("qualify");
+        assert!(
+            caps.public_mining,
+            "majority of distinct challengers passed -> public_mining qualified"
+        );
+        assert!(!caps.ghost_pay, "no ghostpay challenges -> not qualified");
+        assert!(!caps.archive_mode, "no archive challenges -> not qualified");
+
+        // Same node, but flip to a colluding majority: 5 honest vs 7 colluders.
+        let node2 = "2".repeat(64);
+        for i in 0..5 {
+            insert_stratum_row(&db, &node2, &format!("honest{i}"), true, now);
+        }
+        for i in 0..7 {
+            insert_stratum_row(&db, &node2, &format!("colluder{i}"), false, now);
+        }
+        let caps2 = db
+            .get_qualified_capabilities_with_rates(&node2, since, 5, 0.95, 0.90, 0.95, 0.95)
+            .expect("qualify");
+        assert!(
+            !caps2.public_mining,
+            "no strict majority of challengers -> public_mining NOT qualified"
+        );
     }
 }

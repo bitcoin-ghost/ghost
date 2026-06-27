@@ -121,4 +121,9 @@ pub mod coordinator_election;
 
 pub mod coordinator_supervisor;
 
+/// CONSENSUS SECURITY: re-derives peer-broadcast capability verdicts against
+/// this node's own Bitcoin Core, so a colluding minority of challengers cannot
+/// fabricate a FAIL (to grief an honest node under the 95% gate) or a PASS.
+pub mod verification_reverify;
+
 // L2 uses NullifierRouteHandler from ghost-consensus (sender-side proofs).
