@@ -639,7 +639,18 @@
         // — the count of reachable seeds — when the mesh endpoint is briefly
         // unavailable, so the tile never blanks or breaks.
         var meshNodes = await meshNodesPromise;
-        var meshCount = (meshNodes && meshNodes.length) ? meshNodes.length : null;
+        // Count DISTINCT hosts, not raw entries: during a node restart the mesh
+        // briefly reports stale same-IP session duplicates that age out within
+        // ~2 min, which would otherwise inflate this tile.
+        var meshCount = null;
+        if (meshNodes && meshNodes.length) {
+          var hosts = {};
+          meshNodes.forEach(function (n) {
+            var s = String((n && n.address) || ''); var i = s.lastIndexOf(':');
+            hosts[(i > 0 ? s.slice(0, i) : s) || ('id:' + ((n && n.node_id) || ''))] = 1;
+          });
+          meshCount = Object.keys(hosts).length;
+        }
         if (nodesEl) {
           if (meshCount != null) nodesEl.textContent = String(meshCount);
           else nodesEl.innerHTML = online + '<span class="unit"> / ' + VMS.length + '</span>';
