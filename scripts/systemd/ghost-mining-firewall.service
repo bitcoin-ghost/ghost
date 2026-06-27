@@ -1,0 +1,13 @@
+[Unit]
+Description=Ghost mining firewall reconcile (Stratum V1+V2 ports follow mining_mode)
+Documentation=https://bitcoinghost.org/miners.html
+# ufw must be up before we add/remove rules; want the network for good measure.
+After=ufw.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ghost/bin/reconcile-mining-firewall.sh
+
+[Install]
+WantedBy=multi-user.target

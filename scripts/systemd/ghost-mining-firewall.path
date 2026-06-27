@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch pool.toml and reconcile the Stratum firewall when mining_mode changes
+
+[Path]
+# Fires ghost-mining-firewall.service whenever the pool config is rewritten —
+# so toggling public mining (via the dashboard, ghost-setup, or by hand) updates
+# the V1+V2 firewall ports live, with no manual ufw step.
+PathModified=/etc/ghost/pool.toml
+Unit=ghost-mining-firewall.service
+
+[Install]
+WantedBy=multi-user.target
