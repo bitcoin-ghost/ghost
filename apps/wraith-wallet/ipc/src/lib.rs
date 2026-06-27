@@ -204,6 +204,23 @@ pub enum Request {
     WalletAuthInfo,
     /// Show the active wallet's BIP-352 Ghost ID (silent payment receive identity).
     WalletGhostId,
+    /// Fetch the registered Ghost Glyph for `ghost_id` from ghost-pay.
+    WalletGlyph {
+        ghost_id: String,
+    },
+    /// Claim a designed Ghost Glyph for `ghost_id`. `pixels` is a
+    /// 256-byte palette-index bitmap (values 0..25). Authenticated
+    /// against ghost-pay via the internal-auth shared secret.
+    WalletGlyphClaim {
+        ghost_id: String,
+        pixels: Vec<u8>,
+    },
+    /// Check whether a glyph bitmap is unclaimed. The daemon computes
+    /// the bitmap hash from `pixels` and queries ghost-pay's
+    /// availability endpoint.
+    WalletGlyphCheck {
+        pixels: Vec<u8>,
+    },
     /// Export the active wallet's extended public key at `path`,
     /// formatted for use as a BIP-380 descriptor key fragment.
     /// `mainnet=true` emits xpub, `mainnet=false` emits tpub.
@@ -524,6 +541,11 @@ pub enum Response {
     WalletDerive(WalletDeriveResponse),
     WalletAuthInfo(WalletAuthInfoResponse),
     WalletGhostId(WalletGhostIdResponse),
+    WalletGlyph(GlyphInfo),
+    WalletGlyphClaimed(GlyphClaimResult),
+    WalletGlyphChecked {
+        available: bool,
+    },
     WalletXpub(WalletXpubResponse),
     MultisigDescriptorInspected(MultisigDescriptorInspected),
     MultisigDescriptorSaved(MultisigDescriptorSaved),
@@ -1168,6 +1190,34 @@ pub struct WalletGhostIdResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletShowMnemonicResponse {
     pub mnemonic: String,
+}
+
+/// The wallet's registered Ghost Glyph — a 16x16, 26-colour bitmap
+/// bound to its Ghost ID. Mirrors ghost-pay's `GlyphInfoResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlyphInfo {
+    pub ghost_id: String,
+    /// 256 palette indices (0..25), row-major.
+    pub pixels: Vec<u8>,
+    /// SHA256("GhostGlyphBitmap/v1" || pixels), hex — uniqueness key.
+    pub bitmap_hash: String,
+    /// SHA256("GhostGlyph/v1" || pixels || ghost_id), hex — binding.
+    pub commitment: String,
+    /// Wraith deposit txid that funded the lock (None while pending).
+    pub funding_txid: Option<String>,
+    /// Unix timestamp the lock was funded (None while pending).
+    pub registered_at: Option<u64>,
+    /// One of: "none" / "pending" / "registered".
+    pub status: String,
+}
+
+/// Result of claiming a Ghost Glyph. Mirrors ghost-pay's
+/// `GlyphClaimResponse`. The glyph stays `pending` until its lock funds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlyphClaimResult {
+    pub commitment: String,
+    pub bitmap_hash: String,
+    pub status: String,
 }
 
 /// One cosigner row inside a parsed descriptor — what

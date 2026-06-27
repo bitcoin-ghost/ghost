@@ -59,13 +59,13 @@ mod unix {
     use wraith_wallet_ipc::{
         default_socket_path, ChainStatusResponse, CheckForUpdateResponse, DaemonEnvResponse,
         DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope, ErrorResponse,
-        GspAuthResponse, GspPingResponse, GspSessionStatusResponse, HealthResponse,
-        LightBalanceResponse, LightDetectedResponse, LightHistoryEntry, LightHistoryResponse,
-        LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse, LightSentResponse,
-        LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse, LocksJumpedResponse,
-        LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse, PsbtBroadcastResponse,
-        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
-        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
+        GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse,
+        HealthResponse, LightBalanceResponse, LightDetectedResponse, LightHistoryEntry,
+        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
+        LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse,
+        LocksJumpedResponse, LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse,
+        PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse,
+        PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
         WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
         WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
         WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
@@ -259,6 +259,40 @@ mod unix {
             // bitcoin 0.32 has more variants in non_exhaustive — default to Mainnet.
             _ => ghost_keys::GhostNetwork::Mainnet,
         }
+    }
+
+    /// Construct a fresh concrete `GhostPayClient` for the glyph
+    /// routes. `state.chain` is a `dyn ChainClient` trait object, so
+    /// it can't expose the inherent glyph methods — rebuild from the
+    /// daemon's configured ghost-pay URLs + proxy, attaching the
+    /// internal-auth secret (claim is an authenticated route).
+    fn build_ghost_pay_client(
+        state: &DaemonState,
+    ) -> Result<wraith_wallet_core::chain::GhostPayClient, String> {
+        let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
+            state.ghost_pay_urls.clone(),
+            state.tor_proxy.as_deref(),
+        )
+        .map_err(|e| format!("ghost-pay client: {e}"))?;
+        if let Ok(secret) = std::env::var(GHOST_PAY_INTERNAL_AUTH_ENV) {
+            if !secret.is_empty() {
+                c = c.with_internal_secret(secret);
+            }
+        }
+        Ok(c)
+    }
+
+    /// Compute the glyph bitmap uniqueness hash exactly as
+    /// ghost-glyph defines it: hex(SHA256("GhostGlyphBitmap/v1" ||
+    /// pixels)). Must stay byte-for-byte identical to
+    /// `GhostGlyph::compute_bitmap_hash` or `check` queries the
+    /// wrong key.
+    fn glyph_bitmap_hash_hex(pixels: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"GhostGlyphBitmap/v1");
+        hasher.update(pixels);
+        hex::encode(hasher.finalize())
     }
 
     fn parse_network(s: &str) -> Option<bitcoin::Network> {
@@ -3040,6 +3074,52 @@ mod unix {
                     Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
+            Request::WalletGlyph { ghost_id } => match build_ghost_pay_client(state) {
+                Ok(client) => match client.get_glyph(&ghost_id).await {
+                    Ok(v) => match serde_json::from_value::<GlyphInfo>(v) {
+                        Ok(info) => Response::WalletGlyph(info),
+                        Err(e) => Response::Error(ErrorResponse {
+                            message: format!("glyph parse: {e}"),
+                        }),
+                    },
+                    Err(e) => Response::Error(ErrorResponse {
+                        message: format!("glyph: {e}"),
+                    }),
+                },
+                Err(message) => Response::Error(ErrorResponse { message }),
+            },
+            Request::WalletGlyphCheck { pixels } => match build_ghost_pay_client(state) {
+                Ok(client) => {
+                    let bitmap_hash_hex = glyph_bitmap_hash_hex(&pixels);
+                    match client.check_glyph(&bitmap_hash_hex).await {
+                        Ok(v) => {
+                            let available = v
+                                .get("available")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(false);
+                            Response::WalletGlyphChecked { available }
+                        }
+                        Err(e) => Response::Error(ErrorResponse {
+                            message: format!("glyph check: {e}"),
+                        }),
+                    }
+                }
+                Err(message) => Response::Error(ErrorResponse { message }),
+            },
+            Request::WalletGlyphClaim { ghost_id, pixels } => match build_ghost_pay_client(state) {
+                Ok(client) => match client.claim_glyph(&ghost_id, &pixels).await {
+                    Ok(v) => match serde_json::from_value::<GlyphClaimResult>(v) {
+                        Ok(r) => Response::WalletGlyphClaimed(r),
+                        Err(e) => Response::Error(ErrorResponse {
+                            message: format!("glyph claim parse: {e}"),
+                        }),
+                    },
+                    Err(e) => Response::Error(ErrorResponse {
+                        message: format!("glyph claim: {e}"),
+                    }),
+                },
+                Err(message) => Response::Error(ErrorResponse { message }),
+            },
             Request::WalletAuthInfo => {
                 match with_active_wallet(state, |_, ks| {
                     let kp = auth::auth_keypair(ks).map_err(|e| format!("auth-info: {e}"))?;
