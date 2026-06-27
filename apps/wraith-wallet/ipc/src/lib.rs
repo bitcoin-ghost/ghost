@@ -342,6 +342,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         coordinator_peers: Vec<String>,
     },
+    /// Resolve an elected coordinator endpoint for a mix of `tier_id` from the
+    /// node's decentralised-election view (fetched THROUGH ghost-pay, never the
+    /// pool API directly — wallet hard rule). The wallet shards on (tier, epoch)
+    /// so all wallets wanting the same denomination this epoch converge on one
+    /// seat. Reply: [`Response::WraithCoordinatorResolved`]. Falls back to a
+    /// manual coordinator URL when this yields no endpoint.
+    WraithResolveCoordinator {
+        tier_id: String,
+    },
     WraithMixOneShot {
         coordinator_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,6 +557,14 @@ pub enum Response {
     /// unsigned bitcoin transaction + the metadata the caller needs
     /// to compute its own input witness.
     WraithCoordinatorDiscover(WraithDiscoverResponse),
+    /// Reply to [`Request::WraithResolveCoordinator`]. `endpoint` is the elected
+    /// coordinator to dial for the requested tier, or `None` when the election is
+    /// off/pending/unadvertised (caller falls back to a manual URL). `epoch` is
+    /// the election epoch the resolution was sharded on, when known.
+    WraithCoordinatorResolved {
+        endpoint: Option<String>,
+        epoch: Option<u64>,
+    },
     WraithMixPrepared(WraithMixPreparedResponse),
     /// Reply to [`Request::WraithMixSubmit`]. Carries the broadcast
     /// txid and the index of the wallet's mixed output.

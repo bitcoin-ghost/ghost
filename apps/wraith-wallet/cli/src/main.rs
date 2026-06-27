@@ -1272,6 +1272,18 @@ mod unix {
                 }
                 std::process::ExitCode::SUCCESS
             }
+            Ok(Response::WraithCoordinatorResolved { endpoint, epoch }) => {
+                match endpoint {
+                    Some(ep) => println!("endpoint: {ep}"),
+                    None => {
+                        println!("endpoint: (none — election off/pending; use a manual URL)")
+                    }
+                }
+                if let Some(e) = epoch {
+                    println!("epoch:    {e}");
+                }
+                std::process::ExitCode::SUCCESS
+            }
             Ok(Response::Error(e)) => {
                 eprintln!("wraithd error: {}", e.message);
                 std::process::ExitCode::FAILURE

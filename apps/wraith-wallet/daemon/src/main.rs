@@ -3395,6 +3395,32 @@ mod unix {
                     }),
                 }
             }
+            Request::WraithResolveCoordinator { tier_id } => {
+                // Fetch the node's election view THROUGH ghost-pay (wallet hard
+                // rule: never the pool API directly), then resolve the seat that
+                // owns this tier. Any failure → (None, None) so the caller falls
+                // back to a manually-configured coordinator URL.
+                let (endpoint, epoch) =
+                    match wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
+                        state.ghost_pay_urls.clone(),
+                        None,
+                    ) {
+                        Ok(client) => match client.coordinator_election().await {
+                            Ok(election) => crate::coordinator_resolve::resolve_from_election(
+                                &election, &tier_id,
+                            ),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "resolve coordinator: election fetch failed");
+                                (None, None)
+                            }
+                        },
+                        Err(e) => {
+                            tracing::debug!(error = %e, "resolve coordinator: ghost-pay client build failed");
+                            (None, None)
+                        }
+                    };
+                Response::WraithCoordinatorResolved { endpoint, epoch }
+            }
             Request::WraithMixOneShot {
                 coordinator_url,
                 socks5_proxy,
