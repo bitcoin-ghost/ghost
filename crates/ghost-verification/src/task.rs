@@ -114,6 +114,12 @@ pub struct VerificationBroadcast {
     pub response_data: Option<String>,
     /// Timestamp
     pub timestamp: i64,
+    /// The TARGET's own signed response (`SignedResponse<…>` JSON) for
+    /// capabilities that support recipient-side re-derivation (currently
+    /// archive). `None` for all other capabilities. Threaded into the
+    /// `VerificationResultMessage.target_signed_response` field at broadcast.
+    #[serde(default)]
+    pub target_signed_response: Option<String>,
 }
 
 /// CRIT-VER-2: Signed verification broadcast for P2P transmission
@@ -1220,9 +1226,12 @@ impl VerificationTask {
             .verify_archive(&peer.http_address, Some(&block_hash), None)
             .await;
 
-        // C-2 FIX: Validate block data authenticity, not just success flag
-        let (passed, response_data) = match result {
-            Ok(resp) => {
+        // C-2 FIX: Validate block data authenticity, not just success flag.
+        // `target_signed_response` is the TARGET's own signed `ArchiveResponse`
+        // JSON; it is threaded into the broadcast so recipients can re-derive the
+        // verdict against their own chain instead of trusting our `passed`.
+        let (passed, response_data, target_signed_response) = match result {
+            Ok((resp, signed_raw)) => {
                 // C-2 FIX: Perform merkle root validation
                 let validation_result = self.validate_archive_response(
                     &resp,
@@ -1239,11 +1248,15 @@ impl VerificationTask {
                     "validation": validation_result.1,
                 });
 
-                (validation_result.0, Some(response_json.to_string()))
+                (
+                    validation_result.0,
+                    Some(response_json.to_string()),
+                    signed_raw,
+                )
             }
             Err(e) => {
                 debug!(error = %e, "Archive verification failed");
-                (false, Some(format!("{{\"error\":\"{}\"}}", e)))
+                (false, Some(format!("{{\"error\":\"{}\"}}", e)), None)
             }
         };
 
@@ -1282,6 +1295,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            target_signed_response,
         )
         .await;
 
@@ -1357,7 +1371,10 @@ impl VerificationTask {
 
     /// C-2 FIX: Validate archive response against expected values
     ///
-    /// Returns (passed, validation_details)
+    /// Returns (passed, validation_details). Delegates to the shared
+    /// [`crate::challenge::validate_archive_response`] free function so the
+    /// challenger path and the recipient re-derivation path (`ghost-pool`'s
+    /// `ChainReVerifier`) run byte-identical comparison logic.
     fn validate_archive_response(
         &self,
         resp: &crate::challenge::ArchiveResponse,
@@ -1365,97 +1382,12 @@ impl VerificationTask {
         expected_height: u64,
         expected_merkle_root: Option<&str>,
     ) -> (bool, String) {
-        // Basic check: response must indicate success
-        if !resp.success {
-            return (false, "Response indicates failure".to_string());
-        }
-
-        // C-2 FIX: Block data must be present
-        let block_data = match &resp.block_data {
-            Some(data) => data,
-            None => {
-                return (false, "C-2: No block data in response".to_string());
-            }
-        };
-
-        // C-2 FIX: Block hash must match what we requested
-        if block_data.hash.to_lowercase() != expected_hash.to_lowercase() {
-            return (
-                false,
-                format!(
-                    "C-2: Block hash mismatch: got {}, expected {}",
-                    block_data.hash, expected_hash
-                ),
-            );
-        }
-
-        // C-2 FIX: Height must match
-        if block_data.height != expected_height {
-            return (
-                false,
-                format!(
-                    "C-2: Block height mismatch: got {}, expected {}",
-                    block_data.height, expected_height
-                ),
-            );
-        }
-
-        // C-2 FIX: Validate merkle root format (64 hex chars)
-        if block_data.merkle_root.len() != 64
-            || !block_data
-                .merkle_root
-                .chars()
-                .all(|c| c.is_ascii_hexdigit())
-        {
-            return (
-                false,
-                format!(
-                    "C-2: Invalid merkle root format: {}",
-                    block_data.merkle_root
-                ),
-            );
-        }
-
-        // C-2 FIX: If we have expected merkle root from our RPC, cross-check it
-        if let Some(expected_mr) = expected_merkle_root {
-            if block_data.merkle_root.to_lowercase() != expected_mr.to_lowercase() {
-                return (
-                    false,
-                    format!(
-                        "C-2: Merkle root mismatch: got {}, expected {}",
-                        block_data.merkle_root, expected_mr
-                    ),
-                );
-            }
-        }
-
-        // C-2 FIX: Validate tx_count is reasonable (at least 1 for coinbase)
-        if block_data.tx_count == 0 {
-            return (false, "C-2: Block has zero transactions".to_string());
-        }
-
-        // C-2 FIX + LOW-VER-4 FIX: Validate timestamp for historical blocks
-        // Archive verification is for HISTORICAL blocks, so timestamps must be in the past.
-        // The 2-hour future tolerance was for new blocks being mined, but archive challenges
-        // request blocks that already exist in the chain - they cannot have future timestamps.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // LOW-VER-4 FIX: Historical blocks must have timestamp <= now
-        // Only allow minimal clock skew (60 seconds) to account for verification timing
-        if block_data.timestamp > now + 60 {
-            return (
-                false,
-                format!(
-                    "LOW-VER-4: Historical block timestamp {} is in the future (now: {})",
-                    block_data.timestamp, now
-                ),
-            );
-        }
-
-        (true, "Validation passed".to_string())
+        crate::challenge::validate_archive_response(
+            resp,
+            expected_hash,
+            expected_height,
+            expected_merkle_root,
+        )
     }
 
     /// Verify policy capability
@@ -1590,6 +1522,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            None,
         )
         .await;
 
@@ -1665,6 +1598,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            None,
         )
         .await;
 
@@ -1808,6 +1742,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
+            None,
         )
         .await;
 
@@ -2004,6 +1939,7 @@ impl VerificationTask {
     /// Broadcast a verification result via P2P
     ///
     /// MED-VER-7/VER-4: Validates timestamp before broadcasting to prevent stale/future results
+    #[allow(clippy::too_many_arguments)]
     async fn broadcast_result(
         &self,
         target_node_id: NodeId,
@@ -2012,6 +1948,7 @@ impl VerificationTask {
         challenge_data: String,
         response_data: Option<String>,
         timestamp: i64,
+        target_signed_response: Option<String>,
     ) {
         // MED-VER-7/VER-4 FIX: Clock sanity check before broadcasting
         // VER-4: Standardized on 30 seconds max future tolerance (matches verification_handler.rs)
@@ -2054,6 +1991,7 @@ impl VerificationTask {
                 challenge_data,
                 response_data,
                 timestamp,
+                target_signed_response,
             };
 
             if let Err(e) = tx.send(broadcast).await {
@@ -2102,6 +2040,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
+            target_signed_response: None,
         };
 
         let signed = SignedVerificationBroadcast::new(broadcast.clone(), test_signing_fn);
@@ -2144,6 +2083,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
+            target_signed_response: None,
         };
 
         let mut signed = SignedVerificationBroadcast::new(broadcast, test_signing_fn);
@@ -2180,6 +2120,7 @@ mod tests {
             challenge_data: r#"{"block_hash":"hash1","block_height":100}"#.to_string(),
             response_data: None,
             timestamp,
+            target_signed_response: None,
         };
 
         let broadcast2 = VerificationBroadcast {
@@ -2190,6 +2131,7 @@ mod tests {
             challenge_data: r#"{"block_hash":"hash2","block_height":200}"#.to_string(),
             response_data: None,
             timestamp,
+            target_signed_response: None,
         };
 
         let signed1 = SignedVerificationBroadcast::new(broadcast1, test_signing_fn);
@@ -2223,6 +2165,7 @@ mod tests {
                 .unwrap()
                 .as_secs() as i64
                 + 300, // 5 minutes in the future
+            target_signed_response: None,
         };
 
         let signed = SignedVerificationBroadcast::new(broadcast, test_signing_fn);
@@ -2301,6 +2244,7 @@ mod tests {
                 .unwrap()
                 .as_secs() as i64
                 - 700, // 11+ minutes in the past
+            target_signed_response: None,
         };
 
         let signed = SignedVerificationBroadcast::new(broadcast, test_signing_fn);

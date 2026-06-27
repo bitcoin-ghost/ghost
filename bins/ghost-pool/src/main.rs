@@ -1488,10 +1488,16 @@ async fn main() -> Result<()> {
 
     // Create and register verification result handler for P2P verification results
     // HIGH-VER-4: Use with_peers to validate challengers are known nodes before recording
-    let verification_result_handler = Arc::new(VerificationResultHandler::with_peers(
-        Arc::clone(&db),
-        Arc::clone(mesh.peers()),
-    ));
+    // CONSENSUS SECURITY: re-derive peer-broadcast Archive verdicts against our
+    // own Bitcoin Core + the target's signed response, so a colluding minority of
+    // challengers cannot fabricate a FAIL (to grief an honest node under the 95%
+    // gate) or a PASS. `rpc` is the node's Bitcoin Core RPC client (see above).
+    let verification_result_handler = Arc::new(
+        VerificationResultHandler::with_peers(Arc::clone(&db), Arc::clone(mesh.peers()))
+            .with_rederivation(Arc::new(
+                ghost_pool::verification_reverify::ChainReVerifier::new(Arc::clone(&rpc)),
+            )),
+    );
     mesh.register_handler(Arc::clone(&verification_result_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
@@ -5152,6 +5158,7 @@ async fn main() -> Result<()> {
                 timestamp: broadcast.timestamp,
                 challenge_data: broadcast.challenge_data,
                 response_data: broadcast.response_data,
+                target_signed_response: broadcast.target_signed_response,
                 signature,
             };
 

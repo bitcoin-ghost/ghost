@@ -73,6 +73,7 @@ fn make_verification_envelope(
         passed,
         challenge_data,
         response_data: None,
+        target_signed_response: None,
         timestamp,
         signature: [0u8; 64],
     };
@@ -226,6 +227,7 @@ async fn test_933_forged_verification_result_wrong_signature() {
         passed: true,
         challenge_data: r#"{"block_height":100,"expected_hash":"abc"}"#.to_string(),
         response_data: Some(r#"{"hash":"abc"}"#.to_string()),
+        target_signed_response: None,
         timestamp: now,
         signature: [0u8; 64],
     };

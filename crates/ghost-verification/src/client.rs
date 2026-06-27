@@ -544,14 +544,24 @@ impl VerificationClient {
         Ok(health)
     }
 
-    /// Verify archive capability
+    /// Verify archive capability.
+    ///
+    /// Returns the parsed [`ArchiveResponse`] together with the RAW
+    /// `SignedResponse<ArchiveResponse>` JSON when the target returned a signed
+    /// response (`Some`), or `None` when it returned an unsigned one.
+    ///
+    /// SECURITY: unlike the other capability probes, the archive path requests
+    /// the SIGNED response (it does NOT pass `unsigned=true`). The raw signed
+    /// JSON is threaded into the broadcast so that every recipient can RE-DERIVE
+    /// the verdict from the target's own signature instead of trusting the
+    /// challenger's `passed` flag (see `ghost-pool` `ChainReVerifier`).
     pub async fn verify_archive(
         &self,
         node_address: &str,
         block_hash: Option<&str>,
         txid: Option<&str>,
-    ) -> GhostResult<ArchiveResponse> {
-        let mut params = vec!["unsigned=true".to_string()];
+    ) -> GhostResult<(ArchiveResponse, Option<String>)> {
+        let mut params: Vec<String> = Vec::new();
         if let Some(hash) = block_hash {
             params.push(format!("block={}", hash));
         }
@@ -559,10 +569,12 @@ impl VerificationClient {
             params.push(format!("tx={}", tx));
         }
 
-        let url = self.build_url(
-            node_address,
-            &format!("/verify/archive?{}", params.join("&")),
-        )?;
+        let path = if params.is_empty() {
+            "/verify/archive".to_string()
+        } else {
+            format!("/verify/archive?{}", params.join("&"))
+        };
+        let url = self.build_url(node_address, &path)?;
 
         debug!(url = %url, "Verifying archive capability");
 
@@ -571,22 +583,54 @@ impl VerificationClient {
             GhostError::VerificationTimeout("Archive verification request failed".to_string())
         })?;
 
-        // Archive endpoint returns {"signed": bool, "response": ArchiveResponse}
+        // Archive endpoint returns {"signed": bool, "response": <T>} where T is a
+        // `SignedResponse<ArchiveResponse>` when signed==true, else a bare
+        // `ArchiveResponse`.
         let wrapper: serde_json::Value = response.json().await.map_err(|e| {
             debug!("Archive verification response parse error: {}", e);
             GhostError::InvalidVerificationResponse("Invalid archive response format".to_string())
         })?;
 
+        let signed_flag = wrapper
+            .get("signed")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+
         let inner = wrapper.get("response").ok_or_else(|| {
             GhostError::InvalidVerificationResponse("Missing 'response' field".to_string())
         })?;
 
-        let result: ArchiveResponse = serde_json::from_value(inner.clone()).map_err(|e| {
-            debug!("Archive response deserialization error: {}", e);
-            GhostError::InvalidVerificationResponse("Invalid archive response data".to_string())
-        })?;
+        if signed_flag {
+            // `inner` is a SignedResponse<ArchiveResponse>; the ArchiveResponse is
+            // its `payload`. Capture the raw signed JSON verbatim so the target's
+            // signature stays verifiable end-to-end by recipients.
+            let raw_signed = serde_json::to_string(inner).map_err(|e| {
+                debug!("Archive signed response re-serialization error: {}", e);
+                GhostError::InvalidVerificationResponse(
+                    "Invalid signed archive response".to_string(),
+                )
+            })?;
 
-        Ok(result)
+            let payload = inner.get("payload").ok_or_else(|| {
+                GhostError::InvalidVerificationResponse(
+                    "Signed archive response missing 'payload'".to_string(),
+                )
+            })?;
+
+            let result: ArchiveResponse = serde_json::from_value(payload.clone()).map_err(|e| {
+                debug!("Archive payload deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid archive response data".to_string())
+            })?;
+
+            Ok((result, Some(raw_signed)))
+        } else {
+            let result: ArchiveResponse = serde_json::from_value(inner.clone()).map_err(|e| {
+                debug!("Archive response deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid archive response data".to_string())
+            })?;
+
+            Ok((result, None))
+        }
     }
 
     /// Verify policy capability
@@ -793,7 +837,7 @@ impl VerificationClient {
         if result.claimed_capabilities.archive_mode {
             if let Some(hash) = test_block_hash {
                 match self.verify_archive(node_address, Some(hash), None).await {
-                    Ok(resp) => result.archive_verified = resp.success,
+                    Ok((resp, _signed)) => result.archive_verified = resp.success,
                     Err(e) => result.errors.push(format!("Archive: {}", e)),
                 }
             }

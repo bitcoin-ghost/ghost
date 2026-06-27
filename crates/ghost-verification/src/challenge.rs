@@ -102,6 +102,119 @@ pub struct TxData {
     pub output_count: usize,
 }
 
+/// C-2 FIX: Validate an archive response against expected ground-truth values.
+///
+/// Returns `(passed, validation_details)`.
+///
+/// This is the single source of truth for archive verdict comparison. It is
+/// called both by the CHALLENGER (`task.rs`, against its own RPC at challenge
+/// time) and by RECIPIENTS of a broadcast result (`ghost-pool`'s
+/// `ChainReVerifier`, against their own RPC when re-deriving the verdict). Both
+/// paths run identical logic so there is zero divergence between the verdict a
+/// challenger records and the verdict a recipient re-derives.
+///
+/// SECURITY: `expected_hash`, `expected_height` and `expected_merkle_root` MUST
+/// come from the caller's own trusted source (its Bitcoin Core), never from the
+/// untrusted party whose response is being judged.
+pub fn validate_archive_response(
+    resp: &ArchiveResponse,
+    expected_hash: &str,
+    expected_height: u64,
+    expected_merkle_root: Option<&str>,
+) -> (bool, String) {
+    // Basic check: response must indicate success
+    if !resp.success {
+        return (false, "Response indicates failure".to_string());
+    }
+
+    // C-2 FIX: Block data must be present
+    let block_data = match &resp.block_data {
+        Some(data) => data,
+        None => {
+            return (false, "C-2: No block data in response".to_string());
+        }
+    };
+
+    // C-2 FIX: Block hash must match what we requested
+    if block_data.hash.to_lowercase() != expected_hash.to_lowercase() {
+        return (
+            false,
+            format!(
+                "C-2: Block hash mismatch: got {}, expected {}",
+                block_data.hash, expected_hash
+            ),
+        );
+    }
+
+    // C-2 FIX: Height must match
+    if block_data.height != expected_height {
+        return (
+            false,
+            format!(
+                "C-2: Block height mismatch: got {}, expected {}",
+                block_data.height, expected_height
+            ),
+        );
+    }
+
+    // C-2 FIX: Validate merkle root format (64 hex chars)
+    if block_data.merkle_root.len() != 64
+        || !block_data
+            .merkle_root
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return (
+            false,
+            format!(
+                "C-2: Invalid merkle root format: {}",
+                block_data.merkle_root
+            ),
+        );
+    }
+
+    // C-2 FIX: If we have expected merkle root from our RPC, cross-check it
+    if let Some(expected_mr) = expected_merkle_root {
+        if block_data.merkle_root.to_lowercase() != expected_mr.to_lowercase() {
+            return (
+                false,
+                format!(
+                    "C-2: Merkle root mismatch: got {}, expected {}",
+                    block_data.merkle_root, expected_mr
+                ),
+            );
+        }
+    }
+
+    // C-2 FIX: Validate tx_count is reasonable (at least 1 for coinbase)
+    if block_data.tx_count == 0 {
+        return (false, "C-2: Block has zero transactions".to_string());
+    }
+
+    // C-2 FIX + LOW-VER-4 FIX: Validate timestamp for historical blocks
+    // Archive verification is for HISTORICAL blocks, so timestamps must be in the past.
+    // The 2-hour future tolerance was for new blocks being mined, but archive challenges
+    // request blocks that already exist in the chain - they cannot have future timestamps.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // LOW-VER-4 FIX: Historical blocks must have timestamp <= now
+    // Only allow minimal clock skew (60 seconds) to account for verification timing
+    if block_data.timestamp > now + 60 {
+        return (
+            false,
+            format!(
+                "LOW-VER-4: Historical block timestamp {} is in the future (now: {})",
+                block_data.timestamp, now
+            ),
+        );
+    }
+
+    (true, "Validation passed".to_string())
+}
+
 /// Policy challenge request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyChallenge {
