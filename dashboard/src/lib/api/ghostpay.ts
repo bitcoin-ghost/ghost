@@ -122,11 +122,13 @@ export async function getWraithStats(): Promise<WraithStats> {
       avg_fill_rate: sessions.sessions?.length > 0
         ? sessions.sessions.reduce((sum, s) => sum + (s.fill_percentage ?? 0), 0) / sessions.sessions.length / 100
         : 0,
-      avg_completion_time_secs: 180, // Placeholder
       your_participations: sessions.stats?.your_participations ?? 0,
       your_completed: sessions.stats?.your_completed ?? 0,
     };
-  } catch {
+  } catch (e) {
+    // Don't fail silently — a fetch error here previously rendered as all-zeros,
+    // indistinguishable from "no activity". Log so operators can diagnose.
+    console.error("getWraithStats: failed to fetch wraith sessions", e);
     return {
       total_sessions: 0,
       active_sessions: 0,
@@ -134,7 +136,6 @@ export async function getWraithStats(): Promise<WraithStats> {
       sessions_expired: 0,
       total_participants: 0,
       avg_fill_rate: 0,
-      avg_completion_time_secs: 0,
       your_participations: 0,
       your_completed: 0,
     };
@@ -156,9 +157,10 @@ export async function getSettlementStatus(): Promise<SettlementStatus> {
       avg_batch_size: (settlement.batches?.length ?? 0) > 0
         ? settlement.batches!.reduce((sum, b) => sum + b.participant_count, 0) / settlement.batches!.length
         : 0,
-      avg_confirmation_time_mins: 30, // Placeholder
     };
-  } catch {
+  } catch (e) {
+    // See getWraithStats — log instead of silently returning all-zeros.
+    console.error("getSettlementStatus: failed to fetch settlement status", e);
     return {
       l1_available: false,
       l1_height: 0,
@@ -168,7 +170,6 @@ export async function getSettlementStatus(): Promise<SettlementStatus> {
       total_settled_24h: 0,
       current_epoch: 0,
       avg_batch_size: 0,
-      avg_confirmation_time_mins: 0,
     };
   }
 }

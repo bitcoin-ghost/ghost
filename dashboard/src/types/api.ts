@@ -440,7 +440,6 @@ export interface WraithStats {
   sessions_expired?: number;
   total_participants?: number;
   avg_fill_rate?: number;
-  avg_completion_time_secs?: number;
   your_participations?: number;
   your_completed?: number;
 }
@@ -591,7 +590,6 @@ export interface SettlementStatus {
   total_settled_24h?: number;
   current_epoch?: number;
   avg_batch_size?: number;
-  avg_confirmation_time_mins?: number;
 }
 
 // Jump Queue types
