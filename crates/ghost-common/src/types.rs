@@ -59,6 +59,13 @@ pub struct NodeCapabilities {
     pub reaper: bool,
     /// Elder status (+1 share)
     pub elder_status: bool,
+    /// Wraith coordinator role opted in. Earns the mixing service fee, NOT
+    /// 5-4-3-2-1 shares — so it is deliberately excluded from `total_shares()`
+    /// and needs no verification challenge. `#[serde(default)]` so health pings
+    /// from peers on pre-coordinator builds (which omit the field) still
+    /// deserialize as `coordinator = false`.
+    #[serde(default)]
+    pub coordinator: bool,
 }
 
 impl NodeCapabilities {
@@ -116,6 +123,7 @@ impl NodeCapabilities {
             || self.public_mining
             || self.reaper
             || self.elder_status
+            || self.coordinator
     }
 }
 
@@ -451,6 +459,22 @@ pub struct HealthPing {
     /// empty Vec, and newer nodes simply ignore peers that omit it.
     #[serde(default)]
     pub best_records: Vec<WindowBestRecord>,
+    /// If this node has opted in as a Wraith coordinator
+    /// (`capabilities.coordinator`), the reachable endpoint a wallet should dial
+    /// to mix with it: a public `host:port` or a `.onion`. This is a DELIBERATE,
+    /// operator-chosen advertisement (unlike `public_address`, which is withheld
+    /// per S-7) — a coordinator is useless if unreachable, and operators wanting
+    /// privacy advertise a Tor hidden service instead of an IP. `None` for nodes
+    /// that haven't opted in. `#[serde(default)]` for backward compatibility.
+    #[serde(default)]
+    pub coordinator_endpoint: Option<String>,
+    /// If this node is an active coordinator, the number of Wraith mixing
+    /// sessions it handled over a recent trailing window. Summed across the mesh
+    /// at each epoch boundary to size the next epoch's coordinator seat count
+    /// (demand-driven scaling). 0 for non-coordinators and idle coordinators.
+    /// `#[serde(default)]` for backward compatibility.
+    #[serde(default)]
+    pub coordinator_sessions: u32,
 }
 
 /// One node's best (rarest) valid share in a public records window.
@@ -825,6 +849,49 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinator_earns_no_shares_but_counts_as_a_capability() {
+        // Coordinator is fee-incentivised, not share-bearing — it must add 0 to
+        // the 5-4-3-2-1 total even when every share-bearing capability is set.
+        let mut caps = NodeCapabilities {
+            archive_mode: true,
+            ghost_pay: true,
+            public_mining: true,
+            reaper: true,
+            elder_status: true,
+            coordinator: true,
+        };
+        assert_eq!(
+            caps.total_shares(),
+            15,
+            "coordinator must not change the share total"
+        );
+
+        // But a coordinator-only node still "has a capability".
+        caps = NodeCapabilities::new();
+        caps.coordinator = true;
+        assert_eq!(caps.total_shares(), 0);
+        assert!(caps.has_any());
+    }
+
+    #[test]
+    fn test_node_capabilities_coordinator_serde_default() {
+        // A health ping from a pre-coordinator build omits the field entirely;
+        // it must still deserialize (as coordinator = false), not error.
+        let legacy = r#"{"archive_mode":true,"ghost_pay":false,"public_mining":true,"reaper":false,"elder_status":false}"#;
+        let caps: NodeCapabilities =
+            serde_json::from_str(legacy).expect("legacy caps must deserialize");
+        assert!(!caps.coordinator);
+        assert!(caps.archive_mode && caps.public_mining);
+
+        // Round-trips with the field present.
+        let mut on = caps;
+        on.coordinator = true;
+        let json = serde_json::to_string(&on).expect("serialize");
+        let back: NodeCapabilities = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.coordinator);
+    }
+
+    #[test]
     fn test_reaper_works_independently() {
         // Reaper works with private mining (no public_mining flag)
         let mut caps = NodeCapabilities::new();
@@ -1009,6 +1076,8 @@ mod tests {
                 timestamp: 1,
                 miner_id_redacted: "bc1q7z…y492.avalon1".to_string(),
             }],
+            coordinator_endpoint: None,
+            coordinator_sessions: 0,
         }
     }
 
@@ -1019,6 +1088,26 @@ mod tests {
         let back: HealthPing = serde_json::from_str(&json).unwrap();
         assert_eq!(back.local_hashrate_th, 4.0);
         assert_eq!(back.active_miner_id_hashes.len(), 2);
+    }
+
+    #[test]
+    fn health_ping_coordinator_endpoint_roundtrip_and_back_compat() {
+        // Present-and-set survives a round-trip.
+        let mut ping = sample_health_ping();
+        ping.coordinator_endpoint = Some("abc123def456.onion:9100".to_string());
+        let back: HealthPing =
+            serde_json::from_str(&serde_json::to_string(&ping).unwrap()).unwrap();
+        assert_eq!(
+            back.coordinator_endpoint.as_deref(),
+            Some("abc123def456.onion:9100")
+        );
+
+        // An older node's ping omits the field entirely → defaults to None,
+        // proving the wire change is additive.
+        let mut v = serde_json::to_value(&sample_health_ping()).unwrap();
+        v.as_object_mut().unwrap().remove("coordinator_endpoint");
+        let back: HealthPing = serde_json::from_value(v).unwrap();
+        assert_eq!(back.coordinator_endpoint, None);
     }
 
     #[test]

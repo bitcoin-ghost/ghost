@@ -5548,6 +5548,10 @@ impl Database {
             public_mining: stratum_qualified,
             reaper: policy_qualified,
             elder_status: elder_qualified,
+            // Coordinator is a live, opt-in mesh role (advertised via health
+            // pings), not a verified/persisted capability — qualification never
+            // sets it. Always false on the qualified-capabilities path.
+            coordinator: false,
         })
     }
 

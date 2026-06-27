@@ -25,6 +25,19 @@ use crate::sortition::CoordinatorNodeId;
 /// (e.g. `https://node.example:9100`). Sourced from the node-discovery layer.
 pub type EndpointMap = BTreeMap<CoordinatorNodeId, String>;
 
+/// One seated coordinator with its reachable endpoint — the unit the read-only
+/// status endpoint publishes and the wallet resolves against.
+#[derive(Debug, Clone)]
+pub struct SeatedCoordinator {
+    /// The elected node's id.
+    pub node_id: CoordinatorNodeId,
+    /// Seat index `0..seats`; sessions shard onto seats via `shard_for`.
+    pub seat: u32,
+    /// The endpoint a wallet dials for this seat, or `None` if the owner hasn't
+    /// advertised one yet (the wallet then waits or picks another epoch).
+    pub endpoint: Option<String>,
+}
+
 /// The resolved coordinator assignment for one epoch, with endpoints attached.
 #[derive(Debug, Clone)]
 pub struct CoordinatorView {
@@ -65,6 +78,24 @@ impl CoordinatorView {
     /// Number of coordinators seated this epoch.
     pub fn seats(&self) -> usize {
         self.coords.seats()
+    }
+
+    /// The seated coordinators in seat order, each with its advertised endpoint
+    /// (`None` when the owner hasn't advertised one). Drives the read-only status
+    /// endpoint and the wallet's "which endpoint owns my session" resolution.
+    pub fn seated(&self) -> Vec<SeatedCoordinator> {
+        let mut out: Vec<SeatedCoordinator> = self
+            .coords
+            .coordinators
+            .iter()
+            .map(|c| SeatedCoordinator {
+                node_id: c.node_id,
+                seat: c.seat,
+                endpoint: self.endpoints.get(&c.node_id).cloned(),
+            })
+            .collect();
+        out.sort_unstable_by_key(|s| s.seat);
+        out
     }
 
     // ── node-side ────────────────────────────────────────────────────────────
@@ -204,5 +235,33 @@ mod tests {
         assert_eq!(v.seats(), 0);
         assert!(!v.am_i_coordinator(&node(0)));
         assert_eq!(v.endpoint_for_session(&[9u8; 32]), None);
+    }
+
+    #[test]
+    fn seated_lists_every_seat_with_its_endpoint_in_order() {
+        let (v, _q) = view(5);
+        let seated = v.seated();
+        assert_eq!(seated.len(), 5);
+        for (i, s) in seated.iter().enumerate() {
+            assert_eq!(s.seat as usize, i, "seats must be 0..n in order");
+            assert!(s
+                .endpoint
+                .as_deref()
+                .expect("every seated coordinator has an endpoint here")
+                .starts_with("https://node"));
+        }
+    }
+
+    #[test]
+    fn seated_endpoint_is_none_when_owner_has_not_advertised() {
+        let q = qualified(12);
+        let mut eps = endpoints(&q);
+        let full = CoordinatorView::build(3, &beacon(7), &q, eps.clone(), 5);
+        let owner = full.seated()[0].node_id;
+        eps.remove(&owner);
+        let v = CoordinatorView::build(3, &beacon(7), &q, eps, 5);
+        // Still seated (owner known) but no endpoint to dial.
+        assert_eq!(v.seated()[0].node_id, owner);
+        assert_eq!(v.seated()[0].endpoint, None);
     }
 }
