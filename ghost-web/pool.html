@@ -775,6 +775,19 @@
       grid.innerHTML = '<p class="section-lead" style="grid-column:1/-1">Mesh node list unavailable — retrying…</p>';
       return;
     }
+    // Collapse transient same-address duplicates. During a node restart the mesh
+    // briefly reports stale session peer-entries (same IP, a different node_id,
+    // hashrate 0) that age out of the freshness window within ~2 min — without
+    // this they'd flash as phantom extra nodes. Dedup by host, keeping the best
+    // entry per IP: prefer self, then non-zero hashrate, then non-zero miners.
+    function hostOf(a) { var s = String(a || ''); var i = s.lastIndexOf(':'); return i > 0 ? s.slice(0, i) : s; }
+    function nodeScore(x) { return (x.is_self ? 100 : 0) + (((x.hashrate_th || 0) > 0) ? 10 : 0) + (((x.miner_count || 0) > 0) ? 1 : 0); }
+    var byHost = {};
+    nodes.forEach(function (n) {
+      var key = hostOf(n.address) || ('id:' + (n.node_id || ''));
+      if (!byHost[key] || nodeScore(n) > nodeScore(byHost[key])) byHost[key] = n;
+    });
+    nodes = Object.keys(byHost).map(function (k) { return byHost[k]; });
     // Self first, then elders, then by hashrate. Stable, readable ordering.
     var sorted = nodes.slice().sort(function (a, b) {
       if (!!a.is_self !== !!b.is_self) return a.is_self ? -1 : 1;
