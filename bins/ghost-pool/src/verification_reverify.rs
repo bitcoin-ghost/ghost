@@ -7,7 +7,7 @@
 //! sign `passed=false` against an honest node, drag it under the 95% gate, and
 //! steal its reward share.
 //!
-//! [`ChainReVerifier`] closes this by RE-DERIVING the Archive verdict from:
+//! `ChainReVerifier` closes this by RE-DERIVING the Archive verdict from:
 //!   1. the TARGET's own signed `ArchiveResponse` (the only trustworthy input —
 //!      `challenge_data`/`response_data` are authored by the adversarial
 //!      challenger and are NOT in the signed tuple), and
@@ -16,7 +16,7 @@
 //! ([`ghost_verification::challenge::validate_archive_response`]) so there is
 //! zero logic divergence.
 //!
-//! Verdict semantics (see [`ReVerdict`]):
+//! Verdict semantics (see `ReVerdict`):
 //!   - `Pass`         — target's signed block data matches our chain.
 //!   - `Fail`         — target's signed block data contradicts our chain.
 //!   - `Unverifiable` — we cannot judge (no/invalid target signature,
