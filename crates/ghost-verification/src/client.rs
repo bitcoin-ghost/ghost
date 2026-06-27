@@ -514,6 +514,119 @@ impl VerificationClient {
         Ok(format!("{}://{}{}", self.scheme(), host, path))
     }
 
+    /// Extract the bare host (no port) from a `host:port` style address.
+    ///
+    /// Handles IPv4 (`1.2.3.4:8080` -> `1.2.3.4`), bracketed IPv6
+    /// (`[2001:db8::1]:8080` -> `2001:db8::1`), bare IPv6 (`2001:db8::1` kept
+    /// whole), and bare hostnames. Returns `None` when no host can be
+    /// determined (empty input).
+    fn extract_host_part(address: &str) -> Option<&str> {
+        let addr = address.trim();
+        if addr.is_empty() {
+            return None;
+        }
+        let host = if addr.starts_with('[') {
+            // Bracketed IPv6, possibly with a trailing :port
+            addr.trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or(addr)
+        } else if addr.contains("::") || addr.matches(':').count() > 1 {
+            // Bare IPv6 (multiple colons) — there is no host:port split here,
+            // the whole thing is the host.
+            addr
+        } else {
+            // IPv4 or hostname, optionally with :port
+            addr.split(':').next().unwrap_or(addr)
+        };
+        let host = host.trim();
+        if host.is_empty() {
+            None
+        } else {
+            Some(host)
+        }
+    }
+
+    /// CONSENSUS SECURITY: Independent stratum-port reachability probe.
+    ///
+    /// This replaces the old self-attestation path, where the challenger asked
+    /// the target's `/verify/stratum` HTTP endpoint and the TARGET scanned its
+    /// OWN `/proc/net/tcp` for a LISTEN socket — a lying target could simply
+    /// self-report "up". Here the CHALLENGER itself opens a TCP connection to
+    /// the target's public stratum port and directly observes reachability, so
+    /// the verdict reflects the truth the challenger sees, not a relayed claim.
+    ///
+    /// `node_address` is the peer's mesh/HTTP address (`host:port` form); only
+    /// the host is used, combined with the supplied public stratum `port`
+    /// (Stratum V1 `3333`). The probe uses the client's configured timeout.
+    ///
+    /// Returns:
+    /// - `Some(true)`  — TCP connect succeeded ⇒ reachable ⇒ pass.
+    /// - `Some(false)` — connection refused or timed out ⇒ unreachable ⇒ fail
+    ///   (a genuinely-down node must fail).
+    /// - `None`        — INCONCLUSIVE: the target host could not be determined
+    ///   or resolved (challenger-side / unknown address). The caller MUST NOT
+    ///   record a verdict in this case — it mirrors the RPC-unavailable archive
+    ///   path which skips rather than recording a false fail.
+    pub async fn probe_stratum_port(&self, node_address: &str, port: u16) -> Option<bool> {
+        use tokio::net::TcpStream;
+
+        // Determine the target host. An undeterminable host is inconclusive.
+        let host = match Self::extract_host_part(node_address) {
+            Some(h) => h,
+            None => {
+                debug!(
+                    address = %node_address,
+                    "Stratum probe: could not determine target host (inconclusive, skipping)"
+                );
+                return None;
+            }
+        };
+
+        // Resolve host:port to concrete socket addresses. A resolution failure
+        // is a challenger-side / unknown-address condition: inconclusive, never
+        // a false fail.
+        let target = format!("{host}:{port}");
+        let addrs = match tokio::net::lookup_host(&target).await {
+            Ok(iter) => iter.collect::<Vec<_>>(),
+            Err(e) => {
+                debug!(
+                    target = %target,
+                    error = %e,
+                    "Stratum probe: host resolution failed (inconclusive, skipping)"
+                );
+                return None;
+            }
+        };
+        let addr = match addrs.into_iter().next() {
+            Some(a) => a,
+            None => {
+                debug!(
+                    target = %target,
+                    "Stratum probe: host resolved to no addresses (inconclusive, skipping)"
+                );
+                return None;
+            }
+        };
+
+        // Open a real TCP connection. Success ⇒ reachable; a definitive connect
+        // failure (refused) or a timeout ⇒ unreachable ⇒ fail.
+        match tokio::time::timeout(self.config.timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(_stream)) => {
+                debug!(target = %target, "Stratum probe: reachable (TCP connect succeeded)");
+                Some(true)
+            }
+            Ok(Err(e)) => {
+                debug!(target = %target, error = %e, "Stratum probe: unreachable (connect failed)");
+                Some(false)
+            }
+            Err(_elapsed) => {
+                debug!(target = %target, "Stratum probe: unreachable (connect timed out)");
+                Some(false)
+            }
+        }
+    }
+
     /// Get health status of a node
     pub async fn health(&self, node_address: &str) -> GhostResult<HealthResponse> {
         let url = self.build_url(node_address, "/health?unsigned=true")?;
@@ -1235,6 +1348,80 @@ mod tests {
         assert!(!VerificationClient::is_internal_address(
             "2001:4860:4860::8888"
         )); // Google DNS
+    }
+
+    #[test]
+    fn test_extract_host_part() {
+        // IPv4 with and without port
+        assert_eq!(
+            VerificationClient::extract_host_part("1.2.3.4:8080"),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            VerificationClient::extract_host_part("1.2.3.4"),
+            Some("1.2.3.4")
+        );
+        // Bracketed IPv6 with port
+        assert_eq!(
+            VerificationClient::extract_host_part("[2001:db8::1]:8080"),
+            Some("2001:db8::1")
+        );
+        // Bare IPv6 (no port) kept whole
+        assert_eq!(
+            VerificationClient::extract_host_part("2001:db8::1"),
+            Some("2001:db8::1")
+        );
+        // Hostname with port
+        assert_eq!(
+            VerificationClient::extract_host_part("node.example.org:8080"),
+            Some("node.example.org")
+        );
+        // Empty -> None (inconclusive)
+        assert_eq!(VerificationClient::extract_host_part(""), None);
+        assert_eq!(VerificationClient::extract_host_part("   "), None);
+    }
+
+    #[tokio::test]
+    async fn test_probe_stratum_port_reachable_and_refused() {
+        use tokio::net::TcpListener;
+
+        // CONSENSUS SECURITY: the independent probe must return TRUE for a
+        // listening socket (reachable) and FALSE for a closed port (refused).
+        let client = VerificationClient::new().unwrap();
+
+        // Bind a throwaway listener on an ephemeral loopback port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+
+        // Positive: a real LISTEN socket is observed as reachable.
+        let reachable = client.probe_stratum_port("127.0.0.1", listen_port).await;
+        assert_eq!(
+            reachable,
+            Some(true),
+            "a listening socket must probe as reachable (pass)"
+        );
+
+        // Negative: drop the listener so the port is closed, then probe it.
+        // connect() to a closed loopback port is refused immediately -> false.
+        drop(listener);
+        let refused = client.probe_stratum_port("127.0.0.1", listen_port).await;
+        assert_eq!(
+            refused,
+            Some(false),
+            "a closed port must probe as unreachable (fail)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_probe_stratum_port_inconclusive_on_empty_host() {
+        // An undeterminable target host is INCONCLUSIVE -> None, never a false
+        // fail (the caller must skip rather than record passed=false).
+        let client = VerificationClient::new().unwrap();
+        let inconclusive = client.probe_stratum_port("", 3333).await;
+        assert_eq!(
+            inconclusive, None,
+            "empty address -> inconclusive (None), not a false fail"
+        );
     }
 
     #[test]

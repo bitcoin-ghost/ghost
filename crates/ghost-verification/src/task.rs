@@ -1585,7 +1585,18 @@ impl VerificationTask {
         Ok(())
     }
 
-    /// Verify stratum capability
+    /// Verify stratum capability via an INDEPENDENT probe.
+    ///
+    /// CONSENSUS SECURITY: the challenger itself opens a TCP connection to the
+    /// peer's public Stratum V1 port and observes reachability directly, rather
+    /// than relaying the target's self-attestation (the target scanning its own
+    /// `/proc/net/tcp`). A lying target can no longer self-report "up": only
+    /// what THIS challenger can actually reach becomes the recorded `passed`.
+    ///
+    /// An INCONCLUSIVE probe (target host undeterminable / unresolvable, i.e. a
+    /// challenger-side condition) is SKIPPED — no row is stored and nothing is
+    /// broadcast — mirroring the RPC-unavailable archive path. We never record
+    /// a false fail for an inconclusive probe.
     ///
     /// CRIT-VER-3: Returns Result - DB write failures are propagated to caller
     async fn verify_stratum(
@@ -1595,40 +1606,51 @@ impl VerificationTask {
         our_id_hex: &str,
         timestamp: i64,
     ) -> Result<(), String> {
-        use crate::challenge::StratumProtocol;
+        use ghost_common::constants::SV1_STRATUM_PORT;
+
+        let short_id = &peer_id_hex[..8];
 
         let challenge_data = serde_json::json!({
-            "protocol": "sv2",
+            "protocol": "sv1",
+            "probe": "independent_tcp_connect",
+            "port": SV1_STRATUM_PORT,
         })
         .to_string();
 
-        let result = self
+        // Independent reachability probe by THIS challenger.
+        let start = std::time::Instant::now();
+        let probe = self
             .client
-            .verify_stratum(&peer.http_address, StratumProtocol::Sv2)
+            .probe_stratum_port(&peer.http_address, SV1_STRATUM_PORT)
             .await;
+        let latency_ms = Some(start.elapsed().as_millis() as u32);
 
-        let short_id = &peer_id_hex[..8];
-        let (passed, connected, latency_ms, response_data) = match result {
-            Ok(resp) => (
-                resp.success && resp.connected,
-                resp.connected,
-                resp.latency_ms,
-                Some(
-                    serde_json::json!({
-                        "success": resp.success,
-                        "connected": resp.connected,
-                        "latency_ms": resp.latency_ms,
-                    })
-                    .to_string(),
-                ),
-            ),
-            Err(e) => {
-                warn!(peer = %short_id, error = %e, "Stratum verification failed");
-                (false, false, None, Some(format!("{{\"error\":\"{}\"}}", e)))
+        let (passed, connected) = match probe {
+            Some(reachable) => (reachable, reachable),
+            None => {
+                // Inconclusive (challenger-side / unknown address). Do NOT
+                // record a verdict — skip this cycle, exactly like the
+                // RPC-unavailable archive path.
+                warn!(
+                    peer = %short_id,
+                    address = %peer.http_address,
+                    "Stratum probe inconclusive (target address undeterminable) - skipping, no verdict recorded"
+                );
+                return Ok(());
             }
         };
 
-        info!(peer = %short_id, passed = passed, connected = connected, "Stratum verification complete");
+        let response_data = Some(
+            serde_json::json!({
+                "reachable": connected,
+                "port": SV1_STRATUM_PORT,
+                "probe": "independent_tcp_connect",
+                "latency_ms": latency_ms,
+            })
+            .to_string(),
+        );
+
+        info!(peer = %short_id, passed = passed, connected = connected, "Stratum verification complete (independent probe)");
 
         // H-1 FIX: Verify identity before DB write to prevent challenger ID spoofing
         self.require_identity_verified()?;

@@ -176,11 +176,26 @@ pub const ARCHIVE_PASS_RATE: f64 = 0.95;
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const POLICY_PASS_RATE: f64 = 0.95;
 
-/// Stratum challenge pass rate threshold
+/// Stratum challenge pass rate threshold.
+///
+/// CONSENSUS SECURITY: this per-challenge percentage gate NO LONGER governs
+/// stratum qualification. Stratum (and GhostPay) are liveness probes with no
+/// chain ground truth, so they cannot be re-derived like Archive/Policy. They
+/// are instead gated by a per-challenger MAJORITY (one vote per distinct
+/// challenger; see `get_stratum_challenger_majority` in `ghost-storage`), which
+/// a sub-50% colluding minority cannot flip and a flood cannot inflate. This
+/// constant is retained because the legacy per-challenge path
+/// (`get_qualified_capabilities`) and Archive/Policy still share the pattern.
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const STRATUM_PASS_RATE: f64 = 0.95;
 
-/// Ghost Pay challenge pass rate threshold
+/// Ghost Pay challenge pass rate threshold.
+///
+/// CONSENSUS SECURITY: like `STRATUM_PASS_RATE`, this per-challenge percentage
+/// gate NO LONGER governs GhostPay qualification. GhostPay now qualifies on a
+/// per-challenger MAJORITY (see `get_ghostpay_challenger_majority` in
+/// `ghost-storage`). Retained for the legacy per-challenge path and the shared
+/// Archive/Policy pattern.
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const GHOSTPAY_PASS_RATE: f64 = 0.90;
 
