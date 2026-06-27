@@ -203,6 +203,44 @@ impl GhostPayClient {
         Err(last_err.unwrap_or_else(|| ChainError::Transport("no endpoints configured".into())))
     }
 
+    /// `GET /api/v1/pool/coordinator` — the node's decentralised-coordinator
+    /// election view, relayed by ghost-pay (the wallet never hits the node's pool
+    /// API directly; wallet hard rule). Returns the raw election JSON; the daemon
+    /// resolves which seat owns a given (tier, epoch) shard from it. ghost-pay
+    /// returns the inert `{"enabled": false}` shape when the node has the feature
+    /// off or is unreachable, so the wallet falls back to a manual coordinator URL.
+    pub async fn coordinator_election(&self) -> Result<serde_json::Value, ChainError> {
+        let mut last_err: Option<ChainError> = None;
+        for base in &self.base_urls {
+            match self.try_coordinator_election(base).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::debug!(url = %base, error = %e, "ghost-pay coordinator_election failed, trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ChainError::Transport("no endpoints configured".into())))
+    }
+
+    async fn try_coordinator_election(
+        &self,
+        base_url: &str,
+    ) -> Result<serde_json::Value, ChainError> {
+        let url = self.endpoint(base_url, "/api/v1/pool/coordinator");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ChainError::Transport(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| ChainError::Backend(e.to_string()))?;
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| ChainError::Malformed(e.to_string()))
+    }
+
     async fn try_broadcast_tx(&self, base_url: &str, tx_hex: &str) -> Result<String, ChainError> {
         let url = self.endpoint(base_url, "/api/v1/tx/broadcast");
         let mut req = self.http.post(&url).json(&serde_json::json!({
