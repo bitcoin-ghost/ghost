@@ -4,6 +4,7 @@ import {
   lightReceive,
   walletGhostId,
   wraithCoordinatorDiscover,
+  wraithResolveCoordinator,
   wraithMixRun,
   type LightL1UtxoEntry,
   type WraithDiscoverTier,
@@ -57,6 +58,16 @@ export function Mix({ activeWallet }: MixProps) {
   const [ghostId, setGhostId] = useState<string | null>(null);
   const [coordinator, setCoordinator] = useState(DEFAULT_COORDINATOR);
   const [coordinatorPeersText, setCoordinatorPeersText] = useState("");
+
+  // Network-elected coordinator: when on, the wallet resolves the coordinator
+  // for the selected tier from the node's decentralised election (via ghost-pay)
+  // instead of using the manual URL. Off by default so the manual flow is
+  // unchanged until the operator opts in.
+  const [useNetworkCoordinator, setUseNetworkCoordinator] = useState(false);
+  const [resolvedEndpoint, setResolvedEndpoint] = useState<string | null>(null);
+  const [resolvedEpoch, setResolvedEpoch] = useState<number | null>(null);
+  const [resolving, setResolving] = useState(false);
+  const [resolveErr, setResolveErr] = useState<string | null>(null);
   const [tiers, setTiers] = useState<Tier[]>(FALLBACK_TIERS);
   const [tierId, setTierId] = useState(FALLBACK_TIERS[0].id);
   const [discoverInfo, setDiscoverInfo] = useState<{
@@ -88,6 +99,54 @@ export function Mix({ activeWallet }: MixProps) {
     [tiers, tierId],
   );
 
+  // The coordinator URL actually used for discovery + the mix: the network-
+  // elected endpoint when the toggle is on and one resolved, else the manual URL.
+  const effectiveCoordinator = useMemo(
+    () =>
+      useNetworkCoordinator && resolvedEndpoint
+        ? resolvedEndpoint
+        : coordinator.trim(),
+    [useNetworkCoordinator, resolvedEndpoint, coordinator],
+  );
+
+  // Resolve the elected coordinator for the selected tier whenever the toggle is
+  // enabled or the tier changes. Sharding on (tier, epoch) means every wallet
+  // mixing this tier this epoch converges on one seat (larger anonymity set). A
+  // null endpoint (election off/pending) leaves the manual URL in effect.
+  useEffect(() => {
+    if (!useNetworkCoordinator) {
+      setResolvedEndpoint(null);
+      setResolvedEpoch(null);
+      setResolveErr(null);
+      return;
+    }
+    let alive = true;
+    setResolving(true);
+    (async () => {
+      try {
+        const r = await wraithResolveCoordinator(tierId);
+        if (!alive) return;
+        setResolvedEndpoint(r.endpoint);
+        setResolvedEpoch(r.epoch);
+        setResolveErr(
+          r.endpoint
+            ? null
+            : "No elected coordinator available yet — using the manual URL.",
+        );
+      } catch (e) {
+        if (!alive) return;
+        setResolvedEndpoint(null);
+        setResolvedEpoch(null);
+        setResolveErr((e as Error).message ?? String(e));
+      } finally {
+        if (alive) setResolving(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [useNetworkCoordinator, tierId]);
+
   // Discover the coordinator's tier set + identity. Re-runs when
   // the user changes the coordinator URL or peer list (debounced
   // by the controlled-input pattern: every keystroke triggers a
@@ -103,7 +162,7 @@ export function Mix({ activeWallet }: MixProps) {
       .filter((s) => s.length > 0);
     (async () => {
       try {
-        const r = await wraithCoordinatorDiscover(coordinator.trim(), peers);
+        const r = await wraithCoordinatorDiscover(effectiveCoordinator, peers);
         if (!alive) return;
         const next = tiersFromDiscover(r.tiers);
         if (next.length > 0) {
@@ -130,7 +189,7 @@ export function Mix({ activeWallet }: MixProps) {
     return () => {
       alive = false;
     };
-  }, [coordinator, coordinatorPeersText]);
+  }, [effectiveCoordinator, coordinatorPeersText]);
 
   // On mount: pull ghost_id + auto-derive a fresh mix-output and
   // change address from the wallet's BIP86 keys. Indices 90 / 91
@@ -248,7 +307,7 @@ export function Mix({ activeWallet }: MixProps) {
     setBusy(true);
     try {
       const r = await wraithMixRun({
-        coordinator_url: coordinator.trim(),
+        coordinator_url: effectiveCoordinator,
         coordinator_peers: peers,
         tier_id: tierId,
         ghost_id: ghostId,
@@ -334,7 +393,39 @@ export function Mix({ activeWallet }: MixProps) {
           )}
         </div>
         <div className="col">
-          <label>Coordinator URL</label>
+          <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input
+              type="checkbox"
+              checked={useNetworkCoordinator}
+              onChange={(e) => setUseNetworkCoordinator(e.target.checked)}
+              disabled={busy}
+            />
+            Use the network-elected coordinator
+          </label>
+          <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+            Resolve the coordinator for this tier from the node&apos;s
+            decentralised election (via ghost-pay). Wallets mixing the same tier
+            this epoch converge on one coordinator, for a larger anonymity set.
+          </p>
+          {useNetworkCoordinator && (
+            <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+              {resolving
+                ? "Resolving elected coordinator…"
+                : resolvedEndpoint
+                  ? `→ using elected coordinator ${resolvedEndpoint}${
+                      resolvedEpoch != null ? ` (epoch ${resolvedEpoch})` : ""
+                    }`
+                  : (resolveErr ??
+                    "No elected coordinator — using the manual URL below.")}
+            </p>
+          )}
+        </div>
+
+        <div className="col">
+          <label>
+            Coordinator URL
+            {useNetworkCoordinator && resolvedEndpoint ? " (fallback)" : ""}
+          </label>
           <input
             className="mono"
             value={coordinator}

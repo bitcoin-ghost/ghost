@@ -309,6 +309,16 @@ async fn wraith_coordinator_discover(
     to_value(&resp)
 }
 
+/// Resolve an elected coordinator endpoint for a given mixing tier from the
+/// node's decentralised election (fetched through ghost-pay). Returns
+/// `{ endpoint, epoch }`; `endpoint` is null when the election is off/pending,
+/// in which case the UI keeps the manually-entered coordinator URL.
+#[tauri::command]
+async fn wraith_resolve_coordinator(tier_id: String) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WraithResolveCoordinator { tier_id }).await?;
+    to_value(&resp)
+}
+
 /// One-shot Wraith Lite mix. Daemon enrols, signs the BIP-341
 /// taproot key-path witness using the active wallet's BIP86
 /// keystore, and drives the round to broadcast.
@@ -710,6 +720,7 @@ pub fn run() {
             light_utxos,
             light_l1_utxos,
             wraith_coordinator_discover,
+            wraith_resolve_coordinator,
             wraith_mix_run,
             wallet_ghost_id,
             wallet_glyph,

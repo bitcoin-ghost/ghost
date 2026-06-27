@@ -506,6 +506,26 @@ export async function wraithCoordinatorDiscover(
   return unwrap<WraithDiscoverResult>(resp).payload;
 }
 
+export interface WraithResolveResult {
+  /** Elected coordinator endpoint to dial for the tier, or null when the
+   *  election is off/pending/unadvertised (caller keeps the manual URL). */
+  endpoint: string | null;
+  /** Election epoch the resolution was sharded on, when known. */
+  epoch: number | null;
+}
+
+/**
+ * Resolve the network-elected coordinator endpoint for a mixing tier from the
+ * node's decentralised election (fetched through ghost-pay). Wallets sharing a
+ * (tier, epoch) converge on the same seat for a larger anonymity set.
+ */
+export async function wraithResolveCoordinator(
+  tier_id: string,
+): Promise<WraithResolveResult> {
+  const resp = await invoke("wraith_resolve_coordinator", { tierId: tier_id });
+  return unwrap<WraithResolveResult>(resp).payload;
+}
+
 export interface WraithMixCompleted {
   session_id: string;
   broadcast_txid: string;
