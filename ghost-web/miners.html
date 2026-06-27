@@ -259,7 +259,7 @@
         <div class="qs-n">1</div>
         <div class="qs-body">
           <div class="qs-title">Pick an endpoint</div>
-          <div class="qs-desc">Connect to any public-mining Ghost node. SV1: <code>stratum+tcp://&lt;node-host&gt;:3333</code>. SV2: <code>stratum+tcp://&lt;node-host&gt;:34255</code>. Your own node works too if you're running ghost-pool locally.</div>
+          <div class="qs-desc">Connect to any public-mining Ghost node — or <code>pool.bitcoinghost.org</code>, which round-robins across all the public nodes. <strong>Stratum&nbsp;V1</strong> (works on any ASIC): point your miner at <code>stratum+tcp://pool.bitcoinghost.org:3333</code>. <strong>Stratum&nbsp;V2</strong> (encrypted, for miners with native SV2 firmware): host <code>pool.bitcoinghost.org</code>, port <code>34255</code> — plus the two SV2 settings noted below. Running your own node with public mining on? It works the same way.</div>
         </div>
       </li>
       <li>
@@ -286,10 +286,21 @@
     </ol>
 
     <div class="pending-note">
-      Using the aggregated translator (default in most miners) or running
-      SV2 with the <code>aggregate_channels = false</code> setting both
-      work — in either case your shares are attributed to the exact
-      <code>address.worker</code> string your ASIC authorised with.
+      <strong>Stratum&nbsp;V2 settings.</strong> Most ASICs default to V1 and
+      need nothing extra. For native SV2 (e.g. a Bitaxe on AxeOS), set
+      <strong>Protocol</strong> = Stratum&nbsp;V2,
+      <strong>Channel&nbsp;type</strong> = Extended (the pool sends the coinbase
+      template, so your miner can verify it), and paste the
+      <strong>Authority&nbsp;public&nbsp;key</strong>:
+      <code>9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72</code> — the Ghost
+      network authority key, identical on every public node. Username is the same
+      <code>address.worker</code> as V1; the password is ignored.
+    </div>
+
+    <div class="pending-note">
+      Whichever you use — the aggregated translator (the V1 default) or native
+      SV2 with per-miner channels — your shares are attributed to the exact
+      <code>address.worker</code> string your miner authorised with.
     </div>
   </div>
 </section>

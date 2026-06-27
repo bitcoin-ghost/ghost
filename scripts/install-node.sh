@@ -335,10 +335,16 @@ EOF
 log "Configuring firewall"
 ufw allow 22/tcp        >/dev/null 2>&1   # ssh FIRST so we don't lock out
 ufw allow 8333/tcp      >/dev/null 2>&1   # bitcoin P2P
-ufw allow 3333/tcp      >/dev/null 2>&1   # stratum v1
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus
+# Stratum ports are exposed ONLY when this node accepts public miners. Open
+# Stratum V1 and V2 together so any ASIC connects — legacy V1 hardware on 3333,
+# native SV2 firmware (encrypted) on 34255. A private/solo node opens neither.
+if [[ "$PUBLIC_MINING" == "true" ]]; then
+  ufw allow 3333/tcp    >/dev/null 2>&1   # stratum v1
+  ufw allow 34255/tcp   >/dev/null 2>&1   # stratum v2
+fi
 ufw --force enable      >/dev/null 2>&1
 
 # ─────────────────────────────── 11. start ───────────────────────────────────
