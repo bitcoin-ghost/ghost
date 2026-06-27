@@ -39,7 +39,7 @@ use ghost_common::constants::{SV1_STRATUM_PORT, SV2_STRATUM_PORT};
 
 use crate::auth::{verify_internal_auth, InternalAuth};
 use crate::challenge::*;
-use crate::server::{ShareBatch, ShareNotification, VerificationState};
+use crate::server::{MeshNodeInfo, ShareBatch, ShareNotification, VerificationState};
 use crate::websocket::{ws_handler, WsAuthQuery};
 
 /// M-STOR-3: Check if a path is in the allowed list
@@ -226,6 +226,11 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/pool/recent_shares",
             get(api_pool_recent_shares_handler),
         )
+        // Live mesh node list: this node + every connected peer, with the
+        // already-public gossiped capability/hashrate/miner fields. Lets the
+        // website render the node list from one node instead of a hard-coded
+        // VM set, so new nodes appear automatically.
+        .route("/api/v1/pool/mesh-nodes", get(api_pool_mesh_nodes_handler))
         // Read-only decentralised-coordinator election view. Returns
         // `{enabled:false}` unless the operator turns on
         // `[coordinator] wraith_election_enabled`.
@@ -2358,6 +2363,102 @@ async fn api_pool_recent_shares_handler(
         "now_ts": now_s,
         "since_ts": since_ts,
         "shares": shares,
+    }))
+}
+
+/// Shape one connected peer (`MeshNodeInfo`) into the public mesh-node JSON
+/// object. Self is shaped inline by the handler from local state, so this
+/// helper always renders a peer (`is_self = false`). Pulled out as a free
+/// function so the JSON contract is unit-testable without a live server.
+fn mesh_node_to_json(node: &MeshNodeInfo) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": node.node_id,
+        "address": node.address,
+        "elder": node.elder,
+        "capabilities": {
+            "archive": node.cap_archive,
+            "ghost_pay": node.cap_ghost_pay,
+            "public_mining": node.cap_public_mining,
+            "reaper": node.cap_reaper,
+            "elder": node.cap_elder,
+        },
+        "hashrate_th": node.hashrate_th,
+        "miner_count": node.miner_count,
+        "healthy": node.healthy,
+        "is_self": false,
+    })
+}
+
+/// Live mesh node list = this node (self) + every connected peer.
+///
+/// PUBLIC, no auth (same exposure level as `recent_shares`): every field
+/// returned is already gossiped openly in health pings. The website polls
+/// this on one bootstrap node and renders the whole mesh, so newly-joined
+/// nodes appear automatically without a hard-coded VM list or a per-node
+/// nginx proxy block.
+///
+/// Self is built from this node's local state (the same sources
+/// `/api/v1/mining/status` uses); peers come from the in-memory
+/// `PeerManager` via the `mesh_nodes` callback (no network calls). Results
+/// are deduplicated by `node_id` with self always included exactly once;
+/// a missing field on any one peer degrades to a default (`0`/`false`)
+/// rather than failing the whole response.
+async fn api_pool_mesh_nodes_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let health = state.get_health().await;
+
+    // Self address: the operator-configured public host (+ HTTP port when a
+    // bare host was configured). Falls back to an empty string — never fails.
+    let self_address = {
+        let config = state.dashboard_config.read();
+        match config.stratum_host.clone() {
+            Some(host) if host.contains(':') => host,
+            Some(host) => {
+                let port = config.http_port.unwrap_or(8080);
+                format!("{host}:{port}")
+            }
+            None => String::new(),
+        }
+    };
+
+    let self_caps = &health.capabilities;
+    let self_node = serde_json::json!({
+        "node_id": health.node_id,
+        "address": self_address,
+        "elder": self_caps.elder_status,
+        "capabilities": {
+            "archive": self_caps.archive_mode,
+            "ghost_pay": self_caps.ghost_pay,
+            "public_mining": self_caps.public_mining,
+            "reaper": self_caps.reaper,
+            "elder": self_caps.elder_status,
+        },
+        // This node's own realized hashrate (same windowed value it gossips);
+        // 0.0 on deploys without the local-hashrate provider wired.
+        "hashrate_th": state.local_hashrate().unwrap_or(0.0),
+        "miner_count": health.miner_count,
+        // Self is serving this request, so it is healthy by definition.
+        "healthy": true,
+        "is_self": true,
+    });
+
+    let mut nodes = vec![self_node];
+    // Dedup by node_id; self is already in, so skip any peer that re-reports
+    // this node's id (e.g. a same-host placeholder).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(health.node_id.clone());
+
+    for peer in state.mesh_nodes() {
+        if seen.insert(peer.node_id.clone()) {
+            nodes.push(mesh_node_to_json(&peer));
+        }
+    }
+
+    let total = nodes.len();
+    Json(serde_json::json!({
+        "nodes": nodes,
+        "total": total,
     }))
 }
 
@@ -7513,5 +7614,65 @@ mod tests {
     fn test_safe_proc_path_traversal() {
         let allowed = vec!["/proc/meminfo".to_string(), "/proc/cpuinfo".to_string()];
         assert!(!is_safe_proc_path("/proc/../etc/passwd", &allowed));
+    }
+
+    #[test]
+    fn test_mesh_node_to_json_shape() {
+        let node = MeshNodeInfo {
+            node_id: "deadbeef".to_string(),
+            address: "1.2.3.4:8080".to_string(),
+            elder: true,
+            cap_archive: true,
+            cap_ghost_pay: false,
+            cap_public_mining: true,
+            cap_reaper: false,
+            cap_elder: true,
+            hashrate_th: 12.5,
+            miner_count: 3,
+            healthy: true,
+        };
+
+        let v = mesh_node_to_json(&node);
+        assert_eq!(v["node_id"], "deadbeef");
+        assert_eq!(v["address"], "1.2.3.4:8080");
+        assert_eq!(v["elder"], true);
+        assert_eq!(v["hashrate_th"], 12.5);
+        assert_eq!(v["miner_count"], 3);
+        assert_eq!(v["healthy"], true);
+        // Peers are never self.
+        assert_eq!(v["is_self"], false);
+        // Capabilities are nested exactly as the website expects.
+        assert_eq!(v["capabilities"]["archive"], true);
+        assert_eq!(v["capabilities"]["ghost_pay"], false);
+        assert_eq!(v["capabilities"]["public_mining"], true);
+        assert_eq!(v["capabilities"]["reaper"], false);
+        assert_eq!(v["capabilities"]["elder"], true);
+    }
+
+    #[test]
+    fn test_mesh_node_to_json_defaults_for_bare_peer() {
+        // A peer that has only just been discovered (no gossiped metrics yet)
+        // must still serialize to a complete object with safe defaults rather
+        // than dropping fields or failing.
+        let node = MeshNodeInfo {
+            node_id: "00ff".to_string(),
+            address: String::new(),
+            elder: false,
+            cap_archive: false,
+            cap_ghost_pay: false,
+            cap_public_mining: false,
+            cap_reaper: false,
+            cap_elder: false,
+            hashrate_th: 0.0,
+            miner_count: 0,
+            healthy: false,
+        };
+
+        let v = mesh_node_to_json(&node);
+        assert_eq!(v["address"], "");
+        assert_eq!(v["hashrate_th"], 0.0);
+        assert_eq!(v["miner_count"], 0);
+        assert_eq!(v["healthy"], false);
+        assert!(v["capabilities"].is_object());
     }
 }

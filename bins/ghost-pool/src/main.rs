@@ -3398,6 +3398,36 @@ async fn main() -> Result<()> {
             .collect()
     });
 
+    // Live mesh node list for the public /api/v1/pool/mesh-nodes endpoint.
+    // Maps every connected peer to MeshNodeInfo using only already-gossiped,
+    // public fields (capabilities, hashrate, miner count). 120s freshness:
+    // wide enough to tolerate a few missed ~10s health pings, narrow enough
+    // that a genuinely gone node ages out. Self is added by the handler from
+    // local state, so this returns peers only. No network calls.
+    let mesh_for_node_list = Arc::clone(&mesh);
+    verification_state = verification_state.with_mesh_nodes(move || {
+        use ghost_verification::MeshNodeInfo;
+        mesh_for_node_list
+            .peers()
+            .get_connected_peers(120)
+            .into_iter()
+            .map(|p| MeshNodeInfo {
+                node_id: p.node_id_hex(),
+                address: p.public_address.clone(),
+                elder: p.is_elder,
+                cap_archive: p.capabilities.archive_mode,
+                cap_ghost_pay: p.capabilities.ghost_pay,
+                cap_public_mining: p.capabilities.public_mining,
+                cap_reaper: p.capabilities.reaper,
+                cap_elder: p.capabilities.elder_status,
+                hashrate_th: p.local_hashrate_th,
+                miner_count: p.miner_count,
+                // get_connected_peers already filtered to Connected + fresh.
+                healthy: true,
+            })
+            .collect()
+    });
+
     // Mesh-wide deduplicated active miner count. Unions local active miner_id
     // hashes with the most-recent set from each connected peer.
     //

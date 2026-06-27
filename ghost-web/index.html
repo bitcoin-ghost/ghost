@@ -545,7 +545,32 @@
       return out;
     }
 
+    // Bootstrap seeds = the original four load-balancer proxies. New mesh
+    // nodes have NO per-node proxy, so we always enter through one of these
+    // seeds; the /api/v1/pool/mesh-nodes endpoint then returns the WHOLE mesh
+    // (self + every connected peer) from that single node, so nodes 5, 6, …
+    // appear automatically without a hard-coded list.
     var VMS = ['vm1', 'vm2', 'vm3', 'vm4'];
+
+    // Try each seed in order; the first that answers returns the live mesh
+    // node list. Returns null if every seed is unreachable so the caller can
+    // fall back gracefully.
+    async function fetchMeshNodes() {
+      for (var i = 0; i < VMS.length; i++) {
+        try {
+          var ctl = new AbortController();
+          var t = setTimeout(function () { ctl.abort(); }, 5000);
+          var r = await fetch('/api/pool/' + VMS[i] + '/api/v1/pool/mesh-nodes', { signal: ctl.signal });
+          clearTimeout(t);
+          if (r.ok) {
+            var d = await r.json();
+            if (d && Array.isArray(d.nodes) && d.nodes.length) return d.nodes;
+          }
+        } catch (e) { /* try the next seed */ }
+      }
+      return null;
+    }
+
     // Always render with a unit suffix so a 0-hashrate moment looks
     // "loaded but quiet" rather than "broken / not populated".
     function formatHashrate(ths) {
@@ -558,6 +583,9 @@
     }
     async function refresh() {
       try {
+        // Kick off the whole-mesh node fetch in parallel with the per-seed
+        // status polls so the headline metrics aren't gated on it.
+        var meshNodesPromise = fetchMeshNodes();
         var results = await Promise.all(VMS.map(function (vm) {
           var ctl = new AbortController();
           var t = setTimeout(function () { ctl.abort(); }, 5000);
@@ -606,9 +634,18 @@
         var heightEl = document.getElementById('live-height');
         if (hashEl)   hashEl.innerHTML = formatHashrate(hashSmoothed != null ? hashSmoothed : hash);
         if (minersEl) minersEl.textContent = Math.round(minersSmoothed != null ? minersSmoothed : rawMiners).toString();
-        if (nodesEl)  nodesEl.innerHTML = online + '<span class="unit"> / 4</span>';
+        // Active nodes: the live mesh count (self + connected peers) from one
+        // seed, so new nodes show up automatically. Falls back to "online / 4"
+        // — the count of reachable seeds — when the mesh endpoint is briefly
+        // unavailable, so the tile never blanks or breaks.
+        var meshNodes = await meshNodesPromise;
+        var meshCount = (meshNodes && meshNodes.length) ? meshNodes.length : null;
+        if (nodesEl) {
+          if (meshCount != null) nodesEl.textContent = String(meshCount);
+          else nodesEl.innerHTML = online + '<span class="unit"> / ' + VMS.length + '</span>';
+        }
         if (heightEl) heightEl.textContent = height ? height.toLocaleString() : '—';
-        console.debug('[index] refresh ok · ' + online + '/4 nodes · ' + hash.toFixed(2) + ' TH/s · ' + rawMiners + ' miners');
+        console.debug('[index] refresh ok · ' + online + '/' + VMS.length + ' seeds · ' + (meshCount != null ? meshCount + ' mesh nodes · ' : '') + hash.toFixed(2) + ' TH/s · ' + rawMiners + ' miners');
       } catch (err) {
         // Don't let a transient error stop the 30s polling cadence — log
         // and let the next tick try again.
