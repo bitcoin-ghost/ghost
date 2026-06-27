@@ -1638,6 +1638,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/withdrawals/:id", get(get_withdrawal))
         // Status endpoints
         .route("/api/v1/status", get(get_status))
+        // Decentralised-coordinator election relay. Proxies the node's public
+        // /api/v1/pool/coordinator so the wallet can resolve elected coordinators
+        // through ghost-pay (never the pool API directly — wallet hard rule).
+        .route("/api/v1/pool/coordinator", get(get_coordinator_election))
         // Public Pay activity stats for bitcoinghost.org/pay.html. All
         // aggregates, no per-row detail — privacy preserved for both
         // users and operators.
@@ -3105,6 +3109,48 @@ async fn pay_stats_handler(State(state): State<Arc<AppState>>) -> Json<serde_jso
         "epoch_fee_pool_sats": stats.epoch_fee_pool_sats,
         "unspent_notes": stats.unspent_notes,
     }))
+}
+
+/// Relay the local node's decentralised-coordinator election view to the wallet.
+///
+/// The wallet must never hit the node's pool API (`:8080`) directly (hard rule,
+/// `apps/wraith-wallet/CLAUDE.md`), so ghost-pay proxies the node's public
+/// `GET /api/v1/pool/coordinator` here. On any fetch/parse failure we return the
+/// inert `{"enabled": false}` shape — identical to a node with the election
+/// feature off — so the wallet simply falls back to a manually-configured
+/// coordinator URL rather than erroring. Capped at a 1.5s deadline so a hung
+/// pool API can't block the wallet.
+async fn get_coordinator_election(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let url = format!("{}/api/v1/pool/coordinator", state.pool_api_url);
+    let disabled = || serde_json::json!({ "enabled": false });
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        state.pool_http_client.get(&url).send(),
+    )
+    .await;
+    match fetched {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => Json(body),
+                Err(e) => {
+                    tracing::warn!(error = %e, "coordinator relay: malformed election JSON from pool");
+                    Json(disabled())
+                }
+            }
+        }
+        Ok(Ok(resp)) => {
+            tracing::warn!(status = %resp.status(), "coordinator relay: pool returned non-success");
+            Json(disabled())
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "coordinator relay: pool unreachable");
+            Json(disabled())
+        }
+        Err(_) => {
+            tracing::warn!("coordinator relay: pool fetch timed out");
+            Json(disabled())
+        }
+    }
 }
 
 /// Get node status
