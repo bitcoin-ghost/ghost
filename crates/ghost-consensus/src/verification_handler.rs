@@ -94,6 +94,23 @@ pub trait ResultReVerifier: Send + Sync {
         target_node_id: &NodeId,
         target_signed_response: Option<&str>,
     ) -> ReVerdict;
+
+    /// Re-derive a Policy (Bitcoin Pure) verdict from the TARGET's signed
+    /// `PolicyResponse` and the recipient's OWN policy engine.
+    ///
+    /// `challenge_data` is the challenger-authored JSON; the recipient reads only
+    /// the `tx_hex` from it (the exact transaction the target classified) — every
+    /// value the verdict turns on otherwise comes from the TARGET-signed payload
+    /// (the classification) or the recipient's own engine (ground truth). The
+    /// recipient BINDS the two: it recomputes the txid of `tx_hex` and requires it
+    /// to equal the signed `tx_txid`, so a colluder cannot pair a valid signed
+    /// classification with a different `tx_hex` to grief the target.
+    async fn reverify_policy(
+        &self,
+        target_node_id: &NodeId,
+        challenge_data: &str,
+        target_signed_response: Option<&str>,
+    ) -> ReVerdict;
 }
 
 /// Extract `(block_height, block_hash)` from the TARGET-signed archive response
@@ -121,6 +138,42 @@ fn parse_signed_archive_height_hash(signed: Option<&str>) -> (Option<u64>, Optio
         .and_then(|h| h.as_str())
         .map(String::from);
     (height, hash)
+}
+
+/// Extract `(tx_txid, response_tier)` from the TARGET-signed policy response JSON
+/// (`SignedResponse<PolicyResponse>`) for the informational DB columns.
+///
+/// SECURITY: this is used ONLY to populate the diagnostic txid/tier columns; the
+/// stored `passed` verdict comes from [`ResultReVerifier::reverify_policy`]. The
+/// txid/tier are read from inside the target's signed `payload` (not from the
+/// challenger's `challenge_data`). `response_tier` maps the tier string to the
+/// 0..=3 BUDS integer used by `insert_policy_challenge`.
+fn parse_signed_policy_fields(signed: Option<&str>) -> (Option<String>, Option<i32>) {
+    let raw = match signed {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return (None, None),
+    };
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let payload = value.get("payload");
+    let txid = payload
+        .and_then(|p| p.get("tx_txid"))
+        .and_then(|t| t.as_str())
+        .map(String::from);
+    let response_tier = payload
+        .and_then(|p| p.get("classification"))
+        .and_then(|c| c.get("tier"))
+        .and_then(|t| t.as_str())
+        .and_then(|t| match t {
+            "T0" => Some(0),
+            "T1" => Some(1),
+            "T2" => Some(2),
+            "T3" => Some(3),
+            _ => None,
+        });
+    (txid, response_tier)
 }
 
 /// Handler for verification result messages
@@ -419,9 +472,56 @@ impl VerificationResultHandler {
                 }
             }
             CapabilityType::Policy => {
-                let txid = serde_json::from_str::<serde_json::Value>(&msg.challenge_data)
-                    .ok()
-                    .and_then(|v| v.get("txid").and_then(|t| t.as_str()).map(String::from))
+                // SECURITY (consensus): never store the challenger-supplied
+                // `passed` verbatim. When a re-deriver is configured, recompute
+                // the verdict from THIS node's own policy engine and the TARGET's
+                // own signed classification (bound to the challenger's tx_hex by a
+                // txid recompute), so a colluding challenger cannot fabricate a
+                // FAIL (to grief) or a PASS (to inflate a peer).
+                let stored_passed = if let Some(ref reverifier) = self.reverifier {
+                    match reverifier
+                        .reverify_policy(
+                            &msg.target_node_id,
+                            &msg.challenge_data,
+                            msg.target_signed_response.as_deref(),
+                        )
+                        .await
+                    {
+                        ReVerdict::Pass => true,
+                        ReVerdict::Fail => false,
+                        ReVerdict::Unverifiable => {
+                            // We cannot independently judge this result (no/invalid
+                            // target signature, unparseable response, tx_hex
+                            // missing/undeserializable, or txid binding mismatch).
+                            // Record NOTHING — never a false FAIL, never an
+                            // unverified PASS.
+                            debug!(
+                                challenger = %short_challenger,
+                                target = %short_target,
+                                "Policy verdict unverifiable - not recording (no grief)"
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    // Legacy path (unit tests / no re-deriver wired): preserve the
+                    // prior behaviour of trusting the challenger's verdict.
+                    msg.passed
+                };
+
+                // Informational DB columns only. Prefer the txid/tier from inside
+                // the TARGET-signed response (trustworthy); fall back to the
+                // challenger-authored fields. The stored `passed` above — NOT
+                // these — is what gates the payout.
+                let (signed_txid, signed_tier) =
+                    parse_signed_policy_fields(msg.target_signed_response.as_deref());
+
+                let txid = signed_txid
+                    .or_else(|| {
+                        serde_json::from_str::<serde_json::Value>(&msg.challenge_data)
+                            .ok()
+                            .and_then(|v| v.get("txid").and_then(|t| t.as_str()).map(String::from))
+                    })
                     .unwrap_or_default();
 
                 let expected_tier = serde_json::from_str::<serde_json::Value>(&msg.challenge_data)
@@ -429,11 +529,13 @@ impl VerificationResultHandler {
                     .and_then(|v| v.get("expected_tier").and_then(|t| t.as_i64()))
                     .unwrap_or(0) as i32;
 
-                let response_tier = msg.response_data.as_ref().and_then(|rd| {
-                    serde_json::from_str::<serde_json::Value>(rd)
-                        .ok()
-                        .and_then(|v| v.get("tier").and_then(|t| t.as_i64()))
-                        .map(|t| t as i32)
+                let response_tier = signed_tier.or_else(|| {
+                    msg.response_data.as_ref().and_then(|rd| {
+                        serde_json::from_str::<serde_json::Value>(rd)
+                            .ok()
+                            .and_then(|v| v.get("tier").and_then(|t| t.as_i64()))
+                            .map(|t| t as i32)
+                    })
                 });
 
                 if let Err(e) = self.db.insert_policy_challenge(
@@ -442,7 +544,7 @@ impl VerificationResultHandler {
                     &txid,
                     expected_tier,
                     response_tier,
-                    msg.passed,
+                    stored_passed,
                 ) {
                     warn!(error = %e, "Failed to store policy challenge result");
                 }
@@ -600,6 +702,15 @@ mod tests {
         ) -> ReVerdict {
             self.0
         }
+
+        async fn reverify_policy(
+            &self,
+            _target_node_id: &NodeId,
+            _challenge_data: &str,
+            _target_signed_response: Option<&str>,
+        ) -> ReVerdict {
+            self.0
+        }
     }
 
     /// Build a properly-signed Archive `VerificationResultMessage` envelope.
@@ -700,6 +811,107 @@ mod tests {
         handler.handle_verification_result(&env).await.unwrap();
 
         let (passed, total) = db.get_archive_pass_rate(&hex::encode(target), 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(passed, 1, "legacy path stores msg.passed unchanged");
+    }
+
+    // ---- Policy (Bitcoin Pure) re-derivation, handler level ----
+
+    /// Build a properly-signed Policy `VerificationResultMessage` envelope.
+    fn build_policy_envelope(
+        challenger: &NodeIdentity,
+        target: NodeId,
+        msg_passed: bool,
+    ) -> MessageEnvelope {
+        let mut msg = VerificationResultMessage {
+            target_node_id: target,
+            challenger_id: challenger.node_id(),
+            capability: CapabilityType::Policy,
+            passed: msg_passed,
+            challenge_data: r#"{"tx_type":"T0","expected_tier":"T0","tx_hex":"00"}"#.to_string(),
+            response_data: Some(r#"{"tier":"T0","accepted":true}"#.to_string()),
+            target_signed_response: Some("{\"stub\":true}".to_string()),
+            timestamp: Utc::now().timestamp(),
+            signature: [0u8; 64],
+        };
+        let signing_data = msg.signing_data();
+        msg.signature = challenger.sign(&signing_data);
+        let payload = serde_json::to_vec(&msg).expect("serialize VRM");
+        MessageEnvelope::new(
+            MessageType::VerificationResult,
+            challenger.node_id(),
+            payload,
+            1,
+            [0u8; 64],
+        )
+    }
+
+    /// GRIEF OVERRIDE (priority): challenger claims `passed=false` but our
+    /// re-derivation says Pass — the handler stores the re-derived PASS.
+    #[tokio::test]
+    async fn handler_stores_rederived_policy_pass_over_grief() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let challenger = NodeIdentity::generate();
+        let target = [19u8; 32];
+        let env = build_policy_envelope(&challenger, target, false);
+
+        let handler = VerificationResultHandler::new(Arc::clone(&db))
+            .with_rederivation(Arc::new(StubReverifier(ReVerdict::Pass)));
+        handler.handle_verification_result(&env).await.unwrap();
+
+        let (passed, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
+        assert_eq!(total, 1, "result must be recorded");
+        assert_eq!(passed, 1, "stored verdict must be the re-derived PASS");
+    }
+
+    /// FRAUD OVERRIDE: challenger claims `passed=true` but our re-derivation says
+    /// Fail — the handler stores the re-derived FAIL.
+    #[tokio::test]
+    async fn handler_stores_rederived_policy_fail_over_inflation() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let challenger = NodeIdentity::generate();
+        let target = [18u8; 32];
+        let env = build_policy_envelope(&challenger, target, true);
+
+        let handler = VerificationResultHandler::new(Arc::clone(&db))
+            .with_rederivation(Arc::new(StubReverifier(ReVerdict::Fail)));
+        handler.handle_verification_result(&env).await.unwrap();
+
+        let (passed, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
+        assert_eq!(total, 1, "result must be recorded");
+        assert_eq!(passed, 0, "stored verdict must be the re-derived FAIL");
+    }
+
+    /// UNVERIFIABLE: the handler must store NOTHING (never a false FAIL), even
+    /// though the challenger claimed `passed=true`.
+    #[tokio::test]
+    async fn handler_stores_nothing_on_unverifiable_policy() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let challenger = NodeIdentity::generate();
+        let target = [17u8; 32];
+        let env = build_policy_envelope(&challenger, target, true);
+
+        let handler = VerificationResultHandler::new(Arc::clone(&db))
+            .with_rederivation(Arc::new(StubReverifier(ReVerdict::Unverifiable)));
+        handler.handle_verification_result(&env).await.unwrap();
+
+        let (_passed, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
+        assert_eq!(total, 0, "unverifiable policy result must NOT be recorded");
+    }
+
+    /// LEGACY: with no re-verifier wired, the policy path preserves the old
+    /// behaviour of storing the challenger-supplied `passed` verbatim.
+    #[tokio::test]
+    async fn handler_without_rederivation_stores_policy_msg_passed() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let challenger = NodeIdentity::generate();
+        let target = [16u8; 32];
+
+        let env = build_policy_envelope(&challenger, target, true);
+        let handler = VerificationResultHandler::new(Arc::clone(&db));
+        handler.handle_verification_result(&env).await.unwrap();
+
+        let (passed, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
         assert_eq!(total, 1);
         assert_eq!(passed, 1, "legacy path stores msg.passed unchanged");
     }

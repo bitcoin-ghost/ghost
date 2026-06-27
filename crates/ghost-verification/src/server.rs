@@ -1889,6 +1889,11 @@ impl VerificationState {
             classification,
             accepted,
             rejection_reason,
+            // CONSENSUS SECURITY: bind this classification to the exact tx we
+            // evaluated. This goes inside the SIGNED payload, so a recipient can
+            // verify the challenger paired our signature with the correct tx_hex
+            // (txid recompute must match) before trusting the verdict.
+            tx_txid: Some(tx.compute_txid().to_string()),
             error: None,
         })
     }

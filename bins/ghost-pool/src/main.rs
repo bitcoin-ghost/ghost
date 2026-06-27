@@ -1495,7 +1495,10 @@ async fn main() -> Result<()> {
     let verification_result_handler = Arc::new(
         VerificationResultHandler::with_peers(Arc::clone(&db), Arc::clone(mesh.peers()))
             .with_rederivation(Arc::new(
-                ghost_pool::verification_reverify::ChainReVerifier::new(Arc::clone(&rpc)),
+                ghost_pool::verification_reverify::ChainReVerifier::new(
+                    Arc::clone(&rpc),
+                    policy.clone(),
+                ),
             )),
     );
     mesh.register_handler(Arc::clone(&verification_result_handler)
@@ -5092,6 +5095,7 @@ async fn main() -> Result<()> {
         Ok(verification_task) => {
             let verification_task = verification_task
                 .with_rpc(Arc::clone(&rpc))
+                .with_policy(policy.clone())
                 .with_broadcast(verification_tx);
 
             let mut verification_shutdown = shutdown_tx.subscribe();

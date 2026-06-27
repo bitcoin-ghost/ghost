@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::types::NodeId;
+use ghost_policy::PolicyProfile;
 use ghost_storage::Database;
 
 use crate::client::VerificationClient;
@@ -620,6 +621,15 @@ pub struct VerificationTask {
     broadcast_tx: Option<VerificationBroadcastSender>,
     /// Bitcoin RPC for fetching real block data
     rpc: Option<Arc<BitcoinRpc>>,
+    /// CONSENSUS SECURITY: policy profile used to classify our own policy-challenge
+    /// transactions. The challenger derives its OWN ground-truth `(tier, accepted)`
+    /// from this engine and compares the target's signed classification against it
+    /// via [`crate::challenge::validate_policy_response`] — the SAME comparator a
+    /// recipient runs when re-deriving the verdict, so challenger and recipients
+    /// agree exactly on a homogeneous fleet. Defaults to `bitcoin_pure` (the policy
+    /// the +2 BitcoinPure capability attests); overridden per-node via
+    /// [`VerificationTask::with_policy`] from the node's configured profile.
+    policy: PolicyProfile,
     /// LOW-VER-3: Track challenges per target for even distribution
     challenge_tracker: std::sync::Mutex<ChallengeTracker>,
 }
@@ -659,6 +669,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -703,6 +714,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -741,6 +753,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -782,6 +795,7 @@ impl VerificationTask {
             config: VerificationTaskConfig::default(),
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -806,6 +820,7 @@ impl VerificationTask {
             config,
             broadcast_tx: None,
             rpc: None,
+            policy: PolicyProfile::bitcoin_pure(),
             challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
         })
     }
@@ -846,6 +861,15 @@ impl VerificationTask {
     /// Set the Bitcoin RPC client for fetching real block data
     pub fn with_rpc(mut self, rpc: Arc<BitcoinRpc>) -> Self {
         self.rpc = Some(rpc);
+        self
+    }
+
+    /// CONSENSUS SECURITY: set the policy profile used to classify our own
+    /// policy-challenge transactions, so the challenger's verdict is derived from
+    /// the SAME comparator/engine a recipient uses to re-derive it. Should be the
+    /// node's configured profile (the one served by its `/verify/policy` endpoint).
+    pub fn with_policy(mut self, policy: PolicyProfile) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -1426,16 +1450,49 @@ impl VerificationTask {
             }
         };
         let expected_tier = if dirty { "non-T0" } else { "T0" };
+
+        // CONSENSUS SECURITY: derive OUR OWN ground-truth classification of the
+        // exact tx we are about to send, using OUR policy engine. The verdict is
+        // then `our classification == the target's signed classification`, via the
+        // SAME comparator a recipient runs — so the challenger's recorded verdict
+        // and a recipient's re-derived verdict agree on a homogeneous fleet. The
+        // clean/dirty split only controls which tx we build (positive vs negative
+        // control); the engine, not a "non-T0" wildcard, decides the ground truth.
+        let our_tx: bitcoin::Transaction = match hex::decode(&test_tx_hex)
+            .ok()
+            .and_then(|b| bitcoin::consensus::deserialize(&b).ok())
+        {
+            Some(tx) => tx,
+            None => {
+                // We just built this tx; failing to round-trip it is a local bug,
+                // not a peer fault. Skip rather than broadcast a bogus verdict.
+                warn!(
+                    peer = %peer_id_hex[..8],
+                    "Failed to deserialize own policy-challenge tx, skipping"
+                );
+                return Ok(());
+            }
+        };
+        let our_decision = ghost_policy::PolicyEngine::new(self.policy.clone()).evaluate(&our_tx);
+        let our_tier = our_decision.tier().to_string();
+        let our_accepted = our_decision.is_accepted();
+
         debug!(
             dirty,
             tx_hex_len = test_tx_hex.len(),
             expected_tier,
-            "Built policy challenge transaction"
+            our_tier = %our_tier,
+            our_accepted,
+            "Built policy challenge transaction (own classification derived)"
         );
 
+        // CONSENSUS SECURITY: broadcast the tx_hex we used so recipients can BIND
+        // the target's signed classification to it (txid recompute must match the
+        // signed `tx_txid`). tx_type/expected_tier remain for diagnostics.
         let challenge_data = serde_json::json!({
             "tx_type": if dirty { "dirty" } else { "T0" },
             "expected_tier": expected_tier,
+            "tx_hex": test_tx_hex,
         })
         .to_string();
 
@@ -1444,19 +1501,17 @@ impl VerificationTask {
             .verify_policy(&peer.http_address, &test_tx_hex)
             .await;
 
-        let (passed, tier, response_data) = match result {
-            Ok(resp) => {
+        // `target_signed_response` is the TARGET's own signed `PolicyResponse`
+        // JSON; it is threaded into the broadcast so recipients can re-derive the
+        // verdict against their own policy engine instead of trusting our `passed`.
+        let (passed, tier, response_data, target_signed_response) = match result {
+            Ok((resp, signed_raw)) => {
+                // Same comparator the recipient uses — zero divergence. The
+                // target's signed classification is checked against OUR engine's
+                // classification of the SAME tx.
+                let (passed, _detail) =
+                    crate::challenge::validate_policy_response(&resp, &our_tier, our_accepted);
                 let tier = resp.classification.as_ref().map(|c| c.tier.clone());
-                let passed = if dirty {
-                    // GHOST-01 negative control: a real filtering node classifies
-                    // the data-carrier tx as non-T0 AND does not accept it.
-                    let non_t0 = tier.as_ref().map(|t| t != "T0").unwrap_or(false);
-                    resp.success && non_t0 && !resp.accepted
-                } else {
-                    // MED-VER-2: clean tx must classify EXACTLY T0 (not T0 OR T1).
-                    let tier_ok = tier.as_ref().map(|t| t == "T0").unwrap_or(false);
-                    resp.success && tier_ok
-                };
 
                 (
                     passed,
@@ -1470,11 +1525,12 @@ impl VerificationTask {
                         })
                         .to_string(),
                     ),
+                    signed_raw,
                 )
             }
             Err(e) => {
                 warn!(error = %e, peer = %peer_id_hex[..8], "Policy verification failed");
-                (false, None, Some(format!("{{\"error\":\"{}\"}}", e)))
+                (false, None, Some(format!("{{\"error\":\"{}\"}}", e)), None)
             }
         };
 
@@ -1522,7 +1578,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
-            None,
+            target_signed_response,
         )
         .await;
 

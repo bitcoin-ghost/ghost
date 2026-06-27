@@ -633,18 +633,22 @@ impl VerificationClient {
         }
     }
 
-    /// Verify policy capability
+    /// Verify policy capability.
+    ///
+    /// Returns `(PolicyResponse, Option<raw_signed_json>)`. We request a SIGNED
+    /// response (no `unsigned=true`) so recipients of the broadcast can RE-DERIVE
+    /// the verdict against their own policy engine + the target's signature
+    /// instead of trusting the challenger's `passed`. The second element is the
+    /// raw `SignedResponse<PolicyResponse>` JSON verbatim (when the target signed),
+    /// so the target's signature stays verifiable end-to-end.
     pub async fn verify_policy(
         &self,
         node_address: &str,
         tx_hex: &str,
-    ) -> GhostResult<PolicyResponse> {
+    ) -> GhostResult<(PolicyResponse, Option<String>)> {
         let url = self.build_url(
             node_address,
-            &format!(
-                "/verify/policy?tx={}&unsigned=true",
-                urlencoding::encode(tx_hex)
-            ),
+            &format!("/verify/policy?tx={}", urlencoding::encode(tx_hex)),
         )?;
 
         debug!(url = %url, "Verifying policy capability");
@@ -654,23 +658,54 @@ impl VerificationClient {
             GhostError::VerificationTimeout("Policy verification request failed".to_string())
         })?;
 
-        // Policy endpoint returns {"signed": bool, "response": PolicyResponse}
+        // Policy endpoint returns {"signed": bool, "response": <T>} where T is a
+        // `SignedResponse<PolicyResponse>` when signed==true, else a bare
+        // `PolicyResponse`.
         let wrapper: serde_json::Value = response.json().await.map_err(|e| {
             debug!("Policy verification response parse error: {}", e);
             GhostError::InvalidVerificationResponse("Invalid policy response format".to_string())
         })?;
 
-        // Extract the inner response object
+        let signed_flag = wrapper
+            .get("signed")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+
         let inner = wrapper.get("response").ok_or_else(|| {
             GhostError::InvalidVerificationResponse("Missing 'response' field".to_string())
         })?;
 
-        let result: PolicyResponse = serde_json::from_value(inner.clone()).map_err(|e| {
-            debug!("Policy response deserialization error: {}", e);
-            GhostError::InvalidVerificationResponse("Invalid policy response data".to_string())
-        })?;
+        if signed_flag {
+            // `inner` is a SignedResponse<PolicyResponse>; the PolicyResponse is
+            // its `payload`. Capture the raw signed JSON verbatim so the target's
+            // signature stays verifiable end-to-end by recipients.
+            let raw_signed = serde_json::to_string(inner).map_err(|e| {
+                debug!("Policy signed response re-serialization error: {}", e);
+                GhostError::InvalidVerificationResponse(
+                    "Invalid signed policy response".to_string(),
+                )
+            })?;
 
-        Ok(result)
+            let payload = inner.get("payload").ok_or_else(|| {
+                GhostError::InvalidVerificationResponse(
+                    "Signed policy response missing 'payload'".to_string(),
+                )
+            })?;
+
+            let result: PolicyResponse = serde_json::from_value(payload.clone()).map_err(|e| {
+                debug!("Policy payload deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid policy response data".to_string())
+            })?;
+
+            Ok((result, Some(raw_signed)))
+        } else {
+            let result: PolicyResponse = serde_json::from_value(inner.clone()).map_err(|e| {
+                debug!("Policy response deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse("Invalid policy response data".to_string())
+            })?;
+
+            Ok((result, None))
+        }
     }
 
     /// Verify stratum capability
@@ -847,7 +882,7 @@ impl VerificationClient {
         if result.claimed_capabilities.reaper {
             if let Some(tx) = test_tx_hex {
                 match self.verify_policy(node_address, tx).await {
-                    Ok(resp) => result.policy_verified = resp.success,
+                    Ok((resp, _signed)) => result.policy_verified = resp.success,
                     Err(e) => result.errors.push(format!("Policy: {}", e)),
                 }
             }
