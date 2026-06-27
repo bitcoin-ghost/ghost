@@ -17,6 +17,7 @@ import { Send } from "./screens/Send";
 import { Sign } from "./screens/Sign";
 import { Cosigner } from "./screens/Cosigner";
 import { Mix } from "./screens/Mix";
+import { Glyph } from "./screens/Glyph";
 import { Merchant } from "./screens/Merchant";
 import { Reports } from "./screens/Reports";
 import { Locks } from "./screens/Locks";
@@ -35,6 +36,7 @@ type Screen =
   | "sign"
   | "cosigner"
   | "mix"
+  | "glyph"
   | "merchant"
   | "reports"
   | "locks"
@@ -49,6 +51,7 @@ const NAV: Array<{ id: Screen; label: string }> = [
   { id: "sign", label: "Sign" },
   { id: "cosigner", label: "Cosigner" },
   { id: "mix", label: "Mix" },
+  { id: "glyph", label: "Glyph" },
   { id: "merchant", label: "Merchant" },
   { id: "reports", label: "Reports" },
   { id: "locks", label: "Locks" },
@@ -215,6 +218,8 @@ export default function App() {
         return <Cosigner activeWallet={walletState.active} />;
       case "mix":
         return <Mix activeWallet={walletState.active} />;
+      case "glyph":
+        return <Glyph activeWallet={walletState.active} />;
       case "merchant":
         return (
           <Merchant

@@ -306,6 +306,148 @@ impl GhostPayClient {
             .map_err(|e| ChainError::Malformed(e.to_string()))
     }
 
+    /// Fetch the registered Ghost Glyph for `ghost_id` via
+    /// `GET /api/v1/glyph/{ghost_id}`. Public route. Returns the raw
+    /// `GlyphInfoResponse` JSON; the daemon narrows it into a typed
+    /// struct. A 404 (no glyph yet) surfaces as `ChainError::Backend`.
+    pub async fn get_glyph(&self, ghost_id: &str) -> Result<serde_json::Value, ChainError> {
+        let mut last_err: Option<ChainError> = None;
+        for base in &self.base_urls {
+            match self.try_get_glyph(base, ghost_id).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::debug!(url = %base, error = %e, "ghost-pay get_glyph failed, trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ChainError::Transport("no endpoints configured".into())))
+    }
+
+    /// Check whether a glyph bitmap is unclaimed via
+    /// `GET /api/v1/glyph/check/{bitmap_hash_hex}`. Public route.
+    /// Returns the raw `{ "available": bool }` JSON.
+    pub async fn check_glyph(
+        &self,
+        bitmap_hash_hex: &str,
+    ) -> Result<serde_json::Value, ChainError> {
+        let mut last_err: Option<ChainError> = None;
+        for base in &self.base_urls {
+            match self.try_check_glyph(base, bitmap_hash_hex).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::debug!(url = %base, error = %e, "ghost-pay check_glyph failed, trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ChainError::Transport("no endpoints configured".into())))
+    }
+
+    /// Claim a glyph bitmap for `ghost_id` via
+    /// `POST /api/v1/glyph/claim`. Authenticated route — attaches the
+    /// `X-Internal-Auth` header when `with_internal_secret(...)` was
+    /// set, otherwise ghost-pay returns 401. Returns the raw
+    /// `GlyphClaimResponse` JSON.
+    pub async fn claim_glyph(
+        &self,
+        ghost_id: &str,
+        pixels: &[u8],
+    ) -> Result<serde_json::Value, ChainError> {
+        let mut last_err: Option<ChainError> = None;
+        for base in &self.base_urls {
+            match self.try_claim_glyph(base, ghost_id, pixels).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::debug!(url = %base, error = %e, "ghost-pay claim_glyph failed, trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ChainError::Transport("no endpoints configured".into())))
+    }
+
+    async fn try_get_glyph(
+        &self,
+        base_url: &str,
+        ghost_id: &str,
+    ) -> Result<serde_json::Value, ChainError> {
+        let url = self.endpoint(base_url, &format!("/api/v1/glyph/{ghost_id}"));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ChainError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(ChainError::Backend(format!(
+                "ghost-pay glyph returned {}: {}",
+                status, detail
+            )));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| ChainError::Malformed(e.to_string()))
+    }
+
+    async fn try_check_glyph(
+        &self,
+        base_url: &str,
+        bitmap_hash_hex: &str,
+    ) -> Result<serde_json::Value, ChainError> {
+        let url = self.endpoint(base_url, &format!("/api/v1/glyph/check/{bitmap_hash_hex}"));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ChainError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(ChainError::Backend(format!(
+                "ghost-pay glyph check returned {}: {}",
+                status, detail
+            )));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| ChainError::Malformed(e.to_string()))
+    }
+
+    async fn try_claim_glyph(
+        &self,
+        base_url: &str,
+        ghost_id: &str,
+        pixels: &[u8],
+    ) -> Result<serde_json::Value, ChainError> {
+        let url = self.endpoint(base_url, "/api/v1/glyph/claim");
+        let mut req = self.http.post(&url).json(&serde_json::json!({
+            "ghost_id": ghost_id,
+            "pixels": pixels,
+        }));
+        if let Some(secret) = &self.internal_secret {
+            req = req.header("X-Internal-Auth", secret);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ChainError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(ChainError::Backend(format!(
+                "ghost-pay glyph claim returned {}: {}",
+                status, detail
+            )));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| ChainError::Malformed(e.to_string()))
+    }
+
     async fn try_status(&self, base_url: &str) -> Result<ChainStatus, ChainError> {
         let url = self.endpoint(base_url, "/api/v1/status");
         let resp = self

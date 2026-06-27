@@ -287,6 +287,57 @@ export async function walletGhostId(): Promise<{
   }>(resp).payload;
 }
 
+// ----- Ghost Glyph -------------------------------------------------------
+
+export interface GlyphInfo {
+  ghost_id: string;
+  /// 256 palette indices (0..25), row-major.
+  pixels: number[];
+  /// SHA256("GhostGlyphBitmap/v1" || pixels), hex — uniqueness key.
+  bitmap_hash: string;
+  /// SHA256("GhostGlyph/v1" || pixels || ghost_id), hex — binding.
+  commitment: string;
+  /// Wraith deposit txid that funded the lock (null while pending).
+  funding_txid: string | null;
+  /// Unix timestamp the lock was funded (null while pending).
+  registered_at: number | null;
+  /// One of: "none" / "pending" / "registered".
+  status: string;
+}
+
+export interface GlyphClaimResult {
+  commitment: string;
+  bitmap_hash: string;
+  status: string;
+}
+
+/// Fetch the registered Ghost Glyph for `ghostId`. Throws if the
+/// daemon returns an error (e.g. ghost-pay 404 — no glyph yet); the
+/// caller treats that as "not yet designed".
+export async function getGlyph(ghostId: string): Promise<GlyphInfo> {
+  const resp = await invoke("wallet_glyph", { ghostId });
+  return unwrap<GlyphInfo>(resp).payload;
+}
+
+/// Claim a designed glyph. `pixels` is a 256-length array of palette
+/// indices (0..25). Authenticated at the daemon via internal-auth.
+export async function claimGlyph(
+  ghostId: string,
+  pixels: number[],
+): Promise<GlyphClaimResult> {
+  const resp = await invoke("wallet_glyph_claim", { ghostId, pixels });
+  return unwrap<GlyphClaimResult>(resp).payload;
+}
+
+/// Check whether the bitmap formed by `pixels` is unclaimed. The
+/// daemon computes the bitmap hash and queries ghost-pay.
+export async function checkGlyph(
+  pixels: number[],
+): Promise<{ available: boolean }> {
+  const resp = await invoke("wallet_glyph_check", { pixels });
+  return unwrap<{ available: boolean }>(resp).payload;
+}
+
 // ----- Light wallet (L2) -------------------------------------------------
 
 export interface LightBalanceResponse {

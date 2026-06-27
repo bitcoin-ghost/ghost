@@ -147,6 +147,27 @@ async fn wallet_ghost_id() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn wallet_glyph(ghost_id: String) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletGlyph { ghost_id }).await?;
+    to_value(&resp)
+}
+
+#[tauri::command]
+async fn wallet_glyph_claim(
+    ghost_id: String,
+    pixels: Vec<u8>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletGlyphClaim { ghost_id, pixels }).await?;
+    to_value(&resp)
+}
+
+#[tauri::command]
+async fn wallet_glyph_check(pixels: Vec<u8>) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletGlyphCheck { pixels }).await?;
+    to_value(&resp)
+}
+
+#[tauri::command]
 async fn wallet_auth_info() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletAuthInfo).await?;
     to_value(&resp)
@@ -691,6 +712,9 @@ pub fn run() {
             wraith_coordinator_discover,
             wraith_mix_run,
             wallet_ghost_id,
+            wallet_glyph,
+            wallet_glyph_claim,
+            wallet_glyph_check,
             wallet_auth_info,
             gsp_register_scan_key,
             gsp_session_status,

@@ -1203,6 +1203,30 @@ mod unix {
                 println!("  spend_pubkey: {}", g.spend_public_key_hex);
                 std::process::ExitCode::SUCCESS
             }
+            Ok(Response::WalletGlyph(g)) => {
+                println!("ghost_id:     {}", g.ghost_id);
+                println!("status:       {}", g.status);
+                println!("bitmap_hash:  {}", g.bitmap_hash);
+                println!("commitment:   {}", g.commitment);
+                if let Some(txid) = &g.funding_txid {
+                    println!("funding_txid: {txid}");
+                }
+                if let Some(at) = g.registered_at {
+                    println!("registered_at:{at}");
+                }
+                println!("pixels:       {} bytes", g.pixels.len());
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::WalletGlyphClaimed(r)) => {
+                println!("status:       {}", r.status);
+                println!("bitmap_hash:  {}", r.bitmap_hash);
+                println!("commitment:   {}", r.commitment);
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::WalletGlyphChecked { available }) => {
+                println!("available: {available}");
+                std::process::ExitCode::SUCCESS
+            }
             Ok(Response::WalletShowMnemonic(m)) => {
                 println!("WARNING: anyone with these 24 words owns the wallet.\n");
                 println!("{}\n", m.mnemonic);
