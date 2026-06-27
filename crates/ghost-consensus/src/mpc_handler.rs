@@ -867,14 +867,20 @@ mod tests {
             bucket.last_update = Instant::now() - std::time::Duration::from_secs(3600);
         }
 
-        // After refill the tokens should be capped at max_tokens (3).
-        // We should be able to consume exactly max_tokens times.
-        let mut successes = 0u32;
-        for _ in 0..(max + 5) {
-            if limiter.check_and_consume(&node) {
-                successes += 1;
-            }
-        }
-        assert_eq!(successes, max, "tokens should be capped at max_tokens");
+        // After that long delay an uncapped refill would add far more than
+        // max_tokens — it must CAP at max_tokens. This call refills (capped) then
+        // consumes one, leaving exactly max-1 tokens. We assert the bucket level
+        // DIRECTLY rather than consuming in a real-time loop: with this fast
+        // refill (~1 token/ms) a wall-clock loop tops the bucket back up between
+        // iterations on a loaded runner and overshoots the success count — the
+        // historical flake. Inspecting the level is deterministic and still
+        // proves the cap held (a broken cap would leave the level higher).
+        assert!(limiter.check_and_consume(&node));
+        let remaining_millis = limiter.buckets.read().get(&node).unwrap().tokens_millis;
+        assert_eq!(
+            remaining_millis,
+            (max as u64 - 1) * MPC_MILLIS_PER_TOKEN,
+            "refill must cap at max_tokens (then -1 for the consume just made)"
+        );
     }
 }
