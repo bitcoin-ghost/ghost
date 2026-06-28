@@ -105,6 +105,7 @@ ghost-template = { path = "crates/ghost-template" }
 ghost-keys = { path = "crates/ghost-keys" }
 ghost-locks = { path = "crates/ghost-locks" }
 wraith-protocol = { path = "crates/wraith-protocol" }
+wraith-coordinator = { path = "bins/wraith-coordinator" }
 ghost-reconciliation = { path = "crates/ghost-reconciliation" }
 # ZK-BFT Infrastructure
 ghost-zkp = { path = "crates/ghost-zkp" }

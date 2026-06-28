@@ -76,6 +76,8 @@ pub enum WraithClientError {
     Crypto(#[from] wraith_protocol::WraithError),
     #[error("signer rejected input {input_index}: {detail}")]
     Signer { input_index: usize, detail: String },
+    #[error("bond escrow: {0}")]
+    Bond(String),
 }
 
 /// Caller-supplied input commitment. The wallet picks the UTXO it

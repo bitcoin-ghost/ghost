@@ -70,9 +70,10 @@ use ghost_keys::{GhostKeys, GhostKeysExport, PaymentDetector};
 use ghost_locks::{Denomination, GhostLock, StateTransition, TimelockTier};
 use ghost_reconciliation::{BatchExecutor, ReconciliationInput, Settlement};
 use ghost_storage::{
-    ConfidentialTransferRecord, Database, GhostLockRecord, GhostLockState as DbLockState,
-    WithdrawalRequest, WithdrawalStatus,
+    BondRow, ConfidentialTransferRecord, Database, GhostLockRecord,
+    GhostLockState as DbLockState, WithdrawalRequest, WithdrawalStatus,
 };
+use wraith_protocol::{BondId, BondRecord, BondResolution, BondStatus};
 use ghost_zkp::{
     BalanceTree, CommitmentTree, ConsolidationPublicInputs, GhostConsolidateVerifier,
     GhostNoteSpendProof, GhostNoteSpendPublicInputs, GhostNoteVerifier, GhostUnshieldVerifier,
@@ -139,6 +140,18 @@ struct Args {
     /// hosts that don't run a co-located ghost-gsp.
     #[arg(long, env = "GHOST_PAY_INTERNAL_SECRET")]
     internal_secret: Option<String>,
+
+    /// Bearer token that authorises the Wraith coordinator to call the
+    /// bond-ledger endpoints (`/api/v1/wraith/bond/verify`, `/resolve`,
+    /// and the snapshot `GET`). Must match the coordinator's
+    /// `--bond-ledger-token`. Required on mainnet — without it the
+    /// coordinator cannot verify or resolve bonds, so Wraith mixing is
+    /// disabled. Distinct from `--api-secret` (participant HMAC) and
+    /// `--internal-secret` (GSP bypass): the Bearer-vs-HMAC split is what
+    /// stops a participant from resolving their own bond and a
+    /// coordinator from minting escrows.
+    #[arg(long, env = "GHOST_PAY_BOND_LEDGER_TOKEN")]
+    bond_ledger_token: Option<String>,
 
     /// TLS certificate PEM file path (enables HTTPS)
     /// When provided, --tls-key is also required.
@@ -861,6 +874,82 @@ async fn require_api_auth(
     Ok(next.run(request).await)
 }
 
+// =============================================================================
+// WRAITH BOND: COORDINATOR AUTHENTICATION MIDDLEWARE
+// =============================================================================
+
+/// Bearer-token holder for the Wraith coordinator bond endpoints
+/// (`/verify`, `/resolve`, snapshot `GET`). This is a DIFFERENT trust
+/// boundary from [`ApiAuth`]: participants authenticate with an HMAC
+/// (`X-Ghost-Signature`) to ESCROW a bond, but only the coordinator,
+/// holding this Bearer token, may VERIFY or RESOLVE bonds. The split is
+/// structural: a participant cannot resolve (refund/slash) their own
+/// bond, and the coordinator cannot mint escrows out of thin air.
+#[derive(Clone)]
+struct CoordinatorAuth {
+    /// Bearer token. `None` means the endpoints are unconfigured and
+    /// reject every request (503). Startup refuses to run on mainnet
+    /// without it.
+    token: Option<String>,
+    network: Network,
+}
+
+impl CoordinatorAuth {
+    fn new(token: Option<String>, network: Network) -> Self {
+        Self { token, network }
+    }
+
+    /// Constant-time check for `Authorization: Bearer <token>`.
+    fn bearer_matches(&self, headers: &HeaderMap) -> bool {
+        let configured = match &self.token {
+            Some(t) => t,
+            None => return false,
+        };
+        let provided = match headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+        {
+            Some(s) => s,
+            None => return false,
+        };
+        if provided.len() != configured.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (a, b) in provided.bytes().zip(configured.bytes()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+}
+
+/// Authentication middleware for the coordinator-only bond endpoints.
+/// Rejects with 503 when unconfigured, 401 when the Bearer token is
+/// missing or wrong. Does not touch the request body.
+async fn require_coordinator_auth(
+    axum::extract::State(auth): axum::extract::State<CoordinatorAuth>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if auth.token.is_none() {
+        error!(
+            network = ?auth.network,
+            "WRAITH-BOND: --bond-ledger-token not configured - rejecting coordinator request. \
+             Wraith bond verify/resolve is disabled until a token is set."
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if !auth.bearer_matches(request.headers()) {
+        warn!(
+            path = %request.uri().path(),
+            "WRAITH-BOND: coordinator auth failed - missing or invalid Bearer token"
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(request).await)
+}
+
 /// MEDIUM-1: Localhost-only middleware for L2 block production endpoints.
 /// These are called by ghost-pool on the same host — external access would corrupt L2 state.
 async fn localhost_only(
@@ -1575,6 +1664,30 @@ async fn main() -> Result<()> {
 
     info!("H-2: API authentication enabled");
 
+    // WRAITH-BOND: the coordinator bond token is REQUIRED on mainnet.
+    // Without it the coordinator cannot verify/resolve bonds, so a
+    // misconfigured mainnet node would silently run with Wraith mixing
+    // broken (or, worse, an unauthenticated bond surface if the guard
+    // were ever weakened). Fail fast and loud instead. On non-mainnet
+    // the endpoints simply return 503 until a token is set — safe,
+    // since an absent token rejects every coordinator request.
+    if state.network == Network::Bitcoin && state.config.bond_ledger_token.is_none() {
+        return Err(anyhow::anyhow!(
+            "WRAITH-BOND SECURITY: bond-ledger token REQUIRED for mainnet! \
+             Set GHOST_PAY_BOND_LEDGER_TOKEN environment variable or \
+             --bond-ledger-token flag (must match the Wraith coordinator's \
+             --bond-ledger-token). Ghost Pay will NOT start without it on mainnet."
+        ));
+    }
+    if state.config.bond_ledger_token.is_some() {
+        info!("WRAITH-BOND: coordinator bond endpoints enabled");
+    } else {
+        warn!(
+            "WRAITH-BOND: no --bond-ledger-token configured - Wraith bond \
+             verify/resolve/snapshot endpoints will reject all requests (503)"
+        );
+    }
+
     // H-2: Build authenticated routes (require HMAC signature)
     let authenticated_routes = Router::new()
         // Key management (SENSITIVE - can export private keys)
@@ -1602,6 +1715,12 @@ async fn main() -> Result<()> {
         .route("/api/v1/locks/:id/reconcile", post(reconcile_lock))
         // L2 payments (SENSITIVE - instant off-chain transfer)
         .route("/api/v1/payments/send", post(send_l2_payment))
+        // Wraith bond ESCROW (SENSITIVE - holds the participant's L2
+        // funds). Participant-authenticated: a wallet posts its own
+        // bond. Verify/resolve/snapshot live on the coordinator-only
+        // routes below — a participant must not be able to refund or
+        // slash their own bond.
+        .route("/api/v1/wraith/bond/escrow", post(wraith_bond_escrow))
         // GhostGlyph (SENSITIVE - binds identity permanently)
         .route("/api/v1/glyph/claim", post(claim_glyph))
         // L1 UTXO scan via Bitcoin Core's scantxoutset. Authenticated
@@ -1617,6 +1736,23 @@ async fn main() -> Result<()> {
         .layer(axum::middleware::from_fn_with_state(
             api_auth.clone(),
             require_api_auth,
+        ))
+        .with_state(state.clone());
+
+    // WRAITH BOND: coordinator-only routes. Authenticated with the
+    // operator's Bearer token (`--bond-ledger-token`), NOT the
+    // participant HMAC. This is the structural participant/coordinator
+    // split: only the coordinator may verify a bond before admitting a
+    // participant, or resolve (refund/slash) it when the round closes.
+    let coordinator_auth =
+        CoordinatorAuth::new(state.config.bond_ledger_token.clone(), state.network);
+    let coordinator_routes = Router::new()
+        .route("/api/v1/wraith/bond/verify", post(wraith_bond_verify))
+        .route("/api/v1/wraith/bond/resolve", post(wraith_bond_resolve))
+        .route("/api/v1/wraith/bond/:bond_id", get(wraith_bond_snapshot))
+        .layer(axum::middleware::from_fn_with_state(
+            coordinator_auth,
+            require_coordinator_auth,
         ))
         .with_state(state.clone());
 
@@ -1756,6 +1892,7 @@ async fn main() -> Result<()> {
     // LOW-API-1: Security headers for all responses
     let app = public_routes
         .merge(authenticated_routes)
+        .merge(coordinator_routes)
         .merge(localhost_routes)
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(GovernorLayer {
@@ -2938,6 +3075,27 @@ async fn request_withdrawal(
         return Ok(Json(serde_json::json!({
             "success": false,
             "error": format!("Amount exceeds maximum withdrawal of {} sats", max_withdrawal)
+        })));
+    }
+
+    // Bond-net guard: a withdrawal consumes a lock, draining the
+    // owner's spendable L2 balance. If the owner has live Wraith bonds
+    // held against that balance, withdrawing the bonded sats would let
+    // them griefing-exit a mix yet still recover the bond at refund —
+    // a double-spend. Reject anything beyond the bond-net spendable
+    // balance. With no bonds this is a no-op (spendable >= the lock's
+    // own principal, which already caps `req.amount_sats`).
+    let spendable = state
+        .db
+        .with_connection(|conn| {
+            spendable_l2_balance(conn, &ghost_id).map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if (req.amount_sats as i64) > spendable {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "error": "Amount exceeds spendable balance (Wraith bond held)",
+            "spendable_sats": spendable
         })));
     }
 
@@ -7423,6 +7581,455 @@ struct SendL2PaymentRequest {
     sender_ghost_id: Option<String>,
 }
 
+// =============================================================================
+// SPENDABLE L2 BALANCE — single source of truth (bond-net)
+// =============================================================================
+
+/// Compute `ghost_id`'s SPENDABLE L2 balance, in sats:
+///
+/// ```text
+///   unsettled received instant payments
+/// + active lock principal
+/// - sats held by live Wraith bonds (escrowed or slashed)
+/// ```
+///
+/// This is the ONE chokepoint every fund-moving path must consult.
+/// Escrowed bonds are a temporary hold; slashed bonds are a permanent
+/// debit (forfeited to surplus); refunded bonds release their hold and
+/// are not subtracted. If any spend path read the raw
+/// `accepted_instant_payments + ghost_locks` sum WITHOUT subtracting
+/// held bonds, a participant could escrow a bond and then spend the
+/// very same sats — a double-spend. Takes a borrowed `&Connection` so
+/// the caller can run it inside the same transaction as the spend it
+/// guards.
+fn spendable_l2_balance(
+    conn: &rusqlite::Connection,
+    ghost_id: &str,
+) -> rusqlite::Result<i64> {
+    let received: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM accepted_instant_payments \
+         WHERE merchant_wallet_id = ?1 AND settlement_block = 0",
+        rusqlite::params![ghost_id],
+        |row| row.get(0),
+    )?;
+
+    let lock_balance: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM ghost_locks \
+         WHERE owner_ghost_id = ?1 AND state = 'active'",
+        rusqlite::params![ghost_id],
+        |row| row.get(0),
+    )?;
+
+    let held_bonds = ghost_storage::queries::sum_held_bonds_for(conn, ghost_id)?;
+
+    Ok(received + lock_balance - held_bonds)
+}
+
+// =============================================================================
+// WRAITH BOND LEDGER — server-side endpoints
+//
+// Wire contract is fixed by the coordinator's GhostPayBondLedger client
+// (`bins/wraith-coordinator/src/bond_ledger_http.rs`). The core logic is
+// split out of the axum handlers into plain functions over `&Database` so it
+// can be unit-tested for parity with `wraith_protocol::MockBondLedger` (the
+// behavioural spec) without standing up an HTTP server.
+// =============================================================================
+
+/// `true` if a rusqlite error is a UNIQUE / PRIMARY KEY constraint
+/// violation. Used to turn a lost double-escrow race into an idempotent
+/// re-read rather than a 500.
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                ..
+            },
+            _
+        )
+    )
+}
+
+/// Outcome of an escrow attempt.
+enum EscrowOutcome {
+    /// A new bond was created (or an existing live one was returned) —
+    /// either way the participant now has exactly one live bond.
+    BondId(String),
+    /// Spendable balance was below the requested amount; carries the
+    /// spendable figure for the error detail.
+    Insufficient(i64),
+}
+
+/// Core of `POST /api/v1/wraith/bond/escrow`. Atomic: idempotency check,
+/// bond-net balance check, and insert all run in one transaction (the
+/// single shared write connection serialises everything, and the partial
+/// unique index is the last-line defence against a concurrent double
+/// escrow).
+fn escrow_bond_core(
+    db: &Database,
+    ghost_id: &str,
+    session_id: &str,
+    amount_sats: i64,
+) -> Result<EscrowOutcome, GhostError> {
+    let now = chrono::Utc::now().timestamp();
+    // 32 bytes of entropy → "gpbond-" + 64 hex chars.
+    let mut rand_bytes = [0u8; 32];
+    getrandom::getrandom(&mut rand_bytes)
+        .map_err(|e| GhostError::Database(format!("rng: {e}")))?;
+    let new_bond_id = format!("gpbond-{}", hex::encode(rand_bytes));
+
+    db.transaction(|tx| {
+        // 1. Idempotency: a live bond already covers this session.
+        if let Some(existing) = ghost_storage::queries::find_live_bond(tx, ghost_id, session_id)
+            .map_err(|e| GhostError::Database(e.to_string()))?
+        {
+            return Ok(EscrowOutcome::BondId(existing));
+        }
+
+        // 2. Bond-net spendable balance must cover the escrow.
+        let spendable =
+            spendable_l2_balance(tx, ghost_id).map_err(|e| GhostError::Database(e.to_string()))?;
+        if spendable < amount_sats {
+            return Ok(EscrowOutcome::Insufficient(spendable));
+        }
+
+        // 3. Insert. A concurrent escrow that won the race trips the
+        //    partial unique index — fall back to the existing live bond.
+        match ghost_storage::queries::insert_escrowed_bond(
+            tx,
+            &new_bond_id,
+            ghost_id,
+            session_id,
+            amount_sats,
+            now,
+        ) {
+            Ok(_) => Ok(EscrowOutcome::BondId(new_bond_id.clone())),
+            Err(e) if is_unique_violation(&e) => {
+                let existing =
+                    ghost_storage::queries::find_live_bond(tx, ghost_id, session_id)
+                        .map_err(|e| GhostError::Database(e.to_string()))?
+                        .ok_or_else(|| {
+                            GhostError::Database(
+                                "escrow unique violation but no live bond found".into(),
+                            )
+                        })?;
+                Ok(EscrowOutcome::BondId(existing))
+            }
+            Err(e) => Err(GhostError::Database(e.to_string())),
+        }
+    })
+}
+
+/// Outcome of a verify attempt — mirrors `MockBondLedger::verify_bond`.
+enum VerifyOutcome {
+    Verified(String),
+    NotBonded,
+    /// Carries the actual sats for the error detail.
+    AmountMismatch(i64),
+    AlreadyResolved,
+}
+
+/// Core of `POST /api/v1/wraith/bond/verify`. Mirrors
+/// `MockBondLedger::verify_bond` exactly, including ordering: NotBonded
+/// when no record exists, then AmountMismatch (checked even for a
+/// resolved bond), then AlreadyResolved for a non-escrowed bond.
+fn verify_bond_core(
+    db: &Database,
+    ghost_id: &str,
+    session_id: &str,
+    expected_sats: i64,
+) -> Result<VerifyOutcome, GhostError> {
+    let row = db
+        .with_connection(|conn| {
+            ghost_storage::queries::find_bond_for_session(conn, ghost_id, session_id)
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })?;
+    match row {
+        None => Ok(VerifyOutcome::NotBonded),
+        Some(b) => {
+            if b.amount_sats != expected_sats {
+                return Ok(VerifyOutcome::AmountMismatch(b.amount_sats));
+            }
+            if b.status == "escrowed" {
+                Ok(VerifyOutcome::Verified(b.bond_id))
+            } else {
+                Ok(VerifyOutcome::AlreadyResolved)
+            }
+        }
+    }
+}
+
+/// Outcome of a resolve attempt — mirrors `MockBondLedger::resolve_bond`.
+enum ResolveOutcome {
+    Resolved(BondRow),
+    NotFound,
+    AlreadyResolved,
+}
+
+/// Core of `POST /api/v1/wraith/bond/resolve`. Idempotent: a second
+/// resolve of the same bond returns `AlreadyResolved` and never
+/// double-credits. `Refund` → status `'refunded'`; `Slash` → status
+/// `'slashed'` (a permanent debit per `spendable_l2_balance` — the
+/// forfeited sats stay subtracted from spendable, implicitly accruing to
+/// surplus, with no new treasury primitive).
+fn resolve_bond_core(
+    db: &Database,
+    bond_id: &str,
+    resolution: &BondResolution,
+) -> Result<ResolveOutcome, GhostError> {
+    let now = chrono::Utc::now().timestamp();
+    let new_status = match resolution {
+        BondResolution::Refund(_) => "refunded",
+        BondResolution::Slash(_) => "slashed",
+    };
+    let resolution_json =
+        serde_json::to_string(resolution).map_err(|e| GhostError::Database(e.to_string()))?;
+
+    db.transaction(|tx| {
+        match ghost_storage::queries::get_bond(tx, bond_id)
+            .map_err(|e| GhostError::Database(e.to_string()))?
+        {
+            None => Ok(ResolveOutcome::NotFound),
+            Some(b) if b.status != "escrowed" => Ok(ResolveOutcome::AlreadyResolved),
+            Some(_) => {
+                ghost_storage::queries::resolve_bond_row(
+                    tx,
+                    bond_id,
+                    new_status,
+                    &resolution_json,
+                    now,
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+                let updated = ghost_storage::queries::get_bond(tx, bond_id)
+                    .map_err(|e| GhostError::Database(e.to_string()))?
+                    .ok_or_else(|| GhostError::Database("bond vanished mid-resolve".into()))?;
+                Ok(ResolveOutcome::Resolved(updated))
+            }
+        }
+    })
+}
+
+/// Rebuild a `wraith_protocol::BondRecord` from a stored row so the JSON
+/// reply matches the coordinator client's `BondRecord` deserialize
+/// byte-for-byte.
+fn bond_row_to_record(b: &BondRow) -> Result<BondRecord, GhostError> {
+    let status = match b.status.as_str() {
+        "escrowed" => BondStatus::Escrowed,
+        "refunded" | "slashed" => {
+            let res: BondResolution = serde_json::from_str(
+                b.resolution.as_deref().unwrap_or(""),
+            )
+            .map_err(|e| GhostError::Database(format!("decode bond resolution: {e}")))?;
+            BondStatus::Resolved(res)
+        }
+        other => {
+            return Err(GhostError::Database(format!(
+                "unknown bond status '{other}'"
+            )))
+        }
+    };
+    Ok(BondRecord {
+        bond_id: BondId::new(b.bond_id.clone()),
+        ghost_id: b.ghost_id.clone(),
+        session_id: b.session_id.clone(),
+        amount_sats: b.amount_sats as u64,
+        status,
+    })
+}
+
+/// Build the `{ error, detail }` envelope the coordinator client's
+/// `decode_error_body` expects.
+fn bond_err(status: StatusCode, error: &str, detail: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "error": error, "detail": detail })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct BondEscrowRequest {
+    ghost_id: String,
+    session_id: String,
+    amount_sats: u64,
+}
+
+/// `POST /api/v1/wraith/bond/escrow` — participant-authenticated.
+///
+/// Escrows `amount_sats` against the participant's spendable L2 balance,
+/// returning `{ bond_id }`. Idempotent on `(ghost_id, session_id)`:
+/// re-escrowing returns the existing live bond rather than double-debiting.
+async fn wraith_bond_escrow(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BondEscrowRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if req.ghost_id.is_empty() || req.session_id.is_empty() {
+        return Err(bond_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "ghost_id and session_id are required",
+        ));
+    }
+    if req.amount_sats == 0 {
+        return Err(bond_err(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "amount_sats must be greater than 0",
+        ));
+    }
+
+    match escrow_bond_core(
+        &state.db,
+        &req.ghost_id,
+        &req.session_id,
+        req.amount_sats as i64,
+    ) {
+        Ok(EscrowOutcome::BondId(id)) => Ok(Json(serde_json::json!({ "bond_id": id }))),
+        Ok(EscrowOutcome::Insufficient(spendable)) => Err(bond_err(
+            StatusCode::PAYMENT_REQUIRED,
+            "insufficient_balance",
+            &format!("spendable={spendable} requested={}", req.amount_sats),
+        )),
+        Err(e) => {
+            error!(error = %e, "wraith bond escrow failed");
+            Err(bond_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ledger_error",
+                &e.to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BondVerifyRequest {
+    ghost_id: String,
+    session_id: String,
+    expected_sats: u64,
+}
+
+/// `POST /api/v1/wraith/bond/verify` — coordinator-authenticated.
+async fn wraith_bond_verify(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BondVerifyRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match verify_bond_core(
+        &state.db,
+        &req.ghost_id,
+        &req.session_id,
+        req.expected_sats as i64,
+    ) {
+        Ok(VerifyOutcome::Verified(bond_id)) => {
+            Ok(Json(serde_json::json!({ "bond_id": bond_id })))
+        }
+        Ok(VerifyOutcome::NotBonded) => {
+            Err(bond_err(StatusCode::NOT_FOUND, "not_bonded", ""))
+        }
+        Ok(VerifyOutcome::AmountMismatch(actual)) => Err(bond_err(
+            StatusCode::CONFLICT,
+            "amount_mismatch",
+            &format!("actual={actual}"),
+        )),
+        Ok(VerifyOutcome::AlreadyResolved) => {
+            Err(bond_err(StatusCode::CONFLICT, "already_resolved", ""))
+        }
+        Err(e) => {
+            error!(error = %e, "wraith bond verify failed");
+            Err(bond_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ledger_error",
+                &e.to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BondResolveRequest {
+    bond_id: String,
+    resolution: BondResolution,
+}
+
+/// `POST /api/v1/wraith/bond/resolve` — coordinator-authenticated.
+/// Returns the resulting `BondRecord` JSON.
+async fn wraith_bond_resolve(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BondResolveRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match resolve_bond_core(&state.db, &req.bond_id, &req.resolution) {
+        Ok(ResolveOutcome::Resolved(row)) => match bond_row_to_record(&row) {
+            Ok(record) => match serde_json::to_value(&record) {
+                Ok(v) => Ok(Json(v)),
+                Err(e) => Err(bond_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ledger_error",
+                    &e.to_string(),
+                )),
+            },
+            Err(e) => Err(bond_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ledger_error",
+                &e.to_string(),
+            )),
+        },
+        Ok(ResolveOutcome::NotFound) => {
+            Err(bond_err(StatusCode::NOT_FOUND, "not_found", ""))
+        }
+        Ok(ResolveOutcome::AlreadyResolved) => {
+            Err(bond_err(StatusCode::CONFLICT, "already_resolved", ""))
+        }
+        Err(e) => {
+            error!(error = %e, "wraith bond resolve failed");
+            Err(bond_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ledger_error",
+                &e.to_string(),
+            ))
+        }
+    }
+}
+
+/// `GET /api/v1/wraith/bond/{bond_id}` — coordinator-authenticated.
+/// Returns the bond's current `BondRecord` JSON.
+async fn wraith_bond_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(bond_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let row = state
+        .db
+        .with_connection(|conn| {
+            ghost_storage::queries::get_bond(conn, &bond_id)
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .map_err(|e| {
+            error!(error = %e, "wraith bond snapshot failed");
+            bond_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ledger_error",
+                &e.to_string(),
+            )
+        })?;
+
+    match row {
+        None => Err(bond_err(StatusCode::NOT_FOUND, "not_found", "")),
+        Some(b) => match bond_row_to_record(&b) {
+            Ok(record) => match serde_json::to_value(&record) {
+                Ok(v) => Ok(Json(v)),
+                Err(e) => Err(bond_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ledger_error",
+                    &e.to_string(),
+                )),
+            },
+            Err(e) => Err(bond_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ledger_error",
+                &e.to_string(),
+            )),
+        },
+    }
+}
+
 /// POST /api/v1/payments/send — Send an L2 instant payment
 ///
 /// Sends an instant off-chain payment to another Ghost user.
@@ -7475,32 +8082,16 @@ async fn send_l2_payment(
         })));
     }
 
-    // Query sender's available L2 balance:
-    // Sum of unsettled received payments + unspent lock amounts owned by sender
+    // Query sender's available L2 balance through the single bond-net
+    // chokepoint: unsettled received payments + active lock funds, MINUS
+    // sats held by live Wraith bonds. Routing this read through
+    // `spendable_l2_balance` is what stops escrow-then-spend of the same
+    // sats.
     let sender_gid = ghost_id.clone();
     let available_balance: i64 = state
         .db
         .with_connection(|conn| {
-            // L2 balance = received payments not yet settled + active lock funds
-            let received: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(amount_sats), 0) FROM accepted_instant_payments \
-                     WHERE merchant_wallet_id = ?1 AND settlement_block = 0",
-                    rusqlite::params![sender_gid],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let lock_balance: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(amount_sats), 0) FROM ghost_locks \
-                     WHERE owner_ghost_id = ?1 AND state = 'active'",
-                    rusqlite::params![sender_gid],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            Ok(received + lock_balance)
+            spendable_l2_balance(conn, &sender_gid).map_err(|e| GhostError::Database(e.to_string()))
         })
         .map_err(|e| {
             tracing::error!("Failed to query L2 balance: {}", e);
@@ -8717,5 +9308,525 @@ mod tests {
             ghost_pay_prover_id, zkp_prover_id,
             "ghost-pay's inline prover_id must match GhostNoteProver's prover_id"
         );
+    }
+}
+
+#[cfg(test)]
+mod wraith_bond_tests {
+    use super::*;
+    use ghost_keys::GhostKeys;
+    use wraith_protocol::{BondLedger, RefundReason, SlashReason};
+
+    // ----- test scaffolding ------------------------------------------------
+
+    fn make_state(internal_secret: Option<&str>, bond_token: Option<&str>) -> Arc<AppState> {
+        let db = Arc::new(Database::in_memory().expect("in-memory db"));
+        let (scanner_tx, scanner_rx) = mpsc::channel::<ScanRequest>(8);
+        // Keep the receiver alive for the lifetime of the state so the
+        // sender never observes a closed channel (bond endpoints never
+        // send, but other handlers would).
+        std::mem::forget(scanner_rx);
+        let mut args = Args::parse_from(["ghost-pay"]);
+        args.api_secret = Some("hmac-secret".to_string());
+        args.internal_secret = internal_secret.map(|s| s.to_string());
+        args.bond_ledger_token = bond_token.map(|s| s.to_string());
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 18443, "u", "p").expect("rpc"));
+        Arc::new(AppState {
+            keys: RwLock::new(None),
+            ghost_id: RwLock::new(None),
+            ghost_locks: RwLock::new(Vec::new()),
+            locks: RwLock::new(Vec::new()),
+            scanner_tx,
+            config: args,
+            network: Network::Signet,
+            db,
+            rpc,
+            commitment_tree: RwLock::new(CommitmentTree::new(COMMITMENT_TREE_DEPTH)),
+            balance_tree: RwLock::new(BalanceTree::new(COMMITMENT_TREE_DEPTH)),
+            note_spend_verifier: RwLock::new(None),
+            consolidation_verifier: RwLock::new(None),
+            unshield_verifier: RwLock::new(None),
+            pool_http_client: reqwest::Client::new(),
+            pool_api_url: "http://127.0.0.1:8080".to_string(),
+            last_settled_epoch: RwLock::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn bond_router(state: Arc<AppState>) -> Router {
+        let api_auth = ApiAuth::new(
+            state.config.api_secret.clone(),
+            state.config.internal_secret.clone(),
+            state.network,
+        );
+        let coord_auth =
+            CoordinatorAuth::new(state.config.bond_ledger_token.clone(), state.network);
+        let authed = Router::new()
+            .route("/api/v1/wraith/bond/escrow", post(wraith_bond_escrow))
+            .route("/api/v1/payments/send", post(send_l2_payment))
+            .layer(axum::middleware::from_fn_with_state(
+                api_auth,
+                require_api_auth,
+            ))
+            .with_state(state.clone());
+        let coord = Router::new()
+            .route("/api/v1/wraith/bond/verify", post(wraith_bond_verify))
+            .route("/api/v1/wraith/bond/resolve", post(wraith_bond_resolve))
+            .route("/api/v1/wraith/bond/:bond_id", get(wraith_bond_snapshot))
+            .layer(axum::middleware::from_fn_with_state(
+                coord_auth,
+                require_coordinator_auth,
+            ))
+            .with_state(state.clone());
+        // Merging static (`escrow`/`verify`/`resolve`) with the param
+        // (`:bond_id`) route across two routers must not panic at build
+        // time — this call exercises that.
+        authed.merge(coord)
+    }
+
+    async fn spawn_server(state: Arc<AppState>) -> String {
+        let app = bond_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn seed_balance(db: &Database, gid: &str, amount: i64) {
+        db.with_connection(|conn| {
+            let mut pid = [0u8; 16];
+            getrandom::getrandom(&mut pid).unwrap();
+            conn.execute(
+                "INSERT INTO accepted_instant_payments \
+                 (payment_id, sender_lock_id, merchant_wallet_id, amount_sats, \
+                  accepted_at, settlement_block, confidence, sender_pubkey, signature) \
+                 VALUES (?1, 'seed', ?2, ?3, 0, 0, 0.0, X'00', X'00')",
+                rusqlite::params![pid.to_vec(), gid, amount],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ----- core parity vs MockBondLedger (bond.rs is the spec) -------------
+
+    #[test]
+    fn core_escrow_then_verify_then_refund() {
+        let state = make_state(None, None);
+        seed_balance(&state.db, "alice", 500);
+
+        let id = match escrow_bond_core(&state.db, "alice", "s1", 500).unwrap() {
+            EscrowOutcome::BondId(id) => id,
+            EscrowOutcome::Insufficient(_) => panic!("expected created bond"),
+        };
+        assert!(id.starts_with("gpbond-"));
+
+        match verify_bond_core(&state.db, "alice", "s1", 500).unwrap() {
+            VerifyOutcome::Verified(v) => assert_eq!(v, id),
+            other => panic!("expected Verified, got {:?}", core_label(&other)),
+        }
+
+        match resolve_bond_core(
+            &state.db,
+            &id,
+            &BondResolution::Refund(RefundReason::RoundCompleted),
+        )
+        .unwrap()
+        {
+            ResolveOutcome::Resolved(row) => assert_eq!(row.status, "refunded"),
+            _ => panic!("expected Resolved"),
+        }
+
+        // resolved bond must not verify, and a second resolve is rejected.
+        assert!(matches!(
+            verify_bond_core(&state.db, "alice", "s1", 500).unwrap(),
+            VerifyOutcome::AlreadyResolved
+        ));
+        assert!(matches!(
+            resolve_bond_core(
+                &state.db,
+                &id,
+                &BondResolution::Refund(RefundReason::RoundCompleted)
+            )
+            .unwrap(),
+            ResolveOutcome::AlreadyResolved
+        ));
+    }
+
+    #[test]
+    fn core_escrow_then_verify_then_slash() {
+        let state = make_state(None, None);
+        seed_balance(&state.db, "bob", 5_000);
+        let id = match escrow_bond_core(&state.db, "bob", "s2", 5_000).unwrap() {
+            EscrowOutcome::BondId(id) => id,
+            _ => panic!("created"),
+        };
+        match resolve_bond_core(
+            &state.db,
+            &id,
+            &BondResolution::Slash(SlashReason::NoSignDuringSigning),
+        )
+        .unwrap()
+        {
+            ResolveOutcome::Resolved(row) => assert_eq!(row.status, "slashed"),
+            _ => panic!("expected Resolved"),
+        }
+
+        // A slashed bond stays withheld from spendable (permanent debit):
+        // 5_000 seeded, 5_000 slashed → 0 spendable.
+        let spendable = state
+            .db
+            .with_connection(|c| {
+                spendable_l2_balance(c, "bob").map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(spendable, 0, "slashed sats must remain subtracted from spendable");
+
+        // The stored record round-trips into a full BondRecord.
+        let row = state
+            .db
+            .with_connection(|c| {
+                ghost_storage::queries::get_bond(c, &id)
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .unwrap()
+            .expect("bond row present");
+        let record = bond_row_to_record(&row).unwrap();
+        assert_eq!(record.amount_sats, 5_000);
+        assert!(matches!(
+            record.status,
+            BondStatus::Resolved(BondResolution::Slash(SlashReason::NoSignDuringSigning))
+        ));
+    }
+
+    #[test]
+    fn core_escrow_insufficient_balance() {
+        let state = make_state(None, None);
+        seed_balance(&state.db, "carol", 100);
+        match escrow_bond_core(&state.db, "carol", "s3", 500).unwrap() {
+            EscrowOutcome::Insufficient(spendable) => assert_eq!(spendable, 100),
+            _ => panic!("expected Insufficient"),
+        }
+    }
+
+    #[test]
+    fn core_double_escrow_is_idempotent_same_id() {
+        let state = make_state(None, None);
+        seed_balance(&state.db, "dave", 1_000);
+        let id1 = match escrow_bond_core(&state.db, "dave", "s4", 500).unwrap() {
+            EscrowOutcome::BondId(id) => id,
+            _ => panic!("created"),
+        };
+        let id2 = match escrow_bond_core(&state.db, "dave", "s4", 500).unwrap() {
+            EscrowOutcome::BondId(id) => id,
+            _ => panic!("idempotent"),
+        };
+        assert_eq!(id1, id2, "re-escrow must return the same live bond id");
+        // Only one bond was created → only 500 held, 500 still spendable.
+        let spendable = state
+            .db
+            .with_connection(|c| spendable_l2_balance(c, "dave").map_err(|e| GhostError::Database(e.to_string())))
+            .unwrap();
+        assert_eq!(spendable, 500);
+    }
+
+    #[test]
+    fn core_verify_amount_mismatch() {
+        let state = make_state(None, None);
+        seed_balance(&state.db, "erin", 500);
+        let _ = escrow_bond_core(&state.db, "erin", "s5", 500).unwrap();
+        match verify_bond_core(&state.db, "erin", "s5", 1_000).unwrap() {
+            VerifyOutcome::AmountMismatch(actual) => assert_eq!(actual, 500),
+            _ => panic!("expected AmountMismatch"),
+        }
+    }
+
+    #[test]
+    fn core_verify_unknown_is_not_bonded() {
+        let state = make_state(None, None);
+        assert!(matches!(
+            verify_bond_core(&state.db, "nobody", "sX", 500).unwrap(),
+            VerifyOutcome::NotBonded
+        ));
+    }
+
+    #[test]
+    fn core_resolve_unknown_is_not_found() {
+        let state = make_state(None, None);
+        assert!(matches!(
+            resolve_bond_core(
+                &state.db,
+                "gpbond-deadbeef",
+                &BondResolution::Refund(RefundReason::RoundCompleted)
+            )
+            .unwrap(),
+            ResolveOutcome::NotFound
+        ));
+    }
+
+    fn core_label(v: &VerifyOutcome) -> &'static str {
+        match v {
+            VerifyOutcome::Verified(_) => "Verified",
+            VerifyOutcome::NotBonded => "NotBonded",
+            VerifyOutcome::AmountMismatch(_) => "AmountMismatch",
+            VerifyOutcome::AlreadyResolved => "AlreadyResolved",
+        }
+    }
+
+    // ----- double-spend invariant (HTTP) -----------------------------------
+
+    #[tokio::test]
+    async fn escrow_then_send_full_balance_fails_then_succeeds_after_refund() {
+        let state = make_state(Some("int-secret"), Some("btok"));
+        // Load keys so the post-refund send can reach the success path.
+        *state.keys.write() = Some(Arc::new(GhostKeys::generate()));
+        seed_balance(&state.db, "alice", 1_000);
+        let base = spawn_server(state.clone()).await;
+        let http = reqwest::Client::new();
+
+        // Escrow the full balance.
+        let escrow: serde_json::Value = http
+            .post(format!("{base}/api/v1/wraith/bond/escrow"))
+            .header("X-Internal-Auth", "int-secret")
+            .json(&serde_json::json!({"ghost_id":"alice","session_id":"s1","amount_sats":1_000}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let bond_id = escrow["bond_id"].as_str().unwrap().to_string();
+
+        // Spending the full pre-escrow balance must now fail.
+        let send_fail: serde_json::Value = http
+            .post(format!("{base}/api/v1/payments/send"))
+            .header("X-Internal-Auth", "int-secret")
+            .json(&serde_json::json!({
+                "recipient":"bob","amount_sats":1_000,"sender_ghost_id":"alice"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(send_fail["success"], serde_json::json!(false));
+        assert_eq!(send_fail["error"], serde_json::json!("Insufficient L2 balance"));
+        assert_eq!(send_fail["available_sats"], serde_json::json!(0));
+
+        // Refund the bond (coordinator-authenticated).
+        let refund_status = http
+            .post(format!("{base}/api/v1/wraith/bond/resolve"))
+            .header("Authorization", "Bearer btok")
+            .json(&serde_json::json!({
+                "bond_id": bond_id,
+                "resolution": {"Refund":"RoundCompleted"}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(refund_status.is_success());
+
+        // Now the same send succeeds — the hold was released.
+        let send_ok: serde_json::Value = http
+            .post(format!("{base}/api/v1/payments/send"))
+            .header("X-Internal-Auth", "int-secret")
+            .json(&serde_json::json!({
+                "recipient":"bob","amount_sats":1_000,"sender_ghost_id":"alice"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(send_ok["success"], serde_json::json!(true));
+    }
+
+    // ----- auth: participant vs coordinator split --------------------------
+
+    #[tokio::test]
+    async fn escrow_rejects_coordinator_bearer_only() {
+        let state = make_state(Some("int-secret"), Some("btok"));
+        let base = spawn_server(state).await;
+        // A coordinator Bearer token is NOT a participant credential.
+        let status = reqwest::Client::new()
+            .post(format!("{base}/api/v1/wraith/bond/escrow"))
+            .header("Authorization", "Bearer btok")
+            .json(&serde_json::json!({"ghost_id":"a","session_id":"s","amount_sats":1}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn coordinator_routes_reject_participant_credentials() {
+        let state = make_state(Some("int-secret"), Some("btok"));
+        let base = spawn_server(state).await;
+        let http = reqwest::Client::new();
+
+        // verify/resolve with the participant X-Internal-Auth (no Bearer) → 401.
+        for (path, body) in [
+            (
+                "verify",
+                serde_json::json!({"ghost_id":"a","session_id":"s","expected_sats":1}),
+            ),
+            (
+                "resolve",
+                serde_json::json!({"bond_id":"x","resolution":{"Refund":"RoundCompleted"}}),
+            ),
+        ] {
+            let status = http
+                .post(format!("{base}/api/v1/wraith/bond/{path}"))
+                .header("X-Internal-Auth", "int-secret")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED,
+                "/{path} must reject participant creds"
+            );
+        }
+
+        // snapshot GET with participant creds → 401.
+        let status = http
+            .get(format!("{base}/api/v1/wraith/bond/gpbond-x"))
+            .header("X-Internal-Auth", "int-secret")
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn coordinator_routes_reject_wrong_or_absent_token() {
+        let state = make_state(Some("int-secret"), Some("btok"));
+        let base = spawn_server(state).await;
+        let http = reqwest::Client::new();
+
+        // Wrong bearer → 401.
+        let wrong = http
+            .post(format!("{base}/api/v1/wraith/bond/verify"))
+            .header("Authorization", "Bearer not-the-token")
+            .json(&serde_json::json!({"ghost_id":"a","session_id":"s","expected_sats":1}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(wrong, reqwest::StatusCode::UNAUTHORIZED);
+
+        // Absent auth → 401.
+        let absent = http
+            .post(format!("{base}/api/v1/wraith/bond/verify"))
+            .json(&serde_json::json!({"ghost_id":"a","session_id":"s","expected_sats":1}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(absent, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn coordinator_routes_503_when_token_unconfigured() {
+        // No bond token configured at all → endpoints reject with 503.
+        let state = make_state(Some("int-secret"), None);
+        let base = spawn_server(state).await;
+        let status = reqwest::Client::new()
+            .post(format!("{base}/api/v1/wraith/bond/verify"))
+            .header("Authorization", "Bearer anything")
+            .json(&serde_json::json!({"ghost_id":"a","session_id":"s","expected_sats":1}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ----- client <-> server wire round-trip (real GhostPayBondLedger) -----
+
+    #[tokio::test]
+    async fn real_coordinator_client_round_trips_against_live_server() {
+        use wraith_coordinator::bond_ledger_http::GhostPayBondLedger;
+
+        let state = make_state(None, Some("rtok"));
+        seed_balance(&state.db, "alice", 500);
+        // Pre-escrow a bond directly (the participant leg is tested above).
+        let bond_id = match escrow_bond_core(&state.db, "alice", "s1", 500).unwrap() {
+            EscrowOutcome::BondId(id) => id,
+            _ => panic!("created"),
+        };
+        let base = spawn_server(state).await;
+
+        // GhostPayBondLedger is blocking (ureq) — drive it off the runtime.
+        let result = tokio::task::spawn_blocking(move || {
+            let ledger = GhostPayBondLedger::new(base, "rtok").unwrap();
+
+            // verify happy path returns the same bond id.
+            let verified = ledger.verify_bond("alice", "s1", 500).unwrap();
+            assert_eq!(verified.as_str(), bond_id);
+
+            // amount mismatch → AmountMismatch (error string `amount_mismatch`).
+            let mismatch = ledger.verify_bond("alice", "s1", 499).unwrap_err();
+            assert!(
+                matches!(mismatch, wraith_protocol::BondError::AmountMismatch { .. }),
+                "got {mismatch:?}"
+            );
+
+            // unknown participant → NotBonded (`not_bonded`).
+            let nb = ledger.verify_bond("nobody", "s1", 500).unwrap_err();
+            assert!(matches!(nb, wraith_protocol::BondError::NotBonded { .. }), "got {nb:?}");
+
+            // snapshot returns the full escrowed record (BondRecord serde).
+            let snap = ledger.snapshot_bond(&verified).unwrap();
+            assert_eq!(snap.ghost_id, "alice");
+            assert_eq!(snap.session_id, "s1");
+            assert_eq!(snap.amount_sats, 500);
+            assert!(matches!(snap.status, wraith_protocol::BondStatus::Escrowed));
+
+            // resolve(refund) returns the resolved BondRecord.
+            let resolved = ledger
+                .resolve_bond(&verified, BondResolution::Refund(RefundReason::RoundCompleted))
+                .unwrap();
+            assert!(matches!(
+                resolved.status,
+                wraith_protocol::BondStatus::Resolved(BondResolution::Refund(
+                    RefundReason::RoundCompleted
+                ))
+            ));
+
+            // second resolve → AlreadyResolved (`already_resolved`).
+            let again = ledger
+                .resolve_bond(&verified, BondResolution::Refund(RefundReason::RoundCompleted))
+                .unwrap_err();
+            assert!(
+                matches!(again, wraith_protocol::BondError::AlreadyResolved { .. }),
+                "got {again:?}"
+            );
+
+            // A resolved bond no longer verifies. The server returns
+            // 409 `already_resolved`; the coordinator client's /verify
+            // decoder only special-cases not_bonded/amount_mismatch/
+            // ledger_unreachable, so an `already_resolved` on /verify
+            // surfaces as `Other("already_resolved: ...")` — still an
+            // error, so the coordinator rejects the registration.
+            let post = ledger.verify_bond("alice", "s1", 500).unwrap_err();
+            match post {
+                wraith_protocol::BondError::Other(ref s) => {
+                    assert!(s.contains("already_resolved"), "got {post:?}")
+                }
+                other => panic!("expected Other(already_resolved), got {other:?}"),
+            }
+        })
+        .await;
+        result.unwrap();
     }
 }

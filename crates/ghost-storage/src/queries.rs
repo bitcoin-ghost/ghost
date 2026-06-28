@@ -8991,6 +8991,145 @@ impl Database {
     }
 }
 
+// ===========================================================================
+// Wraith bond escrow ledger (`wraith_bonds`, schema v38)
+//
+// These helpers take a borrowed `&Connection` rather than `&Database` so the
+// caller can compose them inside a single transaction — escrow has to check
+// the spendable balance and insert the bond atomically, otherwise a
+// participant could escrow a bond and spend the same sats. `Transaction`
+// derefs to `Connection`, so a `&Transaction` coerces here directly.
+// ===========================================================================
+
+/// One row of the `wraith_bonds` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BondRow {
+    pub bond_id: String,
+    pub ghost_id: String,
+    pub session_id: String,
+    pub amount_sats: i64,
+    /// `'escrowed'` | `'refunded'` | `'slashed'`.
+    pub status: String,
+    /// Serialized `wraith_protocol::BondResolution` once resolved; `None`
+    /// while still escrowed.
+    pub resolution: Option<String>,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+}
+
+fn bond_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<BondRow> {
+    Ok(BondRow {
+        bond_id: row.get(0)?,
+        ghost_id: row.get(1)?,
+        session_id: row.get(2)?,
+        amount_sats: row.get(3)?,
+        status: row.get(4)?,
+        resolution: row.get(5)?,
+        created_at: row.get(6)?,
+        resolved_at: row.get(7)?,
+    })
+}
+
+/// Return the `bond_id` of the live (status `'escrowed'`) bond for a
+/// `(ghost_id, session_id)` pair, if any. Used for idempotent escrow.
+pub fn find_live_bond(
+    conn: &Connection,
+    ghost_id: &str,
+    session_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT bond_id FROM wraith_bonds
+         WHERE ghost_id = ?1 AND session_id = ?2 AND status = 'escrowed'",
+        params![ghost_id, session_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+/// Look up the bond backing a `(ghost_id, session_id)` for verification.
+/// Prefers the live escrowed bond; falls back to the most recent resolved
+/// bond so a resolved bond still surfaces as `already_resolved` rather than
+/// silently re-verifying.
+pub fn find_bond_for_session(
+    conn: &Connection,
+    ghost_id: &str,
+    session_id: &str,
+) -> rusqlite::Result<Option<BondRow>> {
+    conn.query_row(
+        "SELECT bond_id, ghost_id, session_id, amount_sats, status, resolution,
+                created_at, resolved_at
+         FROM wraith_bonds
+         WHERE ghost_id = ?1 AND session_id = ?2
+         ORDER BY (status = 'escrowed') DESC, created_at DESC
+         LIMIT 1",
+        params![ghost_id, session_id],
+        bond_row_from_sql,
+    )
+    .optional()
+}
+
+/// Insert a fresh escrowed bond. Returns the raw rusqlite error on a unique
+/// constraint violation so the caller can fall back to `find_live_bond`.
+pub fn insert_escrowed_bond(
+    conn: &Connection,
+    bond_id: &str,
+    ghost_id: &str,
+    session_id: &str,
+    amount_sats: i64,
+    created_at: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO wraith_bonds
+            (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
+         VALUES (?1, ?2, ?3, ?4, 'escrowed', NULL, ?5, NULL)",
+        params![bond_id, ghost_id, session_id, amount_sats, created_at],
+    )
+}
+
+/// Fetch a single bond by id.
+pub fn get_bond(conn: &Connection, bond_id: &str) -> rusqlite::Result<Option<BondRow>> {
+    conn.query_row(
+        "SELECT bond_id, ghost_id, session_id, amount_sats, status, resolution,
+                created_at, resolved_at
+         FROM wraith_bonds WHERE bond_id = ?1",
+        params![bond_id],
+        bond_row_from_sql,
+    )
+    .optional()
+}
+
+/// Sum the sats currently withheld from a ghost_id's spendable balance by
+/// live bonds. `'escrowed'` bonds are held (refundable); `'slashed'` bonds
+/// are permanently forfeit. `'refunded'` bonds release their hold and are
+/// excluded.
+pub fn sum_held_bonds_for(conn: &Connection, ghost_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(amount_sats), 0) FROM wraith_bonds
+         WHERE ghost_id = ?1 AND status IN ('escrowed', 'slashed')",
+        params![ghost_id],
+        |row| row.get::<_, i64>(0),
+    )
+}
+
+/// Transition an escrowed bond to a resolved status (`'refunded'` or
+/// `'slashed'`). The `status = 'escrowed'` guard makes this a no-op (0 rows)
+/// on an already-resolved bond, which keeps `resolve` idempotent. Returns the
+/// number of rows changed.
+pub fn resolve_bond_row(
+    conn: &Connection,
+    bond_id: &str,
+    new_status: &str,
+    resolution_json: &str,
+    resolved_at: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE wraith_bonds
+         SET status = ?2, resolution = ?3, resolved_at = ?4
+         WHERE bond_id = ?1 AND status = 'escrowed'",
+        params![bond_id, new_status, resolution_json, resolved_at],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

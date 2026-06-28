@@ -28,7 +28,7 @@ use tracing::{debug, info};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 37;
+const SCHEMA_VERSION: u32 = 38;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -93,6 +93,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (35, migrate_v35),
         (36, migrate_v36),
         (37, migrate_v37),
+        (38, migrate_v38),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -1907,6 +1908,38 @@ fn migrate_v37(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v38: Wraith bond escrow ledger. Each row is a participant's L2 bond
+/// for a Wraith mix round. `status` is one of `'escrowed'` (sats are
+/// held), `'refunded'` (released back to the participant), or
+/// `'slashed'` (forfeit). The partial unique index permits at most one
+/// live (escrowed) bond per `(ghost_id, session_id)` while still
+/// allowing a fresh bond after a prior one has been refunded or
+/// slashed.
+fn migrate_v38(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v38: Add wraith_bonds escrow ledger");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS wraith_bonds (
+            bond_id TEXT PRIMARY KEY,
+            ghost_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            amount_sats INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            resolution TEXT,
+            created_at INTEGER NOT NULL,
+            resolved_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wraith_bonds_live
+            ON wraith_bonds(ghost_id, session_id) WHERE status='escrowed';
+        CREATE INDEX IF NOT EXISTS idx_wraith_bonds_lookup
+            ON wraith_bonds(ghost_id, session_id);",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    info!("Created wraith_bonds table + indexes");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2125,6 +2158,86 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(pragma_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v38_wraith_bonds_table_and_partial_unique_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Table exists.
+        let tables = get_table_names(&conn);
+        assert!(
+            tables.contains(&"wraith_bonds".to_string()),
+            "v38 wraith_bonds table missing. Found: {:?}",
+            tables
+        );
+
+        // The partial unique index exists.
+        let index_names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wraith_bonds'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            index_names.contains(&"idx_wraith_bonds_live".to_string()),
+            "v38 partial unique index missing. Found: {:?}",
+            index_names
+        );
+
+        // First escrowed bond for (alice, sess-1) inserts fine.
+        conn.execute(
+            "INSERT INTO wraith_bonds
+                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
+             VALUES ('b1', 'alice', 'sess-1', 500, 'escrowed', NULL, 100, NULL)",
+            [],
+        )
+        .unwrap();
+
+        // A SECOND escrowed bond for the same (ghost_id, session_id) is
+        // rejected by the partial unique index.
+        let dup = conn.execute(
+            "INSERT INTO wraith_bonds
+                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
+             VALUES ('b2', 'alice', 'sess-1', 500, 'escrowed', NULL, 101, NULL)",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "second escrowed bond for the same (ghost_id, session_id) must be rejected"
+        );
+
+        // Resolve the first bond (refund) — frees the partial-unique slot.
+        conn.execute(
+            "UPDATE wraith_bonds SET status='refunded', resolved_at=200 WHERE bond_id='b1'",
+            [],
+        )
+        .unwrap();
+
+        // Now a fresh escrowed bond for the same pair is allowed.
+        conn.execute(
+            "INSERT INTO wraith_bonds
+                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
+             VALUES ('b3', 'alice', 'sess-1', 500, 'escrowed', NULL, 201, NULL)",
+            [],
+        )
+        .expect("a new escrowed bond must be allowed once the prior one is refunded");
+
+        // A slashed prior bond likewise frees the slot for one more escrow.
+        conn.execute(
+            "UPDATE wraith_bonds SET status='slashed', resolution='x', resolved_at=300 WHERE bond_id='b3'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO wraith_bonds
+                (bond_id, ghost_id, session_id, amount_sats, status, resolution, created_at, resolved_at)
+             VALUES ('b4', 'alice', 'sess-1', 500, 'escrowed', NULL, 301, NULL)",
+            [],
+        )
+        .expect("a new escrowed bond must be allowed once the prior one is slashed");
     }
 
     #[test]

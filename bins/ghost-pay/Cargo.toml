@@ -102,6 +102,12 @@ blstrs = { workspace = true }
 ff = "0.13"
 secp256k1 = { workspace = true }
 
+[dev-dependencies]
+# Round-trip test: drive the real coordinator-side BondLedger HTTP client
+# (`GhostPayBondLedger`) against the live ghost-pay bond router to prove the
+# wire shapes + error strings match byte-for-byte.
+wraith-coordinator = { workspace = true }
+
 [features]
 # Use MPC ceremony parameters for ZK proofs (required for mainnet)
 zk-production = ["ghost-zkp/zk-production"]
