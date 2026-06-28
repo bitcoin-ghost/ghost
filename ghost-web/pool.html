@@ -236,20 +236,6 @@
   </div>
 </section>
 
-<section class="block nodes-section">
-  <div class="container">
-    <div class="section-label">network</div>
-    <h2 class="section-title">Nodes on the mesh.</h2>
-    <p class="section-lead">
-      Every node currently gossiping on the pool mesh — this node plus every
-      connected peer, with its verified capabilities, own hashrate and miner
-      count. The list populates live from the mesh, so new nodes appear
-      automatically as they join.
-    </p>
-    <div class="node-grid" id="node-grid"></div>
-  </div>
-</section>
-
 <section class="block payout-section">
   <div class="container">
     <div class="section-label">next block payout</div>
@@ -722,115 +708,6 @@
     getHashrate: function () { return lastStats.hashrate; },
     getMiners:   function () { return lastStats.miners; }
   };
-
-  // ───────── Mesh node list ─────────
-  // The node list populates from the live mesh, not a hard-coded VM set.
-  // POOL_NODES (the four load-balancer proxies) are only BOOTSTRAP SEEDS here:
-  // a newly-joined node has no per-node proxy, so we enter through one seed and
-  // the /api/v1/pool/mesh-nodes endpoint returns the WHOLE mesh (self + every
-  // connected peer) from there. The aggregate sections above keep fanning out
-  // to the seeds because their figures are mesh-aggregated/gossiped and already
-  // reflect new nodes from any one seed.
-  function escHtml(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
-
-  async function fetchMeshNodes() {
-    for (var i = 0; i < POOL_NODES.length; i++) {
-      try {
-        var ctl = new AbortController();
-        var t = setTimeout(function () { ctl.abort(); }, 5000);
-        var r = await fetch('/api/pool/' + POOL_NODES[i].id + '/api/v1/pool/mesh-nodes', { signal: ctl.signal });
-        clearTimeout(t);
-        if (r.ok) {
-          var d = await r.json();
-          if (d && Array.isArray(d.nodes) && d.nodes.length) return d.nodes;
-        }
-      } catch (e) { /* try the next seed */ }
-    }
-    return null;
-  }
-
-  function nodeCapBadges(caps) {
-    caps = caps || {};
-    var defs = [
-      ['elder', 'elder'],
-      ['archive', 'archive'],
-      ['ghost_pay', 'ghost pay'],
-      ['public_mining', 'public'],
-      ['reaper', 'reaper'],
-    ];
-    return defs.map(function (d) {
-      var on = !!caps[d[0]];
-      return '<span class="cap' + (on ? '' : ' off') + '">' + escHtml(d[1]) + '</span>';
-    }).join('');
-  }
-
-  function renderMeshNodes(nodes) {
-    var grid = document.getElementById('node-grid');
-    if (!grid) return;
-    if (!nodes || !nodes.length) {
-      grid.innerHTML = '<p class="section-lead" style="grid-column:1/-1">Mesh node list unavailable — retrying…</p>';
-      return;
-    }
-    // Collapse transient same-address duplicates. During a node restart the mesh
-    // briefly reports stale session peer-entries (same IP, a different node_id,
-    // hashrate 0) that age out of the freshness window within ~2 min — without
-    // this they'd flash as phantom extra nodes. Dedup by host, keeping the best
-    // entry per IP: prefer self, then non-zero hashrate, then non-zero miners.
-    function hostOf(a) { var s = String(a || ''); var i = s.lastIndexOf(':'); return i > 0 ? s.slice(0, i) : s; }
-    function nodeScore(x) { return (x.is_self ? 100 : 0) + (((x.hashrate_th || 0) > 0) ? 10 : 0) + (((x.miner_count || 0) > 0) ? 1 : 0); }
-    var byHost = {};
-    nodes.forEach(function (n) {
-      var key = hostOf(n.address) || ('id:' + (n.node_id || ''));
-      if (!byHost[key] || nodeScore(n) > nodeScore(byHost[key])) byHost[key] = n;
-    });
-    nodes = Object.keys(byHost).map(function (k) { return byHost[k]; });
-    // Self first, then elders, then by hashrate. Stable, readable ordering.
-    var sorted = nodes.slice().sort(function (a, b) {
-      if (!!a.is_self !== !!b.is_self) return a.is_self ? -1 : 1;
-      if (!!a.elder !== !!b.elder) return a.elder ? -1 : 1;
-      return (b.hashrate_th || 0) - (a.hashrate_th || 0);
-    });
-    grid.innerHTML = sorted.map(function (n) {
-      var id = String(n.node_id || '');
-      var shortId = id ? id.slice(0, 8) : '????????';
-      var name = n.is_self ? 'this node' : ('node ' + shortId);
-      var healthy = n.healthy !== false;
-      var hr = formatHashrate(typeof n.hashrate_th === 'number' ? n.hashrate_th : 0);
-      var miners = (typeof n.miner_count === 'number') ? n.miner_count : 0;
-      var addr = n.address ? escHtml(n.address) : '—';
-      var elderStar = n.elder ? ' <span style="color:var(--accent);font-size:12px" title="elder">★</span>' : '';
-      return '' +
-        '<div class="node-card">' +
-          '<div class="head">' +
-            '<span class="name">' + escHtml(name) + elderStar + '</span>' +
-            '<span class="status ' + (healthy ? 'online' : 'offline') + '">' + (healthy ? 'online' : 'offline') + '</span>' +
-          '</div>' +
-          '<div class="row"><span class="k">hashrate</span><span class="v">' + hr + '</span></div>' +
-          '<div class="row"><span class="k">miners</span><span class="v">' + miners + '</span></div>' +
-          '<div class="row"><span class="k">node id</span><span class="v" style="word-break:break-all">' + escHtml(shortId) + '</span></div>' +
-          '<div class="row"><span class="k">address</span><span class="v" style="word-break:break-all">' + addr + '</span></div>' +
-          '<div class="caps">' + nodeCapBadges(n.capabilities) + '</div>' +
-        '</div>';
-    }).join('');
-  }
-
-  async function refreshMeshNodes() {
-    try {
-      var nodes = await fetchMeshNodes();
-      // Only overwrite the grid when we have data; a transient failure keeps
-      // the last good list rather than blanking it. Show the placeholder only
-      // on the very first load when nothing has rendered yet.
-      var grid = document.getElementById('node-grid');
-      if (nodes && nodes.length) renderMeshNodes(nodes);
-      else if (grid && !grid.children.length) renderMeshNodes(null);
-    } catch (e) { /* keep last good render */ }
-  }
-  refreshMeshNodes();
-  setInterval(refreshMeshNodes, 30000);
 
   // ───────── Difficulty helpers (shared by Records + Leaderboards) ─────────
   // Bitcoin "difficulty 1" target. Dividing it by a share's hash-as-int
