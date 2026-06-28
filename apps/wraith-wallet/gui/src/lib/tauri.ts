@@ -257,19 +257,25 @@ export async function walletShowMnemonic(
   return unwrap<{ name: string; mnemonic: string }>(resp).payload;
 }
 
+// These three unwrap() so a daemon Response::Error (e.g. wrong passphrase) THROWS
+// rather than resolving as { result: "error" } — otherwise the caller's success
+// path runs and the failure is silently swallowed (no error shown to the user).
 export async function walletUnlock(
   name: string,
   passphrase: string,
 ): Promise<unknown> {
-  return await invoke("wallet_unlock", { name, passphrase });
+  const resp = await invoke("wallet_unlock", { name, passphrase });
+  return unwrap(resp).payload;
 }
 
 export async function walletLock(name: string | null): Promise<unknown> {
-  return await invoke("wallet_lock", { name });
+  const resp = await invoke("wallet_lock", { name });
+  return unwrap(resp).payload;
 }
 
 export async function walletSelect(name: string): Promise<unknown> {
-  return await invoke("wallet_select", { name });
+  const resp = await invoke("wallet_select", { name });
+  return unwrap(resp).payload;
 }
 
 export async function walletGhostId(): Promise<{
@@ -402,13 +408,18 @@ export async function lightSend(
   memo?: string,
   shroud_max_ms?: number,
 ): Promise<unknown> {
-  return await invoke("light_send", {
+  const resp = await invoke("light_send", {
     recipient,
     amountSats: amount_sats,
     mode,
     memo,
     shroudMaxMs: shroud_max_ms,
   });
+  // Must unwrap: the daemon serializes a rejected payment as
+  // { result: "error", message }, which `invoke` RESOLVES. Without unwrap the
+  // caller's success branch runs and the UI falsely reports "Sent". unwrap()
+  // throws on result:"error" so Send.tsx's catch surfaces the real failure.
+  return unwrap(resp).payload;
 }
 
 export interface LightUtxoEntry {
@@ -577,7 +588,8 @@ export async function wraithMixRun(
 // ----- GSP ---------------------------------------------------------------
 
 export async function gspAuth(): Promise<unknown> {
-  return await invoke("gsp_auth");
+  const resp = await invoke("gsp_auth");
+  return unwrap(resp).payload;
 }
 
 export interface GspSessionStatus {
@@ -599,14 +611,22 @@ export async function gspSessionStatus(): Promise<GspSessionStatus> {
 
 // ----- Locks -------------------------------------------------------------
 
+// Must match the wire `LockEntry` in ipc/src/lib.rs exactly. The fields are read
+// from an `unknown` cast, so a name mismatch is invisible to tsc but breaks at
+// runtime — previously `state`/`created_at`/`recovery_height` (none of which exist
+// on the wire) left the State pill blank and the Confirm/Recover buttons (gated on
+// `state`) permanently unreachable.
 export interface LockEntry {
   lock_id: string;
+  status: string;
   capacity_sats: number;
-  state: string;
-  created_at: number;
-  funding_address?: string;
+  balance_sats: number;
+  denomination: string;
+  timelock_tier: string;
+  funding_address: string;
   funding_txid?: string;
-  recovery_height?: number;
+  funding_vout?: number;
+  creation_height: number;
 }
 
 export interface LocksListResponse {
@@ -635,7 +655,8 @@ export async function locksConfirm(
   lock_id: string,
   funding_txid: string,
 ): Promise<unknown> {
-  return await invoke("locks_confirm", { lockId: lock_id, fundingTxid: funding_txid });
+  const resp = await invoke("locks_confirm", { lockId: lock_id, fundingTxid: funding_txid });
+  return unwrap(resp).payload;
 }
 
 export interface LocksRecoveredResult {

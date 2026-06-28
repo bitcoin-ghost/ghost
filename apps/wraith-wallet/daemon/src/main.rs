@@ -2707,7 +2707,9 @@ mod unix {
                                 .into_iter()
                                 .map(|l| LockEntry {
                                     lock_id: l.lock_id,
-                                    status: format!("{:?}", l.status).to_lowercase(),
+                                    // Canonical lowercase via Display ("pending"/"active"/"in_use");
+                                    // Debug formatting would render multi-word variants wrong (e.g. "inuse").
+                                    status: l.status.to_string(),
                                     capacity_sats: l.capacity_sats,
                                     balance_sats: l.balance_sats,
                                     denomination: l.denomination,
