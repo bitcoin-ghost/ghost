@@ -467,21 +467,33 @@ mod tests {
         let manager = BanManager::new();
         let node_id = [2u8; 32];
 
-        // Ban for short duration (50ms to avoid platform timing flakiness)
+        // Ban for a long duration. The "banned initially" assertion must not
+        // race the expiry — a short ban can elapse between the ban call and the
+        // check on a heavily loaded CI runner (this is what made the test flaky
+        // on macOS), so use a duration that cannot expire before we look.
         manager.ban_for_duration(
             node_id,
             BanReason::RateLimitExceeded,
-            Duration::from_millis(50),
+            Duration::from_secs(3600),
         );
 
-        // Should be banned initially
+        // Should be banned initially.
         assert!(manager.is_banned(&node_id));
 
-        // Wait for expiration (100ms margin for cross-platform reliability)
-        std::thread::sleep(Duration::from_millis(100));
+        // Force the entry's expiry into the past instead of sleeping. This
+        // exercises the real is_banned expiry + eager-eviction path
+        // deterministically, with no wall-clock dependency to flake under load.
+        {
+            let mut banned = manager.banned_nodes.write();
+            banned
+                .get_mut(&node_id)
+                .expect("ban entry present")
+                .expire_at = Instant::now() - Duration::from_secs(1);
+        }
 
-        // Should no longer be banned
+        // Should no longer be banned, and the stale entry is evicted.
         assert!(!manager.is_banned(&node_id));
+        assert_eq!(manager.banned_count(), 0);
     }
 
     #[test]
