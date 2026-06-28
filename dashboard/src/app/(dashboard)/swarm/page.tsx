@@ -18,7 +18,6 @@ import {
   useRemoveSwarmNode,
   useUpdateSwarmNode,
   useRefreshSwarmNode,
-  useConfigureSwarmNode,
   useNodeInfo,
 } from "@/hooks/queries";
 import { setNickname } from "@/lib/api/node";
@@ -64,14 +63,12 @@ export default function SwarmPage() {
   const removeNode = useRemoveSwarmNode();
   const updateNode = useUpdateSwarmNode();
   const refreshNode = useRefreshSwarmNode();
-  const configureNode = useConfigureSwarmNode();
   const queryClient = useQueryClient();
   const { success, error } = useToast();
 
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
-  const [configDialogOpen, setConfigDialogOpen] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [selectedNode, setSelectedNode] = useState<SwarmNode | null>(null);
   const [newNodeName, setNewNodeName] = useState("");
@@ -114,6 +111,22 @@ export default function SwarmPage() {
   // Refresh all nodes - calls API directly for reliability
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [restartingNode, setRestartingNode] = useState<string | null>(null);
+  // Nodes whose last refresh failed — surfaced as a per-node "stale" marker so
+  // best-effort refresh failures aren't silently swallowed.
+  const [staleNodeIds, setStaleNodeIds] = useState<Set<string>>(new Set());
+
+  const markNodeStale = (nodeId: string, stale: boolean) => {
+    setStaleNodeIds((prev) => {
+      if (prev.has(nodeId) === stale) return prev;
+      const next = new Set(prev);
+      if (stale) {
+        next.add(nodeId);
+      } else {
+        next.delete(nodeId);
+      }
+      return next;
+    });
+  };
 
   const handleRestartNode = async (node: SwarmNode) => {
     if (restartingNode) return;
@@ -170,8 +183,9 @@ export default function SwarmPage() {
       let syncResult = { discovered_peers: 0, removed_stale: 0, total_peers: 0 };
       try {
         syncResult = await syncSwarm();
-      } catch {
-        // Sync failed, continue with refresh anyway
+      } catch (err) {
+        // Sync failed, continue with refresh anyway — but log it.
+        console.error("Swarm sync failed; continuing with refresh", err);
       }
 
       // Refresh all remote nodes in parallel via direct API calls
@@ -179,8 +193,11 @@ export default function SwarmPage() {
         await Promise.all(remoteNodes.map(async (node) => {
           try {
             await refreshSwarmNode(node.node_id);
-          } catch {
-            // Ignore individual failures
+            markNodeStale(node.node_id, false);
+          } catch (err) {
+            // Mark the node stale and log — don't swallow silently.
+            console.error(`Swarm refresh failed for ${node.name} (${node.node_id})`, err);
+            markNodeStale(node.node_id, true);
           }
         }));
       }
@@ -217,8 +234,10 @@ export default function SwarmPage() {
       await Promise.all(remoteNodes.map(async (node) => {
         try {
           await refreshSwarmNode(node.node_id);
-        } catch {
-          // Ignore failures
+          markNodeStale(node.node_id, false);
+        } catch (err) {
+          console.error(`Swarm auto-refresh failed for ${node.name} (${node.node_id})`, err);
+          markNodeStale(node.node_id, true);
         }
       }));
       // Refetch swarm data
@@ -228,11 +247,6 @@ export default function SwarmPage() {
     const interval = setInterval(doRefresh, 30000);
     return () => clearInterval(interval);
   }, [nodes.length, queryClient]); // Re-setup when node count changes
-
-  const handleConfigureClick = (node: SwarmNode) => {
-    setSelectedNode(node);
-    setConfigDialogOpen(true);
-  };
 
   const handleEditClick = (node: SwarmNode) => {
     setSelectedNode(node);
@@ -276,9 +290,6 @@ export default function SwarmPage() {
       error("Failed to Update", err instanceof Error ? err.message : "Unknown error");
     }
   };
-
-  // Suppress unused variable warnings for hooks used only for side effects
-  void configureNode;
 
   return (
     <div className="space-y-6">
@@ -419,6 +430,11 @@ export default function SwarmPage() {
                     <Badge variant={node.online ? "success" : "error"} className="text-xs">
                       {node.online ? "Online" : "Offline"}
                     </Badge>
+                    {staleNodeIds.has(node.node_id) && (
+                      <Badge variant="warning" className="text-xs">
+                        Stale
+                      </Badge>
+                    )}
                     {node.watchdog_health && (
                       <Badge
                         variant={node.watchdog_health === "healthy" ? "success" : node.watchdog_health === "degraded" ? "warning" : "error"}
@@ -496,6 +512,9 @@ export default function SwarmPage() {
                         <Badge variant={node.online ? "success" : "error"}>
                           {node.online ? "Online" : "Offline"}
                         </Badge>
+                        {staleNodeIds.has(node.node_id) && (
+                          <Badge variant="warning">Stale</Badge>
+                        )}
                         {node.watchdog_health && (
                           <Badge
                             variant={node.watchdog_health === "healthy" ? "success" : node.watchdog_health === "degraded" ? "warning" : "error"}
@@ -690,61 +709,6 @@ export default function SwarmPage() {
               disabled={!newNodeName.trim() || !newNodeAddress.trim()}
             >
               Add Node
-            </Button>
-          </div>
-        </div>
-      </Dialog>
-
-      {/* Configure Node Dialog */}
-      <Dialog
-        isOpen={configDialogOpen}
-        onClose={() => setConfigDialogOpen(false)}
-        title={`Configure ${selectedNode?.name ?? "Node"}`}
-      >
-        <div className="space-y-4">
-          <p className="text-gray-400 text-sm">
-            Remote node configuration is available for nodes that support it. Configuration changes
-            require the node to restart.
-          </p>
-
-          <div className="p-4 bg-gray-800/50 rounded-lg">
-            <h4 className="text-sm font-medium text-gray-300 mb-3">Current Status</h4>
-            {selectedNode && (
-              <div className="grid grid-cols-2 gap-2 text-sm">
-                <div>
-                  <span className="text-gray-400">Node:</span>{" "}
-                  <span>{selectedNode.name}</span>
-                </div>
-                <div>
-                  <span className="text-gray-400">Status:</span>{" "}
-                  <Badge variant={selectedNode.online ? "success" : "error"}>
-                    {selectedNode.online ? "Online" : "Offline"}
-                  </Badge>
-                </div>
-                <div>
-                  <span className="text-gray-400">Shares:</span>{" "}
-                  <span>
-                    {selectedNode.shares ?? 0}/{selectedNode.max_shares ?? 0}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-gray-400">Uptime:</span>{" "}
-                  <span>{formatUptime(selectedNode.uptime_percent ?? 0)}</span>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="p-4 bg-orange-900/20 border border-orange-800 rounded-lg">
-            <p className="text-orange-300 text-sm">
-              For detailed node configuration, access the node&apos;s dashboard directly on that machine.
-              Configuration changes are synced automatically via the swarm protocol.
-            </p>
-          </div>
-
-          <div className="flex justify-end pt-4 border-t border-gray-800">
-            <Button variant="ghost" onClick={() => setConfigDialogOpen(false)}>
-              Close
             </Button>
           </div>
         </div>

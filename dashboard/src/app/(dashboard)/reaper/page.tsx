@@ -6,6 +6,7 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { StatCard } from "@/components/ui/StatCard";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { useConfig } from "@/hooks/queries/useConfigQueries";
+import { fetchApi } from "@/lib/api/client";
 
 interface ReaperStats {
   txs_evaluated: number;
@@ -29,11 +30,17 @@ interface ReaperStats {
 }
 
 async function fetchReaperStats(): Promise<ReaperStats | null> {
-  const res = await fetch("/api/v1/reaper/status", { credentials: "include" });
-  if (!res.ok) return null;
-  const data = await res.json();
-  // Endpoint returns null when ghost-pool hasn't wired the callback yet.
-  return data && typeof data === "object" && "txs_evaluated" in data ? data : null;
+  try {
+    // Route through the proxy (fetchApi) so the HMAC-signed internal request
+    // reaches ghost-pool; a bare fetch hits the Next server and always 404s.
+    const data = await fetchApi<unknown>("/api/v1/reaper/status");
+    // Endpoint returns null when ghost-pool hasn't wired the callback yet.
+    return data && typeof data === "object" && "txs_evaluated" in data
+      ? (data as ReaperStats)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 const DETECTION_VECTORS = [
@@ -58,6 +65,11 @@ const DETECTION_VECTORS = [
     desc: "Detects invalid or non-functional public keys used as data carriers in multisig outputs.",
   },
   {
+    key: "fake_pubkey_curve_point" as const,
+    name: "Fake Pubkey Curve Points",
+    desc: "Flags fake pubkeys that are not valid secp256k1 curve points, a tell-tale sign the value carries embedded data rather than a real key.",
+  },
+  {
     key: "oversized_op_return" as const,
     name: "Oversized OP_RETURN",
     desc: "Flags OP_RETURN outputs exceeding standard relay limits, used for embedding large data payloads.",
@@ -76,6 +88,11 @@ const DETECTION_VECTORS = [
     key: "excess_witness_data" as const,
     name: "Excess Witness Data",
     desc: "Catches witness items far exceeding what the script actually consumes during execution.",
+  },
+  {
+    key: "excess_stack_items" as const,
+    name: "Excess Stack Items",
+    desc: "Flags witnesses that leave surplus elements on the stack after script execution, a vector for stuffing extra data into the witness.",
   },
   {
     key: "legacy_scriptsig_data" as const,
