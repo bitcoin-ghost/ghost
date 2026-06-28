@@ -7,12 +7,20 @@ import { Input } from '@/components/ui/Input';
 import { Toggle } from '@/components/ui/Toggle';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-import { useSetMempoolProfile, useSetTemplateProfile } from '@/hooks/queries';
+import {
+  useSetMempoolProfile,
+  useSetTemplateProfile,
+  useSaveMempoolProfile,
+  useActivateMempoolProfile,
+} from '@/hooks/queries';
+import { DEFAULT_MEMPOOL_PROFILE } from '../MempoolProfileDialog';
 import type { MempoolProfile, TemplateProfile } from '@/types/api';
+import type { CustomMempoolProfile } from '@/lib/api/config';
 
 interface MempoolPolicyData {
   mempool_profile: string;
   template_profile: string;
+  profile_name: string;
   min_relay_tx_fee: number;
   max_mempool_size: number;
   mempool_expiry: number;
@@ -66,6 +74,8 @@ const TEMPLATE_PROFILES = [
 export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWizardProps) {
   const setMempoolProfile = useSetMempoolProfile();
   const setTemplateProfile = useSetTemplateProfile();
+  const saveMempoolProfile = useSaveMempoolProfile();
+  const activateMempoolProfile = useActivateMempoolProfile();
   const toast = useToast();
 
   const steps = useMemo<WizardStep<MempoolPolicyData>[]>(() => {
@@ -85,9 +95,15 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
         description: 'Configure core mempool parameters',
         validate: (data) => {
           if (data.mempool_profile !== 'custom') return null;
-          if (data.min_relay_tx_fee <= 0) return 'Minimum relay fee must be greater than 0';
-          if (data.max_mempool_size < 5) return 'Mempool size must be at least 5 MB';
-          if (data.mempool_expiry < 1) return 'Mempool expiry must be at least 1 hour';
+          if (!data.profile_name.trim()) return 'Please name this custom profile';
+          if (!Number.isFinite(data.min_relay_tx_fee) || data.min_relay_tx_fee <= 0)
+            return 'Minimum relay fee must be greater than 0';
+          if (!Number.isFinite(data.max_mempool_size) || data.max_mempool_size < 5)
+            return 'Mempool size must be at least 5 MB';
+          if (data.max_mempool_size > 10000) return 'Mempool size must be at most 10000 MB';
+          if (!Number.isFinite(data.mempool_expiry) || data.mempool_expiry < 1)
+            return 'Mempool expiry must be at least 1 hour';
+          if (data.mempool_expiry > 8760) return 'Mempool expiry must be at most 8760 hours (1 year)';
           return null;
         },
       },
@@ -110,25 +126,46 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
         title: 'Confirm',
         description: 'Review and apply your mempool policy',
         onSubmit: async (data) => {
-          const profile = data.mempool_profile === 'custom' ? 'ghost' : data.mempool_profile;
-          await setMempoolProfile.mutateAsync(profile as MempoolProfile);
+          if (data.mempool_profile === 'custom') {
+            // Build a real custom profile from the collected fields (defaults
+            // fill in everything the wizard doesn't surface), persist it, then
+            // activate it — mirroring MempoolProfileDialog's save+activate flow.
+            const customProfile: CustomMempoolProfile = {
+              ...DEFAULT_MEMPOOL_PROFILE,
+              name: data.profile_name.trim(),
+              min_relay_tx_fee: data.min_relay_tx_fee,
+              max_mempool_size: data.max_mempool_size,
+              mempool_expiry: data.mempool_expiry,
+              datacarrier: data.datacarrier,
+              filter_inscriptions: data.filter_inscriptions,
+              filter_brc20: data.filter_brc20,
+              filter_runes: data.filter_runes,
+            };
+            await saveMempoolProfile.mutateAsync(customProfile);
+            await activateMempoolProfile.mutateAsync(customProfile.name);
+          } else {
+            await setMempoolProfile.mutateAsync(data.mempool_profile as MempoolProfile);
+          }
           await setTemplateProfile.mutateAsync(data.template_profile as TemplateProfile);
           toast.success(
             'Mempool Policy Updated',
-            `Mempool profile set to ${data.mempool_profile}, template set to ${data.template_profile}`
+            data.mempool_profile === 'custom'
+              ? `Custom profile "${data.profile_name.trim()}" saved and activated, template set to ${data.template_profile}`
+              : `Mempool profile set to ${data.mempool_profile}, template set to ${data.template_profile}`
           );
           onClose();
         },
       },
     ];
     return allSteps;
-  }, [setMempoolProfile, setTemplateProfile, toast, onClose]);
+  }, [setMempoolProfile, setTemplateProfile, saveMempoolProfile, activateMempoolProfile, toast, onClose]);
 
   const wizard = useWizard<MempoolPolicyData>({
     steps,
     initialData: {
       mempool_profile: 'standard',
       template_profile: 'standard',
+      profile_name: 'Custom Policy',
       min_relay_tx_fee: 1,
       max_mempool_size: 300,
       mempool_expiry: 336,
@@ -207,6 +244,15 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
           {/* Step 1: Core Settings (custom only) */}
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
+              <div className="p-4 rounded-lg bg-gray-800/50">
+                <Input
+                  label="Profile Name"
+                  type="text"
+                  value={data.profile_name}
+                  onChange={(e) => setData({ profile_name: e.target.value })}
+                  helperText="A label for this custom profile; it is saved and activated on your node"
+                />
+              </div>
               <div className="p-4 rounded-lg bg-gray-800/50">
                 <Input
                   label="Minimum Relay TX Fee (sat/vB)"
@@ -356,6 +402,10 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                 <div className="p-4 rounded-lg bg-gray-800/50">
                   <h4 className="text-gray-100 font-medium mb-3">Custom Settings</h4>
                   <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-gray-400">Profile Name</span>
+                      <span className="text-gray-100">{data.profile_name}</span>
+                    </div>
                     <div className="flex items-center justify-between">
                       <span className="text-gray-400">Min Relay Fee</span>
                       <span className="text-gray-100">{data.min_relay_tx_fee} sat/vB</span>

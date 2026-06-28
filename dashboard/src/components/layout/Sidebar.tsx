@@ -23,6 +23,7 @@ import {
   Banknote,
   HardDrive,
   Cpu,
+  Palette,
   Settings,
   ChevronLeft,
   X,
@@ -93,6 +94,7 @@ const GROUPS: NavGroup[] = [
     label: "identity",
     items: [
       { href: "/elders", label: "Elders & MPC", icon: <Users {...ICON} /> },
+      { href: "/glyph", label: "Glyph", icon: <Palette {...ICON} /> },
     ],
   },
   {
