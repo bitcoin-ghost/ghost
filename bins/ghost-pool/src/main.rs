@@ -4997,6 +4997,19 @@ async fn main() -> Result<()> {
         // DoS attacks that exhaust file descriptors or memory.
         let noise_connection_limit = Arc::new(Semaphore::new(100));
         let mut noise_shutdown = shutdown_tx.subscribe();
+        // MESH REGISTRATION FIX: an inbound Noise connection (a node dialling us)
+        // must trigger a reverse SUB-dial back to that node. Health pings are
+        // ZMQ PUB/SUB broadcasts, so the ONLY way we register a peer is by
+        // subscribing to its PUB sockets — which the SUB loop only does for peers
+        // already in the PeerManager. A dynamically-joining node dials us over
+        // Noise (so its verifications arrive, but are rejected as "unknown
+        // challenger"); without dialling back we never receive its health pings
+        // and never learn it. Only the static seed list got this today, so
+        // non-seed nodes could never join. Captured into the listener task below.
+        let noise_is_mainnet = is_mainnet_round;
+        let noise_disc_port = config.network.p2p.discovery;
+        let reverse_subscribed: Arc<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
         tokio::spawn(async move {
             use tokio::net::TcpListener;
@@ -5040,6 +5053,9 @@ async fn main() -> Result<()> {
                     Ok((stream, addr)) => {
                         let pool = Arc::clone(&noise_pool_clone);
                         let mesh = Arc::clone(&mesh_for_noise);
+                        let conn_is_mainnet = noise_is_mainnet;
+                        let conn_disc_port = noise_disc_port;
+                        let conn_rev_sub = Arc::clone(&reverse_subscribed);
 
                         tokio::spawn(async move {
                             // M-17: Hold permit for connection lifetime - released when dropped
@@ -5071,6 +5087,58 @@ async fn main() -> Result<()> {
                                         peer_key = %hex::encode(&conn.peer_key[..8]),
                                         "Accepted Noise connection"
                                     );
+
+                                    // MESH REGISTRATION FIX: reverse-subscribe to this
+                                    // inbound peer so we receive its PUB/SUB health pings
+                                    // (the only path that registers it in the PeerManager).
+                                    // connect_peer mints a placeholder peer; the SUB loop
+                                    // dials its 8555-8562 PUBs; the real node_id then arrives
+                                    // via the first PoW-gated, signed health ping and retires
+                                    // the placeholder. No new trust is granted — counting a
+                                    // peer still requires that valid health ping. Skip
+                                    // private/reserved source IPs on mainnet (SSRF guard) and
+                                    // dial back only once per host (the addr.ip() is the real
+                                    // TCP source of a completed handshake).
+                                    {
+                                        let ip = addr.ip();
+                                        let routable = if conn_is_mainnet {
+                                            match ip {
+                                                std::net::IpAddr::V4(v4) => {
+                                                    !(v4.is_loopback()
+                                                        || v4.is_private()
+                                                        || v4.is_link_local()
+                                                        || v4.is_unspecified())
+                                                }
+                                                std::net::IpAddr::V6(v6) => {
+                                                    !(v6.is_loopback() || v6.is_unspecified())
+                                                }
+                                            }
+                                        } else {
+                                            true
+                                        };
+                                        let first_time = routable
+                                            && conn_rev_sub
+                                                .lock()
+                                                .map(|mut s| s.insert(ip))
+                                                .unwrap_or(false);
+                                        if first_time {
+                                            let mesh_cb = Arc::clone(&mesh);
+                                            let addr_str = format!("{}:{}", ip, conn_disc_port);
+                                            tokio::spawn(async move {
+                                                match mesh_cb.connect_peer(&addr_str).await {
+                                                    Ok(()) => tracing::info!(
+                                                        peer = %addr_str,
+                                                        "Reverse-subscribed to inbound peer (mesh registration)"
+                                                    ),
+                                                    Err(e) => tracing::debug!(
+                                                        peer = %addr_str,
+                                                        error = %e,
+                                                        "Reverse-subscribe connect_peer failed"
+                                                    ),
+                                                }
+                                            });
+                                        }
+                                    }
 
                                     // Handle incoming messages from this connection
                                     // Messages are received, validated, and dispatched to handlers
