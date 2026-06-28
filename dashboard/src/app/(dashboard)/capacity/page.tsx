@@ -6,6 +6,7 @@ import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
+import { fetchApi } from "@/lib/api/client";
 
 /**
  * Capacity & load-balancer view.
@@ -30,9 +31,10 @@ interface PoolNodesResponse {
 }
 
 async function fetchPoolNodes(): Promise<PoolNodesResponse> {
-  const res = await fetch("/api/internal/pool-nodes", { credentials: "include" });
-  if (!res.ok) throw new Error(`pool-nodes HTTP ${res.status}`);
-  return res.json();
+  // Route through the proxy (fetchApi) so the HMAC-signed internal request
+  // reaches ghost-pool; a bare fetch hits the Next server and always 404s,
+  // which previously left this page rendering only an error card.
+  return fetchApi<PoolNodesResponse>("/api/internal/pool-nodes");
 }
 
 function utilPct(n: PoolNode): number {

@@ -6,6 +6,7 @@ import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { SkeletonCard } from "@/components/ui/Skeleton";
+import { fetchApi } from "@/lib/api/client";
 
 /**
  * Per-node mempool view.
@@ -35,9 +36,10 @@ interface MempoolStatus {
 }
 
 async function fetchMempoolStatus(): Promise<MempoolStatus> {
-  const res = await fetch("/api/v1/system/mempool", { credentials: "include" });
-  if (!res.ok) throw new Error(`mempool status HTTP ${res.status}`);
-  return res.json();
+  // Route through the proxy (fetchApi) so the HMAC-signed internal request
+  // reaches ghost-pool; a bare fetch hits the Next server and always 404s,
+  // which previously made every node falsely report "not installed".
+  return fetchApi<MempoolStatus>("/api/v1/system/mempool");
 }
 
 export default function MempoolPage() {

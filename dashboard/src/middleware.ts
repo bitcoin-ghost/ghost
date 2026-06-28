@@ -50,10 +50,14 @@ export async function middleware(request: NextRequest) {
     return addSecurityHeaders(NextResponse.next());
   }
 
-  // Remote access — password-gated dashboard
+  // Remote access — password-gated dashboard.
+  // Fail CLOSED: if no DASHBOARD_PASSWORD is configured we cannot authenticate a
+  // remote caller, so deny rather than serve unauthenticated. Localhost is
+  // handled above and is unaffected; remote access only works once the operator
+  // sets a password.
   const dashboardPassword = process.env.DASHBOARD_PASSWORD;
   if (!dashboardPassword) {
-    return addSecurityHeaders(NextResponse.next());
+    return redirectToLogin(request, pathname);
   }
 
   const token = request.cookies.get("ghost-session")?.value;
