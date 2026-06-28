@@ -6299,13 +6299,13 @@ mod tests {
     fn parse_param_hashes_extracts_and_skips_malformed() {
         let block = "fa9db2b7".repeat(8); // 64 hex chars
         let payout = "0123abcd".repeat(8);
-        let env = format!(
-            "block:{},garbage,PAYOUT:{},BAD:xyz,SHORT:00",
-            block, payout
-        );
+        let env = format!("block:{},garbage,PAYOUT:{},BAD:xyz,SHORT:00", block, payout);
         let map = parse_param_hashes(&env);
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get("BLOCK"), Some(&<[u8; 32]>::try_from(hex::decode(&block).unwrap().as_slice()).unwrap()));
+        assert_eq!(
+            map.get("BLOCK"),
+            Some(&<[u8; 32]>::try_from(hex::decode(&block).unwrap().as_slice()).unwrap())
+        );
         assert!(map.contains_key("PAYOUT"));
         assert!(!map.contains_key("BAD"));
         assert!(!map.contains_key("SHORT"));
