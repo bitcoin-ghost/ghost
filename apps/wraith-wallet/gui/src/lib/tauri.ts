@@ -268,6 +268,59 @@ export async function walletUnlock(
   return unwrap(resp).payload;
 }
 
+export interface WalletBackupResult {
+  name: string;
+  /// Absolute path the daemon wrote / read.
+  path: string;
+  /// Size of the encrypted keystore copied, in bytes.
+  bytes: number;
+}
+
+/// Back up wallet `name`'s encrypted keystore to `to_path`. The daemon
+/// copies the on-disk keystore (still encrypted) and refuses to
+/// overwrite an existing file.
+export async function walletExport(
+  name: string,
+  to_path: string,
+): Promise<WalletBackupResult> {
+  const resp = await invoke("wallet_export", { name, toPath: to_path });
+  return unwrap<WalletBackupResult>(resp).payload;
+}
+
+/// Restore wallet `name` from an exported keystore at `from_path`. The
+/// daemon refuses if a wallet of that name already exists on disk.
+export async function walletRestore(
+  name: string,
+  from_path: string,
+): Promise<WalletBackupResult> {
+  const resp = await invoke("wallet_restore", { name, fromPath: from_path });
+  return unwrap<WalletBackupResult>(resp).payload;
+}
+
+export interface CheckForUpdateResult {
+  current_version: string;
+  /// Version from the fetched manifest, when fetch + parse succeeded.
+  latest_version: string | null;
+  /// True only when the manifest version byte-equals the running one.
+  up_to_date: boolean;
+  /// Where the manifest was fetched from (resolved override or the
+  /// daemon-configured default).
+  manifest_url: string;
+  tarball: string | null;
+  tarball_sha256: string | null;
+}
+
+/// Ask the daemon to fetch a release manifest and compare its version
+/// against the running daemon. Pass `manifest_url` to override the
+/// daemon-configured default. The daemon only reports — it never
+/// downloads or installs.
+export async function checkForUpdate(
+  manifest_url?: string,
+): Promise<CheckForUpdateResult> {
+  const resp = await invoke("check_for_update", { manifestUrl: manifest_url });
+  return unwrap<CheckForUpdateResult>(resp).payload;
+}
+
 export async function walletLock(name: string | null): Promise<unknown> {
   const resp = await invoke("wallet_lock", { name });
   return unwrap(resp).payload;
@@ -626,16 +679,85 @@ export interface LockEntry {
   funding_address: string;
   funding_txid?: string;
   funding_vout?: number;
+  /// Block height the lock was created at.
   creation_height: number;
+  /// Absolute block height the timelock matures at — after this the wallet's
+  /// unilateral recovery branch is spendable (creation_height + recovery_blocks).
+  recovery_height: number;
 }
 
 export interface LocksListResponse {
   locks: LockEntry[];
 }
 
+/// Wire-format lock entry — matches `wraith_wallet_ipc::LockEntry`
+/// exactly. Field names differ from the frontend's `LockEntry`
+/// (`status` vs `state`), so `locksList` adapts. Reading the wire
+/// shape straight through left `state` undefined, which silently
+/// suppressed every per-row action (Confirm / Recover / Rotate),
+/// since those gate on `state`.
+interface WireLockEntry {
+  lock_id: string;
+  status: string;
+  capacity_sats: number;
+  balance_sats: number;
+  denomination: string;
+  timelock_tier: string;
+  funding_address: string;
+  funding_txid: string | null;
+  funding_vout: number | null;
+  creation_height: number;
+  recovery_height: number;
+}
+
+interface WireLocksListResponse {
+  locks: WireLockEntry[];
+  total_locked_sats: number;
+}
+
 export async function locksList(): Promise<LocksListResponse> {
   const resp = await invoke("locks_list");
-  return unwrap<LocksListResponse>(resp).payload;
+  const raw = unwrap<WireLocksListResponse>(resp).payload;
+  const locks: LockEntry[] = (raw.locks ?? []).map((w) => ({
+    lock_id: w.lock_id,
+    capacity_sats: w.capacity_sats,
+    balance_sats: w.balance_sats,
+    denomination: w.denomination,
+    timelock_tier: w.timelock_tier,
+    status: w.status,
+    funding_address: w.funding_address,
+    funding_txid: w.funding_txid ?? undefined,
+    funding_vout: w.funding_vout ?? undefined,
+    creation_height: w.creation_height,
+    recovery_height: w.recovery_height,
+  }));
+  return { locks };
+}
+
+export type LockJumpPriority = "normal" | "high" | "urgent";
+
+export interface LocksJumpedResult {
+  lock_id: string;
+  /// Jump (key-rotation) transaction id, when the operator broadcast
+  /// it. `null` while the rotation is queued.
+  jump_txid: string | null;
+}
+
+/// Rotate a lock's custody key ("jump"): the operator re-derives the
+/// cooperative key to `target_address`, severing any prior key
+/// exposure while keeping the funds inside the lock. `priority`
+/// trades fee for queue position.
+export async function locksJump(
+  lock_id: string,
+  target_address: string,
+  priority: LockJumpPriority = "normal",
+): Promise<LocksJumpedResult> {
+  const resp = await invoke("locks_jump", {
+    lockId: lock_id,
+    targetAddress: target_address,
+    priority,
+  });
+  return unwrap<LocksJumpedResult>(resp).payload;
 }
 
 export interface LocksPreparedResponse {

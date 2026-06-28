@@ -4,9 +4,12 @@ import {
   locksPrepare,
   locksConfirm,
   locksRecover,
+  locksJump,
   type LockEntry,
+  type LockJumpPriority,
   type LocksPreparedResponse,
   type LocksRecoveredResult,
+  type LocksJumpedResult,
 } from "../lib/tauri";
 
 interface Tier {
@@ -28,7 +31,8 @@ const TIERS: Tier[] = [
 /// inline-form style of the Mix and Receive screens.
 type RowForm =
   | { kind: "confirm"; lock_id: string }
-  | { kind: "recover"; lock_id: string };
+  | { kind: "recover"; lock_id: string }
+  | { kind: "jump"; lock_id: string };
 
 export function Locks() {
   const [locks, setLocks] = useState<LockEntry[]>([]);
@@ -36,6 +40,7 @@ export function Locks() {
   const [err, setErr] = useState<string | null>(null);
   const [prep, setPrep] = useState<LocksPreparedResponse | null>(null);
   const [recovery, setRecovery] = useState<LocksRecoveredResult | null>(null);
+  const [jumped, setJumped] = useState<LocksJumpedResult | null>(null);
 
   // Expandable forms.
   const [showPrepare, setShowPrepare] = useState(false);
@@ -45,6 +50,8 @@ export function Locks() {
   const [confirmTxid, setConfirmTxid] = useState("");
   const [recoverDest, setRecoverDest] = useState("");
   const [recoverFee, setRecoverFee] = useState("1000");
+  const [jumpDest, setJumpDest] = useState("");
+  const [jumpPriority, setJumpPriority] = useState<LockJumpPriority>("normal");
 
   const refresh = async () => {
     setErr(null);
@@ -102,10 +109,17 @@ export function Locks() {
     setRecoverFee("1000");
   };
 
+  const openJump = (lock_id: string) => {
+    setOpenRow({ kind: "jump", lock_id });
+    setJumpDest("");
+    setJumpPriority("normal");
+  };
+
   const closeRow = () => {
     setOpenRow(null);
     setConfirmTxid("");
     setRecoverDest("");
+    setJumpDest("");
   };
 
   const onConfirmSubmit = async (lock_id: string) => {
@@ -144,6 +158,27 @@ export function Locks() {
     try {
       const result = await locksRecover(lock_id, dest, fee);
       setRecovery(result);
+      closeRow();
+      await refresh();
+    } catch (e) {
+      setErr((e as Error).message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onJumpSubmit = async (lock_id: string) => {
+    const dest = jumpDest.trim();
+    if (!dest) {
+      setErr("Target address is required.");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    setJumped(null);
+    try {
+      const result = await locksJump(lock_id, dest, jumpPriority);
+      setJumped(result);
       closeRow();
       await refresh();
     } catch (e) {
@@ -258,7 +293,7 @@ export function Locks() {
                 <th>ID</th>
                 <th>Capacity</th>
                 <th>State</th>
-                <th>Created height</th>
+                <th>Recovery height</th>
                 <th />
               </tr>
             </thead>
@@ -283,7 +318,7 @@ export function Locks() {
                           {l.status}
                         </span>
                       </td>
-                      <td className="mono muted">{l.creation_height ?? "—"}</td>
+                      <td className="mono muted">{l.recovery_height ?? "—"}</td>
                       <td style={{ textAlign: "right" }}>
                         {l.status === "pending" && (
                           <button
@@ -296,14 +331,25 @@ export function Locks() {
                           </button>
                         )}
                         {l.status === "active" && (
-                          <button
-                            className="danger"
-                            onClick={() => openRecover(l.lock_id)}
-                            disabled={busy}
-                            title="Unilateral exit — sends a recovery tx straight to bitcoind, no operator cooperation. Only works after the timelock has matured."
-                          >
-                            Recover
-                          </button>
+                          <>
+                            <button
+                              className="secondary"
+                              onClick={() => openJump(l.lock_id)}
+                              disabled={busy}
+                              style={{ marginRight: 6 }}
+                              title="Rotate the lock's custody key to a fresh address — keeps funds inside the lock while severing any prior key exposure. Operator cooperation required."
+                            >
+                              Rotate key
+                            </button>
+                            <button
+                              className="danger"
+                              onClick={() => openRecover(l.lock_id)}
+                              disabled={busy}
+                              title="Unilateral exit — sends a recovery tx straight to bitcoind, no operator cooperation. Only works after the timelock has matured."
+                            >
+                              Recover
+                            </button>
+                          </>
                         )}
                       </td>
                     </tr>
@@ -437,6 +483,81 @@ export function Locks() {
                         </td>
                       </tr>
                     )}
+                    {isOpen && openRow.kind === "jump" && (
+                      <tr key={`${l.lock_id}-form`}>
+                        <td colSpan={5}>
+                          <div
+                            style={{
+                              padding: 12,
+                              background: "var(--bg-subtle, rgba(0,0,0,0.04))",
+                              borderRadius: 6,
+                            }}
+                          >
+                            <strong>
+                              Rotate custody key — {l.lock_id.slice(0, 16)}…
+                            </strong>
+                            <p
+                              className="muted"
+                              style={{ margin: "4px 0 8px", fontSize: 13 }}
+                            >
+                              A jump moves the lock's funds to a fresh
+                              cooperative key at the target address, with the
+                              operator's help. Use it to rotate away from a
+                              key you suspect is exposed without touching the
+                              timelock recovery branch — the balance stays
+                              locked throughout. Higher priority pays a larger
+                              fee for a faster queue slot.
+                            </p>
+                            <div className="col">
+                              <label>Target address</label>
+                              <input
+                                className="mono"
+                                value={jumpDest}
+                                onChange={(e) => setJumpDest(e.target.value)}
+                                placeholder="bc1q… / tb1p… / bcrt1…"
+                                disabled={busy}
+                                autoFocus
+                              />
+                            </div>
+                            <div className="col">
+                              <label>Priority</label>
+                              <select
+                                value={jumpPriority}
+                                onChange={(e) =>
+                                  setJumpPriority(
+                                    e.target.value as LockJumpPriority,
+                                  )
+                                }
+                                disabled={busy}
+                              >
+                                <option value="normal">Normal (queued)</option>
+                                <option value="high">High (expedited)</option>
+                                <option value="urgent">
+                                  Urgent (immediate, higher fee)
+                                </option>
+                              </select>
+                            </div>
+                            <div className="row" style={{ marginTop: 8 }}>
+                              <button
+                                className="secondary"
+                                onClick={closeRow}
+                                disabled={busy}
+                                style={{ marginRight: 6 }}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                className="primary"
+                                onClick={() => onJumpSubmit(l.lock_id)}
+                                disabled={busy}
+                              >
+                                {busy ? "Rotating…" : "Rotate key"}
+                              </button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
                   </Fragment>
                 );
               })}
@@ -444,6 +565,26 @@ export function Locks() {
           </table>
         )}
       </div>
+
+      {jumped && (
+        <div className="card" style={{ borderColor: "var(--pass)" }}>
+          <h2>Key rotation requested ✓</h2>
+          <p className="muted" style={{ margin: 0 }}>
+            The operator is rotating this lock's custody key to the new
+            address. The balance stays locked the whole time.
+          </p>
+          <div className="kv">
+            <div className="k">Lock ID</div>
+            <div className="v mono" style={{ fontSize: 12 }}>
+              {jumped.lock_id}
+            </div>
+            <div className="k">Jump txid</div>
+            <div className="v mono" style={{ fontSize: 12 }}>
+              {jumped.jump_txid ?? "queued — not yet broadcast"}
+            </div>
+          </div>
+        </div>
+      )}
 
       {recovery && (
         <div className="card" style={{ borderColor: "var(--pass)" }}>
