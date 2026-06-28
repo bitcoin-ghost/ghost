@@ -70,15 +70,15 @@ use ghost_keys::{GhostKeys, GhostKeysExport, PaymentDetector};
 use ghost_locks::{Denomination, GhostLock, StateTransition, TimelockTier};
 use ghost_reconciliation::{BatchExecutor, ReconciliationInput, Settlement};
 use ghost_storage::{
-    BondRow, ConfidentialTransferRecord, Database, GhostLockRecord,
-    GhostLockState as DbLockState, WithdrawalRequest, WithdrawalStatus,
+    BondRow, ConfidentialTransferRecord, Database, GhostLockRecord, GhostLockState as DbLockState,
+    WithdrawalRequest, WithdrawalStatus,
 };
-use wraith_protocol::{BondId, BondRecord, BondResolution, BondStatus};
 use ghost_zkp::{
     BalanceTree, CommitmentTree, ConsolidationPublicInputs, GhostConsolidateVerifier,
     GhostNoteSpendProof, GhostNoteSpendPublicInputs, GhostNoteVerifier, GhostUnshieldVerifier,
     UnshieldPublicInputs, MAX_CONSOLIDATION_INPUTS,
 };
+use wraith_protocol::{BondId, BondRecord, BondResolution, BondStatus};
 
 // H-PAY-2: Cryptography for encrypted key storage
 use aes_gcm::{
@@ -7602,10 +7602,7 @@ struct SendL2PaymentRequest {
 /// very same sats — a double-spend. Takes a borrowed `&Connection` so
 /// the caller can run it inside the same transaction as the spend it
 /// guards.
-fn spendable_l2_balance(
-    conn: &rusqlite::Connection,
-    ghost_id: &str,
-) -> rusqlite::Result<i64> {
+fn spendable_l2_balance(conn: &rusqlite::Connection, ghost_id: &str) -> rusqlite::Result<i64> {
     let received: i64 = conn.query_row(
         "SELECT COALESCE(SUM(amount_sats), 0) FROM accepted_instant_payments \
          WHERE merchant_wallet_id = ?1 AND settlement_block = 0",
@@ -7675,8 +7672,7 @@ fn escrow_bond_core(
     let now = chrono::Utc::now().timestamp();
     // 32 bytes of entropy → "gpbond-" + 64 hex chars.
     let mut rand_bytes = [0u8; 32];
-    getrandom::getrandom(&mut rand_bytes)
-        .map_err(|e| GhostError::Database(format!("rng: {e}")))?;
+    getrandom::getrandom(&mut rand_bytes).map_err(|e| GhostError::Database(format!("rng: {e}")))?;
     let new_bond_id = format!("gpbond-{}", hex::encode(rand_bytes));
 
     db.transaction(|tx| {
@@ -7706,14 +7702,13 @@ fn escrow_bond_core(
         ) {
             Ok(_) => Ok(EscrowOutcome::BondId(new_bond_id.clone())),
             Err(e) if is_unique_violation(&e) => {
-                let existing =
-                    ghost_storage::queries::find_live_bond(tx, ghost_id, session_id)
-                        .map_err(|e| GhostError::Database(e.to_string()))?
-                        .ok_or_else(|| {
-                            GhostError::Database(
-                                "escrow unique violation but no live bond found".into(),
-                            )
-                        })?;
+                let existing = ghost_storage::queries::find_live_bond(tx, ghost_id, session_id)
+                    .map_err(|e| GhostError::Database(e.to_string()))?
+                    .ok_or_else(|| {
+                        GhostError::Database(
+                            "escrow unique violation but no live bond found".into(),
+                        )
+                    })?;
                 Ok(EscrowOutcome::BondId(existing))
             }
             Err(e) => Err(GhostError::Database(e.to_string())),
@@ -7740,11 +7735,10 @@ fn verify_bond_core(
     session_id: &str,
     expected_sats: i64,
 ) -> Result<VerifyOutcome, GhostError> {
-    let row = db
-        .with_connection(|conn| {
-            ghost_storage::queries::find_bond_for_session(conn, ghost_id, session_id)
-                .map_err(|e| GhostError::Database(e.to_string()))
-        })?;
+    let row = db.with_connection(|conn| {
+        ghost_storage::queries::find_bond_for_session(conn, ghost_id, session_id)
+            .map_err(|e| GhostError::Database(e.to_string()))
+    })?;
     match row {
         None => Ok(VerifyOutcome::NotBonded),
         Some(b) => {
@@ -7817,10 +7811,9 @@ fn bond_row_to_record(b: &BondRow) -> Result<BondRecord, GhostError> {
     let status = match b.status.as_str() {
         "escrowed" => BondStatus::Escrowed,
         "refunded" | "slashed" => {
-            let res: BondResolution = serde_json::from_str(
-                b.resolution.as_deref().unwrap_or(""),
-            )
-            .map_err(|e| GhostError::Database(format!("decode bond resolution: {e}")))?;
+            let res: BondResolution =
+                serde_json::from_str(b.resolution.as_deref().unwrap_or(""))
+                    .map_err(|e| GhostError::Database(format!("decode bond resolution: {e}")))?;
             BondStatus::Resolved(res)
         }
         other => {
@@ -7840,7 +7833,11 @@ fn bond_row_to_record(b: &BondRow) -> Result<BondRecord, GhostError> {
 
 /// Build the `{ error, detail }` envelope the coordinator client's
 /// `decode_error_body` expects.
-fn bond_err(status: StatusCode, error: &str, detail: &str) -> (StatusCode, Json<serde_json::Value>) {
+fn bond_err(
+    status: StatusCode,
+    error: &str,
+    detail: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
     (
         status,
         Json(serde_json::json!({ "error": error, "detail": detail })),
@@ -7919,12 +7916,8 @@ async fn wraith_bond_verify(
         &req.session_id,
         req.expected_sats as i64,
     ) {
-        Ok(VerifyOutcome::Verified(bond_id)) => {
-            Ok(Json(serde_json::json!({ "bond_id": bond_id })))
-        }
-        Ok(VerifyOutcome::NotBonded) => {
-            Err(bond_err(StatusCode::NOT_FOUND, "not_bonded", ""))
-        }
+        Ok(VerifyOutcome::Verified(bond_id)) => Ok(Json(serde_json::json!({ "bond_id": bond_id }))),
+        Ok(VerifyOutcome::NotBonded) => Err(bond_err(StatusCode::NOT_FOUND, "not_bonded", "")),
         Ok(VerifyOutcome::AmountMismatch(actual)) => Err(bond_err(
             StatusCode::CONFLICT,
             "amount_mismatch",
@@ -7972,9 +7965,7 @@ async fn wraith_bond_resolve(
                 &e.to_string(),
             )),
         },
-        Ok(ResolveOutcome::NotFound) => {
-            Err(bond_err(StatusCode::NOT_FOUND, "not_found", ""))
-        }
+        Ok(ResolveOutcome::NotFound) => Err(bond_err(StatusCode::NOT_FOUND, "not_found", "")),
         Ok(ResolveOutcome::AlreadyResolved) => {
             Err(bond_err(StatusCode::CONFLICT, "already_resolved", ""))
         }
@@ -9482,7 +9473,10 @@ mod wraith_bond_tests {
                 spendable_l2_balance(c, "bob").map_err(|e| GhostError::Database(e.to_string()))
             })
             .unwrap();
-        assert_eq!(spendable, 0, "slashed sats must remain subtracted from spendable");
+        assert_eq!(
+            spendable, 0,
+            "slashed sats must remain subtracted from spendable"
+        );
 
         // The stored record round-trips into a full BondRecord.
         let row = state
@@ -9527,7 +9521,9 @@ mod wraith_bond_tests {
         // Only one bond was created → only 500 held, 500 still spendable.
         let spendable = state
             .db
-            .with_connection(|c| spendable_l2_balance(c, "dave").map_err(|e| GhostError::Database(e.to_string())))
+            .with_connection(|c| {
+                spendable_l2_balance(c, "dave").map_err(|e| GhostError::Database(e.to_string()))
+            })
             .unwrap();
         assert_eq!(spendable, 500);
     }
@@ -9613,7 +9609,10 @@ mod wraith_bond_tests {
             .await
             .unwrap();
         assert_eq!(send_fail["success"], serde_json::json!(false));
-        assert_eq!(send_fail["error"], serde_json::json!("Insufficient L2 balance"));
+        assert_eq!(
+            send_fail["error"],
+            serde_json::json!("Insufficient L2 balance")
+        );
         assert_eq!(send_fail["available_sats"], serde_json::json!(0));
 
         // Refund the bond (coordinator-authenticated).
@@ -9783,7 +9782,10 @@ mod wraith_bond_tests {
 
             // unknown participant → NotBonded (`not_bonded`).
             let nb = ledger.verify_bond("nobody", "s1", 500).unwrap_err();
-            assert!(matches!(nb, wraith_protocol::BondError::NotBonded { .. }), "got {nb:?}");
+            assert!(
+                matches!(nb, wraith_protocol::BondError::NotBonded { .. }),
+                "got {nb:?}"
+            );
 
             // snapshot returns the full escrowed record (BondRecord serde).
             let snap = ledger.snapshot_bond(&verified).unwrap();
@@ -9794,7 +9796,10 @@ mod wraith_bond_tests {
 
             // resolve(refund) returns the resolved BondRecord.
             let resolved = ledger
-                .resolve_bond(&verified, BondResolution::Refund(RefundReason::RoundCompleted))
+                .resolve_bond(
+                    &verified,
+                    BondResolution::Refund(RefundReason::RoundCompleted),
+                )
                 .unwrap();
             assert!(matches!(
                 resolved.status,
@@ -9805,7 +9810,10 @@ mod wraith_bond_tests {
 
             // second resolve → AlreadyResolved (`already_resolved`).
             let again = ledger
-                .resolve_bond(&verified, BondResolution::Refund(RefundReason::RoundCompleted))
+                .resolve_bond(
+                    &verified,
+                    BondResolution::Refund(RefundReason::RoundCompleted),
+                )
                 .unwrap_err();
             assert!(
                 matches!(again, wraith_protocol::BondError::AlreadyResolved { .. }),

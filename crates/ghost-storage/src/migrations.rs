@@ -2175,7 +2175,9 @@ mod tests {
 
         // The partial unique index exists.
         let index_names: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wraith_bonds'")
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wraith_bonds'",
+            )
             .unwrap()
             .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
