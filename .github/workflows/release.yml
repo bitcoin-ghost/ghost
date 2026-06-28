@@ -53,7 +53,14 @@ jobs:
       # release artifacts here.
       - name: Build
         run: |
+          # CRITICAL: ghost-pool MUST be built with --features zk-production so the
+          # released binary can run on mainnet. Without it, is_production_mode() is
+          # false and ghost-pool aborts at startup ("MAINNET SECURITY: ZK consensus
+          # on mainnet requires trusted setup parameters"), so every curl|bash
+          # install crash-loops. zk-production is a compile-time flag with no
+          # build-time artefacts (params are loaded at runtime), so this is safe.
           cargo build --release --target ${{ matrix.target }} \
+            --features ghost-pool/zk-production \
             -p ghost-pool -p ghost-cli -p ghost-pay -p ghost-gsp-bin \
             -p translator_sv2 -p pool_sv2 -p jd_client_sv2 -p jd_server_sv2
 
