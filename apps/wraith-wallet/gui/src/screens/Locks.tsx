@@ -258,7 +258,7 @@ export function Locks() {
                 <th>ID</th>
                 <th>Capacity</th>
                 <th>State</th>
-                <th>Recovery height</th>
+                <th>Created height</th>
                 <th />
               </tr>
             </thead>
@@ -273,19 +273,19 @@ export function Locks() {
                       <td>
                         <span
                           className={`pill ${
-                            l.state === "active"
+                            l.status === "active"
                               ? "pass"
-                              : l.state === "pending"
+                              : l.status === "pending"
                                 ? "warn"
                                 : "mute"
                           }`}
                         >
-                          {l.state}
+                          {l.status}
                         </span>
                       </td>
-                      <td className="mono muted">{l.recovery_height ?? "—"}</td>
+                      <td className="mono muted">{l.creation_height ?? "—"}</td>
                       <td style={{ textAlign: "right" }}>
-                        {l.state === "pending" && (
+                        {l.status === "pending" && (
                           <button
                             className="secondary"
                             onClick={() => openConfirm(l.lock_id)}
@@ -295,7 +295,7 @@ export function Locks() {
                             Confirm funding
                           </button>
                         )}
-                        {l.state === "active" && (
+                        {l.status === "active" && (
                           <button
                             className="danger"
                             onClick={() => openRecover(l.lock_id)}
@@ -380,8 +380,9 @@ export function Locks() {
                             >
                               Builds, signs, and broadcasts a recovery tx
                               with the wallet's recovery secret. Only works
-                              after the timelock has matured (recovery
-                              height {l.recovery_height ?? "—"}). The
+                              after the timelock (tier {l.timelock_tier})
+                              matures — lock created at height{" "}
+                              {l.creation_height ?? "—"}. The
                               operator is bypassed entirely — this is the
                               wallet's safety net for an unresponsive Ghost
                               Pay node.
