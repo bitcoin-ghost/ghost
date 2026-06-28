@@ -2,6 +2,7 @@
 
 import { ReactNode, useEffect } from 'react';
 import { Sidebar } from '@/components/layout/Sidebar';
+import { OnboardingGate } from '@/components/layout/OnboardingGate';
 import { useRealtimeSync } from '@/hooks/useRealtimeSync';
 import { useUIStore } from '@/stores';
 
@@ -34,6 +35,7 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
     <div className="flex min-h-screen">
       <RealtimeBridge />
       <TooltipShortcut />
+      <OnboardingGate />
       <Sidebar />
       <main className="flex-1 overflow-auto md:ml-0 ml-0">
         <div className="p-4 md:p-6 pt-14 md:pt-6">
