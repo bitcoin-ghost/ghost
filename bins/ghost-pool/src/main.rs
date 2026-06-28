@@ -553,6 +553,302 @@ fn print_status(status: &ghost_pool::registry::NodeStatusResponse) {
     }
 }
 
+// ============================================================================
+// MPC / ZK trusted-setup parameter self-heal
+//
+// A fresh node that has the `zk-production` binary but no MPC ceremony output on
+// disk used to crash-loop: `ghost_zkp::load_trusted_params()` failed at startup
+// and the process exited BEFORE the background MPC task could fetch the params
+// from a seed. The helpers below fetch (and SECURITY-verify) the ceremony output
+// from seeds so the node self-heals instead. They are the single shared
+// implementation used by BOTH the startup self-heal and the runtime MPC task.
+// ============================================================================
+
+/// Name of the environment variable holding the pinned ceremony parameter
+/// hashes (`BLOCK:sha256hex,PAYOUT:sha256hex,...`).
+///
+/// Resolves to the canonical `ghost_zkp` constant whenever ZK consensus is
+/// compiled in (always, in practice); falls back to the literal otherwise so
+/// the fetch helpers compile even in an `mpc-ceremony`-only build.
+#[cfg(feature = "mpc-ceremony")]
+fn zk_params_hash_env_name() -> &'static str {
+    #[cfg(feature = "zk-consensus")]
+    {
+        ghost_zkp::ZK_PARAMS_HASH_ENV
+    }
+    #[cfg(not(feature = "zk-consensus"))]
+    {
+        "ZK_PARAMS_HASH"
+    }
+}
+
+/// Parse the pinned ceremony parameter hashes from `ZK_PARAMS_HASH`.
+///
+/// Format: `TYPE:sha256hex` pairs separated by commas, e.g.
+/// `BLOCK:fa9d...,PAYOUT:1234...`. Mirrors `ghost_zkp::parse_expected_hashes`
+/// (which is private) so the fetch path can verify a downloaded blob against
+/// the same pinned digest that `load_trusted_params` enforces. Malformed
+/// entries are skipped. Returns an empty map when the variable is unset, in
+/// which case no hash is pinned and verification is not enforced (test nets).
+#[cfg(feature = "mpc-ceremony")]
+fn expected_param_hashes() -> std::collections::HashMap<String, [u8; 32]> {
+    match std::env::var(zk_params_hash_env_name()) {
+        Ok(env_val) => parse_param_hashes(&env_val),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// Pure parser for the `ZK_PARAMS_HASH` value (split out for testability).
+///
+/// Accepts comma-separated `TYPE:sha256hex` pairs; malformed entries (wrong
+/// length, non-hex) are skipped rather than aborting, so a single bad entry
+/// cannot mask the others. Types are upper-cased so lookups are case-insensitive.
+#[cfg(feature = "mpc-ceremony")]
+fn parse_param_hashes(env_val: &str) -> std::collections::HashMap<String, [u8; 32]> {
+    let mut map = std::collections::HashMap::new();
+    for pair in env_val.split(',') {
+        let mut it = pair.splitn(2, ':');
+        if let (Some(ty), Some(hash_hex)) = (it.next(), it.next()) {
+            let hash_hex = hash_hex.trim();
+            if hash_hex.len() != 64 {
+                continue;
+            }
+            if let Ok(bytes) = hex::decode(hash_hex) {
+                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                    map.insert(ty.trim().to_uppercase(), arr);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// SECURITY: decide whether a freshly-fetched parameter blob may be trusted and
+/// written to disk as part of the trusted set.
+///
+/// A blob is accepted only when it is non-trivial in size AND — when a hash is
+/// pinned for this parameter type via `ZK_PARAMS_HASH` — its SHA-256 matches
+/// that pinned digest. This is the trusted-setup gate: a malicious seed cannot
+/// inject forged parameters, because a mismatched blob is rejected here BEFORE
+/// it is ever written. When no hash is pinned (test nets), only the size check
+/// applies, preserving the historical behaviour.
+#[cfg(feature = "mpc-ceremony")]
+fn params_blob_is_trusted(data: &[u8], expected_hash: Option<&[u8; 32]>) -> bool {
+    if data.len() <= 1000 {
+        return false;
+    }
+    match expected_hash {
+        Some(expected) => {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let actual: [u8; 32] = hasher.finalize().into();
+            &actual == expected
+        }
+        None => true,
+    }
+}
+
+/// Fetch a single MPC parameter set from one seed, verify it, and write it to
+/// `params_dir` (as `<base>_v0.bin`, the `<base>_current.bin` symlink, and the
+/// extracted `<vk_name>` verifying key).
+///
+/// Returns `true` only when the blob was fetched, passed
+/// [`params_blob_is_trusted`], and was written. A hash mismatch is rejected
+/// (returns `false`) so the caller moves on to the next seed.
+#[cfg(feature = "mpc-ceremony")]
+async fn fetch_one_param(
+    host: &str,
+    endpoint: &str,
+    params_dir: &std::path::Path,
+    base: &str,
+    vk_name: &str,
+    expected_hash: Option<&[u8; 32]>,
+) -> bool {
+    let url = format!("http://{}:8080/api/v1/mpc/{}", host, endpoint);
+    debug!(url = %url, "MPC: fetching params from peer");
+
+    let response = match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            debug!(status = %resp.status(), peer = %host, endpoint, "MPC: peer returned non-success status");
+            return false;
+        }
+        Err(e) => {
+            debug!(error = %e, peer = %host, endpoint, "MPC: failed to fetch from peer");
+            return false;
+        }
+    };
+
+    let data = match response.bytes().await {
+        Ok(data) => data,
+        Err(e) => {
+            debug!(error = %e, peer = %host, endpoint, "MPC: failed to read response body");
+            return false;
+        }
+    };
+
+    if !params_blob_is_trusted(&data, expected_hash) {
+        if expected_hash.is_some() && data.len() > 1000 {
+            // Size was fine but the pinned hash did not match: this is a forged
+            // or corrupt trusted-setup blob. Refuse it and try the next seed.
+            warn!(
+                peer = %host,
+                endpoint,
+                size = data.len(),
+                "MPC: SECURITY: fetched params failed hash verification against ZK_PARAMS_HASH — rejecting and trying next seed"
+            );
+        } else {
+            debug!(size = data.len(), peer = %host, endpoint, "MPC: response too small, peer may not have params");
+        }
+        return false;
+    }
+
+    let _ = std::fs::create_dir_all(params_dir);
+    let params_path = params_dir.join(format!("{}_v0.bin", base));
+    let current_path = params_dir.join(format!("{}_current.bin", base));
+
+    if let Err(e) = std::fs::write(&params_path, &data) {
+        warn!(error = %e, endpoint, "MPC: failed to save fetched params");
+        return false;
+    }
+
+    // Point `<base>_current.bin` at the version we just wrote.
+    let _ = std::fs::remove_file(&current_path);
+    if let Err(e) = std::os::unix::fs::symlink(&params_path, &current_path) {
+        warn!(error = %e, endpoint, "MPC: failed to create params symlink");
+    }
+
+    // Extract and persist the verifying key for proof verification.
+    if let Ok(params) = ghost_mpc::params::load_parameters(&params_path) {
+        let vk_path = params_dir.join(vk_name);
+        if let Err(e) = ghost_mpc::params::save_verifying_key(&vk_path, &params.vk) {
+            warn!(error = %e, endpoint, "MPC: failed to save verifying key");
+        }
+    }
+
+    info!(size = data.len(), peer = %host, endpoint, "MPC: fetched + verified params from peer");
+    true
+}
+
+/// Fetch the full ceremony parameter set (note_spend, payout, unshield) from a
+/// single seed. `note_spend` is the primary, hash-pinned trusted-setup file:
+/// the function returns `true` only when it was fetched and verified. `payout`
+/// and `unshield` are fetched best-effort afterwards (verified against their
+/// own pinned hashes when present). This is the one shared fetch implementation.
+#[cfg(feature = "mpc-ceremony")]
+async fn try_fetch_params_from_seed(
+    host: &str,
+    params_dir: &std::path::Path,
+    expected: &std::collections::HashMap<String, [u8; 32]>,
+) -> bool {
+    if !fetch_one_param(
+        host,
+        "params",
+        params_dir,
+        "note_spend_params",
+        "note_spend_vk.bin",
+        expected.get("BLOCK"),
+    )
+    .await
+    {
+        return false;
+    }
+
+    let _ = fetch_one_param(
+        host,
+        "payout-params",
+        params_dir,
+        "payout_params",
+        "payout_vk.bin",
+        expected.get("PAYOUT"),
+    )
+    .await;
+    let _ = fetch_one_param(
+        host,
+        "unshield-params",
+        params_dir,
+        "unshield_params",
+        "unshield_vk.bin",
+        expected.get("UNSHIELD"),
+    )
+    .await;
+
+    true
+}
+
+/// Startup self-heal: ensure the trusted-setup parameters exist on disk before
+/// the hard `load_trusted_params` check, fetching them from seeds if missing.
+///
+/// Idempotent: returns immediately when `note_spend_params_current.bin` (the
+/// file `load_trusted_params` verifies) is already present. Otherwise it tries
+/// each seed for a bounded number of rounds with a short backoff. On total
+/// failure it returns an error so the process exits — systemd restarts it and
+/// it retries, recovering automatically the moment a seed becomes reachable.
+/// It NEVER loops forever inside one process and NEVER continues without params.
+#[cfg(all(feature = "zk-consensus", feature = "mpc-ceremony"))]
+async fn ensure_mpc_params_present(
+    seed_nodes: &[String],
+    params_dir: &std::path::Path,
+) -> Result<()> {
+    let current = params_dir.join("note_spend_params_current.bin");
+    if current.exists() {
+        return Ok(());
+    }
+
+    if seed_nodes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "MPC params missing at {} and no seed nodes are configured to fetch them from. \
+             Add at least one reachable seed to network.seed_nodes, or run the genesis node \
+             with --genesis to create the ceremony.",
+            params_dir.display()
+        ));
+    }
+
+    let expected = expected_param_hashes();
+    warn!(
+        path = %params_dir.display(),
+        seeds = seed_nodes.len(),
+        verified = expected.contains_key("BLOCK"),
+        "MPC params missing — fetching trusted-setup parameters from seeds before ZK startup check…"
+    );
+
+    const MAX_ROUNDS: u32 = 20;
+    for round in 1..=MAX_ROUNDS {
+        for seed in seed_nodes {
+            let host = seed.split(':').next().unwrap_or(seed);
+            if try_fetch_params_from_seed(host, params_dir, &expected).await && current.exists() {
+                info!(peer = %host, path = %params_dir.display(), "MPC params self-heal succeeded — trusted-setup parameters fetched and verified");
+                return Ok(());
+            }
+        }
+
+        if round % 4 == 0 {
+            info!(
+                round,
+                "MPC params self-heal: still fetching from seeds (round {}/{})…", round, MAX_ROUNDS
+            );
+        }
+        if round < MAX_ROUNDS {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "MPC params self-heal: exhausted all {} seed(s) over {} rounds — trusted-setup parameters \
+         still missing at {}. Exiting so the service manager restarts and retries; the node will \
+         recover automatically once a seed serving verified ceremony params is reachable.",
+        seed_nodes.len(),
+        MAX_ROUNDS,
+        params_dir.display()
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1676,6 +1972,21 @@ async fn main() -> Result<()> {
         }
 
         if is_production {
+            // SELF-HEAL: a fresh production node may have the binary but no MPC
+            // ceremony output on disk yet. Fetch + verify the params from seeds
+            // BEFORE the hard `load_trusted_params` check, otherwise the process
+            // would exit here and the background MPC task that fetches params
+            // would never run — an unrecoverable crash-loop. The fetch path
+            // verifies every blob against the pinned ZK_PARAMS_HASH, so a
+            // malicious seed cannot inject forged trusted-setup parameters.
+            #[cfg(feature = "mpc-ceremony")]
+            if let Ok(zk_params_path) = std::env::var(ghost_zkp::ZK_PARAMS_PATH_ENV) {
+                let params_dir = std::path::PathBuf::from(&zk_params_path);
+                let current = params_dir.join("note_spend_params_current.bin");
+                if !current.exists() {
+                    ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
+                }
+            }
             ghost_zkp::load_trusted_params()?;
             info!("ZK consensus using PRODUCTION parameters from MPC ceremony");
         } else {
@@ -2471,188 +2782,18 @@ async fn main() -> Result<()> {
 
                         // Try to fetch params from seed nodes
                         let params_dir = ceremony_manager_for_startup.params_dir().clone();
+                        let expected_hashes = expected_param_hashes();
                         let mut fetched = false;
 
                         for fetch_attempt in 1..=20 {
-                            // Try each seed node
+                            // Try each seed node (shared fetch + hash verification)
                             for seed in &seed_nodes_for_mpc {
-                                // Extract host from seed (format: "host:port")
                                 let host = seed.split(':').next().unwrap_or(seed);
-                                let url = format!("http://{}:8080/api/v1/mpc/params", host);
-
-                                debug!(url = %url, "MPC: Trying to fetch params from peer");
-
-                                match reqwest::Client::new()
-                                    .get(&url)
-                                    .timeout(std::time::Duration::from_secs(60))
-                                    .send()
+                                if try_fetch_params_from_seed(host, &params_dir, &expected_hashes)
                                     .await
                                 {
-                                    Ok(response) if response.status().is_success() => {
-                                        match response.bytes().await {
-                                            Ok(data) if data.len() > 1000 => {
-                                                // Save params to disk
-                                                let _ = std::fs::create_dir_all(&params_dir);
-                                                let params_path =
-                                                    params_dir.join("note_spend_params_v0.bin");
-                                                let current_path = params_dir
-                                                    .join("note_spend_params_current.bin");
-
-                                                if let Err(e) = std::fs::write(&params_path, &data)
-                                                {
-                                                    warn!(error = %e, "MPC: Failed to save fetched params");
-                                                    continue;
-                                                }
-
-                                                // Create symlink to current
-                                                let _ = std::fs::remove_file(&current_path);
-                                                if let Err(e) = std::os::unix::fs::symlink(
-                                                    &params_path,
-                                                    &current_path,
-                                                ) {
-                                                    warn!(error = %e, "MPC: Failed to create params symlink");
-                                                }
-
-                                                // Extract and save note_spend VK
-                                                if let Ok(ns_params) =
-                                                    ghost_mpc::params::load_parameters(&params_path)
-                                                {
-                                                    let ns_vk_path =
-                                                        params_dir.join("note_spend_vk.bin");
-                                                    if let Err(e) =
-                                                        ghost_mpc::params::save_verifying_key(
-                                                            &ns_vk_path,
-                                                            &ns_params.vk,
-                                                        )
-                                                    {
-                                                        warn!(error = %e, "MPC: Failed to save note_spend VK");
-                                                    }
-                                                }
-
-                                                info!(size = data.len(), peer = %host, "MPC: Fetched genesis note_spend params from peer!");
-
-                                                // Also fetch payout params from same peer (with VK extraction)
-                                                let payout_url = format!(
-                                                    "http://{}:8080/api/v1/mpc/payout-params",
-                                                    host
-                                                );
-                                                if let Ok(payout_resp) = reqwest::Client::new()
-                                                    .get(&payout_url)
-                                                    .timeout(std::time::Duration::from_secs(60))
-                                                    .send()
-                                                    .await
-                                                {
-                                                    if payout_resp.status().is_success() {
-                                                        if let Ok(payout_data) =
-                                                            payout_resp.bytes().await
-                                                        {
-                                                            if payout_data.len() > 1000 {
-                                                                let payout_path = params_dir
-                                                                    .join("payout_params_v0.bin");
-                                                                let payout_current = params_dir
-                                                                    .join(
-                                                                        "payout_params_current.bin",
-                                                                    );
-                                                                if let Err(e) = std::fs::write(
-                                                                    &payout_path,
-                                                                    &payout_data,
-                                                                ) {
-                                                                    warn!(error = %e, "MPC: Failed to save fetched payout params");
-                                                                } else {
-                                                                    let _ = std::fs::remove_file(
-                                                                        &payout_current,
-                                                                    );
-                                                                    if let Err(e) =
-                                                                        std::os::unix::fs::symlink(
-                                                                            &payout_path,
-                                                                            &payout_current,
-                                                                        )
-                                                                    {
-                                                                        warn!(error = %e, "MPC: Failed to create payout params symlink");
-                                                                    }
-                                                                    // Extract and save payout VK
-                                                                    if let Ok(payout_params) = ghost_mpc::params::load_parameters(&payout_path) {
-                                                                        let payout_vk_path = params_dir.join("payout_vk.bin");
-                                                                        if let Err(e) = ghost_mpc::params::save_verifying_key(&payout_vk_path, &payout_params.vk) {
-                                                                            warn!(error = %e, "MPC: Failed to save payout VK");
-                                                                        }
-                                                                    }
-                                                                    info!(size = payout_data.len(), peer = %host, "MPC: Fetched payout params from peer!");
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                // Also fetch unshield params from same peer (with VK extraction)
-                                                let unshield_url = format!(
-                                                    "http://{}:8080/api/v1/mpc/unshield-params",
-                                                    host
-                                                );
-                                                if let Ok(unshield_resp) = reqwest::Client::new()
-                                                    .get(&unshield_url)
-                                                    .timeout(std::time::Duration::from_secs(60))
-                                                    .send()
-                                                    .await
-                                                {
-                                                    if unshield_resp.status().is_success() {
-                                                        if let Ok(unshield_data) =
-                                                            unshield_resp.bytes().await
-                                                        {
-                                                            if unshield_data.len() > 1000 {
-                                                                let unshield_path = params_dir
-                                                                    .join("unshield_params_v0.bin");
-                                                                let unshield_current = params_dir
-                                                                    .join(
-                                                                    "unshield_params_current.bin",
-                                                                );
-                                                                if let Err(e) = std::fs::write(
-                                                                    &unshield_path,
-                                                                    &unshield_data,
-                                                                ) {
-                                                                    warn!(error = %e, "MPC: Failed to save fetched unshield params");
-                                                                } else {
-                                                                    let _ = std::fs::remove_file(
-                                                                        &unshield_current,
-                                                                    );
-                                                                    if let Err(e) =
-                                                                        std::os::unix::fs::symlink(
-                                                                            &unshield_path,
-                                                                            &unshield_current,
-                                                                        )
-                                                                    {
-                                                                        warn!(error = %e, "MPC: Failed to create unshield params symlink");
-                                                                    }
-                                                                    // Extract and save unshield VK
-                                                                    if let Ok(unshield_params) = ghost_mpc::params::load_parameters(&unshield_path) {
-                                                                        let unshield_vk_path = params_dir.join("unshield_vk.bin");
-                                                                        if let Err(e) = ghost_mpc::params::save_verifying_key(&unshield_vk_path, &unshield_params.vk) {
-                                                                            warn!(error = %e, "MPC: Failed to save unshield VK");
-                                                                        }
-                                                                    }
-                                                                    info!(size = unshield_data.len(), peer = %host, "MPC: Fetched unshield params from peer!");
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-
-                                                fetched = true;
-                                                break;
-                                            }
-                                            Ok(data) => {
-                                                debug!(size = data.len(), "MPC: Response too small, peer may not have params");
-                                            }
-                                            Err(e) => {
-                                                debug!(error = %e, peer = %host, "MPC: Failed to read response body");
-                                            }
-                                        }
-                                    }
-                                    Ok(response) => {
-                                        debug!(status = %response.status(), peer = %host, "MPC: Peer returned non-success status");
-                                    }
-                                    Err(e) => {
-                                        debug!(error = %e, peer = %host, "MPC: Failed to fetch from peer");
-                                    }
+                                    fetched = true;
+                                    break;
                                 }
                             }
 
@@ -6101,5 +6242,79 @@ mod tests {
                 key_path: missing2.clone()
             }
         );
+    }
+
+    // ── MPC / ZK trusted-setup param self-heal ───────────────────────
+
+    #[cfg(feature = "mpc-ceremony")]
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(data);
+        h.finalize().into()
+    }
+
+    /// A blob whose hash matches the pinned digest is trusted.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn params_blob_trusted_when_hash_matches() {
+        let blob = vec![7u8; 4096];
+        let expected = sha256(&blob);
+        assert!(params_blob_is_trusted(&blob, Some(&expected)));
+    }
+
+    /// SECURITY: a forged blob (wrong hash) is rejected even though it is large
+    /// enough — a malicious seed cannot inject it as the trusted set.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn params_blob_rejected_when_hash_mismatches() {
+        let good = vec![7u8; 4096];
+        let expected = sha256(&good);
+        let forged = vec![9u8; 4096]; // same size, different bytes
+        assert!(!params_blob_is_trusted(&forged, Some(&expected)));
+    }
+
+    /// A tiny blob is rejected regardless of hash pinning.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn params_blob_rejected_when_too_small() {
+        let tiny = vec![0u8; 16];
+        assert!(!params_blob_is_trusted(&tiny, None));
+        let h = sha256(&tiny);
+        assert!(!params_blob_is_trusted(&tiny, Some(&h)));
+    }
+
+    /// With no pinned hash (test nets) only the size gate applies.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn params_blob_unverified_accepts_large_blob() {
+        let blob = vec![1u8; 2048];
+        assert!(params_blob_is_trusted(&blob, None));
+    }
+
+    /// `ZK_PARAMS_HASH` parsing extracts each pinned type, upper-cases the key,
+    /// and skips malformed entries without dropping the valid ones.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn parse_param_hashes_extracts_and_skips_malformed() {
+        let block = "fa9db2b7".repeat(8); // 64 hex chars
+        let payout = "0123abcd".repeat(8);
+        let env = format!("block:{},garbage,PAYOUT:{},BAD:xyz,SHORT:00", block, payout);
+        let map = parse_param_hashes(&env);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("BLOCK"),
+            Some(&<[u8; 32]>::try_from(hex::decode(&block).unwrap().as_slice()).unwrap())
+        );
+        assert!(map.contains_key("PAYOUT"));
+        assert!(!map.contains_key("BAD"));
+        assert!(!map.contains_key("SHORT"));
+    }
+
+    /// An empty / unset value yields no pinned hashes (verification not enforced).
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn parse_param_hashes_empty_is_empty() {
+        assert!(parse_param_hashes("").is_empty());
     }
 }
