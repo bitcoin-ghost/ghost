@@ -3335,6 +3335,10 @@ mod unix {
                         );
                     }
                 };
+                // Build the ghost-pay client (carries the internal-auth
+                // secret) before `req` consumes `ghost_id`. The bond is
+                // escrowed against this participant's own L2 balance.
+                let bond_gid = ghost_id.clone();
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
@@ -3348,9 +3352,30 @@ mod unix {
                     change_address,
                     mix_output_address,
                 };
-                // No-op bond_setup: v1 daemon takes bond escrow as a
-                // precondition. Phase C wires this to ghost-pay.
-                let bond_setup = |_: &str, _: u64| async { Ok::<(), WraithClientError>(()) };
+                let pay = match build_ghost_pay_client(state) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("bond escrow client: {e}"),
+                            }),
+                        );
+                    }
+                };
+                // Escrow the bond against ghost-pay once the coordinator
+                // returns the real session_id + bond amount.
+                let bond_setup = |session_id: &str, amount: u64| {
+                    let session_id = session_id.to_string();
+                    let pay = &pay;
+                    let gid = bond_gid.clone();
+                    async move {
+                        pay.escrow_bond(&gid, &session_id, amount)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| WraithClientError::Bond(e.to_string()))
+                    }
+                };
                 match client.prepare_mix(req, bond_setup).await {
                     Ok(prepared) => {
                         let resp = WraithMixPreparedResponse {
@@ -3553,6 +3578,9 @@ mod unix {
                         );
                     }
                 };
+                // Build the ghost-pay client before `req` consumes
+                // `ghost_id`; escrow this participant's bond against it.
+                let bond_gid = ghost_id.clone();
                 let req = MixRequest {
                     tier_id,
                     ghost_id,
@@ -3566,7 +3594,28 @@ mod unix {
                     change_address,
                     mix_output_address,
                 };
-                let bond_setup = |_: &str, _: u64| async { Ok::<(), WraithClientError>(()) };
+                let pay = match build_ghost_pay_client(state) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Envelope::new(
+                            id,
+                            Response::Error(ErrorResponse {
+                                message: format!("bond escrow client: {e}"),
+                            }),
+                        );
+                    }
+                };
+                let bond_setup = |session_id: &str, amount: u64| {
+                    let session_id = session_id.to_string();
+                    let pay = &pay;
+                    let gid = bond_gid.clone();
+                    async move {
+                        pay.escrow_bond(&gid, &session_id, amount)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| WraithClientError::Bond(e.to_string()))
+                    }
+                };
                 let prepared = match client.prepare_mix(req, bond_setup).await {
                     Ok(p) => p,
                     Err(e) => {

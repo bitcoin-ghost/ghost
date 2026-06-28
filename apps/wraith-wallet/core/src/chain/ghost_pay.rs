@@ -417,6 +417,73 @@ impl GhostPayClient {
             .map_err(|e| ChainError::Malformed(e.to_string()))
     }
 
+    /// Escrow a Wraith bond against the wallet's spendable L2 balance via
+    /// `POST /api/v1/wraith/bond/escrow`. Authenticated route — attaches
+    /// the `X-Internal-Auth` header when `with_internal_secret(...)` was
+    /// set. Idempotent on `(ghost_id, session_id)`: re-escrowing returns
+    /// the existing bond id rather than double-debiting. Returns the
+    /// `bond_id`. Tries each configured base URL in order.
+    pub async fn escrow_bond(
+        &self,
+        ghost_id: &str,
+        session_id: &str,
+        amount_sats: u64,
+    ) -> Result<String, ChainError> {
+        let mut last_err: Option<ChainError> = None;
+        for base in &self.base_urls {
+            match self
+                .try_escrow_bond(base, ghost_id, session_id, amount_sats)
+                .await
+            {
+                Ok(id) => return Ok(id),
+                Err(e) => {
+                    tracing::debug!(url = %base, error = %e, "ghost-pay escrow_bond failed, trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| ChainError::Transport("no endpoints configured".into())))
+    }
+
+    async fn try_escrow_bond(
+        &self,
+        base_url: &str,
+        ghost_id: &str,
+        session_id: &str,
+        amount_sats: u64,
+    ) -> Result<String, ChainError> {
+        let url = self.endpoint(base_url, "/api/v1/wraith/bond/escrow");
+        let mut req = self.http.post(&url).json(&serde_json::json!({
+            "ghost_id": ghost_id,
+            "session_id": session_id,
+            "amount_sats": amount_sats,
+        }));
+        if let Some(secret) = &self.internal_secret {
+            req = req.header("X-Internal-Auth", secret);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ChainError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(ChainError::Backend(format!(
+                "ghost-pay bond escrow returned {}: {}",
+                status, detail
+            )));
+        }
+        #[derive(Deserialize)]
+        struct EscrowResp {
+            bond_id: String,
+        }
+        let body: EscrowResp = resp
+            .json()
+            .await
+            .map_err(|e| ChainError::Malformed(e.to_string()))?;
+        Ok(body.bond_id)
+    }
+
     async fn try_claim_glyph(
         &self,
         base_url: &str,

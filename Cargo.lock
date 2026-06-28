@@ -3390,6 +3390,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wraith-coordinator",
  "wraith-protocol",
 ]
 
