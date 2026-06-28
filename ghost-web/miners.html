@@ -193,115 +193,147 @@
   </div>
 </section>
 
-<!-- ───────── Compatibility ───────── -->
-<section class="block miner-hw-section">
-  <div class="container">
-    <div class="section-label">compatibility</div>
-    <h2 class="section-title">Hardware you can point at Ghost.</h2>
-    <p class="section-lead">
-      Any SHA-256d ASIC that speaks Stratum V1 or V2. Here are the
-      configs people actually run.
-    </p>
-
-    <div class="hw-table-wrap">
-      <table class="hw-table">
-        <thead>
-          <tr>
-            <th>Class</th>
-            <th>Protocol</th>
-            <th>Typical rate</th>
-            <th>Notes</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><strong>Bitaxe / open-source</strong></td>
-            <td>SV1</td>
-            <td>~1 TH/s</td>
-            <td>Set pool URL in the web UI, authorise as <code>addr.worker</code>. Zero-fuss.</td>
-          </tr>
-          <tr>
-            <td><strong>Antminer / Whatsminer</strong></td>
-            <td>SV1 (SV2 varies)</td>
-            <td>100–300 TH/s</td>
-            <td>Standard pool config. Use SV2 endpoint if firmware supports it; SV1 as a drop-in otherwise.</td>
-          </tr>
-          <tr>
-            <td><strong>SV2 native miners</strong></td>
-            <td>SV2</td>
-            <td>any</td>
-            <td>Encrypted Stratum transport with per-miner channels. Worker name flows through the TLV ext 0x0002 attribution extension so each ASIC's shares track to its own <code>address.worker</code>.</td>
-          </tr>
-          <tr>
-            <td><strong>Solo / custom</strong></td>
-            <td>SV1 or SV2</td>
-            <td>any</td>
-            <td>Run ghost-pool on your own node and point local hashers at it. Your node builds the template, your miners hash it. You get 100% of any block you find; pool fee still applies to the subsidy.</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-</section>
-
 <!-- ───────── Quickstart ───────── -->
 <section class="block miner-quickstart-section" id="quickstart">
   <div class="container">
     <div class="section-label">quickstart</div>
-    <h2 class="section-title">Four steps to your first share.</h2>
+    <h2 class="section-title">Connect a miner in seconds.</h2>
     <p class="section-lead">
-      No account, no forms. Pick an endpoint, set your address, start
-      hashing.
+      No account. No sign-up. No KYC. Your payout address <em>is</em> your
+      identity — paste it in, pick your Stratum version, and copy the exact
+      settings for your miner.
     </p>
 
-    <ol class="quickstart-steps">
-      <li>
-        <div class="qs-n">1</div>
-        <div class="qs-body">
-          <div class="qs-title">Pick an endpoint</div>
-          <div class="qs-desc">Connect to any public-mining Ghost node — or <code>pool.bitcoinghost.org</code>, which round-robins across all the public nodes. <strong>Stratum&nbsp;V1</strong> (works on any ASIC): point your miner at <code>stratum+tcp://pool.bitcoinghost.org:3333</code>. <strong>Stratum&nbsp;V2</strong> (encrypted, for miners with native SV2 firmware): host <code>pool.bitcoinghost.org</code>, port <code>34255</code> — plus the two SV2 settings noted below. Running your own node with public mining on? It works the same way.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">2</div>
-        <div class="qs-body">
-          <div class="qs-title">Set your credentials</div>
-          <div class="qs-desc">Username is your full payout address plus a worker name: <code>bc1q…yourAddress.bitaxe1</code>. Any string with a <code>.</code> separator works — one address can back many workers. Password field can be anything (<code>x</code> is fine).</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">3</div>
-        <div class="qs-body">
-          <div class="qs-title">Start hashing</div>
-          <div class="qs-desc">Save the config on your miner and kick it over. Shares start flowing within seconds; each one lands on your unpaid ledger straight away.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">4</div>
-        <div class="qs-body">
-          <div class="qs-title">Watch your stats</div>
-          <div class="qs-desc">Paste your address into the <a href="/pool.html#your-miner">lookup on the pool page</a> to see hashrate, unpaid work, lifetime shares, and projected sats. Each worker gets its own page with a 24-hour hashrate chart.</div>
-        </div>
-      </li>
-    </ol>
+    <style>
+      .qsgen { display: grid; grid-template-columns: 1fr 1.1fr; gap: 22px; margin-top: 28px; align-items: start; }
+      @media (max-width: 760px) { .qsgen { grid-template-columns: 1fr; } }
+      .qsgen-form { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 22px; display: flex; flex-direction: column; gap: 18px; }
+      .qsgen-field { display: flex; flex-direction: column; gap: 7px; }
+      .qsgen-label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+      .qsgen-form input { font-family: var(--font-mono); font-size: 14px; color: var(--fg); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 8px; padding: 11px 13px; outline: none; transition: border-color 120ms; }
+      .qsgen-form input:focus { border-color: var(--accent); }
+      .qsgen-form input::placeholder { color: var(--fainter); }
+      .qsgen-toggle { display: flex; gap: 8px; }
+      .qsgen-toggle button { flex: 1; font-family: var(--font-sans); font-size: 13px; font-weight: 600; color: var(--dim); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 8px; padding: 10px 8px; cursor: pointer; transition: all 120ms; }
+      .qsgen-toggle button:hover { color: var(--fg); }
+      .qsgen-toggle button.active { color: #000; background: var(--accent); border-color: var(--accent); }
+      :root[data-theme="dark"] .qsgen-toggle button.active { color: #000; }
+      .qsgen-out { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 22px; display: flex; flex-direction: column; gap: 13px; }
+      .qsg-row { display: flex; flex-direction: column; gap: 5px; }
+      .qsg-row .k { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+      .qsg-val { display: flex; align-items: center; gap: 8px; }
+      .qsg-val code { flex: 1; font-family: var(--font-mono); font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--rule); border-radius: 7px; padding: 9px 11px; overflow-x: auto; white-space: nowrap; }
+      .qsg-copy { flex: none; font-family: var(--font-sans); font-size: 12px; font-weight: 600; color: var(--dim); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 7px; padding: 9px 12px; cursor: pointer; transition: all 120ms; }
+      .qsg-copy:hover { color: var(--fg); border-color: var(--fg); }
+      .qsg-copy.done { color: var(--green); border-color: var(--green); }
+      .qsg-foot { font-size: 12.5px; color: var(--dim); line-height: 1.55; margin-top: 4px; }
+      .qsg-foot code { font-family: var(--font-mono); font-size: 12px; color: var(--fg); }
+      .qsg-noacct { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--green); margin-bottom: 14px; }
+      .qsg-noacct::before { content: "✓"; }
+    </style>
 
-    <div class="pending-note">
-      <strong>Stratum&nbsp;V2 settings.</strong> Most ASICs default to V1 and
-      need nothing extra. For native SV2 (e.g. a Bitaxe on AxeOS), set
-      <strong>Protocol</strong> = Stratum&nbsp;V2,
-      <strong>Channel&nbsp;type</strong> = Extended (the pool sends the coinbase
-      template, so your miner can verify it), and paste the
-      <strong>Authority&nbsp;public&nbsp;key</strong>:
-      <code>9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72</code> — the Ghost
-      network authority key, identical on every public node. Username is the same
-      <code>address.worker</code> as V1; the password is ignored.
+    <div class="qsgen">
+      <div class="qsgen-form">
+        <label class="qsgen-field">
+          <span class="qsgen-label">Your payout address</span>
+          <input id="qsg-addr" type="text" spellcheck="false" autocomplete="off" placeholder="bc1q… your Bitcoin address" />
+        </label>
+        <label class="qsgen-field">
+          <span class="qsgen-label">Worker name</span>
+          <input id="qsg-worker" type="text" spellcheck="false" autocomplete="off" value="worker1" placeholder="worker1" />
+        </label>
+        <div class="qsgen-field">
+          <span class="qsgen-label">Stratum version</span>
+          <div class="qsgen-toggle" id="qsg-proto">
+            <button type="button" data-proto="sv1" class="active">SV1 · any ASIC</button>
+            <button type="button" data-proto="sv2">SV2 · native firmware</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="qsgen-out" id="qsg-out"></div>
     </div>
 
-    <div class="pending-note">
-      Whichever you use — the aggregated translator (the V1 default) or native
-      SV2 with per-miner channels — your shares are attributed to the exact
-      <code>address.worker</code> string your miner authorised with.
-    </div>
+    <p class="qsg-foot" style="margin-top:18px">
+      One address can back as many workers as you like — give each ASIC its own
+      worker name. Shares land on your unpaid ledger within seconds. Track them
+      any time by pasting your address into the
+      <a href="/pool.html#your-miner">lookup on the pool page</a> — no login.
+    </p>
+
+    <script>
+      (function () {
+        var POOL = 'pool.bitcoinghost.org';
+        var SV1_PORT = '3333';
+        var SV2_PORT = '34255';
+        var SV2_AUTHORITY = '9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72';
+        var proto = 'sv1';
+
+        var addrEl = document.getElementById('qsg-addr');
+        var workerEl = document.getElementById('qsg-worker');
+        var outEl = document.getElementById('qsg-out');
+        var toggle = document.getElementById('qsg-proto');
+
+        function esc(s) {
+          return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+          });
+        }
+        function username() {
+          var a = (addrEl.value || '').trim() || '<your-address>';
+          var w = (workerEl.value || '').trim() || 'worker1';
+          return a + '.' + w;
+        }
+        function row(k, v) {
+          return '<div class="qsg-row"><span class="k">' + k + '</span>' +
+            '<div class="qsg-val"><code>' + esc(v) + '</code>' +
+            '<button type="button" class="qsg-copy" data-copy="' + esc(v) + '">Copy</button></div></div>';
+        }
+        function render() {
+          var user = username();
+          var html = '<div class="qsg-noacct">No account needed — no KYC</div>';
+          if (proto === 'sv1') {
+            html += row('Stratum URL', 'stratum+tcp://' + POOL + ':' + SV1_PORT);
+            html += row('Username', user);
+            html += row('Password', 'x');
+            html += '<p class="qsg-foot">Works on any ASIC — set the pool/URL, username and password fields in your miner’s web UI. The password is ignored; <code>x</code> is fine.</p>';
+          } else {
+            html += row('Host', POOL);
+            html += row('Port', SV2_PORT);
+            html += row('Username', user);
+            html += row('Protocol', 'Stratum V2');
+            html += row('Channel type', 'Extended');
+            html += row('Authority public key', SV2_AUTHORITY);
+            html += '<p class="qsg-foot">For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). The authority key is the same on every public Ghost node. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
+          }
+          outEl.innerHTML = html;
+        }
+
+        toggle.addEventListener('click', function (e) {
+          var b = e.target.closest('button[data-proto]');
+          if (!b) return;
+          proto = b.getAttribute('data-proto');
+          Array.prototype.forEach.call(toggle.children, function (c) { c.classList.toggle('active', c === b); });
+          render();
+        });
+        addrEl.addEventListener('input', render);
+        workerEl.addEventListener('input', render);
+        outEl.addEventListener('click', function (e) {
+          var b = e.target.closest('.qsg-copy');
+          if (!b) return;
+          var val = b.getAttribute('data-copy');
+          var done = function () { b.textContent = 'Copied'; b.classList.add('done'); setTimeout(function () { b.textContent = 'Copy'; b.classList.remove('done'); }, 1400); };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(val).then(done, done);
+          } else {
+            var ta = document.createElement('textarea'); ta.value = val; document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); } catch (e2) {} document.body.removeChild(ta); done();
+          }
+        });
+
+        render();
+      })();
+    </script>
   </div>
 </section>
 
