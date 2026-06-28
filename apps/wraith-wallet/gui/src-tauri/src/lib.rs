@@ -110,6 +110,36 @@ async fn wallet_show_mnemonic(
     to_value(&resp)
 }
 
+/// Back up wallet `name`'s encrypted keystore by copying it to
+/// `to_path` (a destination file the user chose). The daemon performs
+/// the copy itself and refuses to overwrite an existing file. The
+/// keystore stays encrypted end-to-end — no plaintext key material
+/// crosses this boundary.
+#[tauri::command]
+async fn wallet_export(name: String, to_path: String) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletExport { name, to_path }).await?;
+    to_value(&resp)
+}
+
+/// Restore a wallet from a previously-exported encrypted keystore at
+/// `from_path`, installing it as wallet `name`. The daemon refuses if
+/// a wallet of that name already exists on disk.
+#[tauri::command]
+async fn wallet_restore(name: String, from_path: String) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletRestore { name, from_path }).await?;
+    to_value(&resp)
+}
+
+/// Ask the daemon to fetch a release manifest (from `manifest_url`, or
+/// the daemon-configured default when `None`) and compare its version
+/// against the running daemon. The daemon only reports — it never
+/// downloads or installs anything.
+#[tauri::command]
+async fn check_for_update(manifest_url: Option<String>) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::CheckForUpdate { manifest_url }).await?;
+    to_value(&resp)
+}
+
 #[tauri::command]
 async fn light_balance() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::LightBalance).await?;
@@ -713,6 +743,9 @@ pub fn run() {
             wallet_create,
             wallet_import,
             wallet_show_mnemonic,
+            wallet_export,
+            wallet_restore,
+            check_for_update,
             light_balance,
             light_receive,
             light_history,

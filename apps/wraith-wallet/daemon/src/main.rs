@@ -2718,6 +2718,7 @@ mod unix {
                                     funding_txid: l.funding_txid,
                                     funding_vout: l.funding_vout,
                                     creation_height: l.creation_height,
+                                    recovery_height: l.recovery_height,
                                 })
                                 .collect();
                             Response::LocksList(LocksListResponse {

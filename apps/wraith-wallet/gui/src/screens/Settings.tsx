@@ -2,8 +2,15 @@ import { useEffect, useState } from "react";
 import {
   daemonEnv,
   daemonHealth,
+  walletList,
+  walletExport,
+  walletRestore,
+  checkForUpdate,
   type DaemonEnvResponse,
   type HealthResponse,
+  type WalletEntry,
+  type WalletBackupResult,
+  type CheckForUpdateResult,
 } from "../lib/tauri";
 
 interface SettingsProps {
@@ -30,6 +37,45 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
+  // Keystore backup / restore.
+  const [wallets, setWallets] = useState<WalletEntry[]>([]);
+  const [backupWallet, setBackupWallet] = useState("");
+  const [backupPath, setBackupPath] = useState("");
+  const [restoreName, setRestoreName] = useState("");
+  const [restorePath, setRestorePath] = useState("");
+  const [keystoreBusy, setKeystoreBusy] = useState(false);
+  const [keystoreErr, setKeystoreErr] = useState<string | null>(null);
+  const [exportResult, setExportResult] = useState<WalletBackupResult | null>(
+    null,
+  );
+  const [restoreResult, setRestoreResult] = useState<WalletBackupResult | null>(
+    null,
+  );
+
+  // Update check.
+  const [updateUrl, setUpdateUrl] = useState("");
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateErr, setUpdateErr] = useState<string | null>(null);
+  const [updateResult, setUpdateResult] = useState<CheckForUpdateResult | null>(
+    null,
+  );
+
+  const refreshWallets = async () => {
+    try {
+      const list = await walletList();
+      setWallets(list.wallets);
+      // Default the backup selector to the active wallet, if any.
+      setBackupWallet((cur) => {
+        if (cur && list.wallets.some((w) => w.name === cur)) return cur;
+        const active = list.wallets.find((w) => w.is_active);
+        return active?.name ?? list.wallets[0]?.name ?? "";
+      });
+    } catch {
+      // Wallet management may be unavailable (e.g. kiosk mode); leave
+      // the list empty so the card shows the "no wallets" hint.
+    }
+  };
+
   useEffect(() => {
     let alive = true;
     const tick = async () => {
@@ -45,12 +91,80 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
       }
     };
     tick();
+    refreshWallets();
     const id = setInterval(tick, 8000);
     return () => {
       alive = false;
       clearInterval(id);
     };
   }, []);
+
+  const onBackup = async () => {
+    const name = backupWallet.trim();
+    const path = backupPath.trim();
+    if (!name) {
+      setKeystoreErr("Pick a wallet to back up.");
+      return;
+    }
+    if (!path) {
+      setKeystoreErr("Enter a destination file path for the backup.");
+      return;
+    }
+    setKeystoreBusy(true);
+    setKeystoreErr(null);
+    setExportResult(null);
+    try {
+      const r = await walletExport(name, path);
+      setExportResult(r);
+      setBackupPath("");
+    } catch (e) {
+      setKeystoreErr((e as Error).message ?? String(e));
+    } finally {
+      setKeystoreBusy(false);
+    }
+  };
+
+  const onRestore = async () => {
+    const name = restoreName.trim();
+    const path = restorePath.trim();
+    if (!name) {
+      setKeystoreErr("Enter a name for the restored wallet.");
+      return;
+    }
+    if (!path) {
+      setKeystoreErr("Enter the path to the keystore file to restore.");
+      return;
+    }
+    setKeystoreBusy(true);
+    setKeystoreErr(null);
+    setRestoreResult(null);
+    try {
+      const r = await walletRestore(name, path);
+      setRestoreResult(r);
+      setRestoreName("");
+      setRestorePath("");
+      await refreshWallets();
+    } catch (e) {
+      setKeystoreErr((e as Error).message ?? String(e));
+    } finally {
+      setKeystoreBusy(false);
+    }
+  };
+
+  const onCheckUpdate = async () => {
+    setUpdateBusy(true);
+    setUpdateErr(null);
+    setUpdateResult(null);
+    try {
+      const url = updateUrl.trim();
+      const r = await checkForUpdate(url.length > 0 ? url : undefined);
+      setUpdateResult(r);
+    } catch (e) {
+      setUpdateErr((e as Error).message ?? String(e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  };
 
   const fmtUptime = (secs: number | undefined): string => {
     if (secs == null) return "—";
@@ -114,6 +228,218 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
           <div className="k">IPC socket</div>
           <div className="v mono">{env?.socket_path ?? "—"}</div>
         </div>
+      </div>
+
+      <div className="card">
+        <h2>Keystore backup &amp; restore</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+          Wallets are stored as Argon2id + AES-256-GCM encrypted
+          keystores. A backup is a straight copy of that encrypted file —
+          it never leaves the daemon as plaintext, and it still requires
+          the wallet passphrase to unlock after a restore. Keep it
+          somewhere safe; anyone who also learns the passphrase can spend
+          from it.
+        </p>
+
+        {keystoreErr && (
+          <div className="card error-card" style={{ marginBottom: 12 }}>
+            {keystoreErr}
+          </div>
+        )}
+
+        <h3 style={{ marginBottom: 4 }}>Back up</h3>
+        {wallets.length === 0 ? (
+          <p className="muted" style={{ fontSize: 13 }}>
+            No wallets available to back up.
+          </p>
+        ) : (
+          <>
+            <div className="col">
+              <label>Wallet</label>
+              <select
+                value={backupWallet}
+                onChange={(e) => setBackupWallet(e.target.value)}
+                disabled={keystoreBusy}
+              >
+                {wallets.map((w) => (
+                  <option key={w.name} value={w.name}>
+                    {w.name}
+                    {w.is_active ? " (active)" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="col">
+              <label>Destination file path</label>
+              <input
+                className="mono"
+                value={backupPath}
+                onChange={(e) => setBackupPath(e.target.value)}
+                placeholder="/home/you/backups/wallet.keystore"
+                disabled={keystoreBusy}
+              />
+              <span className="muted" style={{ fontSize: 12 }}>
+                Absolute path the daemon writes to. It refuses to
+                overwrite an existing file.
+              </span>
+            </div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <button
+                className="btn-primary"
+                onClick={onBackup}
+                disabled={keystoreBusy}
+              >
+                {keystoreBusy ? "Working…" : "Back up keystore"}
+              </button>
+            </div>
+            {exportResult && (
+              <div className="kv" style={{ marginTop: 12 }}>
+                <div className="k">Backed up</div>
+                <div className="v mono" style={{ fontSize: 12 }}>
+                  {exportResult.name}
+                </div>
+                <div className="k">Wrote</div>
+                <div className="v mono" style={{ fontSize: 12 }}>
+                  {exportResult.path}
+                </div>
+                <div className="k">Size</div>
+                <div className="v">
+                  {exportResult.bytes.toLocaleString()} bytes
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        <h3 style={{ marginTop: 16, marginBottom: 4 }}>Restore</h3>
+        <div className="col">
+          <label>New wallet name</label>
+          <input
+            value={restoreName}
+            onChange={(e) => setRestoreName(e.target.value)}
+            placeholder="restored-wallet"
+            disabled={keystoreBusy}
+          />
+        </div>
+        <div className="col">
+          <label>Keystore file path</label>
+          <input
+            className="mono"
+            value={restorePath}
+            onChange={(e) => setRestorePath(e.target.value)}
+            placeholder="/home/you/backups/wallet.keystore"
+            disabled={keystoreBusy}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            The daemon refuses to overwrite a wallet that already exists
+            under this name. Unlock it afterwards with its original
+            passphrase.
+          </span>
+        </div>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button
+            className="btn-primary"
+            onClick={onRestore}
+            disabled={keystoreBusy}
+          >
+            {keystoreBusy ? "Working…" : "Restore keystore"}
+          </button>
+        </div>
+        {restoreResult && (
+          <div className="kv" style={{ marginTop: 12 }}>
+            <div className="k">Restored</div>
+            <div className="v mono" style={{ fontSize: 12 }}>
+              {restoreResult.name}
+            </div>
+            <div className="k">Installed at</div>
+            <div className="v mono" style={{ fontSize: 12 }}>
+              {restoreResult.path}
+            </div>
+            <div className="k">Size</div>
+            <div className="v">
+              {restoreResult.bytes.toLocaleString()} bytes
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <h2>Updates</h2>
+          <span className="pill mute">v{health?.version ?? "—"}</span>
+        </div>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+          Asks the daemon to fetch a signed release manifest and compare
+          its version against the running daemon. Nothing is downloaded
+          or installed — this only tells you whether a newer build
+          exists.
+        </p>
+        <div className="col">
+          <label>Manifest URL (optional)</label>
+          <input
+            className="mono"
+            value={updateUrl}
+            onChange={(e) => setUpdateUrl(e.target.value)}
+            placeholder={
+              env?.network
+                ? "leave blank to use the daemon's configured channel"
+                : "https://…/manifest.json"
+            }
+            disabled={updateBusy}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>
+            Leave blank to use the daemon's{" "}
+            <code>WRAITHD_UPDATE_MANIFEST_URL</code> default. The daemon
+            errors if neither is set.
+          </span>
+        </div>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button
+            className="btn-primary"
+            onClick={onCheckUpdate}
+            disabled={updateBusy}
+          >
+            {updateBusy ? "Checking…" : "Check for updates"}
+          </button>
+        </div>
+        {updateErr && (
+          <div className="card error-card" style={{ marginTop: 12 }}>
+            {updateErr}
+          </div>
+        )}
+        {updateResult && (
+          <div style={{ marginTop: 12 }}>
+            <div className="row" style={{ marginBottom: 8 }}>
+              <span
+                className={`pill ${updateResult.up_to_date ? "pass" : "warn"}`}
+              >
+                {updateResult.up_to_date
+                  ? "up to date"
+                  : "update available"}
+              </span>
+            </div>
+            <div className="kv">
+              <div className="k">Current</div>
+              <div className="v mono">{updateResult.current_version}</div>
+              <div className="k">Latest</div>
+              <div className="v mono">
+                {updateResult.latest_version ?? "—"}
+              </div>
+              <div className="k">Manifest</div>
+              <div className="v mono" style={{ fontSize: 12 }}>
+                {updateResult.manifest_url}
+              </div>
+              {updateResult.tarball && (
+                <>
+                  <div className="k">Tarball</div>
+                  <div className="v mono" style={{ fontSize: 12 }}>
+                    {updateResult.tarball}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="card">

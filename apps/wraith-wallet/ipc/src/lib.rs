@@ -968,6 +968,12 @@ pub struct LockEntry {
     pub funding_txid: Option<String>,
     pub funding_vout: Option<u32>,
     pub creation_height: u32,
+    /// Absolute block height at which the lock's timelock matures and
+    /// the wallet's unilateral recovery branch becomes spendable
+    /// (`creation_height + recovery_blocks` per the lock's
+    /// `timelock_tier`). Sourced from the operator-reported
+    /// `recovery_height` on the GSP lock record.
+    pub recovery_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
