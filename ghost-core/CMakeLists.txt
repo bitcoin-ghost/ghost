@@ -27,9 +27,27 @@ get_directory_property(precious_variables CACHE_VARIABLES)
 # Project / Package metadata
 #=============================
 set(CLIENT_NAME "Ghost Core")
-set(CLIENT_VERSION_MAJOR 1)
-set(CLIENT_VERSION_MINOR 0)
-set(CLIENT_VERSION_BUILD 0)
+# Single source of truth: derive the client version from the workspace
+# Cargo.toml so ghostd's reported version auto-tracks releases. A release bump
+# updates Cargo.toml's [workspace.package] version, and the next ghostd build
+# follows it — no manual sync, never stuck at a stale version again.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml" _ghost_ws_version_lines
+     REGEX "^version = \"[0-9]+\\.[0-9]+\\.[0-9]+\"")
+if(_ghost_ws_version_lines)
+  list(GET _ghost_ws_version_lines 0 _ghost_ws_version_line)
+endif()
+if(_ghost_ws_version_line MATCHES "version = \"([0-9]+)\\.([0-9]+)\\.([0-9]+)\"")
+  set(CLIENT_VERSION_MAJOR ${CMAKE_MATCH_1})
+  set(CLIENT_VERSION_MINOR ${CMAKE_MATCH_2})
+  set(CLIENT_VERSION_BUILD ${CMAKE_MATCH_3})
+  message(STATUS "Ghost client version (from workspace Cargo.toml): ${CLIENT_VERSION_MAJOR}.${CLIENT_VERSION_MINOR}.${CLIENT_VERSION_BUILD}")
+else()
+  # Fallback for a standalone ghost-core build with no adjacent Cargo.toml.
+  set(CLIENT_VERSION_MAJOR 1)
+  set(CLIENT_VERSION_MINOR 10)
+  set(CLIENT_VERSION_BUILD 6)
+  message(WARNING "Ghost: could not read version from ../Cargo.toml; using fallback ${CLIENT_VERSION_MAJOR}.${CLIENT_VERSION_MINOR}.${CLIENT_VERSION_BUILD}")
+endif()
 set(CLIENT_VERSION_RC 0)
 set(CLIENT_VERSION_IS_RELEASE "true")
 set(COPYRIGHT_YEAR "2025")
