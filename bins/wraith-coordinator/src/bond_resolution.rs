@@ -75,30 +75,53 @@ pub fn resolve_round_bonds(
     inputs: &[AcceptedInputs],
     resolution: BondResolution,
 ) -> ResolutionSummary {
+    // A failed resolve leaves the bond stranded as `escrowed` (the participant's
+    // sats stay withheld) with no recovery, so retry transient failures (a brief
+    // ghost-pay blip/restart, a rate-limit on the path) with backoff before
+    // giving up. resolve_bond is idempotent — re-resolving an already-resolved
+    // bond returns AlreadyResolved and never double-credits — so retrying after a
+    // lost-response success is safe.
+    const MAX_ATTEMPTS: u32 = 4;
     let mut summary = ResolutionSummary::default();
     for input in inputs {
-        match ledger.resolve_bond(&input.bond_id, resolution.clone()) {
-            Ok(_record) => {
-                info!(
-                    %session_id,
-                    ghost_id = %input.ghost_id,
-                    bond_id = %input.bond_id,
-                    ?resolution,
-                    "bond resolved",
-                );
-                summary.resolved += 1;
+        let mut last_err = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match ledger.resolve_bond(&input.bond_id, resolution.clone()) {
+                Ok(_record) => {
+                    info!(
+                        %session_id,
+                        ghost_id = %input.ghost_id,
+                        bond_id = %input.bond_id,
+                        ?resolution,
+                        attempt,
+                        "bond resolved",
+                    );
+                    summary.resolved += 1;
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < MAX_ATTEMPTS {
+                        // 200ms, 400ms, 800ms backoff (resolve_bond is blocking).
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            200u64 * (1 << (attempt - 1)),
+                        ));
+                    }
+                }
             }
-            Err(e) => {
-                warn!(
-                    %session_id,
-                    ghost_id = %input.ghost_id,
-                    bond_id = %input.bond_id,
-                    ?resolution,
-                    error = %e,
-                    "bond resolution failed",
-                );
-                summary.failed += 1;
-            }
+        }
+        if let Some(e) = last_err {
+            warn!(
+                %session_id,
+                ghost_id = %input.ghost_id,
+                bond_id = %input.bond_id,
+                ?resolution,
+                attempts = MAX_ATTEMPTS,
+                error = %e,
+                "bond resolution failed after retries — bond may remain escrowed",
+            );
+            summary.failed += 1;
         }
     }
     summary
