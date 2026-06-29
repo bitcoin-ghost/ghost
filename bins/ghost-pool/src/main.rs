@@ -3822,8 +3822,11 @@ async fn main() -> Result<()> {
 
     // Share broadcast relay: sync callback → async Noise broadcast
     // Follows the MPC relay pattern (main.rs:1107-1134)
+    // Buffer cushion for share-relay bursts. The real throughput fix is the
+    // concurrent per-peer fan-out in MeshNetwork::broadcast; this just absorbs
+    // short bursts so try_send doesn't drop proofs under load.
     let (share_broadcast_tx, mut share_broadcast_rx) =
-        tokio::sync::mpsc::channel::<ghost_common::types::ShareProof>(256);
+        tokio::sync::mpsc::channel::<ghost_common::types::ShareProof>(1024);
     let mesh_for_shares_relay = Arc::clone(&mesh);
     tokio::spawn(async move {
         while let Some(proof) = share_broadcast_rx.recv().await {

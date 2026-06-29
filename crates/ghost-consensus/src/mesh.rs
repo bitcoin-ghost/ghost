@@ -1595,25 +1595,37 @@ impl MeshNetwork {
         }
 
         // Sensitive messages use point-to-point Noise to each known peer.
-        let peers = self.peers.get_connected_peers(60);
-        let mut sent = 0;
+        // Fan the sends out CONCURRENTLY rather than awaiting each peer in turn:
+        // a sequential loop made one slow or unreachable peer stall the entire
+        // broadcast, and as the mesh grew (3 -> 5+ peers) that backed up the
+        // share-relay queue until proofs aged past the freshness cap and were
+        // dropped as stale. Concurrent fan-out bounds each broadcast to the
+        // slowest single peer instead of the sum, and each peer has its own Noise
+        // connection so the sends don't contend.
+        let self_id = self.identity.node_id();
+        let targets: Vec<_> = self
+            .peers
+            .get_connected_peers(60)
+            .into_iter()
+            .filter(|peer| peer.node_id != self_id)
+            .collect();
 
-        for peer in peers {
-            if peer.node_id == self.identity.node_id() {
-                continue; // Don't send to ourselves
-            }
-
-            match self.send_to_peer(&peer, &envelope).await {
-                Ok(_) => sent += 1,
+        let envelope_ref = &envelope;
+        let results = futures::future::join_all(targets.into_iter().map(|peer| async move {
+            match self.send_to_peer(&peer, envelope_ref).await {
+                Ok(_) => true,
                 Err(e) => {
                     warn!(
                         peer = %peer.node_id_short(),
                         error = %e,
                         "Failed to send to peer"
                     );
+                    false
                 }
             }
-        }
+        }))
+        .await;
+        let sent = results.into_iter().filter(|&ok| ok).count();
 
         debug!(
             msg_type = ?envelope.msg_type,
