@@ -48,8 +48,10 @@ Options:
   --nickname <name>           Display name in the mesh        (default: ghost-node)
   --sync <mode>               ibd | fast | haze               (default: ibd)
                                 ibd  — full trustless sync + prune (recommended)
-                                fast — assumeutxo snapshot (~minutes; trusts a
-                                       snapshot hash, keeps validating; reversible)
+                                fast — EXPERIMENTAL: a real assumeutxo snapshot is
+                                       not yet distributed, so this currently
+                                       behaves exactly like ibd (no snapshot is
+                                       loaded). Use ibd.
                                 haze — strips block data, ~195GB, FAST but
                                        IRREVERSIBLE. You can never serve raw
                                        blocks or go archive without a full resync.
@@ -57,20 +59,30 @@ Options:
   --no-reaper                 Don't run the mempool reaper    (capability -2)
   --archive                   Full archive node (~720GB, capability +5)
   --ghost-pay                 Enable the L2 payments service  (capability +4)
+  --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
+
+With no config flags on an interactive terminal, a guided setup wizard runs.
 EOF
 }
 
 # ─────────────────────────────── arg parse ───────────────────────────────────
+# CONFIG_FLAGS counts how many config-setting flags were passed. The interactive
+# wizard runs ONLY when none were given (and stdin is a TTY and --non-interactive
+# was not passed); otherwise the script behaves exactly as the flag interface
+# always has.
+CONFIG_FLAGS=0
+NON_INTERACTIVE="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --payout-address) PAYOUT_ADDRESS="$2"; shift 2;;
-    --nickname)       NICKNAME="$2"; shift 2;;
-    --sync)           SYNC_MODE="$2"; shift 2;;
-    --no-public-mining) PUBLIC_MINING="false"; shift;;
-    --no-reaper)      REAPER="false"; shift;;
-    --archive)        ARCHIVE="true"; shift;;
-    --ghost-pay)      GHOST_PAY="true"; shift;;
+    --payout-address) PAYOUT_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --nickname)       NICKNAME="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --sync)           SYNC_MODE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --no-public-mining) PUBLIC_MINING="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --ghost-pay)      GHOST_PAY="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --non-interactive) NON_INTERACTIVE="true"; shift;;
     -h|--help)        usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
   esac
@@ -79,14 +91,123 @@ done
 err() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo -e "\033[36m==>\033[0m $*"; }
 
+# Set to "true" by the wizard so the post-wizard validation below doesn't ask the
+# haze confirmation a second time (the wizard already collected it).
+WIZARD_RAN="false"
+
+# Yes/No prompt with a default. Echoes "true" or "false" so the caller can assign
+# it straight into PUBLIC_MINING / REAPER / ARCHIVE / GHOST_PAY. The read prompt
+# goes to stderr, so it stays visible inside $(...) capture; only the echoed
+# answer is captured. `|| true` keeps an EOF (Ctrl-D) from tripping `set -e`.
+prompt_yes_no() {
+  local question="$1" default="$2" answer hint="[y/N]"
+  [[ "$default" == "Y" ]] && hint="[Y/n]"
+  read -rp "$question $hint " answer || true
+  answer="${answer:-$default}"
+  case "${answer,,}" in
+    y|yes) echo "true";;
+    n|no)  echo "false";;
+    *)     [[ "$default" == "Y" ]] && echo "true" || echo "false";;
+  esac
+}
+
+# Interactive first-run wizard. Collects the SAME variables the flag interface
+# sets (PAYOUT_ADDRESS, SYNC_MODE, PUBLIC_MINING, REAPER, ARCHIVE, GHOST_PAY,
+# NICKNAME); the rest of the installer is unchanged. Only ever runs with no
+# config flags, on a TTY, without --non-interactive.
+run_wizard() {
+  echo
+  log "Bitcoin Ghost — guided node setup"
+  echo "This installs a full Ghost node (ghostd + ghost-pool), joins the mesh, and"
+  echo "registers as an Elder while slots remain. Press Enter to accept each [default]."
+  echo
+
+  # Payout address — REQUIRED, no default, re-prompt until valid.
+  local addr
+  while :; do
+    read -rp "Payout address (mainnet bech32 — where your rewards are paid): " addr || true
+    if [[ "$addr" =~ ^bc1[a-z0-9]{20,}$ ]]; then
+      PAYOUT_ADDRESS="$addr"; break
+    fi
+    echo "  ✗ That doesn't look like a mainnet bech32 address (must start 'bc1…'). Try again."
+  done
+
+  # Sync mode.
+  echo
+  echo "Block download / sync method:"
+  echo "  1) ibd   full trustless sync — validates every block (hours up to ~a day). RECOMMENDED."
+  echo "  2) haze  IRREVERSIBLE — strips block data (~195GB, fast). Can never serve raw blocks or"
+  echo "           become an archive node afterwards without a full resync."
+  echo "  (A 'fast' assumeutxo snapshot is planned but not yet distributed, so it is not offered"
+  echo "   here — it would currently behave just like ibd.)"
+  local sync_choice
+  read -rp "Choose 1 or 2 [1]: " sync_choice || true
+  sync_choice="${sync_choice:-1}"
+  case "$sync_choice" in
+    1|ibd) SYNC_MODE="ibd";;
+    2|haze)
+      SYNC_MODE="haze"
+      echo
+      echo -e "\033[33mWARNING\033[0m: haze strips block data IRREVERSIBLY."
+      local hc
+      read -rp "  Type 'yes' to confirm haze (anything else uses ibd): " hc || true
+      if [[ "$hc" != "yes" ]]; then
+        echo "  Not confirmed — falling back to ibd."; SYNC_MODE="ibd"
+      fi
+      ;;
+    *) echo "  Unrecognised choice — using ibd."; SYNC_MODE="ibd";;
+  esac
+
+  # Capabilities.
+  echo
+  echo "Capabilities (each affects your node's reward share):"
+  PUBLIC_MINING="$(prompt_yes_no "  Accept external miners — public mining (+3 shares)?" Y)"
+  REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions (+2 path)?" Y)"
+  ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk (+5 shares)?" N)"
+  GHOST_PAY="$(prompt_yes_no "  Enable Ghost Pay — L2 instant-payments service (+4 shares)?" N)"
+
+  # Nickname.
+  echo
+  local nn
+  read -rp "Node nickname shown in the mesh [ghost-node]: " nn || true
+  NICKNAME="${nn:-ghost-node}"
+
+  # Summary + final confirmation before anything destructive happens.
+  echo
+  log "Summary of your choices"
+  echo "  Payout address : $PAYOUT_ADDRESS"
+  echo "  Sync mode      : $SYNC_MODE"
+  echo "  Public mining  : $PUBLIC_MINING"
+  echo "  Reaper         : $REAPER"
+  echo "  Archive node   : $ARCHIVE"
+  echo "  Ghost Pay      : $GHOST_PAY"
+  echo "  Nickname       : $NICKNAME"
+  echo
+  local proceed
+  proceed="$(prompt_yes_no "Proceed with installation?" Y)"
+  [[ "$proceed" == "true" ]] || err "Aborted by user."
+  WIZARD_RAN="true"
+  echo
+}
+
 [[ $EUID -eq 0 ]] || err "Run as root (sudo)."
+
+# Enter the wizard ONLY with no config flags, an interactive terminal, and no
+# --non-interactive. Otherwise fall straight through to the flag/validation path
+# exactly as before.
+if [[ "$CONFIG_FLAGS" -eq 0 && "$NON_INTERACTIVE" != "true" && -t 0 ]]; then
+  run_wizard
+fi
+
 [[ -n "$PAYOUT_ADDRESS" ]] || { usage; err "--payout-address is required."; }
 [[ "$PAYOUT_ADDRESS" =~ ^bc1[a-z0-9]{20,}$ ]] || err "Payout address doesn't look like a mainnet bech32 address."
 [[ "$(uname -m)" == "x86_64" ]] || err "Only x86_64 is supported by this installer right now."
 case "$SYNC_MODE" in ibd|fast) ;;
-  haze) echo -e "\033[33mWARNING\033[0m: --sync haze strips block data IRREVERSIBLY. This node can never";
-        echo "         serve raw blocks or become an archive node without a full resync.";
-        read -rp "         Type 'yes' to continue: " c; [[ "$c" == "yes" ]] || err "Aborted.";;
+  haze) if [[ "$WIZARD_RAN" != "true" ]]; then
+          echo -e "\033[33mWARNING\033[0m: --sync haze strips block data IRREVERSIBLY. This node can never";
+          echo "         serve raw blocks or become an archive node without a full resync.";
+          read -rp "         Type 'yes' to continue: " c; [[ "$c" == "yes" ]] || err "Aborted.";
+        fi;;
   *) err "--sync must be ibd, fast, or haze.";;
 esac
 
