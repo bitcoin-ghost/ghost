@@ -84,9 +84,10 @@ check_node() {
         echo "pool_ok=0" >> "$out"
     fi
 
-    # 2. ghost-pay reachable
-    if curl -sf --connect-timeout 3 "http://$ip:$GHOST_PAY_PORT/health" >/dev/null 2>&1 \
-       || curl -sf --connect-timeout 3 "http://$ip:$GHOST_PAY_PORT/api/v1/l2/state" >/dev/null 2>&1; then
+    # 2. ghost-pay reachable (ghost-pay serves HTTPS with an identity-derived
+    #    self-signed cert, so probe https with -k)
+    if curl -skf --connect-timeout 3 "https://$ip:$GHOST_PAY_PORT/health" >/dev/null 2>&1 \
+       || curl -skf --connect-timeout 3 "https://$ip:$GHOST_PAY_PORT/api/v1/l2/state" >/dev/null 2>&1; then
         echo "pay_ok=1" >> "$out"
     else
         echo "pay_ok=0" >> "$out"

@@ -549,7 +549,7 @@ Type=simple
 User=ghost
 Group=ghost
 WorkingDirectory=/var/lib/ghost
-ExecStart=/opt/ghost/bin/ghost-pay --api-listen 0.0.0.0:8800 --data-dir /home/ghost/.ghost/ghost-pay --bitcoin-rpc http://127.0.0.1:8332 --network mainnet --treasury-address bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k --node-payout-address ${PAYOUT_ADDRESS}
+ExecStart=/opt/ghost/bin/ghost-pay --api-listen 0.0.0.0:8800 --data-dir /home/ghost/.ghost/ghost-pay --bitcoin-rpc http://127.0.0.1:8332 --network mainnet --treasury-address bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k --node-payout-address ${PAYOUT_ADDRESS} --identity-key /home/ghost/.ghost/node.key
 Environment=RUST_LOG=info
 Environment=BITCOIN_RPC_USER=ghostrpc_mainnet
 Environment=BITCOIN_RPC_PASSWORD=${RPCPW}
