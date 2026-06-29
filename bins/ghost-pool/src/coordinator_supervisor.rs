@@ -43,6 +43,11 @@ pub struct CoordinatorRoleConfig {
     pub listen: SocketAddr,
     pub bond_ledger_url: Option<String>,
     pub bond_ledger_token: Option<String>,
+    /// This node's own `node_id` (Ed25519 pubkey). The co-located ghost-pay
+    /// derives its identity TLS cert from the SAME `node.key`, so the bond
+    /// ledger client pins the server cert's pubkey to exactly this value —
+    /// rejecting any other certificate on the loopback bond seam.
+    pub node_id: [u8; 32],
     pub fee_address: Option<String>,
     /// ghostd RPC the broadcaster pushes merged round txs to (reused from
     /// `[bitcoin]`).
@@ -128,23 +133,26 @@ impl CoordinatorSupervisor {
     async fn start(&self) {
         // Production bond ledger. On mainnet its presence was already enforced
         // in `maybe_new`; off mainnet a node may run without one (test nets).
-        let bond_ledger: Option<Arc<dyn BondLedger>> =
-            match (&self.cfg.bond_ledger_url, &self.cfg.bond_ledger_token) {
-                (Some(url), Some(token)) => match GhostPayBondLedger::new(url, token) {
-                    Ok(l) => Some(Arc::new(l)),
-                    Err(e) => {
-                        error!(error = %e, "coordinator: bond ledger init failed; not activating");
-                        return;
-                    }
-                },
-                (Some(_), None) => {
-                    error!(
-                    "coordinator: bond_ledger_url set without bond_ledger_token; not activating"
-                );
+        let bond_ledger: Option<Arc<dyn BondLedger>> = match (
+            &self.cfg.bond_ledger_url,
+            &self.cfg.bond_ledger_token,
+        ) {
+            (Some(url), Some(token)) => match GhostPayBondLedger::new(url, token, self.cfg.node_id)
+            {
+                Ok(l) => Some(Arc::new(l)),
+                Err(e) => {
+                    error!(error = %e, "coordinator: bond ledger init failed; not activating");
                     return;
                 }
-                _ => None,
-            };
+            },
+            (Some(_), None) => {
+                error!(
+                    "coordinator: bond_ledger_url set without bond_ledger_token; not activating"
+                );
+                return;
+            }
+            _ => None,
+        };
 
         let broadcaster: Option<Arc<dyn Broadcaster>> = match GhostdBroadcaster::new(
             self.cfg.ghostd_rpc_url.clone(),
@@ -223,6 +231,7 @@ mod tests {
             listen: "0.0.0.0:9100".parse().unwrap(),
             bond_ledger_url: bond_ledger_url.map(String::from),
             bond_ledger_token: bond_ledger_url.map(|_| "tok".to_string()),
+            node_id: [0u8; 32],
             fee_address: None,
             ghostd_rpc_url: "http://127.0.0.1:8332".to_string(),
             ghostd_rpc_user: "u".to_string(),

@@ -3671,6 +3671,10 @@ async fn main() -> Result<()> {
             listen,
             bond_ledger_url: config.coordinator.bond_ledger_url.clone(),
             bond_ledger_token: config.coordinator.bond_ledger_token.clone(),
+            // The co-located ghost-pay serves its bond endpoints with an
+            // identity cert derived from this SAME node identity, so the bond
+            // ledger client pins against our own node_id.
+            node_id: identity.node_id(),
             fee_address: config.coordinator.coordinator_fee_address.clone(),
             ghostd_rpc_url: format!(
                 "http://{}:{}",

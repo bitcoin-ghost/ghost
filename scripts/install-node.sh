@@ -411,7 +411,10 @@ EOF
 # in-process coordinator when this node wins a seat; `coordinator_port` is the
 # listen port (0.0.0.0:<port>); `bond_ledger_url`/`bond_ledger_token` point at
 # the local ghost-pay bond ledger (the token MUST equal ghost-pay's
-# GHOST_PAY_BOND_LEDGER_TOKEN). `wraith_election_enabled` + `coordinator_enabled`
+# GHOST_PAY_BOND_LEDGER_TOKEN). The URL is `https://` — ghost-pay serves its
+# bond endpoints with an identity-derived TLS cert and the coordinator pins it
+# against this node's own node_id (cert pubkey == node_id), so plain HTTP would
+# be rejected. `wraith_election_enabled` + `coordinator_enabled`
 # + `advertised_endpoint` make this node electable and let it compute the
 # per-epoch draw, so a single enabled node is enough and many are safe.
 if [[ "$WRAITH" == "true" ]]; then
@@ -423,7 +426,7 @@ coordinator_enabled = true
 advertised_endpoint = "${PUBIP}:9100"
 coordinator_port = 9100
 coordinator_role_enabled = true
-bond_ledger_url = "http://127.0.0.1:8800"
+bond_ledger_url = "https://127.0.0.1:8800"
 bond_ledger_token = "${BOND_LEDGER_TOKEN}"
 EOF
 fi

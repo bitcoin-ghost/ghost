@@ -6,8 +6,10 @@
 //! coordinator using the **real** `GhostPayBondLedger` HTTP client. Every
 //! load-bearing component on the bond path is the production article:
 //!
-//!   - the real `ghost-pay` server (subprocess, ephemeral port, plain
-//!     HTTP, non-mainnet `signet`),
+//!   - the real `ghost-pay` server (subprocess, ephemeral port, non-mainnet
+//!     `signet`) serving **real HTTPS** with an identity-derived cert (cert
+//!     pubkey == node_id, from a `--identity-key` node.key), against which the
+//!     coordinator client pins — the exact production trust path,
 //!   - the real participant HMAC auth on `/escrow`
 //!     (`X-Ghost-Signature` + `X-Ghost-Timestamp`),
 //!   - the real coordinator Bearer auth on `/verify` + `/resolve` +
@@ -48,6 +50,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tower::ServiceExt;
 
+use ghost_common::signer::{LocalSigner, Signer};
+use ghost_common::tls::{IdentityPinningVerifier, PubkeyAllowList};
 use ghost_storage::Database;
 use wraith_coordinator::bond_ledger_http::GhostPayBondLedger;
 use wraith_coordinator::broadcaster::{Broadcaster, StubBroadcaster};
@@ -73,6 +77,12 @@ const DB_PASSWORD: &str = "e2e-ghost-pay-db-password-0123456789abcdef";
 
 /// Per-participant signet change/fee destination (valid bech32 checksum).
 const TEST_FEE_ADDRESS: &str = "tb1q0xcqpzrky6eff2g52qdye53xkk9jxkvraulyla";
+
+/// 32-byte Ed25519 identity seed written to the ghost-pay `node.key` and
+/// handed to ghost-pay via `--identity-key`. ghost-pay derives its bond-endpoint
+/// TLS cert from this seed (cert pubkey == node_id), and the coordinator client
+/// pins against that node_id.
+const NODE_IDENTITY_SEED: [u8; 32] = [0x5a; 32];
 
 /// Five distinct valid signet P2WPKH mix-output addresses (keys `[i;32]`).
 const FIVE_SIGNET_ADDRS: [&str; 5] = [
@@ -179,9 +189,36 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
+/// The `node_id` (Ed25519 pubkey) ghost-pay advertises for a 32-byte seed.
+fn node_id_for(secret: &[u8; 32]) -> [u8; 32] {
+    LocalSigner::from_bytes(secret).public_key()
+}
+
+/// Build a `ureq` agent that pins ghost-pay's identity TLS cert against
+/// `node_id` — the same pinning the production `GhostPayBondLedger` uses, so
+/// the participant HMAC `/escrow` calls and health polls in this test ride the
+/// real HTTPS path too.
+fn pinned_agent(node_id: [u8; 32]) -> ureq::Agent {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let allow: PubkeyAllowList = Arc::new(move |k: &[u8; 32]| *k == node_id);
+    let verifier = Arc::new(IdentityPinningVerifier::new(allow));
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .tls_config(Arc::new(tls))
+        .build()
+}
+
 struct GhostPay {
     child: Child,
     base_url: String,
+    /// node_id ghost-pay serves its identity cert for (== `node_id_for(seed)`).
+    node_id: [u8; 32],
+    /// Pinned HTTPS agent for the test's own participant/health calls.
+    agent: ureq::Agent,
     /// A long-lived handle on the same encrypted DB the server uses, opened
     /// before spawn (so migrations don't race) and kept for read-back
     /// ground-truth assertions over `wraith_bonds`.
@@ -205,6 +242,12 @@ impl GhostPay {
             seed_l2_balance(&db, ghost_id, *sats);
         }
 
+        // Write the node.key (32-byte Ed25519 seed) ghost-pay derives its
+        // identity TLS cert from, and compute the node_id we pin against.
+        let key_path = data_dir.path().join("node.key");
+        std::fs::write(&key_path, NODE_IDENTITY_SEED).expect("write node.key");
+        let node_id = node_id_for(&NODE_IDENTITY_SEED);
+
         let port = free_port();
         let bin = ghost_pay_binary();
         let child = Command::new(bin)
@@ -214,6 +257,10 @@ impl GhostPay {
             .arg(format!("127.0.0.1:{port}"))
             .arg("--data-dir")
             .arg(data_dir.path())
+            // Serve the bond endpoints over HTTPS with the identity-derived
+            // cert (cert pubkey == node_id) — the production trust path.
+            .arg("--identity-key")
+            .arg(&key_path)
             .arg("--api-secret")
             .arg(API_SECRET)
             .arg("--bond-ledger-token")
@@ -234,10 +281,12 @@ impl GhostPay {
             .spawn()
             .expect("spawn ghost-pay");
 
-        let base_url = format!("http://127.0.0.1:{port}");
+        let base_url = format!("https://127.0.0.1:{port}");
         let gp = GhostPay {
             child,
             base_url,
+            node_id,
+            agent: pinned_agent(node_id),
             db,
             _data_dir: data_dir,
         };
@@ -257,10 +306,11 @@ impl GhostPay {
         let url = format!("{}/health", self.base_url);
         let deadline = Instant::now() + Duration::from_secs(45);
         loop {
-            match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
-                // Any HTTP status (incl. 503) means the listener is up.
+            match self.agent.get(&url).timeout(Duration::from_secs(2)).call() {
+                // Any HTTP status (incl. 503) means the TLS listener is up and
+                // the pinned handshake succeeded.
                 Ok(_) | Err(ureq::Error::Status(_, _)) => break,
-                // Transport error (connection refused) — still binding.
+                // Transport error (connection refused / TLS not ready) — still binding.
                 Err(_) => {}
             }
             if Instant::now() >= deadline {
@@ -275,7 +325,7 @@ impl GhostPay {
     /// Build a fresh real `GhostPayBondLedger` pointed at this server with
     /// the matching Bearer token.
     fn ledger(&self) -> GhostPayBondLedger {
-        GhostPayBondLedger::new(&self.base_url, BOND_TOKEN).expect("ledger")
+        GhostPayBondLedger::new(&self.base_url, BOND_TOKEN, self.node_id).expect("ledger")
     }
 }
 
@@ -353,6 +403,7 @@ enum EscrowResult {
 /// real `require_api_auth` middleware verifies.
 fn escrow_bond(
     pacer: &Pacer,
+    agent: &ureq::Agent,
     base_url: &str,
     ghost_id: &str,
     session_id: &str,
@@ -375,7 +426,8 @@ fn escrow_bond(
     mac.update(body.as_bytes());
     let sig = hex::encode(mac.finalize().into_bytes());
 
-    let resp = ureq::post(&format!("{base_url}/api/v1/wraith/bond/escrow"))
+    let resp = agent
+        .post(&format!("{base_url}/api/v1/wraith/bond/escrow"))
         .set("content-type", "application/json")
         .set("X-Ghost-Signature", &sig)
         .set("X-Ghost-Timestamp", &ts.to_string())
@@ -395,8 +447,14 @@ fn escrow_bond(
     }
 }
 
-fn escrow_ok(pacer: &Pacer, base: &str, ghost_id: &str, session_id: &str) -> String {
-    match escrow_bond(pacer, base, ghost_id, session_id, BOND_SATS) {
+fn escrow_ok(
+    pacer: &Pacer,
+    agent: &ureq::Agent,
+    base: &str,
+    ghost_id: &str,
+    session_id: &str,
+) -> String {
+    match escrow_bond(pacer, agent, base, ghost_id, session_id, BOND_SATS) {
         EscrowResult::Ok(id) => id,
         EscrowResult::Err(code, err) => panic!("escrow {ghost_id} failed: {code} {err}"),
     }
@@ -729,6 +787,35 @@ async fn bond_e2e_real_ghostpay_full_lifecycle() {
     let gp = GhostPay::spawn(&seeds);
     let pacer: Pacer = Arc::new(Mutex::new(RateMirror::new()));
     let base = gp.base_url.clone();
+    // Pinned HTTPS agent for the participant `/escrow` + health calls — same
+    // identity pin the coordinator's bond ledger client uses.
+    let agent = gp.agent.clone();
+
+    // ======================================================================
+    // PHASE 0 — NEGATIVE PIN: a bond ledger client pinned to the WRONG node_id
+    //           must FAIL the TLS handshake against the real ghost-pay server.
+    //           This proves the pin actually rejects a non-matching cert — a
+    //           pinning impl that accepted any cert would let `verify_bond`
+    //           succeed here, which is worse than the original bug.
+    // ======================================================================
+    {
+        let wrong_node_id = node_id_for(&[0xa5; 32]);
+        assert_ne!(
+            wrong_node_id, gp.node_id,
+            "test setup: wrong node_id must differ from the served one"
+        );
+        // Same https base_url + valid Bearer token — ONLY the pinned node_id
+        // is wrong, isolating the TLS pin as the cause of failure.
+        let wrong_ledger =
+            GhostPayBondLedger::new(&base, BOND_TOKEN, wrong_node_id).expect("ledger ctor");
+        let err = wrong_ledger
+            .verify_bond("h0", "any-session", BOND_SATS)
+            .expect_err("wrong-node_id pin MUST NOT verify a bond");
+        assert!(
+            matches!(err, wraith_protocol::BondError::LedgerUnreachable(_)),
+            "wrong pin must fail at the TLS handshake (LedgerUnreachable); got {err:?}"
+        );
+    }
 
     // ======================================================================
     // PHASE 1 — HAPPY PATH: escrow → join → verify → mix → resolve(refund)
@@ -743,7 +830,7 @@ async fn bond_e2e_real_ghostpay_full_lifecycle() {
         // 1b. Each escrows a real 500-sat bond via ghost-pay /escrow (HMAC).
         let mut bond_ids = Vec::new();
         for g in &happy {
-            let id = escrow_ok(&pacer, &base, g, &session_id);
+            let id = escrow_ok(&pacer, &agent, &base, g, &session_id);
             assert!(id.starts_with("gpbond-"), "real bond id: {id}");
             bond_ids.push(id);
         }
@@ -893,13 +980,13 @@ async fn bond_e2e_real_ghostpay_full_lifecycle() {
     {
         // `ds` was seeded with exactly one bond's worth (500). First escrow
         // (session ds-A) succeeds and consumes the whole spendable balance.
-        let id_a = escrow_ok(&pacer, &base, "ds", "ds-A");
+        let id_a = escrow_ok(&pacer, &agent, &base, "ds", "ds-A");
         assert!(id_a.starts_with("gpbond-"));
         assert_eq!(held_bonds(&gp.db, "ds"), 500, "first escrow held");
 
         // Second escrow (different session ds-B) must be refused: spendable
         // is now 0 because the live bond is netted out by spendable_l2_balance.
-        match escrow_bond(&pacer, &base, "ds", "ds-B", BOND_SATS) {
+        match escrow_bond(&pacer, &agent, &base, "ds", "ds-B", BOND_SATS) {
             EscrowResult::Err(code, err) => {
                 assert_eq!(code, 402, "double-spend escrow rejected");
                 assert_eq!(err, "insufficient_balance");
@@ -923,7 +1010,7 @@ async fn bond_e2e_real_ghostpay_full_lifecycle() {
 
         let mut bond_ids = std::collections::HashMap::new();
         for g in &slash {
-            bond_ids.insert(*g, escrow_ok(&pacer, &base, g, &session_id));
+            bond_ids.insert(*g, escrow_ok(&pacer, &agent, &base, g, &session_id));
         }
 
         force_locked(&state, &session_id);
