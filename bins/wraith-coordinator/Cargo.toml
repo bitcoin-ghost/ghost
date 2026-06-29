@@ -93,3 +93,14 @@ http-body-util = "0.1"
 # Used by the end-to-end blind-signature test to build a `PublicKey` from
 # the coordinator's hex-encoded signing pubkey.
 secp256k1 = { workspace = true }
+# bond_e2e.rs stands up the REAL ghost-pay bond server as a subprocess and
+# exercises the coordinator↔ghost-pay wire end-to-end. `ghost-storage` seeds
+# L2 balances directly into the (real, SQLCipher-encrypted, v38) ghost-pay
+# database and reads back `wraith_bonds` / held-bond sums for ground-truth
+# assertions; `scrypt` re-derives the same DB key ghost-pay derives from
+# `GHOST_PAY_PASSWORD`; `tempfile` provides the throwaway data dir.
+ghost-storage = { workspace = true }
+ghost-common = { workspace = true }
+rusqlite = { workspace = true }
+scrypt = { workspace = true }
+tempfile = "3.10"
