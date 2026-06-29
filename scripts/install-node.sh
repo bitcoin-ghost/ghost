@@ -40,6 +40,14 @@ GHOST_PAY="false"
 # otherwise (mixing rides on Ghost Pay's bond ledger). --wraith / --no-wraith
 # pin it explicitly.
 WRAITH=""
+# Tor. OFF by default — a plain clearnet install is completely unchanged.
+#   hybrid   (--tor)      reach outbound peers via Tor AND stay reachable on
+#                         clearnet 8333, plus publish an ephemeral v3 onion.
+#   tor-only (--tor-only) route everything over Tor, disable clearnet
+#                         (onlynet=onion) and close 8333.
+# --no-tor pins it off. TOR_MODE only matters when TOR is "true".
+TOR="false"
+TOR_MODE="hybrid"
 
 usage() {
   cat <<EOF
@@ -67,6 +75,11 @@ Options:
   --no-wraith                 Never run a Wraith mixing coordinator
                                 (default: follows --ghost-pay — on when Ghost Pay
                                  is on, off otherwise)
+  --tor                       Route over Tor (hybrid): outbound peers via Tor +
+                                publish an onion, still reachable on clearnet 8333
+  --tor-only                  Route over Tor ONLY: no clearnet (onlynet=onion),
+                                close 8333 (implies --tor)
+  --no-tor                    Never use Tor                   (default)
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
 
@@ -92,6 +105,9 @@ while [[ $# -gt 0 ]]; do
     --ghost-pay)      GHOST_PAY="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --wraith)         WRAITH="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-wraith)      WRAITH="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --tor)            TOR="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --tor-only)       TOR="true"; TOR_MODE="tor-only"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --no-tor)         TOR="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --non-interactive) NON_INTERACTIVE="true"; shift;;
     -h|--help)        usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -184,6 +200,19 @@ run_wizard() {
     WRAITH="false"
   fi
 
+  # Tor. Off by default. Hybrid keeps clearnet reachability AND adds an onion;
+  # tor-only routes everything over Tor and drops clearnet.
+  echo
+  echo "Privacy:"
+  TOR="$(prompt_yes_no "  Route this node over Tor (adds an onion service)?" N)"
+  if [[ "$TOR" == "true" ]]; then
+    if [[ "$(prompt_yes_no "    Tor-only? (N = hybrid: reachable on clearnet AND via onion)" N)" == "true" ]]; then
+      TOR_MODE="tor-only"
+    else
+      TOR_MODE="hybrid"
+    fi
+  fi
+
   # Nickname.
   echo
   local nn
@@ -200,6 +229,7 @@ run_wizard() {
   echo "  Archive node   : $ARCHIVE"
   echo "  Ghost Pay      : $GHOST_PAY"
   echo "  Wraith mixing  : $WRAITH"
+  echo "  Tor            : $([[ "$TOR" == "true" ]] && echo "$TOR_MODE" || echo "off")"
   echo "  Nickname       : $NICKNAME"
   echo
   local proceed
@@ -251,6 +281,11 @@ apt-get update -qq
 apt-get install -y -qq \
   libevent-2.1-7 libevent-extra-2.1-7 libevent-pthreads-2.1-7 libevent-openssl-2.1-7 \
   libzmq5 ca-certificates ufw openssl curl gnupg tar >/dev/null
+# Tor — only when routing over Tor. DEBIAN_FRONTEND is already exported above.
+if [[ "$TOR" == "true" ]]; then
+  log "Installing Tor"
+  apt-get install -y -qq tor >/dev/null
+fi
 
 # ─────────────────────────── 2. user + layout ────────────────────────────────
 log "Creating ghost user and directories"
@@ -330,6 +365,44 @@ fallbackfee=0.00001
 assumevalid=${ASSUMEVALID}
 EOF
 } > /etc/bitcoin/bitcoin.conf
+
+# Tor wiring. `listen=1` is already written above; here we add the onion service
+# (listenonion), the control-port endpoint ghostd uses to create/rotate it
+# (torcontrol), and outbound peering via Tor's SOCKS proxy (proxy). tor-only also
+# disables clearnet so the node ONLY talks over the onion network. bitcoin.conf
+# is rewritten from scratch on every run (truncating `>` above), so appending
+# here never duplicates lines across re-runs.
+if [[ "$TOR" == "true" ]]; then
+  {
+    echo "listenonion=1"
+    echo "torcontrol=127.0.0.1:9051"
+    echo "proxy=127.0.0.1:9050"
+    [[ "$TOR_MODE" == "tor-only" ]] && echo "onlynet=onion"
+  } >> /etc/bitcoin/bitcoin.conf
+fi
+
+# ─────────────────────── 5b. Tor service provisioning ────────────────────────
+# Configure Tor's control port (cookie-authenticated) so ghostd can publish its
+# ephemeral v3 onion, and grant the ghostd-running user access to the cookie.
+if [[ "$TOR" == "true" ]]; then
+  log "Configuring Tor (mode: ${TOR_MODE})"
+  # Idempotent append — the ControlPort line is our sentinel, so re-running the
+  # installer never duplicates the block in /etc/tor/torrc.
+  if ! grep -qE '^[[:space:]]*ControlPort[[:space:]]+9051([[:space:]]|$)' /etc/tor/torrc 2>/dev/null; then
+    cat >> /etc/tor/torrc <<'TORRC'
+
+# Added by Bitcoin Ghost installer — ghostd onion-service control access.
+ControlPort 9051
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
+TORRC
+  fi
+  # ghostd runs as the `ghost` user (see ghostd.service `User=ghost` below); it
+  # must be in the debian-tor group to read the control-auth cookie.
+  usermod -aG debian-tor ghost
+  systemctl enable tor >/dev/null 2>&1 || true
+  systemctl restart tor
+fi
 
 # ─────────────────────────── 6. pool config ──────────────────────────────────
 log "Writing /etc/ghost/pool.toml"
@@ -495,10 +568,14 @@ EOF
 log "Installing systemd units"
 REAPER_FLAGS=""
 [[ "$REAPER" == "true" ]] && REAPER_FLAGS="-ghostreaper=enabled -ghostreaper-rejectinscription=1 -ghostreaper-rejectdropstuffing=1 -ghostreaper-rejectfakepubkey=1 -ghostreaper-rejectannex=1 -ghostreaper-rejectopreturn=1 -ghostreaper-rejectrunestone=1 -ghostreaper-maxopreturn=82 -ghostreaper-mindropsize=76"
+# Order ghostd after tor when Tor is enabled, so the control port is up before
+# ghostd tries to publish its onion. Empty otherwise → unit byte-identical.
+GHOSTD_AFTER=""
+[[ "$TOR" == "true" ]] && GHOSTD_AFTER=" tor.service"
 cat > /etc/systemd/system/ghostd.service <<EOF
 [Unit]
 Description=Ghost Bitcoin Core (mainnet)
-After=network-online.target
+After=network-online.target${GHOSTD_AFTER}
 Wants=network-online.target
 [Service]
 Type=simple
@@ -575,6 +652,12 @@ ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus
 # Ghost Pay L2 / Wraith bond ledger (peers issue Ghost Pay verification
 # challenges here, and wallets escrow Wraith bonds here) — only when enabled.
 [[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay / bond ledger
+# Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
+# peering happens over the onion. Hybrid leaves the rule above in place (still
+# reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.
+if [[ "$TOR" == "true" && "$TOR_MODE" == "tor-only" ]]; then
+  ufw delete allow 8333/tcp >/dev/null 2>&1 || true   # tor-only: no clearnet P2P
+fi
 ufw --force enable      >/dev/null 2>&1
 
 # Stratum V1 (3333) + V2 (34255) are exposed ONLY when this node accepts public
