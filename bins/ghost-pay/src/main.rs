@@ -1892,12 +1892,24 @@ async fn main() -> Result<()> {
     // LOW-API-1: Security headers for all responses
     let app = public_routes
         .merge(authenticated_routes)
-        .merge(coordinator_routes)
         .merge(localhost_routes)
-        .layer(axum::middleware::from_fn(security_headers_middleware))
+        // H-8: IP rate-limit only the externally-reachable participant/public
+        // surface (incl. the HMAC-authed `/escrow` and the public/localhost
+        // routes). The coordinator bond routes are merged AFTER this layer and
+        // are therefore EXEMPT.
         .layer(GovernorLayer {
             config: governor_conf,
         })
+        // Coordinator bond routes (`/verify`, `/resolve`, snapshot) are
+        // Bearer-token authed and called by the co-located coordinator over
+        // loopback (`127.0.0.1:8800`) — the token is their protection, not an IP
+        // budget. IP rate-limiting them stranded bonds on a busy round: a
+        // back-to-back `/resolve` burst at round completion hit 429 and
+        // `resolve_round_bonds` swallowed the error (no retry), leaving bonds
+        // `escrowed` and sats withheld. Merging them after the GovernorLayer
+        // exempts them; security headers + CORS below still cover them.
+        .merge(coordinator_routes)
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(cors_origins))
