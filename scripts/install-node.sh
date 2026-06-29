@@ -19,7 +19,7 @@ GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
 POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 GHOSTD_URL="${GHOSTD_URL:-https://get.bitcoinghost.org/bin/ghostd}"
-GHOSTD_SHA256="c05c8588925860b5e50296b2fbaa5004e0569f280b623fa91d39611aac7fc73a"
+GHOSTD_SHA256="bb3a864248cea6ece930eb76fef525a0f5b1fde65976a886935df34e9e95859d"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
 # ZK params are auto-fetched from peers on first run; this is the pinned hash.
 ZK_PARAMS_HASH="BLOCK:fa9db2b79ee55bd181c33943a466aad24e58618c7cf1e2f23daf91462115ce77"
