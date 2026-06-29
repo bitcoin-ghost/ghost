@@ -122,10 +122,12 @@ struct Cli {
     #[arg(long, env = "WRAITH_COORDINATOR_FILL_WINDOW_SECS")]
     fill_window_secs: Option<u64>,
 
-    /// Production ghost-pay BondLedger HTTP endpoint, e.g.
-    /// `http://127.0.0.1:8800/`. Calls the `/api/v1/wraith/bond/*`
+    /// Production ghost-pay BondLedger HTTPS endpoint, e.g.
+    /// `https://127.0.0.1:8800/`. Calls the `/api/v1/wraith/bond/*`
     /// endpoint set defined in `bond_ledger_http.rs`. Auth via the
-    /// matching --bond-ledger-token (HTTP Bearer).
+    /// matching --bond-ledger-token (HTTP Bearer). MUST be `https://`:
+    /// the client pins ghost-pay's identity cert (see
+    /// --bond-ledger-node-id).
     #[arg(long, env = "WRAITH_COORDINATOR_BOND_LEDGER_URL")]
     bond_ledger_url: Option<String>,
 
@@ -134,6 +136,14 @@ struct Cli {
     /// boot. Required when --bond-ledger-url is set.
     #[arg(long, env = "WRAITH_COORDINATOR_BOND_LEDGER_TOKEN")]
     bond_ledger_token: Option<String>,
+
+    /// The ghost-pay node's `node_id` (64-hex Ed25519 pubkey) to pin its
+    /// TLS identity cert against. ghost-pay derives its bond-endpoint cert
+    /// from its `node.key`, so the cert's pubkey IS this node_id; the
+    /// client accepts that cert and no other (no CA, no DNS). Required when
+    /// --bond-ledger-url is set.
+    #[arg(long, env = "WRAITH_COORDINATOR_BOND_LEDGER_NODE_ID")]
+    bond_ledger_node_id: Option<String>,
 
     /// Use an in-memory StubBroadcaster instead of a real backend.
     /// Refused on mainnet — a stub broadcaster doesn't actually push
@@ -226,9 +236,16 @@ async fn main() -> Result<()> {
             .bond_ledger_token
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--bond-ledger-url requires --bond-ledger-token"))?;
-        let ledger = GhostPayBondLedger::new(url, token)
+        let node_id_hex = cli.bond_ledger_node_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--bond-ledger-url requires --bond-ledger-node-id (the ghost-pay \
+                 node_id to pin its identity TLS cert against)"
+            )
+        })?;
+        let node_id = parse_node_id(node_id_hex)?;
+        let ledger = GhostPayBondLedger::new(url, token, node_id)
             .map_err(|e| anyhow::anyhow!("ghost-pay bond ledger: {e}"))?;
-        info!(endpoint = %url, "using GhostPayBondLedger");
+        info!(endpoint = %url, "using GhostPayBondLedger (identity-pinned TLS)");
         Some(Arc::new(ledger))
     } else {
         None
@@ -375,6 +392,20 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Parse a 64-hex Ed25519 `node_id` (the value the bond ledger client pins
+/// ghost-pay's identity TLS cert against) into raw bytes.
+fn parse_node_id(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s.trim())
+        .with_context(|| format!("--bond-ledger-node-id must be 64-hex; got `{s}`"))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "--bond-ledger-node-id must decode to exactly 32 bytes (got {})",
+            bytes.len()
+        )
+    })?;
+    Ok(arr)
 }
 
 fn parse_network(s: &str) -> Result<bitcoin::Network> {

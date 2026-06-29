@@ -10441,6 +10441,7 @@ dependencies = [
  "hyper",
  "reqwest 0.12.28",
  "rusqlite",
+ "rustls",
  "scrypt",
  "secp256k1 0.29.1",
  "serde",

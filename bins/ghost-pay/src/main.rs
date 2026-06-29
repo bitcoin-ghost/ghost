@@ -9396,6 +9396,64 @@ mod wraith_bond_tests {
         format!("http://{addr}")
     }
 
+    /// Like `spawn_server`, but serves the bond router over HTTPS with an
+    /// **identity-derived** TLS cert (cert pubkey == node_id from `secret`),
+    /// exactly as a production node does via `--identity-key`. Returns the
+    /// `https://` base URL and the served node_id so the test can pin the real
+    /// `GhostPayBondLedger` client against it. Mirrors the production TLS
+    /// accept loop in `main`.
+    async fn spawn_server_tls(state: Arc<AppState>, secret: [u8; 32]) -> (String, [u8; 32]) {
+        use ghost_common::signer::{LocalSigner, Signer};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let node_id = LocalSigner::from_bytes(&secret).public_key();
+        let tls = ghost_common::tls::build_server_config_with_identity(
+            &ghost_common::config::TlsConfig::default(),
+            &secret,
+            None,
+        )
+        .expect("identity TLS config");
+
+        let app = bond_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+
+        tokio::spawn(async move {
+            let mut make_service =
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            loop {
+                let (tcp, remote) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let acceptor = acceptor.clone();
+                let tower_service = {
+                    use tower::Service;
+                    match make_service.call(remote).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    }
+                };
+                tokio::spawn(async move {
+                    let tls_stream = match acceptor.accept(tcp).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let svc = hyper_util::service::TowerToHyperService::new(tower_service);
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+
+        (format!("https://{addr}"), node_id)
+    }
+
     fn seed_balance(db: &Database, gid: &str, amount: i64) {
         db.with_connection(|conn| {
             let mut pid = [0u8; 16];
@@ -9775,11 +9833,34 @@ mod wraith_bond_tests {
             EscrowOutcome::BondId(id) => id,
             _ => panic!("created"),
         };
-        let base = spawn_server(state).await;
+        // Serve the bond router over real HTTPS with an identity cert, exactly
+        // as a production node does, and pin the client to its node_id.
+        let server_secret = [7u8; 32];
+        let (base, node_id) = spawn_server_tls(state, server_secret).await;
+
+        // NEGATIVE pinning check: a client pinned to a DIFFERENT node_id must
+        // fail the TLS handshake — proving the pin actually rejects wrong certs
+        // rather than accepting any cert.
+        {
+            let base_wrong = base.clone();
+            let wrong = tokio::task::spawn_blocking(move || {
+                let wrong_node_id = ghost_common::signer::Signer::public_key(
+                    &ghost_common::signer::LocalSigner::from_bytes(&[8u8; 32]),
+                );
+                let ledger = GhostPayBondLedger::new(base_wrong, "rtok", wrong_node_id).unwrap();
+                ledger.verify_bond("alice", "s1", 500)
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(wrong, Err(wraith_protocol::BondError::LedgerUnreachable(_))),
+                "wrong-node_id pin must fail the handshake (LedgerUnreachable); got {wrong:?}"
+            );
+        }
 
         // GhostPayBondLedger is blocking (ureq) — drive it off the runtime.
         let result = tokio::task::spawn_blocking(move || {
-            let ledger = GhostPayBondLedger::new(base, "rtok").unwrap();
+            let ledger = GhostPayBondLedger::new(base, "rtok", node_id).unwrap();
 
             // verify happy path returns the same bond id.
             let verified = ledger.verify_bond("alice", "s1", 500).unwrap();
