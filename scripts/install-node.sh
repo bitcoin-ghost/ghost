@@ -36,6 +36,10 @@ PUBLIC_MINING="true"
 REAPER="true"
 ARCHIVE="false"
 GHOST_PAY="false"
+# Wraith mixing coordinator. Empty = "auto": ON when Ghost Pay is on, OFF
+# otherwise (mixing rides on Ghost Pay's bond ledger). --wraith / --no-wraith
+# pin it explicitly.
+WRAITH=""
 
 usage() {
   cat <<EOF
@@ -59,6 +63,10 @@ Options:
   --no-reaper                 Don't run the mempool reaper    (capability -2)
   --archive                   Full archive node (~720GB, capability +5)
   --ghost-pay                 Enable the L2 payments service  (capability +4)
+  --wraith                    Run a Wraith mixing coordinator (implies --ghost-pay)
+  --no-wraith                 Never run a Wraith mixing coordinator
+                                (default: follows --ghost-pay — on when Ghost Pay
+                                 is on, off otherwise)
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
 
@@ -82,6 +90,8 @@ while [[ $# -gt 0 ]]; do
     --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --ghost-pay)      GHOST_PAY="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --wraith)         WRAITH="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --no-wraith)      WRAITH="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --non-interactive) NON_INTERACTIVE="true"; shift;;
     -h|--help)        usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -166,6 +176,14 @@ run_wizard() {
   ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk (+5 shares)?" N)"
   GHOST_PAY="$(prompt_yes_no "  Enable Ghost Pay — L2 instant-payments service (+4 shares)?" N)"
 
+  # Wraith mixing coordinator — only offered when Ghost Pay is on (it relies on
+  # ghost-pay's bond ledger). Defaults Y so a Ghost Pay node mixes by default.
+  if [[ "$GHOST_PAY" == "true" ]]; then
+    WRAITH="$(prompt_yes_no "  Enable Wraith mixing coordinator (requires Ghost Pay)?" Y)"
+  else
+    WRAITH="false"
+  fi
+
   # Nickname.
   echo
   local nn
@@ -181,6 +199,7 @@ run_wizard() {
   echo "  Reaper         : $REAPER"
   echo "  Archive node   : $ARCHIVE"
   echo "  Ghost Pay      : $GHOST_PAY"
+  echo "  Wraith mixing  : $WRAITH"
   echo "  Nickname       : $NICKNAME"
   echo
   local proceed
@@ -211,6 +230,20 @@ case "$SYNC_MODE" in ibd|fast) ;;
   *) err "--sync must be ibd, fast, or haze.";;
 esac
 
+# Wraith mixing rides on Ghost Pay's bond ledger (the coordinator verifies and
+# resolves participant bonds against ghost-pay on 127.0.0.1:8800). Resolve the
+# "auto" default — track Ghost Pay — and pull Ghost Pay in when Wraith was asked
+# for explicitly without it. We auto-enable Ghost Pay (rather than erroring) so a
+# non-interactive `--wraith` install can't half-provision a coordinator that has
+# no bond ledger to talk to.
+if [[ -z "$WRAITH" ]]; then
+  WRAITH="$GHOST_PAY"
+fi
+if [[ "$WRAITH" == "true" && "$GHOST_PAY" != "true" ]]; then
+  log "Wraith mixing requires Ghost Pay — enabling Ghost Pay (capability +4) as well."
+  GHOST_PAY="true"
+fi
+
 # ────────────────────────────── 1. packages ──────────────────────────────────
 log "Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -222,7 +255,7 @@ apt-get install -y -qq \
 # ─────────────────────────── 2. user + layout ────────────────────────────────
 log "Creating ghost user and directories"
 id ghost >/dev/null 2>&1 || useradd -r -m -d /home/ghost -s /bin/bash ghost
-mkdir -p /opt/ghost/bin /etc/ghost /etc/bitcoin /var/lib/bitcoin /var/lib/ghost /home/ghost/.ghost/data
+mkdir -p /opt/ghost/bin /etc/ghost /etc/bitcoin /var/lib/bitcoin /var/lib/ghost /home/ghost/.ghost/data /home/ghost/.ghost/ghost-pay
 
 # ─────────────────────── 3. download + verify binaries ───────────────────────
 log "Downloading and verifying binaries (${GHOST_VERSION})"
@@ -245,6 +278,11 @@ fi
 grep " ${POOL_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${POOL_TARBALL}."
 tar -xzf "$POOL_TARBALL"
 install -m755 -o root -g root "$(find . -name ghost-pool -type f | head -1)" /opt/ghost/bin/ghost-pool
+# ghost-pay (L2 + Wraith bond ledger) ships in the same signed tarball; install
+# it only when Ghost Pay is enabled.
+if [[ "$GHOST_PAY" == "true" ]]; then
+  install -m755 -o root -g root "$(find . -name ghost-pay -type f | head -1)" /opt/ghost/bin/ghost-pay
+fi
 # ghostd (pinned checksum)
 curl -fsSL "$GHOSTD_URL" -o ghostd || err "Could not download ghostd from ${GHOSTD_URL}."
 echo "${GHOSTD_SHA256}  ghostd" | sha256sum -c - || err "ghostd checksum verification FAILED."
@@ -257,6 +295,16 @@ RPCPW="$(openssl rand -hex 32)"
 APISECRET="$(openssl rand -hex 32)"
 SIGNKEY="$(openssl rand -hex 32)"
 PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+# Ghost Pay secrets. On mainnet ghost-pay refuses to start without all three of
+# these (key-encryption password, API HMAC secret, coordinator bond-ledger
+# token). BOND_LEDGER_TOKEN is generated ONCE here and shared verbatim between
+# ghost-pay (GHOST_PAY_BOND_LEDGER_TOKEN) and the ghost-pool coordinator
+# ([coordinator] bond_ledger_token) so the two always match.
+if [[ "$GHOST_PAY" == "true" ]]; then
+  PAY_KEY_PASSWORD="$(openssl rand -hex 32)"
+  PAY_API_SECRET="$(openssl rand -hex 32)"
+  BOND_LEDGER_TOKEN="$(openssl rand -hex 32)"
+fi
 
 # ───────────────────────── 5. ghostd config (sync) ───────────────────────────
 log "Writing /etc/bitcoin/bitcoin.conf (sync mode: ${SYNC_MODE})"
@@ -358,6 +406,28 @@ enabled = ${REAPER}
 mode = "strict"
 EOF
 
+# Wraith mixing coordinator. Keys are the `[coordinator]` (CoordinatorConfig)
+# fields read by ghost-pool: `coordinator_role_enabled` actually RUNS the
+# in-process coordinator when this node wins a seat; `coordinator_port` is the
+# listen port (0.0.0.0:<port>); `bond_ledger_url`/`bond_ledger_token` point at
+# the local ghost-pay bond ledger (the token MUST equal ghost-pay's
+# GHOST_PAY_BOND_LEDGER_TOKEN). `wraith_election_enabled` + `coordinator_enabled`
+# + `advertised_endpoint` make this node electable and let it compute the
+# per-epoch draw, so a single enabled node is enough and many are safe.
+if [[ "$WRAITH" == "true" ]]; then
+cat >> /etc/ghost/pool.toml <<EOF
+
+[coordinator]
+wraith_election_enabled = true
+coordinator_enabled = true
+advertised_endpoint = "${PUBIP}:9100"
+coordinator_port = 9100
+coordinator_role_enabled = true
+bond_ledger_url = "http://127.0.0.1:8800"
+bond_ledger_token = "${BOND_LEDGER_TOKEN}"
+EOF
+fi
+
 # H-11: configs with secrets must be 0600.
 chown ghost:ghost /etc/bitcoin/bitcoin.conf /etc/ghost/pool.toml
 chmod 600 /etc/bitcoin/bitcoin.conf /etc/ghost/pool.toml
@@ -389,6 +459,13 @@ while true; do
   if [ "$IBD" = "false" ]; then
     echo "[ghost-pool-gate] ghostd synced — starting ghost-pool"
     systemctl start ghost-pool
+    # ghost-pay (when installed) also needs a live ghostd + ghost-pool, so the
+    # gate owns its first start too — mirrors ghost-pool, which is not enabled
+    # at boot.
+    if [ -f /etc/systemd/system/ghost-pay.service ]; then
+      echo "[ghost-pool-gate] starting ghost-pay"
+      systemctl start ghost-pay
+    fi
     exit 0
   fi
   sleep 30
@@ -452,6 +529,39 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
+# ghost-pay L2 service (also serves the Wraith bond ledger on 8800). Only
+# installed when Ghost Pay is enabled. GHOST_PAY_BOND_LEDGER_TOKEN is the SAME
+# secret written into pool.toml's [coordinator] bond_ledger_token above, so the
+# coordinator authenticates to this bond ledger. MPC verification keys default
+# to the sibling of --data-dir (/home/ghost/.ghost/mpc_params), where ghost-pool
+# fetches them. The unit carries secrets, so it is locked to 0600.
+if [[ "$GHOST_PAY" == "true" ]]; then
+cat > /etc/systemd/system/ghost-pay.service <<EOF
+[Unit]
+Description=Ghost Pay L2 service (Wraith bond ledger)
+After=network-online.target ghostd.service ghost-pool.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+WorkingDirectory=/var/lib/ghost
+ExecStart=/opt/ghost/bin/ghost-pay --api-listen 0.0.0.0:8800 --data-dir /home/ghost/.ghost/ghost-pay --bitcoin-rpc http://127.0.0.1:8332 --network mainnet --treasury-address bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k --node-payout-address ${PAYOUT_ADDRESS}
+Environment=RUST_LOG=info
+Environment=BITCOIN_RPC_USER=ghostrpc_mainnet
+Environment=BITCOIN_RPC_PASSWORD=${RPCPW}
+Environment=GHOST_PAY_PASSWORD=${PAY_KEY_PASSWORD}
+Environment=GHOST_PAY_API_SECRET=${PAY_API_SECRET}
+Environment=GHOST_PAY_BOND_LEDGER_TOKEN=${BOND_LEDGER_TOKEN}
+Restart=on-failure
+RestartSec=15
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 600 /etc/systemd/system/ghost-pay.service
+fi
+
 # ─────────────────────────────── 9. firewall ─────────────────────────────────
 log "Configuring firewall"
 ufw allow 22/tcp        >/dev/null 2>&1   # ssh FIRST so we don't lock out
@@ -459,6 +569,9 @@ ufw allow 8333/tcp      >/dev/null 2>&1   # bitcoin P2P
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus
+# Ghost Pay L2 / Wraith bond ledger (peers issue Ghost Pay verification
+# challenges here, and wallets escrow Wraith bonds here) — only when enabled.
+[[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay / bond ledger
 ufw --force enable      >/dev/null 2>&1
 
 # Stratum V1 (3333) + V2 (34255) are exposed ONLY when this node accepts public
@@ -466,7 +579,7 @@ ufw --force enable      >/dev/null 2>&1
 # service follows `mining_mode` in pool.toml, and a .path unit re-runs it
 # whenever the config changes — so toggling public mining later (dashboard /
 # ghost-setup / hand edit) updates the firewall live, with no manual ufw step.
-log "Installing mining-firewall reconcile (stratum ports follow mining_mode)"
+log "Installing mining-firewall reconcile (stratum + coordinator ports follow pool.toml)"
 cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -486,12 +599,27 @@ else
   for p in "${PORTS[@]}"; do ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true; done
   logger -t ghost-mining-firewall "public mining OFF -> Stratum 3333+34255 CLOSED"
 fi
+
+# Wraith coordinator listen port (9100) follows [coordinator]
+# coordinator_role_enabled, exactly as the Stratum ports follow public mining.
+coord="no"
+if [[ -r "$CONF" ]] \
+ && grep -qE '^[[:space:]]*coordinator_role_enabled[[:space:]]*=[[:space:]]*true([[:space:]]|$)' "$CONF" 2>/dev/null; then
+  coord="yes"
+fi
+if [[ "$coord" == "yes" ]]; then
+  ufw allow 9100/tcp >/dev/null 2>&1 || true
+  logger -t ghost-mining-firewall "coordinator role ON -> Wraith 9100 OPEN"
+else
+  ufw delete allow 9100/tcp >/dev/null 2>&1 || true
+  logger -t ghost-mining-firewall "coordinator role OFF -> Wraith 9100 CLOSED"
+fi
 EOF
 chmod 755 /opt/ghost/bin/reconcile-mining-firewall.sh
 
 cat > /etc/systemd/system/ghost-mining-firewall.service <<'EOF'
 [Unit]
-Description=Ghost mining firewall reconcile (Stratum V1+V2 ports follow mining_mode)
+Description=Ghost mining firewall reconcile (Stratum + Wraith coordinator ports follow pool.toml)
 After=ufw.service network-online.target
 Wants=network-online.target
 [Service]
@@ -503,7 +631,7 @@ EOF
 
 cat > /etc/systemd/system/ghost-mining-firewall.path <<'EOF'
 [Unit]
-Description=Watch pool.toml and reconcile the Stratum firewall when mining_mode changes
+Description=Watch pool.toml and reconcile the Stratum + Wraith coordinator firewall on change
 [Path]
 PathModified=/etc/ghost/pool.toml
 Unit=ghost-mining-firewall.service
