@@ -6,12 +6,14 @@ import {
   getUpdateStatus,
   rollbackUpdate,
 } from '@/lib/api/system';
+import { getAutoUpdate, setAutoUpdate } from '@/lib/api/autoUpdate';
 
 export const systemKeys = {
   all: ['system'] as const,
   version: () => [...systemKeys.all, 'version'] as const,
   updates: () => [...systemKeys.all, 'updates'] as const,
   updateStatus: () => [...systemKeys.all, 'updateStatus'] as const,
+  autoUpdate: () => [...systemKeys.all, 'autoUpdate'] as const,
 };
 
 export function useSystemVersion() {
@@ -59,6 +61,26 @@ export function useRollbackUpdate() {
     mutationFn: rollbackUpdate,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: systemKeys.all });
+    },
+  });
+}
+
+// Auto-update opt-in: reflects /etc/ghost/auto-update.conf (default OFF).
+export function useAutoUpdate() {
+  return useQuery({
+    queryKey: systemKeys.autoUpdate(),
+    queryFn: getAutoUpdate,
+    staleTime: 30_000,
+  });
+}
+
+export function useSetAutoUpdate() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (enabled: boolean) => setAutoUpdate(enabled),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: systemKeys.autoUpdate() });
     },
   });
 }
