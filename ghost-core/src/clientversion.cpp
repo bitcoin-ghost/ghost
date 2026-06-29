@@ -21,7 +21,7 @@ using util::Join;
  * for both ghostd and ghost-qt, to make it harder for attackers to
  * target servers or GUI users specifically.
  */
-const std::string UA_NAME("GhostCore");
+const std::string UA_NAME("Ghost");
 
 
 #include <bitcoin-build-info.h>
