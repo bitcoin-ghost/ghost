@@ -203,6 +203,56 @@
   </div>
 </section>
 
+<!-- ───────── Mining modes ───────── -->
+<section class="block node-modes-section" id="mining-modes">
+  <div class="container">
+    <div class="section-label">mining modes</div>
+    <h2 class="section-title">Solo, private pool, or public pool.</h2>
+    <p class="section-lead">
+      Every node decides how its hashpower is used and who may point miners
+      at it. Pick one of three modes — switch any time from the node
+      dashboard. No account, no sign-up, no KYC.
+    </p>
+
+    <ul class="feature-list node-core-pink cap-bulleted">
+      <li>
+        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+        <div>
+          <div class="fl-name">Private Solo</div>
+          <div class="fl-desc">Your miners only — Stratum ports stay closed to outsiders and the node isn't published in DNS. You keep <strong>99% of the block subsidy plus every transaction fee</strong>, paid straight to your own address. The remaining 1% of the subsidy is the protocol fee, split between the treasury and the node pool. No reward sharing.</div>
+        </div>
+      </li>
+      <li>
+        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+        <div>
+          <div class="fl-name">Private Pool</div>
+          <div class="fl-desc">Run a pool for a group you choose. Miners connect with a password and rewards are pool-aggregated and shared across connected hashers — but the node stays out of DNS, so the public can't find it. Good for a farm, a club, or friends pooling together.</div>
+        </div>
+      </li>
+      <li>
+        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+        <div>
+          <div class="fl-name">Public Pool <span class="fl-badge">+3</span></div>
+          <div class="fl-desc">Published in DNS so anyone can point an ASIC at your node. Rewards are pool-aggregated and shared, and accepting external miners earns the public-mining capability (+3 shares). This is the default mode.</div>
+        </div>
+      </li>
+    </ul>
+
+    <p class="section-lead" style="margin-top:1.5rem">
+      Set it at install with <code>--mining-mode solo|pool|public</code>, or
+      change it later in the node dashboard under <strong>Mining</strong>.
+    </p>
+    <p class="section-lead" style="margin-top:1rem">
+      <strong>Name your pool.</strong> Every block you find carries a tag in
+      its coinbase, visible on any block explorer. By default it reflects the
+      mode (<code>- G H O S T - PublicPool</code>), but you can set a custom
+      name — <code>- G H O S T - YourPool</code> — from the node dashboard's
+      Pool Setup (ASCII, up to 30 characters). It's how your pool gets
+      recognised on-chain.
+    </p>
+  </div>
+</section>
+
 <!-- ───────── The gate ───────── -->
 <section class="block node-gate-section">
   <div class="container">
