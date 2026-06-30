@@ -1519,6 +1519,19 @@ load_assumeutxo_snapshot() {
   port="$(grep -m1 '^rpcport=' "$conf" | cut -d= -f2-)"; port="${port:-8332}"
   [[ -n "$user" && -n "$pass" ]] || err "fast sync: could not read ghostd RPC credentials from ${conf}."
 
+  # 0. Disk-space guard. assumeUTXO needs the ~9GB snapshot file AND the ~10GB
+  #    UTXO chainstate it loads into — far more headroom than a minimal pruned
+  #    IBD. If there isn't ~25GB free under the data dir, skip the snapshot and
+  #    return non-zero so the caller falls back to a full IBD (which is fine on a
+  #    small disk because pruning keeps it bounded). Better to be slow than to
+  #    fill the disk mid-load and wedge ghostd.
+  local need_kb=$((25 * 1024 * 1024)) free_kb
+  free_kb="$(df -Pk "$(dirname "$SNAPSHOT_PATH")" | awk 'NR==2{print $4}')"
+  if [[ -n "$free_kb" && "$free_kb" -lt "$need_kb" ]]; then
+    log "fast sync: only $((free_kb/1024/1024))GB free under $(dirname "$SNAPSHOT_PATH") — assumeUTXO needs ~25GB (9GB snapshot + ~10GB chainstate). Skipping snapshot; using full IBD instead."
+    return 1
+  fi
+
   # 1. Resumable download. The host advertises `Accept-Ranges: bytes`, so `-C -`
   #    continues a partial file after an interruption instead of restarting the
   #    ~9GB transfer. The default progress meter (no -s) shows progress/ETA.
