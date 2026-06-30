@@ -1,0 +1,13 @@
+# Bitcoin Ghost — node-dashboard auto-update toggle.
+#
+# Grants the dashboard service user (ghost) permission to flip the auto-update
+# opt-in, and NOTHING else. The command is pinned with its exact argument, so
+# `ghost` can run only:
+#     sudo /opt/ghost/bin/ghost-autoupdate-toggle on
+#     sudo /opt/ghost/bin/ghost-autoupdate-toggle off
+# Any other argument (or other command) is rejected by sudo. The toggle binary
+# is root-owned 0755, so the dashboard user cannot rewrite what runs as root.
+#
+# Installed 0440 at /etc/sudoers.d/ghost-autoupdate; validated with `visudo -cf`.
+Defaults!/opt/ghost/bin/ghost-autoupdate-toggle !requiretty
+ghost ALL=(root) NOPASSWD: /opt/ghost/bin/ghost-autoupdate-toggle on, /opt/ghost/bin/ghost-autoupdate-toggle off

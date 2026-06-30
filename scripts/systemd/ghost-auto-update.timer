@@ -1,0 +1,16 @@
+[Unit]
+Description=Bitcoin Ghost opt-in node auto-update (every 6h, randomised)
+Documentation=https://get.bitcoinghost.org
+
+[Timer]
+# First check shortly after boot, then every 6 hours.
+OnBootSec=15min
+OnUnitActiveSec=6h
+# Spread fleet load / avoid a thundering herd on the release host.
+RandomizedDelaySec=1h
+# Catch up a missed window (e.g. the node was off) on next boot.
+Persistent=true
+Unit=ghost-auto-update.service
+
+[Install]
+WantedBy=timers.target

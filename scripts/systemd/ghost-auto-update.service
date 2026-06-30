@@ -1,0 +1,15 @@
+[Unit]
+Description=Bitcoin Ghost opt-in node auto-update (verifies GPG signature before applying)
+Documentation=https://get.bitcoinghost.org
+# Only meaningful once the node is up; never block boot on it.
+After=network-online.target ghostd.service ghost-pool.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The script itself is a no-op unless /etc/ghost/auto-update.conf opts in.
+ExecStart=/opt/ghost/bin/ghost-auto-update.sh
+# Verification, binary swap, and systemctl control all require root.
+User=root
+# Never tie the result of a periodic check to a "failed" unit dashboard.
+SuccessExitStatus=0
