@@ -23,12 +23,12 @@
 //! Database migrations
 
 use rusqlite::Connection;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 38;
+const SCHEMA_VERSION: u32 = 39;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -94,6 +94,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (36, migrate_v36),
         (37, migrate_v37),
         (38, migrate_v38),
+        (39, migrate_v39),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -1940,6 +1941,119 @@ fn migrate_v38(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v39: MPC ceremony state foundation.
+///
+/// Two changes, both idempotent and safe on the live 5-contribution DBs as
+/// well as a fresh genesis DB.
+///
+/// Change 1 — add a stable `ceremony_id BLOB` column to the `mpc_ceremony`
+/// singleton. `ceremony_id` is the genesis-derived constant Schnorr proofs bind
+/// to (= position-1 `prev_params_hash`, the genesis lineage hash). It is
+/// nullable: legacy/pre-genesis rows carry NULL, which the reader treats as
+/// "not yet established" and the load path re-derives from position-1.
+///
+/// Change 2 — backfill the `mpc_ceremony` singleton (id=1) from existing
+/// contribution history when it is ABSENT but `mpc_contributions` has rows (the
+/// exact state of the live fleet: 5 contributions, empty singleton). The
+/// singleton then becomes the authoritative source of truth for progression,
+/// set as follows:
+///
+/// ```text
+/// contribution_count = MAX(elder_position)
+/// current_params_hash = mpc_contributions[MAX].new_params_hash  (lineage hash)
+/// is_ossified         = 0
+/// ceremony_id         = mpc_contributions[1].prev_params_hash
+/// updated_at          = now
+/// ```
+///
+/// An existing singleton is NEVER overwritten. If `mpc_contributions` is also
+/// empty (fresh genesis), the singleton is left for genesis init to create.
+fn migrate_v39(conn: &Connection) -> GhostResult<()> {
+    use rusqlite::OptionalExtension;
+
+    debug!("Running migration v39: Add mpc_ceremony.ceremony_id + backfill singleton");
+
+    // 1. Add the stable ceremony_id column.
+    conn.execute_batch("ALTER TABLE mpc_ceremony ADD COLUMN ceremony_id BLOB;")
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    // 2. Idempotent backfill — never overwrite an existing singleton.
+    let singleton_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mpc_ceremony WHERE id = 1)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| GhostError::Migration(e.to_string()))?
+        != 0;
+
+    if singleton_exists {
+        info!("v39: mpc_ceremony singleton already present — leaving it untouched");
+        return Ok(());
+    }
+
+    let max_position: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(elder_position) FROM mpc_contributions",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    let Some(max_position) = max_position else {
+        // No contributions — fresh genesis DB. Genesis init will create the row.
+        info!("v39: no mpc_contributions rows — leaving singleton empty for genesis init");
+        return Ok(());
+    };
+
+    // Lineage head: current_params_hash = new_params_hash at the highest position.
+    let current_params_hash: Vec<u8> = conn
+        .query_row(
+            "SELECT new_params_hash FROM mpc_contributions WHERE elder_position = ?1",
+            [max_position],
+            |r| r.get(0),
+        )
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    // ceremony_id = genesis lineage hash = position-1 prev_params_hash.
+    // Defensive: if position 1 is somehow absent, store NULL (reader re-derives).
+    let ceremony_id: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT prev_params_hash FROM mpc_contributions WHERE elder_position = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    if ceremony_id.is_none() {
+        warn!(
+            "v39: contribution position 1 missing — backfilling singleton with NULL ceremony_id \
+             (load path will re-derive once position 1 is available)"
+        );
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    conn.execute(
+        "INSERT INTO mpc_ceremony
+            (id, contribution_count, current_params_hash, is_ossified, ossified_at,
+             block_vk_hash, payout_vk_hash, updated_at, ceremony_id)
+         VALUES (1, ?1, ?2, 0, NULL, NULL, NULL, ?3, ?4)",
+        rusqlite::params![max_position, current_params_hash, now, ceremony_id],
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    info!(
+        contribution_count = max_position,
+        "v39: Backfilled mpc_ceremony singleton from existing contribution history"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1969,6 +2083,164 @@ mod tests {
         let version = get_schema_version(&conn)
             .expect("MEDIUM-STOR-2: Failed to get schema version after idempotent migrations");
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    // ========================================================================
+    // v39: mpc_ceremony.ceremony_id + singleton backfill (Stage A task 3)
+    // ========================================================================
+
+    /// Create the `mpc_ceremony` + `mpc_contributions` tables in their pre-v39
+    /// (v13) shape — i.e. WITHOUT the `ceremony_id` column — and stamp the DB at
+    /// schema version 38 so `run_migrations` runs only v39.
+    fn setup_pre_v39_mpc(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE mpc_ceremony (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                contribution_count INTEGER NOT NULL DEFAULT 0,
+                current_params_hash BLOB NOT NULL,
+                is_ossified INTEGER NOT NULL DEFAULT 0,
+                ossified_at INTEGER,
+                block_vk_hash BLOB,
+                payout_vk_hash BLOB,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE mpc_contributions (
+                elder_position INTEGER PRIMARY KEY,
+                contributor_node_id TEXT NOT NULL,
+                prev_params_hash BLOB NOT NULL,
+                new_params_hash BLOB NOT NULL,
+                contribution_proof BLOB NOT NULL,
+                epoch INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        set_schema_version(conn, 38).unwrap();
+    }
+
+    /// Insert `n` synthetic contributions chaining lineage hashes:
+    /// pos 1 prev=[200;32] new=[1;32]; pos i prev=[i-1;32] new=[i;32].
+    fn insert_synthetic_contributions(conn: &Connection, n: u8) {
+        for pos in 1..=n {
+            let prev = if pos == 1 { [200u8; 32] } else { [pos - 1; 32] };
+            let new = [pos; 32];
+            conn.execute(
+                "INSERT INTO mpc_contributions
+                    (elder_position, contributor_node_id, prev_params_hash, new_params_hash,
+                     contribution_proof, epoch, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
+                rusqlite::params![
+                    pos as i64,
+                    format!("node{pos}"),
+                    &prev[..],
+                    &new[..],
+                    &[1u8, 2, 3][..]
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    fn read_singleton(conn: &Connection) -> Option<(i64, Vec<u8>, i64, Option<Vec<u8>>)> {
+        conn.query_row(
+            "SELECT contribution_count, current_params_hash, is_ossified, ceremony_id
+             FROM mpc_ceremony WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn test_v39_adds_ceremony_id_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let cols = get_column_names(&conn, "mpc_ceremony");
+        assert!(
+            cols.contains(&"ceremony_id".to_string()),
+            "v39 must add ceremony_id column; got {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_v39_backfills_singleton_from_five_contributions() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup_pre_v39_mpc(&conn);
+        insert_synthetic_contributions(&conn, 5);
+
+        run_migrations(&conn).unwrap();
+
+        let (count, cph, ossified, cid) =
+            read_singleton(&conn).expect("singleton must be backfilled");
+        assert_eq!(count, 5, "contribution_count = MAX(elder_position)");
+        assert_eq!(
+            cph,
+            vec![5u8; 32],
+            "current_params_hash = contributions[5].new_params_hash"
+        );
+        assert_eq!(ossified, 0, "backfilled ceremony is not ossified");
+        assert_eq!(
+            cid,
+            Some(vec![200u8; 32]),
+            "ceremony_id = contributions[1].prev_params_hash"
+        );
+    }
+
+    #[test]
+    fn test_v39_backfill_is_idempotent_no_op_on_rerun() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup_pre_v39_mpc(&conn);
+        insert_synthetic_contributions(&conn, 5);
+
+        run_migrations(&conn).unwrap();
+        // Re-running is version-gated and must not change the singleton.
+        run_migrations(&conn).unwrap();
+
+        let (count, cph, _ossified, cid) = read_singleton(&conn).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(cph, vec![5u8; 32]);
+        assert_eq!(cid, Some(vec![200u8; 32]));
+    }
+
+    #[test]
+    fn test_v39_never_overwrites_existing_singleton() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup_pre_v39_mpc(&conn);
+        insert_synthetic_contributions(&conn, 5);
+        // A singleton already exists with a DIFFERENT count — must be preserved.
+        conn.execute(
+            "INSERT INTO mpc_ceremony
+                (id, contribution_count, current_params_hash, is_ossified, updated_at)
+             VALUES (1, 2, ?1, 0, 123)",
+            rusqlite::params![&[2u8; 32][..]],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let (count, cph, _ossified, cid) = read_singleton(&conn).unwrap();
+        assert_eq!(count, 2, "existing singleton count must NOT be overwritten");
+        assert_eq!(cph, vec![2u8; 32], "existing current_params_hash preserved");
+        assert_eq!(
+            cid, None,
+            "existing row's ceremony_id left as NULL (not backfilled)"
+        );
+    }
+
+    #[test]
+    fn test_v39_empty_contributions_writes_no_singleton() {
+        let conn = Connection::open_in_memory().unwrap();
+        setup_pre_v39_mpc(&conn);
+        // No contributions at all (fresh genesis DB).
+
+        run_migrations(&conn).unwrap();
+
+        assert!(
+            read_singleton(&conn).is_none(),
+            "no singleton must be written when mpc_contributions is empty"
+        );
     }
 
     /// Helper: returns all table names from sqlite_master

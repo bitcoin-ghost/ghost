@@ -2580,8 +2580,29 @@ async fn main() -> Result<()> {
         use ghost_consensus::MpcHandler;
         use ghost_mpc::CeremonyManager;
 
-        // Load MPC ceremony state from database
+        // Load MPC ceremony state from database (the backfilled singleton)
         let mpc_state = db.get_mpc_ceremony_state()?;
+
+        // Stage A task 2: derive the STABLE ceremony_id.
+        //
+        // ceremony_id binds every Schnorr proof, so it must be identical on
+        // every node and unchanging for the life of the ceremony. The canonical
+        // source is position-1's `prev_params_hash` (the genesis lineage hash);
+        // the persisted `mpc_ceremony.ceremony_id` column is a backfilled cache
+        // of the same value. Prefer the canonical derivation, fall back to the
+        // cached column, then to zero (pre-genesis — genesis init then sets it).
+        //
+        // This deliberately REPLACES the old behaviour of using
+        // `current_params_hash`, which changed every time a contribution was
+        // applied and so could never be a stable ceremony binding.
+        let persisted_ceremony_id = mpc_state
+            .as_ref()
+            .map(|s| s.ceremony_id)
+            .filter(|cid| *cid != [0u8; 32]);
+        let stable_ceremony_id = db
+            .mpc_genesis_ceremony_id()?
+            .or(persisted_ceremony_id)
+            .unwrap_or([0u8; 32]);
 
         // Determine params directory (from config or default)
         let mpc_params_dir =
@@ -2603,8 +2624,8 @@ async fn main() -> Result<()> {
                 note_spend_vk_hash: s.block_vk_hash,
                 payout_vk_hash: s.payout_vk_hash,
                 updated_at: s.updated_at,
-                // Fields added in later versions - derive ceremony_id from params hash
-                ceremony_id: s.current_params_hash, // Use params hash as ceremony ID for continuity
+                // Stable genesis-derived ceremony_id (NOT current_params_hash).
+                ceremony_id: stable_ceremony_id,
                 pending_commitment_count: 0,
             }),
         ) {
@@ -2613,6 +2634,78 @@ async fn main() -> Result<()> {
                 warn!(error = %e, "Failed to initialize MPC ceremony manager, continuing without MPC");
                 // Create a minimal ceremony manager that reports as ossified
                 Arc::new(CeremonyManager::new(mpc_params_dir))
+            }
+        };
+
+        // Stage A task 3: startup lineage cross-check (fail-closed).
+        //
+        // After loading the current parameters, recompute their LINEAGE hash
+        // (`hash_parameters` — structured VK + h + l vectors, NOT the raw-file
+        // pin hash) and require it to equal BOTH:
+        //   * the singleton's `current_params_hash`, and
+        //   * `mpc_contributions[MAX].new_params_hash`.
+        // A mismatch means the on-disk params are corrupt or out of step with
+        // the recorded lineage; this node must NOT enter the rolling /
+        // contribution path (it would poison the lineage). The result gates the
+        // auto-contribute task below. The existing frozen/pinned behaviour is
+        // untouched — pinned nodes still freeze via their own guard, and the
+        // raw-file `ZK_PARAMS_HASH` check (a DIFFERENT digest) still runs.
+        let mpc_lineage_ok: bool = {
+            let count = ceremony_manager.contribution_count();
+            if count == 0 {
+                // Pre-genesis / genesis-forming: nothing applied to cross-check.
+                true
+            } else {
+                match ceremony_manager.note_spend_params() {
+                    None => {
+                        error!(
+                            count,
+                            "MPC lineage cross-check FAILED: ceremony reports contributions but no \
+                             parameters are loaded — refusing to enter rolling (fail-closed)"
+                        );
+                        false
+                    }
+                    Some(params) => match ghost_mpc::contribution::hash_parameters(&params) {
+                        Err(e) => {
+                            error!(error = %e, "MPC lineage cross-check FAILED: could not hash loaded params — refusing rolling");
+                            false
+                        }
+                        Ok(file_lineage) => {
+                            // contributions[MAX].new_params_hash (lineage head)
+                            let contribution_head = db
+                                .get_mpc_contribution(count)
+                                .ok()
+                                .flatten()
+                                .map(|c| c.new_params_hash);
+                            // mpc_ceremony.current_params_hash (loaded into state)
+                            let singleton_head = ceremony_manager.current_params_hash();
+
+                            let ok = ghost_mpc::lineage_head_matches(
+                                &file_lineage,
+                                &singleton_head,
+                                contribution_head.as_ref(),
+                            );
+                            if ok {
+                                info!(
+                                    position = count,
+                                    "MPC lineage cross-check passed: on-disk params match recorded lineage head"
+                                );
+                            } else {
+                                error!(
+                                    position = count,
+                                    on_disk = %hex::encode(&file_lineage[..8]),
+                                    contribution_head = contribution_head
+                                        .map(|h| hex::encode(&h[..8]))
+                                        .unwrap_or_else(|| "<missing>".to_string()),
+                                    singleton_head = %hex::encode(&singleton_head[..8]),
+                                    "MPC lineage cross-check FAILED: on-disk params do not match the \
+                                     recorded lineage head — refusing rolling (fail-closed)"
+                                );
+                            }
+                            ok
+                        }
+                    },
+                }
             }
         };
 
@@ -2950,6 +3043,20 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Stage A task 3: fail-closed lineage gate. If the startup
+            // cross-check found the on-disk params out of step with the recorded
+            // lineage head, do NOT enter the rolling/contribution path — a
+            // contribution built on top of mismatched params would poison the
+            // lineage. The node keeps serving whatever it loaded; it just won't
+            // fetch or contribute. (Pinned/frozen nodes already returned above.)
+            if !mpc_lineage_ok {
+                error!(
+                    "MPC: startup lineage cross-check failed — refusing to enter the rolling \
+                     ceremony (fail-closed). Investigate on-disk params vs recorded lineage."
+                );
+                return;
+            }
+
             // Retry loop: attempt contribution up to 5 times with random 10-100s intervals.
             // This handles race conditions where multiple nodes try the same position
             // simultaneously — the loser retries at the next position.
@@ -2983,8 +3090,12 @@ async fn main() -> Result<()> {
                 // hash). On test nets (no pinned hash) this is the normal forming
                 // path. Either way the fetch can no longer clobber pinned params.
                 if !ceremony_manager_for_startup.has_current_params() {
-                    // Use DB to determine if this is truly genesis or if we need to fetch
-                    let db_count = db_for_mpc.get_mpc_elder_count().unwrap_or(0) as u32;
+                    // Use DB to determine if this is truly genesis or if we need to fetch.
+                    // Authoritative progression count = mpc_ceremony singleton (falls back to
+                    // COUNT(mpc_contributions) when the singleton is absent, e.g. fresh genesis).
+                    let db_count = db_for_mpc
+                        .mpc_contribution_count_authoritative()
+                        .unwrap_or(0);
 
                     if db_count == 0 && is_genesis_node {
                         // Genesis protection layer 1: Query seed peers for existing contributors
@@ -3225,8 +3336,13 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                // Determine position from DB (authoritative source, not stale in-memory state)
-                let db_count = db_for_mpc.get_mpc_elder_count().unwrap_or(0) as u32;
+                // Determine position from DB (authoritative source, not stale in-memory state).
+                // Progression count comes from the mpc_ceremony singleton (falls back to
+                // COUNT(mpc_contributions) when absent). Voter-set sizing still uses
+                // get_mpc_elder_count() in the handler — these are deliberately distinct.
+                let db_count = db_for_mpc
+                    .mpc_contribution_count_authoritative()
+                    .unwrap_or(0);
                 let next_position = db_count + 1;
 
                 info!(

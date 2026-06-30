@@ -35,7 +35,7 @@
 //! 2. Contribution is broadcast to network
 //! 3. Current elders verify and vote on contribution
 //! 4. Bootstrap (positions 1-3): genesis node approves alone
-//!    Normal (position 4+): 75% (3/4) of elders must approve
+//!    Normal (position 4+): 67% supermajority of elders must approve
 //! 5. At elder 101, ceremony ossifies permanently
 //!
 //! ## Security Properties
@@ -64,22 +64,21 @@ use crate::message::{
     MpcParametersResponseMessage, MpcVerificationVoteMessage,
 };
 
-/// BFT threshold for MPC contribution approval (75% = 3/4)
-const MPC_BFT_THRESHOLD_PERCENT: u32 = 75;
-
-/// Minimum number of MPC contributors before BFT voting kicks in.
-/// During bootstrap (< 4 contributors), the genesis node can approve alone.
-/// Once 4+ elders exist, 75% (ceil(4*75/100)=3, i.e. 3/4) approval is required.
-/// NOTE: With 3 contributors, ceil(3*75/100)=3 requires unanimous agreement,
-/// which is too fragile (any single node offline blocks new contributions).
-const MPC_BFT_BOOTSTRAP_COUNT: u32 = 4;
+/// BFT threshold + bootstrap count for MPC contribution approval.
+///
+/// SINGLE SOURCE OF TRUTH: these come from `ghost_common::constants` (and are
+/// re-exported by `ghost-mpc`) so the quorum computed here matches every other
+/// node and every other MPC code path exactly. A divergence would split
+/// consensus — one node applying a contribution that another rejects.
+use ghost_common::constants::{MPC_BFT_BOOTSTRAP_COUNT, MPC_BFT_THRESHOLD_PERCENT};
 
 /// Compute BFT threshold for MPC contribution approval.
 ///
 /// During bootstrap (fewer than `MPC_BFT_BOOTSTRAP_COUNT` contributors) the
 /// genesis node can approve alone (threshold = 1).  Once the contributor count
-/// reaches `MPC_BFT_BOOTSTRAP_COUNT` (4), the threshold becomes a 75%
-/// supermajority: `ceil(contributor_count * 75 / 100)`.
+/// reaches `MPC_BFT_BOOTSTRAP_COUNT` (4), the threshold becomes a
+/// `MPC_BFT_THRESHOLD_PERCENT` (67%) supermajority:
+/// `ceil(contributor_count * 67 / 100)`.
 pub(crate) fn bft_threshold(contributor_count: u32) -> u32 {
     if contributor_count < MPC_BFT_BOOTSTRAP_COUNT {
         1
@@ -242,9 +241,16 @@ impl MpcHandler {
     ///
     /// This queries the database directly to ensure we have the latest count,
     /// since contributions can be applied outside this handler (e.g., during startup).
+    ///
+    /// Progression count = the `mpc_ceremony` singleton (authoritative), falling
+    /// back to `COUNT(mpc_contributions)` when the singleton is absent. The
+    /// helper also logs loudly if the two disagree. This is intentionally
+    /// DISTINCT from `mpc_contributor_count()` (raw COUNT), which sizes the
+    /// BFT voter set for `bft_threshold`.
     pub fn contribution_count(&self) -> u32 {
-        // Use database as single source of truth
-        self.mpc_contributor_count()
+        self.db
+            .mpc_contribution_count_authoritative()
+            .unwrap_or_else(|_| self.mpc_contributor_count())
     }
 
     /// Handle an incoming MPC contribution
@@ -805,26 +811,44 @@ mod tests {
 
     #[test]
     fn test_bft_threshold_4_contributors() {
-        // 4 contributors: ceil(4 * 75 / 100) = ceil(300/100) = 3
+        // 4 contributors: ceil(4 * 67 / 100) = ceil(268/100) = 3
         assert_eq!(bft_threshold(4), 3);
     }
 
     #[test]
     fn test_bft_threshold_10_contributors() {
-        // 10 contributors: ceil(10 * 75 / 100) = ceil(750/100) = 8
-        assert_eq!(bft_threshold(10), 8);
+        // 10 contributors: ceil(10 * 67 / 100) = ceil(670/100) = 7
+        assert_eq!(bft_threshold(10), 7);
     }
 
     #[test]
     fn test_bft_threshold_100_contributors() {
-        // 100 contributors: ceil(100 * 75 / 100) = ceil(7500/100) = 75
-        assert_eq!(bft_threshold(100), 75);
+        // 100 contributors: ceil(100 * 67 / 100) = ceil(6700/100) = 67
+        assert_eq!(bft_threshold(100), 67);
     }
 
     #[test]
     fn test_bft_threshold_101_max() {
-        // 101 contributors (max): ceil(101 * 75 / 100) = ceil(7575/100) = 76
-        assert_eq!(bft_threshold(101), 76);
+        // 101 contributors (max): ceil(101 * 67 / 100) = ceil(6767/100) = 68
+        assert_eq!(bft_threshold(101), 68);
+    }
+
+    /// Stage A task 1: the handler's quorum constant is the single shared
+    /// `ghost-common` value (== the `ghost-mpc` re-export), == documented 67%.
+    #[test]
+    fn test_bft_threshold_uses_shared_constant() {
+        assert_eq!(MPC_BFT_THRESHOLD_PERCENT, 67);
+        assert_eq!(MPC_BFT_BOOTSTRAP_COUNT, 4);
+        assert_eq!(
+            MPC_BFT_THRESHOLD_PERCENT,
+            ghost_common::constants::MPC_BFT_THRESHOLD_PERCENT
+        );
+        // The handler and the ghost-mpc library re-export must be identical.
+        assert_eq!(
+            MPC_BFT_THRESHOLD_PERCENT,
+            ghost_mpc::MPC_BFT_THRESHOLD_PERCENT
+        );
+        assert_eq!(MPC_BFT_BOOTSTRAP_COUNT, ghost_mpc::MPC_BFT_BOOTSTRAP_COUNT);
     }
 
     // --- Rate limiter tests ---

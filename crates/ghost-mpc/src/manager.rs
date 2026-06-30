@@ -873,6 +873,11 @@ impl CeremonyManager {
 
         state.current_params_hash = params_hash;
         state.updated_at = now;
+        // 4.22 SECURITY: the ceremony_id is the stable, genesis-derived constant
+        // that all Schnorr proofs bind to. It equals the genesis parameters hash,
+        // which is exactly what position-1's `prev_params_hash` will be — so it
+        // stays identical fleet-wide for the life of the ceremony.
+        state.ceremony_id = params_hash;
 
         info!(
             params_hash = %hex::encode(params_hash),
@@ -941,6 +946,10 @@ impl CeremonyManager {
 
         state.current_params_hash = params_hash;
         state.updated_at = now;
+        // 4.22 SECURITY: stable genesis-derived ceremony_id (= genesis params
+        // hash = position-1 prev_params_hash). Identical fleet-wide; Schnorr
+        // proofs bind to it. See `initialize_genesis` for the rationale.
+        state.ceremony_id = params_hash;
 
         info!(
             params_hash = %hex::encode(params_hash),

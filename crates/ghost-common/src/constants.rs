@@ -141,6 +141,26 @@ pub const ELDER_OFFLINE_THRESHOLD_DAYS: u64 = 7;
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const BFT_THRESHOLD_PERCENT: u64 = 67;
 
+/// BFT threshold percentage for MPC ceremony contribution approval (67%).
+///
+/// SINGLE SOURCE OF TRUTH shared by `ghost-mpc` and `ghost-consensus` so the
+/// quorum required to apply a new MPC contribution is computed identically on
+/// every node. A mismatch here is a consensus split: one node would apply a
+/// contribution (advancing the trusted-setup lineage) while another rejects it.
+/// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
+pub const MPC_BFT_THRESHOLD_PERCENT: u32 = 67;
+
+/// Minimum number of MPC contributors before BFT supermajority voting applies.
+///
+/// During bootstrap (fewer than this many contributors) the genesis node may
+/// approve alone (threshold = 1). At or above this count the threshold becomes
+/// a `MPC_BFT_THRESHOLD_PERCENT` supermajority: `ceil(count * percent / 100)`.
+/// Set to 4 because with only 3 contributors `ceil(3 * 67 / 100) = 3` would
+/// require unanimity — too fragile, since any single offline node would block
+/// all further contributions.
+/// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
+pub const MPC_BFT_BOOTSTRAP_COUNT: u32 = 4;
+
 /// Consensus voting timeout in milliseconds
 pub const CONSENSUS_TIMEOUT_MS: u64 = 5000;
 
