@@ -28,6 +28,29 @@ SEED_NODES='"83.136.251.162:8555", "85.9.198.212:8555", "213.163.207.46:8555", "
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
 ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
+# ─────────────────── assumeUTXO snapshot (--sync fast) ────────────────────────
+# A verified UTXO snapshot at block height 910000. With `--sync fast` the
+# installer downloads this and hands it to ghostd's `loadtxoutset` RPC, giving an
+# immediately-usable chainstate at the snapshot height while the node syncs
+# 910000→tip in the foreground and validates genesis→910000 in the background.
+#
+# TRUSTLESS: `loadtxoutset` recomputes the snapshot's UTXO-set hash and rejects
+# the file unless it matches the value pinned in ghostd's own chainparams
+# (m_assumeutxo_data height 910000 ==
+# 4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568). That pinned
+# hash — NOT the host, NOT the SHA-256 below — is the trust root. SNAPSHOT_SHA256
+# is only an integrity / anti-truncation guard on the ~9GB download so we never
+# feed a corrupt file to loadtxoutset.
+#
+# TODO(hosting): SNAPSHOT_URL is a raw IP for now. Replace it with a
+# `snapshot.bitcoinghost.org` DNS record or an object-storage URL once
+# provisioned (the file + its `.sha256` should move with it). Both values are
+# overridable from the environment for staging/testing.
+SNAPSHOT_URL="${SNAPSHOT_URL:-http://94.237.48.104/ghost-utxo-910000.dat}"
+SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-6ac0208110d6d6c0783c50ea825aae32f5229cf1dcb63ac986543e95aa0306bf}"
+SNAPSHOT_PATH="${SNAPSHOT_PATH:-/home/ghost/.ghost/snapshot.dat}"
+SNAPSHOT_HEIGHT="910000"
+
 # ─────────────────────────────── defaults ────────────────────────────────────
 PAYOUT_ADDRESS=""
 NICKNAME="ghost-node"
@@ -81,10 +104,14 @@ Options:
                                 display name). Default: derived from --mining-mode.
   --sync <mode>               ibd | fast | haze               (default: ibd)
                                 ibd  — full trustless sync + prune (recommended)
-                                fast — EXPERIMENTAL: a real assumeutxo snapshot is
-                                       not yet distributed, so this currently
-                                       behaves exactly like ibd (no snapshot is
-                                       loaded). Use ibd.
+                                fast — assumeutxo: downloads a verified UTXO
+                                       snapshot at height 910000 (~9GB) and loads
+                                       it, so the node is usable in minutes; it
+                                       then syncs 910000→tip in the foreground and
+                                       validates genesis→910000 in the background.
+                                       STILL TRUSTLESS — ghostd verifies the
+                                       snapshot's UTXO-set hash against its pinned
+                                       chainparams and rejects any mismatch.
                                 haze — strips block data, ~195GB, FAST but
                                        IRREVERSIBLE. You can never serve raw
                                        blocks or go archive without a full resync.
@@ -239,16 +266,18 @@ run_wizard() {
   echo
   echo "Block download / sync method:"
   echo "  1) ibd   full trustless sync — validates every block (hours up to ~a day). RECOMMENDED."
-  echo "  2) haze  IRREVERSIBLE — strips block data (~195GB, fast). Can never serve raw blocks or"
+  echo "  2) fast  assumeutxo — load a verified UTXO snapshot at height 910000 (~9GB download),"
+  echo "           usable in minutes, then sync 910000→tip + validate genesis→910000 in the"
+  echo "           background. Still trustless (the snapshot hash is checked against chainparams)."
+  echo "  3) haze  IRREVERSIBLE — strips block data (~195GB, fast). Can never serve raw blocks or"
   echo "           become an archive node afterwards without a full resync."
-  echo "  (A 'fast' assumeutxo snapshot is planned but not yet distributed, so it is not offered"
-  echo "   here — it would currently behave just like ibd.)"
   local sync_choice
-  read -rp "Choose 1 or 2 [1]: " sync_choice || true
+  read -rp "Choose 1, 2 or 3 [1]: " sync_choice || true
   sync_choice="${sync_choice:-1}"
   case "$sync_choice" in
-    1|ibd) SYNC_MODE="ibd";;
-    2|haze)
+    1|ibd)  SYNC_MODE="ibd";;
+    2|fast) SYNC_MODE="fast";;
+    3|haze)
       SYNC_MODE="haze"
       echo
       echo -e "\033[33mWARNING\033[0m: haze strips block data IRREVERSIBLY."
@@ -1471,10 +1500,96 @@ else
   log "auto-update disabled (default) — node will not self-upgrade"
 fi
 
+# ─────────────────── assumeUTXO snapshot load (--sync fast) ──────────────────
+# Runs ONLY for SYNC_MODE=fast, AFTER ghostd is started (loadtxoutset needs a
+# live RPC) and BEFORE the sync gate is enabled. Flow: resumable download →
+# SHA-256 integrity check → wait for ghostd RPC → loadtxoutset → cleanup. Any
+# failure aborts the install loudly; we never start the pool against a node we
+# silently failed to seed. See the SNAPSHOT_* constants at the top of this file
+# for the trust model (loadtxoutset verifies against pinned chainparams; the
+# SHA-256 is only an anti-truncation guard).
+load_assumeutxo_snapshot() {
+  local conf="/etc/bitcoin/bitcoin.conf"
+  local user pass port
+  # Reuse the exact RPC credentials the installer just wrote to bitcoin.conf
+  # (rpcuser=ghostrpc_mainnet, rpcpassword=$RPCPW) by reading them back, so this
+  # stays correct even if those lines ever change shape.
+  user="$(grep -m1 '^rpcuser=' "$conf" | cut -d= -f2-)"
+  pass="$(grep -m1 '^rpcpassword=' "$conf" | cut -d= -f2-)"
+  port="$(grep -m1 '^rpcport=' "$conf" | cut -d= -f2-)"; port="${port:-8332}"
+  [[ -n "$user" && -n "$pass" ]] || err "fast sync: could not read ghostd RPC credentials from ${conf}."
+
+  # 1. Resumable download. The host advertises `Accept-Ranges: bytes`, so `-C -`
+  #    continues a partial file after an interruption instead of restarting the
+  #    ~9GB transfer. The default progress meter (no -s) shows progress/ETA.
+  log "fast sync: downloading UTXO snapshot (height ${SNAPSHOT_HEIGHT}, ~9GB) from ${SNAPSHOT_URL}"
+  mkdir -p "$(dirname "$SNAPSHOT_PATH")"
+  if ! curl -fL -C - --retry 5 --retry-delay 10 --retry-connrefused \
+        -o "$SNAPSHOT_PATH" "$SNAPSHOT_URL"; then
+    err "fast sync: snapshot download failed from ${SNAPSHOT_URL}."
+  fi
+
+  # 2. Integrity gate — verify the file SHA-256 BEFORE handing it to ghostd. On
+  #    mismatch, delete the bad file and abort (never loadtxoutset a corrupt or
+  #    truncated snapshot). This is integrity only; trust comes from chainparams.
+  log "fast sync: verifying snapshot SHA-256 (integrity guard)"
+  if ! echo "${SNAPSHOT_SHA256}  ${SNAPSHOT_PATH}" | sha256sum -c - >/dev/null 2>&1; then
+    rm -f "$SNAPSHOT_PATH"
+    err "fast sync: snapshot SHA-256 mismatch (expected ${SNAPSHOT_SHA256}) — corrupt download deleted, aborting."
+  fi
+  log "fast sync: snapshot SHA-256 OK"
+  # ghostd runs as the `ghost` user and must be able to read the file it loads.
+  chown ghost:ghost "$SNAPSHOT_PATH"
+
+  # 3. Wait for ghostd RPC to be ready (it was just started). Poll
+  #    getblockchaininfo until it answers — up to ~5min.
+  log "fast sync: waiting for ghostd RPC to come up..."
+  local up="false" resp _i
+  for _i in $(seq 1 60); do
+    resp="$(curl -s --max-time 8 --user "${user}:${pass}" \
+      --data '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
+      "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+    if echo "$resp" | grep -q '"blocks"'; then up="true"; break; fi
+    sleep 5
+  done
+  [[ "$up" == "true" ]] || err "fast sync: ghostd RPC did not come up — aborting (snapshot left at ${SNAPSHOT_PATH})."
+
+  # 4. loadtxoutset — long-running (loads the UTXO set + verifies it against
+  #    pinned chainparams). Give curl a long timeout. ghostd returns an object
+  #    with `coins_loaded`/`base_height` on success, or a JSON-RPC error (e.g.
+  #    txoutset hash mismatch vs chainparams) on failure. Abort loudly on any
+  #    error — never proceed as if the load succeeded.
+  log "fast sync: loading snapshot via loadtxoutset (verifies against chainparams; takes several minutes)..."
+  local payload load_resp
+  payload="$(printf '{"jsonrpc":"1.0","method":"loadtxoutset","params":["%s"]}' "$SNAPSHOT_PATH")"
+  load_resp="$(curl -s --max-time 3600 --user "${user}:${pass}" \
+    --data "$payload" "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+  if echo "$load_resp" | grep -q '"coins_loaded"'; then
+    log "fast sync: loadtxoutset OK — node live at height ${SNAPSHOT_HEIGHT}, now background-syncing to tip"
+  else
+    err "fast sync: loadtxoutset FAILED — ghostd response: ${load_resp:-<none>}. Snapshot left at ${SNAPSHOT_PATH} for inspection."
+  fi
+
+  # 5. Clean up the 9GB download — loadtxoutset has copied the UTXO set into the
+  #    chainstate, so the .dat is no longer needed. ONLY after confirmed success.
+  rm -f "$SNAPSHOT_PATH"
+  log "fast sync: removed snapshot file ${SNAPSHOT_PATH} (UTXO set now in chainstate)"
+}
+
 # ─────────────────────────────── 11. start ───────────────────────────────────
 log "Starting services"
 systemctl daemon-reload
 systemctl enable --now ghostd >/dev/null 2>&1
+# --sync fast: seed the chainstate from the assumeUTXO snapshot now that ghostd's
+# RPC is (coming) up, before the gate is enabled. The sync gate below is UNCHANGED
+# and already correct for assumeUTXO: getblockchaininfo's initialblockdownload
+# reflects the ACTIVE (snapshot) chainstate, whose tip is ~10 months old right
+# after the load, so it stays `true` until the 910000→tip sync nears completion —
+# i.e. the gate starts ghost-pool when the node is genuinely near-tip and usable,
+# not at the instant of load. (ibd/haze paths skip this entirely.)
+if [[ "$SYNC_MODE" == "fast" ]]; then
+  load_assumeutxo_snapshot
+fi
 # ghost-pool is NOT started here — the gate starts it once ghostd is synced.
 # ghost-pool.service is installed but left disabled; the (enabled) gate owns it.
 systemctl enable --now ghost-pool-gate >/dev/null 2>&1
