@@ -602,6 +602,114 @@ fn realcrypto_lifecycle() {
 }
 
 // ============================================================================
+// (A2) BUG-1 INVARIANT — candidate generation must not move current.bin
+// ============================================================================
+
+/// Bug-1 regression (the node5 crash-loop): GENERATING a contribution must NOT
+/// advance the node's active params. Only `apply_contribution_multi` (after BFT
+/// approval) may move `current.bin` / `current_params_hash`.
+///
+/// Walks the real machinery the mainnet binary uses:
+///   1. genesis → active head = anchor (on disk AND in the manager).
+///   2. `generate_contribution_at_position` → candidate params + contribution;
+///      the manager's `current_params_hash` is UNCHANGED (anchor) and the
+///      on-disk `note_spend_params_current.bin` STILL hashes to anchor.
+///   3. the candidate is written to its SEPARATE serving file (the exact
+///      `ghost_common::mpc::candidate_note_spend_filename` the contributor uses)
+///      and is retrievable + hashes to the contribution's `new_params_hash` —
+///      WITHOUT having disturbed current.bin.
+///   4. only after `apply_contribution_multi` do the manager head AND the
+///      on-disk current.bin become the candidate (`new_params_hash`).
+#[test]
+fn generate_does_not_advance_current_only_apply_does() {
+    use ghost_mpc::params::load_parameters;
+
+    let (note, consolidate, unshield) = generate_genesis_params();
+    let node = Node::genesis(&note, &consolidate, &unshield);
+
+    let params_dir = node.manager.params_dir().clone();
+    let current_bin = params_dir.join("note_spend_params_current.bin");
+    assert!(current_bin.exists(), "genesis must install current.bin");
+
+    // The applied head before any contribution.
+    let anchor = node.manager.current_params_hash();
+    let ondisk_anchor =
+        hash_parameters(&load_parameters(&current_bin).expect("load genesis current")).unwrap();
+    assert_eq!(
+        ondisk_anchor, anchor,
+        "on-disk current.bin must hash to the manager's head at genesis"
+    );
+
+    // (2) Generate position-1 candidate. This must NOT touch active state.
+    let contributor = NodeIdentity::generate();
+    let (new_params, contribution) = node
+        .manager
+        .generate_contribution_at_position(&hex::encode(contributor.node_id()), 1)
+        .expect("generate candidate");
+    assert_ne!(
+        contribution.new_params_hash, anchor,
+        "a real phase-2 transform must change the lineage hash"
+    );
+    assert_eq!(
+        node.manager.current_params_hash(),
+        anchor,
+        "GENERATION must not advance the manager head"
+    );
+    assert_eq!(
+        hash_parameters(&load_parameters(&current_bin).expect("reload current")).unwrap(),
+        anchor,
+        "GENERATION must not rewrite the on-disk current.bin"
+    );
+
+    // (3) Write the candidate to its hash-keyed serving file (what the
+    // contributor does) and confirm it is retrievable + correct, and STILL has
+    // not disturbed current.bin.
+    let mut buf = Vec::new();
+    new_params.write(&mut buf).expect("serialize candidate");
+    let candidate_path = params_dir.join(ghost_common::mpc::candidate_note_spend_filename(
+        &contribution.new_params_hash,
+    ));
+    std::fs::write(&candidate_path, &buf).expect("write candidate");
+    assert_ne!(
+        candidate_path, current_bin,
+        "candidate file must be separate"
+    );
+
+    let served = load_parameters(&candidate_path).expect("load served candidate");
+    assert_eq!(
+        hash_parameters(&served).unwrap(),
+        contribution.new_params_hash,
+        "candidate served by hash must be the un-applied params the voter verifies"
+    );
+    assert_eq!(
+        node.manager.current_params_hash(),
+        anchor,
+        "writing the candidate serving file must not move the manager head"
+    );
+    assert_eq!(
+        hash_parameters(&load_parameters(&current_bin).unwrap()).unwrap(),
+        anchor,
+        "writing the candidate serving file must not rewrite current.bin"
+    );
+
+    // (4) Apply through the manager (the ONLY legitimate writer of current.bin).
+    node.manager
+        .apply_contribution_multi(new_params, None, None, &contribution)
+        .expect("apply contribution");
+    assert_eq!(
+        node.manager.current_params_hash(),
+        contribution.new_params_hash,
+        "apply must advance the manager head to the candidate"
+    );
+    assert_eq!(
+        hash_parameters(&load_parameters(&current_bin).expect("reload current after apply"))
+            .unwrap(),
+        contribution.new_params_hash,
+        "apply must repoint on-disk current.bin to the candidate"
+    );
+}
+
+// ============================================================================
 // (B) ≥67% SUPERMAJORITY retained quorum — pure verifier + DB
 // ============================================================================
 

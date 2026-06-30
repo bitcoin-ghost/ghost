@@ -687,6 +687,50 @@ fn sha256_file(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Persist a freshly generated note-spend CANDIDATE (un-applied) parameter set
+/// for serving to voters, keyed by its lineage `new_params_hash`.
+///
+/// SECURITY (Bug-1 fix): the candidate is written to a SEPARATE serving file
+/// (`note_spend_params_candidate_<hash>.bin`) and NEVER to the active
+/// `note_spend_params_current.bin`. The node's `current.bin` must remain the
+/// last BFT-APPLIED params until a contribution is actually applied through
+/// `CeremonyManager::apply_contribution_multi` (the sole legitimate writer of
+/// `current.bin`). Writing the un-applied candidate over `current.bin` is what
+/// crash-looped node5: on restart the genesis-anchored cross-check saw on-disk
+/// candidate ≠ chain head and failed closed.
+///
+/// Stale candidates from superseded positions are purged best-effort so the
+/// serving directory does not accumulate multi-hundred-megabyte blobs. Returns
+/// the candidate file path on success.
+#[cfg(feature = "mpc-ceremony")]
+fn write_candidate_note_spend_params(
+    params_dir: &std::path::Path,
+    new_params_hash: &[u8; 32],
+    serialized: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(params_dir)?;
+
+    // Drop candidate files for other (superseded) positions. Keep only the one
+    // we are about to (re)write so a long retry loop never bloats the dir.
+    let keep = ghost_common::mpc::candidate_note_spend_filename(new_params_hash);
+    if let Ok(entries) = std::fs::read_dir(params_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(ghost_common::mpc::CANDIDATE_NOTE_SPEND_PREFIX)
+                && name.ends_with(".bin")
+                && name != keep
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let candidate_path = params_dir.join(&keep);
+    std::fs::write(&candidate_path, serialized)?;
+    Ok(candidate_path)
+}
+
 /// True iff `note_spend_params_current.bin` exists in `params_dir` and — when a
 /// hash is pinned — its SHA-256 matches.
 ///
@@ -985,7 +1029,22 @@ async fn fetch_and_parse_params(
     endpoint: &str,
     expected_hash: Option<[u8; 32]>,
 ) -> Option<ghost_mpc::Groth16Params> {
-    let url = format!("http://{}:8080/api/v1/mpc/{}", host, endpoint);
+    // When we are after a specific (candidate) lineage hash, ask the peer to
+    // serve THAT candidate by hash. The contributor stores its un-applied
+    // candidate in a separate serving file keyed by `new_hash` (its active
+    // current.bin stays at the applied head), so a bare GET would return the
+    // applied params and the hash filter below would reject every peer. With
+    // `?new_hash=` the contributor serves the candidate; peers without it fall
+    // back to their current.bin (which won't match, so we skip them).
+    let url = match expected_hash {
+        Some(h) => format!(
+            "http://{}:8080/api/v1/mpc/{}?new_hash={}",
+            host,
+            endpoint,
+            hex::encode(h)
+        ),
+        None => format!("http://{}:8080/api/v1/mpc/{}", host, endpoint),
+    };
     let resp = reqwest::Client::new()
         .get(&url)
         .timeout(std::time::Duration::from_secs(60))
@@ -3673,23 +3732,41 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             } else {
-                                // Non-genesis: save params to disk for serving via API.
-                                // We can't use apply_contribution here because it modifies
-                                // internal state (contribution_count) which breaks retries
-                                // if BFT rejects. Instead, write the binary directly.
+                                // Non-genesis: save the generated CANDIDATE to a
+                                // SEPARATE serving file keyed by its lineage hash —
+                                // NEVER the active note_spend_params_current.bin.
+                                //
+                                // We can't use apply_contribution here because it
+                                // modifies internal state (contribution_count) which
+                                // breaks retries if BFT rejects. And we must NOT
+                                // overwrite current.bin (the last BFT-APPLIED head):
+                                // doing so left node5 serving an un-applied candidate
+                                // as its "current" params and crash-looped it on
+                                // restart (on-disk candidate != chain head). Voters
+                                // fetch this candidate by hash via
+                                // GET /api/v1/mpc/params?new_hash=<hash>; our own
+                                // current.bin only advances when (and if) the apply
+                                // path runs after BFT approval.
                                 let params_dir = ceremony_manager_for_startup.params_dir().clone();
-                                let _ = std::fs::create_dir_all(&params_dir);
-                                let current_path = params_dir.join("note_spend_params_current.bin");
                                 let mut buf = Vec::new();
                                 if new_params.write(&mut buf).is_ok() {
-                                    if let Err(e) = std::fs::write(&current_path, &buf) {
-                                        warn!(error = %e, "MPC: Failed to save params to disk");
-                                    } else {
-                                        info!(
-                                            position = position,
-                                            size = buf.len(),
-                                            "MPC: Saved generated params to disk for serving"
-                                        );
+                                    match write_candidate_note_spend_params(
+                                        &params_dir,
+                                        &contribution.new_params_hash,
+                                        &buf,
+                                    ) {
+                                        Ok(candidate_path) => {
+                                            info!(
+                                                position = position,
+                                                size = buf.len(),
+                                                new_hash = %hex::encode(&contribution.new_params_hash[..8]),
+                                                path = %candidate_path.display(),
+                                                "MPC: Saved generated CANDIDATE params for serving (active current.bin unchanged)"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "MPC: Failed to save candidate params to disk");
+                                        }
                                     }
                                 }
                             }
@@ -7106,6 +7183,47 @@ mod tests {
         assert!(current.exists());
         assert!(v0.exists());
         assert_eq!(sha256_file(&current).unwrap(), pinned);
+    }
+
+    /// Bug-1 regression: generating a candidate must write a SEPARATE serving
+    /// file keyed by its lineage hash and must NEVER touch the active
+    /// `note_spend_params_current.bin`. Writing the un-applied candidate over
+    /// current.bin crash-looped node5 (on-disk candidate != BFT chain head).
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn write_candidate_does_not_touch_current() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-existing applied head — must remain byte-for-byte untouched.
+        let current = dir.path().join("note_spend_params_current.bin");
+        let applied = vec![0x11u8; 4096];
+        std::fs::write(&current, &applied).unwrap();
+
+        let new_hash = [0xCDu8; 32];
+        let candidate_blob = vec![0x22u8; 2048];
+        let path =
+            write_candidate_note_spend_params(dir.path(), &new_hash, &candidate_blob).unwrap();
+
+        // The candidate lives in its own hash-keyed file, distinct from current.
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            ghost_common::mpc::candidate_note_spend_filename(&new_hash)
+        );
+        assert_ne!(path, current);
+        assert_eq!(std::fs::read(&path).unwrap(), candidate_blob);
+        // The active current.bin is unchanged — only the apply path may move it.
+        assert_eq!(std::fs::read(&current).unwrap(), applied);
+
+        // Writing a candidate for a NEW position purges the stale one but keeps
+        // current.bin intact (serving dir never accumulates blobs).
+        let new_hash2 = [0xEFu8; 32];
+        let path2 =
+            write_candidate_note_spend_params(dir.path(), &new_hash2, &vec![0x33u8; 1024]).unwrap();
+        assert!(path2.exists());
+        assert!(
+            !path.exists(),
+            "stale candidate from old position must be purged"
+        );
+        assert_eq!(std::fs::read(&current).unwrap(), applied);
     }
 
     /// SECURITY: if the on-disk file does not match the pinned hash after the
