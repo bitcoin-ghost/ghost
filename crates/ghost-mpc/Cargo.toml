@@ -9,6 +9,12 @@ license = "MIT"
 default = []
 # Enable for testing without full MPC operations
 test-utils = []
+# TEST-ONLY: shrink MAX_CEREMONY_CONTRIBUTORS so the Stage D regtest lifecycle
+# harness can walk genesis -> contributions -> ossification in seconds. NOT a
+# default feature; never enabled by any shipping crate (ghost-pool / ghost-
+# consensus). The mainnet binary keeps the 101 cap. See crates/ghost-mpc/src/
+# lib.rs MAX_CEREMONY_CONTRIBUTORS and tests/mpc_lifecycle.rs.
+mpc-test-cap = []
 
 [dependencies]
 # ZK proving system (Groth16 via bellperson)
@@ -63,3 +69,6 @@ zeroize = { version = "1.7", features = ["derive"] }
 [dev-dependencies]
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"
+# Stage D lifecycle harness: model the GET /api/v1/mpc/votes/{position} response
+# shape for the autonomous catch-up rehearsal.
+serde_json = "1.0"

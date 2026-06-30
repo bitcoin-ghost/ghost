@@ -1129,14 +1129,16 @@ impl MpcContributionMessage {
     }
 
     /// Get a hash of this contribution for voting reference
+    ///
+    /// Delegates to the single shared definition in `ghost_common::mpc` so the
+    /// live voter and the genesis-anchored startup verifier (which re-derives
+    /// this from retained DB rows) compute byte-identical hashes.
     pub fn contribution_hash(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"MpcContributionHash/v1");
-        hasher.update(self.candidate);
-        hasher.update(self.elder_position.to_le_bytes());
-        hasher.update(self.new_params_hash);
-        hasher.finalize().into()
+        ghost_common::mpc::contribution_hash(
+            &self.candidate,
+            self.elder_position,
+            &self.new_params_hash,
+        )
     }
 
     /// Verify the candidate's signature
@@ -1182,13 +1184,11 @@ pub struct MpcVerificationVoteMessage {
 
 impl MpcVerificationVoteMessage {
     /// Get the message to be signed
+    ///
+    /// Delegates to `ghost_common::mpc` so a retained vote signature verifies
+    /// identically whether checked live here or re-derived at startup.
     pub fn signing_message(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"MpcVerificationVote/v1");
-        hasher.update(self.contribution_hash);
-        hasher.update([self.approve as u8]);
-        hasher.finalize().into()
+        ghost_common::mpc::vote_signing_message(&self.contribution_hash, self.approve)
     }
 
     /// Verify the voter's signature

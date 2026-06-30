@@ -971,6 +971,193 @@ async fn try_fetch_params_from_seed(
     true
 }
 
+/// Fetch + parse one circuit's parameters from a peer entirely IN MEMORY.
+///
+/// Used by the BFT voter / params-adoption path to obtain a candidate parameter
+/// set for cryptographic verification without touching the on-disk parameter
+/// files (only the post-approval apply persists parameters). When
+/// `expected_hash` is set, the parsed parameters' `hash_parameters()` (the
+/// structured LINEAGE hash) must match or `None` is returned. The heavy
+/// parse/hash runs on a blocking thread so the async runtime is never stalled.
+#[cfg(feature = "mpc-ceremony")]
+async fn fetch_and_parse_params(
+    host: &str,
+    endpoint: &str,
+    expected_hash: Option<[u8; 32]>,
+) -> Option<ghost_mpc::Groth16Params> {
+    let url = format!("http://{}:8080/api/v1/mpc/{}", host, endpoint);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data = resp.bytes().await.ok()?;
+    if data.len() <= 1000 {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || {
+        let params = ghost_mpc::params::read_parameters_from_bytes(&data).ok()?;
+        if let Some(expected) = expected_hash {
+            let h = ghost_mpc::contribution::hash_parameters(&params).ok()?;
+            if h != expected {
+                tracing::debug!(
+                    expected = %hex::encode(&expected[..8]),
+                    got = %hex::encode(&h[..8]),
+                    "MPC fetch: parsed params hash != expected lineage hash"
+                );
+                return None;
+            }
+        }
+        Some(params)
+    })
+    .await
+    .ok()?
+}
+
+/// Fetch a full candidate parameter bundle (note-spend + payout + unshield) from
+/// the network for one contribution.
+///
+/// The primary note-spend parameters MUST hash-match `expected_note_spend_hash`
+/// (the contribution's claimed lineage head) — only then is a bundle returned.
+/// `payout`/`unshield` ride along best-effort (they share the same toxic waste).
+/// Returns `None` if no seed can supply matching note-spend parameters, which
+/// forces the voter to ABSTAIN rather than approve blind.
+#[cfg(feature = "mpc-ceremony")]
+async fn fetch_ceremony_params_bundle(
+    seeds: &[String],
+    expected_note_spend_hash: [u8; 32],
+) -> Option<ghost_consensus::mpc_handler::FetchedCeremonyParams> {
+    for seed in seeds {
+        let host = seed.split(':').next().unwrap_or(seed);
+        let note_spend =
+            match fetch_and_parse_params(host, "params", Some(expected_note_spend_hash)).await {
+                Some(p) => p,
+                None => continue,
+            };
+        let payout = fetch_and_parse_params(host, "payout-params", None).await;
+        let unshield = fetch_and_parse_params(host, "unshield-params", None).await;
+        return Some(ghost_consensus::mpc_handler::FetchedCeremonyParams {
+            note_spend: std::sync::Arc::new(note_spend),
+            payout: payout.map(std::sync::Arc::new),
+            unshield: unshield.map(std::sync::Arc::new),
+        });
+    }
+    None
+}
+
+/// Stage C task 3: fetch a single position's FULL contribution (with the real
+/// `contribution_proof`) AND its retained approve/reject votes from a peer's
+/// `/api/v1/mpc/votes/{position}` endpoint, and persist BOTH locally.
+///
+/// This is what makes catch-up autonomous: the old `/contributors` sync saved
+/// rows with an EMPTY proof and NO votes, so a fresh node could neither re-run
+/// `verify_contribution` nor check the retained BFT quorum. After this call the
+/// local DB holds the real proof (filled via the safe proof-fill upsert in
+/// `save_mpc_contribution`) and every retained vote, so the genesis-anchored
+/// startup verification has the data it needs. Returns `true` if at least the
+/// proof or some votes were persisted from some seed.
+#[cfg(feature = "mpc-ceremony")]
+async fn sync_mpc_proof_and_votes(
+    seeds: &[String],
+    position: u32,
+    db: &ghost_storage::Database,
+) -> bool {
+    for seed in seeds {
+        let host = seed.split(':').next().unwrap_or(seed);
+        let url = format!("http://{}:8080/api/v1/mpc/votes/{}", host, position);
+        let resp = match reqwest::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let data: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let mut persisted = false;
+
+        // 1. Persist the real proof (proof-fill upsert preserves an applied row).
+        if let Some(c) = data.get("contribution") {
+            let proof_hex = c
+                .get("contribution_proof")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let node_id = c.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+            let prev = c
+                .get("prev_params_hash")
+                .and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+            let new = c
+                .get("new_params_hash")
+                .and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+            let created_at = c.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+            let epoch = c.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            if let (false, Ok(proof_bytes), Some(prev), Some(new)) = (
+                proof_hex.is_empty() || node_id.is_empty(),
+                hex::decode(proof_hex),
+                prev,
+                new,
+            ) {
+                let record = ghost_storage::queries::MpcContributionRecord {
+                    elder_position: position,
+                    contributor_node_id: node_id.to_string(),
+                    prev_params_hash: prev,
+                    new_params_hash: new,
+                    contribution_proof: proof_bytes,
+                    epoch,
+                    created_at,
+                };
+                if db.save_mpc_contribution(&record).is_ok() {
+                    persisted = true;
+                }
+            }
+        }
+
+        // 2. Persist every retained vote (save_mpc_vote upserts by (pos, voter)).
+        if let Some(votes) = data.get("votes").and_then(|v| v.as_array()) {
+            for v in votes {
+                let voter = v.get("voter_node_id").and_then(|x| x.as_str());
+                let approve = v.get("approve").and_then(|x| x.as_bool());
+                let sig = v
+                    .get("signature")
+                    .and_then(|x| x.as_str())
+                    .and_then(|h| hex::decode(h).ok());
+                let voted_at = v.get("voted_at").and_then(|x| x.as_u64()).unwrap_or(0);
+                if let (Some(voter), Some(approve), Some(sig)) = (voter, approve, sig) {
+                    let vote = ghost_storage::queries::MpcVerificationVote {
+                        contribution_position: position,
+                        voter_node_id: voter.to_string(),
+                        approve,
+                        signature: sig,
+                        voted_at,
+                    };
+                    if db.save_mpc_vote(&vote).is_ok() {
+                        persisted = true;
+                    }
+                }
+            }
+        }
+
+        if persisted {
+            return true;
+        }
+    }
+    false
+}
+
 /// Startup self-heal: ensure the trusted-setup parameters exist on disk before
 /// the hard `load_trusted_params` check, fetching them from seeds if missing.
 ///
@@ -2168,6 +2355,18 @@ async fn main() -> Result<()> {
     #[allow(unused_assignments, unused_mut)]
     let mut l2_tree_state_fn_opt: Option<ghost_verification::L2TreeStateFn> = None;
 
+    // Stage C: when the ZK startup mode is genesis-anchored ROLLING (the static
+    // current-params pin `ZK_PARAMS_HASH` is absent but `ZK_GENESIS_PARAMS_HASH`
+    // is set), this carries the immutable genesis lineage anchor from the
+    // zk-consensus gate down to the MPC block, which runs the genesis-anchored
+    // lineage + retained-quorum verification (fail-closed). `None` keeps the
+    // legacy static-pin / test behaviour exactly.
+    #[cfg_attr(
+        not(all(feature = "zk-consensus", feature = "mpc-ceremony")),
+        allow(unused_mut, unused_variables, unused_assignments)
+    )]
+    let mut zk_rolling_anchor: Option<[u8; 32]> = None;
+
     #[cfg(feature = "zk-consensus")]
     {
         use ghost_consensus::epoch_manager::{EpochManager, EpochManagerConfig};
@@ -2188,26 +2387,55 @@ async fn main() -> Result<()> {
         }
 
         if is_production {
-            // SELF-HEAL: a fresh production node may have the binary but no MPC
-            // ceremony output on disk yet. Fetch + verify the params from seeds
-            // BEFORE the hard `load_trusted_params` check, otherwise the process
-            // would exit here and the background MPC task that fetches params
-            // would never run — an unrecoverable crash-loop. The fetch path
-            // verifies every blob against the pinned ZK_PARAMS_HASH, so a
-            // malicious seed cannot inject forged trusted-setup parameters.
-            #[cfg(feature = "mpc-ceremony")]
-            if let Ok(zk_params_path) = std::env::var(ghost_zkp::ZK_PARAMS_PATH_ENV) {
-                let params_dir = std::path::PathBuf::from(&zk_params_path);
-                // ALWAYS run the self-heal: it validates present params against
-                // the pinned hash and quarantines + re-fetches a present-but-
-                // corrupt set (the node6 case), in addition to fetching a missing
-                // one. Gating this on `!current.exists()` would let a corrupt-but-
-                // present file slip straight into the hard `load_trusted_params`
-                // check below and crash-loop the node.
-                ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
+            // Stage C: choose the trusted-setup verification mode explicitly.
+            // StaticPin (`ZK_PARAMS_HASH` set) = the legacy frozen/pinned and
+            // post-ossification path, bit-identical to prior releases.
+            // GenesisAnchoredRolling (`ZK_PARAMS_HASH` absent, `ZK_GENESIS_PARAMS_HASH`
+            // set) = the unpinned rolling path: the static current-params file
+            // check is replaced by the genesis-anchored lineage + retained-quorum
+            // verification run in the MPC block below. Neither set on a production
+            // node → `select_startup_mode` errors and startup aborts (never
+            // unverified).
+            match ghost_zkp::select_startup_mode()? {
+                ghost_zkp::ZkStartupMode::StaticPin => {
+                    // SELF-HEAL: a fresh production node may have the binary but no
+                    // MPC ceremony output on disk yet. Fetch + verify the params
+                    // from seeds BEFORE the hard `load_trusted_params` check,
+                    // otherwise the process would exit here and the background MPC
+                    // task that fetches params would never run — an unrecoverable
+                    // crash-loop. The fetch path verifies every blob against the
+                    // pinned ZK_PARAMS_HASH, so a malicious seed cannot inject
+                    // forged trusted-setup parameters.
+                    #[cfg(feature = "mpc-ceremony")]
+                    if let Ok(zk_params_path) = std::env::var(ghost_zkp::ZK_PARAMS_PATH_ENV) {
+                        let params_dir = std::path::PathBuf::from(&zk_params_path);
+                        // ALWAYS run the self-heal: it validates present params
+                        // against the pinned hash and quarantines + re-fetches a
+                        // present-but-corrupt set (the node6 case), in addition to
+                        // fetching a missing one. Gating this on `!current.exists()`
+                        // would let a corrupt-but-present file slip straight into
+                        // the hard `load_trusted_params` check below and crash-loop
+                        // the node.
+                        ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
+                    }
+                    ghost_zkp::load_trusted_params()?;
+                    info!(
+                        "ZK consensus using PRODUCTION parameters from MPC ceremony (static pin)"
+                    );
+                }
+                ghost_zkp::ZkStartupMode::GenesisAnchoredRolling { genesis_anchor } => {
+                    // Rolling: do NOT run the static file-hash check (there is no
+                    // current pin to check against). The genesis-anchored lineage
+                    // + retained-quorum verification runs in the MPC block below
+                    // and is FATAL on failure. Hand it the immutable anchor.
+                    zk_rolling_anchor = Some(genesis_anchor);
+                    info!(
+                        anchor = %hex::encode(&genesis_anchor[..8]),
+                        "ZK consensus in ROLLING mode: trusted setup verified by genesis anchor + \
+                         lineage chain + retained BFT quorum (static current-params pin absent)"
+                    );
+                }
             }
-            ghost_zkp::load_trusted_params()?;
-            info!("ZK consensus using PRODUCTION parameters from MPC ceremony");
         } else {
             warn!("ZK consensus using TEST parameters - NOT SECURE FOR MAINNET");
         }
@@ -2580,8 +2808,29 @@ async fn main() -> Result<()> {
         use ghost_consensus::MpcHandler;
         use ghost_mpc::CeremonyManager;
 
-        // Load MPC ceremony state from database
+        // Load MPC ceremony state from database (the backfilled singleton)
         let mpc_state = db.get_mpc_ceremony_state()?;
+
+        // Stage A task 2: derive the STABLE ceremony_id.
+        //
+        // ceremony_id binds every Schnorr proof, so it must be identical on
+        // every node and unchanging for the life of the ceremony. The canonical
+        // source is position-1's `prev_params_hash` (the genesis lineage hash);
+        // the persisted `mpc_ceremony.ceremony_id` column is a backfilled cache
+        // of the same value. Prefer the canonical derivation, fall back to the
+        // cached column, then to zero (pre-genesis — genesis init then sets it).
+        //
+        // This deliberately REPLACES the old behaviour of using
+        // `current_params_hash`, which changed every time a contribution was
+        // applied and so could never be a stable ceremony binding.
+        let persisted_ceremony_id = mpc_state
+            .as_ref()
+            .map(|s| s.ceremony_id)
+            .filter(|cid| *cid != [0u8; 32]);
+        let stable_ceremony_id = db
+            .mpc_genesis_ceremony_id()?
+            .or(persisted_ceremony_id)
+            .unwrap_or([0u8; 32]);
 
         // Determine params directory (from config or default)
         let mpc_params_dir =
@@ -2603,8 +2852,8 @@ async fn main() -> Result<()> {
                 note_spend_vk_hash: s.block_vk_hash,
                 payout_vk_hash: s.payout_vk_hash,
                 updated_at: s.updated_at,
-                // Fields added in later versions - derive ceremony_id from params hash
-                ceremony_id: s.current_params_hash, // Use params hash as ceremony ID for continuity
+                // Stable genesis-derived ceremony_id (NOT current_params_hash).
+                ceremony_id: stable_ceremony_id,
                 pending_commitment_count: 0,
             }),
         ) {
@@ -2615,6 +2864,136 @@ async fn main() -> Result<()> {
                 Arc::new(CeremonyManager::new(mpc_params_dir))
             }
         };
+
+        // Stage A task 3: startup lineage cross-check (fail-closed).
+        //
+        // After loading the current parameters, recompute their LINEAGE hash
+        // (`hash_parameters` — structured VK + h + l vectors, NOT the raw-file
+        // pin hash) and require it to equal BOTH:
+        //   * the singleton's `current_params_hash`, and
+        //   * `mpc_contributions[MAX].new_params_hash`.
+        // A mismatch means the on-disk params are corrupt or out of step with
+        // the recorded lineage; this node must NOT enter the rolling /
+        // contribution path (it would poison the lineage). The result gates the
+        // auto-contribute task below. The existing frozen/pinned behaviour is
+        // untouched — pinned nodes still freeze via their own guard, and the
+        // raw-file `ZK_PARAMS_HASH` check (a DIFFERENT digest) still runs.
+        let mpc_lineage_ok: bool = {
+            let count = ceremony_manager.contribution_count();
+            if count == 0 {
+                // Pre-genesis / genesis-forming: nothing applied to cross-check.
+                true
+            } else {
+                match ceremony_manager.note_spend_params() {
+                    None => {
+                        error!(
+                            count,
+                            "MPC lineage cross-check FAILED: ceremony reports contributions but no \
+                             parameters are loaded — refusing to enter rolling (fail-closed)"
+                        );
+                        false
+                    }
+                    Some(params) => match ghost_mpc::contribution::hash_parameters(&params) {
+                        Err(e) => {
+                            error!(error = %e, "MPC lineage cross-check FAILED: could not hash loaded params — refusing rolling");
+                            false
+                        }
+                        Ok(file_lineage) => {
+                            // contributions[MAX].new_params_hash (lineage head)
+                            let contribution_head = db
+                                .get_mpc_contribution(count)
+                                .ok()
+                                .flatten()
+                                .map(|c| c.new_params_hash);
+                            // mpc_ceremony.current_params_hash (loaded into state)
+                            let singleton_head = ceremony_manager.current_params_hash();
+
+                            let ok = ghost_mpc::lineage_head_matches(
+                                &file_lineage,
+                                &singleton_head,
+                                contribution_head.as_ref(),
+                            );
+                            if ok {
+                                info!(
+                                    position = count,
+                                    "MPC lineage cross-check passed: on-disk params match recorded lineage head"
+                                );
+                            } else {
+                                error!(
+                                    position = count,
+                                    on_disk = %hex::encode(&file_lineage[..8]),
+                                    contribution_head = contribution_head
+                                        .map(|h| hex::encode(&h[..8]))
+                                        .unwrap_or_else(|| "<missing>".to_string()),
+                                    singleton_head = %hex::encode(&singleton_head[..8]),
+                                    "MPC lineage cross-check FAILED: on-disk params do not match the \
+                                     recorded lineage head — refusing rolling (fail-closed)"
+                                );
+                            }
+                            ok
+                        }
+                    },
+                }
+            }
+        };
+
+        // Stage C task 2 + 5: genesis-anchored startup verification (ROLLING mode).
+        //
+        // When the node is UNPINNED (no static `ZK_PARAMS_HASH`, an immutable
+        // `ZK_GENESIS_PARAMS_HASH` instead — `zk_rolling_anchor` is Some), the
+        // static current-params file check was deliberately skipped at the ZK
+        // gate. Here we validate the evolving setup the rolling way: genesis
+        // anchor → lineage chain 1..N → retained BFT quorum per position →
+        // on-disk head. This is FATAL on failure (same fail-closed posture the
+        // static pin had — a mismatch means lineage/quorum is broken, not merely
+        // "file != static hash"). On success we true-up the singleton (task 5) so
+        // a node that abstained on some position is reconciled to the verified
+        // head + chain length.
+        if let Some(genesis_anchor) = zk_rolling_anchor {
+            // Head lineage hash of the on-disk current params (None if not loaded).
+            let head_lineage: Option<[u8; 32]> = ceremony_manager
+                .note_spend_params()
+                .and_then(|p| ghost_mpc::contribution::hash_parameters(&p).ok());
+
+            let verified_count = db
+                .verify_mpc_genesis_anchored_lineage(&genesis_anchor, head_lineage.as_ref())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "MAINNET SECURITY (rolling): genesis-anchored trusted-setup verification \
+                         FAILED — refusing to start (fail-closed). {e}"
+                    )
+                })?;
+
+            info!(
+                count = verified_count,
+                anchor = %hex::encode(&genesis_anchor[..8]),
+                "MPC: genesis-anchored startup verification PASSED (anchor + lineage + retained \
+                 BFT quorum + on-disk head)"
+            );
+
+            // Task 5: reconcile the singleton to the verified head + length.
+            if let Some(head) = head_lineage {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match db.reconcile_mpc_singleton_to_head(
+                    verified_count,
+                    &head,
+                    &genesis_anchor,
+                    now,
+                ) {
+                    Ok(true) => info!(
+                        count = verified_count,
+                        "MPC: trued-up mpc_ceremony singleton to the verified rolling head"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(error = %e, "MPC: singleton true-up after verification failed")
+                    }
+                }
+            }
+        }
 
         // Create broadcast callback for MPC handler
         // Uses async Noise relay: sync closure queues messages, background task
@@ -2651,233 +3030,204 @@ async fn main() -> Result<()> {
         // we need to fetch the actual params binary from the contributor so our
         // local params stay current. Without this, /api/v1/mpc/params serves stale
         // genesis params and new contributors can't build valid hash chains.
-        let params_dir_for_callback = ceremony_manager.params_dir().clone();
         let ceremony_mgr_for_callback = Arc::clone(&ceremony_manager);
         let seed_nodes_for_callback = config.network.seed_nodes.clone();
+        let db_for_callback = Arc::clone(&db);
         type ParamsUpdateFn = dyn Fn(&[u8; 32], &[u8; 32]) + Send + Sync;
         let params_update_callback: Arc<ParamsUpdateFn> = Arc::new(
             move |expected_hash: &[u8; 32], _contributor: &[u8; 32]| {
-                let params_dir = params_dir_for_callback.clone();
                 let ceremony_mgr = Arc::clone(&ceremony_mgr_for_callback);
                 let seeds = seed_nodes_for_callback.clone();
+                let db = Arc::clone(&db_for_callback);
                 let expected = *expected_hash;
                 tokio::spawn(async move {
-                    // Small delay to let the contributing node finish writing
+                    // Small delay to let the contributing node finish writing.
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    // Serialise this callback's param writes against the
-                    // ceremony-task fetch path so the two writers can never
-                    // interleave on the same `note_spend_params_*.bin` files.
+
+                    // Fast path: we already hold these params (e.g. we voted and
+                    // applied through the manager directly). Nothing to adopt.
+                    if ceremony_mgr.current_params_hash() == expected {
+                        return;
+                    }
+
+                    // SECURITY (params_callback trust-gap upgrade): a node adopting
+                    // parameters it did not itself vote on must run the SAME
+                    // cryptographic gate as a voter — never adopt on a bare hash
+                    // match. Recover the full contribution (proof, prev, position)
+                    // from the BFT-approved row that apply_contribution persisted.
+                    let record = match db.get_mpc_contribution_by_new_hash(&expected) {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
+                            tracing::warn!(
+                                expected = %hex::encode(&expected[..8]),
+                                "MPC params_callback: no approved contribution row for hash — refusing to adopt"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MPC params_callback: contribution lookup failed");
+                            return;
+                        }
+                    };
+                    let proof: ghost_mpc::ContributionProof = match serde_json::from_slice(
+                        &record.contribution_proof,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MPC params_callback: malformed stored proof — refusing to adopt");
+                            return;
+                        }
+                    };
+                    let contribution = ghost_mpc::MpcContribution {
+                        position: record.elder_position,
+                        prev_params_hash: record.prev_params_hash,
+                        new_params_hash: record.new_params_hash,
+                        proof,
+                        contributor: record.contributor_node_id.clone(),
+                        timestamp: record.created_at,
+                        commitment_hash: None,
+                    };
+
+                    // Serialise param writes against the other writers (startup
+                    // fetch, BFT apply) on the shared parameter files.
                     let _param_write_guard = param_write_lock().lock().await;
-                    let _ = std::fs::create_dir_all(&params_dir);
-                    // Try each seed node, verify the fetched params hash matches
-                    for seed in &seeds {
-                        let host = seed.split(':').next().unwrap_or(seed);
-                        let url = format!("http://{}:8080/api/v1/mpc/params", host);
-                        match reqwest::Client::new()
-                            .get(&url)
-                            .timeout(std::time::Duration::from_secs(60))
-                            .send()
-                            .await
-                        {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.bytes().await {
-                                    Ok(data) if data.len() > 1000 => {
-                                        // Write to temp file, load, verify hash
-                                        let tmp_path = params_dir.join("note_spend_params_tmp.bin");
-                                        if let Err(e) = std::fs::write(&tmp_path, &data) {
-                                            tracing::warn!(error = %e, peer = %host,
-                                                "MPC params_callback: Failed to write temp params");
-                                            continue;
-                                        }
-                                        // Load and verify hash before committing
-                                        match ghost_mpc::params::load_parameters(&tmp_path) {
-                                            Ok(params) => {
-                                                match ghost_mpc::contribution::hash_parameters(
-                                                    &params,
-                                                ) {
-                                                    Ok(hash) if hash == expected => {
-                                                        // Hash matches! Move to current
-                                                        let current = params_dir
-                                                            .join("note_spend_params_current.bin");
-                                                        if let Err(e) =
-                                                            std::fs::rename(&tmp_path, &current)
-                                                        {
-                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to rename params");
-                                                            continue;
-                                                        }
-                                                        // Save updated VK alongside params
-                                                        let vk_path =
-                                                            params_dir.join("note_spend_vk.bin");
-                                                        if let Err(e) =
-                                                            ghost_mpc::params::save_verifying_key(
-                                                                &vk_path, &params.vk,
-                                                            )
-                                                        {
-                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to save VK");
-                                                        }
-                                                        if let Err(e) =
-                                                            ceremony_mgr.load_current_params()
-                                                        {
-                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to reload");
-                                                        } else {
-                                                            tracing::info!(
-                                                                size = data.len(),
-                                                                peer = %host,
-                                                                hash = %hex::encode(&hash[..8]),
-                                                                "MPC params_callback: Verified and updated note_spend params"
-                                                            );
-                                                        }
-                                                        // Also fetch latest payout params from same peer (with VK extraction)
-                                                        let payout_url = format!("http://{}:8080/api/v1/mpc/payout-params", host);
-                                                        if let Ok(payout_resp) =
-                                                            reqwest::Client::new()
-                                                                .get(&payout_url)
-                                                                .timeout(
-                                                                    std::time::Duration::from_secs(
-                                                                        60,
-                                                                    ),
-                                                                )
-                                                                .send()
-                                                                .await
-                                                        {
-                                                            if payout_resp.status().is_success() {
-                                                                if let Ok(payout_data) =
-                                                                    payout_resp.bytes().await
-                                                                {
-                                                                    if payout_data.len() > 1000 {
-                                                                        let payout_current = params_dir.join("payout_params_current.bin");
-                                                                        let payout_write =
-                                                                            std::fs::read_link(
-                                                                                &payout_current,
-                                                                            )
-                                                                            .unwrap_or(
-                                                                                payout_current
-                                                                                    .clone(),
-                                                                            );
-                                                                        if let Err(e) =
-                                                                            std::fs::write(
-                                                                                &payout_write,
-                                                                                &payout_data,
-                                                                            )
-                                                                        {
-                                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to save payout params");
-                                                                        } else {
-                                                                            // Extract and save payout VK
-                                                                            if let Ok(payout_params) = ghost_mpc::params::load_parameters(&payout_write) {
-                                                                                let payout_vk_path = params_dir.join("payout_vk.bin");
-                                                                                if let Err(e) = ghost_mpc::params::save_verifying_key(&payout_vk_path, &payout_params.vk) {
-                                                                                    tracing::warn!(error = %e, "MPC params_callback: Failed to save payout VK");
-                                                                                }
-                                                                            }
-                                                                            tracing::info!(
-                                                                                size = payout_data.len(),
-                                                                                peer = %host,
-                                                                                "MPC params_callback: Updated payout params"
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        // Also fetch latest unshield params from same peer (with VK extraction)
-                                                        let unshield_url = format!("http://{}:8080/api/v1/mpc/unshield-params", host);
-                                                        if let Ok(unshield_resp) =
-                                                            reqwest::Client::new()
-                                                                .get(&unshield_url)
-                                                                .timeout(
-                                                                    std::time::Duration::from_secs(
-                                                                        60,
-                                                                    ),
-                                                                )
-                                                                .send()
-                                                                .await
-                                                        {
-                                                            if unshield_resp.status().is_success() {
-                                                                if let Ok(unshield_data) =
-                                                                    unshield_resp.bytes().await
-                                                                {
-                                                                    if unshield_data.len() > 1000 {
-                                                                        let unshield_current = params_dir.join("unshield_params_current.bin");
-                                                                        let unshield_write =
-                                                                            std::fs::read_link(
-                                                                                &unshield_current,
-                                                                            )
-                                                                            .unwrap_or(
-                                                                                unshield_current
-                                                                                    .clone(),
-                                                                            );
-                                                                        if let Err(e) =
-                                                                            std::fs::write(
-                                                                                &unshield_write,
-                                                                                &unshield_data,
-                                                                            )
-                                                                        {
-                                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to save unshield params");
-                                                                        } else {
-                                                                            // Extract and save unshield VK
-                                                                            if let Ok(unshield_params) = ghost_mpc::params::load_parameters(&unshield_write) {
-                                                                                let unshield_vk_path = params_dir.join("unshield_vk.bin");
-                                                                                if let Err(e) = ghost_mpc::params::save_verifying_key(&unshield_vk_path, &unshield_params.vk) {
-                                                                                    tracing::warn!(error = %e, "MPC params_callback: Failed to save unshield VK");
-                                                                                }
-                                                                            }
-                                                                            tracing::info!(
-                                                                                size = unshield_data.len(),
-                                                                                peer = %host,
-                                                                                "MPC params_callback: Updated unshield params"
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        return;
-                                                    }
-                                                    Ok(hash) => {
-                                                        tracing::debug!(
-                                                            peer = %host,
-                                                            got = %hex::encode(&hash[..8]),
-                                                            expected = %hex::encode(&expected[..8]),
-                                                            "MPC params_callback: Hash mismatch, trying next peer"
-                                                        );
-                                                        let _ = std::fs::remove_file(&tmp_path);
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(error = %e, "MPC params_callback: Hash computation failed");
-                                                        let _ = std::fs::remove_file(&tmp_path);
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, peer = %host,
-                                                    "MPC params_callback: Failed to load params for verification");
-                                                let _ = std::fs::remove_file(&tmp_path);
-                                            }
-                                        }
-                                    }
-                                    _ => continue,
-                                }
+
+                    // Fetch the candidate bundle (note-spend hash MUST match).
+                    let bundle = match fetch_ceremony_params_bundle(&seeds, expected).await {
+                        Some(b) => b,
+                        None => {
+                            tracing::warn!(
+                                expected = %hex::encode(&expected[..8]),
+                                "MPC params_callback: no peer had matching params"
+                            );
+                            return;
+                        }
+                    };
+
+                    // CRYPTO GATE: verify the fetched params are a valid
+                    // transformation of OUR current params (the prev) before
+                    // hot-swapping. Genesis (position 1) / pre-genesis nodes have
+                    // no prev to verify against and adopt the hash-pinned anchor.
+                    //
+                    // Stage C task 4: use the catch-up (no timestamp-skew) verify.
+                    // This path adopts an ALREADY-BFT-APPROVED contribution that
+                    // may be HISTORICAL (a node offline for days, or replaying the
+                    // chain), whose timestamp is far outside the live ±1h window.
+                    // Every cryptographic check (Schnorr bound to ceremony_id, hash
+                    // chain, h/l pairing transform against OUR prev) is identical to
+                    // the live path; only the freshness window — a replay defence
+                    // for LIVE proposals, irrelevant once a contribution is part of
+                    // the approved lineage — is dropped.
+                    if contribution.position >= 2 && ceremony_mgr.has_current_params() {
+                        let mgr = Arc::clone(&ceremony_mgr);
+                        let note_spend = Arc::clone(&bundle.note_spend);
+                        let contribution_for_verify = contribution.clone();
+                        let prev_params = match mgr.note_spend_params() {
+                            Some(p) => p,
+                            None => {
+                                tracing::warn!(
+                                    "MPC params_callback: no current params to verify against — refusing to adopt"
+                                );
+                                return;
                             }
-                            _ => continue,
+                        };
+                        let verified = tokio::task::spawn_blocking(move || {
+                            mgr.verify_contribution_catchup(
+                                &prev_params,
+                                &note_spend,
+                                &contribution_for_verify,
+                            )
+                        })
+                        .await;
+                        match verified {
+                            Ok(Ok(true)) => {}
+                            other => {
+                                tracing::warn!(
+                                    position = contribution.position,
+                                    result = ?other,
+                                    "MPC params_callback: candidate params FAILED verification — refusing to adopt (never adopt on hash match alone)"
+                                );
+                                return;
+                            }
                         }
                     }
-                    tracing::warn!(
-                        expected = %hex::encode(&expected[..8]),
-                        "MPC params_callback: No peer had matching params"
-                    );
+
+                    // Adopt through the manager: disk write + symlink + in-memory
+                    // hot-swap + count/current_params_hash + ossify check.
+                    let note_spend = (*bundle.note_spend).clone();
+                    let payout = bundle.payout.as_ref().map(|p| (**p).clone());
+                    let unshield = bundle.unshield.as_ref().map(|p| (**p).clone());
+                    let mgr = Arc::clone(&ceremony_mgr);
+                    let contribution_for_apply = contribution.clone();
+                    let applied = tokio::task::spawn_blocking(move || {
+                        mgr.apply_contribution_multi(
+                            note_spend,
+                            payout,
+                            unshield,
+                            &contribution_for_apply,
+                        )
+                    })
+                    .await;
+                    match applied {
+                        Ok(Ok(())) => {
+                            // Persist the singleton from the manager's authoritative state.
+                            let s = ceremony_mgr.state();
+                            let db_state = ghost_storage::queries::MpcCeremonyState {
+                                contribution_count: s.contribution_count,
+                                current_params_hash: s.current_params_hash,
+                                is_ossified: s.is_ossified,
+                                ossified_at: s.ossified_at,
+                                block_vk_hash: s.note_spend_vk_hash,
+                                payout_vk_hash: s.payout_vk_hash,
+                                updated_at: s.updated_at,
+                                ceremony_id: s.ceremony_id,
+                            };
+                            if let Err(e) = db.save_mpc_ceremony_state(&db_state) {
+                                tracing::warn!(error = %e, "MPC params_callback: failed to persist ceremony singleton");
+                            }
+                            tracing::info!(
+                                position = contribution.position,
+                                hash = %hex::encode(&expected[..8]),
+                                "MPC params_callback: verified and adopted contribution params"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, position = contribution.position, "MPC params_callback: manager apply failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MPC params_callback: apply task panicked");
+                        }
+                    }
                 });
             },
         );
+
+        // Stage 1a: the network fetcher the voter uses to obtain a candidate's
+        // parameters before running real cryptographic verification. Fetches the
+        // bundle in memory (no disk writes — verification is read-only).
+        let seed_nodes_for_fetch = config.network.seed_nodes.clone();
+        let params_fetcher: ghost_consensus::mpc_handler::MpcParamsFetchFn =
+            Arc::new(move |expected: [u8; 32]| {
+                let seeds = seed_nodes_for_fetch.clone();
+                Box::pin(async move { fetch_ceremony_params_bundle(&seeds, expected).await })
+            });
 
         let mpc_handler = Arc::new(
             MpcHandler::new(Arc::clone(&identity), Arc::clone(&db))
                 .with_broadcaster(mpc_broadcast)
                 .with_params_callback(params_update_callback)
+                // Stage 1a: wire the authoritative crypto backend + fetcher so the
+                // voter verifies (Schnorr + pairing) before approving.
+                .with_ceremony_manager(Arc::clone(&ceremony_manager))
+                .with_params_fetcher(params_fetcher)
                 .with_state(
                     ceremony_manager.contribution_count(),
                     ceremony_manager.is_ossified(),
                 ),
         );
+        // Install the self-reference so MPC message handling can offload heavy
+        // fetch/verify/apply work off the single-threaded mesh message loop.
+        mpc_handler.init_self_ref();
 
         // Register MPC handler with mesh
         mesh.register_handler(Arc::clone(&mpc_handler)
@@ -2950,6 +3300,20 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Stage A task 3: fail-closed lineage gate. If the startup
+            // cross-check found the on-disk params out of step with the recorded
+            // lineage head, do NOT enter the rolling/contribution path — a
+            // contribution built on top of mismatched params would poison the
+            // lineage. The node keeps serving whatever it loaded; it just won't
+            // fetch or contribute. (Pinned/frozen nodes already returned above.)
+            if !mpc_lineage_ok {
+                error!(
+                    "MPC: startup lineage cross-check failed — refusing to enter the rolling \
+                     ceremony (fail-closed). Investigate on-disk params vs recorded lineage."
+                );
+                return;
+            }
+
             // Retry loop: attempt contribution up to 5 times with random 10-100s intervals.
             // This handles race conditions where multiple nodes try the same position
             // simultaneously — the loser retries at the next position.
@@ -2983,8 +3347,12 @@ async fn main() -> Result<()> {
                 // hash). On test nets (no pinned hash) this is the normal forming
                 // path. Either way the fetch can no longer clobber pinned params.
                 if !ceremony_manager_for_startup.has_current_params() {
-                    // Use DB to determine if this is truly genesis or if we need to fetch
-                    let db_count = db_for_mpc.get_mpc_elder_count().unwrap_or(0) as u32;
+                    // Use DB to determine if this is truly genesis or if we need to fetch.
+                    // Authoritative progression count = mpc_ceremony singleton (falls back to
+                    // COUNT(mpc_contributions) when the singleton is absent, e.g. fresh genesis).
+                    let db_count = db_for_mpc
+                        .mpc_contribution_count_authoritative()
+                        .unwrap_or(0);
 
                     if db_count == 0 && is_genesis_node {
                         // Genesis protection layer 1: Query seed peers for existing contributors
@@ -3167,11 +3535,23 @@ async fn main() -> Result<()> {
                                                     {
                                                         synced_count += 1;
                                                     }
+
+                                                    // Stage C task 3: upgrade the
+                                                    // proof-less placeholder with the
+                                                    // REAL proof + retained votes so
+                                                    // catch-up can re-verify + check
+                                                    // the retained BFT quorum.
+                                                    sync_mpc_proof_and_votes(
+                                                        &seed_nodes_for_mpc,
+                                                        position,
+                                                        &db_for_mpc,
+                                                    )
+                                                    .await;
                                                 }
                                                 if synced_count > 0 {
                                                     info!(
                                                         count = synced_count,
-                                                        "MPC: Synced contributor records from peer"
+                                                        "MPC: Synced contributor records (+ proofs/votes) from peer"
                                                     );
                                                 }
                                                 break;
@@ -3225,8 +3605,13 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                // Determine position from DB (authoritative source, not stale in-memory state)
-                let db_count = db_for_mpc.get_mpc_elder_count().unwrap_or(0) as u32;
+                // Determine position from DB (authoritative source, not stale in-memory state).
+                // Progression count comes from the mpc_ceremony singleton (falls back to
+                // COUNT(mpc_contributions) when absent). Voter-set sizing still uses
+                // get_mpc_elder_count() in the handler — these are deliberately distinct.
+                let db_count = db_for_mpc
+                    .mpc_contribution_count_authoritative()
+                    .unwrap_or(0);
                 let next_position = db_count + 1;
 
                 info!(
@@ -3467,6 +3852,16 @@ async fn main() -> Result<()> {
                                             };
 
                                         let _ = db_for_mpc.save_mpc_contribution(&record);
+
+                                        // Stage C task 3: fill the real proof +
+                                        // retained votes for catch-up re-verification
+                                        // and the retained BFT quorum check.
+                                        sync_mpc_proof_and_votes(
+                                            &seed_nodes_for_mpc,
+                                            position,
+                                            &db_for_mpc,
+                                        )
+                                        .await;
                                     }
                                     break;
                                 }

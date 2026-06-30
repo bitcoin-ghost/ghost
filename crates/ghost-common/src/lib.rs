@@ -39,6 +39,7 @@ pub mod identity_rotation;
 pub mod instant;
 pub mod key_rotation;
 pub mod metrics;
+pub mod mpc;
 pub mod rpc;
 pub mod sanitize;
 pub mod serde_hex;

@@ -248,6 +248,17 @@ pub fn load_parameters(path: &Path) -> MpcResult<Parameters<Bls12>> {
     Ok(params)
 }
 
+/// Parse Groth16 parameters directly from an in-memory byte buffer.
+///
+/// Used by the BFT voter to verify a fetched candidate parameter set WITHOUT
+/// writing hundreds of megabytes to disk (verification is read-only; only the
+/// post-approval apply persists parameters). Mirrors [`load_parameters`]'s
+/// decoding (`checked = false`).
+pub fn read_parameters_from_bytes(bytes: &[u8]) -> MpcResult<Parameters<Bls12>> {
+    Parameters::read(std::io::Cursor::new(bytes), false)
+        .map_err(|e| MpcError::InvalidParams(e.to_string()))
+}
+
 /// Save a verifying key to a file
 ///
 /// S-5 SECURITY: Uses atomic write (temp file + rename) to prevent corruption.

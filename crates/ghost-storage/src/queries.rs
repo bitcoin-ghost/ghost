@@ -5993,7 +5993,11 @@ impl Database {
 // MPC CEREMONY QUERIES
 // =============================================================================
 
-/// MPC ceremony state record (singleton)
+/// MPC ceremony state record (singleton, id=1).
+///
+/// This row is the authoritative source of truth for ceremony progression
+/// (`contribution_count`, `current_params_hash`, `is_ossified`) and for the
+/// stable `ceremony_id` that Schnorr proofs bind to.
 #[derive(Debug, Clone)]
 pub struct MpcCeremonyState {
     pub contribution_count: u32,
@@ -6003,6 +6007,11 @@ pub struct MpcCeremonyState {
     pub block_vk_hash: Option<[u8; 32]>,
     pub payout_vk_hash: Option<[u8; 32]>,
     pub updated_at: u64,
+    /// Stable, genesis-derived ceremony identifier (= position-1
+    /// `prev_params_hash`, the genesis lineage hash). Identical fleet-wide for
+    /// the life of the ceremony. `[0u8; 32]` if not yet established (pre-genesis
+    /// or a legacy row written before this column existed).
+    pub ceremony_id: [u8; 32],
 }
 
 /// MPC contribution record
@@ -6044,6 +6053,7 @@ impl Database {
     #[allow(clippy::type_complexity)]
     pub fn get_mpc_ceremony_state(&self) -> GhostResult<Option<MpcCeremonyState>> {
         self.with_connection(|conn| {
+            #[allow(clippy::type_complexity)]
             let result: Option<(
                 i64,
                 Vec<u8>,
@@ -6052,10 +6062,11 @@ impl Database {
                 Option<Vec<u8>>,
                 Option<Vec<u8>>,
                 i64,
+                Option<Vec<u8>>,
             )> = conn
                 .query_row(
                     "SELECT contribution_count, current_params_hash, is_ossified, ossified_at,
-                            block_vk_hash, payout_vk_hash, updated_at
+                            block_vk_hash, payout_vk_hash, updated_at, ceremony_id
                      FROM mpc_ceremony WHERE id = 1",
                     [],
                     |row| {
@@ -6067,6 +6078,7 @@ impl Database {
                             row.get(4)?,
                             row.get(5)?,
                             row.get(6)?,
+                            row.get(7)?,
                         ))
                     },
                 )
@@ -6074,10 +6086,28 @@ impl Database {
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             match result {
-                Some((count, hash_bytes, ossified, ossified_at, block_vk, payout_vk, updated)) => {
+                Some((
+                    count,
+                    hash_bytes,
+                    ossified,
+                    ossified_at,
+                    block_vk,
+                    payout_vk,
+                    updated,
+                    ceremony_id_bytes,
+                )) => {
                     let mut params_hash = [0u8; 32];
                     if hash_bytes.len() == 32 {
                         params_hash.copy_from_slice(&hash_bytes);
+                    }
+
+                    // ceremony_id is nullable for legacy rows written before the
+                    // column existed; a NULL or wrong-length value reads as zero.
+                    let mut ceremony_id = [0u8; 32];
+                    if let Some(ref cid) = ceremony_id_bytes {
+                        if cid.len() == 32 {
+                            ceremony_id.copy_from_slice(cid);
+                        }
                     }
 
                     let block_vk_hash = block_vk.and_then(|v| {
@@ -6117,6 +6147,7 @@ impl Database {
                         payout_vk_hash,
                         updated_at: i64_to_u64(updated, "updated_at")
                             .map_err(|e| GhostError::Database(e.to_string()))?,
+                        ceremony_id,
                     }))
                 }
                 None => Ok(None),
@@ -6129,8 +6160,9 @@ impl Database {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO mpc_ceremony (id, contribution_count, current_params_hash, is_ossified,
-                                          ossified_at, block_vk_hash, payout_vk_hash, updated_at)
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                          ossified_at, block_vk_hash, payout_vk_hash, updated_at,
+                                          ceremony_id)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                     contribution_count = excluded.contribution_count,
                     current_params_hash = excluded.current_params_hash,
@@ -6138,7 +6170,8 @@ impl Database {
                     ossified_at = excluded.ossified_at,
                     block_vk_hash = excluded.block_vk_hash,
                     payout_vk_hash = excluded.payout_vk_hash,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at,
+                    ceremony_id = excluded.ceremony_id",
                 params![
                     state.contribution_count as i64,
                     &state.current_params_hash[..],
@@ -6147,6 +6180,7 @@ impl Database {
                     state.block_vk_hash.as_ref().map(|v| &v[..]),
                     state.payout_vk_hash.as_ref().map(|v| &v[..]),
                     state.updated_at as i64,
+                    &state.ceremony_id[..],
                 ],
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -6154,13 +6188,30 @@ impl Database {
         })
     }
 
-    /// Save an MPC contribution
+    /// Save an MPC contribution.
+    ///
+    /// Stage C: this is a SAFE proof-fill upsert. A first INSERT records the row.
+    /// On conflict (the position already exists) it ONLY fills in a previously
+    /// EMPTY `contribution_proof`, and ONLY when the incoming row has the SAME
+    /// identity (contributor + prev/new hashes). It NEVER rewrites the hashes or
+    /// replaces an already-present proof. This lets a node that first synced a
+    /// proof-less row (the old `/contributors` path) later upgrade it with the
+    /// real proof fetched from `/api/v1/mpc/votes/{position}` — needed for
+    /// catch-up re-verification — while a peer can never overwrite the lineage
+    /// hashes or substitute a different proof for an applied position.
     pub fn save_mpc_contribution(&self, contribution: &MpcContributionRecord) -> GhostResult<()> {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO mpc_contributions (elder_position, contributor_node_id, prev_params_hash,
                                                 new_params_hash, contribution_proof, epoch, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(elder_position) DO UPDATE SET
+                    contribution_proof = excluded.contribution_proof
+                 WHERE length(mpc_contributions.contribution_proof) = 0
+                   AND length(excluded.contribution_proof) > 0
+                   AND mpc_contributions.contributor_node_id = excluded.contributor_node_id
+                   AND mpc_contributions.prev_params_hash = excluded.prev_params_hash
+                   AND mpc_contributions.new_params_hash = excluded.new_params_hash",
                 params![
                     contribution.elder_position as i64,
                     contribution.contributor_node_id,
@@ -6220,6 +6271,62 @@ impl Database {
                         contributor_node_id: node_id,
                         prev_params_hash,
                         new_params_hash,
+                        contribution_proof: proof,
+                        epoch: i64_to_u64(epoch, "mpc_epoch")
+                            .map_err(|e| GhostError::Database(e.to_string()))?,
+                        created_at: i64_to_u64(created_at, "mpc_created_at")
+                            .map_err(|e| GhostError::Database(e.to_string()))?,
+                    }))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Get an MPC contribution by its `new_params_hash` (lineage head produced
+    /// by that contribution).
+    ///
+    /// Used by the params-adoption path (a node fetching parameters it did not
+    /// itself vote on) to recover the full contribution record — proof, prev
+    /// hash, position — so it can re-run cryptographic `verify_contribution`
+    /// before hot-swapping, rather than trusting a bare hash match.
+    pub fn get_mpc_contribution_by_new_hash(
+        &self,
+        new_params_hash: &[u8; 32],
+    ) -> GhostResult<Option<MpcContributionRecord>> {
+        self.with_connection(|conn| {
+            let result: Option<(i64, String, Vec<u8>, Vec<u8>, i64, i64)> = conn
+                .query_row(
+                    "SELECT elder_position, contributor_node_id, prev_params_hash,
+                            contribution_proof, epoch, created_at
+                     FROM mpc_contributions WHERE new_params_hash = ?1",
+                    params![&new_params_hash[..]],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            match result {
+                Some((position, node_id, prev_hash, proof, epoch, created_at)) => {
+                    let mut prev_params_hash = [0u8; 32];
+                    if prev_hash.len() == 32 {
+                        prev_params_hash.copy_from_slice(&prev_hash);
+                    }
+                    Ok(Some(MpcContributionRecord {
+                        elder_position: i64_to_u32_count(position, "elder_position")
+                            .map_err(|e| GhostError::Database(e.to_string()))?,
+                        contributor_node_id: node_id,
+                        prev_params_hash,
+                        new_params_hash: *new_params_hash,
                         contribution_proof: proof,
                         epoch: i64_to_u64(epoch, "mpc_epoch")
                             .map_err(|e| GhostError::Database(e.to_string()))?,
@@ -6531,6 +6638,76 @@ impl Database {
             i64_to_u32_count(count, "mpc_elder_count")
                 .map_err(|e| GhostError::Database(e.to_string()))
         })
+    }
+
+    /// Highest applied MPC contribution position (`MAX(elder_position)`).
+    ///
+    /// Returns `None` when no contributions exist. This is the lineage head's
+    /// position; `get_mpc_contribution(max)?.new_params_hash` is the lineage
+    /// hash of the current parameters.
+    pub fn get_mpc_max_contribution_position(&self) -> GhostResult<Option<u32>> {
+        self.with_connection(|conn| {
+            let max: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(elder_position) FROM mpc_contributions",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            match max {
+                Some(v) => Ok(Some(
+                    i64_to_u32_count(v, "mpc_max_position")
+                        .map_err(|e| GhostError::Database(e.to_string()))?,
+                )),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Authoritative ceremony contribution count for *progression* (next
+    /// position) decisions.
+    ///
+    /// The `mpc_ceremony` singleton (id=1) is the source of truth. When the
+    /// singleton is present its `contribution_count` is returned; when it is
+    /// absent (pre-backfill / fresh genesis) this falls back to
+    /// `COUNT(*) mpc_contributions`.
+    ///
+    /// INVARIANT CHECK: if the singleton exists but its `contribution_count`
+    /// disagrees with `COUNT(*) mpc_contributions`, that is a corruption / split
+    /// signal — it is logged loudly. We still return the singleton value (the
+    /// authoritative one) rather than silently trusting either source.
+    ///
+    /// NOTE: this is distinct from `get_mpc_elder_count()`, which counts
+    /// contribution rows and is the correct input for *voter-set sizing*
+    /// (BFT quorum). Do not conflate the two.
+    pub fn mpc_contribution_count_authoritative(&self) -> GhostResult<u32> {
+        let row_count = self.get_mpc_elder_count()?;
+        match self.get_mpc_ceremony_state()? {
+            Some(state) => {
+                if state.contribution_count != row_count {
+                    warn!(
+                        singleton_count = state.contribution_count,
+                        contribution_rows = row_count,
+                        "MPC INVARIANT VIOLATION: mpc_ceremony.contribution_count disagrees with \
+                         COUNT(mpc_contributions) — possible state corruption or interrupted apply. \
+                         Trusting the authoritative singleton value."
+                    );
+                }
+                Ok(state.contribution_count)
+            }
+            None => Ok(row_count),
+        }
+    }
+
+    /// Stable, genesis-derived ceremony identifier.
+    ///
+    /// Defined as position-1's `prev_params_hash` (the genesis lineage hash),
+    /// which never changes for the life of the ceremony and is identical on
+    /// every node. Returns `None` before the genesis contribution exists.
+    /// This is the canonical source; the persisted `mpc_ceremony.ceremony_id`
+    /// column is a cache of the same value.
+    pub fn mpc_genesis_ceremony_id(&self) -> GhostResult<Option<[u8; 32]>> {
+        Ok(self.get_mpc_contribution(1)?.map(|c| c.prev_params_hash))
     }
 
     /// Get all MPC elder node IDs as parsed 32-byte arrays
@@ -11356,5 +11533,131 @@ mod tests {
             !caps2.public_mining,
             "no strict majority of challengers -> public_mining NOT qualified"
         );
+    }
+
+    // ========================================================================
+    // MPC ceremony state foundation (Stage A tasks 2 & 3)
+    // ========================================================================
+
+    fn mk_contribution(pos: u32) -> MpcContributionRecord {
+        let prev = if pos == 1 {
+            [200u8; 32]
+        } else {
+            [(pos - 1) as u8; 32]
+        };
+        MpcContributionRecord {
+            elder_position: pos,
+            contributor_node_id: format!("node{pos}"),
+            prev_params_hash: prev,
+            new_params_hash: [pos as u8; 32],
+            contribution_proof: vec![1, 2, 3],
+            epoch: 0,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn test_ceremony_state_roundtrips_ceremony_id() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let state = MpcCeremonyState {
+            contribution_count: 5,
+            current_params_hash: [5u8; 32],
+            is_ossified: false,
+            ossified_at: None,
+            block_vk_hash: None,
+            payout_vk_hash: None,
+            updated_at: 42,
+            ceremony_id: [200u8; 32],
+        };
+        db.save_mpc_ceremony_state(&state).unwrap();
+
+        let loaded = db.get_mpc_ceremony_state().unwrap().expect("present");
+        assert_eq!(loaded.contribution_count, 5);
+        assert_eq!(loaded.current_params_hash, [5u8; 32]);
+        assert_eq!(loaded.ceremony_id, [200u8; 32]);
+        assert_eq!(loaded.updated_at, 42);
+    }
+
+    #[test]
+    fn test_authoritative_count_falls_back_to_row_count_when_singleton_absent() {
+        let db = Database::in_memory().expect("create in-memory db");
+        // No singleton yet; two contribution rows.
+        db.save_mpc_contribution(&mk_contribution(1)).unwrap();
+        db.save_mpc_contribution(&mk_contribution(2)).unwrap();
+
+        assert_eq!(
+            db.mpc_contribution_count_authoritative().unwrap(),
+            2,
+            "with no singleton, fall back to COUNT(mpc_contributions)"
+        );
+    }
+
+    #[test]
+    fn test_authoritative_count_prefers_singleton() {
+        let db = Database::in_memory().expect("create in-memory db");
+        db.save_mpc_contribution(&mk_contribution(1)).unwrap();
+        db.save_mpc_contribution(&mk_contribution(2)).unwrap();
+        db.save_mpc_contribution(&mk_contribution(3)).unwrap();
+        // Singleton agrees (count 3) — authoritative value returned.
+        db.save_mpc_ceremony_state(&MpcCeremonyState {
+            contribution_count: 3,
+            current_params_hash: [3u8; 32],
+            is_ossified: false,
+            ossified_at: None,
+            block_vk_hash: None,
+            payout_vk_hash: None,
+            updated_at: 0,
+            ceremony_id: [200u8; 32],
+        })
+        .unwrap();
+        assert_eq!(db.mpc_contribution_count_authoritative().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_genesis_ceremony_id_derives_from_position_one() {
+        let db = Database::in_memory().expect("create in-memory db");
+        assert_eq!(
+            db.mpc_genesis_ceremony_id().unwrap(),
+            None,
+            "no contributions -> no ceremony_id yet"
+        );
+        db.save_mpc_contribution(&mk_contribution(1)).unwrap();
+        db.save_mpc_contribution(&mk_contribution(2)).unwrap();
+        assert_eq!(
+            db.mpc_genesis_ceremony_id().unwrap(),
+            Some([200u8; 32]),
+            "ceremony_id derives from position-1 prev_params_hash"
+        );
+    }
+
+    #[test]
+    fn test_ceremony_id_stable_across_reloads() {
+        // Simulate the main.rs load-path derivation across two restarts: the
+        // canonical ceremony_id (position-1 prev hash) never changes even as the
+        // lineage head (current_params_hash) advances.
+        let db = Database::in_memory().expect("create in-memory db");
+        for pos in 1..=3 {
+            db.save_mpc_contribution(&mk_contribution(pos)).unwrap();
+        }
+        let first = db.mpc_genesis_ceremony_id().unwrap();
+        // Advance the lineage head.
+        db.save_mpc_contribution(&mk_contribution(4)).unwrap();
+        db.save_mpc_contribution(&mk_contribution(5)).unwrap();
+        let second = db.mpc_genesis_ceremony_id().unwrap();
+        assert_eq!(
+            first, second,
+            "ceremony_id must be stable as lineage advances"
+        );
+        assert_eq!(second, Some([200u8; 32]));
+    }
+
+    #[test]
+    fn test_max_contribution_position() {
+        let db = Database::in_memory().expect("create in-memory db");
+        assert_eq!(db.get_mpc_max_contribution_position().unwrap(), None);
+        for pos in 1..=4 {
+            db.save_mpc_contribution(&mk_contribution(pos)).unwrap();
+        }
+        assert_eq!(db.get_mpc_max_contribution_position().unwrap(), Some(4));
     }
 }
