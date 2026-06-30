@@ -32,7 +32,20 @@ ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 PAYOUT_ADDRESS=""
 NICKNAME="ghost-node"
 SYNC_MODE="ibd"            # ibd (trustless, default) | fast (assumeutxo) | haze (IRREVERSIBLE)
-PUBLIC_MINING="true"
+# Mining mode — the single source of truth for who can mine and how rewards are
+# shared. One of: public_pool | private_pool | private_solo (mirrors
+# ghost-common MiningMode and the dashboard PoolSetupWizard). Default is
+# public_pool, unchanged from the historical default.
+#   public_pool  — DNS-registered, ANYONE can mine, pool-aggregated rewards (+3).
+#   private_pool — password-required, NOT in DNS, your miners + invited external
+#                  miners, pool-aggregated (shared) rewards. No +3 DNS capability.
+#   private_solo — password-required, NOT in DNS, Stratum closed to external
+#                  miners; 99% subsidy + ALL fees to the operator's own address.
+MINING_MODE="public_pool"
+# Optional custom pool name. Empty = fall back to the mining-mode default coinbase
+# tag (nothing written to pool.toml). When set it becomes the block coinbase
+# scriptsig tag "- G H O S T - <name>", visible on explorers. ASCII, <=30 chars.
+POOL_NAME=""
 REAPER="true"
 ARCHIVE="false"
 GHOST_PAY="false"
@@ -62,6 +75,10 @@ Required:
 
 Options:
   --nickname <name>           Display name in the mesh        (default: ghost-node)
+  --pool-name <name>          Custom pool name shown in the block coinbase as
+                                '- G H O S T - <name>' on explorers. ASCII only,
+                                max 30 chars. Distinct from --nickname (the mesh
+                                display name). Default: derived from --mining-mode.
   --sync <mode>               ibd | fast | haze               (default: ibd)
                                 ibd  — full trustless sync + prune (recommended)
                                 fast — EXPERIMENTAL: a real assumeutxo snapshot is
@@ -71,7 +88,20 @@ Options:
                                 haze — strips block data, ~195GB, FAST but
                                        IRREVERSIBLE. You can never serve raw
                                        blocks or go archive without a full resync.
-  --no-public-mining          Don't accept external miners (capability -3)
+  --mining-mode <mode>        solo | pool | public            (default: public)
+                                public — Public Pool: DNS-registered, ANYONE can
+                                         mine, pool-aggregated rewards (+3 shares).
+                                pool   — Private Pool: password-required, NOT in
+                                         DNS, your miners + invited external
+                                         miners, shared rewards (no +3 capability).
+                                solo   — Private Solo: password-required, NOT in
+                                         DNS, Stratum closed to external miners,
+                                         99% subsidy + ALL fees to your address.
+                                A miner password is generated automatically for
+                                the private modes and printed at the end.
+  --no-public-mining          Backward-compatible alias for --mining-mode solo.
+                                Prefer --mining-mode. If both are given, the last
+                                one on the command line wins.
   --no-reaper                 Don't run the mempool reaper    (capability -2)
   --archive                   Full archive node (~720GB, capability +5)
   --ghost-pay                 Enable the L2 payments service  (capability +4)
@@ -107,8 +137,20 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --payout-address) PAYOUT_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --nickname)       NICKNAME="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --pool-name)      POOL_NAME="${2:-}"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --sync)           SYNC_MODE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --no-public-mining) PUBLIC_MINING="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --mining-mode)
+      case "${2:-}" in
+        solo|private_solo)   MINING_MODE="private_solo";;
+        pool|private_pool)   MINING_MODE="private_pool";;
+        public|public_pool)  MINING_MODE="public_pool";;
+        *) echo "Unknown --mining-mode '${2:-}' (expected: solo | pool | public)" >&2; usage; exit 1;;
+      esac
+      shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    # Backward-compatible alias for --mining-mode solo. Both write the same
+    # MINING_MODE variable, so when --mining-mode and --no-public-mining are both
+    # passed the last one on the command line wins (predictable left-to-right).
+    --no-public-mining) MINING_MODE="private_solo"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --ghost-pay)      GHOST_PAY="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -128,12 +170,36 @@ done
 err() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo -e "\033[36m==>\033[0m $*"; }
 
+# One-line human label for a mining_mode value (summary + final output).
+mining_mode_label() {
+  case "$1" in
+    public_pool)  echo "Public Pool (DNS-registered, anyone can mine, +3 shares)";;
+    private_pool) echo "Private Pool (password-required, invited miners, not in DNS)";;
+    private_solo) echo "Private Solo (password-required, no external miners, solo rewards)";;
+    *)            echo "$1";;
+  esac
+}
+
+# Strip leading/trailing whitespace (mirrors the dashboard wizard's .trim()).
+_trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+# Validate a custom pool name against the SAME rules as the dashboard wizard:
+# printable ASCII (0x20–0x7E) only, max 30 characters after trimming. Returns 0
+# if the trimmed name is acceptable, non-zero otherwise. (An empty name is
+# "invalid" here; callers treat empty as "use the default" before calling this.)
+pool_name_valid() {
+  local n; n="$(_trim "$1")"
+  [[ -n "$n" ]] || return 1
+  (( ${#n} <= 30 )) || return 1
+  LC_ALL=C grep -qE '^[ -~]+$' <<<"$n"
+}
+
 # Set to "true" by the wizard so the post-wizard validation below doesn't ask the
 # haze confirmation a second time (the wizard already collected it).
 WIZARD_RAN="false"
 
 # Yes/No prompt with a default. Echoes "true" or "false" so the caller can assign
-# it straight into PUBLIC_MINING / REAPER / ARCHIVE / GHOST_PAY. The read prompt
+# it straight into REAPER / ARCHIVE / GHOST_PAY. The read prompt
 # goes to stderr, so it stays visible inside $(...) capture; only the echoed
 # answer is captured. `|| true` keeps an EOF (Ctrl-D) from tripping `set -e`.
 prompt_yes_no() {
@@ -149,7 +215,7 @@ prompt_yes_no() {
 }
 
 # Interactive first-run wizard. Collects the SAME variables the flag interface
-# sets (PAYOUT_ADDRESS, SYNC_MODE, PUBLIC_MINING, REAPER, ARCHIVE, GHOST_PAY,
+# sets (PAYOUT_ADDRESS, SYNC_MODE, MINING_MODE, REAPER, ARCHIVE, GHOST_PAY,
 # NICKNAME); the rest of the installer is unchanged. Only ever runs with no
 # config flags, on a TTY, without --non-interactive.
 run_wizard() {
@@ -195,10 +261,45 @@ run_wizard() {
     *) echo "  Unrecognised choice — using ibd."; SYNC_MODE="ibd";;
   esac
 
+  # Mining mode — who can mine and how rewards are shared. Default = Public Pool
+  # (option 1), preserving the historical default behaviour.
+  echo
+  echo "Mining mode (who can mine and how rewards are shared):"
+  echo "  1) Public Pool   DNS-registered, ANYONE can mine, pool-aggregated (shared) rewards (+3 shares). RECOMMENDED."
+  echo "  2) Private Pool  Password-required, NOT in DNS; your miners + invited external miners, shared rewards."
+  echo "  3) Private Solo  Password-required, NOT in DNS, closed to external miners; 99% of subsidy + ALL fees to you."
+  local mode_choice
+  read -rp "Choose 1, 2 or 3 [1]: " mode_choice || true
+  mode_choice="${mode_choice:-1}"
+  case "$mode_choice" in
+    1|public|public_pool) MINING_MODE="public_pool";;
+    2|pool|private_pool)  MINING_MODE="private_pool";;
+    3|solo|private_solo)  MINING_MODE="private_solo";;
+    *) echo "  Unrecognised choice — using Public Pool."; MINING_MODE="public_pool";;
+  esac
+
+  # Optional custom pool name — offered for the pool modes (the coinbase tag
+  # identifies a shared pool). Skipped for Private Solo, which has no shared pool
+  # identity; it keeps the mode-default tag (set --pool-name explicitly to change
+  # it). Blank = mode default. Validated/re-prompted to match the dashboard.
+  POOL_NAME=""
+  if [[ "$MINING_MODE" == "public_pool" || "$MINING_MODE" == "private_pool" ]]; then
+    echo
+    echo "Pool name (optional) — shown in the block coinbase as '- G H O S T - <name>'"
+    echo "on block explorers. ASCII only, max 30 characters. Leave blank for the default."
+    while :; do
+      local pn
+      read -rp "Pool name [none]: " pn || true
+      pn="$(_trim "$pn")"
+      [[ -z "$pn" ]] && { POOL_NAME=""; break; }
+      if pool_name_valid "$pn"; then POOL_NAME="$pn"; break; fi
+      echo "  ✗ Must be printable ASCII and at most 30 characters. Try again (or leave blank)."
+    done
+  fi
+
   # Capabilities.
   echo
   echo "Capabilities (each affects your node's reward share):"
-  PUBLIC_MINING="$(prompt_yes_no "  Accept external miners — public mining (+3 shares)?" Y)"
   REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions (+2 path)?" Y)"
   ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk (+5 shares)?" N)"
   GHOST_PAY="$(prompt_yes_no "  Enable Ghost Pay — L2 instant-payments service (+4 shares)?" N)"
@@ -241,7 +342,10 @@ run_wizard() {
   log "Summary of your choices"
   echo "  Payout address : $PAYOUT_ADDRESS"
   echo "  Sync mode      : $SYNC_MODE"
-  echo "  Public mining  : $PUBLIC_MINING"
+  echo "  Mining mode    : $(mining_mode_label "$MINING_MODE")"
+  [[ -n "$POOL_NAME" ]] && echo "  Pool name      : $POOL_NAME  (coinbase: - G H O S T - $POOL_NAME)"
+  [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]] && \
+    echo "  Miner password : (generated automatically — shown when install completes)"
   echo "  Reaper         : $REAPER"
   echo "  Archive node   : $ARCHIVE"
   echo "  Ghost Pay      : $GHOST_PAY"
@@ -277,6 +381,19 @@ case "$SYNC_MODE" in ibd|fast) ;;
         fi;;
   *) err "--sync must be ibd, fast, or haze.";;
 esac
+
+# Normalise / validate an optional custom pool name. The wizard validates
+# interactively and re-prompts; this central check catches the flag path
+# (--pool-name) and mirrors the dashboard wizard's rules exactly (printable
+# ASCII, <=30 chars after trimming) so the installer and dashboard agree on the
+# resulting coinbase tag. Empty = use the mode default (nothing written).
+if [[ -n "$POOL_NAME" ]]; then
+  if pool_name_valid "$POOL_NAME"; then
+    POOL_NAME="$(_trim "$POOL_NAME")"
+  else
+    err "--pool-name must be printable ASCII (no control characters) and at most 30 characters."
+  fi
+fi
 
 # Wraith mixing rides on Ghost Pay's bond ledger (the coordinator verifies and
 # resolves participant bonds against ghost-pay on 127.0.0.1:8800). Resolve the
@@ -348,6 +465,15 @@ RPCPW="$(openssl rand -hex 32)"
 APISECRET="$(openssl rand -hex 32)"
 SIGNKEY="$(openssl rand -hex 32)"
 PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+# Private-mining password. The private modes (private_pool, private_solo) require
+# a miner password — ghost-pool refuses to start without one — so we generate a
+# strong one here (secure by default; well over the 8-char minimum) and surface
+# it to the operator at the end so they can configure their miners. public_pool
+# needs none, so it is left empty and never written to pool.toml.
+PRIVATE_MINING_PASSWORD=""
+if [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]]; then
+  PRIVATE_MINING_PASSWORD="$(openssl rand -hex 16)"
+fi
 # Ghost Pay secrets. On mainnet ghost-pay refuses to start without all three of
 # these (key-encryption password, API HMAC secret, coordinator bond-ledger
 # token). BOND_LEDGER_TOKEN is generated ONCE here and shared verbatim between
@@ -424,7 +550,34 @@ fi
 
 # ─────────────────────────── 6. pool config ──────────────────────────────────
 log "Writing /etc/ghost/pool.toml"
-MINING_MODE="public_pool"; [[ "$PUBLIC_MINING" == "true" ]] || MINING_MODE="private_solo"
+# Build the [network] mining block. public_pool emits exactly the historical
+# single line (byte-for-byte unchanged). The private modes append the fields
+# ghost-pool REQUIRES: a miner password for both, plus the operator's solo
+# payout address for private_solo (99% subsidy + all fees route there).
+MINING_BLOCK="mining_mode = \"${MINING_MODE}\""
+case "$MINING_MODE" in
+  private_pool)
+    MINING_BLOCK="${MINING_BLOCK}
+private_mining_password = \"${PRIVATE_MINING_PASSWORD}\""
+    ;;
+  private_solo)
+    MINING_BLOCK="${MINING_BLOCK}
+private_mining_password = \"${PRIVATE_MINING_PASSWORD}\"
+solo_payout_address = \"${PAYOUT_ADDRESS}\""
+    ;;
+esac
+# Build the [pool] node-identity block. The optional custom pool_name is appended
+# only when set, so the default (no pool_name) output is byte-for-byte unchanged.
+# POOL_NAME is already trimmed + validated (printable ASCII, <=30); we still
+# TOML-escape backslash and double-quote so the written basic string round-trips
+# to exactly the name the dashboard would store (and thus the same coinbase tag).
+POOL_IDENTITY_BLOCK="node_payout_address = \"${PAYOUT_ADDRESS}\""
+if [[ -n "$POOL_NAME" ]]; then
+  POOL_NAME_ESCAPED="${POOL_NAME//\\/\\\\}"
+  POOL_NAME_ESCAPED="${POOL_NAME_ESCAPED//\"/\\\"}"
+  POOL_IDENTITY_BLOCK="${POOL_IDENTITY_BLOCK}
+pool_name = \"${POOL_NAME_ESCAPED}\""
+fi
 cat > /etc/ghost/pool.toml <<EOF
 [identity]
 key_path = "/home/ghost/.ghost/node.key"
@@ -448,7 +601,7 @@ sv2_port = 34255
 sv1_port = 3333
 http_port = 8080
 max_miners = 1000
-mining_mode = "${MINING_MODE}"
+${MINING_BLOCK}
 seed_nodes = [${SEED_NODES}]
 
 [network.p2p]
@@ -471,7 +624,7 @@ archive_mode = ${ARCHIVE}
 prune_height = 0
 
 [pool]
-node_payout_address = "${PAYOUT_ADDRESS}"
+${POOL_IDENTITY_BLOCK}
 treasury_address = "bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k"
 treasury_fee_percent = 1.0
 min_payout_sats = 10000
@@ -689,19 +842,22 @@ cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'EOF'
 set -euo pipefail
 CONF="${GHOST_POOL_CONF:-/etc/ghost/pool.toml}"
 PORTS=(3333 34255)
-public="no"
-if [[ -r "$CONF" ]]; then
-  if grep -qE '^[[:space:]]*public_mining[[:space:]]*=[[:space:]]*true([[:space:]]|$)' "$CONF" 2>/dev/null \
-   || grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?public_pool"?' "$CONF" 2>/dev/null; then
-    public="yes"
-  fi
+# External miners are accepted in public_pool AND private_pool — both open the
+# Stratum ports (public_pool to anyone, private_pool to password-holders). Only
+# private_solo keeps them closed. mining_mode is the single source of truth: the
+# legacy public_mining bool was removed and is ignored by ghost-pool, so we key
+# purely off mining_mode here to stay consistent with the running node.
+accept_miners="no"
+if [[ -r "$CONF" ]] \
+ && grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?(public_pool|private_pool)"?' "$CONF" 2>/dev/null; then
+  accept_miners="yes"
 fi
-if [[ "$public" == "yes" ]]; then
+if [[ "$accept_miners" == "yes" ]]; then
   for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
-  logger -t ghost-mining-firewall "public mining ON -> Stratum 3333+34255 OPEN"
+  logger -t ghost-mining-firewall "external miners ON (public_pool/private_pool) -> Stratum 3333+34255 OPEN"
 else
   for p in "${PORTS[@]}"; do ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true; done
-  logger -t ghost-mining-firewall "public mining OFF -> Stratum 3333+34255 CLOSED"
+  logger -t ghost-mining-firewall "external miners OFF (private_solo) -> Stratum 3333+34255 CLOSED"
 fi
 
 # Wraith coordinator listen port (9100) follows [coordinator]
@@ -1336,3 +1492,24 @@ cat <<EOF
   joins the mesh and registers as an Elder if slots remain (first 101).
   Watch the gate:  journalctl -u ghost-pool-gate -f
 EOF
+
+# Private modes need a miner password — show it now (and where it lives) so the
+# operator can point their mining software at this node.
+if [[ "$MINING_MODE" == "private_pool" || "$MINING_MODE" == "private_solo" ]]; then
+  if [[ "$MINING_MODE" == "private_pool" ]]; then
+    REACH_NOTE="External miners may connect to Stratum on this host's ports 3333 (SV1) / 34255 (SV2)."
+  else
+    REACH_NOTE="Stratum ports 3333 (SV1) / 34255 (SV2) are CLOSED to external miners — only miners you run locally can connect."
+  fi
+cat <<EOF
+
+  🔒 Mining mode: $(mining_mode_label "$MINING_MODE")
+     Miners must authenticate with this password (stored in
+     /etc/ghost/pool.toml as [network] private_mining_password):
+
+         ${PRIVATE_MINING_PASSWORD}
+
+     Keep it safe — anyone with it can mine on this node.
+     ${REACH_NOTE}
+EOF
+fi
