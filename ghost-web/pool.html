@@ -245,8 +245,9 @@
       When a block is found the top 200 miners by unpaid work (filtered to
       those above the 546-sat dust threshold) get included in the coinbase,
       proportional to their share. Everyone else keeps their ledger intact
-      and carries it forward to compete for the next block. Unpaid shares
-      expire only if a miner goes dark for 7 days.
+      and carries it forward to compete for the next block. Your unpaid
+      work never expires while you keep mining — it is only reclaimed if a
+      miner goes completely dark for over a year.
     </p>
 
     <div class="payout-summary">
@@ -283,8 +284,8 @@
       Ledger model — your unpaid work carries forward across blocks until
       you're included in a coinbase. Miners below the <code>546</code>-sat
       dust line are skipped for that block and their ledger stays intact.
-      Unpaid shares for miners who haven't submitted anything in 7 days
-      are dropped into the node reward pool.
+      Unpaid shares are only reclaimed into the node reward pool if a miner
+      has been dark for over a year.
     </div>
   </div>
 </section>

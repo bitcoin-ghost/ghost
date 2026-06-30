@@ -1261,7 +1261,17 @@ impl Database {
         })
     }
 
-    /// Delete shares older than `retention_secs` seconds
+    /// Delete shares older than `retention_secs` seconds.
+    ///
+    /// This is the SINGLE authority for the `shares` row lifecycle. It does
+    /// two distinct things:
+    ///   1. PAID shares (`paid_in_proposal_hash IS NOT NULL`) older than
+    ///      `retention_secs` are pruned — a short audit tail, no ledger value.
+    ///   2. UNPAID shares (`paid_in_proposal_hash IS NULL`) are NEVER pruned
+    ///      by age. They are only reclaimed once their miner has been dark
+    ///      (no `last_seen` update) for over **one year**. An actively-mining
+    ///      miner therefore accumulates their unpaid ledger indefinitely and
+    ///      it carries forward across every block, exactly as promised.
     ///
     /// Uses the existing `idx_shares_timestamp` index for efficient deletion.
     /// Returns the number of deleted rows.
@@ -1279,10 +1289,11 @@ impl Database {
             .as_secs() as i64;
         let paid_cutoff = now_s - retention_secs;
         // Inactive-miner cutoff: unpaid shares belonging to miners whose
-        // last_seen is older than 7 days are dropped into the node pool
-        // (via disappearance) so they don't sit on the ledger forever.
-        // Active miners keep every unpaid share regardless of age.
-        const INACTIVE_SECS: i64 = 7 * 24 * 3600;
+        // last_seen is older than ONE YEAR are reclaimed into the node pool
+        // (via disappearance) so a permanently-abandoned miner's ledger does
+        // not pin rows forever. Active miners — and even miners dark for up
+        // to a year — keep every unpaid share regardless of age.
+        const INACTIVE_SECS: i64 = 365 * 24 * 3600;
         let inactive_cutoff = now_s - INACTIVE_SECS;
 
         self.with_connection(|conn| {
@@ -1298,7 +1309,7 @@ impl Database {
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             // 2. Unpaid shares: drop only if the miner has been dark for
-            //    7+ days. Active miners keep their full unpaid ledger.
+            //    1+ year. Active miners keep their full unpaid ledger.
             let unpaid_deleted = conn
                 .execute(
                     "DELETE FROM shares
@@ -10212,9 +10223,9 @@ mod tests {
             .as_secs() as i64;
 
         // Insert old share (48 hours ago) belonging to a miner that has
-        // been dark for >7 days. delete_old_shares only prunes unpaid
-        // shares of inactive miners, so the miner row is required for
-        // the inactive-cutoff JOIN to match.
+        // been dark for >1 year. delete_old_shares only prunes unpaid
+        // shares of inactive miners (last_seen older than 1 year), so the
+        // miner row is required for the inactive-cutoff JOIN to match.
         let old_share = ShareRecord {
             id: None,
             round_id: 1,
@@ -10229,8 +10240,8 @@ mod tests {
         db.upsert_miner(&MinerRecord {
             miner_id: "miner_old".to_string(),
             payout_address: String::new(),
-            first_seen: now_s - (10 * 24 * 3600),
-            last_seen: now_s - (8 * 24 * 3600),
+            first_seen: now_s - (400 * 24 * 3600),
+            last_seen: now_s - (400 * 24 * 3600),
             connected_node: None,
             total_shares: 1,
             total_work: 1000.0,
@@ -10287,6 +10298,264 @@ mod tests {
             deleted, 0,
             "Recent share should survive minimum retention guard"
         );
+    }
+
+    // =========================================================================
+    // SHARE-LIFECYCLE / PAYOUT-LEDGER PROTECTION TESTS
+    //
+    // These guard the miners' earned-but-unpaid balances against the two
+    // hourly prune paths. `delete_old_shares` (Path A) is the SINGLE authority
+    // for share-row deletion; `run_maintenance`/`prune_old_rounds` (Path B)
+    // must never touch a still-needed share.
+    // =========================================================================
+
+    fn ledger_now_s() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn ledger_miner(id: &str, last_seen: i64) -> MinerRecord {
+        MinerRecord {
+            miner_id: id.to_string(),
+            payout_address: id.split('.').next().unwrap_or(id).to_string(),
+            first_seen: last_seen - 24 * 3600,
+            last_seen,
+            connected_node: None,
+            total_shares: 1,
+            total_work: 1500.0,
+            blocks_won: 0,
+            total_payouts_sats: 0,
+            avg_hashrate_ths: 0.0,
+        }
+    }
+
+    fn ledger_round(round_id: u64, status: PayoutStatus, start_time: i64) -> RoundRecord {
+        RoundRecord {
+            round_id,
+            block_height: 800_000 + round_id,
+            block_hash: Some(format!("blockhash{round_id}")),
+            start_time,
+            end_time: Some(start_time + 600),
+            total_shares: 0,
+            total_work: 0.0,
+            winning_miner: None,
+            found_by_node: None,
+            payout_status: status,
+            subsidy_sats: Some(625_000_000),
+            tx_fees_sats: Some(1_000_000),
+        }
+    }
+
+    fn ledger_share(round_id: u64, miner_id: &str, hash: &str, timestamp: i64) -> ShareRecord {
+        ShareRecord {
+            id: None,
+            round_id,
+            miner_id: miner_id.to_string(),
+            difficulty: 1500.0,
+            work: 1500.0,
+            share_hash: hash.to_string(),
+            timestamp,
+            received_by: "node1".to_string(),
+            valid: true,
+        }
+    }
+
+    /// THE CORE REGRESSION TEST.
+    ///
+    /// An actively-mining miner has an UNPAID share with an OLD `round_id`
+    /// (far inside the `keep_rounds` prune window) and an OLD timestamp. Both
+    /// hourly prune paths run. The share — and the miner's unpaid ledger — must
+    /// survive untouched.
+    ///
+    /// Pre-fix this FAILS: `run_maintenance` → `prune_old_shares` did
+    /// `DELETE FROM shares WHERE round_id < (MAX-keep_rounds)` with no
+    /// paid/last_seen check and wiped the share.
+    #[test]
+    fn test_active_miner_unpaid_share_survives_both_prune_paths() {
+        let db = Database::in_memory().unwrap();
+        let now_s = ledger_now_s();
+        let miner = "bc1qactive.worker";
+
+        // Actively-mining miner: last_seen == now.
+        db.upsert_miner(&ledger_miner(miner, now_s)).unwrap();
+
+        // Historic confirmed round, deep in the prune window.
+        db.create_round(&ledger_round(
+            1,
+            PayoutStatus::Confirmed,
+            now_s - 30 * 24 * 3600,
+        ))
+        .unwrap();
+        // A current round far ahead so MAX(round_id) - keep_rounds(1000) leaves
+        // round 1 well inside the window the buggy code would have deleted.
+        db.create_round(&ledger_round(2_000, PayoutStatus::Active, now_s))
+            .unwrap();
+
+        // UNPAID share: old round_id, old timestamp, active miner.
+        db.insert_share(&ledger_share(
+            1,
+            miner,
+            "active_old_unpaid",
+            now_s - 30 * 24 * 3600,
+        ))
+        .unwrap();
+
+        let (count_before, work_before) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(count_before, 1);
+
+        // Run BOTH hourly paths, exactly as the pool does.
+        db.run_maintenance(crate::database::MaintenanceConfig::default())
+            .unwrap();
+        db.delete_old_shares(24 * 3600).unwrap();
+
+        // The active miner's old unpaid share MUST still exist.
+        let shares = db.get_shares_by_round(1).unwrap();
+        assert_eq!(
+            shares.len(),
+            1,
+            "active miner's old unpaid share was wiped by a prune path"
+        );
+
+        let (count_after, work_after) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(count_after, 1, "unpaid-ledger count changed");
+        assert!(
+            (work_after - work_before).abs() < 1e-9,
+            "unpaid-ledger work changed: {work_before} -> {work_after}"
+        );
+    }
+
+    /// A miner dark for 30 days (< 1 year) keeps its unpaid share. Pre-fix this
+    /// FAILS: `delete_old_shares` dropped unpaid shares after only 7 days dark.
+    #[test]
+    fn test_dark_miner_under_one_year_unpaid_share_kept() {
+        let db = Database::in_memory().unwrap();
+        let now_s = ledger_now_s();
+        let miner = "bc1qdark30d.worker";
+
+        db.upsert_miner(&ledger_miner(miner, now_s - 30 * 24 * 3600))
+            .unwrap();
+        db.insert_share(&ledger_share(
+            1,
+            miner,
+            "dark30d_unpaid",
+            now_s - 30 * 24 * 3600,
+        ))
+        .unwrap();
+
+        db.run_maintenance(crate::database::MaintenanceConfig::default())
+            .unwrap();
+        let deleted = db.delete_old_shares(24 * 3600).unwrap();
+
+        assert_eq!(
+            deleted, 0,
+            "share of a 30-day-dark miner must not be pruned"
+        );
+        assert_eq!(db.get_shares_by_round(1).unwrap().len(), 1);
+        let (count, _) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// A miner dark for 400 days (> 1 year) has its abandoned unpaid share
+    /// reclaimed by `delete_old_shares`.
+    #[test]
+    fn test_dark_miner_over_one_year_unpaid_share_reclaimed() {
+        let db = Database::in_memory().unwrap();
+        let now_s = ledger_now_s();
+        let miner = "bc1qdark400d.worker";
+
+        db.upsert_miner(&ledger_miner(miner, now_s - 400 * 24 * 3600))
+            .unwrap();
+        db.insert_share(&ledger_share(
+            1,
+            miner,
+            "dark400d_unpaid",
+            now_s - 400 * 24 * 3600,
+        ))
+        .unwrap();
+
+        let deleted = db.delete_old_shares(24 * 3600).unwrap();
+        assert_eq!(
+            deleted, 1,
+            "share of a >1-year-dark miner must be reclaimed"
+        );
+        assert!(db.get_shares_by_round(1).unwrap().is_empty());
+    }
+
+    /// A PAID share older than the retention window is pruned (harmless audit
+    /// tail), regardless of the miner being active.
+    #[test]
+    fn test_paid_share_pruned_after_retention() {
+        let db = Database::in_memory().unwrap();
+        let now_s = ledger_now_s();
+        let miner = "bc1qpaid.worker";
+
+        // Active miner — proves the prune keys off PAID status, not last_seen.
+        db.upsert_miner(&ledger_miner(miner, now_s)).unwrap();
+        db.insert_share(&ledger_share(1, miner, "paid_old", now_s - 48 * 3600))
+            .unwrap();
+
+        // Commit it to a payout proposal => paid_in_proposal_hash set.
+        let marked = db
+            .mark_miners_paid(&[7u8; 32], &[miner.to_string()], now_s)
+            .unwrap();
+        assert_eq!(marked, 1);
+        // It is now off the unpaid ledger.
+        let (unpaid, _) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(unpaid, 0);
+
+        let deleted = db.delete_old_shares(24 * 3600).unwrap();
+        assert_eq!(deleted, 1, "paid share older than 24h must be pruned");
+        assert!(db.get_shares_by_round(1).unwrap().is_empty());
+    }
+
+    /// `prune_old_rounds` must never orphan a share: a past-window confirmed
+    /// round with a remaining share is NOT deleted; once Path A legitimately
+    /// removes the share, a later round prune deletes the now-empty round.
+    #[test]
+    fn test_prune_old_rounds_never_orphans_share() {
+        let db = Database::in_memory().unwrap();
+        let now_s = ledger_now_s();
+        let miner = "bc1qpinned.worker";
+
+        // Current round far ahead so MAX(round_id) - 1000 puts round 1 in window.
+        db.create_round(&ledger_round(2_000, PayoutStatus::Active, now_s))
+            .unwrap();
+        // Past-window, terminal-status (confirmed) round...
+        db.create_round(&ledger_round(
+            1,
+            PayoutStatus::Confirmed,
+            now_s - 30 * 24 * 3600,
+        ))
+        .unwrap();
+        // ...pinned by a remaining share.
+        db.insert_share(&ledger_share(1, miner, "pinning_share", now_s - 48 * 3600))
+            .unwrap();
+
+        // First prune: the share pins round 1 => it must survive.
+        db.prune_old_rounds(1000).unwrap();
+        assert!(
+            db.get_round(1).unwrap().is_some(),
+            "round with a remaining share was orphaned"
+        );
+        assert_eq!(db.get_shares_by_round(1).unwrap().len(), 1);
+
+        // Legitimately remove the share via Path A (mark paid, then age out).
+        db.mark_miners_paid(&[9u8; 32], &[miner.to_string()], now_s)
+            .unwrap();
+        assert_eq!(db.delete_old_shares(24 * 3600).unwrap(), 1);
+        assert!(db.get_shares_by_round(1).unwrap().is_empty());
+
+        // Now the round is empty + confirmed + past-window => it is pruned.
+        let deleted = db.prune_old_rounds(1000).unwrap();
+        assert!(deleted >= 1, "empty terminal round should now be prunable");
+        assert!(
+            db.get_round(1).unwrap().is_none(),
+            "empty terminal round was not pruned"
+        );
+        // The far-ahead active round is untouched.
+        assert!(db.get_round(2_000).unwrap().is_some());
     }
 
     // =========================================================================

@@ -4717,7 +4717,6 @@ async fn main() -> Result<()> {
                     match db_for_maintenance.run_maintenance(config) {
                         Ok(result) => {
                             tracing::info!(
-                                shares = result.shares_deleted,
                                 rounds = result.rounds_deleted,
                                 pings = result.pings_deleted,
                                 votes = result.votes_deleted,
