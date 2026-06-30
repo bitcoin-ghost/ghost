@@ -844,14 +844,27 @@ impl Database {
         Ok(())
     }
 
-    /// Prune old shares from the database
+    /// Prune old, fully-settled rounds from the database.
     ///
-    /// Deletes shares older than the specified number of rounds.
-    /// Returns the number of shares deleted.
+    /// A `rounds` row is deleted ONLY when all three hold:
+    ///   1. it is past the retention window (`round_id < MAX - keep_rounds`),
+    ///   2. its `payout_status` is terminal (`confirmed`/`orphaned`/`failed`),
+    ///   3. it has **zero remaining shares** referencing it.
     ///
-    /// 4.17 SECURITY: Wrapped in transaction for atomicity
-    pub fn prune_old_shares(&self, keep_rounds: u64) -> GhostResult<usize> {
-        // 4.17: Use transaction method for atomic prune
+    /// This function NEVER deletes from the `shares` table. Share-row lifecycle
+    /// is owned solely by [`Database::delete_old_shares`] (Path A), which keeps
+    /// an active or recently-dark miner's unpaid ledger intact. Because an
+    /// unpaid share pins its round via the `NOT EXISTS` guard, a round is only
+    /// reclaimed once `delete_old_shares` has legitimately removed its last
+    /// share (after payout, or after the miner has been dark for over a year).
+    ///
+    /// Note: `shares.round_id` has NO foreign key / `ON DELETE CASCADE` to
+    /// `rounds` (see the `shares` schema in migrations.rs), so deleting a round
+    /// can never cascade into a live unpaid share. The `NOT EXISTS` guard is a
+    /// belt-and-braces invariant that keeps round cleanup honest regardless.
+    ///
+    /// 4.17 SECURITY: Wrapped in transaction for atomicity.
+    pub fn prune_old_rounds(&self, keep_rounds: u64) -> GhostResult<usize> {
         self.transaction(|tx| {
             // Find the minimum round ID to keep
             let current_round: Option<u64> = tx
@@ -864,66 +877,26 @@ impl Database {
 
             let min_round_to_keep = current.saturating_sub(keep_rounds);
 
+            // Delete only terminal-status rounds past the window that have NO
+            // remaining shares. Shares are NOT touched here — an unpaid share
+            // keeps its round alive until Path A prunes that share.
             let deleted = tx
                 .execute(
-                    "DELETE FROM shares WHERE round_id < ?1",
+                    "DELETE FROM rounds
+                     WHERE round_id < ?1
+                       AND payout_status IN ('confirmed', 'orphaned', 'failed')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM shares s WHERE s.round_id = rounds.round_id
+                       )",
                     [min_round_to_keep],
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             if deleted > 0 {
-                info!(deleted, min_round = min_round_to_keep, "Pruned old shares");
-            }
-
-            Ok(deleted)
-        })
-    }
-
-    /// Prune old rounds from the database
-    ///
-    /// Deletes rounds older than the specified number and their associated data.
-    /// Only deletes rounds that are confirmed or orphaned.
-    /// Returns the number of rounds deleted.
-    ///
-    /// 4.17 SECURITY: Wrapped in transaction for atomicity and cascade deletion
-    pub fn prune_old_rounds(&self, keep_rounds: u64) -> GhostResult<usize> {
-        // 4.17: Use transaction method for atomic prune with cascade
-        self.transaction(|tx| {
-            // Find the minimum round ID to keep
-            let current_round: Option<u64> = tx
-                .query_row(
-                    "SELECT MAX(round_id) FROM rounds",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let Some(current) = current_round else {
-                return Ok(0);
-            };
-
-            let min_round_to_keep = current.saturating_sub(keep_rounds);
-
-            // 4.17: Delete shares first (child records) before rounds (parent)
-            let shares_deleted = tx.execute(
-                "DELETE FROM shares WHERE round_id < ?1",
-                [min_round_to_keep],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            // Only delete confirmed or orphaned rounds
-            let deleted = tx.execute(
-                "DELETE FROM rounds WHERE round_id < ?1 AND payout_status IN ('confirmed', 'orphaned', 'failed')",
-                [min_round_to_keep],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if deleted > 0 {
                 info!(
                     rounds_deleted = deleted,
-                    shares_deleted = shares_deleted,
                     min_round = min_round_to_keep,
-                    "Pruned old rounds and associated shares"
+                    "Pruned old empty rounds"
                 );
             }
 
@@ -1099,7 +1072,10 @@ impl Database {
     pub fn run_maintenance(&self, config: MaintenanceConfig) -> GhostResult<MaintenanceResult> {
         info!("Running database maintenance");
 
-        let shares_deleted = self.prune_old_shares(config.keep_rounds)?;
+        // NOTE: `shares` rows are NOT pruned here. The share-row lifecycle is
+        // owned solely by `delete_old_shares` (Path A, run by the dedicated
+        // share-pruning task), which protects active and recently-dark miners'
+        // unpaid ledgers. `prune_old_rounds` only removes already-empty rounds.
         let rounds_deleted = self.prune_old_rounds(config.keep_rounds)?;
         let pings_deleted = self.prune_old_health_pings(config.keep_health_ping_days)?;
         let votes_deleted = self.prune_old_votes(config.keep_rounds)?;
@@ -1119,8 +1095,7 @@ impl Database {
         self.checkpoint()?;
 
         // Optimize if significant data was deleted
-        let total_deleted = shares_deleted
-            + rounds_deleted
+        let total_deleted = rounds_deleted
             + pings_deleted
             + votes_deleted
             + uptime_deleted
@@ -1135,7 +1110,6 @@ impl Database {
         let stats = self.stats()?;
 
         info!(
-            shares_deleted,
             rounds_deleted,
             pings_deleted,
             votes_deleted,
@@ -1149,7 +1123,6 @@ impl Database {
         );
 
         Ok(MaintenanceResult {
-            shares_deleted,
             rounds_deleted,
             pings_deleted,
             votes_deleted,
@@ -1228,7 +1201,6 @@ impl Default for MaintenanceConfig {
 /// Result of database maintenance
 #[derive(Debug, Clone)]
 pub struct MaintenanceResult {
-    pub shares_deleted: usize,
     pub rounds_deleted: usize,
     pub pings_deleted: usize,
     pub votes_deleted: usize,

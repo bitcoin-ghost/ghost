@@ -316,54 +316,12 @@ fn test_558_share_work_sum() {
     assert!((total - 5500.0).abs() < 0.001);
 }
 
-#[test]
-fn test_559_prune_old_shares() {
-    let db = Database::in_memory().unwrap();
-
-    // Create multiple rounds
-    for round_id in 1..=10u64 {
-        let round = RoundRecord {
-            round_id,
-            block_height: 800000 + round_id,
-            block_hash: None,
-            start_time: 1700000000 + round_id as i64 * 1000,
-            end_time: Some(1700000000 + round_id as i64 * 1000 + 600),
-            total_shares: 1,
-            total_work: 1000.0,
-            winning_miner: None,
-            found_by_node: None,
-            payout_status: PayoutStatus::Confirmed,
-            subsidy_sats: Some(625_000_000),
-            tx_fees_sats: Some(1_000_000),
-        };
-        db.create_round(&round).unwrap();
-
-        let share = ShareRecord {
-            id: None,
-            round_id,
-            miner_id: "miner1".to_string(),
-            difficulty: 1000.0,
-            work: 1000.0,
-            share_hash: format!("hash{}", round_id),
-            timestamp: 1700000000 + round_id as i64 * 1000,
-            received_by: "node1".to_string(),
-            valid: true,
-        };
-        db.insert_share(&share).unwrap();
-    }
-
-    // Prune shares older than 5 rounds from current (round 10)
-    let deleted = db.prune_old_shares(5).unwrap();
-    assert!(deleted > 0);
-
-    // Shares from rounds 1-4 should be deleted
-    let old_shares = db.get_shares_by_round(1).unwrap();
-    assert!(old_shares.is_empty());
-
-    // Shares from round 10 should remain
-    let new_shares = db.get_shares_by_round(10).unwrap();
-    assert_eq!(new_shares.len(), 1);
-}
+// NOTE: the former `test_559_prune_old_shares` was removed along with the
+// `Database::prune_old_shares` function. That round-count-based bulk share
+// delete unconditionally wiped unpaid shares of active miners (the payout-
+// correctness bug). Share-row lifecycle is now owned solely by
+// `delete_old_shares` (Path A); see the dedicated protection tests in
+// `crates/ghost-storage/src/queries.rs` and `database.rs`.
 
 #[test]
 fn test_560_get_round_miners() {
