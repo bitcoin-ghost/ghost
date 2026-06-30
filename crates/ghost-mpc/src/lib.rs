@@ -75,6 +75,16 @@ pub use manager::{CeremonyManager, CeremonyState};
 pub use params::{MpcParameters, ParameterFiles};
 pub use sync::ParameterSync;
 
+/// Concrete Groth16 proving-parameter type used throughout the ceremony.
+///
+/// Re-exported as a stable alias so downstream crates (notably
+/// `ghost-consensus`, which wires the BFT voter to real cryptographic
+/// verification) can name and hold the candidate parameters WITHOUT taking a
+/// direct dependency on `bellperson`/`blstrs`. This is exactly the type
+/// accepted by [`CeremonyManager::verify_contribution`] and
+/// [`CeremonyManager::apply_contribution_multi`].
+pub type Groth16Params = bellperson::groth16::Parameters<blstrs::Bls12>;
+
 /// Maximum number of elders that contribute to the ceremony.
 /// After this, the ceremony ossifies and parameters are permanent.
 pub const MAX_CEREMONY_CONTRIBUTORS: u32 = 101;

@@ -6266,6 +6266,62 @@ impl Database {
         })
     }
 
+    /// Get an MPC contribution by its `new_params_hash` (lineage head produced
+    /// by that contribution).
+    ///
+    /// Used by the params-adoption path (a node fetching parameters it did not
+    /// itself vote on) to recover the full contribution record — proof, prev
+    /// hash, position — so it can re-run cryptographic `verify_contribution`
+    /// before hot-swapping, rather than trusting a bare hash match.
+    pub fn get_mpc_contribution_by_new_hash(
+        &self,
+        new_params_hash: &[u8; 32],
+    ) -> GhostResult<Option<MpcContributionRecord>> {
+        self.with_connection(|conn| {
+            let result: Option<(i64, String, Vec<u8>, Vec<u8>, i64, i64)> = conn
+                .query_row(
+                    "SELECT elder_position, contributor_node_id, prev_params_hash,
+                            contribution_proof, epoch, created_at
+                     FROM mpc_contributions WHERE new_params_hash = ?1",
+                    params![&new_params_hash[..]],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            match result {
+                Some((position, node_id, prev_hash, proof, epoch, created_at)) => {
+                    let mut prev_params_hash = [0u8; 32];
+                    if prev_hash.len() == 32 {
+                        prev_params_hash.copy_from_slice(&prev_hash);
+                    }
+                    Ok(Some(MpcContributionRecord {
+                        elder_position: i64_to_u32_count(position, "elder_position")
+                            .map_err(|e| GhostError::Database(e.to_string()))?,
+                        contributor_node_id: node_id,
+                        prev_params_hash,
+                        new_params_hash: *new_params_hash,
+                        contribution_proof: proof,
+                        epoch: i64_to_u64(epoch, "mpc_epoch")
+                            .map_err(|e| GhostError::Database(e.to_string()))?,
+                        created_at: i64_to_u64(created_at, "mpc_created_at")
+                            .map_err(|e| GhostError::Database(e.to_string()))?,
+                    }))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     /// Save an MPC verification vote
     pub fn save_mpc_vote(&self, vote: &MpcVerificationVote) -> GhostResult<()> {
         self.with_connection(|conn| {

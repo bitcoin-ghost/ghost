@@ -971,6 +971,84 @@ async fn try_fetch_params_from_seed(
     true
 }
 
+/// Fetch + parse one circuit's parameters from a peer entirely IN MEMORY.
+///
+/// Used by the BFT voter / params-adoption path to obtain a candidate parameter
+/// set for cryptographic verification without touching the on-disk parameter
+/// files (only the post-approval apply persists parameters). When
+/// `expected_hash` is set, the parsed parameters' `hash_parameters()` (the
+/// structured LINEAGE hash) must match or `None` is returned. The heavy
+/// parse/hash runs on a blocking thread so the async runtime is never stalled.
+#[cfg(feature = "mpc-ceremony")]
+async fn fetch_and_parse_params(
+    host: &str,
+    endpoint: &str,
+    expected_hash: Option<[u8; 32]>,
+) -> Option<ghost_mpc::Groth16Params> {
+    let url = format!("http://{}:8080/api/v1/mpc/{}", host, endpoint);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data = resp.bytes().await.ok()?;
+    if data.len() <= 1000 {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || {
+        let params = ghost_mpc::params::read_parameters_from_bytes(&data).ok()?;
+        if let Some(expected) = expected_hash {
+            let h = ghost_mpc::contribution::hash_parameters(&params).ok()?;
+            if h != expected {
+                tracing::debug!(
+                    expected = %hex::encode(&expected[..8]),
+                    got = %hex::encode(&h[..8]),
+                    "MPC fetch: parsed params hash != expected lineage hash"
+                );
+                return None;
+            }
+        }
+        Some(params)
+    })
+    .await
+    .ok()?
+}
+
+/// Fetch a full candidate parameter bundle (note-spend + payout + unshield) from
+/// the network for one contribution.
+///
+/// The primary note-spend parameters MUST hash-match `expected_note_spend_hash`
+/// (the contribution's claimed lineage head) — only then is a bundle returned.
+/// `payout`/`unshield` ride along best-effort (they share the same toxic waste).
+/// Returns `None` if no seed can supply matching note-spend parameters, which
+/// forces the voter to ABSTAIN rather than approve blind.
+#[cfg(feature = "mpc-ceremony")]
+async fn fetch_ceremony_params_bundle(
+    seeds: &[String],
+    expected_note_spend_hash: [u8; 32],
+) -> Option<ghost_consensus::mpc_handler::FetchedCeremonyParams> {
+    for seed in seeds {
+        let host = seed.split(':').next().unwrap_or(seed);
+        let note_spend =
+            match fetch_and_parse_params(host, "params", Some(expected_note_spend_hash)).await {
+                Some(p) => p,
+                None => continue,
+            };
+        let payout = fetch_and_parse_params(host, "payout-params", None).await;
+        let unshield = fetch_and_parse_params(host, "unshield-params", None).await;
+        return Some(ghost_consensus::mpc_handler::FetchedCeremonyParams {
+            note_spend: std::sync::Arc::new(note_spend),
+            payout: payout.map(std::sync::Arc::new),
+            unshield: unshield.map(std::sync::Arc::new),
+        });
+    }
+    None
+}
+
 /// Startup self-heal: ensure the trusted-setup parameters exist on disk before
 /// the hard `load_trusted_params` check, fetching them from seeds if missing.
 ///
@@ -2744,233 +2822,181 @@ async fn main() -> Result<()> {
         // we need to fetch the actual params binary from the contributor so our
         // local params stay current. Without this, /api/v1/mpc/params serves stale
         // genesis params and new contributors can't build valid hash chains.
-        let params_dir_for_callback = ceremony_manager.params_dir().clone();
         let ceremony_mgr_for_callback = Arc::clone(&ceremony_manager);
         let seed_nodes_for_callback = config.network.seed_nodes.clone();
+        let db_for_callback = Arc::clone(&db);
         type ParamsUpdateFn = dyn Fn(&[u8; 32], &[u8; 32]) + Send + Sync;
         let params_update_callback: Arc<ParamsUpdateFn> = Arc::new(
             move |expected_hash: &[u8; 32], _contributor: &[u8; 32]| {
-                let params_dir = params_dir_for_callback.clone();
                 let ceremony_mgr = Arc::clone(&ceremony_mgr_for_callback);
                 let seeds = seed_nodes_for_callback.clone();
+                let db = Arc::clone(&db_for_callback);
                 let expected = *expected_hash;
                 tokio::spawn(async move {
-                    // Small delay to let the contributing node finish writing
+                    // Small delay to let the contributing node finish writing.
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    // Serialise this callback's param writes against the
-                    // ceremony-task fetch path so the two writers can never
-                    // interleave on the same `note_spend_params_*.bin` files.
+
+                    // Fast path: we already hold these params (e.g. we voted and
+                    // applied through the manager directly). Nothing to adopt.
+                    if ceremony_mgr.current_params_hash() == expected {
+                        return;
+                    }
+
+                    // SECURITY (params_callback trust-gap upgrade): a node adopting
+                    // parameters it did not itself vote on must run the SAME
+                    // cryptographic gate as a voter — never adopt on a bare hash
+                    // match. Recover the full contribution (proof, prev, position)
+                    // from the BFT-approved row that apply_contribution persisted.
+                    let record = match db.get_mpc_contribution_by_new_hash(&expected) {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
+                            tracing::warn!(
+                                expected = %hex::encode(&expected[..8]),
+                                "MPC params_callback: no approved contribution row for hash — refusing to adopt"
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MPC params_callback: contribution lookup failed");
+                            return;
+                        }
+                    };
+                    let proof: ghost_mpc::ContributionProof = match serde_json::from_slice(
+                        &record.contribution_proof,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MPC params_callback: malformed stored proof — refusing to adopt");
+                            return;
+                        }
+                    };
+                    let contribution = ghost_mpc::MpcContribution {
+                        position: record.elder_position,
+                        prev_params_hash: record.prev_params_hash,
+                        new_params_hash: record.new_params_hash,
+                        proof,
+                        contributor: record.contributor_node_id.clone(),
+                        timestamp: record.created_at,
+                        commitment_hash: None,
+                    };
+
+                    // Serialise param writes against the other writers (startup
+                    // fetch, BFT apply) on the shared parameter files.
                     let _param_write_guard = param_write_lock().lock().await;
-                    let _ = std::fs::create_dir_all(&params_dir);
-                    // Try each seed node, verify the fetched params hash matches
-                    for seed in &seeds {
-                        let host = seed.split(':').next().unwrap_or(seed);
-                        let url = format!("http://{}:8080/api/v1/mpc/params", host);
-                        match reqwest::Client::new()
-                            .get(&url)
-                            .timeout(std::time::Duration::from_secs(60))
-                            .send()
-                            .await
-                        {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.bytes().await {
-                                    Ok(data) if data.len() > 1000 => {
-                                        // Write to temp file, load, verify hash
-                                        let tmp_path = params_dir.join("note_spend_params_tmp.bin");
-                                        if let Err(e) = std::fs::write(&tmp_path, &data) {
-                                            tracing::warn!(error = %e, peer = %host,
-                                                "MPC params_callback: Failed to write temp params");
-                                            continue;
-                                        }
-                                        // Load and verify hash before committing
-                                        match ghost_mpc::params::load_parameters(&tmp_path) {
-                                            Ok(params) => {
-                                                match ghost_mpc::contribution::hash_parameters(
-                                                    &params,
-                                                ) {
-                                                    Ok(hash) if hash == expected => {
-                                                        // Hash matches! Move to current
-                                                        let current = params_dir
-                                                            .join("note_spend_params_current.bin");
-                                                        if let Err(e) =
-                                                            std::fs::rename(&tmp_path, &current)
-                                                        {
-                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to rename params");
-                                                            continue;
-                                                        }
-                                                        // Save updated VK alongside params
-                                                        let vk_path =
-                                                            params_dir.join("note_spend_vk.bin");
-                                                        if let Err(e) =
-                                                            ghost_mpc::params::save_verifying_key(
-                                                                &vk_path, &params.vk,
-                                                            )
-                                                        {
-                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to save VK");
-                                                        }
-                                                        if let Err(e) =
-                                                            ceremony_mgr.load_current_params()
-                                                        {
-                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to reload");
-                                                        } else {
-                                                            tracing::info!(
-                                                                size = data.len(),
-                                                                peer = %host,
-                                                                hash = %hex::encode(&hash[..8]),
-                                                                "MPC params_callback: Verified and updated note_spend params"
-                                                            );
-                                                        }
-                                                        // Also fetch latest payout params from same peer (with VK extraction)
-                                                        let payout_url = format!("http://{}:8080/api/v1/mpc/payout-params", host);
-                                                        if let Ok(payout_resp) =
-                                                            reqwest::Client::new()
-                                                                .get(&payout_url)
-                                                                .timeout(
-                                                                    std::time::Duration::from_secs(
-                                                                        60,
-                                                                    ),
-                                                                )
-                                                                .send()
-                                                                .await
-                                                        {
-                                                            if payout_resp.status().is_success() {
-                                                                if let Ok(payout_data) =
-                                                                    payout_resp.bytes().await
-                                                                {
-                                                                    if payout_data.len() > 1000 {
-                                                                        let payout_current = params_dir.join("payout_params_current.bin");
-                                                                        let payout_write =
-                                                                            std::fs::read_link(
-                                                                                &payout_current,
-                                                                            )
-                                                                            .unwrap_or(
-                                                                                payout_current
-                                                                                    .clone(),
-                                                                            );
-                                                                        if let Err(e) =
-                                                                            std::fs::write(
-                                                                                &payout_write,
-                                                                                &payout_data,
-                                                                            )
-                                                                        {
-                                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to save payout params");
-                                                                        } else {
-                                                                            // Extract and save payout VK
-                                                                            if let Ok(payout_params) = ghost_mpc::params::load_parameters(&payout_write) {
-                                                                                let payout_vk_path = params_dir.join("payout_vk.bin");
-                                                                                if let Err(e) = ghost_mpc::params::save_verifying_key(&payout_vk_path, &payout_params.vk) {
-                                                                                    tracing::warn!(error = %e, "MPC params_callback: Failed to save payout VK");
-                                                                                }
-                                                                            }
-                                                                            tracing::info!(
-                                                                                size = payout_data.len(),
-                                                                                peer = %host,
-                                                                                "MPC params_callback: Updated payout params"
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        // Also fetch latest unshield params from same peer (with VK extraction)
-                                                        let unshield_url = format!("http://{}:8080/api/v1/mpc/unshield-params", host);
-                                                        if let Ok(unshield_resp) =
-                                                            reqwest::Client::new()
-                                                                .get(&unshield_url)
-                                                                .timeout(
-                                                                    std::time::Duration::from_secs(
-                                                                        60,
-                                                                    ),
-                                                                )
-                                                                .send()
-                                                                .await
-                                                        {
-                                                            if unshield_resp.status().is_success() {
-                                                                if let Ok(unshield_data) =
-                                                                    unshield_resp.bytes().await
-                                                                {
-                                                                    if unshield_data.len() > 1000 {
-                                                                        let unshield_current = params_dir.join("unshield_params_current.bin");
-                                                                        let unshield_write =
-                                                                            std::fs::read_link(
-                                                                                &unshield_current,
-                                                                            )
-                                                                            .unwrap_or(
-                                                                                unshield_current
-                                                                                    .clone(),
-                                                                            );
-                                                                        if let Err(e) =
-                                                                            std::fs::write(
-                                                                                &unshield_write,
-                                                                                &unshield_data,
-                                                                            )
-                                                                        {
-                                                                            tracing::warn!(error = %e, "MPC params_callback: Failed to save unshield params");
-                                                                        } else {
-                                                                            // Extract and save unshield VK
-                                                                            if let Ok(unshield_params) = ghost_mpc::params::load_parameters(&unshield_write) {
-                                                                                let unshield_vk_path = params_dir.join("unshield_vk.bin");
-                                                                                if let Err(e) = ghost_mpc::params::save_verifying_key(&unshield_vk_path, &unshield_params.vk) {
-                                                                                    tracing::warn!(error = %e, "MPC params_callback: Failed to save unshield VK");
-                                                                                }
-                                                                            }
-                                                                            tracing::info!(
-                                                                                size = unshield_data.len(),
-                                                                                peer = %host,
-                                                                                "MPC params_callback: Updated unshield params"
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        return;
-                                                    }
-                                                    Ok(hash) => {
-                                                        tracing::debug!(
-                                                            peer = %host,
-                                                            got = %hex::encode(&hash[..8]),
-                                                            expected = %hex::encode(&expected[..8]),
-                                                            "MPC params_callback: Hash mismatch, trying next peer"
-                                                        );
-                                                        let _ = std::fs::remove_file(&tmp_path);
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(error = %e, "MPC params_callback: Hash computation failed");
-                                                        let _ = std::fs::remove_file(&tmp_path);
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, peer = %host,
-                                                    "MPC params_callback: Failed to load params for verification");
-                                                let _ = std::fs::remove_file(&tmp_path);
-                                            }
-                                        }
-                                    }
-                                    _ => continue,
-                                }
+
+                    // Fetch the candidate bundle (note-spend hash MUST match).
+                    let bundle = match fetch_ceremony_params_bundle(&seeds, expected).await {
+                        Some(b) => b,
+                        None => {
+                            tracing::warn!(
+                                expected = %hex::encode(&expected[..8]),
+                                "MPC params_callback: no peer had matching params"
+                            );
+                            return;
+                        }
+                    };
+
+                    // CRYPTO GATE: verify the fetched params are a valid
+                    // transformation of OUR current params (the prev) before
+                    // hot-swapping. Genesis (position 1) / pre-genesis nodes have
+                    // no prev to verify against and adopt the hash-pinned anchor.
+                    if contribution.position >= 2 && ceremony_mgr.has_current_params() {
+                        let mgr = Arc::clone(&ceremony_mgr);
+                        let note_spend = Arc::clone(&bundle.note_spend);
+                        let contribution_for_verify = contribution.clone();
+                        let verified = tokio::task::spawn_blocking(move || {
+                            mgr.verify_contribution(&note_spend, &contribution_for_verify)
+                        })
+                        .await;
+                        match verified {
+                            Ok(Ok(true)) => {}
+                            other => {
+                                tracing::warn!(
+                                    position = contribution.position,
+                                    result = ?other,
+                                    "MPC params_callback: candidate params FAILED verification — refusing to adopt (never adopt on hash match alone)"
+                                );
+                                return;
                             }
-                            _ => continue,
                         }
                     }
-                    tracing::warn!(
-                        expected = %hex::encode(&expected[..8]),
-                        "MPC params_callback: No peer had matching params"
-                    );
+
+                    // Adopt through the manager: disk write + symlink + in-memory
+                    // hot-swap + count/current_params_hash + ossify check.
+                    let note_spend = (*bundle.note_spend).clone();
+                    let payout = bundle.payout.as_ref().map(|p| (**p).clone());
+                    let unshield = bundle.unshield.as_ref().map(|p| (**p).clone());
+                    let mgr = Arc::clone(&ceremony_mgr);
+                    let contribution_for_apply = contribution.clone();
+                    let applied = tokio::task::spawn_blocking(move || {
+                        mgr.apply_contribution_multi(
+                            note_spend,
+                            payout,
+                            unshield,
+                            &contribution_for_apply,
+                        )
+                    })
+                    .await;
+                    match applied {
+                        Ok(Ok(())) => {
+                            // Persist the singleton from the manager's authoritative state.
+                            let s = ceremony_mgr.state();
+                            let db_state = ghost_storage::queries::MpcCeremonyState {
+                                contribution_count: s.contribution_count,
+                                current_params_hash: s.current_params_hash,
+                                is_ossified: s.is_ossified,
+                                ossified_at: s.ossified_at,
+                                block_vk_hash: s.note_spend_vk_hash,
+                                payout_vk_hash: s.payout_vk_hash,
+                                updated_at: s.updated_at,
+                                ceremony_id: s.ceremony_id,
+                            };
+                            if let Err(e) = db.save_mpc_ceremony_state(&db_state) {
+                                tracing::warn!(error = %e, "MPC params_callback: failed to persist ceremony singleton");
+                            }
+                            tracing::info!(
+                                position = contribution.position,
+                                hash = %hex::encode(&expected[..8]),
+                                "MPC params_callback: verified and adopted contribution params"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, position = contribution.position, "MPC params_callback: manager apply failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MPC params_callback: apply task panicked");
+                        }
+                    }
                 });
             },
         );
+
+        // Stage 1a: the network fetcher the voter uses to obtain a candidate's
+        // parameters before running real cryptographic verification. Fetches the
+        // bundle in memory (no disk writes — verification is read-only).
+        let seed_nodes_for_fetch = config.network.seed_nodes.clone();
+        let params_fetcher: ghost_consensus::mpc_handler::MpcParamsFetchFn =
+            Arc::new(move |expected: [u8; 32]| {
+                let seeds = seed_nodes_for_fetch.clone();
+                Box::pin(async move { fetch_ceremony_params_bundle(&seeds, expected).await })
+            });
 
         let mpc_handler = Arc::new(
             MpcHandler::new(Arc::clone(&identity), Arc::clone(&db))
                 .with_broadcaster(mpc_broadcast)
                 .with_params_callback(params_update_callback)
+                // Stage 1a: wire the authoritative crypto backend + fetcher so the
+                // voter verifies (Schnorr + pairing) before approving.
+                .with_ceremony_manager(Arc::clone(&ceremony_manager))
+                .with_params_fetcher(params_fetcher)
                 .with_state(
                     ceremony_manager.contribution_count(),
                     ceremony_manager.is_ossified(),
                 ),
         );
+        // Install the self-reference so MPC message handling can offload heavy
+        // fetch/verify/apply work off the single-threaded mesh message loop.
+        mpc_handler.init_self_ref();
 
         // Register MPC handler with mesh
         mesh.register_handler(Arc::clone(&mpc_handler)
