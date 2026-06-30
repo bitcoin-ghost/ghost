@@ -581,7 +581,7 @@ impl CeremonyManager {
     /// chain or adopts an already-BFT-approved historical contribution, the
     /// live ±1h freshness window would wrongly reject it. This runs the SAME
     /// cryptographic checks (Schnorr proof bound to `ceremony_id`, hash chain,
-    /// h/l pairing transform) via [`verify_contribution_lineage`], omitting only
+    /// h/l pairing transform) via [`crate::contribution::verify_contribution_lineage`], omitting only
     /// the freshness window. Unlike [`Self::verify_contribution`] it does NOT
     /// require `contribution.position == count+1`, because catch-up validates a
     /// position relative to a supplied `prev` rather than the live head.
