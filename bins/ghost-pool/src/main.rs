@@ -649,13 +649,199 @@ fn params_blob_is_trusted(data: &[u8], expected_hash: Option<&[u8; 32]>) -> bool
     }
 }
 
+/// Process-wide serialisation for trusted-setup parameter writes.
+///
+/// BOTH the ceremony-task fetch path ([`fetch_one_param`]) and the
+/// BFT-apply params-update callback write the SAME on-disk files
+/// (`note_spend_params_*.bin` and friends). If two of those writes interleaved,
+/// the next startup's `load_trusted_params` (or a live reader) could observe a
+/// half-written, right-sized but wrong-hash file — exactly the node6
+/// crash-loop signature. Holding this async mutex across the write +
+/// verify-after-write critical section makes every parameter write atomic with
+/// respect to every other, so no torn/raced file is ever produced.
+#[cfg(feature = "mpc-ceremony")]
+fn param_write_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// SHA-256 of a file's raw bytes.
+///
+/// Matches `ghost_zkp::compute_params_file_hash` and [`params_blob_is_trusted`]
+/// (the pinned `ZK_PARAMS_HASH` BLOCK digest is the SHA-256 of the params file
+/// bytes), so this is the canonical way to validate params already on disk.
+#[cfg(feature = "mpc-ceremony")]
+fn sha256_file(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// True iff `note_spend_params_current.bin` exists in `params_dir` and — when a
+/// hash is pinned — its SHA-256 matches.
+///
+/// Mirrors the gate `load_trusted_params` applies at startup, so a node that
+/// already holds valid trusted-setup params on disk is recognised WITHOUT
+/// re-fetching them (a re-fetch would overwrite the good file). With no pinned
+/// hash (test nets) only presence is required, matching historical behaviour.
+#[cfg(feature = "mpc-ceremony")]
+fn ondisk_note_spend_valid(params_dir: &std::path::Path, expected_hash: Option<&[u8; 32]>) -> bool {
+    let current = params_dir.join("note_spend_params_current.bin");
+    if !current.exists() {
+        return false;
+    }
+    match expected_hash {
+        Some(pinned) => matches!(sha256_file(&current), Ok(actual) if &actual == pinned),
+        None => true,
+    }
+}
+
+/// Atomically write `data` to `final_path`: write a unique temp file in the same
+/// directory, `fsync` it, then `rename` it over the destination.
+///
+/// `rename(2)` is atomic on a single filesystem, so a concurrent reader or a
+/// crash mid-write never observes a partially written params file (the node6
+/// right-sized/wrong-hash corruption). The temp name is unique per write so two
+/// concurrent writers cannot scribble over each other's in-progress file.
+#[cfg(feature = "mpc-ceremony")]
+fn write_params_atomic(final_path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let dir = final_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = final_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "params.bin".to_string());
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        ".{}.tmp.{}.{}",
+        file_name,
+        std::process::id(),
+        nonce
+    ));
+
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp_path, final_path)?;
+        Ok(())
+    })();
+
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    res
+}
+
+/// Install `data` as the trusted `<base>_v0.bin`, repoint `<base>_current.bin`
+/// at it, then VERIFY-AFTER-WRITE.
+///
+/// The write is atomic ([`write_params_atomic`]). After repointing `current`,
+/// the file `load_trusted_params` will actually read is re-read from disk and
+/// re-hashed against `expected_hash`. If a torn/raced write (or any I/O fault)
+/// left a wrong file in place, both the `current` pointer and the `v0` file are
+/// removed and `false` is returned — a corrupt trusted-setup file is NEVER left
+/// behind to crash-loop the node. With no pinned hash (test nets) no post-write
+/// hash check is possible; the caller's size gate still applies.
+///
+/// Callers MUST hold [`param_write_lock`] across this call so the verify-after
+/// read cannot be swapped by a concurrent writer.
+#[cfg(feature = "mpc-ceremony")]
+fn install_and_verify_param(
+    params_dir: &std::path::Path,
+    base: &str,
+    data: &[u8],
+    expected_hash: Option<&[u8; 32]>,
+) -> bool {
+    let params_path = params_dir.join(format!("{}_v0.bin", base));
+    let current_path = params_dir.join(format!("{}_current.bin", base));
+
+    if let Err(e) = write_params_atomic(&params_path, data) {
+        warn!(error = %e, base, "MPC: failed to save fetched params");
+        return false;
+    }
+
+    // Point `<base>_current.bin` at the version we just wrote.
+    let _ = std::fs::remove_file(&current_path);
+    if let Err(e) = std::os::unix::fs::symlink(&params_path, &current_path) {
+        warn!(error = %e, base, "MPC: failed to create params symlink");
+    }
+
+    // SECURITY: verify-after-write. Re-read the exact file the next startup's
+    // `load_trusted_params` will read and re-check its hash against the pinned
+    // digest. Leaving a corrupt file here is what crash-loops a node.
+    if let Some(expected) = expected_hash {
+        match sha256_file(&current_path) {
+            Ok(actual) if &actual == expected => {}
+            Ok(_) => {
+                warn!(
+                    base,
+                    "MPC: SECURITY: params failed verify-after-write (on-disk hash != pinned) — removing corrupt file"
+                );
+                let _ = std::fs::remove_file(&current_path);
+                let _ = std::fs::remove_file(&params_path);
+                return false;
+            }
+            Err(e) => {
+                warn!(error = %e, base, "MPC: failed verify-after-write re-read — removing");
+                let _ = std::fs::remove_file(&current_path);
+                let _ = std::fs::remove_file(&params_path);
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Move an existing-but-corrupt `note_spend_params_current.bin` aside for
+/// forensics (suffixed `.corrupt.<unixsecs>`) and drop the live `current`
+/// pointer so a fresh fetch recreates it. Best-effort: if the rename fails the
+/// backing file is removed so it can never be re-read as trusted.
+#[cfg(all(feature = "zk-consensus", feature = "mpc-ceremony"))]
+fn quarantine_corrupt_note_spend(params_dir: &std::path::Path) {
+    let current = params_dir.join("note_spend_params_current.bin");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Resolve the real backing file (`current` is usually a symlink to *_v0.bin).
+    let real = std::fs::canonicalize(&current).unwrap_or_else(|_| current.clone());
+    let mut quarantined = real.clone().into_os_string();
+    quarantined.push(format!(".corrupt.{}", ts));
+    let quarantined = std::path::PathBuf::from(quarantined);
+    if let Err(e) = std::fs::rename(&real, &quarantined) {
+        warn!(error = %e, path = %real.display(), "MPC: failed to quarantine corrupt params; removing instead");
+        let _ = std::fs::remove_file(&real);
+    } else {
+        warn!(from = %real.display(), to = %quarantined.display(), "MPC: quarantined corrupt trusted-setup params");
+    }
+    // Drop the (now possibly dangling) `current` pointer so the re-fetch recreates it.
+    let _ = std::fs::remove_file(&current);
+}
+
 /// Fetch a single MPC parameter set from one seed, verify it, and write it to
 /// `params_dir` (as `<base>_v0.bin`, the `<base>_current.bin` symlink, and the
 /// extracted `<vk_name>` verifying key).
 ///
 /// Returns `true` only when the blob was fetched, passed
-/// [`params_blob_is_trusted`], and was written. A hash mismatch is rejected
-/// (returns `false`) so the caller moves on to the next seed.
+/// [`params_blob_is_trusted`], was written atomically, and passed
+/// verify-after-write. A hash mismatch is rejected (returns `false`) so the
+/// caller moves on to the next seed.
 #[cfg(feature = "mpc-ceremony")]
 async fn fetch_one_param(
     host: &str,
@@ -711,25 +897,28 @@ async fn fetch_one_param(
 
     let _ = std::fs::create_dir_all(params_dir);
     let params_path = params_dir.join(format!("{}_v0.bin", base));
-    let current_path = params_dir.join(format!("{}_current.bin", base));
 
-    if let Err(e) = std::fs::write(&params_path, &data) {
-        warn!(error = %e, endpoint, "MPC: failed to save fetched params");
-        return false;
-    }
-
-    // Point `<base>_current.bin` at the version we just wrote.
-    let _ = std::fs::remove_file(&current_path);
-    if let Err(e) = std::os::unix::fs::symlink(&params_path, &current_path) {
-        warn!(error = %e, endpoint, "MPC: failed to create params symlink");
-    }
-
-    // Extract and persist the verifying key for proof verification.
-    if let Ok(params) = ghost_mpc::params::load_parameters(&params_path) {
-        let vk_path = params_dir.join(vk_name);
-        if let Err(e) = ghost_mpc::params::save_verifying_key(&vk_path, &params.vk) {
-            warn!(error = %e, endpoint, "MPC: failed to save verifying key");
+    // Serialise the write + verify-after-write against every other parameter
+    // write (the BFT-apply callback, other fetch tasks) so a concurrent writer
+    // can neither tear this file nor swap it between our write and our re-read.
+    let installed = {
+        let _write_guard = param_write_lock().lock().await;
+        if !install_and_verify_param(params_dir, base, &data, expected_hash) {
+            false
+        } else {
+            // Extract and persist the verifying key while STILL holding the lock,
+            // so the file we read is exactly the one we just verified.
+            if let Ok(params) = ghost_mpc::params::load_parameters(&params_path) {
+                let vk_path = params_dir.join(vk_name);
+                if let Err(e) = ghost_mpc::params::save_verifying_key(&vk_path, &params.vk) {
+                    warn!(error = %e, endpoint, "MPC: failed to save verifying key");
+                }
+            }
+            true
         }
+    };
+    if !installed {
+        return false;
     }
 
     info!(size = data.len(), peer = %host, endpoint, "MPC: fetched + verified params from peer");
@@ -797,20 +986,47 @@ async fn ensure_mpc_params_present(
     params_dir: &std::path::Path,
 ) -> Result<()> {
     let current = params_dir.join("note_spend_params_current.bin");
+    let expected = expected_param_hashes();
+
     if current.exists() {
-        return Ok(());
+        // Present — but DON'T blindly trust it. Validate against the pinned
+        // ZK_PARAMS_HASH (the same gate `load_trusted_params` enforces on the
+        // next line). A present-but-CORRUPT file (the node6 crash-loop) must
+        // SELF-HEAL: quarantine the bad file and fall through to re-fetch,
+        // rather than returning Ok and letting the hard hash check kill the
+        // process. NEVER continue with unverified params.
+        match expected.get("BLOCK") {
+            Some(pinned) => match sha256_file(&current) {
+                Ok(actual) if &actual == pinned => return Ok(()),
+                Ok(actual) => {
+                    warn!(
+                        expected = %hex::encode(pinned),
+                        got = %hex::encode(actual),
+                        path = %current.display(),
+                        "MPC params present but hash MISMATCHES the pinned ZK_PARAMS_HASH — quarantining and re-fetching from seeds (self-heal)"
+                    );
+                    quarantine_corrupt_note_spend(params_dir);
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %current.display(), "MPC params present but unreadable — quarantining and re-fetching");
+                    quarantine_corrupt_note_spend(params_dir);
+                }
+            },
+            // No pinned hash (test nets): preserve historical behaviour — a
+            // present file is accepted as-is (nothing to verify it against).
+            None => return Ok(()),
+        }
     }
 
     if seed_nodes.is_empty() {
         return Err(anyhow::anyhow!(
-            "MPC params missing at {} and no seed nodes are configured to fetch them from. \
-             Add at least one reachable seed to network.seed_nodes, or run the genesis node \
-             with --genesis to create the ceremony.",
+            "MPC params missing or quarantined at {} and no seed nodes are configured to fetch \
+             them from. Add at least one reachable seed to network.seed_nodes, or run the genesis \
+             node with --genesis to create the ceremony.",
             params_dir.display()
         ));
     }
 
-    let expected = expected_param_hashes();
     warn!(
         path = %params_dir.display(),
         seeds = seed_nodes.len(),
@@ -1982,10 +2198,13 @@ async fn main() -> Result<()> {
             #[cfg(feature = "mpc-ceremony")]
             if let Ok(zk_params_path) = std::env::var(ghost_zkp::ZK_PARAMS_PATH_ENV) {
                 let params_dir = std::path::PathBuf::from(&zk_params_path);
-                let current = params_dir.join("note_spend_params_current.bin");
-                if !current.exists() {
-                    ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
-                }
+                // ALWAYS run the self-heal: it validates present params against
+                // the pinned hash and quarantines + re-fetches a present-but-
+                // corrupt set (the node6 case), in addition to fetching a missing
+                // one. Gating this on `!current.exists()` would let a corrupt-but-
+                // present file slip straight into the hard `load_trusted_params`
+                // check below and crash-loop the node.
+                ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
             }
             ghost_zkp::load_trusted_params()?;
             info!("ZK consensus using PRODUCTION parameters from MPC ceremony");
@@ -2445,6 +2664,10 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     // Small delay to let the contributing node finish writing
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    // Serialise this callback's param writes against the
+                    // ceremony-task fetch path so the two writers can never
+                    // interleave on the same `note_spend_params_*.bin` files.
+                    let _param_write_guard = param_write_lock().lock().await;
                     let _ = std::fs::create_dir_all(&params_dir);
                     // Try each seed node, verify the fetched params hash matches
                     for seed in &seeds {
@@ -2695,6 +2918,38 @@ async fn main() -> Result<()> {
                 return;
             }
 
+            // ROOT-CAUSE GUARD (node6 crash-loop): in production the trusted
+            // setup is PINNED via `ZK_PARAMS_HASH=BLOCK:<sha256>` and therefore
+            // FROZEN — its on-disk SHA-256 must stay equal to that digest or the
+            // next startup's `load_trusted_params` fails and the node crash-loops.
+            // If we already hold params matching the pinned BLOCK hash, the
+            // ceremony is complete for us: load them into memory and DO NOT enter
+            // the contribution/fetch loop below. Either branch of that loop would
+            // OVERWRITE the pinned file on disk — a network re-fetch, or (worse)
+            // a freshly *generated* contribution whose random params hash to a
+            // different value every time (exactly the observed "3 different wrong
+            // hashes, same size"). This guard fires regardless of whether local
+            // ceremony state happens to be flagged ossified. On test nets (no
+            // pinned BLOCK hash) it does nothing, so an open ceremony still forms.
+            {
+                let pinned = expected_param_hashes();
+                if pinned.contains_key("BLOCK") {
+                    let params_dir_for_check = ceremony_manager_for_startup.params_dir().clone();
+                    if ondisk_note_spend_valid(&params_dir_for_check, pinned.get("BLOCK")) {
+                        if !ceremony_manager_for_startup.has_current_params() {
+                            // Adopt the valid on-disk params into memory (so the
+                            // params API can serve them) without re-fetching.
+                            let _ = ceremony_manager_for_startup.load_current_params();
+                        }
+                        info!(
+                            "MPC: trusted setup is pinned and valid on disk — ceremony is frozen; \
+                             not fetching or contributing (prevents clobbering the pinned params)"
+                        );
+                        return;
+                    }
+                }
+            }
+
             // Retry loop: attempt contribution up to 5 times with random 10-100s intervals.
             // This handles race conditions where multiple nodes try the same position
             // simultaneously — the loser retries at the next position.
@@ -2719,7 +2974,14 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                // Ensure we have parameters loaded
+                // Ensure we have parameters loaded.
+                //
+                // NOTE: a node holding VALID pinned trusted-setup params already
+                // returned above (the frozen-ceremony guard), so reaching here in
+                // production means params are genuinely missing/invalid on disk
+                // and the fetch below heals them (and verifies against the pinned
+                // hash). On test nets (no pinned hash) this is the normal forming
+                // path. Either way the fetch can no longer clobber pinned params.
                 if !ceremony_manager_for_startup.has_current_params() {
                     // Use DB to determine if this is truly genesis or if we need to fetch
                     let db_count = db_for_mpc.get_mpc_elder_count().unwrap_or(0) as u32;
@@ -2944,6 +3206,23 @@ async fn main() -> Result<()> {
                             return;
                         }
                     }
+                }
+
+                // DEFENCE IN DEPTH: never generate/apply a contribution once the
+                // trusted setup is PINNED. A contribution transforms the params,
+                // changing their hash — which would break the pinned
+                // `ZK_PARAMS_HASH` check on every node. In production the only
+                // legitimate actions are "load existing pinned params" or "fetch
+                // the pinned params if missing" (both done above); contributing
+                // is a test-net / ceremony-formation activity only. This also
+                // closes the residual window where a production node that healed
+                // missing params in the fetch step above would otherwise proceed
+                // to overwrite them with a freshly generated contribution.
+                if expected_param_hashes().contains_key("BLOCK") {
+                    info!(
+                        "MPC: trusted setup is pinned (ZK_PARAMS_HASH) — skipping contribution generation; params are frozen"
+                    );
+                    return;
                 }
 
                 // Determine position from DB (authoritative source, not stale in-memory state)
@@ -6390,5 +6669,203 @@ mod tests {
     #[test]
     fn parse_param_hashes_empty_is_empty() {
         assert!(parse_param_hashes("").is_empty());
+    }
+
+    // ── Atomic write + verify-after-write + self-heal ────────────────
+
+    /// `write_params_atomic` lands a file whose re-read hash matches the input,
+    /// and leaves no stray temp file behind.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn write_params_atomic_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("note_spend_params_v0.bin");
+        let blob = vec![0x42u8; 4096];
+
+        write_params_atomic(&target, &blob).unwrap();
+
+        assert!(target.exists());
+        assert_eq!(sha256_file(&target).unwrap(), sha256(&blob));
+        // No leftover temp files in the directory.
+        let leftover = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!leftover, "atomic write must not leave a temp file behind");
+    }
+
+    /// A correctly-hashed blob installs cleanly: `current` exists, points at the
+    /// `v0` file, and its hash matches the pinned digest.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn install_and_verify_param_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = vec![0x07u8; 4096];
+        let pinned = sha256(&blob);
+
+        let ok = install_and_verify_param(dir.path(), "note_spend_params", &blob, Some(&pinned));
+        assert!(ok);
+
+        let current = dir.path().join("note_spend_params_current.bin");
+        let v0 = dir.path().join("note_spend_params_v0.bin");
+        assert!(current.exists());
+        assert!(v0.exists());
+        assert_eq!(sha256_file(&current).unwrap(), pinned);
+    }
+
+    /// SECURITY: if the on-disk file does not match the pinned hash after the
+    /// write (simulated here by passing a non-matching expected hash), the
+    /// verify-after-write step removes BOTH the `current` pointer and the `v0`
+    /// file — no corrupt trusted-setup file is left behind to crash-loop a node.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn install_and_verify_param_mismatch_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = vec![0x07u8; 4096];
+        // Pin the hash of DIFFERENT content so verify-after-write must fail.
+        let wrong = sha256(&vec![0x09u8; 4096]);
+
+        let ok = install_and_verify_param(dir.path(), "note_spend_params", &blob, Some(&wrong));
+        assert!(!ok, "mismatched params must report failure");
+
+        let current = dir.path().join("note_spend_params_current.bin");
+        let v0 = dir.path().join("note_spend_params_v0.bin");
+        assert!(!current.exists(), "corrupt current params must be removed");
+        assert!(!v0.exists(), "corrupt v0 params must be removed");
+    }
+
+    /// With no pinned hash (test nets) the install succeeds and leaves the file
+    /// in place — there is nothing to verify it against, so the size gate in the
+    /// caller is the only check.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn install_and_verify_param_unpinned_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = vec![0x07u8; 4096];
+
+        let ok = install_and_verify_param(dir.path(), "note_spend_params", &blob, None);
+        assert!(ok);
+        assert!(dir.path().join("note_spend_params_current.bin").exists());
+    }
+
+    /// `ondisk_note_spend_valid` recognises a valid on-disk set (so the ceremony
+    /// task does not re-fetch/clobber), and rejects a missing or mismatching one.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn ondisk_note_spend_valid_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = vec![0x33u8; 4096];
+        let pinned = sha256(&blob);
+
+        // Missing → false regardless of pinning.
+        assert!(!ondisk_note_spend_valid(dir.path(), Some(&pinned)));
+        assert!(!ondisk_note_spend_valid(dir.path(), None));
+
+        // Install a valid set.
+        assert!(install_and_verify_param(
+            dir.path(),
+            "note_spend_params",
+            &blob,
+            Some(&pinned)
+        ));
+
+        // Present + correct pinned → true.
+        assert!(ondisk_note_spend_valid(dir.path(), Some(&pinned)));
+        // Present + no pin (test net) → true.
+        assert!(ondisk_note_spend_valid(dir.path(), None));
+        // Present + WRONG pin → false.
+        let wrong = sha256(&vec![0x44u8; 4096]);
+        assert!(!ondisk_note_spend_valid(dir.path(), Some(&wrong)));
+    }
+
+    /// Quarantine moves the corrupt file aside (`.corrupt.<ts>`) and drops the
+    /// live `current` pointer so a re-fetch can recreate it.
+    #[cfg(all(feature = "zk-consensus", feature = "mpc-ceremony"))]
+    #[test]
+    fn quarantine_moves_corrupt_aside() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("note_spend_params_current.bin");
+        std::fs::File::create(&current)
+            .unwrap()
+            .write_all(&[0xABu8; 4096])
+            .unwrap();
+
+        quarantine_corrupt_note_spend(dir.path());
+
+        assert!(!current.exists(), "live current pointer must be dropped");
+        let has_corrupt = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt."));
+        assert!(has_corrupt, "a .corrupt. forensic copy should remain");
+    }
+
+    /// SELF-HEAL: a PRESENT-but-WRONG note_spend file (right size, wrong bytes —
+    /// the node6 signature) must NOT pass. With a pinned BLOCK hash and no seeds
+    /// to heal from, `ensure_mpc_params_present` quarantines the bad file and
+    /// returns Err — it never returns `Ok(())` with a hash-mismatching file at
+    /// the live path. Env-mutating, so it is the ONLY test that touches
+    /// `ZK_PARAMS_HASH` (avoids intra-suite races).
+    #[cfg(all(feature = "zk-consensus", feature = "mpc-ceremony"))]
+    #[tokio::test]
+    async fn ensure_present_but_corrupt_self_heals_not_ok() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("note_spend_params_current.bin");
+        // Right-sized but WRONG content.
+        std::fs::File::create(&current)
+            .unwrap()
+            .write_all(&[0xABu8; 4096])
+            .unwrap();
+
+        // Pin a BLOCK hash that does NOT match the garbage on disk.
+        let pinned = sha256(&[0x11u8; 4096]);
+        let prev = std::env::var("ZK_PARAMS_HASH").ok();
+        std::env::set_var("ZK_PARAMS_HASH", format!("BLOCK:{}", hex::encode(pinned)));
+
+        // No seeds → cannot heal → must NOT return Ok while the bad file sits there.
+        let res = ensure_mpc_params_present(&[], dir.path()).await;
+
+        // Restore env before asserting (so a panic cannot leak the override).
+        match prev {
+            Some(v) => std::env::set_var("ZK_PARAMS_HASH", v),
+            None => std::env::remove_var("ZK_PARAMS_HASH"),
+        }
+
+        assert!(
+            res.is_err(),
+            "must NOT return Ok with a hash-mismatching file present"
+        );
+        assert!(
+            !current.exists(),
+            "the corrupt file must be quarantined away from the live path"
+        );
+        let has_corrupt = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt."));
+        assert!(has_corrupt, "a .corrupt. forensic copy should remain");
+    }
+
+    /// LOCK the documented `params_blob_is_trusted(None)` behaviour AND prove it
+    /// cannot apply to note_spend: note_spend is fetched via
+    /// `try_fetch_params_from_seed`, which passes `expected.get("BLOCK")`. When
+    /// `ZK_PARAMS_HASH` pins BLOCK (production), that lookup is `Some`, so the
+    /// permissive `None` branch is never taken for note_spend.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn note_spend_block_hash_is_some_when_pinned() {
+        let block = "ab12cd34".repeat(8); // 64 hex chars
+        let map = parse_param_hashes(&format!("BLOCK:{}", block));
+        // This is the exact key `try_fetch_params_from_seed` passes for note_spend.
+        assert!(
+            map.get("BLOCK").is_some(),
+            "note_spend must resolve a pinned BLOCK hash, never None, in production"
+        );
+        // And a non-trivial blob with the None branch IS accepted — proving the
+        // permissive path exists, which is exactly why note_spend must use Some.
+        assert!(params_blob_is_trusted(&vec![1u8; 2048], None));
+        assert!(!params_blob_is_trusted(&vec![1u8; 2048], map.get("BLOCK")));
     }
 }
