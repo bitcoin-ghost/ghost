@@ -46,7 +46,7 @@ ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 # `snapshot.bitcoinghost.org` DNS record or an object-storage URL once
 # provisioned (the file + its `.sha256` should move with it). Both values are
 # overridable from the environment for staging/testing.
-SNAPSHOT_URL="${SNAPSHOT_URL:-http://94.237.48.104/ghost-utxo-910000.dat}"
+SNAPSHOT_URL="${SNAPSHOT_URL:-http://83.136.251.162:8088/ghost-utxo-910000.dat}"
 SNAPSHOT_SHA256="${SNAPSHOT_SHA256:-6ac0208110d6d6c0783c50ea825aae32f5229cf1dcb63ac986543e95aa0306bf}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/home/ghost/.ghost/snapshot.dat}"
 SNAPSHOT_HEIGHT="910000"
@@ -1588,7 +1588,14 @@ systemctl enable --now ghostd >/dev/null 2>&1
 # i.e. the gate starts ghost-pool when the node is genuinely near-tip and usable,
 # not at the instant of load. (ibd/haze paths skip this entirely.)
 if [[ "$SYNC_MODE" == "fast" ]]; then
-  load_assumeutxo_snapshot
+  # Best-effort: assumeUTXO is an onboarding SPEED-UP, not a requirement. If the
+  # snapshot host is unreachable or anything in the load fails, fall back to a
+  # full trustless IBD rather than aborting the install. The subshell isolates
+  # the function's internal `err` (exit) so a failure is caught here. ghostd is
+  # already running and will sync from genesis on its own in the fallback.
+  if ! ( load_assumeutxo_snapshot ); then
+    log "assumeUTXO snapshot unavailable or failed to load — falling back to full IBD (this is safe, just slower; no action needed)."
+  fi
 fi
 # ghost-pool is NOT started here — the gate starts it once ghostd is synced.
 # ghost-pool.service is installed but left disabled; the (enabled) gate owns it.
