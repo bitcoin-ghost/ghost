@@ -575,6 +575,31 @@ impl CeremonyManager {
         )
     }
 
+    /// Verify a HISTORICAL contribution during catch-up (no timestamp skew).
+    ///
+    /// Stage C task 4: when a node that was offline for days re-verifies the
+    /// chain or adopts an already-BFT-approved historical contribution, the
+    /// live ±1h freshness window would wrongly reject it. This runs the SAME
+    /// cryptographic checks (Schnorr proof bound to `ceremony_id`, hash chain,
+    /// h/l pairing transform) via [`verify_contribution_lineage`], omitting only
+    /// the freshness window. Unlike [`Self::verify_contribution`] it does NOT
+    /// require `contribution.position == count+1`, because catch-up validates a
+    /// position relative to a supplied `prev` rather than the live head.
+    pub fn verify_contribution_catchup(
+        &self,
+        prev_params: &Parameters<Bls12>,
+        new_params: &Parameters<Bls12>,
+        contribution: &MpcContribution,
+    ) -> MpcResult<bool> {
+        let ceremony_id = self.state.read().ceremony_id;
+        crate::contribution::verify_contribution_lineage(
+            prev_params,
+            new_params,
+            contribution,
+            &ceremony_id,
+        )
+    }
+
     /// Apply a contribution after BFT approval
     ///
     /// This updates the ceremony state and hot-swaps the parameters.
@@ -1354,6 +1379,44 @@ mod tests {
             err.contains("commitment") || err.contains("not found"),
             "Error should mention commitment mismatch, got: {}",
             err
+        );
+    }
+
+    /// Stage C task 4: a contribution with a far-past timestamp (beyond the ±1h
+    /// live skew window) is REJECTED by the live verify but ACCEPTED by the
+    /// catch-up/lineage verify — every cryptographic check still passes, only the
+    /// freshness window is dropped.
+    #[test]
+    fn test_catchup_verify_accepts_old_timestamp_live_rejects() {
+        let (manager, _temp) = create_test_manager();
+        manager.ensure_genesis_initialized().unwrap();
+
+        // Capture genesis (the prev) before generating the contribution.
+        let genesis = manager.note_spend_params().unwrap();
+
+        let (new_params, mut contribution) = manager.generate_contribution("node1").unwrap();
+        // Backdate well beyond the ±1h skew window (2 days ago).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        contribution.timestamp = now - 2 * 24 * 3600;
+
+        // Live verify must reject on the skew window.
+        let live = manager.verify_contribution(&new_params, &contribution);
+        assert!(
+            live.is_err(),
+            "live verify must reject a far-past timestamp (skew window)"
+        );
+        assert!(live.unwrap_err().to_string().contains("timestamp"));
+
+        // Catch-up/lineage verify must ACCEPT — crypto is identical, no skew.
+        let caught_up = manager
+            .verify_contribution_catchup(genesis.as_ref(), &new_params, &contribution)
+            .expect("catch-up verify must not error on an old but valid contribution");
+        assert!(
+            caught_up,
+            "catch-up verify must accept an old but cryptographically valid contribution"
         );
     }
 

@@ -6188,13 +6188,30 @@ impl Database {
         })
     }
 
-    /// Save an MPC contribution
+    /// Save an MPC contribution.
+    ///
+    /// Stage C: this is a SAFE proof-fill upsert. A first INSERT records the row.
+    /// On conflict (the position already exists) it ONLY fills in a previously
+    /// EMPTY `contribution_proof`, and ONLY when the incoming row has the SAME
+    /// identity (contributor + prev/new hashes). It NEVER rewrites the hashes or
+    /// replaces an already-present proof. This lets a node that first synced a
+    /// proof-less row (the old `/contributors` path) later upgrade it with the
+    /// real proof fetched from `/api/v1/mpc/votes/{position}` — needed for
+    /// catch-up re-verification — while a peer can never overwrite the lineage
+    /// hashes or substitute a different proof for an applied position.
     pub fn save_mpc_contribution(&self, contribution: &MpcContributionRecord) -> GhostResult<()> {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO mpc_contributions (elder_position, contributor_node_id, prev_params_hash,
                                                 new_params_hash, contribution_proof, epoch, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(elder_position) DO UPDATE SET
+                    contribution_proof = excluded.contribution_proof
+                 WHERE length(mpc_contributions.contribution_proof) = 0
+                   AND length(excluded.contribution_proof) > 0
+                   AND mpc_contributions.contributor_node_id = excluded.contributor_node_id
+                   AND mpc_contributions.prev_params_hash = excluded.prev_params_hash
+                   AND mpc_contributions.new_params_hash = excluded.new_params_hash",
                 params![
                     contribution.elder_position as i64,
                     contribution.contributor_node_id,

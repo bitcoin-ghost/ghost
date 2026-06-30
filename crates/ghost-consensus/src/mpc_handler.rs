@@ -135,6 +135,7 @@ enum VoteDecision {
 /// re-exported by `ghost-mpc`) so the quorum computed here matches every other
 /// node and every other MPC code path exactly. A divergence would split
 /// consensus — one node applying a contribution that another rejects.
+#[cfg(test)]
 use ghost_common::constants::{MPC_BFT_BOOTSTRAP_COUNT, MPC_BFT_THRESHOLD_PERCENT};
 
 /// Compute BFT threshold for MPC contribution approval.
@@ -145,11 +146,10 @@ use ghost_common::constants::{MPC_BFT_BOOTSTRAP_COUNT, MPC_BFT_THRESHOLD_PERCENT
 /// `MPC_BFT_THRESHOLD_PERCENT` (67%) supermajority:
 /// `ceil(contributor_count * 67 / 100)`.
 pub(crate) fn bft_threshold(contributor_count: u32) -> u32 {
-    if contributor_count < MPC_BFT_BOOTSTRAP_COUNT {
-        1
-    } else {
-        (contributor_count * MPC_BFT_THRESHOLD_PERCENT).div_ceil(100)
-    }
+    // Delegate to the single shared definition so the live voter and the
+    // genesis-anchored retained-quorum check (ghost-storage) apply EXACTLY the
+    // same rule under which a contribution was approved.
+    ghost_common::mpc::mpc_bft_threshold(contributor_count)
 }
 
 /// Rate limiting for MPC messages

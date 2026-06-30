@@ -505,28 +505,78 @@ fn schnorr_prove<R: RngCore + CryptoRng>(
     })
 }
 
-/// Verify a contribution proof
+/// Verify a contribution proof (LIVE path — enforces the ±1h timestamp skew).
 ///
-/// 4.22 SECURITY: ceremony_id is used to verify Schnorr proofs are bound to this ceremony
+/// 4.22 SECURITY: ceremony_id is used to verify Schnorr proofs are bound to this
+/// ceremony. Use this when verifying a contribution that is being proposed RIGHT
+/// NOW (the live voter / single-position incremental adoption): the skew window
+/// rejects stale replayed contributions.
 pub fn verify_contribution(
     prev_params: &Parameters<Bls12>,
     new_params: &Parameters<Bls12>,
     contribution: &MpcContribution,
     ceremony_id: &[u8; 32],
 ) -> MpcResult<bool> {
+    verify_contribution_inner(
+        prev_params,
+        new_params,
+        contribution,
+        ceremony_id,
+        /* enforce_timestamp_skew = */ true,
+    )
+}
+
+/// Verify a contribution proof for HISTORICAL catch-up / lineage re-verification
+/// (does NOT enforce the timestamp skew).
+///
+/// Stage C task 4: the genesis-anchored startup verification and the catch-up
+/// path re-verify contributions that were legitimately approved LONG ago (a node
+/// offline for days, or replaying the full chain at boot). Those contributions'
+/// timestamps are far outside any ±1h window, so the live skew check would
+/// wrongly reject them. The cryptographic guarantees that matter here — the
+/// Schnorr proof bound to `ceremony_id`, the hash chain, and the h/l pairing
+/// transform checks — are IDENTICAL to the live path; only the freshness window
+/// (a replay defence for *live* proposals, irrelevant once a contribution is
+/// already a BFT-approved part of the immutable lineage) is dropped.
+pub fn verify_contribution_lineage(
+    prev_params: &Parameters<Bls12>,
+    new_params: &Parameters<Bls12>,
+    contribution: &MpcContribution,
+    ceremony_id: &[u8; 32],
+) -> MpcResult<bool> {
+    verify_contribution_inner(
+        prev_params,
+        new_params,
+        contribution,
+        ceremony_id,
+        /* enforce_timestamp_skew = */ false,
+    )
+}
+
+/// Shared verification core. `enforce_timestamp_skew` toggles ONLY the ±1h
+/// freshness window; every cryptographic check is unconditional.
+fn verify_contribution_inner(
+    prev_params: &Parameters<Bls12>,
+    new_params: &Parameters<Bls12>,
+    contribution: &MpcContribution,
+    ceremony_id: &[u8; 32],
+    enforce_timestamp_skew: bool,
+) -> MpcResult<bool> {
     // SECURITY: Validate timestamp is within ±1 hour of current time
-    // This prevents replay attacks with old contributions
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let timestamp_diff = now.abs_diff(contribution.timestamp);
-    const MAX_TIMESTAMP_SKEW_SECS: u64 = 3600; // 1 hour
-    if timestamp_diff > MAX_TIMESTAMP_SKEW_SECS {
-        return Err(MpcError::InvalidProof(format!(
-            "Contribution timestamp too far from current time: {} seconds",
-            timestamp_diff
-        )));
+    // This prevents replay attacks with old contributions (LIVE path only).
+    if enforce_timestamp_skew {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let timestamp_diff = now.abs_diff(contribution.timestamp);
+        const MAX_TIMESTAMP_SKEW_SECS: u64 = 3600; // 1 hour
+        if timestamp_diff > MAX_TIMESTAMP_SKEW_SECS {
+            return Err(MpcError::InvalidProof(format!(
+                "Contribution timestamp too far from current time: {} seconds",
+                timestamp_diff
+            )));
+        }
     }
 
     // Verify hash chain

@@ -69,7 +69,10 @@ pub mod params;
 pub mod sync;
 
 // Re-export main types
-pub use contribution::{ContributionProof, MpcContribution, MultiContributionResult};
+pub use contribution::{
+    verify_contribution, verify_contribution_lineage, ContributionProof, MpcContribution,
+    MultiContributionResult,
+};
 pub use errors::{MpcError, MpcResult};
 pub use manager::{CeremonyManager, CeremonyState};
 pub use params::{MpcParameters, ParameterFiles};
@@ -98,6 +101,11 @@ pub const PARAM_CHUNK_SIZE: usize = 1024 * 1024;
 /// (the voter/quorum path) share ONE definition. Changing the quorum on only
 /// one side would split consensus — see `ghost_common::constants`.
 pub use ghost_common::constants::{MPC_BFT_BOOTSTRAP_COUNT, MPC_BFT_THRESHOLD_PERCENT};
+
+/// Re-export the single shared BFT-threshold FUNCTION (not just the constants)
+/// so the ghost-mpc library, the ghost-consensus voter, and the ghost-storage
+/// retained-quorum check all compute the required approve-vote count identically.
+pub use ghost_common::mpc::mpc_bft_threshold;
 
 /// Cross-check that on-disk parameters match the recorded lineage head.
 ///

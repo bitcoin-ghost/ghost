@@ -398,6 +398,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/mpc/contributors",
             get(api_mpc_contributors_handler),
         )
+        // Stage C: per-position contribution (WITH proof) + retained approve
+        // votes, so a catching-up node can re-verify proofs and check the
+        // retained BFT quorum (the contributors list above omits both).
+        .route("/api/v1/mpc/votes/:position", get(api_mpc_votes_handler))
         // Ghost Haze & Shroud endpoints
         .route("/api/v1/haze/status", get(api_haze_status_handler))
         .route("/api/v1/shroud/status", get(api_shroud_status_handler))
@@ -6283,6 +6287,83 @@ async fn api_mpc_contributors_handler(
     }))
 }
 
+/// Stage C: per-position contribution + retained votes handler.
+///
+/// Serves, for a single ceremony position: the FULL contribution record —
+/// including the (non-empty) `contribution_proof`, which the `/contributors`
+/// list deliberately omits — AND every retained verification vote (voter,
+/// approve, signature). This is exactly the data a catching-up node needs to
+/// (a) re-run `verify_contribution` on the fetched proof and (b) re-check the
+/// retained BFT quorum at startup, without keeping historical params blobs.
+async fn api_mpc_votes_handler(
+    State(state): State<Arc<VerificationState>>,
+    Path(position): Path<u32>,
+) -> impl IntoResponse {
+    let Some(ref db) = state.database else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no database" })),
+        );
+    };
+
+    let contribution = match db.get_mpc_contribution(position) {
+        Ok(Some(rec)) => serde_json::json!({
+            "position": rec.elder_position,
+            "node_id": rec.contributor_node_id,
+            "prev_params_hash": hex::encode(rec.prev_params_hash),
+            "new_params_hash": hex::encode(rec.new_params_hash),
+            // Hex-encoded serialized ContributionProof — the field the
+            // contributors endpoint drops. Empty string if not retained.
+            "contribution_proof": hex::encode(&rec.contribution_proof),
+            "epoch": rec.epoch,
+            "created_at": rec.created_at,
+        }),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(
+                    serde_json::json!({ "error": "no contribution at position", "position": position }),
+                ),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let votes = match db.get_mpc_votes(position) {
+        Ok(v) => v
+            .into_iter()
+            .map(|vote| {
+                serde_json::json!({
+                    "voter_node_id": vote.voter_node_id,
+                    "approve": vote.approve,
+                    "signature": hex::encode(vote.signature),
+                    "voted_at": vote.voted_at,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "contribution": contribution,
+            "votes": votes,
+            "vote_count": votes.len(),
+        })),
+    )
+}
+
 // =============================================================================
 // Ghost Haze & Shroud endpoint handlers
 // =============================================================================
@@ -7674,5 +7755,164 @@ mod tests {
         assert_eq!(v["miner_count"], 0);
         assert_eq!(v["healthy"], false);
         assert!(v["capabilities"].is_object());
+    }
+
+    /// Stage C task 3 — sync endpoint round-trip:
+    /// a "server" node persists a chain (contributions WITH real proof + votes),
+    /// serves position 2 over `GET /api/v1/mpc/votes/2`, and a "fresh" node parses
+    /// the response, persists the non-empty proof + votes, and the genesis-anchored
+    /// startup quorum check then PASSES on the fresh node.
+    #[tokio::test]
+    async fn test_mpc_votes_endpoint_roundtrip() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use ghost_common::identity::NodeIdentity;
+        use ghost_common::mpc::{contribution_hash, vote_signing_message};
+        use ghost_storage::queries::{MpcContributionRecord, MpcVerificationVote};
+        use ghost_storage::Database;
+        use tower::ServiceExt;
+
+        let anchor = [0xC9u8; 32];
+        let id1 = NodeIdentity::generate(); // contributor at position 1 (elder #1)
+        let id2 = NodeIdentity::generate(); // contributor at position 2
+        let new1 = [0x11u8; 32];
+        let new2 = [0x22u8; 32];
+
+        // Real (non-empty) proof bytes for each position. Their CONTENT is opaque
+        // to the quorum check (which binds votes to new_params_hash), so arbitrary
+        // non-empty bytes suffice to prove the proof survives the round-trip.
+        let proof1 = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let proof2 = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+
+        // --- server DB ---
+        let server_db = Database::in_memory().unwrap();
+        server_db
+            .save_mpc_contribution(&MpcContributionRecord {
+                elder_position: 1,
+                contributor_node_id: hex::encode(id1.node_id()),
+                prev_params_hash: anchor,
+                new_params_hash: new1,
+                contribution_proof: proof1.clone(),
+                epoch: 0,
+                created_at: 100,
+            })
+            .unwrap();
+        server_db
+            .save_mpc_contribution(&MpcContributionRecord {
+                elder_position: 2,
+                contributor_node_id: hex::encode(id2.node_id()),
+                prev_params_hash: new1,
+                new_params_hash: new2,
+                contribution_proof: proof2.clone(),
+                epoch: 0,
+                created_at: 200,
+            })
+            .unwrap();
+        // Position 2's approve vote from elder #1 (the only then-eligible elder).
+        let ch2 = contribution_hash(&id2.node_id(), 2, &new2);
+        let approve_msg = vote_signing_message(&ch2, true);
+        let sig = id1.sign(&approve_msg);
+        server_db
+            .save_mpc_vote(&MpcVerificationVote {
+                contribution_position: 2,
+                voter_node_id: hex::encode(id1.node_id()),
+                approve: true,
+                signature: sig.to_vec(),
+                voted_at: 200,
+            })
+            .unwrap();
+
+        // --- serve position 2 over HTTP ---
+        let state = {
+            use ghost_common::types::NodeCapabilities;
+            use ghost_policy::PolicyProfile;
+            Arc::new(
+                crate::server::VerificationState::new(
+                    hex::encode(id1.node_id()),
+                    "1.0.0".to_string(),
+                    PolicyProfile::default(),
+                    NodeCapabilities::default(),
+                )
+                .with_database(server_db),
+            )
+        };
+        let app = super::create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/mpc/votes/2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // The served proof is non-empty (the bug this endpoint fixes).
+        let served_proof_hex = data["contribution"]["contribution_proof"].as_str().unwrap();
+        assert_eq!(served_proof_hex, hex::encode(&proof2));
+        assert!(!served_proof_hex.is_empty());
+        assert_eq!(data["vote_count"].as_u64().unwrap(), 1);
+
+        // --- fresh node: parse + persist, then the quorum check passes ---
+        let fresh_db = Database::in_memory().unwrap();
+        // Position 1 (genesis) is anchored, no votes needed; persist its row.
+        fresh_db
+            .save_mpc_contribution(&MpcContributionRecord {
+                elder_position: 1,
+                contributor_node_id: hex::encode(id1.node_id()),
+                prev_params_hash: anchor,
+                new_params_hash: new1,
+                contribution_proof: proof1.clone(),
+                epoch: 0,
+                created_at: 100,
+            })
+            .unwrap();
+        // Persist position 2 exactly as the sync path would, from the served JSON.
+        let c = &data["contribution"];
+        let proof_bytes = hex::decode(c["contribution_proof"].as_str().unwrap()).unwrap();
+        assert!(
+            !proof_bytes.is_empty(),
+            "fresh node must persist a real proof"
+        );
+        fresh_db
+            .save_mpc_contribution(&MpcContributionRecord {
+                elder_position: c["position"].as_u64().unwrap() as u32,
+                contributor_node_id: c["node_id"].as_str().unwrap().to_string(),
+                prev_params_hash: hex::decode(c["prev_params_hash"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                new_params_hash: hex::decode(c["new_params_hash"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                contribution_proof: proof_bytes,
+                epoch: 0,
+                created_at: c["created_at"].as_u64().unwrap(),
+            })
+            .unwrap();
+        for v in data["votes"].as_array().unwrap() {
+            fresh_db
+                .save_mpc_vote(&MpcVerificationVote {
+                    contribution_position: 2,
+                    voter_node_id: v["voter_node_id"].as_str().unwrap().to_string(),
+                    approve: v["approve"].as_bool().unwrap(),
+                    signature: hex::decode(v["signature"].as_str().unwrap()).unwrap(),
+                    voted_at: v["voted_at"].as_u64().unwrap(),
+                })
+                .unwrap();
+        }
+
+        // The fresh node's genesis-anchored startup verification now passes.
+        let verified = fresh_db
+            .verify_mpc_genesis_anchored_lineage(&anchor, Some(&new2))
+            .expect("fresh node startup quorum check must pass after sync");
+        assert_eq!(verified, 2);
     }
 }

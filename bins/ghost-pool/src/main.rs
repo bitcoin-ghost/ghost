@@ -1049,6 +1049,115 @@ async fn fetch_ceremony_params_bundle(
     None
 }
 
+/// Stage C task 3: fetch a single position's FULL contribution (with the real
+/// `contribution_proof`) AND its retained approve/reject votes from a peer's
+/// `/api/v1/mpc/votes/{position}` endpoint, and persist BOTH locally.
+///
+/// This is what makes catch-up autonomous: the old `/contributors` sync saved
+/// rows with an EMPTY proof and NO votes, so a fresh node could neither re-run
+/// `verify_contribution` nor check the retained BFT quorum. After this call the
+/// local DB holds the real proof (filled via the safe proof-fill upsert in
+/// `save_mpc_contribution`) and every retained vote, so the genesis-anchored
+/// startup verification has the data it needs. Returns `true` if at least the
+/// proof or some votes were persisted from some seed.
+#[cfg(feature = "mpc-ceremony")]
+async fn sync_mpc_proof_and_votes(
+    seeds: &[String],
+    position: u32,
+    db: &ghost_storage::Database,
+) -> bool {
+    for seed in seeds {
+        let host = seed.split(':').next().unwrap_or(seed);
+        let url = format!("http://{}:8080/api/v1/mpc/votes/{}", host, position);
+        let resp = match reqwest::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let data: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let mut persisted = false;
+
+        // 1. Persist the real proof (proof-fill upsert preserves an applied row).
+        if let Some(c) = data.get("contribution") {
+            let proof_hex = c
+                .get("contribution_proof")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let node_id = c.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+            let prev = c
+                .get("prev_params_hash")
+                .and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+            let new = c
+                .get("new_params_hash")
+                .and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+            let created_at = c.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+            let epoch = c.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            if let (false, Ok(proof_bytes), Some(prev), Some(new)) = (
+                proof_hex.is_empty() || node_id.is_empty(),
+                hex::decode(proof_hex),
+                prev,
+                new,
+            ) {
+                let record = ghost_storage::queries::MpcContributionRecord {
+                    elder_position: position,
+                    contributor_node_id: node_id.to_string(),
+                    prev_params_hash: prev,
+                    new_params_hash: new,
+                    contribution_proof: proof_bytes,
+                    epoch,
+                    created_at,
+                };
+                if db.save_mpc_contribution(&record).is_ok() {
+                    persisted = true;
+                }
+            }
+        }
+
+        // 2. Persist every retained vote (save_mpc_vote upserts by (pos, voter)).
+        if let Some(votes) = data.get("votes").and_then(|v| v.as_array()) {
+            for v in votes {
+                let voter = v.get("voter_node_id").and_then(|x| x.as_str());
+                let approve = v.get("approve").and_then(|x| x.as_bool());
+                let sig = v
+                    .get("signature")
+                    .and_then(|x| x.as_str())
+                    .and_then(|h| hex::decode(h).ok());
+                let voted_at = v.get("voted_at").and_then(|x| x.as_u64()).unwrap_or(0);
+                if let (Some(voter), Some(approve), Some(sig)) = (voter, approve, sig) {
+                    let vote = ghost_storage::queries::MpcVerificationVote {
+                        contribution_position: position,
+                        voter_node_id: voter.to_string(),
+                        approve,
+                        signature: sig,
+                        voted_at,
+                    };
+                    if db.save_mpc_vote(&vote).is_ok() {
+                        persisted = true;
+                    }
+                }
+            }
+        }
+
+        if persisted {
+            return true;
+        }
+    }
+    false
+}
+
 /// Startup self-heal: ensure the trusted-setup parameters exist on disk before
 /// the hard `load_trusted_params` check, fetching them from seeds if missing.
 ///
@@ -2246,6 +2355,18 @@ async fn main() -> Result<()> {
     #[allow(unused_assignments, unused_mut)]
     let mut l2_tree_state_fn_opt: Option<ghost_verification::L2TreeStateFn> = None;
 
+    // Stage C: when the ZK startup mode is genesis-anchored ROLLING (the static
+    // current-params pin `ZK_PARAMS_HASH` is absent but `ZK_GENESIS_PARAMS_HASH`
+    // is set), this carries the immutable genesis lineage anchor from the
+    // zk-consensus gate down to the MPC block, which runs the genesis-anchored
+    // lineage + retained-quorum verification (fail-closed). `None` keeps the
+    // legacy static-pin / test behaviour exactly.
+    #[cfg_attr(
+        not(all(feature = "zk-consensus", feature = "mpc-ceremony")),
+        allow(unused_mut, unused_variables, unused_assignments)
+    )]
+    let mut zk_rolling_anchor: Option<[u8; 32]> = None;
+
     #[cfg(feature = "zk-consensus")]
     {
         use ghost_consensus::epoch_manager::{EpochManager, EpochManagerConfig};
@@ -2266,26 +2387,55 @@ async fn main() -> Result<()> {
         }
 
         if is_production {
-            // SELF-HEAL: a fresh production node may have the binary but no MPC
-            // ceremony output on disk yet. Fetch + verify the params from seeds
-            // BEFORE the hard `load_trusted_params` check, otherwise the process
-            // would exit here and the background MPC task that fetches params
-            // would never run — an unrecoverable crash-loop. The fetch path
-            // verifies every blob against the pinned ZK_PARAMS_HASH, so a
-            // malicious seed cannot inject forged trusted-setup parameters.
-            #[cfg(feature = "mpc-ceremony")]
-            if let Ok(zk_params_path) = std::env::var(ghost_zkp::ZK_PARAMS_PATH_ENV) {
-                let params_dir = std::path::PathBuf::from(&zk_params_path);
-                // ALWAYS run the self-heal: it validates present params against
-                // the pinned hash and quarantines + re-fetches a present-but-
-                // corrupt set (the node6 case), in addition to fetching a missing
-                // one. Gating this on `!current.exists()` would let a corrupt-but-
-                // present file slip straight into the hard `load_trusted_params`
-                // check below and crash-loop the node.
-                ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
+            // Stage C: choose the trusted-setup verification mode explicitly.
+            // StaticPin (`ZK_PARAMS_HASH` set) = the legacy frozen/pinned and
+            // post-ossification path, bit-identical to prior releases.
+            // GenesisAnchoredRolling (`ZK_PARAMS_HASH` absent, `ZK_GENESIS_PARAMS_HASH`
+            // set) = the unpinned rolling path: the static current-params file
+            // check is replaced by the genesis-anchored lineage + retained-quorum
+            // verification run in the MPC block below. Neither set on a production
+            // node → `select_startup_mode` errors and startup aborts (never
+            // unverified).
+            match ghost_zkp::select_startup_mode()? {
+                ghost_zkp::ZkStartupMode::StaticPin => {
+                    // SELF-HEAL: a fresh production node may have the binary but no
+                    // MPC ceremony output on disk yet. Fetch + verify the params
+                    // from seeds BEFORE the hard `load_trusted_params` check,
+                    // otherwise the process would exit here and the background MPC
+                    // task that fetches params would never run — an unrecoverable
+                    // crash-loop. The fetch path verifies every blob against the
+                    // pinned ZK_PARAMS_HASH, so a malicious seed cannot inject
+                    // forged trusted-setup parameters.
+                    #[cfg(feature = "mpc-ceremony")]
+                    if let Ok(zk_params_path) = std::env::var(ghost_zkp::ZK_PARAMS_PATH_ENV) {
+                        let params_dir = std::path::PathBuf::from(&zk_params_path);
+                        // ALWAYS run the self-heal: it validates present params
+                        // against the pinned hash and quarantines + re-fetches a
+                        // present-but-corrupt set (the node6 case), in addition to
+                        // fetching a missing one. Gating this on `!current.exists()`
+                        // would let a corrupt-but-present file slip straight into
+                        // the hard `load_trusted_params` check below and crash-loop
+                        // the node.
+                        ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
+                    }
+                    ghost_zkp::load_trusted_params()?;
+                    info!(
+                        "ZK consensus using PRODUCTION parameters from MPC ceremony (static pin)"
+                    );
+                }
+                ghost_zkp::ZkStartupMode::GenesisAnchoredRolling { genesis_anchor } => {
+                    // Rolling: do NOT run the static file-hash check (there is no
+                    // current pin to check against). The genesis-anchored lineage
+                    // + retained-quorum verification runs in the MPC block below
+                    // and is FATAL on failure. Hand it the immutable anchor.
+                    zk_rolling_anchor = Some(genesis_anchor);
+                    info!(
+                        anchor = %hex::encode(&genesis_anchor[..8]),
+                        "ZK consensus in ROLLING mode: trusted setup verified by genesis anchor + \
+                         lineage chain + retained BFT quorum (static current-params pin absent)"
+                    );
+                }
             }
-            ghost_zkp::load_trusted_params()?;
-            info!("ZK consensus using PRODUCTION parameters from MPC ceremony");
         } else {
             warn!("ZK consensus using TEST parameters - NOT SECURE FOR MAINNET");
         }
@@ -2787,6 +2937,64 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Stage C task 2 + 5: genesis-anchored startup verification (ROLLING mode).
+        //
+        // When the node is UNPINNED (no static `ZK_PARAMS_HASH`, an immutable
+        // `ZK_GENESIS_PARAMS_HASH` instead — `zk_rolling_anchor` is Some), the
+        // static current-params file check was deliberately skipped at the ZK
+        // gate. Here we validate the evolving setup the rolling way: genesis
+        // anchor → lineage chain 1..N → retained BFT quorum per position →
+        // on-disk head. This is FATAL on failure (same fail-closed posture the
+        // static pin had — a mismatch means lineage/quorum is broken, not merely
+        // "file != static hash"). On success we true-up the singleton (task 5) so
+        // a node that abstained on some position is reconciled to the verified
+        // head + chain length.
+        if let Some(genesis_anchor) = zk_rolling_anchor {
+            // Head lineage hash of the on-disk current params (None if not loaded).
+            let head_lineage: Option<[u8; 32]> = ceremony_manager
+                .note_spend_params()
+                .and_then(|p| ghost_mpc::contribution::hash_parameters(&p).ok());
+
+            let verified_count = db
+                .verify_mpc_genesis_anchored_lineage(&genesis_anchor, head_lineage.as_ref())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "MAINNET SECURITY (rolling): genesis-anchored trusted-setup verification \
+                         FAILED — refusing to start (fail-closed). {e}"
+                    )
+                })?;
+
+            info!(
+                count = verified_count,
+                anchor = %hex::encode(&genesis_anchor[..8]),
+                "MPC: genesis-anchored startup verification PASSED (anchor + lineage + retained \
+                 BFT quorum + on-disk head)"
+            );
+
+            // Task 5: reconcile the singleton to the verified head + length.
+            if let Some(head) = head_lineage {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match db.reconcile_mpc_singleton_to_head(
+                    verified_count,
+                    &head,
+                    &genesis_anchor,
+                    now,
+                ) {
+                    Ok(true) => info!(
+                        count = verified_count,
+                        "MPC: trued-up mpc_ceremony singleton to the verified rolling head"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(error = %e, "MPC: singleton true-up after verification failed")
+                    }
+                }
+            }
+        }
+
         // Create broadcast callback for MPC handler
         // Uses async Noise relay: sync closure queues messages, background task
         // routes them through mesh.broadcast() which uses Noise encryption
@@ -2900,12 +3108,35 @@ async fn main() -> Result<()> {
                     // transformation of OUR current params (the prev) before
                     // hot-swapping. Genesis (position 1) / pre-genesis nodes have
                     // no prev to verify against and adopt the hash-pinned anchor.
+                    //
+                    // Stage C task 4: use the catch-up (no timestamp-skew) verify.
+                    // This path adopts an ALREADY-BFT-APPROVED contribution that
+                    // may be HISTORICAL (a node offline for days, or replaying the
+                    // chain), whose timestamp is far outside the live ±1h window.
+                    // Every cryptographic check (Schnorr bound to ceremony_id, hash
+                    // chain, h/l pairing transform against OUR prev) is identical to
+                    // the live path; only the freshness window — a replay defence
+                    // for LIVE proposals, irrelevant once a contribution is part of
+                    // the approved lineage — is dropped.
                     if contribution.position >= 2 && ceremony_mgr.has_current_params() {
                         let mgr = Arc::clone(&ceremony_mgr);
                         let note_spend = Arc::clone(&bundle.note_spend);
                         let contribution_for_verify = contribution.clone();
+                        let prev_params = match mgr.note_spend_params() {
+                            Some(p) => p,
+                            None => {
+                                tracing::warn!(
+                                    "MPC params_callback: no current params to verify against — refusing to adopt"
+                                );
+                                return;
+                            }
+                        };
                         let verified = tokio::task::spawn_blocking(move || {
-                            mgr.verify_contribution(&note_spend, &contribution_for_verify)
+                            mgr.verify_contribution_catchup(
+                                &prev_params,
+                                &note_spend,
+                                &contribution_for_verify,
+                            )
                         })
                         .await;
                         match verified {
@@ -3304,11 +3535,23 @@ async fn main() -> Result<()> {
                                                     {
                                                         synced_count += 1;
                                                     }
+
+                                                    // Stage C task 3: upgrade the
+                                                    // proof-less placeholder with the
+                                                    // REAL proof + retained votes so
+                                                    // catch-up can re-verify + check
+                                                    // the retained BFT quorum.
+                                                    sync_mpc_proof_and_votes(
+                                                        &seed_nodes_for_mpc,
+                                                        position,
+                                                        &db_for_mpc,
+                                                    )
+                                                    .await;
                                                 }
                                                 if synced_count > 0 {
                                                     info!(
                                                         count = synced_count,
-                                                        "MPC: Synced contributor records from peer"
+                                                        "MPC: Synced contributor records (+ proofs/votes) from peer"
                                                     );
                                                 }
                                                 break;
@@ -3609,6 +3852,16 @@ async fn main() -> Result<()> {
                                             };
 
                                         let _ = db_for_mpc.save_mpc_contribution(&record);
+
+                                        // Stage C task 3: fill the real proof +
+                                        // retained votes for catch-up re-verification
+                                        // and the retained BFT quorum check.
+                                        sync_mpc_proof_and_votes(
+                                            &seed_nodes_for_mpc,
+                                            position,
+                                            &db_for_mpc,
+                                        )
+                                        .await;
                                     }
                                     break;
                                 }

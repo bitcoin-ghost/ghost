@@ -203,6 +203,117 @@ pub const ZK_PARAMS_PATH_ENV: &str = "ZK_PARAMS_PATH";
 /// Example: "BLOCK:abc123..."
 pub const ZK_PARAMS_HASH_ENV: &str = "ZK_PARAMS_HASH";
 
+/// Stage C: Environment variable for the IMMUTABLE genesis lineage anchor.
+///
+/// This is the trust root for the unpinned, rolling-ceremony verification path.
+/// Unlike [`ZK_PARAMS_HASH_ENV`] (a raw-file SHA-256 of the *current* params,
+/// which changes on every contribution and therefore cannot be pinned while
+/// rolling), this is the STRUCTURED lineage hash (`ghost_mpc::contribution::
+/// hash_parameters`) of the GENESIS parameters — equivalently
+/// `mpc_contributions[1].prev_params_hash`. It is constant for the entire life
+/// of the ceremony, so an operator can pin/distribute it exactly like the old
+/// static hash.
+///
+/// Format: 64 lowercase hex characters (32 bytes), no `TYPE:` prefix. Example:
+/// `ZK_GENESIS_PARAMS_HASH=c9c907f688fc1102...` (64 hex). For mainnet this is
+/// `c9c907f688fc1102…` — the genesis anchor verified from production data.
+pub const ZK_GENESIS_PARAMS_HASH_ENV: &str = "ZK_GENESIS_PARAMS_HASH";
+
+/// Parse the immutable genesis lineage anchor from the environment.
+///
+/// * `Ok(None)` — the variable is unset.
+/// * `Ok(Some(hash))` — a well-formed 64-hex value (the 32-byte lineage anchor).
+/// * `Err(..)` — the variable is SET but malformed. Fail-closed: a malformed
+///   anchor must never be silently treated as "unset", which could downgrade a
+///   node out of the verified rolling path.
+pub fn genesis_params_hash() -> ZkResult<Option<[u8; 32]>> {
+    let raw = match std::env::var(ZK_GENESIS_PARAMS_HASH_ENV) {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(e) => {
+            return Err(ZkError::InvalidParams(format!(
+                "Failed to read {}: {}",
+                ZK_GENESIS_PARAMS_HASH_ENV, e
+            )))
+        }
+    };
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 {
+        return Err(ZkError::InvalidParams(format!(
+            "{} must be exactly 64 hex chars (32-byte lineage hash), got {}",
+            ZK_GENESIS_PARAMS_HASH_ENV,
+            trimmed.len()
+        )));
+    }
+    let bytes: [u8; 32] = hex::decode(trimmed)
+        .map_err(|e| {
+            ZkError::InvalidParams(format!(
+                "{} is not valid hex: {}",
+                ZK_GENESIS_PARAMS_HASH_ENV, e
+            ))
+        })?
+        .try_into()
+        .map_err(|_| {
+            ZkError::InvalidParams(format!(
+                "{} decode to 32 bytes failed",
+                ZK_GENESIS_PARAMS_HASH_ENV
+            ))
+        })?;
+    Ok(Some(bytes))
+}
+
+/// Stage C: which trusted-setup verification path a node engages at startup.
+///
+/// These are MUTUALLY EXCLUSIVE and there is deliberately NO variant where the
+/// trusted setup is left unverified. The selection is made by
+/// [`select_startup_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZkStartupMode {
+    /// `ZK_PARAMS_HASH` is set: verify the on-disk *current* params against the
+    /// pinned raw-file SHA-256. This is the existing frozen/pinned behaviour and
+    /// the post-ossification path. Bit-identical to prior releases.
+    StaticPin,
+    /// `ZK_PARAMS_HASH` is ABSENT but `ZK_GENESIS_PARAMS_HASH` is set: the static
+    /// current pin is intentionally removed for rolling. The node instead
+    /// validates the evolving setup by the immutable genesis anchor + the lineage
+    /// chain + the retained BFT quorum per position (see ghost-storage). Carries
+    /// the genesis anchor (a LINEAGE hash) that roots the chain.
+    GenesisAnchoredRolling { genesis_anchor: [u8; 32] },
+}
+
+/// Stage C: choose the startup verification mode from the environment.
+///
+/// Precedence — explicit and mutually consistent:
+/// 1. `ZK_PARAMS_HASH` set            → [`ZkStartupMode::StaticPin`] (pinned/frozen
+///    or post-ossification). Unchanged from prior releases.
+/// 2. else `ZK_GENESIS_PARAMS_HASH`   → [`ZkStartupMode::GenesisAnchoredRolling`]
+///    (the new genesis-anchored lineage path engages ONLY when the static current
+///    pin is absent).
+/// 3. else                            → `Err`. There is NEVER a mode where nothing
+///    is verified; a mainnet node with neither pin refuses to start.
+///
+/// After ossification at 101 the operator re-pins `ZK_PARAMS_HASH` to the v101
+/// file hash and selection returns to `StaticPin` automatically.
+pub fn select_startup_mode() -> ZkResult<ZkStartupMode> {
+    let static_pin_set = std::env::var(ZK_PARAMS_HASH_ENV).is_ok();
+    if static_pin_set {
+        return Ok(ZkStartupMode::StaticPin);
+    }
+    match genesis_params_hash()? {
+        Some(genesis_anchor) => Ok(ZkStartupMode::GenesisAnchoredRolling { genesis_anchor }),
+        None => Err(ZkError::InvalidParams(format!(
+            "Trusted-setup verification is unconfigured: neither {} (static pin) nor {} \
+             (genesis anchor) is set. Refusing to start — the trusted setup must never run \
+             unverified. Set {} to the pinned current-params SHA-256 (frozen/ossified), or \
+             {} to the immutable genesis lineage hash (rolling).",
+            ZK_PARAMS_HASH_ENV,
+            ZK_GENESIS_PARAMS_HASH_ENV,
+            ZK_PARAMS_HASH_ENV,
+            ZK_GENESIS_PARAMS_HASH_ENV
+        ))),
+    }
+}
+
 /// 2.4 HIGH: Compute SHA-256 hash of a parameters file
 ///
 /// Streams the file to handle large parameter sets efficiently.
@@ -671,5 +782,101 @@ pub fn check_simulated_proofs_warning() {
         tracing::debug!(
             "L-8: Simulated proofs are disabled (GHOST_ALLOW_SIMULATED_PROOFS not set to 1)"
         );
+    }
+}
+
+// ============================================================================
+// Stage C: Genesis anchor + startup mode-selection tests
+// ============================================================================
+
+#[cfg(test)]
+mod startup_mode_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Env vars are process-global; serialize the mode-selection tests so they
+    // do not clobber each other's `ZK_PARAMS_HASH` / `ZK_GENESIS_PARAMS_HASH`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that clears both vars on entry and on drop, so each test runs
+    /// against a known-clean environment regardless of ordering.
+    struct EnvScrub;
+    impl EnvScrub {
+        fn new() -> Self {
+            std::env::remove_var(ZK_PARAMS_HASH_ENV);
+            std::env::remove_var(ZK_GENESIS_PARAMS_HASH_ENV);
+            EnvScrub
+        }
+    }
+    impl Drop for EnvScrub {
+        fn drop(&mut self) {
+            std::env::remove_var(ZK_PARAMS_HASH_ENV);
+            std::env::remove_var(ZK_GENESIS_PARAMS_HASH_ENV);
+        }
+    }
+
+    const ANCHOR_HEX: &str = "c9c907f688fc1102000000000000000000000000000000000000000000000000";
+
+    fn anchor_bytes() -> [u8; 32] {
+        hex::decode(ANCHOR_HEX).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn test_genesis_hash_unset_is_none() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        assert_eq!(genesis_params_hash().unwrap(), None);
+    }
+
+    #[test]
+    fn test_genesis_hash_valid_parses() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        std::env::set_var(ZK_GENESIS_PARAMS_HASH_ENV, ANCHOR_HEX);
+        assert_eq!(genesis_params_hash().unwrap(), Some(anchor_bytes()));
+    }
+
+    #[test]
+    fn test_genesis_hash_malformed_is_error_not_none() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        // Wrong length — must FAIL, never silently degrade to None.
+        std::env::set_var(ZK_GENESIS_PARAMS_HASH_ENV, "deadbeef");
+        assert!(genesis_params_hash().is_err());
+        // Non-hex of the right length — must FAIL.
+        std::env::set_var(ZK_GENESIS_PARAMS_HASH_ENV, "z".repeat(64));
+        assert!(genesis_params_hash().is_err());
+    }
+
+    #[test]
+    fn test_mode_static_pin_when_zk_params_hash_set() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        std::env::set_var(ZK_PARAMS_HASH_ENV, "BLOCK:00");
+        assert_eq!(select_startup_mode().unwrap(), ZkStartupMode::StaticPin);
+        // Static pin wins even if the genesis anchor is ALSO set (frozen path).
+        std::env::set_var(ZK_GENESIS_PARAMS_HASH_ENV, ANCHOR_HEX);
+        assert_eq!(select_startup_mode().unwrap(), ZkStartupMode::StaticPin);
+    }
+
+    #[test]
+    fn test_mode_rolling_when_only_genesis_anchor_set() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        std::env::set_var(ZK_GENESIS_PARAMS_HASH_ENV, ANCHOR_HEX);
+        assert_eq!(
+            select_startup_mode().unwrap(),
+            ZkStartupMode::GenesisAnchoredRolling {
+                genesis_anchor: anchor_bytes()
+            }
+        );
+    }
+
+    #[test]
+    fn test_mode_refuses_when_neither_set() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        // Neither pin present → never an unverified mode; selection errors.
+        assert!(select_startup_mode().is_err());
     }
 }
