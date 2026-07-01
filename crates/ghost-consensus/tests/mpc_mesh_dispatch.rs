@@ -17,8 +17,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ghost_common::config::P2PPortConfig;
 use ghost_common::error::GhostResult;
-use ghost_common::types::NodeId;
 use ghost_common::identity::NodeIdentity;
+// Only referenced by the `mpc-ceremony`-gated fetcher tests below.
+#[cfg(feature = "mpc-ceremony")]
+use ghost_common::types::NodeId;
 use ghost_consensus::mesh::{MeshConfig, MeshNetwork, MessageHandler};
 use ghost_consensus::message::{MessageEnvelope, MessageType, MpcContributionMessage};
 use tokio::sync::Notify;
@@ -507,4 +509,130 @@ async fn mpc_crossnode_votes_aggregate_to_quorum_and_apply() {
          position 5 (approvals recorded: {:?})",
         db.count_mpc_approvals(5)
     );
+}
+
+/// 7th contribution-flow gap (mesh-inclusive ROOT): the CONTRIBUTOR of a
+/// position never applies its OWN contribution through its own handler. A node's
+/// `MpcHandler` only ever applies contributions it RECEIVED via
+/// `handle_contribution` (which inserts them into `pending_contributions`); a
+/// node's own broadcast is never delivered back to itself, so it is never in
+/// that map. Therefore cross-node approve votes that reach quorum find NO pending
+/// entry on the contributor and drive NO apply — the contributor's `current.bin`
+/// + singleton stay behind even though the voters advanced. This is exactly why
+/// `ghost-pool` must SELF-ADOPT (from its local candidate, once the applied row
+/// gossips back) rather than relying on the handler.
+///
+/// This is the negative counterpart to
+/// `mpc_crossnode_votes_aggregate_to_quorum_and_apply`: identical wiring, except
+/// the node under test is the CONTRIBUTOR (it never received its own
+/// contribution into pending), so the same three quorum votes do NOT apply.
+#[cfg(feature = "mpc-ceremony")]
+#[tokio::test]
+async fn contributor_own_contribution_not_applied_by_handler_via_votes() {
+    use ghost_storage::queries::MpcContributionRecord;
+
+    let noise_port = 19599u16;
+
+    // Four elders (positions 1..4) recorded in the contributor's DB so incoming
+    // votes pass the `is_node_mpc_contributor(voter)` gate. count == 4 → the
+    // shared BFT threshold is 3.
+    let e1 = NodeIdentity::generate();
+    let e2 = NodeIdentity::generate();
+    let e3 = NodeIdentity::generate();
+    let e4 = NodeIdentity::generate();
+    let elders = [
+        (1u32, e1.node_id(), [0x01u8; 32], [0x11u8; 32]),
+        (2u32, e2.node_id(), [0x11u8; 32], [0x22u8; 32]),
+        (3u32, e3.node_id(), [0x22u8; 32], [0x33u8; 32]),
+        (4u32, e4.node_id(), [0x33u8; 32], [0x44u8; 32]),
+    ];
+
+    let db = Arc::new(Database::in_memory().expect("in-memory db"));
+    for (pos, id, prev, new) in elders {
+        db.save_mpc_contribution(&MpcContributionRecord {
+            elder_position: pos,
+            contributor_node_id: hex::encode(id),
+            prev_params_hash: prev,
+            new_params_hash: new,
+            contribution_proof: vec![0xAB; 32],
+            epoch: 0,
+            created_at: 0,
+        })
+        .expect("save elder row");
+    }
+
+    // The node under test IS the contributor of position 5 (a 5th identity, not
+    // an elder). Its handler NEVER receives its own contribution → no pending
+    // entry. No ceremony manager: it cannot self-vote either.
+    let contributor_id = Arc::new(NodeIdentity::generate());
+    let handler = Arc::new(MpcHandler::new(
+        Arc::clone(&contributor_id),
+        Arc::clone(&db),
+    ));
+    handler.init_self_ref();
+
+    let node = Arc::new(
+        MeshNetwork::try_new(Arc::clone(&contributor_id), mesh_config(19500, noise_port))
+            .expect("contributor mesh init"),
+    );
+    node.register_handler(Arc::clone(&handler) as Arc<dyn MessageHandler>);
+
+    // The position-5 contribution the node authored (its own candidate).
+    let mut contribution = MpcContributionMessage {
+        candidate: contributor_id.node_id(),
+        elder_position: 5,
+        prev_params_hash: [0x44u8; 32],
+        new_params_hash: [0x55u8; 32],
+        contribution_proof: vec![0xCD; 128],
+        signature: [0u8; 64],
+        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+    };
+    let sm = contribution.signing_message();
+    contribution.signature = contributor_id.sign(&sm);
+    let contribution_hash = contribution.contribution_hash();
+
+    // A separate peer relays the three elder votes to the contributor.
+    let relay_id = Arc::new(NodeIdentity::generate());
+    let relay = Arc::new(
+        MeshNetwork::try_new(Arc::clone(&relay_id), mesh_config(19510, noise_port))
+            .expect("relay mesh init"),
+    );
+
+    node.start().await.expect("contributor mesh start");
+    relay.start().await.expect("relay mesh start");
+    spawn_noise_listener(Arc::clone(&node), noise_port);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    relay.connect_peer("127.0.0.1").await.expect("connect_peer");
+
+    // Three elders broadcast approve votes for the authored contribution. On a
+    // VOTER (which held it pending) these would aggregate to quorum and apply;
+    // on the CONTRIBUTOR there is no pending entry, so they must NOT apply.
+    for elder in [&e2, &e3, &e4] {
+        let mut vote = ghost_consensus::message::MpcVerificationVoteMessage {
+            contribution_hash,
+            voter: elder.node_id(),
+            approve: true,
+            rejection_reason: None,
+            signature: [0u8; 64],
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        };
+        vote.signature = elder.sign(&vote.signing_message());
+        let payload = serde_json::to_vec(&vote).unwrap();
+        let envelope = relay
+            .create_envelope_raw(MessageType::MpcVerificationVote, payload)
+            .expect("envelope");
+        relay.broadcast(envelope).await.expect("broadcast vote");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Give the handler time to (not) act, then confirm position 5 was NOT applied
+    // — the contributor's head cannot advance from cross-node votes alone.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            db.get_mpc_contribution(5).ok().flatten().is_none(),
+            "gap: the contributor applied its OWN position 5 purely from cross-node votes \
+             (handler has no pending self-entry) — ghost-pool self-adopt is what must close this"
+        );
+    }
 }
