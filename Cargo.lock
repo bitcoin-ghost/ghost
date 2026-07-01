@@ -5122,6 +5122,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpc-xproc-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "bellperson",
+ "blstrs",
+ "ghost-common",
+ "ghost-mpc",
+ "ghost-policy",
+ "ghost-verification",
+ "ghost-zkp",
+ "hex",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "muda"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

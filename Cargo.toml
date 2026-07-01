@@ -41,6 +41,8 @@ members = [
     # ZK-BFT Infrastructure
     "crates/ghost-zkp",
     "crates/ghost-mpc",
+    # Cross-process MPC ceremony contribution harness (test-only, feature-gated)
+    "crates/mpc-xproc-harness",
     # Visual Identity
     "crates/ghost-glyph",
     # GSP

@@ -1,0 +1,51 @@
+[package]
+name = "mpc-xproc-harness"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = """
+Cross-PROCESS MPC rolling-ceremony contribution harness. Spawns real, separate
+OS processes (`mpc-xnode`) that serve un-applied candidate params over real HTTP
+(`GET /api/v1/mpc/params?new_hash=<hex>`, the exact production handler), fetch +
+cryptographically verify each other's candidates, vote, reach a BFT threshold,
+and apply — proving the fix for the node5 crash-loop (candidate NEVER overwrites
+the active current.bin) holds across a genuine process boundary. Gate before the
+mainnet un-pin (tasks/plan_mpc_rolling_resume.md, Stage 5 / Stage D)."""
+
+[[bin]]
+name = "mpc-xnode"
+path = "src/main.rs"
+
+[features]
+# Shrink MAX_CEREMONY_CONTRIBUTORS (101 -> 4) so the cross-process ceremony can
+# reach ossification in a few real phase-2 transforms. Propagates to ghost-mpc's
+# own compile-time cap. NEVER a default feature; enabled only on an explicit
+# `--features mpc-test-cap` targeted run, exactly like the in-process Stage D
+# harness. See crates/ghost-mpc/src/lib.rs::MAX_CEREMONY_CONTRIBUTORS.
+mpc-test-cap = ["ghost-mpc/mpc-test-cap"]
+
+[dependencies]
+# The real ceremony machinery — same crate the mainnet binary runs.
+ghost-mpc = { path = "../ghost-mpc" }
+ghost-common = { path = "../ghost-common" }
+# The REAL params-serving handler (api_mpc_params_handler + resolve path).
+ghost-verification = { path = "../ghost-verification" }
+ghost-policy = { path = "../ghost-policy" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The driver test generates ONE shared genesis (like fleet node 1) then spawns
+# the node processes; it needs the ZK circuits + curve/param crates for genesis.
+ghost-zkp = { path = "../ghost-zkp" }
+bellperson = "0.26"
+blstrs = "0.7"
+rand = "0.8"
+tempfile = "3.10"

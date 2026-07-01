@@ -6073,7 +6073,11 @@ fn resolve_mpc_note_spend_path(
     base_dir.join("note_spend_params_current.bin")
 }
 
-async fn api_mpc_params_handler(
+// NOTE: `pub` so the cross-process MPC ceremony harness
+// (`crates/mpc-xproc-harness`) can mount this EXACT production handler in a
+// minimal router and prove the `?new_hash=` candidate-vs-current serving works
+// across real OS process boundaries. Behaviour is unchanged.
+pub async fn api_mpc_params_handler(
     State(_state): State<Arc<VerificationState>>,
     Query(query): Query<MpcParamsQuery>,
 ) -> impl IntoResponse {
