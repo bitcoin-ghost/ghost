@@ -159,6 +159,31 @@ fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> boo
     current_count == cached_count
 }
 
+/// The ceremony position this node should target next, accounting for a node
+/// whose adopted head lags the recorded chain tip.
+///
+/// * `authoritative_count` — the `mpc_ceremony` singleton count. This is advanced
+///   ONLY when a position is actually ADOPTED (params applied + singleton
+///   persisted).
+/// * `max_position` — the `mpc_contributions` MAX. This is advanced whenever an
+///   applied-contribution ROW arrives (startup contributor sync OR live gossip),
+///   even before this node has adopted the corresponding params.
+///
+/// A node that joined / un-pinned while the ceremony had already advanced sees
+/// its `max_position` climb via gossip while its `authoritative_count` stays put,
+/// because merely receiving the row never drives the on-disk head forward. If it
+/// naïvely targeted `authoritative_count + 1` it would try to contribute an
+/// ALREADY-FILLED position forever (the node6→stuck-at-5 incident). The correct
+/// target is one past the recorded chain tip, so the node contributes the next
+/// FREE position — after first catching its head up to that tip. Returning
+/// `max(count, tip) + 1` makes the target robust whether or not the catch-up has
+/// completed this instant, and reduces to the normal `count + 1` when the head is
+/// already at the tip (`count == tip`).
+#[cfg(feature = "mpc-ceremony")]
+fn mpc_next_contribution_position(authoritative_count: u32, max_position: u32) -> u32 {
+    authoritative_count.max(max_position) + 1
+}
+
 /// Build this node's best (rarest) valid share per records window from the
 /// local DB, shaped exactly like the `/api/v1/pool/records` response (redacted
 /// miner_id, achieved difficulty from the hash). Gossiped in health pings so
@@ -1567,6 +1592,20 @@ async fn adopt_all_applied_positions(
         .unwrap_or(0);
     while ceremony_mgr.contribution_count() < max_pos {
         let next = ceremony_mgr.contribution_count() + 1;
+        // Before adopting, make sure this position's FULL data is present locally.
+        // A row that arrived via lightweight gossip (or the proof-less
+        // `/contributors` sync) carries an EMPTY proof and NO retained votes, so:
+        //   * a FOREIGN lineage could not be re-verified (`verify_contribution_catchup`
+        //     needs the real Schnorr/pairing proof), and
+        //   * a later restart's genesis-anchored check would fail closed (it
+        //     requires the retained ≥quorum BFT votes for every position 2..N).
+        // Pull the real proof + retained votes from a peer's
+        // `/api/v1/mpc/votes/{pos}` endpoint (best-effort; safe proof-fill upsert
+        // preserves an applied row). If no seed serves it we still attempt the
+        // adopt with whatever is local — an OWN position needs neither, and a
+        // FOREIGN one without a valid proof simply fails the crypto verify below
+        // and we stop (fail-safe), never adopting on hash-match alone.
+        sync_mpc_proof_and_votes(seeds, next, db).await;
         if !adopt_applied_position(ceremony_mgr, db, peers, seeds, our_node_id_hex, next).await {
             return false;
         }
@@ -4277,14 +4316,88 @@ async fn main() -> Result<()> {
                     return;
                 }
 
+                // ── Attempt-start catch-up (behind-the-head rolling gap) ─────────
+                // A node that joined / un-pinned while the ceremony had ALREADY
+                // advanced receives the applied-contribution ROWS via gossip (its
+                // `mpc_contributions` MAX climbs) but NOTHING drives its on-disk
+                // head + `mpc_ceremony` singleton forward — so its authoritative
+                // count lags the recorded chain tip. Left unhandled it computes
+                // `next_position = count + 1` and keeps contributing an
+                // ALREADY-FILLED position forever (the node6→stuck-at-5 incident)
+                // instead of catching up and contributing the next FREE one.
+                //
+                // "Behind" = authoritative singleton count < recorded MAX position.
+                // Catch the head up by adopting every un-adopted applied position in
+                // order via the shared adopt driver: params are fetched
+                // contributor-aware + hash-checked, FOREIGN lineages are additionally
+                // crypto-verified (`verify_contribution_catchup`), and each
+                // position's retained BFT quorum votes are synced so a later
+                // restart's genesis-anchored check still passes. `next_position`
+                // below is then recomputed from the advanced count.
+                //
+                // Idempotent + free when NOT behind: the inner while-loop is a no-op
+                // (count == max_pos) and no fetch happens — the normal same-position
+                // rolling path is untouched. Fail-safe: if catch-up can't complete
+                // (peer unreachable / a position won't verify) we do NOT contribute a
+                // stale position — wait and let the next attempt / a restart retry.
+                {
+                    let authoritative = db_for_mpc
+                        .mpc_contribution_count_authoritative()
+                        .unwrap_or(0);
+                    let chain_tip = db_for_mpc
+                        .get_mpc_max_contribution_position()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    if authoritative < chain_tip {
+                        info!(
+                            authoritative,
+                            chain_tip,
+                            "MPC: adopted head lags the recorded chain tip — catching up before \
+                             computing the next contribution position"
+                        );
+                        if adopt_all_applied_positions(
+                            &ceremony_manager_for_startup,
+                            &db_for_mpc,
+                            mesh_for_mpc_startup.peers(),
+                            &seed_nodes_for_mpc,
+                            &node_id_hex,
+                        )
+                        .await
+                        {
+                            info!(
+                                head = ceremony_manager_for_startup.contribution_count(),
+                                "MPC: caught up to the recorded chain tip"
+                            );
+                        } else {
+                            warn!(
+                                head = ceremony_manager_for_startup.contribution_count(),
+                                chain_tip,
+                                "MPC: could not fully catch up to the chain tip this attempt — \
+                                 NOT contributing a stale position; will retry"
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    }
+                }
+
                 // Determine position from DB (authoritative source, not stale in-memory state).
                 // Progression count comes from the mpc_ceremony singleton (falls back to
                 // COUNT(mpc_contributions) when absent). Voter-set sizing still uses
                 // get_mpc_elder_count() in the handler — these are deliberately distinct.
+                // After the catch-up above, `db_count == chain_tip`, so targeting one
+                // past the tip (via `mpc_next_contribution_position`) is the next FREE
+                // position — never an already-filled one.
                 let db_count = db_for_mpc
                     .mpc_contribution_count_authoritative()
                     .unwrap_or(0);
-                let next_position = db_count + 1;
+                let chain_tip = db_for_mpc
+                    .get_mpc_max_contribution_position()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let next_position = mpc_next_contribution_position(db_count, chain_tip);
 
                 info!(
                     attempt,
@@ -7552,6 +7665,284 @@ mod tests {
                 .contribution_count,
             2
         );
+    }
+
+    // ── attempt-start catch-up (behind-the-head rolling gap) ─────────
+    //
+    // A node that joined / un-pinned while the ceremony had already advanced
+    // receives applied-contribution ROWS via gossip (its `mpc_contributions` MAX
+    // climbs) but nothing drives its adopted head + singleton forward. Pre-fix it
+    // computed `next_position = singleton_count + 1` and contributed an
+    // ALREADY-FILLED position forever (node6→stuck-at-5). These lock in the fix:
+    // detect "behind", catch the head up by adopting every un-adopted position,
+    // then target one past the recorded chain tip (the next FREE position).
+
+    /// Directly write a note-spend candidate serving file WITHOUT the
+    /// supersede-cleanup that `write_candidate_note_spend_params` performs, so a
+    /// multi-step test can stage several positions' candidates simultaneously.
+    #[cfg(feature = "mpc-ceremony")]
+    fn stage_candidate(dir: &Path, new_hash: &[u8; 32], params: &ghost_mpc::Groth16Params) {
+        let mut buf = Vec::new();
+        params.write(&mut buf).expect("serialize candidate params");
+        let name = ghost_common::mpc::candidate_note_spend_filename(new_hash);
+        std::fs::write(dir.join(name), &buf).expect("write candidate file");
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    fn foreign_row(
+        position: u32,
+        contributor: &str,
+        c: &ghost_mpc::MpcContribution,
+    ) -> ghost_storage::queries::MpcContributionRecord {
+        ghost_storage::queries::MpcContributionRecord {
+            elder_position: position,
+            contributor_node_id: contributor.to_string(),
+            prev_params_hash: c.prev_params_hash,
+            new_params_hash: c.new_params_hash,
+            contribution_proof: serde_json::to_vec(&c.proof).unwrap(),
+            epoch: 0,
+            created_at: c.timestamp,
+        }
+    }
+
+    /// The pure targeting decision, at the EXACT node6 numbers. Pre-fix targeted
+    /// `count + 1` off a lagging singleton (an already-filled position); the fix
+    /// targets one past the recorded chain tip (the next free position).
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn mpc_next_contribution_position_targets_next_free_after_catchup() {
+        // node6: adopted head (singleton) lagged at 4 while the chain tip advanced
+        // to 5. The PRE-FIX formula `count + 1` == 5 — ALREADY node5's position.
+        assert_eq!(
+            4 + 1,
+            5,
+            "pre-fix formula targets the FILLED position (bug)"
+        );
+        // The FIX targets one past the tip → 6 (next FREE), both before the
+        // catch-up (count 4) and after it advances the head to the tip (count 5).
+        assert_eq!(mpc_next_contribution_position(4, 5), 6);
+        assert_eq!(mpc_next_contribution_position(5, 5), 6);
+        // Behind by two (count 4, tip 6): target 7 (after adopting 5 then 6).
+        assert_eq!(mpc_next_contribution_position(4, 6), 7);
+        assert_eq!(mpc_next_contribution_position(6, 6), 7);
+        // Not behind (fresh genesis / already caught up): normal count+1, and never
+        // a phantom advance past the head.
+        assert_eq!(mpc_next_contribution_position(0, 0), 1);
+        assert_eq!(mpc_next_contribution_position(3, 3), 4);
+    }
+
+    /// node6 reproduction: singleton at 1 while the chain tip advanced to a FOREIGN
+    /// position 2 (received only as a row). The attempt-start catch-up must ADOPT
+    /// position 2 (params + singleton advance to 2), after which the node targets
+    /// position 3 — NOT the already-filled 2. Pre-fix (no catch-up) it stayed
+    /// stuck targeting 2.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn attempt_start_catchup_adopts_foreign_position_and_targets_next_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, _p1) = ceremony_at_position_1(dir.path());
+
+        // A DIFFERENT node contributed position 2 (a VALID foreign lineage
+        // transform of our position-1 head). We are the "behind" node: we received
+        // the ROW + the contributor's candidate params but never adopted the head.
+        let foreign_id = hex::encode(NodeIdentity::generate().node_id());
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&foreign_id, 2)
+            .expect("generate foreign position 2");
+        stage_candidate(dir.path(), &c2.new_params_hash, &p2);
+        db.save_mpc_contribution(&foreign_row(2, &foreign_id, &c2))
+            .unwrap();
+
+        // ── PRE (the node6 stuck state) ──────────────────────────────────────
+        let pre_count = db.mpc_contribution_count_authoritative().unwrap();
+        let tip = db.get_mpc_max_contribution_position().unwrap().unwrap();
+        assert_eq!(pre_count, 1, "adopted head still lags at position 1");
+        assert_eq!(tip, 2, "the chain tip advanced to position 2 via the row");
+        // Pre-fix targeted `count + 1` == 2 — the position ALREADY filled by the
+        // foreign contributor. That is the forever-stuck condition.
+        assert_eq!(pre_count + 1, tip, "pre-fix targets the FILLED position");
+
+        // ── CATCH UP (the fix) ───────────────────────────────────────────────
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(
+            adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await,
+            "attempt-start catch-up must adopt the foreign applied position"
+        );
+
+        // ── POST (fails under pre-fix) ───────────────────────────────────────
+        assert_eq!(manager.contribution_count(), 2, "head advanced to the tip");
+        assert_eq!(
+            manager.current_params_hash(),
+            c2.new_params_hash,
+            "current.bin is the position-2 applied head"
+        );
+        let post_count = db.mpc_contribution_count_authoritative().unwrap();
+        assert_eq!(post_count, 2, "singleton advanced to the tip");
+        // Now the node targets position 3 — the next FREE position, not the filled 2.
+        assert_eq!(
+            mpc_next_contribution_position(post_count, tip),
+            3,
+            "after catch-up the node targets the next FREE position (3), not 2"
+        );
+    }
+
+    /// Multi-step catch-up: behind by two. The singleton sits at 1 while the chain
+    /// tip advanced to position 3 (rows for 2 and 3 received). The catch-up must
+    /// adopt 2 THEN 3 in order, after which the node targets 4.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn attempt_start_catchup_multi_step_adopts_all_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, _p1) = ceremony_at_position_1(dir.path());
+
+        // Our own positions 2 and 3 were BFT-applied and gossiped back as rows; we
+        // hold both candidate serving files but adopted neither (singleton at 1).
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&our_id, 2)
+            .expect("generate position 2");
+        let (p3, c3) = manager
+            .generate_contribution_at_position(&our_id, 3)
+            .expect("generate position 3");
+        stage_candidate(dir.path(), &c2.new_params_hash, &p2);
+        stage_candidate(dir.path(), &c3.new_params_hash, &p3);
+        db.save_mpc_contribution(&foreign_row(2, &our_id, &c2))
+            .unwrap();
+        db.save_mpc_contribution(&foreign_row(3, &our_id, &c3))
+            .unwrap();
+
+        let pre_count = db.mpc_contribution_count_authoritative().unwrap();
+        let tip = db.get_mpc_max_contribution_position().unwrap().unwrap();
+        assert_eq!(pre_count, 1);
+        assert_eq!(tip, 3, "behind by two positions");
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(
+            adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await,
+            "catch-up must adopt BOTH lagging positions in order"
+        );
+
+        assert_eq!(manager.contribution_count(), 3, "head advanced 1 -> 2 -> 3");
+        assert_eq!(manager.current_params_hash(), c3.new_params_hash);
+        let post_count = db.mpc_contribution_count_authoritative().unwrap();
+        assert_eq!(post_count, 3);
+        assert_eq!(
+            mpc_next_contribution_position(post_count, tip),
+            4,
+            "after a two-step catch-up the node targets position 4"
+        );
+    }
+
+    /// Fail-closed on FOREIGN lineage: a caught-up position this node did NOT
+    /// author is adopted ONLY after cryptographic `verify_contribution_catchup`
+    /// (Schnorr + pairing transform), never on hash-match alone. A forged
+    /// candidate whose file hashes to the recorded head but whose params are not a
+    /// valid transform must be REJECTED and must NOT advance the head.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn catchup_rejects_forged_foreign_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, p1_hash) = ceremony_at_position_1(dir.path());
+
+        // Borrow a foreign node's REAL position-2 proof (valid Schnorr bound to
+        // this ceremony_id), so the forgery clears the proof checks and is caught
+        // specifically by the pairing TRANSFORM check.
+        let foreign_id = hex::encode(NodeIdentity::generate().node_id());
+        let (_p2, c2) = manager
+            .generate_contribution_at_position(&foreign_id, 2)
+            .expect("generate foreign position 2 (for its valid proof)");
+
+        // FORGERY: the "position-2 params" are actually the UNCHANGED position-1
+        // params (an identity transform that applied no tau). The candidate file
+        // hashes to the row's new_params_hash (hash-match PASSES), but
+        // e(new_h, tau_G2) != e(old_h, G2) when new_h == old_h and tau != 1, so
+        // `verify_contribution_catchup` MUST reject it.
+        let prev = manager.note_spend_params().unwrap();
+        let forged_hash = ghost_mpc::contribution::hash_parameters(&prev).unwrap();
+        assert_eq!(
+            forged_hash, p1_hash,
+            "forged candidate == the position-1 head"
+        );
+        stage_candidate(dir.path(), &forged_hash, &prev);
+        db.save_mpc_contribution(&ghost_storage::queries::MpcContributionRecord {
+            elder_position: 2,
+            contributor_node_id: foreign_id.clone(),
+            prev_params_hash: p1_hash,
+            new_params_hash: forged_hash,
+            contribution_proof: serde_json::to_vec(&c2.proof).unwrap(),
+            epoch: 0,
+            created_at: c2.timestamp,
+        })
+        .unwrap();
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        let adopted = adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await;
+
+        assert!(!adopted, "a forged foreign candidate must NOT be adopted");
+        assert_eq!(
+            manager.contribution_count(),
+            1,
+            "head must stay at position 1 — no false advance on a rejected forgery"
+        );
+        assert_eq!(
+            db.get_mpc_ceremony_state()
+                .unwrap()
+                .unwrap()
+                .contribution_count,
+            1,
+            "singleton must not advance on a rejected forgery"
+        );
+    }
+
+    /// Restart-safety of a caught-up position: after adopting position N the node
+    /// must hold params AND the retained ≥quorum BFT votes for it, so a later
+    /// restart's genesis-anchored startup check passes without manual backfill
+    /// (the node6 votes I had to backfill by hand). The network vote sync runs
+    /// against a peer's `/api/v1/mpc/votes/{pos}` endpoint (no HTTP server in a
+    /// unit test); here the votes are seeded as that sync would deliver them, and
+    /// we assert they SURVIVE the adopt and are queryable for the restart check.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn catchup_retains_votes_for_restart_safety() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, _p1) = ceremony_at_position_1(dir.path());
+
+        let foreign_id = hex::encode(NodeIdentity::generate().node_id());
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&foreign_id, 2)
+            .expect("generate foreign position 2");
+        stage_candidate(dir.path(), &c2.new_params_hash, &p2);
+        db.save_mpc_contribution(&foreign_row(2, &foreign_id, &c2))
+            .unwrap();
+
+        // The retained BFT quorum votes for position 2 (as the votes endpoint
+        // would serve them).
+        for i in 0..3u8 {
+            let voter = hex::encode(NodeIdentity::generate().node_id());
+            db.save_mpc_vote(&ghost_storage::queries::MpcVerificationVote {
+                contribution_position: 2,
+                voter_node_id: voter,
+                approve: true,
+                signature: vec![i.wrapping_add(1); 64],
+                voted_at: 1_700_000_000 + i as u64,
+            })
+            .unwrap();
+        }
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await);
+
+        // Params present at the adopted head …
+        assert_eq!(manager.contribution_count(), 2);
+        assert_eq!(manager.current_params_hash(), c2.new_params_hash);
+        // … AND the retained quorum votes for the caught-up position survive, so
+        // the genesis-anchored restart verification has what it needs.
+        let votes = db.get_mpc_votes(2).unwrap();
+        assert_eq!(
+            votes.len(),
+            3,
+            "retained BFT votes for the caught-up position are present after catch-up"
+        );
+        assert!(votes.iter().all(|v| v.approve));
     }
 
     // ── reaper_config_from_settings ──────────────────────────────────
