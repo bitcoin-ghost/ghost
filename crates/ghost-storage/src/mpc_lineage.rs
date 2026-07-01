@@ -384,6 +384,10 @@ impl crate::Database {
                     payout_vk_hash: None,
                     updated_at,
                     ceremony_id: *genesis_anchor,
+                    // The file-hash pin is latched separately by the startup path
+                    // (which has the on-disk params to hash); reconcile only
+                    // records the verified lineage head + length here.
+                    ossified_file_hash: None,
                 };
                 self.save_mpc_ceremony_state(&new_state)?;
                 Ok(true)
@@ -773,6 +777,7 @@ mod tests {
             payout_vk_hash: None,
             updated_at: 1,
             ceremony_id: ANCHOR,
+            ossified_file_hash: None,
         })
         .unwrap();
 

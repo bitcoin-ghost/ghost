@@ -279,6 +279,16 @@ pub enum ZkStartupMode {
     /// chain + the retained BFT quorum per position (see ghost-storage). Carries
     /// the genesis anchor (a LINEAGE hash) that roots the chain.
     GenesisAnchoredRolling { genesis_anchor: [u8; 32] },
+    /// AUTONOMOUS OSSIFIED PIN: the DB ceremony singleton has ossified (reached
+    /// `MAX_CEREMONY_CONTRIBUTORS`) and recorded the final params FILE hash. This
+    /// mode is selected AUTOMATICALLY from that DB latch — with NO operator action
+    /// and REGARDLESS of env vars — and takes precedence over both `StaticPin` and
+    /// `GenesisAnchoredRolling`. Startup verifies the on-disk current params hash
+    /// to this pin (fail-closed), then STILL runs the genesis-anchored lineage +
+    /// retained-quorum verification once so the frozen params stay cryptographically
+    /// anchored to the genesis root — not merely file-hash-trusted. Carries the
+    /// pinned raw-file SHA-256 (the SAME digest a `ZK_PARAMS_HASH` static pin holds).
+    OssifiedPinned { file_hash: [u8; 32] },
 }
 
 /// Stage C: choose the startup verification mode from the environment.
@@ -312,6 +322,88 @@ pub fn select_startup_mode() -> ZkResult<ZkStartupMode> {
             ZK_GENESIS_PARAMS_HASH_ENV
         ))),
     }
+}
+
+/// AUTONOMOUS OSSIFICATION selector: choose the startup verification mode with
+/// the DB ossification latch taking ABSOLUTE precedence over the environment.
+///
+/// `ossified_file_hash` is the `mpc_ceremony.ossified_file_hash` column: `Some`
+/// exactly when the ceremony has reached `MAX_CEREMONY_CONTRIBUTORS` and the final
+/// params file hash was durably recorded. When present, this returns
+/// [`ZkStartupMode::OssifiedPinned`] REGARDLESS of `ZK_PARAMS_HASH` /
+/// `ZK_GENESIS_PARAMS_HASH` — the trusted setup is final, so no env var (which an
+/// operator may have left pointing at a now-stale intermediate hash) can override
+/// the frozen pin. When absent, selection falls back to [`select_startup_mode`]
+/// (StaticPin / GenesisAnchoredRolling), unchanged.
+///
+/// This is the mechanism that lets a node self-pin at the cap with no operator
+/// action, surviving restarts and fresh joins forever: the DB flag drives it.
+pub fn select_startup_mode_with_ossification(
+    ossified_file_hash: Option<[u8; 32]>,
+) -> ZkResult<ZkStartupMode> {
+    if let Some(file_hash) = ossified_file_hash {
+        return Ok(ZkStartupMode::OssifiedPinned { file_hash });
+    }
+    select_startup_mode()
+}
+
+/// Streaming raw-file SHA-256 (available in every build, unlike the
+/// zk-production-gated [`compute_params_file_hash`]). Matches
+/// `ghost_mpc::params::hash_params_file` and a `ZK_PARAMS_HASH=BLOCK:<hex>` pin.
+fn sha256_file_raw(path: &std::path::Path) -> ZkResult<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| ZkError::InvalidParams(format!("Failed to open params file: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buffer)
+            .map_err(|e| ZkError::InvalidParams(format!("Failed to read params file: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// FAIL-CLOSED verification for [`ZkStartupMode::OssifiedPinned`]: the on-disk
+/// `note_spend_params_current.bin` in `params_dir` MUST hash to `expected`.
+///
+/// A missing file, an unreadable file, or ANY hash mismatch returns `Err`, so a
+/// tampered or wrong params file can never run under the ossified pin. This is
+/// the ossified analogue of the `ZK_PARAMS_HASH` BLOCK check `load_trusted_params`
+/// performs — same digest, same fail-closed posture — but sourcing the pin from
+/// the DB latch instead of an env var.
+pub fn verify_ossified_current_params(
+    params_dir: &std::path::Path,
+    expected: &[u8; 32],
+) -> ZkResult<()> {
+    let current = params_dir.join("note_spend_params_current.bin");
+    if !current.exists() {
+        return Err(ZkError::InvalidParams(format!(
+            "OSSIFIED PIN: {} is missing — refusing to start (fail-closed). The ceremony has \
+             ossified; the final trusted-setup params must be present and match the recorded pin.",
+            current.display()
+        )));
+    }
+    let actual = sha256_file_raw(&current)?;
+    if &actual != expected {
+        return Err(ZkError::InvalidParams(format!(
+            "OSSIFIED PIN MISMATCH: {} hashes to {} but the permanently-recorded ossified pin is \
+             {}. The trusted-setup params are tampered or wrong — refusing to start (fail-closed).",
+            current.display(),
+            hex::encode(actual),
+            hex::encode(expected)
+        )));
+    }
+    tracing::info!(
+        pin = %hex::encode(expected),
+        "OSSIFIED PIN verified: on-disk trusted-setup params match the permanent ossified file hash"
+    );
+    Ok(())
 }
 
 /// 2.4 HIGH: Compute SHA-256 hash of a parameters file
@@ -878,5 +970,69 @@ mod startup_mode_tests {
         let _s = EnvScrub::new();
         // Neither pin present → never an unverified mode; selection errors.
         assert!(select_startup_mode().is_err());
+    }
+
+    #[test]
+    fn test_ossified_pin_overrides_static_pin_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        // Operator left a STALE static pin in the env — the DB ossification latch
+        // must take absolute precedence and select OssifiedPinned with the DB hash.
+        std::env::set_var(ZK_PARAMS_HASH_ENV, "BLOCK:00");
+        let db_pin = [0xEE; 32];
+        assert_eq!(
+            select_startup_mode_with_ossification(Some(db_pin)).unwrap(),
+            ZkStartupMode::OssifiedPinned { file_hash: db_pin }
+        );
+    }
+
+    #[test]
+    fn test_ossified_pin_overrides_genesis_anchor_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        std::env::set_var(ZK_GENESIS_PARAMS_HASH_ENV, ANCHOR_HEX);
+        let db_pin = [0x11; 32];
+        assert_eq!(
+            select_startup_mode_with_ossification(Some(db_pin)).unwrap(),
+            ZkStartupMode::OssifiedPinned { file_hash: db_pin }
+        );
+    }
+
+    #[test]
+    fn test_ossified_pin_absent_falls_back_to_env_mode() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _s = EnvScrub::new();
+        std::env::set_var(ZK_GENESIS_PARAMS_HASH_ENV, ANCHOR_HEX);
+        // No DB latch → behave exactly like select_startup_mode (rolling here).
+        assert_eq!(
+            select_startup_mode_with_ossification(None).unwrap(),
+            ZkStartupMode::GenesisAnchoredRolling {
+                genesis_anchor: anchor_bytes()
+            }
+        );
+        // And with NOTHING configured, absence still refuses (never unverified).
+        std::env::remove_var(ZK_GENESIS_PARAMS_HASH_ENV);
+        assert!(select_startup_mode_with_ossification(None).is_err());
+    }
+
+    #[test]
+    fn test_verify_ossified_params_pass_and_tamper_fail() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note_spend_params_current.bin");
+        let bytes = b"final ossified trusted-setup parameters blob";
+        std::fs::write(&path, bytes).unwrap();
+        let expected: [u8; 32] = Sha256::digest(bytes).into();
+
+        // Matching file → OK.
+        assert!(verify_ossified_current_params(dir.path(), &expected).is_ok());
+
+        // Tampered file (same path, different bytes) → FAIL closed.
+        std::fs::write(&path, b"tampered params blob of a different length!!").unwrap();
+        assert!(verify_ossified_current_params(dir.path(), &expected).is_err());
+
+        // Missing file → FAIL closed.
+        std::fs::remove_file(&path).unwrap();
+        assert!(verify_ossified_current_params(dir.path(), &expected).is_err());
     }
 }

@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 39;
+const SCHEMA_VERSION: u32 = 40;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -95,6 +95,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (37, migrate_v37),
         (38, migrate_v38),
         (39, migrate_v39),
+        (40, migrate_v40),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2054,6 +2055,31 @@ fn migrate_v39(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// Migration v40: autonomous-ossification pin.
+///
+/// Adds a nullable `ossified_file_hash BLOB` column to the `mpc_ceremony`
+/// singleton. When the ceremony reaches `MAX_CEREMONY_CONTRIBUTORS` this column
+/// records the raw-file SHA-256 of the final `note_spend_params_current.bin`
+/// (the SAME digest a `ZK_PARAMS_HASH` static pin holds). Its presence makes a
+/// node self-select the `OssifiedPinned` startup mode with no operator action —
+/// no env re-pin, surviving restarts and fresh joins forever.
+///
+/// Additive and idempotent: no existing row is rewritten (a live ceremony that
+/// has not yet ossified simply gets a NULL column, which reads as "not ossified
+/// yet"). The one-way latch in `save_mpc_ceremony_state` / `latch_mpc_ossification`
+/// is what later populates it, deterministically, on every node.
+fn migrate_v40(conn: &Connection) -> GhostResult<()> {
+    debug!(
+        "Running migration v40: Add mpc_ceremony.ossified_file_hash (autonomous ossification pin)"
+    );
+
+    conn.execute_batch("ALTER TABLE mpc_ceremony ADD COLUMN ossified_file_hash BLOB;")
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    info!("v40: Added mpc_ceremony.ossified_file_hash column");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2240,6 +2266,57 @@ mod tests {
         assert!(
             read_singleton(&conn).is_none(),
             "no singleton must be written when mpc_contributions is empty"
+        );
+    }
+
+    // ========================================================================
+    // v40: mpc_ceremony.ossified_file_hash (autonomous ossification pin)
+    // ========================================================================
+
+    #[test]
+    fn test_v40_adds_ossified_file_hash_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let cols = get_column_names(&conn, "mpc_ceremony");
+        assert!(
+            cols.contains(&"ossified_file_hash".to_string()),
+            "v40 must add ossified_file_hash column; got {cols:?}"
+        );
+    }
+
+    #[test]
+    fn test_v40_applies_on_existing_db_without_data_loss() {
+        // Start at the pre-v39 shape with a populated singleton, then run the
+        // full migration chain (v39 + v40). The column is added and the existing
+        // singleton data is untouched (additive migration).
+        let conn = Connection::open_in_memory().unwrap();
+        setup_pre_v39_mpc(&conn);
+        insert_synthetic_contributions(&conn, 3);
+        conn.execute(
+            "INSERT INTO mpc_ceremony
+                (id, contribution_count, current_params_hash, is_ossified, updated_at)
+             VALUES (1, 3, ?1, 0, 77)",
+            rusqlite::params![&[3u8; 32][..]],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let cols = get_column_names(&conn, "mpc_ceremony");
+        assert!(cols.contains(&"ossified_file_hash".to_string()));
+        // Existing data preserved; new column defaults to NULL.
+        let (count, ofh): (i64, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT contribution_count, ossified_file_hash FROM mpc_ceremony WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "existing singleton preserved across v40");
+        assert_eq!(
+            ofh, None,
+            "ossified_file_hash defaults to NULL (not ossified)"
         );
     }
 

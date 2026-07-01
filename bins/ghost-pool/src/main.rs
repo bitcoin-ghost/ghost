@@ -1341,6 +1341,7 @@ fn persist_singleton_from_manager(
         payout_vk_hash: s.payout_vk_hash,
         updated_at: s.updated_at,
         ceremony_id: s.ceremony_id,
+        ossified_file_hash: s.ossified_file_hash,
     };
     if let Err(e) = db.save_mpc_ceremony_state(&db_state) {
         tracing::warn!(error = %e, "MPC adopt: failed to persist ceremony singleton");
@@ -1853,13 +1854,19 @@ async fn sync_mpc_proof_and_votes(
 /// failure it returns an error so the process exits — systemd restarts it and
 /// it retries, recovering automatically the moment a seed becomes reachable.
 /// It NEVER loops forever inside one process and NEVER continues without params.
+///
+/// The `expected` pinned hashes gate every fetched/present blob. Normally this is
+/// `expected_param_hashes()` (from `ZK_PARAMS_HASH`), but the autonomous-ossified
+/// path passes `{ "BLOCK": ossified_file_hash }` sourced from the DB latch so a
+/// fresh joiner self-heals the FINAL params with no env pin at all.
 #[cfg(all(feature = "zk-consensus", feature = "mpc-ceremony"))]
 async fn ensure_mpc_params_present(
     seed_nodes: &[String],
     params_dir: &std::path::Path,
+    expected: &std::collections::HashMap<String, [u8; 32]>,
 ) -> Result<()> {
     let current = params_dir.join("note_spend_params_current.bin");
-    let expected = expected_param_hashes();
+    let expected = expected.clone();
 
     if current.exists() {
         // Present — but DON'T blindly trust it. Validate against the pinned
@@ -3082,7 +3089,75 @@ async fn main() -> Result<()> {
             // verification run in the MPC block below. Neither set on a production
             // node → `select_startup_mode` errors and startup aborts (never
             // unverified).
-            match ghost_zkp::select_startup_mode()? {
+            //
+            // AUTONOMOUS OSSIFICATION takes ABSOLUTE precedence: if the DB
+            // ceremony singleton has ossified (reached the 101 cap) and recorded
+            // the final params file hash, the node self-selects `OssifiedPinned`
+            // from that DB latch REGARDLESS of env vars — no operator re-pin. This
+            // is read fresh from the DB here so it drives the very first decision.
+            let ossified_pin: Option<[u8; 32]> = db
+                .get_mpc_ceremony_state()
+                .ok()
+                .flatten()
+                .filter(|s| s.is_ossified)
+                .and_then(|s| s.ossified_file_hash);
+            match ghost_zkp::select_startup_mode_with_ossification(ossified_pin)? {
+                ghost_zkp::ZkStartupMode::OssifiedPinned { file_hash } => {
+                    // The trusted setup is FINAL. Behaves like StaticPin but the
+                    // pin comes from the DB latch, not an env var (which may be a
+                    // stale intermediate hash). Self-heal missing/corrupt params
+                    // from seeds — verified against the ossified pin — then apply
+                    // the hard fail-closed file-hash check. A tampered or wrong
+                    // params file MUST NOT run.
+                    let params_dir = std::path::PathBuf::from(
+                        std::env::var(ghost_zkp::ZK_PARAMS_PATH_ENV).map_err(|_| {
+                            anyhow::anyhow!(
+                                "OSSIFIED PIN: {} is not set — cannot locate the frozen \
+                                 trusted-setup params directory. Refusing to start (fail-closed).",
+                                ghost_zkp::ZK_PARAMS_PATH_ENV
+                            )
+                        })?,
+                    );
+                    #[cfg(feature = "mpc-ceremony")]
+                    {
+                        let mut expected = std::collections::HashMap::new();
+                        expected.insert("BLOCK".to_string(), file_hash);
+                        ensure_mpc_params_present(
+                            &config.network.seed_nodes,
+                            &params_dir,
+                            &expected,
+                        )
+                        .await?;
+                    }
+                    // FATAL if the on-disk head does not match the ossified pin.
+                    ghost_zkp::verify_ossified_current_params(&params_dir, &file_hash)?;
+                    // Still run the genesis-anchored lineage + retained-quorum
+                    // verification below so the frozen params stay cryptographically
+                    // anchored to the genesis root, not merely file-hash-trusted.
+                    // Anchor = DB-derived genesis lineage hash (position-1
+                    // prev_params_hash); fall back to the env anchor if present.
+                    let anchor = db
+                        .mpc_genesis_ceremony_id()
+                        .ok()
+                        .flatten()
+                        .or_else(|| ghost_zkp::genesis_params_hash().ok().flatten())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "OSSIFIED PIN: cannot derive the genesis lineage anchor (no \
+                                 position-1 contribution and {} unset) — refusing to start so the \
+                                 ossified params are never left unanchored (fail-closed).",
+                                ghost_zkp::ZK_GENESIS_PARAMS_HASH_ENV
+                            )
+                        })?;
+                    zk_rolling_anchor = Some(anchor);
+                    info!(
+                        pin = %hex::encode(&file_hash[..8]),
+                        anchor = %hex::encode(&anchor[..8]),
+                        "ZK consensus in OSSIFIED mode: trusted setup is FINAL — verified against \
+                         the permanent DB pin, still genesis-anchored (no operator action, no env \
+                         re-pin)"
+                    );
+                }
                 ghost_zkp::ZkStartupMode::StaticPin => {
                     // SELF-HEAL: a fresh production node may have the binary but no
                     // MPC ceremony output on disk yet. Fetch + verify the params
@@ -3102,7 +3177,12 @@ async fn main() -> Result<()> {
                         // would let a corrupt-but-present file slip straight into
                         // the hard `load_trusted_params` check below and crash-loop
                         // the node.
-                        ensure_mpc_params_present(&config.network.seed_nodes, &params_dir).await?;
+                        ensure_mpc_params_present(
+                            &config.network.seed_nodes,
+                            &params_dir,
+                            &expected_param_hashes(),
+                        )
+                        .await?;
                     }
                     ghost_zkp::load_trusted_params()?;
                     info!(
@@ -3584,6 +3664,9 @@ async fn main() -> Result<()> {
                 // Stable genesis-derived ceremony_id (NOT current_params_hash).
                 ceremony_id: stable_ceremony_id,
                 pending_commitment_count: 0,
+                // Round-trip the permanent ossification pin from the DB so the
+                // manager stays ossified across restarts (irreversible latch).
+                ossified_file_hash: s.ossified_file_hash,
             }),
         ) {
             Ok(manager) => Arc::new(manager),
@@ -3807,6 +3890,54 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+
+            // AUTONOMOUS OSSIFICATION LATCH (fresh-joiner + safety net).
+            //
+            // The genesis-anchored verification above just PROVED the on-disk head
+            // is the cryptographically-valid chain tip. If that verified chain has
+            // reached the cap, permanently record the ossified params FILE hash
+            // from the on-disk head. This is the step that lets a fresh node which
+            // just SYNCED an already-complete 1..MAX chain self-pin: on its NEXT
+            // startup `ossified_pin` is Some and it auto-selects `OssifiedPinned`
+            // with zero operator action. It is also a safety net for any node that
+            // reached the cap without persisting the pin through the apply path.
+            //
+            // Idempotent + irreversible: `latch_mpc_ossification` never re-pins an
+            // already-latched singleton and the storage layer refuses to clear it.
+            // Non-fatal: a transient hash failure just defers self-pinning to the
+            // next restart — the genesis-anchored verification still fully guards
+            // this node in the meantime.
+            if verified_count >= ghost_mpc::MAX_CEREMONY_CONTRIBUTORS {
+                match ceremony_manager.current_params_file_hash() {
+                    Ok(file_hash) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        match db.latch_mpc_ossification(&file_hash, now) {
+                            Ok(true) => info!(
+                                count = verified_count,
+                                file_hash = %hex::encode(&file_hash[..8]),
+                                "MPC: autonomously OSSIFIED — recorded permanent params file-hash \
+                                 pin; this node self-pins on next startup (no operator action)"
+                            ),
+                            Ok(false) => {
+                                info!("MPC: ossified pin already latched (permanent) — leaving it")
+                            }
+                            Err(e) => warn!(
+                                error = %e,
+                                "MPC: reached cap but could not latch ossified pin — will retry on \
+                                 next restart (genesis-anchored verification still guards this node)"
+                            ),
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "MPC: reached cap but could not hash on-disk head to latch ossified pin — \
+                         will retry on next restart"
+                    ),
+                }
+            }
         }
 
         // Create broadcast callback for MPC handler
@@ -4010,6 +4141,7 @@ async fn main() -> Result<()> {
                                 payout_vk_hash: s.payout_vk_hash,
                                 updated_at: s.updated_at,
                                 ceremony_id: s.ceremony_id,
+                                ossified_file_hash: s.ossified_file_hash,
                             };
                             if let Err(e) = db.save_mpc_ceremony_state(&db_state) {
                                 tracing::warn!(error = %e, "MPC params_callback: failed to persist ceremony singleton");
@@ -8928,7 +9060,7 @@ mod tests {
         std::env::set_var("ZK_PARAMS_HASH", format!("BLOCK:{}", hex::encode(pinned)));
 
         // No seeds → cannot heal → must NOT return Ok while the bad file sits there.
-        let res = ensure_mpc_params_present(&[], dir.path()).await;
+        let res = ensure_mpc_params_present(&[], dir.path(), &expected_param_hashes()).await;
 
         // Restore env before asserting (so a panic cannot leak the override).
         match prev {
