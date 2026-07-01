@@ -1613,6 +1613,128 @@ async fn adopt_all_applied_positions(
     true
 }
 
+/// Reconcile the `mpc_ceremony` singleton to the recorded contribution-chain
+/// head. The SINGLE source of the "singleton count == chain tip == head lineage
+/// hash" invariant shared by the fresh-join SYNC path (Part A) and the startup
+/// self-heal guard (Part B).
+///
+/// * ZERO contribution rows → returns `Ok(None)` and writes NOTHING: the node
+///   is legitimately pre-genesis (a brand-new genesis node) and must stay so.
+/// * `n > 0` rows AND singleton absent-or-BEHIND → creates / advances the
+///   singleton to `contribution_count = n` with
+///   `current_params_hash = mpc_contributions[n].new_params_hash` (the lineage
+///   head) and `ceremony_id = position-1.prev_params_hash` (the genesis anchor).
+/// * `n > 0` rows AND singleton already at/ahead of `n` → no-op, `Ok(Some(n))`.
+///
+/// Fail-CLOSED + honest: it reconciles ONLY to contributions that actually
+/// exist, never fabricates a genesis or invents a head, and NEVER lowers an
+/// already-ahead singleton (that would be a rollback).
+#[cfg(feature = "mpc-ceremony")]
+fn reconcile_singleton_to_recorded_head(
+    db: &ghost_storage::Database,
+) -> anyhow::Result<Option<u32>> {
+    let max_pos = match db.get_mpc_max_contribution_position()? {
+        Some(n) if n > 0 => n,
+        // No contribution rows: genuinely pre-genesis — leave the DB untouched.
+        _ => return Ok(None),
+    };
+
+    // Only create-if-absent or advance-if-behind; never lower an ahead singleton.
+    if let Some(state) = db.get_mpc_ceremony_state()? {
+        if state.contribution_count >= max_pos {
+            return Ok(Some(max_pos));
+        }
+    }
+
+    let head = db.get_mpc_contribution(max_pos)?.ok_or_else(|| {
+        anyhow::anyhow!("MPC: chain tip position {max_pos} has no contribution row")
+    })?;
+    // Canonical ceremony anchor = position-1's prev_params_hash (genesis lineage).
+    let anchor = db.mpc_genesis_ceremony_id()?.unwrap_or([0u8; 32]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    db.reconcile_mpc_singleton_to_head(max_pos, &head.new_params_hash, &anchor, now)?;
+    Ok(Some(max_pos))
+}
+
+/// Ensure the on-disk `note_spend_params_current.bin` IS the recorded
+/// contribution-chain head (`mpc_contributions[MAX].new_params_hash`).
+///
+/// If the manager already holds head parameters whose lineage
+/// [`hash_parameters`] equals the recorded head, this is a no-op (`Ok(true)`) —
+/// the common case for both a fresh join (the generic params fetch already
+/// installed the head) and a node7-style restart (the head is on disk, only the
+/// singleton was missing). Otherwise the head is fetched BY ITS LINEAGE HASH
+/// (contributor-first, then seeds; hash-checked inside
+/// [`fetch_ceremony_params_bundle`]) and installed through the manager's atomic
+/// params writer ([`ghost_mpc::CeremonyManager::install_synced_head`]), then the
+/// on-disk head is guaranteed to match.
+///
+/// Returns `Ok(false)` when there is no recorded head (zero contributions —
+/// pre-genesis). Returns `Err` (fail-safe) when a head is recorded but no source
+/// can supply matching parameters, so the caller does NOT persist a singleton it
+/// cannot back with on-disk params.
+#[cfg(feature = "mpc-ceremony")]
+async fn ensure_recorded_head_installed(
+    ceremony_mgr: &Arc<ghost_mpc::CeremonyManager>,
+    db: &ghost_storage::Database,
+    peers: &ghost_consensus::peer::PeerManager,
+    seeds: &[String],
+) -> anyhow::Result<bool> {
+    let max_pos = match db.get_mpc_max_contribution_position()? {
+        Some(n) if n > 0 => n,
+        _ => return Ok(false),
+    };
+    let head = db.get_mpc_contribution(max_pos)?.ok_or_else(|| {
+        anyhow::anyhow!("MPC: chain tip position {max_pos} has no contribution row")
+    })?;
+
+    // Already at the recorded head on disk (loaded into the manager)?
+    let on_disk_ok = ceremony_mgr
+        .note_spend_params()
+        .and_then(|p| ghost_mpc::contribution::hash_parameters(&p).ok())
+        .map(|h| h == head.new_params_hash)
+        .unwrap_or(false);
+    if on_disk_ok {
+        return Ok(true);
+    }
+
+    // current.bin is missing / stale: fetch the exact head by its lineage hash
+    // and install it through the atomic params writer. Serialise against the
+    // other trusted-setup writers on the shared parameter files.
+    let _guard = param_write_lock().lock().await;
+    let contributor_addr = hex::decode(&head.contributor_node_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .and_then(|c| resolve_contributor_addr(peers, db, &c));
+    let sources = ordered_fetch_sources(contributor_addr.as_deref(), seeds);
+    let bundle = fetch_ceremony_params_bundle(&sources, head.new_params_hash)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MPC: no source served head params matching recorded lineage at position {max_pos}"
+            )
+        })?;
+    let note_spend = (*bundle.note_spend).clone();
+    let new_hash = head.new_params_hash;
+    // `install_synced_head` is CPU-heavy (serialise + hash hundreds of MB); run it
+    // off the async runtime on a blocking thread (mirrors the adopt path).
+    let mgr = Arc::clone(ceremony_mgr);
+    let installed = tokio::task::spawn_blocking(move || {
+        mgr.install_synced_head(max_pos, &note_spend, new_hash)
+    })
+    .await;
+    match installed {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(e)) => Err(anyhow::anyhow!("MPC: install_synced_head failed: {e}")),
+        Err(e) => Err(anyhow::anyhow!(
+            "MPC: install_synced_head task join failed: {e}"
+        )),
+    }
+}
+
 /// Stage C task 3: fetch a single position's FULL contribution (with the real
 /// `contribution_proof`) AND its retained approve/reject votes from a peer's
 /// `/api/v1/mpc/votes/{position}` endpoint, and persist BOTH locally.
@@ -3372,7 +3494,50 @@ async fn main() -> Result<()> {
         use ghost_consensus::MpcHandler;
         use ghost_mpc::CeremonyManager;
 
-        // Load MPC ceremony state from database (the backfilled singleton)
+        // Part B — defensive startup self-heal (node7 recovery).
+        //
+        // A node that SYNCED contribution rows (+ proofs/votes) but never
+        // persisted the `mpc_ceremony` singleton (the fresh-join gap Part A fixes
+        // at the source) would otherwise fall through `load_or_init(None)` into
+        // the PRE-GENESIS branch and DISCARD its synced position-1..n state,
+        // regenerating genesis. Detect that inconsistency BEFORE `load_or_init`
+        // and reconcile the singleton to the recorded chain-tip head, so the
+        // manager loads the synced position cleanly instead.
+        //
+        // "Inconsistent" = contribution rows EXIST (`max_pos > 0`) AND the
+        // singleton is absent, or present but BEHIND the recorded chain tip
+        // (`count < max_pos`). A node with ZERO contribution rows is left
+        // untouched — it is legitimately pre-genesis (this is how a brand-new
+        // genesis node starts). Fail-CLOSED + honest: reconcile only from
+        // contributions that actually exist; never fabricate a genesis or head.
+        {
+            let singleton_count = db.get_mpc_ceremony_state()?.map(|s| s.contribution_count);
+            let max_pos = db.get_mpc_max_contribution_position()?.unwrap_or(0);
+            let inconsistent = max_pos > 0 && singleton_count.map(|c| c < max_pos).unwrap_or(true);
+            if inconsistent {
+                match reconcile_singleton_to_recorded_head(&db) {
+                    Ok(Some(head)) => info!(
+                        head,
+                        had_singleton = singleton_count.is_some(),
+                        prior_count = singleton_count.unwrap_or(0),
+                        "MPC startup self-heal: reconciled mpc_ceremony singleton to the recorded \
+                         contribution-chain head (contributions present but singleton absent/behind) \
+                         — loading the synced position instead of re-initialising pre-genesis"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        error = %e,
+                        "MPC startup self-heal: singleton reconcile failed — startup verification \
+                         will decide (fail-closed)"
+                    ),
+                }
+            }
+        }
+
+        // Load MPC ceremony state from database (reconciled above if it was
+        // absent/behind, so a synced node now passes `Some(state)` — with
+        // `count == chain tip` — into `load_or_init` and loads current.bin,
+        // rather than the pre-genesis `None` path).
         let mpc_state = db.get_mpc_ceremony_state()?;
 
         // Stage A task 2: derive the STABLE ceremony_id.
@@ -3428,6 +3593,40 @@ async fn main() -> Result<()> {
                 Arc::new(CeremonyManager::new(mpc_params_dir))
             }
         };
+
+        // Part B — current.bin consistency for the reconciled head.
+        //
+        // The Part-B guard above ensured the singleton == chain tip, so
+        // `load_or_init` above loaded whatever `note_spend_params_current.bin`
+        // holds at that count. In the node7 case current.bin IS the synced head
+        // (the fetch installed it), so this is a no-op. But if current.bin is
+        // MISSING or STALE (e.g. a partial sync, or a head fetched under a
+        // pre-reconcile count), a synced node has no sequential apply path to
+        // rebuild it (`adopt_all_applied_positions` is a no-op once
+        // count == chain tip). Re-install the recorded head by its lineage hash
+        // through the atomic params writer so the genesis-anchored FATAL check
+        // below passes on a genuinely-consistent head — rather than the node
+        // silently proving against stale params or falsely advancing.
+        // Fail-CLOSED: if the head can't be installed we leave current.bin as-is
+        // and let the FATAL verification decide.
+        if ceremony_manager.contribution_count() > 0 {
+            match ensure_recorded_head_installed(
+                &ceremony_manager,
+                &db,
+                mesh.peers(),
+                &config.network.seed_nodes,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(e) => warn!(
+                    error = %e,
+                    "MPC startup self-heal: could not (re)install the recorded head to current.bin \
+                     — genesis-anchored verification will decide (fail-closed)"
+                ),
+            }
+        }
 
         // Stage A task 3: startup lineage cross-check (fail-closed).
         //
@@ -4295,6 +4494,51 @@ async fn main() -> Result<()> {
                         if !fetched || !ceremony_manager_for_startup.has_current_params() {
                             warn!("MPC: Failed to fetch genesis parameters from network. Use --genesis on the first node.");
                             return;
+                        }
+
+                        // Part A — persist a CONSISTENT synced head.
+                        //
+                        // The sync above populated `mpc_contributions` (+ proofs/
+                        // votes) and fetched the head params into current.bin, but
+                        // it never wrote the `mpc_ceremony` singleton. Left there,
+                        // the next restart reads NO singleton, re-initialises
+                        // PRE-GENESIS, and DISCARDS the synced position-1..n state
+                        // (the node7 onboarding bug). Leave the node fully
+                        // consistent at the synced head:
+                        //   1. guarantee current.bin IS the recorded chain-tip head
+                        //      (re-fetch by lineage hash + atomic install if the
+                        //      generic fetch left it stale), then
+                        //   2. persist the singleton (count == chain tip ==
+                        //      on-disk head lineage hash).
+                        // Fail-SAFE: if the head can't be made consistent we do NOT
+                        // persist a singleton we cannot back with on-disk params —
+                        // the next attempt / restart re-syncs.
+                        match ensure_recorded_head_installed(
+                            &ceremony_manager_for_startup,
+                            &db_for_mpc,
+                            mesh_for_mpc_startup.peers(),
+                            &seed_nodes_for_mpc,
+                        )
+                        .await
+                        {
+                            Ok(true) => match reconcile_singleton_to_recorded_head(&db_for_mpc) {
+                                Ok(Some(head)) => info!(
+                                    head,
+                                    "MPC: persisted synced ceremony head (current.bin + mpc_ceremony \
+                                     singleton) — the node will load this position cleanly on restart"
+                                ),
+                                Ok(None) => {}
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "MPC: failed to persist synced ceremony singleton"
+                                ),
+                            },
+                            Ok(false) => {}
+                            Err(e) => warn!(
+                                error = %e,
+                                "MPC: could not install the synced head params to current.bin; \
+                                 singleton NOT persisted — a restart will re-sync (fail-safe)"
+                            ),
                         }
                     }
                 }
@@ -7665,6 +7909,184 @@ mod tests {
                 .contribution_count,
             2
         );
+    }
+
+    // ── fresh-join singleton self-heal (node7 onboarding gap) ────────
+    //
+    // node7 joined genesis-anchored, synced the full lineage (contribution rows
+    // + proofs + votes) and fetched the head params into current.bin, but the
+    // sync NEVER wrote the `mpc_ceremony` singleton. On restart
+    // `get_mpc_ceremony_state()` returned None, `load_or_init(None)`
+    // re-initialised PRE-GENESIS, and the node DISCARDED its synced position-1..n
+    // state. These lock in the fix: with contribution rows present but no
+    // singleton, the startup reconcile creates the singleton at the chain tip
+    // (current_params_hash == contributions[MAX].new_params_hash) so the node is
+    // NOT pre-genesis; with ZERO contributions it stays pre-genesis.
+
+    /// Build a node7-shaped state in `dir`: an in-memory DB with contribution
+    /// rows 1..=n (+ proofs) and an on-disk head (`current.bin`) at position n,
+    /// but DELIBERATELY no `mpc_ceremony` singleton (the fresh-join sync gap).
+    #[cfg(feature = "mpc-ceremony")]
+    fn synced_ceremony_no_singleton(
+        dir: &Path,
+        n: u32,
+    ) -> (
+        std::sync::Arc<ghost_mpc::CeremonyManager>,
+        std::sync::Arc<ghost_storage::Database>,
+        String,
+    ) {
+        use ghost_common::identity::NodeIdentity;
+
+        let manager = std::sync::Arc::new(ghost_mpc::CeremonyManager::new(dir.to_path_buf()));
+        manager.ensure_genesis_initialized().expect("genesis init");
+        let id_hex = hex::encode(NodeIdentity::generate().node_id());
+        let db = std::sync::Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+
+        // Position 1 (genesis contribution), then 2..=n, applied in order so
+        // current.bin ends at the position-n head; every position saved as a row.
+        let (p1, c1) = manager
+            .generate_contribution(&id_hex)
+            .expect("generate position 1");
+        manager
+            .apply_contribution(p1, &c1)
+            .expect("apply position 1");
+        db.save_mpc_contribution(&foreign_row(1, &id_hex, &c1))
+            .unwrap();
+        for pos in 2..=n {
+            let (p, c) = manager
+                .generate_contribution_at_position(&id_hex, pos)
+                .expect("generate position");
+            manager.apply_contribution(p, &c).expect("apply position");
+            db.save_mpc_contribution(&foreign_row(pos, &id_hex, &c))
+                .unwrap();
+        }
+        // NODE7 GAP: deliberately do NOT persist the mpc_ceremony singleton.
+        assert!(
+            db.get_mpc_ceremony_state().unwrap().is_none(),
+            "helper must reproduce the node7 state: rows present, NO singleton"
+        );
+        (manager, db, id_hex)
+    }
+
+    /// Storage/reconcile: N contribution rows (+ proofs) but NO singleton → the
+    /// startup reconcile CREATES the singleton at count=N with
+    /// `current_params_hash == contributions[N].new_params_hash` (NOT pre-genesis).
+    /// Pre-fix this scenario stayed singleton-less → pre-genesis on restart.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn startup_reconcile_creates_singleton_from_synced_contributions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, _id) = synced_ceremony_no_singleton(dir.path(), 3);
+
+        assert_eq!(db.get_mpc_max_contribution_position().unwrap(), Some(3));
+        let head_hash = db.get_mpc_contribution(3).unwrap().unwrap().new_params_hash;
+
+        // ── the fix ─────────────────────────────────────────────────────────
+        let n = reconcile_singleton_to_recorded_head(&db).unwrap();
+        assert_eq!(n, Some(3));
+
+        let singleton = db
+            .get_mpc_ceremony_state()
+            .unwrap()
+            .expect("singleton created — node is NO LONGER pre-genesis");
+        assert_eq!(
+            singleton.contribution_count, 3,
+            "singleton count == chain tip"
+        );
+        assert_eq!(
+            singleton.current_params_hash, head_hash,
+            "singleton head == recorded contributions[MAX].new_params_hash (lineage hash)"
+        );
+        // Invariant: singleton head == on-disk current.bin head lineage hash.
+        let on_disk =
+            ghost_mpc::contribution::hash_parameters(&manager.note_spend_params().unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk, head_hash,
+            "singleton head == on-disk current.bin head"
+        );
+    }
+
+    /// The genuine pre-genesis path is preserved: ZERO contribution rows AND no
+    /// singleton → the reconcile is a no-op and the node stays pre-genesis (this
+    /// is how a brand-new genesis node starts). No singleton is fabricated.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn startup_reconcile_zero_contributions_stays_pregenesis() {
+        let db = std::sync::Arc::new(ghost_storage::Database::in_memory().unwrap());
+        assert!(db.get_mpc_ceremony_state().unwrap().is_none());
+        assert_eq!(db.get_mpc_max_contribution_position().unwrap(), None);
+
+        assert_eq!(
+            reconcile_singleton_to_recorded_head(&db).unwrap(),
+            None,
+            "no contributions → pre-genesis, nothing to reconcile"
+        );
+        assert!(
+            db.get_mpc_ceremony_state().unwrap().is_none(),
+            "must NOT fabricate a singleton for a brand-new genesis node"
+        );
+    }
+
+    /// Sync-path (Part A): after the finalize runs, the singleton is present at
+    /// the synced count AND current.bin on disk hashes to the head lineage hash.
+    /// (current.bin was already installed by the params fetch, so no network is
+    /// needed — `ensure_recorded_head_installed` returns Ok(true) immediately.)
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn sync_path_persists_head_and_singleton() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, _id) = synced_ceremony_no_singleton(dir.path(), 2);
+        let head_hash = db.get_mpc_contribution(2).unwrap().unwrap().new_params_hash;
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(
+            ensure_recorded_head_installed(&manager, &db, &peers, &[])
+                .await
+                .unwrap(),
+            "current.bin already at the recorded head — no re-fetch needed"
+        );
+        assert_eq!(reconcile_singleton_to_recorded_head(&db).unwrap(), Some(2));
+
+        let singleton = db.get_mpc_ceremony_state().unwrap().unwrap();
+        assert_eq!(singleton.contribution_count, 2);
+        assert_eq!(singleton.current_params_hash, head_hash);
+
+        // current.bin on disk hashes to the head lineage hash.
+        let current = dir.path().join("note_spend_params_current.bin");
+        let on_disk = ghost_mpc::contribution::hash_parameters(
+            &ghost_mpc::params::load_parameters(&current).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk, head_hash,
+            "on-disk current.bin == head lineage hash"
+        );
+    }
+
+    /// Regression: the caller reconciles BEFORE `load_or_init`, so the ceremony
+    /// state handed to `load_or_init` is `Some(state)` — never `None` — when
+    /// contributions are present. `load_or_init(dir, None)` with contributions is
+    /// the exact node7 crash-path and must be unreachable after the guard.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn load_or_init_receives_some_after_startup_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_manager, db, _id) = synced_ceremony_no_singleton(dir.path(), 2);
+
+        // Pre-reconcile: state is None — load_or_init(None) would go PRE-GENESIS.
+        assert!(db.get_mpc_ceremony_state().unwrap().is_none());
+
+        // Part B guard runs the reconcile before load_or_init.
+        reconcile_singleton_to_recorded_head(&db).unwrap();
+
+        // The value load_or_init now receives is Some(state), count == chain tip.
+        let state = db.get_mpc_ceremony_state().unwrap();
+        assert!(
+            state.is_some(),
+            "caller must pass Some(state) to load_or_init after reconcile, never None"
+        );
+        assert_eq!(state.unwrap().contribution_count, 2);
     }
 
     // ── attempt-start catch-up (behind-the-head rolling gap) ─────────

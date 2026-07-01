@@ -721,6 +721,86 @@ impl CeremonyManager {
         Ok(())
     }
 
+    /// Durably install an already-obtained, hash-verified note-spend parameter
+    /// set as the CURRENT head for a node that SYNCED the ceremony mid-flight.
+    ///
+    /// A node that joins after the ceremony has already advanced fetches the
+    /// applied contribution ROWS (+ proofs/votes) and the head parameters from a
+    /// peer, but it never ran the sequential [`apply_contribution_multi`] for the
+    /// intermediate positions (it holds neither the toxic waste nor the
+    /// intermediate parameter files). Such a node cannot reach its head through
+    /// the position-`count + 1` apply path. This method records the fetched head
+    /// through the SAME S-5/S-6 atomic writers (`save_parameters` +
+    /// `update_current_params`) the apply path uses, so a restart loads
+    /// `note_spend_params_current.bin` cleanly instead of re-initialising
+    /// pre-genesis.
+    ///
+    /// This is NOT a contribution — it does not transform parameters; it only
+    /// makes the ALREADY-AGREED head durable on THIS node. It is fail-CLOSED:
+    /// both the provided params AND the on-disk copy after write MUST re-hash
+    /// (lineage [`hash_parameters`]) to `head_hash` (the recorded
+    /// `mpc_contributions[version].new_params_hash`), else the install is
+    /// rejected and no mismatched head is left as current.
+    pub fn install_synced_head(
+        &self,
+        version: u32,
+        params: &Parameters<Bls12>,
+        head_hash: [u8; 32],
+    ) -> MpcResult<()> {
+        // Refuse to install anything that is not the claimed head lineage: the
+        // caller fetched `params` by `head_hash`, but re-check here so this
+        // method is safe in isolation and never persists a mismatched head.
+        let provided = hash_parameters(params)?;
+        if provided != head_hash {
+            return Err(MpcError::InvalidParams(format!(
+                "install_synced_head: provided params hash {} != expected head {}",
+                hex::encode(&provided[..8]),
+                hex::encode(&head_hash[..8])
+            )));
+        }
+
+        self.files.ensure_dir()?;
+        let note_spend_path = self.files.note_spend_params_path(version);
+        save_parameters(&note_spend_path, params)?;
+        save_verifying_key(&self.files.note_spend_vk_path(), &params.vk)?;
+        // Atomically repoint note_spend_params_current.bin at the version we just
+        // wrote (the one legitimate current.bin writer, shared with apply).
+        update_current_params(&self.files, version)?;
+
+        // Verify-after-write: the on-disk current head must re-hash to `head_hash`.
+        let installed = load_parameters(&self.files.current_note_spend_params_path())?;
+        let on_disk = hash_parameters(&installed)?;
+        if on_disk != head_hash {
+            return Err(MpcError::InvalidParams(format!(
+                "install_synced_head: verify-after-write failed — on-disk head {} != expected {}",
+                hex::encode(&on_disk[..8]),
+                hex::encode(&head_hash[..8])
+            )));
+        }
+
+        // Hot-swap into memory and set the in-memory state to the synced head.
+        let vk = prepare_verifying_key(&installed.vk);
+        *self.note_spend_params.write() = Some(Arc::new(installed));
+        *self.note_spend_vk.write() = Some(Arc::new(vk));
+        let mut state = self.state.write();
+        if version > state.contribution_count {
+            state.contribution_count = version;
+        }
+        state.current_params_hash = head_hash;
+        state.note_spend_vk_hash = Some(head_hash);
+        state.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        info!(
+            version,
+            head = %hex::encode(&head_hash[..8]),
+            "MPC: installed synced ceremony head (current.bin) via the atomic params writer"
+        );
+        Ok(())
+    }
+
     /// Mark the ceremony as ossified
     ///
     /// This is called when elder 101 contributes, permanently closing
@@ -1439,6 +1519,79 @@ mod tests {
             manager.contribution_count(),
             10,
             "Contribution count must not decrease — lower network counts are rejected"
+        );
+    }
+
+    /// `install_synced_head` durably installs a fetched head for a node that
+    /// joined mid-flight (no sequential apply path). It must write current.bin
+    /// through the atomic writer, load it into memory, advance the in-memory
+    /// state to the synced head, and leave the on-disk head hashing to the
+    /// recorded lineage hash — so a subsequent `load_or_init` loads it cleanly.
+    #[test]
+    fn test_install_synced_head_persists_current_bin() {
+        // Produce a real position-1 head on a "donor" manager.
+        let (donor, _donor_tmp) = create_test_manager();
+        donor.ensure_genesis_initialized().unwrap();
+        let (head_params, c1) = donor.generate_contribution("donor").unwrap();
+        let head_hash = c1.new_params_hash;
+
+        // A FRESH node (own dir, never ran genesis/apply) installs the synced head.
+        let (joiner, tmp) = create_test_manager();
+        assert!(!joiner.has_current_params());
+        joiner
+            .install_synced_head(1, &head_params, head_hash)
+            .expect("install synced head");
+
+        // In-memory state advanced to the synced head.
+        assert_eq!(joiner.contribution_count(), 1);
+        assert_eq!(joiner.current_params_hash(), head_hash);
+        assert!(joiner.has_current_params());
+
+        // On-disk current.bin exists and re-hashes to the recorded lineage head.
+        let current = tmp.path().join("note_spend_params_current.bin");
+        assert!(current.exists(), "current.bin must be written");
+        let on_disk = crate::contribution::hash_parameters(&load_parameters(&current).unwrap())
+            .expect("hash on-disk head");
+        assert_eq!(
+            on_disk, head_hash,
+            "on-disk current.bin must be the recorded lineage head"
+        );
+
+        // A restart (load_or_init with the persisted count) loads it — NOT pre-genesis.
+        let reloaded = CeremonyManager::load_or_init(
+            tmp.path().to_path_buf(),
+            Some(CeremonyState {
+                contribution_count: 1,
+                current_params_hash: head_hash,
+                ..CeremonyState::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(reloaded.contribution_count(), 1);
+        assert!(
+            reloaded.has_current_params(),
+            "restart must load the installed head, not re-init pre-genesis"
+        );
+    }
+
+    /// `install_synced_head` is fail-CLOSED: a params set that does not hash to
+    /// the claimed head lineage is REJECTED (never written as the current head).
+    #[test]
+    fn test_install_synced_head_rejects_hash_mismatch() {
+        let (donor, _donor_tmp) = create_test_manager();
+        donor.ensure_genesis_initialized().unwrap();
+        let (head_params, _c1) = donor.generate_contribution("donor").unwrap();
+
+        let (joiner, _tmp) = create_test_manager();
+        let wrong_hash = [0x11u8; 32];
+        let result = joiner.install_synced_head(1, &head_params, wrong_hash);
+        assert!(
+            result.is_err(),
+            "params not matching the claimed head hash must be rejected"
+        );
+        assert!(
+            !joiner.has_current_params(),
+            "a rejected install must not leave a head loaded"
         );
     }
 }
