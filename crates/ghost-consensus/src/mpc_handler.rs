@@ -139,6 +139,28 @@ enum VoteDecision {
     Abstain,
 }
 
+/// Outcome of the cheap structural + hash-chain pre-check.
+///
+/// The pre-check must distinguish a DETERMINISTIC structural failure (which
+/// every honest node sees identically, so it is safe to REJECT) from a purely
+/// LOCAL / transient condition (our own view is momentarily behind — the
+/// predecessor contribution is not yet in our DB, or the lookup errored). A
+/// local condition is NOT proof the candidate is bad, so it must ABSTAIN and be
+/// re-evaluated on the next rebroadcast — never recorded as a permanent reject.
+enum StructuralOutcome {
+    /// Structure well-formed and (for position > 1) the chain link is confirmed
+    /// against a predecessor we hold. Proceed to cryptographic verification.
+    Pass,
+    /// Deterministic structural failure visible identically to every node
+    /// (empty proof, zero/duplicate hashes, or a predecessor we HOLD whose hash
+    /// does not match the claimed `prev_params_hash`). Cast a reject.
+    Reject(String),
+    /// Indeterminate / local: we do not yet hold the predecessor (mid-catch-up,
+    /// or the contributor just restarted and our view lags) or the lookup
+    /// errored. We cannot judge the chain — abstain, do not reject.
+    Indeterminate(String),
+}
+
 /// BFT threshold + bootstrap count for MPC contribution approval.
 ///
 /// SINGLE SOURCE OF TRUTH: these come from `ghost_common::constants` (and are
@@ -236,15 +258,44 @@ impl RateLimiter {
 /// Maximum age for pending contributions before cleanup (30 minutes)
 const PENDING_CONTRIBUTION_TIMEOUT_SECS: u64 = 30 * 60;
 
+/// Minimum interval between heavy re-verifications of the SAME still-pending
+/// candidate on rebroadcast.
+///
+/// A contributor rebroadcasts its stable candidate roughly every 60-90s until it
+/// converges. When we have NOT yet approved a position (no vote, or a prior
+/// transient reject we must heal), each rebroadcast is an opportunity to re-run
+/// the real cryptographic verification and, if it now passes, upgrade our vote.
+/// This throttle sits comfortably under the rebroadcast cadence so every genuine
+/// rebroadcast re-evaluates, while capping repeated multi-second Groth16 verifies
+/// under a duplicate flood (a peer replaying the same hash faster than that).
+const MPC_REEVAL_MIN_INTERVAL_SECS: u64 = 30;
+
 /// Pending contribution awaiting verification
 #[derive(Clone)]
 struct PendingContribution {
     message: MpcContributionMessage,
     received_at: Instant,
-    approval_count: u32,
-    rejection_count: u32,
-    /// Track which voters have already voted (prevents duplicate vote inflation)
-    voters: std::collections::HashSet<NodeId>,
+    /// Last time we ran (or re-ran) verify+vote for this candidate. Throttles the
+    /// heavy re-verification triggered by rebroadcasts / duplicate floods.
+    last_evaluated: Instant,
+    /// Latest vote from each voter (`voter -> approve`). LATEST-WINS: a voter that
+    /// first cast a transient reject and later fetches + verifies the candidate has
+    /// its `approve` supersede the stale reject (and a repeat of the same value is
+    /// idempotent — no double counting). This is what lets a stuck reject heal
+    /// toward quorum without waiting for the 30-minute pending reclaim.
+    votes: std::collections::HashMap<NodeId, bool>,
+}
+
+impl PendingContribution {
+    /// Number of voters whose latest vote is `approve`.
+    fn approval_count(&self) -> u32 {
+        self.votes.values().filter(|&&approve| approve).count() as u32
+    }
+
+    /// Number of voters whose latest vote is `reject`.
+    fn rejection_count(&self) -> u32 {
+        self.votes.values().filter(|&&approve| !approve).count() as u32
+    }
 }
 
 /// MPC ceremony handler
@@ -435,15 +486,15 @@ impl MpcHandler {
             return Ok(());
         }
 
-        // Store as pending
+        // Store as pending — or, for a rebroadcast of an already-pending
+        // candidate, decide whether to RE-EVALUATE it.
         let contribution_hash = msg.contribution_hash();
+        let our_id = self.identity.node_id();
         {
             let mut pending = self.pending_contributions.write();
-            if pending.contains_key(&contribution_hash) {
-                debug!("Duplicate MPC contribution, ignoring");
-                return Ok(());
-            }
-            // Clean up stale pending contributions before inserting
+
+            // Clean up stale pending contributions first, so a long-aged entry
+            // never blocks a fresh candidate at the same hash.
             pending.retain(|_, c| {
                 c.received_at.elapsed().as_secs() < PENDING_CONTRIBUTION_TIMEOUT_SECS
             });
@@ -455,16 +506,43 @@ impl MpcHandler {
                 c.inserted_at.elapsed().as_secs() < PENDING_CONTRIBUTION_TIMEOUT_SECS
             });
 
-            pending.insert(
-                contribution_hash,
-                PendingContribution {
-                    message: msg.clone(),
-                    received_at: Instant::now(),
-                    approval_count: 0,
-                    rejection_count: 0,
-                    voters: std::collections::HashSet::new(),
-                },
-            );
+            if let Some(existing) = pending.get_mut(&contribution_hash) {
+                // Rebroadcast of a candidate we are already tracking. Re-evaluate
+                // ONLY when we have NOT yet approved it (no vote yet, or a prior
+                // transient reject that must heal) AND a throttle interval has
+                // elapsed — this lets a stuck reject recover on a later rebroadcast
+                // without re-running the heavy Groth16 verify on every duplicate.
+                // A candidate we have already approved needs no re-work, and a
+                // definitively-invalid one is simply re-rejected by the same real
+                // verification each time — never approved by retrying.
+                let already_approved = existing.votes.get(&our_id) == Some(&true);
+                let throttle_elapsed =
+                    existing.last_evaluated.elapsed().as_secs() >= MPC_REEVAL_MIN_INTERVAL_SECS;
+                if already_approved || !throttle_elapsed {
+                    debug!(
+                        position = msg.elder_position,
+                        already_approved,
+                        "Duplicate MPC contribution — no re-evaluation (already approved or throttled)"
+                    );
+                    return Ok(());
+                }
+                // Arm the throttle and fall through to re-run verify+vote below.
+                existing.last_evaluated = Instant::now();
+                debug!(
+                    position = msg.elder_position,
+                    "Re-evaluating rebroadcast MPC contribution (not yet approved)"
+                );
+            } else {
+                pending.insert(
+                    contribution_hash,
+                    PendingContribution {
+                        message: msg.clone(),
+                        received_at: Instant::now(),
+                        last_evaluated: Instant::now(),
+                        votes: std::collections::HashMap::new(),
+                    },
+                );
+            }
         }
 
         info!(
@@ -527,51 +605,70 @@ impl MpcHandler {
 
     /// Cheap structural + hash-chain pre-check (the FAST REJECT).
     ///
-    /// Returns `true` only when the proof is present, the hashes are well-formed
-    /// and distinct, AND `prev_params_hash` chains from the recorded previous
-    /// contribution. This is necessary but NOT sufficient — it does NOT prove
-    /// the contribution is a valid cryptographic transformation. Approval
+    /// Distinguishes a DETERMINISTIC structural failure ([`StructuralOutcome::Reject`])
+    /// from an INDETERMINATE local condition ([`StructuralOutcome::Indeterminate`],
+    /// e.g. the predecessor contribution is not yet in OUR database because we are
+    /// mid-catch-up or the contributor just restarted). Only the former is a
+    /// permanent, everyone-sees-it verdict safe to record as a reject; the latter
+    /// must ABSTAIN so it is re-evaluated on the next rebroadcast rather than
+    /// blocking quorum forever with a stale reject.
+    ///
+    /// A [`StructuralOutcome::Pass`] is necessary but NOT sufficient — it does NOT
+    /// prove the contribution is a valid cryptographic transformation. Approval
     /// additionally requires [`MpcHandler::crypto_decide`].
-    fn structural_precheck(&self, msg: &MpcContributionMessage) -> bool {
-        // Structural validation: proof exists, hashes are non-zero and different
+    fn structural_precheck(&self, msg: &MpcContributionMessage) -> StructuralOutcome {
+        // Structural validation: proof exists, hashes are non-zero and different.
+        // These fields are part of the signed payload every node sees identically,
+        // so a failure here is a DETERMINISTIC reject.
         let structurally_valid = !msg.contribution_proof.is_empty()
             && msg.prev_params_hash != [0u8; 32]
             && msg.new_params_hash != [0u8; 32]
             && msg.prev_params_hash != msg.new_params_hash;
         if !structurally_valid {
-            return false;
+            return StructuralOutcome::Reject("Malformed contribution structure".to_string());
         }
 
         // Hash chain validation: verify prev_params_hash matches the latest contribution.
         if msg.elder_position == 1 {
             // Genesis contribution has no predecessor to validate against.
-            return true;
+            return StructuralOutcome::Pass;
         }
         match self.db.get_mpc_contribution(msg.elder_position - 1) {
             Ok(Some(prev)) => {
                 if prev.new_params_hash != msg.prev_params_hash {
+                    // We HOLD the predecessor and its hash does not match the
+                    // claimed link — the chain is definitively broken. Every node
+                    // holding this predecessor sees the same mismatch → reject.
                     warn!(
                         position = msg.elder_position,
                         expected = %hex::encode(&prev.new_params_hash[..8]),
                         got = %hex::encode(&msg.prev_params_hash[..8]),
                         "MPC contribution prev_params_hash does not chain from previous contribution"
                     );
-                    false
+                    StructuralOutcome::Reject(
+                        "prev_params_hash does not chain from previous contribution".to_string(),
+                    )
                 } else {
-                    true
+                    StructuralOutcome::Pass
                 }
             }
             Ok(None) => {
+                // We do NOT yet hold the predecessor (our view lags — mid-catch-up,
+                // or the contributor just restarted). We cannot judge the chain, so
+                // ABSTAIN and re-evaluate later rather than casting a stale reject.
                 warn!(
                     position = msg.elder_position,
                     prev_position = msg.elder_position - 1,
-                    "Cannot verify hash chain: previous contribution not found"
+                    "Cannot verify hash chain: previous contribution not present locally — abstaining"
                 );
-                false
+                StructuralOutcome::Indeterminate(
+                    "previous contribution not present locally".to_string(),
+                )
             }
             Err(e) => {
-                warn!(error = %e, "Failed to look up previous MPC contribution for chain verification");
-                false
+                // A local lookup error is not proof of forgery — abstain.
+                warn!(error = %e, "Failed to look up previous MPC contribution for chain verification — abstaining");
+                StructuralOutcome::Indeterminate(format!("previous-contribution lookup error: {e}"))
             }
         }
     }
@@ -586,8 +683,17 @@ impl MpcHandler {
     /// so a flaky node never approves blind and never drags the 67% threshold
     /// toward rejection.
     async fn decide_vote(&self, msg: &MpcContributionMessage) -> VoteDecision {
-        if !self.structural_precheck(msg) {
-            return VoteDecision::Reject("Invalid structure or hash chain".to_string());
+        match self.structural_precheck(msg) {
+            StructuralOutcome::Reject(reason) => return VoteDecision::Reject(reason),
+            StructuralOutcome::Indeterminate(reason) => {
+                info!(
+                    position = msg.elder_position,
+                    reason = %reason,
+                    "MPC: structural pre-check indeterminate — abstaining (will re-evaluate on rebroadcast)"
+                );
+                return VoteDecision::Abstain;
+            }
+            StructuralOutcome::Pass => {}
         }
 
         #[cfg(feature = "mpc-ceremony")]
@@ -783,29 +889,25 @@ impl MpcHandler {
         let should_apply = {
             let mut pending = self.pending_contributions.write();
             if let Some(contribution) = pending.get_mut(&contribution_hash) {
-                // H-4: Insert our node ID into voters set before incrementing count.
+                // H-4 / latest-wins: record our node's LATEST verdict. Re-inserting
+                // the same value is idempotent (no double counting); a re-vote that
+                // upgrades a prior transient reject to approve supersedes it.
                 let our_id = self.identity.node_id();
-                if !contribution.voters.insert(our_id) {
-                    return Ok(());
-                }
-                if approve {
-                    contribution.approval_count += 1;
-                } else {
-                    contribution.rejection_count += 1;
-                }
+                contribution.votes.insert(our_id, approve);
 
+                let approval_count = contribution.approval_count();
                 let contributor_count = self.mpc_contributor_count();
                 let threshold = bft_threshold(contributor_count);
 
                 info!(
-                    approvals = contribution.approval_count,
-                    rejections = contribution.rejection_count,
+                    approvals = approval_count,
+                    rejections = contribution.rejection_count(),
                     mpc_contributors = contributor_count,
                     threshold = threshold,
                     "Self-vote counted for MPC contribution"
                 );
 
-                contribution.approval_count >= threshold
+                approval_count >= threshold
             } else {
                 false
             }
@@ -851,38 +953,37 @@ impl MpcHandler {
             return Ok(());
         }
 
-        // Update pending contribution (with duplicate vote prevention)
+        // Update pending contribution. LATEST-WINS: a repeat of the same vote value
+        // is idempotent (no double counting), while a voter that upgrades a prior
+        // transient reject to an approve on a rebroadcast has its approve counted
+        // toward quorum — this is what lets a stuck reject heal without waiting for
+        // the pending entry to be reclaimed.
         let should_apply = {
             let mut pending = self.pending_contributions.write();
             if let Some(contribution) = pending.get_mut(&msg.contribution_hash) {
-                // Reject duplicate votes from the same voter
-                if !contribution.voters.insert(msg.voter) {
+                let prior = contribution.votes.insert(msg.voter, msg.approve);
+                if prior == Some(msg.approve) {
                     debug!(
                         voter = %hex::encode(&msg.voter[..8]),
-                        "Duplicate MPC vote from same voter, ignoring"
+                        "Duplicate MPC vote (same value) from voter, no change"
                     );
-                    return Ok(());
                 }
 
-                if msg.approve {
-                    contribution.approval_count += 1;
-                } else {
-                    contribution.rejection_count += 1;
-                }
+                let approval_count = contribution.approval_count();
 
                 // Check if we have BFT threshold
                 let contributor_count = self.mpc_contributor_count();
                 let threshold = bft_threshold(contributor_count);
 
                 debug!(
-                    approvals = contribution.approval_count,
-                    rejections = contribution.rejection_count,
+                    approvals = approval_count,
+                    rejections = contribution.rejection_count(),
                     mpc_contributors = contributor_count,
                     threshold = threshold,
                     "MPC vote counted"
                 );
 
-                contribution.approval_count >= threshold
+                approval_count >= threshold
             } else {
                 false
             }
@@ -1427,6 +1528,35 @@ mod ceremony_vote_tests {
         })
     }
 
+    /// A fetcher whose reachability is toggled at runtime. While `reachable` is
+    /// false the contributor is unreachable (fetch returns `None`, the transient
+    /// condition); once flipped true it serves the candidate params (subject to the
+    /// production hash filter). Models a contributor that was momentarily down
+    /// (e.g. just-restarted) and then comes back.
+    fn fetcher_toggle(
+        params: Arc<Groth16Params>,
+        reachable: Arc<std::sync::atomic::AtomicBool>,
+    ) -> MpcParamsFetchFn {
+        Arc::new(move |expected, _contributor| {
+            let p = Arc::clone(&params);
+            let reachable = Arc::clone(&reachable);
+            Box::pin(async move {
+                if !reachable.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None; // contributor unreachable — transient
+                }
+                let h = ghost_mpc::contribution::hash_parameters(&p).ok()?;
+                if h != expected {
+                    return None;
+                }
+                Some(FetchedCeremonyParams {
+                    note_spend: p,
+                    payout: None,
+                    unshield: None,
+                })
+            })
+        })
+    }
+
     /// A fetcher that models the real network topology: the candidate params are
     /// held ONLY by the contributor node (keyed by its node id), exactly as in
     /// production where the contributor serves its un-applied candidate and the
@@ -1472,9 +1602,8 @@ mod ceremony_vote_tests {
             PendingContribution {
                 message: msg.clone(),
                 received_at: Instant::now(),
-                approval_count: 0,
-                rejection_count: 0,
-                voters: std::collections::HashSet::new(),
+                last_evaluated: Instant::now(),
+                votes: std::collections::HashMap::new(),
             },
         );
     }
@@ -1555,7 +1684,7 @@ mod ceremony_vote_tests {
 
         // PROOF the hole is closed: the OLD structural-only check approves this.
         assert!(
-            handler.structural_precheck(&msg),
+            matches!(handler.structural_precheck(&msg), StructuralOutcome::Pass),
             "the old structural-only check WOULD have passed the forged contribution"
         );
 
@@ -1653,7 +1782,10 @@ mod ceremony_vote_tests {
             .with_state(0, false);
 
         // Structural + hash checks pass — proving hash match alone is insufficient.
-        assert!(handler.structural_precheck(&msg));
+        assert!(matches!(
+            handler.structural_precheck(&msg),
+            StructuralOutcome::Pass
+        ));
         insert_pending(&handler, &msg);
 
         handler.verify_and_vote(&msg).await.unwrap();
@@ -1803,5 +1935,178 @@ mod ceremony_vote_tests {
         assert!(db.get_mpc_contribution(1).unwrap().is_none());
         assert_eq!(manager.contribution_count(), 0);
         assert_eq!(manager.current_params_hash(), genesis_hash);
+    }
+
+    /// (7) STRUCTURAL INDETERMINATE — the exact ~1-second mainnet fast-reject.
+    /// A contribution arrives for a position whose predecessor we do NOT yet hold
+    /// (our view lags, the contributor just restarted). The old pre-check collapsed
+    /// this "cannot verify the chain yet" condition into a permanent `approve=false`
+    /// reject. Post-fix it is INDETERMINATE → ABSTAIN: no vote is stored, so it no
+    /// longer blocks quorum forever, and the pending survives to be re-evaluated on
+    /// the next rebroadcast once the predecessor arrives.
+    #[tokio::test]
+    async fn test_structural_indeterminate_abstains_not_reject() {
+        let voter = Arc::new(NodeIdentity::generate());
+        let contributor = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().unwrap());
+        let (manager, _dir) = genesis_manager();
+
+        // Position-2 contribution whose predecessor (position 1) is absent from OUR db.
+        let mut msg = MpcContributionMessage {
+            candidate: contributor.node_id(),
+            elder_position: 2,
+            prev_params_hash: [7u8; 32],
+            new_params_hash: [9u8; 32],
+            contribution_proof: vec![1, 2, 3, 4],
+            signature: [0u8; 64],
+            timestamp: 0,
+        };
+        let sm = msg.signing_message();
+        msg.signature = contributor.sign(&sm);
+
+        let handler = MpcHandler::new(Arc::clone(&voter), Arc::clone(&db))
+            .with_ceremony_manager(Arc::clone(&manager))
+            .with_params_fetcher(fetcher_failing())
+            .with_state(1, false);
+
+        // The precise fix: a missing predecessor is INDETERMINATE, not a Reject.
+        assert!(
+            matches!(
+                handler.structural_precheck(&msg),
+                StructuralOutcome::Indeterminate(_)
+            ),
+            "missing predecessor must be indeterminate, not a definitive reject"
+        );
+
+        insert_pending(&handler, &msg);
+        handler.verify_and_vote(&msg).await.unwrap();
+
+        // Pre-fix stored approve=false here and blocked position 2 forever.
+        // Post-fix: NO vote at all — nothing to unstick.
+        let (approvals, rejections) = db.count_mpc_approvals(2).unwrap();
+        assert_eq!(approvals, 0);
+        assert_eq!(
+            rejections, 0,
+            "an indeterminate structural check must NOT record a reject"
+        );
+        assert!(
+            handler
+                .pending_contributions
+                .read()
+                .contains_key(&msg.contribution_hash()),
+            "pending must survive so a later rebroadcast re-evaluates"
+        );
+    }
+
+    /// (8) STUCK-REJECT SELF-HEAL — transient-then-reachable with idempotent UPSERT.
+    /// A prior transient `approve=false` row already sits in the DB (exactly node7's
+    /// mainnet state, written by the old binary). The contributor is first
+    /// unreachable — the voter ABSTAINS and must NOT disturb the stale reject — then
+    /// becomes reachable, the candidate verifies, and the voter UPSERTs its vote to
+    /// `approve=true`, superseding the reject and (at the bootstrap threshold)
+    /// applying. This is the recovery that needs no manual vote-clearing.
+    #[tokio::test]
+    async fn test_stuck_transient_reject_heals_to_approve_on_retry() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().unwrap());
+        let (manager, _dir) = genesis_manager();
+
+        let (new_params, contribution) = manager.generate_contribution("node1").unwrap();
+        let new_params = Arc::new(new_params);
+        let msg = message_for(&contribution, &identity);
+
+        // Seed the mainnet stuck state: a prior transient reject for us at position 1.
+        db.save_mpc_vote(&DbMpcVote {
+            contribution_position: 1,
+            voter_node_id: hex::encode(identity.node_id()),
+            approve: false,
+            signature: vec![0u8; 64],
+            voted_at: 0,
+        })
+        .unwrap();
+        assert_eq!(db.count_mpc_approvals(1).unwrap(), (0, 1));
+
+        let reachable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = MpcHandler::new(Arc::clone(&identity), Arc::clone(&db))
+            .with_ceremony_manager(Arc::clone(&manager))
+            .with_params_fetcher(fetcher_toggle(
+                Arc::clone(&new_params),
+                Arc::clone(&reachable),
+            ))
+            .with_state(0, false);
+        insert_pending(&handler, &msg);
+
+        // Retry 1 — contributor still unreachable → ABSTAIN. The stale reject is
+        // NOT overwritten (abstain casts no vote), nothing applies.
+        handler.verify_and_vote(&msg).await.unwrap();
+        assert_eq!(
+            db.count_mpc_approvals(1).unwrap(),
+            (0, 1),
+            "abstain must leave the stuck reject untouched (never flip a vote blind)"
+        );
+        assert!(db.get_mpc_contribution(1).unwrap().is_none());
+
+        // Retry 2 — contributor reachable, candidate verifies → APPROVE upserts the
+        // reject→approve, bootstrap threshold (1) met → applied.
+        reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+        handler.verify_and_vote(&msg).await.unwrap();
+        let (approvals, rejections) = db.count_mpc_approvals(1).unwrap();
+        assert_eq!(
+            approvals, 1,
+            "a successful re-verify upserts the stuck reject to approve"
+        );
+        assert_eq!(
+            rejections, 0,
+            "the stale reject row was superseded, not left alongside"
+        );
+        assert!(
+            db.get_mpc_contribution(1).unwrap().is_some(),
+            "the healed contribution applies without manual vote-clearing"
+        );
+        assert_eq!(manager.contribution_count(), 1);
+    }
+
+    /// (9) DEFINITIVE-INVALID STAYS REJECTED — no retry-until-approve hole. A forged
+    /// candidate (tampered Schnorr) fetches fine but FAILS the real pairing check.
+    /// Re-evaluating on every rebroadcast runs the SAME full verification, which
+    /// fails identically each time: it stays rejected and is NEVER approved or
+    /// downgraded to abstain by retrying.
+    #[tokio::test]
+    async fn test_definitive_reject_stays_rejected_on_retry() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().unwrap());
+        let (manager, _dir) = genesis_manager();
+
+        let (new_params, mut contribution) = manager.generate_contribution("node1").unwrap();
+        let new_params = Arc::new(new_params);
+        contribution.proof.tau_pok.response[0] ^= 0x01; // tamper → hard crypto fail
+        let msg = message_for(&contribution, &identity);
+
+        let handler = MpcHandler::new(Arc::clone(&identity), Arc::clone(&db))
+            .with_ceremony_manager(Arc::clone(&manager))
+            .with_params_fetcher(fetcher_returning(Arc::clone(&new_params)))
+            .with_state(0, false);
+        insert_pending(&handler, &msg);
+
+        // First evaluation → definitive crypto FAIL → reject.
+        handler.verify_and_vote(&msg).await.unwrap();
+        let (a1, r1) = db.count_mpc_approvals(1).unwrap();
+        assert_eq!(a1, 0);
+        assert!(r1 >= 1, "forged candidate must be rejected");
+        assert!(db.get_mpc_contribution(1).unwrap().is_none());
+
+        // Re-evaluation (rebroadcast retry) → same real verification, same FAIL.
+        handler.verify_and_vote(&msg).await.unwrap();
+        let (a2, r2) = db.count_mpc_approvals(1).unwrap();
+        assert_eq!(
+            a2, 0,
+            "a genuinely invalid candidate is NEVER approved by retrying"
+        );
+        assert!(
+            r2 >= 1,
+            "a definitive crypto fail remains a reject on retry"
+        );
+        assert!(db.get_mpc_contribution(1).unwrap().is_none());
+        assert_eq!(manager.contribution_count(), 0);
     }
 }
