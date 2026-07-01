@@ -116,6 +116,49 @@ const RECORD_WINDOWS: [(&str, i64); 4] = [
     ("month", 2_592_000),
 ];
 
+/// MPC contribution retry window (a joining node broadcasting its candidate).
+///
+/// A joining node broadcasts a signed contribution candidate and then waits for
+/// the existing elders to fetch its (~2.8 MB) parameters, run the heavy Groth16
+/// `verify_contribution` pairing check, gossip votes, reach BFT quorum, apply
+/// the contribution and propagate the new head back. On release builds that full
+/// round trip routinely takes well over a minute per candidate. The window must
+/// therefore be generous: we rebroadcast the SAME stable candidate on every
+/// attempt (see `cached_contribution_still_valid`) so votes accumulate for one
+/// `new_hash`, and give voters ~15-20 min total to converge instead of giving up
+/// after ~5 minutes (the old 5-attempt / 10-100s loop that let the candidate
+/// hash keep changing faster than voters could verify — the "moving target").
+///
+/// 15 attempts with a randomised 60-90s delay ⇒ 14 sleeps × ~75s ≈ 17.5 min.
+/// These are consensus-affecting timings and are deliberately NOT env-tunable.
+const MPC_CONTRIBUTION_MAX_ATTEMPTS: u32 = 15;
+/// Minimum per-attempt retry delay — enough for a voter to fetch the candidate,
+/// run the Groth16 verify, gossip its vote, reach quorum, apply and propagate
+/// back on a release build before we rebroadcast.
+const MPC_CONTRIBUTION_RETRY_DELAY_MIN_SECS: u64 = 60;
+/// Maximum per-attempt retry delay. The delay is randomised in
+/// `[MIN, MAX]` to avoid a thundering herd when several nodes retry at once.
+const MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS: u64 = 90;
+
+/// Decide whether a cached MPC contribution candidate is still valid to
+/// rebroadcast unchanged on the next retry.
+///
+/// A candidate is generated for ceremony position `cached_count + 1`, chained
+/// onto the applied head at authoritative count `cached_count`. It stays valid
+/// for as long as the authoritative contribution count has NOT advanced: no new
+/// contribution has been applied, so our candidate still targets the correct
+/// position and chains onto the correct head. In that case we rebroadcast the
+/// SAME candidate (identical `new_hash`) so voters accumulate votes toward
+/// quorum instead of chasing a fresh hash every attempt.
+///
+/// If the count has ADVANCED (`current_count != cached_count`, i.e. another
+/// contribution was applied while we waited), our candidate is built on a stale
+/// head and MUST be regenerated (rebased) onto the new head — its
+/// `prev_params_hash` would otherwise fail hash-chain validation.
+fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> bool {
+    current_count == cached_count
+}
+
 /// Build this node's best (rarest) valid share per records window from the
 /// local DB, shaped exactly like the `/api/v1/pool/records` response (redacted
 /// miner_id, achieved difficulty from the hash). Gossiped in health pings so
@@ -3373,15 +3416,19 @@ async fn main() -> Result<()> {
                 return;
             }
 
-            // Retry loop: attempt contribution up to 5 times with random 10-100s intervals.
+            // Retry loop: attempt contribution up to MPC_CONTRIBUTION_MAX_ATTEMPTS
+            // times with a randomised 60-90s interval (~15-20 min total window).
             // This handles race conditions where multiple nodes try the same position
-            // simultaneously — the loser retries at the next position.
-            // Between retries: sync contributors, re-fetch latest params from network
-            // (prevents stale prev_params_hash), and randomize delay to avoid races.
-            // Cache the signed message so retries broadcast the same hash (votes accumulate).
+            // simultaneously — the loser rebases onto the new head and retries at the
+            // next position.
+            // Between retries: sync contributors, and ONLY when the ceremony position
+            // has actually advanced, re-fetch the latest applied params (prevents stale
+            // prev_params_hash) and regenerate. When the position is UNCHANGED we keep
+            // the cached candidate and rebroadcast the SAME signed message so voters
+            // accumulate votes for one hash toward quorum (no "moving target").
             let mut cached_msg: Option<(ghost_consensus::message::MpcContributionMessage, u32)> =
                 None;
-            for attempt in 1..=5u32 {
+            for attempt in 1..=MPC_CONTRIBUTION_MAX_ATTEMPTS {
                 // Re-check if we became an elder (e.g., via P2P sync of our own contribution)
                 if db_for_mpc.is_mpc_elder(&node_id_hex).unwrap_or(false) {
                     let position = db_for_mpc
@@ -3848,12 +3895,17 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Wait random 10-100s before retry to prevent race conditions
-                // where multiple nodes fight for the same position simultaneously.
-                if attempt < 5 {
+                // Wait a randomised 60-90s before retry: long enough for voters to
+                // fetch + Groth16-verify + vote + reach quorum + apply + propagate
+                // back, and randomised to prevent races where multiple nodes fight
+                // for the same position simultaneously.
+                if attempt < MPC_CONTRIBUTION_MAX_ATTEMPTS {
                     let delay_secs = {
                         use rand::Rng;
-                        rand::thread_rng().gen_range(10..=100)
+                        rand::thread_rng().gen_range(
+                            MPC_CONTRIBUTION_RETRY_DELAY_MIN_SECS
+                                ..=MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS,
+                        )
                     };
                     info!(
                         attempt,
@@ -3946,10 +3998,45 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // Re-fetch latest MPC params from network before next attempt.
-                    // Without this, the ceremony manager holds stale params and any
-                    // new contribution will fail hash-chain validation because
-                    // prev_params_hash won't match the latest applied contribution.
+                    // Decide whether to re-fetch + regenerate, or keep our stable
+                    // candidate. Read the authoritative count AFTER the contributor
+                    // sync above: if a new contribution was applied while we waited,
+                    // our candidate is chained onto a stale head and must be rebased
+                    // (re-fetch the new applied head + regenerate). If the position is
+                    // UNCHANGED, re-fetching would invalidate the cache and force the
+                    // next attempt to regenerate a DIFFERENT candidate with fresh
+                    // randomness (the "moving target" that stopped voters converging) —
+                    // so we skip it and rebroadcast the SAME cached candidate next
+                    // attempt, letting votes accumulate for one hash toward quorum.
+                    let current_count = db_for_mpc
+                        .mpc_contribution_count_authoritative()
+                        .unwrap_or(db_count);
+                    let position_advanced = match &cached_msg {
+                        Some((_, cached_count)) => {
+                            !cached_contribution_still_valid(*cached_count, current_count)
+                        }
+                        // No cached candidate (generation failed this attempt): re-fetch
+                        // so the next attempt regenerates on the freshest head.
+                        None => true,
+                    };
+                    if !position_advanced {
+                        info!(
+                            attempt,
+                            db_count = current_count,
+                            "MPC: ceremony position unchanged — keeping cached candidate, \
+                             will rebroadcast the same hash next attempt"
+                        );
+                        continue;
+                    }
+
+                    // Position ADVANCED (or no cache): re-fetch the latest applied MPC
+                    // params before the next attempt so we rebase onto the new head.
+                    // Without this, the ceremony manager holds stale params and the
+                    // regenerated contribution would fail hash-chain validation because
+                    // prev_params_hash won't match the latest applied contribution. Note
+                    // this writes the genuinely-newer APPLIED head to current.bin, which
+                    // is correct — the candidate-serving rule only forbids writing our
+                    // own UN-applied candidate to current.bin.
                     let params_dir = ceremony_manager_for_startup.params_dir().clone();
                     for seed in &seed_nodes_for_mpc {
                         let host = seed.split(':').next().unwrap_or(seed);
@@ -4111,7 +4198,10 @@ async fn main() -> Result<()> {
                 round_manager_for_mpc
                     .update_node_capabilities(identity_for_mpc.node_id(), updated_caps);
             } else {
-                warn!("MPC: Failed to contribute after 5 attempts. Node will not be an elder.");
+                warn!(
+                    attempts = MPC_CONTRIBUTION_MAX_ATTEMPTS,
+                    "MPC: Failed to contribute after all attempts. Node will not be an elder."
+                );
             }
         });
         info!("MPC auto-contribution task scheduled (15s delay)");
@@ -6663,6 +6753,41 @@ mod tests {
         assert_eq!(cfg.min_drop_data_size, 64);
         // valid for the analyzer
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── cached_contribution_still_valid (MPC retry loop) ─────────────
+
+    #[test]
+    fn cached_contribution_valid_when_position_unchanged() {
+        // Candidate generated at authoritative count N (targets position N+1).
+        // A retry where the count is STILL N must keep the cached candidate so
+        // the SAME new_hash is rebroadcast and votes accumulate toward quorum
+        // (the fix for the "moving target" that stalled node5 on mainnet).
+        let cached_count = 6u32;
+        let current_count = 6u32;
+        assert!(
+            cached_contribution_still_valid(cached_count, current_count),
+            "unchanged position must NOT invalidate the cached candidate"
+        );
+    }
+
+    #[test]
+    fn cached_contribution_invalid_when_position_advanced() {
+        // Another contribution was applied while we waited (count N -> N+1):
+        // our candidate is chained onto a stale head and MUST be regenerated
+        // (rebased) onto the new head, so it is no longer valid to rebroadcast.
+        let cached_count = 6u32;
+        let current_count = 7u32;
+        assert!(
+            !cached_contribution_still_valid(cached_count, current_count),
+            "advanced position MUST invalidate the cached candidate (rebase)"
+        );
+    }
+
+    #[test]
+    fn cached_contribution_invalid_on_multi_step_advance() {
+        // Robust to more than one applied contribution during a long wait.
+        assert!(!cached_contribution_still_valid(6, 9));
     }
 
     // ── expand_path ──────────────────────────────────────────────────
