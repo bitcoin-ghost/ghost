@@ -13,7 +13,13 @@
 set -euo pipefail
 
 # ─────────────────────────── network constants ───────────────────────────────
-GHOST_VERSION="v1.10.8"
+# GHOST_VERSION auto-tracks the latest signed GitHub release, so cutting a new
+# release needs no installer edit (releases follow a version bump automatically).
+# Override with the GHOST_VERSION env var; falls back to a known-good pin when the
+# GitHub API is unreachable. The release tarball is GPG-verified below regardless
+# of how the version resolves, so auto-tracking never lowers the security bar.
+GHOST_VERSION="${GHOST_VERSION:-$(curl -fsSL --max-time 10 https://api.github.com/repos/bitcoin-ghost/ghost/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)}"
+GHOST_VERSION="${GHOST_VERSION:-v1.10.16}"
 # Signed release artefacts (GPG: defenwycke release key).
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
