@@ -37,7 +37,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -5742,206 +5742,18 @@ async fn main() -> Result<()> {
     });
     info!("P2P mesh network started");
 
-    // C-1: Start Noise Protocol listener for encrypted P2P connections
-    // This listens for incoming encrypted TCP connections from peers
-    if let Some(noise_pool) = mesh.noise_pool() {
-        let noise_pool_clone = Arc::clone(noise_pool);
+    // C-1: Start the Noise Protocol RECEIVE listener for encrypted P2P.
+    // The accept/handshake/dispatch loop now lives in MeshNetwork
+    // (`run_noise_listener`) so the receive side of the Noise plane is owned and
+    // tested alongside the send side, instead of being hand-rolled here.
+    if mesh.noise_pool().is_some() {
         let mesh_for_noise = Arc::clone(&mesh);
-        let noise_port = ghost_consensus::mesh::DEFAULT_NOISE_PORT;
-
-        // M-17 SECURITY: Limit concurrent Noise connections to prevent resource exhaustion.
-        // 100 concurrent connections is sufficient for a healthy P2P mesh while preventing
-        // DoS attacks that exhaust file descriptors or memory.
-        let noise_connection_limit = Arc::new(Semaphore::new(100));
-        let mut noise_shutdown = shutdown_tx.subscribe();
-        // MESH REGISTRATION FIX: an inbound Noise connection (a node dialling us)
-        // must trigger a reverse SUB-dial back to that node. Health pings are
-        // ZMQ PUB/SUB broadcasts, so the ONLY way we register a peer is by
-        // subscribing to its PUB sockets — which the SUB loop only does for peers
-        // already in the PeerManager. A dynamically-joining node dials us over
-        // Noise (so its verifications arrive, but are rejected as "unknown
-        // challenger"); without dialling back we never receive its health pings
-        // and never learn it. Only the static seed list got this today, so
-        // non-seed nodes could never join. Captured into the listener task below.
+        let noise_shutdown = shutdown_tx.subscribe();
         let noise_is_mainnet = is_mainnet_round;
-        let noise_disc_port = config.network.p2p.discovery;
-        let reverse_subscribed: Arc<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-
         tokio::spawn(async move {
-            use tokio::net::TcpListener;
-
-            let bind_addr = format!("0.0.0.0:{}", noise_port);
-            let listener = match TcpListener::bind(&bind_addr).await {
-                Ok(l) => {
-                    info!(
-                        port = noise_port,
-                        max_connections = 100,
-                        "Noise Protocol listener started (encrypted P2P)"
-                    );
-                    l
-                }
-                Err(e) => {
-                    error!(error = %e, port = noise_port, "Failed to start Noise listener");
-                    return;
-                }
-            };
-
-            loop {
-                // M-17: Acquire permit before accepting connection
-                let permit = match noise_connection_limit.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // Semaphore closed - should not happen
-                        error!("Noise connection semaphore closed unexpectedly");
-                        return;
-                    }
-                };
-
-                let accept_result = tokio::select! {
-                    result = listener.accept() => result,
-                    _ = noise_shutdown.recv() => {
-                        tracing::info!("Noise listener shutting down");
-                        return;
-                    }
-                };
-
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        let pool = Arc::clone(&noise_pool_clone);
-                        let mesh = Arc::clone(&mesh_for_noise);
-                        let conn_is_mainnet = noise_is_mainnet;
-                        let conn_disc_port = noise_disc_port;
-                        let conn_rev_sub = Arc::clone(&reverse_subscribed);
-
-                        tokio::spawn(async move {
-                            // M-17: Hold permit for connection lifetime - released when dropped
-                            let _permit = permit;
-
-                            // H2: Timeout Noise handshake to prevent resource exhaustion
-                            // from peers that connect but never complete the handshake
-                            let accept_result = tokio::time::timeout(
-                                std::time::Duration::from_secs(30),
-                                pool.accept_connection(stream),
-                            )
-                            .await;
-
-                            let accept_result = match accept_result {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    tracing::warn!(
-                                        peer = %addr,
-                                        "Noise handshake timed out after 30s"
-                                    );
-                                    return;
-                                }
-                            };
-
-                            match accept_result {
-                                Ok(conn) => {
-                                    tracing::debug!(
-                                        peer = %addr,
-                                        peer_key = %hex::encode(&conn.peer_key[..8]),
-                                        "Accepted Noise connection"
-                                    );
-
-                                    // MESH REGISTRATION FIX: reverse-subscribe to this
-                                    // inbound peer so we receive its PUB/SUB health pings
-                                    // (the only path that registers it in the PeerManager).
-                                    // connect_peer mints a placeholder peer; the SUB loop
-                                    // dials its 8555-8562 PUBs; the real node_id then arrives
-                                    // via the first PoW-gated, signed health ping and retires
-                                    // the placeholder. No new trust is granted — counting a
-                                    // peer still requires that valid health ping. Skip
-                                    // private/reserved source IPs on mainnet (SSRF guard) and
-                                    // dial back only once per host (the addr.ip() is the real
-                                    // TCP source of a completed handshake).
-                                    {
-                                        let ip = addr.ip();
-                                        let routable = if conn_is_mainnet {
-                                            match ip {
-                                                std::net::IpAddr::V4(v4) => {
-                                                    !(v4.is_loopback()
-                                                        || v4.is_private()
-                                                        || v4.is_link_local()
-                                                        || v4.is_unspecified())
-                                                }
-                                                std::net::IpAddr::V6(v6) => {
-                                                    !(v6.is_loopback() || v6.is_unspecified())
-                                                }
-                                            }
-                                        } else {
-                                            true
-                                        };
-                                        let first_time = routable
-                                            && conn_rev_sub
-                                                .lock()
-                                                .map(|mut s| s.insert(ip))
-                                                .unwrap_or(false);
-                                        if first_time {
-                                            let mesh_cb = Arc::clone(&mesh);
-                                            let addr_str = format!("{}:{}", ip, conn_disc_port);
-                                            tokio::spawn(async move {
-                                                match mesh_cb.connect_peer(&addr_str).await {
-                                                    Ok(()) => tracing::info!(
-                                                        peer = %addr_str,
-                                                        "Reverse-subscribed to inbound peer (mesh registration)"
-                                                    ),
-                                                    Err(e) => tracing::debug!(
-                                                        peer = %addr_str,
-                                                        error = %e,
-                                                        "Reverse-subscribe connect_peer failed"
-                                                    ),
-                                                }
-                                            });
-                                        }
-                                    }
-
-                                    // Handle incoming messages from this connection
-                                    // Messages are received, validated, and dispatched to handlers
-                                    loop {
-                                        match conn.recv().await {
-                                            Ok(payload) => {
-                                                // Process received encrypted message through the mesh handler
-                                                if let Err(e) = mesh.handle_received(&payload).await
-                                                {
-                                                    tracing::debug!(
-                                                        peer = %addr,
-                                                        error = %e,
-                                                        "Error handling Noise message"
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::debug!(
-                                                    peer = %addr,
-                                                    error = %e,
-                                                    "Noise connection error"
-                                                );
-                                                // Remove broken connection
-                                                pool.remove_connection(&conn.peer_key);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        peer = %addr,
-                                        error = %e,
-                                        "Noise handshake failed"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Noise accept error");
-                        // Drop permit on error so we don't leak it
-                        drop(permit);
-                    }
-                }
-            }
+            mesh_for_noise
+                .run_noise_listener(noise_is_mainnet, noise_shutdown)
+                .await;
         });
     } else {
         warn!("Noise Protocol DISABLED - P2P traffic is unencrypted");

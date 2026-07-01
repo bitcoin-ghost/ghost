@@ -2142,6 +2142,186 @@ impl MeshNetwork {
         Ok(())
     }
 
+    /// Run the Noise-encrypted P2P RECEIVE listener — the receive counterpart of
+    /// the send side (`send_encrypted` / `broadcast`).
+    ///
+    /// Binds the configured `noise_port`, accepts inbound encrypted connections,
+    /// completes the Noise handshake, and dispatches every decrypted message
+    /// through [`handle_received`](Self::handle_received) to the registered
+    /// handlers. Point-to-point message types (MPC contributions/votes, shares,
+    /// consensus votes, payouts, …) are delivered over Noise, so WITHOUT this
+    /// loop a node emits Noise traffic but never receives any — the broadcast
+    /// reaches the peer's TCP stack but is never dispatched to a handler.
+    ///
+    /// This loop was previously hand-rolled in `bins/ghost-pool` and the
+    /// `MeshNetwork` owned no receive path of its own (the `NoiseReceiver` /
+    /// `NoiseMessageHandler` types were never wired in). Making it a first-class
+    /// `MeshNetwork` method keeps the send and receive sides symmetric and lets
+    /// integration tests exercise the REAL dispatch path.
+    ///
+    /// Runs until `shutdown` fires or the mesh stops. `is_mainnet` gates the
+    /// SSRF guard on the reverse-subscribe dial-back (private/reserved source IPs
+    /// are skipped on mainnet).
+    pub async fn run_noise_listener(
+        self: &Arc<Self>,
+        is_mainnet: bool,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) {
+        let pool = match self.noise_pool.as_ref() {
+            Some(p) => Arc::clone(p),
+            None => {
+                warn!("run_noise_listener called but Noise is disabled — no receive path");
+                return;
+            }
+        };
+        let noise_port = self.config.noise_port;
+        let disc_port = self.config.ports.discovery;
+
+        // M-17: cap concurrent inbound Noise connections to bound resource use.
+        let connection_limit = Arc::new(tokio::sync::Semaphore::new(100));
+        // Dial back at most once per inbound host (mesh-registration reverse-sub).
+        let reverse_subscribed: Arc<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let bind_addr = format!("0.0.0.0:{}", noise_port);
+        let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(l) => {
+                info!(
+                    port = noise_port,
+                    max_connections = 100,
+                    "Noise Protocol listener started (encrypted P2P receive plane)"
+                );
+                l
+            }
+            Err(e) => {
+                error!(error = %e, port = noise_port, "Failed to start Noise listener");
+                return;
+            }
+        };
+
+        loop {
+            // M-17: acquire a permit before accepting a connection.
+            let permit = match connection_limit.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    error!("Noise connection semaphore closed unexpectedly");
+                    return;
+                }
+            };
+
+            let accept_result = tokio::select! {
+                result = listener.accept() => result,
+                _ = shutdown.recv() => {
+                    info!("Noise listener shutting down");
+                    return;
+                }
+            };
+
+            let (stream, addr) = match accept_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!(error = %e, "Noise accept error");
+                    drop(permit);
+                    continue;
+                }
+            };
+
+            let pool = Arc::clone(&pool);
+            let mesh = Arc::clone(self);
+            let conn_rev_sub = Arc::clone(&reverse_subscribed);
+
+            tokio::spawn(async move {
+                // M-17: hold the permit for the connection lifetime.
+                let _permit = permit;
+
+                // H2: bound the handshake so a peer that connects but never
+                // completes the handshake cannot pin resources.
+                let handshake = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    pool.accept_connection(stream),
+                )
+                .await;
+
+                let conn = match handshake {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(e)) => {
+                        warn!(peer = %addr, error = %e, "Noise handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(peer = %addr, "Noise handshake timed out after 30s");
+                        return;
+                    }
+                };
+
+                debug!(
+                    peer = %addr,
+                    peer_key = %hex::encode(&conn.peer_key[..8]),
+                    "Accepted Noise connection"
+                );
+
+                // MESH REGISTRATION: reverse-subscribe to this inbound peer so we
+                // receive its ZMQ health pings (the path that registers it in the
+                // PeerManager). connect_peer mints a placeholder that the first
+                // signed health ping retires — no trust is granted here. Skip
+                // private/reserved source IPs on mainnet (SSRF guard) and dial
+                // back only once per host.
+                let ip = addr.ip();
+                let routable = if is_mainnet {
+                    match ip {
+                        std::net::IpAddr::V4(v4) => {
+                            !(v4.is_loopback()
+                                || v4.is_private()
+                                || v4.is_link_local()
+                                || v4.is_unspecified())
+                        }
+                        std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()),
+                    }
+                } else {
+                    true
+                };
+                let first_time = routable
+                    && conn_rev_sub
+                        .lock()
+                        .map(|mut s| s.insert(ip))
+                        .unwrap_or(false);
+                if first_time {
+                    let mesh_cb = Arc::clone(&mesh);
+                    let addr_str = format!("{}:{}", ip, disc_port);
+                    tokio::spawn(async move {
+                        match mesh_cb.connect_peer(&addr_str).await {
+                            Ok(()) => info!(
+                                peer = %addr_str,
+                                "Reverse-subscribed to inbound peer (mesh registration)"
+                            ),
+                            Err(e) => debug!(
+                                peer = %addr_str,
+                                error = %e,
+                                "Reverse-subscribe connect_peer failed"
+                            ),
+                        }
+                    });
+                }
+
+                // Receive, validate, and dispatch every message on this connection.
+                loop {
+                    match conn.recv().await {
+                        Ok(payload) => {
+                            if let Err(e) = mesh.handle_received(&payload).await {
+                                debug!(peer = %addr, error = %e, "Error handling Noise message");
+                            }
+                        }
+                        Err(e) => {
+                            debug!(peer = %addr, error = %e, "Noise connection error");
+                            pool.remove_connection(&conn.peer_key);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     /// Get validation statistics for monitoring
     pub fn validation_stats(&self) -> ValidationStats {
         self.validation_stats.read().clone()
