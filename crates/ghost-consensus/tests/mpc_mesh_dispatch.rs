@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ghost_common::config::P2PPortConfig;
 use ghost_common::error::GhostResult;
+use ghost_common::types::NodeId;
 use ghost_common::identity::NodeIdentity;
 use ghost_consensus::mesh::{MeshConfig, MeshNetwork, MessageHandler};
 use ghost_consensus::message::{MessageEnvelope, MessageType, MpcContributionMessage};
@@ -293,7 +294,7 @@ async fn mpc_position2_contribution_broadcast_drives_voter_vote() {
 
     // The fetcher the voter uses to obtain the candidate params for verification.
     let fetch_params = Arc::clone(&p2_params);
-    let fetcher: MpcParamsFetchFn = Arc::new(move |_expected: [u8; 32]| {
+    let fetcher: MpcParamsFetchFn = Arc::new(move |_expected: [u8; 32], _contributor: NodeId| {
         let p = Arc::clone(&fetch_params);
         Box::pin(async move {
             Some(FetchedCeremonyParams {
