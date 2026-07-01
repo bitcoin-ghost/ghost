@@ -726,7 +726,7 @@ impl CeremonyManager {
     ///
     /// A node that joins after the ceremony has already advanced fetches the
     /// applied contribution ROWS (+ proofs/votes) and the head parameters from a
-    /// peer, but it never ran the sequential [`apply_contribution_multi`] for the
+    /// peer, but it never ran the sequential `apply_contribution_multi` for the
     /// intermediate positions (it holds neither the toxic waste nor the
     /// intermediate parameter files). Such a node cannot reach its head through
     /// the position-`count + 1` apply path. This method records the fetched head

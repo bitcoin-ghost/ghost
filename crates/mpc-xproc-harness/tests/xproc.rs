@@ -52,15 +52,21 @@ fn generate_genesis_params() -> (Groth16Params, Groth16Params, Groth16Params) {
     use ghost_zkp::circuit::{GhostNoteSpendCircuit, GhostUnshieldCircuit, NoteConsolidateCircuit};
     use rand::rngs::OsRng;
 
-    let note =
-        generate_random_parameters::<Bls12, _, _>(GhostNoteSpendCircuit::<Fr>::dummy(20), &mut OsRng)
-            .expect("genesis note-spend");
-    let consolidate =
-        generate_random_parameters::<Bls12, _, _>(NoteConsolidateCircuit::<Fr>::dummy(20), &mut OsRng)
-            .expect("genesis consolidate");
-    let unshield =
-        generate_random_parameters::<Bls12, _, _>(GhostUnshieldCircuit::<Fr>::dummy(20), &mut OsRng)
-            .expect("genesis unshield");
+    let note = generate_random_parameters::<Bls12, _, _>(
+        GhostNoteSpendCircuit::<Fr>::dummy(20),
+        &mut OsRng,
+    )
+    .expect("genesis note-spend");
+    let consolidate = generate_random_parameters::<Bls12, _, _>(
+        NoteConsolidateCircuit::<Fr>::dummy(20),
+        &mut OsRng,
+    )
+    .expect("genesis consolidate");
+    let unshield = generate_random_parameters::<Bls12, _, _>(
+        GhostUnshieldCircuit::<Fr>::dummy(20),
+        &mut OsRng,
+    )
+    .expect("genesis unshield");
     (note, consolidate, unshield)
 }
 
@@ -180,7 +186,11 @@ fn start_node(
     };
     match node.read_resp() {
         Some(ready) => {
-            assert_eq!(ready["ready"], json!(true), "[{name}] first RESP must be ready");
+            assert_eq!(
+                ready["ready"],
+                json!(true),
+                "[{name}] first RESP must be ready"
+            );
             Some(node)
         }
         None => {
@@ -215,7 +225,9 @@ fn cross_process_contribution_flow() {
     assert_ne!(anchor_bytes, [0u8; 32]);
 
     // Distribute identical genesis to every committee node's params dir.
-    let node_roots: Vec<tempfile::TempDir> = (0..COMMITTEE).map(|_| tempfile::tempdir().unwrap()).collect();
+    let node_roots: Vec<tempfile::TempDir> = (0..COMMITTEE)
+        .map(|_| tempfile::tempdir().unwrap())
+        .collect();
     let homes: Vec<PathBuf> = node_roots.iter().map(|d| d.path().to_path_buf()).collect();
     for home in &homes {
         copy_dir_files(&seed_params, &home.join(".ghost/mpc_params"));
@@ -224,7 +236,13 @@ fn cross_process_contribution_flow() {
     // ---- Spawn the committee: node 0 = contributor+server; 1..=voters --------
     // Every node starts pinned to the genesis anchor (expected-head = anchor).
     let names: Vec<String> = (0..COMMITTEE)
-        .map(|i| if i == 0 { "C".to_string() } else { format!("V{i}") })
+        .map(|i| {
+            if i == 0 {
+                "C".to_string()
+            } else {
+                format!("V{i}")
+            }
+        })
         .collect();
     let mut nodes: Vec<Node> = Vec::new();
     for i in 0..COMMITTEE {
@@ -246,7 +264,11 @@ fn cross_process_contribution_flow() {
     for n in nodes.iter_mut() {
         let s = n.send(json!({"cmd": "inspect"}));
         assert_eq!(s["count"], json!(0), "genesis count 0");
-        assert_eq!(s["current_bin_hash"], json!(anchor), "on-disk head == anchor");
+        assert_eq!(
+            s["current_bin_hash"],
+            json!(anchor),
+            "on-disk head == anchor"
+        );
         assert_eq!(s["ossified"], json!(false));
     }
     println!("GATE 1a PASS: {COMMITTEE} separate processes share genesis; count 0; current.bin == anchor");
@@ -259,19 +281,29 @@ fn cross_process_contribution_flow() {
         println!("\n---- position {p} ----");
 
         // ---- (1) CONTRIBUTOR (separate process) generates + serves candidate --
-        let mut gen = nodes[0].send(json!({"cmd": "gen_candidate", "contributor_id": format!("elder-{p}")}));
+        let mut gen =
+            nodes[0].send(json!({"cmd": "gen_candidate", "contributor_id": format!("elder-{p}")}));
         assert_eq!(gen["ok"], json!(true), "gen_candidate ok");
         assert_eq!(gen["position"], json!(p), "sequential position");
-        assert_eq!(gen["prev_hash"], json!(current_head), "prev chains from head");
+        assert_eq!(
+            gen["prev_hash"],
+            json!(current_head),
+            "prev chains from head"
+        );
         let mut new_hash = gen["new_hash"].as_str().unwrap().to_string();
         let mut contribution = gen["contribution"].as_str().unwrap().to_string();
         assert_ne!(new_hash, current_head, "candidate hash strictly evolves");
         // GATE 1b: contributor's OWN current.bin is UNCHANGED by generation.
         assert_eq!(
-            gen["current_bin_hash"], json!(current_head),
+            gen["current_bin_hash"],
+            json!(current_head),
             "GATE 1: generating a candidate MUST NOT move the contributor's current.bin"
         );
-        println!("GATE 1 PASS: C generated pos {p} candidate {}… ; C.current.bin still {}… (un-applied)", &new_hash[..16], &current_head[..16]);
+        println!(
+            "GATE 1 PASS: C generated pos {p} candidate {}… ; C.current.bin still {}… (un-applied)",
+            &new_hash[..16],
+            &current_head[..16]
+        );
 
         // ---- (4) Bug-1 cross-process RESTART mid-ceremony (fixed path) --------
         if p == restart_at {
@@ -292,20 +324,31 @@ fn cross_process_contribution_flow() {
                 Some(BASE_PORT),
                 Some(&current_head),
             )
-            .expect("GATE 4: contributor must NOT crash-loop on restart (current.bin == chain head)");
+            .expect(
+                "GATE 4: contributor must NOT crash-loop on restart (current.bin == chain head)",
+            );
             nodes[0] = restarted;
             let s = nodes[0].send(json!({"cmd": "inspect"}));
             assert_eq!(
-                s["current_bin_hash"], json!(current_head),
+                s["current_bin_hash"],
+                json!(current_head),
                 "GATE 4: after restart current.bin == applied chain head (never the candidate)"
             );
-            println!("GATE 4 PASS: C restarted cleanly; current.bin == chain head {}… (no crash-loop)", &current_head[..16]);
+            println!(
+                "GATE 4 PASS: C restarted cleanly; current.bin == chain head {}… (no crash-loop)",
+                &current_head[..16]
+            );
             // Regenerate the candidate on the fresh process (cache was lost).
-            gen = nodes[0].send(json!({"cmd": "gen_candidate", "contributor_id": format!("elder-{p}")}));
+            gen = nodes[0]
+                .send(json!({"cmd": "gen_candidate", "contributor_id": format!("elder-{p}")}));
             assert_eq!(gen["ok"], json!(true));
             new_hash = gen["new_hash"].as_str().unwrap().to_string();
             contribution = gen["contribution"].as_str().unwrap().to_string();
-            assert_eq!(gen["current_bin_hash"], json!(current_head), "still un-applied after regen");
+            assert_eq!(
+                gen["current_bin_hash"],
+                json!(current_head),
+                "still un-applied after regen"
+            );
         }
 
         // ---- (2) VOTERS (separate processes) FETCH by hash + real verify ------
@@ -318,13 +361,25 @@ fn cross_process_contribution_flow() {
                 "contribution": contribution,
             }));
             assert_eq!(
-                r["served_by_hash"], json!(true),
+                r["served_by_hash"],
+                json!(true),
                 "voter must receive the candidate served via ?new_hash= (hash matches)"
             );
-            assert_eq!(r["fetched_hash"], json!(new_hash), "fetched params hash == candidate");
-            assert_eq!(r["verify_ok"], json!(true), "real verify_contribution (Schnorr+pairing) approves");
+            assert_eq!(
+                r["fetched_hash"],
+                json!(new_hash),
+                "fetched params hash == candidate"
+            );
+            assert_eq!(
+                r["verify_ok"],
+                json!(true),
+                "real verify_contribution (Schnorr+pairing) approves"
+            );
             approvals += 1;
-            println!("  [{}] fetched {} bytes via ?new_hash=, verify_ok=true", nodes[v].name, r["size"]);
+            println!(
+                "  [{}] fetched {} bytes via ?new_hash=, verify_ok=true",
+                nodes[v].name, r["size"]
+            );
         }
         // The contributor holds valid params it generated -> counts as an approval.
         approvals += 1;
@@ -345,15 +400,21 @@ fn cross_process_contribution_flow() {
         for n in nodes.iter_mut() {
             // Voters already fetched+cached; the contributor holds its generated
             // params. Contributor also needs the params cached — it does (gen).
-            let a = n.send(json!({"cmd": "apply", "new_hash": new_hash, "contribution": contribution}));
+            let a =
+                n.send(json!({"cmd": "apply", "new_hash": new_hash, "contribution": contribution}));
             assert_eq!(a["ok"], json!(true), "[{}] apply ok", n.name);
             assert_eq!(a["count"], json!(p), "[{}] count advanced to {p}", n.name);
             assert_eq!(
-                a["current_bin_hash"], json!(new_hash),
-                "GATE 3: [{}] current.bin converged to the candidate after apply", n.name
+                a["current_bin_hash"],
+                json!(new_hash),
+                "GATE 3: [{}] current.bin converged to the candidate after apply",
+                n.name
             );
         }
-        println!("GATE 3 PASS: all {COMMITTEE} nodes' current.bin converged to {}… (count {p})", &new_hash[..16]);
+        println!(
+            "GATE 3 PASS: all {COMMITTEE} nodes' current.bin converged to {}… (count {p})",
+            &new_hash[..16]
+        );
 
         current_head = new_hash;
     }
@@ -365,7 +426,12 @@ fn cross_process_contribution_flow() {
         assert_eq!(s["ossified"], json!(true), "[{}] ossified at cap", n.name);
         let t = n.send(json!({"cmd": "try_generate", "contributor_id": "late"}));
         assert_eq!(t["ok"], json!(false));
-        assert_eq!(t["err"], json!("CeremonyOssified"), "[{}] post-cap contribute refused", n.name);
+        assert_eq!(
+            t["err"],
+            json!("CeremonyOssified"),
+            "[{}] post-cap contribute refused",
+            n.name
+        );
     }
     println!("GATE 5a PASS: every node ossified at cap {cap}; further contribution refused (CeremonyOssified)");
 
@@ -374,7 +440,10 @@ fn cross_process_contribution_flow() {
     let fresh_home = fresh_root.path().to_path_buf();
     // A fresh node "fetches" genesis+the chain to disk (we copy the contributor's
     // final params dir, standing in for the network sync), then boots ossified.
-    copy_dir_files(&homes[0].join(".ghost/mpc_params"), &fresh_home.join(".ghost/mpc_params"));
+    copy_dir_files(
+        &homes[0].join(".ghost/mpc_params"),
+        &fresh_home.join(".ghost/mpc_params"),
+    );
     let mut fresh = start_node(
         "F",
         &fresh_home,
@@ -388,17 +457,30 @@ fn cross_process_contribution_flow() {
     .expect("fresh post-ossification node must boot clean");
     // It fetches the final params from the still-serving contributor and confirms
     // the lineage hash equals the ossified head.
-    let f = fresh.send(json!({"cmd": "fetch_head", "url": contributor_url, "new_hash": current_head}));
-    assert_eq!(f["ok"], json!(true), "fresh node fetched final params over HTTP");
+    let f =
+        fresh.send(json!({"cmd": "fetch_head", "url": contributor_url, "new_hash": current_head}));
     assert_eq!(
-        f["fetched_hash"], json!(current_head),
+        f["ok"],
+        json!(true),
+        "fresh node fetched final params over HTTP"
+    );
+    assert_eq!(
+        f["fetched_hash"],
+        json!(current_head),
         "GATE 5: fresh node's fetched final params hash == ossified head"
     );
     // And it CANNOT contribute.
     let t = fresh.send(json!({"cmd": "try_generate", "contributor_id": "johnny-come-lately"}));
     assert_eq!(t["ok"], json!(false));
-    assert_eq!(t["err"], json!("CeremonyOssified"), "fresh node cannot contribute post-ossification");
-    println!("GATE 5b PASS: fresh node fetched final params ({}…) + cannot contribute", &current_head[..16]);
+    assert_eq!(
+        t["err"],
+        json!("CeremonyOssified"),
+        "fresh node cannot contribute post-ossification"
+    );
+    println!(
+        "GATE 5b PASS: fresh node fetched final params ({}…) + cannot contribute",
+        &current_head[..16]
+    );
 
     // ---- (4) NEGATIVE CONTROL: the OLD overwrite-current behaviour crashes ----
     // Prove the startup guard actually detects the node5 condition, and that the
@@ -407,20 +489,46 @@ fn cross_process_contribution_flow() {
     let d_root = tempfile::tempdir().unwrap();
     let d_home = d_root.path().to_path_buf();
     copy_dir_files(&seed_params, &d_home.join(".ghost/mpc_params"));
-    let mut d = start_node("D", &d_home, &anchor, &anchor, 0, false, None, Some(&anchor))
-        .expect("D starts clean at genesis");
+    let mut d = start_node(
+        "D",
+        &d_home,
+        &anchor,
+        &anchor,
+        0,
+        false,
+        None,
+        Some(&anchor),
+    )
+    .expect("D starts clean at genesis");
     let dg = d.send(json!({"cmd": "gen_candidate", "contributor_id": "d-elder"}));
     let d_new_hash = dg["new_hash"].as_str().unwrap().to_string();
-    assert_eq!(dg["current_bin_hash"], json!(anchor), "D fixed path: current.bin still anchor");
+    assert_eq!(
+        dg["current_bin_hash"],
+        json!(anchor),
+        "D fixed path: current.bin still anchor"
+    );
     // Simulate the OLD bug: write the un-applied candidate OVER current.bin.
     let ob = d.send(json!({"cmd": "simulate_old_bug_overwrite_current", "new_hash": d_new_hash}));
     assert_eq!(ob["ok"], json!(true));
-    assert_eq!(ob["current_bin_hash"], json!(d_new_hash), "D now has candidate as current.bin (the bug)");
+    assert_eq!(
+        ob["current_bin_hash"],
+        json!(d_new_hash),
+        "D now has candidate as current.bin (the bug)"
+    );
     d.shutdown();
     std::thread::sleep(std::time::Duration::from_millis(300));
     // Restart D pinned to the real chain head (anchor). current.bin != anchor now,
     // so the genesis-anchored guard MUST fail-closed (exit non-zero, no ready).
-    let crashed = start_node("D", &d_home, &anchor, &anchor, 0, false, None, Some(&anchor));
+    let crashed = start_node(
+        "D",
+        &d_home,
+        &anchor,
+        &anchor,
+        0,
+        false,
+        None,
+        Some(&anchor),
+    );
     assert!(
         crashed.is_none(),
         "GATE 4 negative control: overwriting current.bin with the candidate MUST crash-loop on restart"

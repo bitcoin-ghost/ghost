@@ -136,8 +136,8 @@ async fn run_node(argv: &[String]) {
         ceremony_id,
         ..Default::default()
     };
-    let manager = CeremonyManager::load_or_init(params_dir.clone(), Some(state))
-        .expect("load_or_init");
+    let manager =
+        CeremonyManager::load_or_init(params_dir.clone(), Some(state)).expect("load_or_init");
     // Force the on-disk current params into memory even at count 0 (a genesis
     // holder must be able to generate/verify against them).
     manager.load_current_params().expect("load_current_params");
@@ -248,9 +248,16 @@ async fn run_node(argv: &[String]) {
             }
             "fetch_verify" => {
                 let url = cmd.get("url").and_then(|v| v.as_str()).unwrap().to_string();
-                let new_hash = cmd.get("new_hash").and_then(|v| v.as_str()).unwrap().to_string();
-                let contribution_json =
-                    cmd.get("contribution").and_then(|v| v.as_str()).unwrap().to_string();
+                let new_hash = cmd
+                    .get("new_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string();
+                let contribution_json = cmd
+                    .get("contribution")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string();
                 let resp = do_fetch_verify(&manager, &url, &new_hash, &contribution_json).await;
                 if let Some(p) = resp.1 {
                     params_cache.insert(new_hash.clone(), p);
@@ -258,22 +265,31 @@ async fn run_node(argv: &[String]) {
                 emit_resp(&resp.0);
             }
             "apply" => {
-                let new_hash = cmd.get("new_hash").and_then(|v| v.as_str()).unwrap().to_string();
-                let contribution_json =
-                    cmd.get("contribution").and_then(|v| v.as_str()).unwrap().to_string();
+                let new_hash = cmd
+                    .get("new_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string();
+                let contribution_json = cmd
+                    .get("contribution")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string();
                 let contrib: ghost_mpc::contribution::MpcContribution =
                     serde_json::from_str(&contribution_json).unwrap();
                 match params_cache.remove(&new_hash) {
-                    Some(params) => match manager.apply_contribution_multi(params, None, None, &contrib) {
-                        Ok(()) => emit_resp(&json!({
-                            "ok": true,
-                            "count": manager.contribution_count(),
-                            "mgr_head": hex::encode(manager.current_params_hash()),
-                            "current_bin_hash": current_bin_lineage_hash(&params_dir),
-                            "ossified": manager.is_ossified(),
-                        })),
-                        Err(e) => emit_resp(&json!({"ok": false, "err": err_kind(&e)})),
-                    },
+                    Some(params) => {
+                        match manager.apply_contribution_multi(params, None, None, &contrib) {
+                            Ok(()) => emit_resp(&json!({
+                                "ok": true,
+                                "count": manager.contribution_count(),
+                                "mgr_head": hex::encode(manager.current_params_hash()),
+                                "current_bin_hash": current_bin_lineage_hash(&params_dir),
+                                "ossified": manager.is_ossified(),
+                            })),
+                            Err(e) => emit_resp(&json!({"ok": false, "err": err_kind(&e)})),
+                        }
+                    }
                     None => emit_resp(&json!({
                         "ok": false,
                         "err": "no cached params for new_hash (node never fetched/generated it)"
@@ -285,7 +301,10 @@ async fn run_node(argv: &[String]) {
             // lineage hash, since `verify_contribution` refuses once ossified.
             "fetch_head" => {
                 let url = cmd.get("url").and_then(|v| v.as_str()).unwrap().to_string();
-                let new_hash = cmd.get("new_hash").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let new_hash = cmd
+                    .get("new_hash")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let full = match &new_hash {
                     Some(h) => format!("{url}?new_hash={h}"),
                     None => url,
@@ -304,10 +323,14 @@ async fn run_node(argv: &[String]) {
                                 "fetched_hash": hex::encode(hash_parameters(&p).unwrap()),
                                 "size": data.len(),
                             })),
-                            Err(e) => emit_resp(&json!({"ok": false, "err": format!("parse: {e}")})),
+                            Err(e) => {
+                                emit_resp(&json!({"ok": false, "err": format!("parse: {e}")}))
+                            }
                         }
                     }
-                    Ok(r) => emit_resp(&json!({"ok": false, "err": format!("status {}", r.status())})),
+                    Ok(r) => {
+                        emit_resp(&json!({"ok": false, "err": format!("status {}", r.status())}))
+                    }
                     Err(e) => emit_resp(&json!({"ok": false, "err": format!("http: {e}")})),
                 }
             }
@@ -317,9 +340,7 @@ async fn run_node(argv: &[String]) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("late-comer");
                 match manager.generate_contribution(contributor) {
-                    Ok((_p, cnt)) => {
-                        emit_resp(&json!({"ok": true, "position": cnt.position}))
-                    }
+                    Ok((_p, cnt)) => emit_resp(&json!({"ok": true, "position": cnt.position})),
                     Err(e) => emit_resp(&json!({"ok": false, "err": err_kind(&e)})),
                 }
             }
@@ -328,7 +349,11 @@ async fn run_node(argv: &[String]) {
             // restart must then crash-loop (startup guard fails), proving the
             // guard has teeth and that the fixed path (separate file) avoids it.
             "simulate_old_bug_overwrite_current" => {
-                let new_hash = cmd.get("new_hash").and_then(|v| v.as_str()).unwrap().to_string();
+                let new_hash = cmd
+                    .get("new_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string();
                 match params_cache.get(&new_hash) {
                     Some(params) => {
                         let mut buf = Vec::new();
@@ -389,30 +414,58 @@ async fn do_fetch_verify(
         .await
     {
         Ok(r) => r,
-        Err(e) => return (json!({"verify_ok": false, "err": format!("http: {e}")}), None),
+        Err(e) => {
+            return (
+                json!({"verify_ok": false, "err": format!("http: {e}")}),
+                None,
+            )
+        }
     };
     if !resp.status().is_success() {
-        return (json!({"verify_ok": false, "err": format!("status {}", resp.status())}), None);
+        return (
+            json!({"verify_ok": false, "err": format!("status {}", resp.status())}),
+            None,
+        );
     }
     let data = match resp.bytes().await {
         Ok(b) => b,
-        Err(e) => return (json!({"verify_ok": false, "err": format!("body: {e}")}), None),
+        Err(e) => {
+            return (
+                json!({"verify_ok": false, "err": format!("body: {e}")}),
+                None,
+            )
+        }
     };
     if data.len() <= 1000 {
         return (json!({"verify_ok": false, "err": "params too small"}), None);
     }
     let params = match read_parameters_from_bytes(&data) {
         Ok(p) => p,
-        Err(e) => return (json!({"verify_ok": false, "err": format!("parse: {e}")}), None),
+        Err(e) => {
+            return (
+                json!({"verify_ok": false, "err": format!("parse: {e}")}),
+                None,
+            )
+        }
     };
     let fetched_hash = match hash_parameters(&params) {
         Ok(h) => hex::encode(h),
-        Err(e) => return (json!({"verify_ok": false, "err": format!("hash: {e}")}), None),
+        Err(e) => {
+            return (
+                json!({"verify_ok": false, "err": format!("hash: {e}")}),
+                None,
+            )
+        }
     };
     let contrib: ghost_mpc::contribution::MpcContribution =
         match serde_json::from_str(contribution_json) {
             Ok(c) => c,
-            Err(e) => return (json!({"verify_ok": false, "err": format!("contrib json: {e}")}), None),
+            Err(e) => {
+                return (
+                    json!({"verify_ok": false, "err": format!("contrib json: {e}")}),
+                    None,
+                )
+            }
         };
     let verify_ok = matches!(manager.verify_contribution(&params, &contrib), Ok(true));
     (
@@ -441,7 +494,10 @@ async fn spawn_params_server(port: u16, node_id: String) {
     // Mount ONLY the real params handler — same code path the mainnet node
     // serves `/api/v1/mpc/params?new_hash=` through, minus unrelated middleware.
     let app = axum::Router::new()
-        .route("/api/v1/mpc/params", axum::routing::get(api_mpc_params_handler))
+        .route(
+            "/api/v1/mpc/params",
+            axum::routing::get(api_mpc_params_handler),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
