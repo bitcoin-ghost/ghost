@@ -37,7 +37,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -115,6 +115,74 @@ const RECORD_WINDOWS: [(&str, i64); 4] = [
     ("week", 604_800),
     ("month", 2_592_000),
 ];
+
+/// MPC contribution retry window (a joining node broadcasting its candidate).
+///
+/// A joining node broadcasts a signed contribution candidate and then waits for
+/// the existing elders to fetch its (~2.8 MB) parameters, run the heavy Groth16
+/// `verify_contribution` pairing check, gossip votes, reach BFT quorum, apply
+/// the contribution and propagate the new head back. On release builds that full
+/// round trip routinely takes well over a minute per candidate. The window must
+/// therefore be generous: we rebroadcast the SAME stable candidate on every
+/// attempt (see `cached_contribution_still_valid`) so votes accumulate for one
+/// `new_hash`, and give voters ~15-20 min total to converge instead of giving up
+/// after ~5 minutes (the old 5-attempt / 10-100s loop that let the candidate
+/// hash keep changing faster than voters could verify — the "moving target").
+///
+/// 15 attempts with a randomised 60-90s delay ⇒ 14 sleeps × ~75s ≈ 17.5 min.
+/// These are consensus-affecting timings and are deliberately NOT env-tunable.
+const MPC_CONTRIBUTION_MAX_ATTEMPTS: u32 = 15;
+/// Minimum per-attempt retry delay — enough for a voter to fetch the candidate,
+/// run the Groth16 verify, gossip its vote, reach quorum, apply and propagate
+/// back on a release build before we rebroadcast.
+const MPC_CONTRIBUTION_RETRY_DELAY_MIN_SECS: u64 = 60;
+/// Maximum per-attempt retry delay. The delay is randomised in
+/// `[MIN, MAX]` to avoid a thundering herd when several nodes retry at once.
+const MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS: u64 = 90;
+
+/// Decide whether a cached MPC contribution candidate is still valid to
+/// rebroadcast unchanged on the next retry.
+///
+/// A candidate is generated for ceremony position `cached_count + 1`, chained
+/// onto the applied head at authoritative count `cached_count`. It stays valid
+/// for as long as the authoritative contribution count has NOT advanced: no new
+/// contribution has been applied, so our candidate still targets the correct
+/// position and chains onto the correct head. In that case we rebroadcast the
+/// SAME candidate (identical `new_hash`) so voters accumulate votes toward
+/// quorum instead of chasing a fresh hash every attempt.
+///
+/// If the count has ADVANCED (`current_count != cached_count`, i.e. another
+/// contribution was applied while we waited), our candidate is built on a stale
+/// head and MUST be regenerated (rebased) onto the new head — its
+/// `prev_params_hash` would otherwise fail hash-chain validation.
+fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> bool {
+    current_count == cached_count
+}
+
+/// The ceremony position this node should target next, accounting for a node
+/// whose adopted head lags the recorded chain tip.
+///
+/// * `authoritative_count` — the `mpc_ceremony` singleton count. This is advanced
+///   ONLY when a position is actually ADOPTED (params applied + singleton
+///   persisted).
+/// * `max_position` — the `mpc_contributions` MAX. This is advanced whenever an
+///   applied-contribution ROW arrives (startup contributor sync OR live gossip),
+///   even before this node has adopted the corresponding params.
+///
+/// A node that joined / un-pinned while the ceremony had already advanced sees
+/// its `max_position` climb via gossip while its `authoritative_count` stays put,
+/// because merely receiving the row never drives the on-disk head forward. If it
+/// naïvely targeted `authoritative_count + 1` it would try to contribute an
+/// ALREADY-FILLED position forever (the node6→stuck-at-5 incident). The correct
+/// target is one past the recorded chain tip, so the node contributes the next
+/// FREE position — after first catching its head up to that tip. Returning
+/// `max(count, tip) + 1` makes the target robust whether or not the catch-up has
+/// completed this instant, and reduces to the normal `count + 1` when the head is
+/// already at the tip (`count == tip`).
+#[cfg(feature = "mpc-ceremony")]
+fn mpc_next_contribution_position(authoritative_count: u32, max_position: u32) -> u32 {
+    authoritative_count.max(max_position) + 1
+}
 
 /// Build this node's best (rarest) valid share per records window from the
 /// local DB, shaped exactly like the `/api/v1/pool/records` response (redacted
@@ -687,6 +755,50 @@ fn sha256_file(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Persist a freshly generated note-spend CANDIDATE (un-applied) parameter set
+/// for serving to voters, keyed by its lineage `new_params_hash`.
+///
+/// SECURITY (Bug-1 fix): the candidate is written to a SEPARATE serving file
+/// (`note_spend_params_candidate_<hash>.bin`) and NEVER to the active
+/// `note_spend_params_current.bin`. The node's `current.bin` must remain the
+/// last BFT-APPLIED params until a contribution is actually applied through
+/// `CeremonyManager::apply_contribution_multi` (the sole legitimate writer of
+/// `current.bin`). Writing the un-applied candidate over `current.bin` is what
+/// crash-looped node5: on restart the genesis-anchored cross-check saw on-disk
+/// candidate ≠ chain head and failed closed.
+///
+/// Stale candidates from superseded positions are purged best-effort so the
+/// serving directory does not accumulate multi-hundred-megabyte blobs. Returns
+/// the candidate file path on success.
+#[cfg(feature = "mpc-ceremony")]
+fn write_candidate_note_spend_params(
+    params_dir: &std::path::Path,
+    new_params_hash: &[u8; 32],
+    serialized: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(params_dir)?;
+
+    // Drop candidate files for other (superseded) positions. Keep only the one
+    // we are about to (re)write so a long retry loop never bloats the dir.
+    let keep = ghost_common::mpc::candidate_note_spend_filename(new_params_hash);
+    if let Ok(entries) = std::fs::read_dir(params_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(ghost_common::mpc::CANDIDATE_NOTE_SPEND_PREFIX)
+                && name.ends_with(".bin")
+                && name != keep
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let candidate_path = params_dir.join(&keep);
+    std::fs::write(&candidate_path, serialized)?;
+    Ok(candidate_path)
+}
+
 /// True iff `note_spend_params_current.bin` exists in `params_dir` and — when a
 /// hash is pinned — its SHA-256 matches.
 ///
@@ -985,7 +1097,22 @@ async fn fetch_and_parse_params(
     endpoint: &str,
     expected_hash: Option<[u8; 32]>,
 ) -> Option<ghost_mpc::Groth16Params> {
-    let url = format!("http://{}:8080/api/v1/mpc/{}", host, endpoint);
+    // When we are after a specific (candidate) lineage hash, ask the peer to
+    // serve THAT candidate by hash. The contributor stores its un-applied
+    // candidate in a separate serving file keyed by `new_hash` (its active
+    // current.bin stays at the applied head), so a bare GET would return the
+    // applied params and the hash filter below would reject every peer. With
+    // `?new_hash=` the contributor serves the candidate; peers without it fall
+    // back to their current.bin (which won't match, so we skip them).
+    let url = match expected_hash {
+        Some(h) => format!(
+            "http://{}:8080/api/v1/mpc/{}?new_hash={}",
+            host,
+            endpoint,
+            hex::encode(h)
+        ),
+        None => format!("http://{}:8080/api/v1/mpc/{}", host, endpoint),
+    };
     let resp = reqwest::Client::new()
         .get(&url)
         .timeout(std::time::Duration::from_secs(60))
@@ -1018,21 +1145,93 @@ async fn fetch_and_parse_params(
     .ok()?
 }
 
+/// Host portion of an `address` that may be a bare host, `host:port`,
+/// `[ipv6]:port`, or carry a `scheme://` prefix. Mirrors the mesh's own
+/// `extract_host_from_address` so a contributor's advertised mesh address
+/// (`ip:8559`) reduces to just the host we then hit on the fetch port (`:8080`).
+#[cfg(feature = "mpc-ceremony")]
+fn fetch_host_of(address: &str) -> String {
+    let s = match address.find("://") {
+        Some(i) => &address[i + 3..],
+        None => address,
+    };
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    match s.rfind(':') {
+        Some(i) if !s[i + 1..].is_empty() && s[i + 1..].chars().all(|c| c.is_ascii_digit()) => {
+            s[..i].to_string()
+        }
+        _ => s.to_string(),
+    }
+}
+
+/// Resolve a contributor node id to its reachable address: the live mesh peer
+/// registry FIRST (freshest — the same registry the mesh uses for Noise/health),
+/// then the persisted `nodes` table. Empty strings are treated as unresolved.
+/// `None` means we could not find an address and must fall back to seeds only.
+#[cfg(feature = "mpc-ceremony")]
+fn resolve_contributor_addr(
+    peers: &ghost_consensus::peer::PeerManager,
+    db: &ghost_storage::Database,
+    contributor: &ghost_common::types::NodeId,
+) -> Option<String> {
+    peers
+        .get_peer(contributor)
+        .map(|p| p.public_address)
+        .filter(|a| !a.is_empty())
+        .or_else(|| {
+            db.get_node(&hex::encode(contributor))
+                .ok()
+                .flatten()
+                .and_then(|n| n.public_address)
+        })
+        .filter(|a| !a.is_empty())
+}
+
+/// Build the ordered list of fetch hosts for a candidate parameter bundle: the
+/// CONTRIBUTOR first (the only node serving its un-applied candidate), then the
+/// configured seeds. Entries are reduced to host-only and de-duplicated by host
+/// so the contributor is never retried as a seed and duplicate seeds are dropped.
+/// When `contributor_addr` is `None` (address unresolved) the result is exactly
+/// the seed hosts — preserving the prior seeds-only behaviour as a fallback.
+#[cfg(feature = "mpc-ceremony")]
+fn ordered_fetch_sources(contributor_addr: Option<&str>, seeds: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(seeds.len() + 1);
+    if let Some(addr) = contributor_addr {
+        let h = fetch_host_of(addr);
+        if !h.is_empty() {
+            out.push(h);
+        }
+    }
+    for seed in seeds {
+        let h = fetch_host_of(seed);
+        if h.is_empty() || out.iter().any(|existing| existing == &h) {
+            continue;
+        }
+        out.push(h);
+    }
+    out
+}
+
 /// Fetch a full candidate parameter bundle (note-spend + payout + unshield) from
 /// the network for one contribution.
 ///
 /// The primary note-spend parameters MUST hash-match `expected_note_spend_hash`
 /// (the contribution's claimed lineage head) — only then is a bundle returned.
 /// `payout`/`unshield` ride along best-effort (they share the same toxic waste).
-/// Returns `None` if no seed can supply matching note-spend parameters, which
-/// forces the voter to ABSTAIN rather than approve blind.
+/// Returns `None` if no source can supply matching note-spend parameters, which
+/// forces the voter to ABSTAIN rather than approve blind. Sources are tried in
+/// the given order (contributor-first per [`ordered_fetch_sources`]).
 #[cfg(feature = "mpc-ceremony")]
 async fn fetch_ceremony_params_bundle(
-    seeds: &[String],
+    sources: &[String],
     expected_note_spend_hash: [u8; 32],
 ) -> Option<ghost_consensus::mpc_handler::FetchedCeremonyParams> {
-    for seed in seeds {
-        let host = seed.split(':').next().unwrap_or(seed);
+    for source in sources {
+        let host = source.split(':').next().unwrap_or(source);
         let note_spend =
             match fetch_and_parse_params(host, "params", Some(expected_note_spend_hash)).await {
                 Some(p) => p,
@@ -1047,6 +1246,493 @@ async fn fetch_ceremony_params_bundle(
         });
     }
     None
+}
+
+/// Load a note-spend CANDIDATE parameter set from THIS node's local serving
+/// directory, keyed by its lineage `new_params_hash`, and verify the parsed
+/// params hash to that head before returning.
+///
+/// This is the fast, network-free source for a contributor adopting its OWN
+/// applied contribution: the candidate it generated + wrote (never `current.bin`)
+/// hashes to exactly the `new_params_hash` the voters BFT-approved. Returns
+/// `None` when the file is absent, unreadable, unparsable, or the parsed hash
+/// does not match (a corrupt/stale candidate) — the caller then falls back to
+/// the network.
+#[cfg(feature = "mpc-ceremony")]
+fn load_local_candidate_note_spend(
+    params_dir: &std::path::Path,
+    new_params_hash: &[u8; 32],
+) -> Option<ghost_mpc::Groth16Params> {
+    let path = params_dir.join(ghost_common::mpc::candidate_note_spend_filename(
+        new_params_hash,
+    ));
+    let bytes = std::fs::read(&path).ok()?;
+    let params = ghost_mpc::params::read_parameters_from_bytes(&bytes).ok()?;
+    let h = ghost_mpc::contribution::hash_parameters(&params).ok()?;
+    if &h != new_params_hash {
+        tracing::warn!(
+            expected = %hex::encode(&new_params_hash[..8]),
+            got = %hex::encode(&h[..8]),
+            "MPC adopt: local candidate hash != recorded lineage head — ignoring (will try network)"
+        );
+        return None;
+    }
+    Some(params)
+}
+
+/// Reconstruct an [`ghost_mpc::MpcContribution`] from a persisted contribution
+/// row. The proof is parsed from the stored bytes when present; when it is empty
+/// or malformed (e.g. a row synced from `/contributors` before the real proof
+/// was back-filled) an all-empty proof is substituted. This is safe for the
+/// adopt/apply path because `apply_contribution_multi` reads only the position,
+/// hashes and timestamp — never the proof. Callers that adopt params they did
+/// NOT author still run [`ghost_mpc::CeremonyManager::verify_contribution_catchup`]
+/// separately, which requires a real proof.
+#[cfg(feature = "mpc-ceremony")]
+fn contribution_from_row(
+    row: &ghost_storage::queries::MpcContributionRecord,
+) -> ghost_mpc::MpcContribution {
+    let proof = serde_json::from_slice::<ghost_mpc::ContributionProof>(&row.contribution_proof)
+        .unwrap_or_else(|_| {
+            let empty_pok = || ghost_mpc::contribution::ProofOfKnowledge {
+                commitment_g1: Vec::new(),
+                challenge: [0u8; 32],
+                response: Vec::new(),
+            };
+            ghost_mpc::ContributionProof {
+                tau_g1: Vec::new(),
+                tau_g2: Vec::new(),
+                alpha_g1: Vec::new(),
+                beta_g1: Vec::new(),
+                beta_g2: Vec::new(),
+                tau_pok: empty_pok(),
+                alpha_pok: empty_pok(),
+                beta_pok: empty_pok(),
+            }
+        });
+    ghost_mpc::MpcContribution {
+        position: row.elder_position,
+        prev_params_hash: row.prev_params_hash,
+        new_params_hash: row.new_params_hash,
+        proof,
+        contributor: row.contributor_node_id.clone(),
+        timestamp: row.created_at,
+        commitment_hash: None,
+    }
+}
+
+/// Persist the `mpc_ceremony` singleton from the ceremony manager's AUTHORITATIVE
+/// post-apply state (count, current-params hash, ossification, vk hashes,
+/// ceremony_id). Mirrors the persistence the BFT `params_update_callback` does
+/// after it applies. Returns `false` on a DB error so callers never declare a
+/// consistent head while the singleton write failed.
+#[cfg(feature = "mpc-ceremony")]
+fn persist_singleton_from_manager(
+    ceremony_mgr: &ghost_mpc::CeremonyManager,
+    db: &ghost_storage::Database,
+) -> bool {
+    let s = ceremony_mgr.state();
+    let db_state = ghost_storage::queries::MpcCeremonyState {
+        contribution_count: s.contribution_count,
+        current_params_hash: s.current_params_hash,
+        is_ossified: s.is_ossified,
+        ossified_at: s.ossified_at,
+        block_vk_hash: s.note_spend_vk_hash,
+        payout_vk_hash: s.payout_vk_hash,
+        updated_at: s.updated_at,
+        ceremony_id: s.ceremony_id,
+    };
+    if let Err(e) = db.save_mpc_ceremony_state(&db_state) {
+        tracing::warn!(error = %e, "MPC adopt: failed to persist ceremony singleton");
+        return false;
+    }
+    true
+}
+
+/// Apply an already-obtained, hash-matched note-spend parameter set for
+/// `contribution` through the ONLY legitimate `current.bin` writer
+/// ([`ghost_mpc::CeremonyManager::apply_contribution_multi`]), then persist the
+/// `mpc_ceremony` singleton from the manager's authoritative state.
+///
+/// Returns `true` ONLY when the post-conditions hold: manager count ==
+/// `contribution.position` AND manager current-params hash ==
+/// `contribution.new_params_hash` (so `note_spend_params_current.bin` is the
+/// applied head) AND the singleton was persisted. A `false` return means the
+/// adopt did NOT complete cleanly and the caller MUST NOT declare success.
+///
+/// Payout/unshield ride the note-spend lineage (same toxic waste) and are
+/// intentionally left as `None` here: the note-spend hash is the BFT-chained
+/// trusted-setup head, and the contributor holds only its note-spend candidate.
+/// `update_current_params` copies only the versions that exist on disk, so the
+/// payout/unshield current pointers are left untouched (byte-identical to the
+/// applied head).
+#[cfg(feature = "mpc-ceremony")]
+fn apply_and_persist_adopted_note_spend(
+    ceremony_mgr: &ghost_mpc::CeremonyManager,
+    db: &ghost_storage::Database,
+    note_spend: ghost_mpc::Groth16Params,
+    contribution: &ghost_mpc::MpcContribution,
+) -> bool {
+    if let Err(e) = ceremony_mgr.apply_contribution_multi(note_spend, None, None, contribution) {
+        tracing::warn!(
+            error = %e,
+            position = contribution.position,
+            "MPC adopt: apply_contribution_multi failed"
+        );
+        return false;
+    }
+    if !persist_singleton_from_manager(ceremony_mgr, db) {
+        return false;
+    }
+    // Lineage invariant: the on-disk head + singleton now sit at our applied
+    // position. Verified against the recorded `new_params_hash`, so an adopted
+    // `current.bin` that failed to advance can never masquerade as success.
+    let ok = ceremony_mgr.contribution_count() == contribution.position
+        && ceremony_mgr.current_params_hash() == contribution.new_params_hash;
+    if !ok {
+        tracing::error!(
+            position = contribution.position,
+            count = ceremony_mgr.contribution_count(),
+            "MPC adopt: post-apply invariant violated (count/hash != applied position)"
+        );
+    }
+    ok
+}
+
+/// Adopt the BFT-applied contribution recorded at `position` into THIS node's
+/// on-disk `note_spend_params_current.bin` + `mpc_ceremony` singleton, advancing
+/// the ceremony manager from `position - 1` to `position`.
+///
+/// This closes the contributor self-adopt gap. A node that GENERATED a
+/// contribution never applies it through its own [`ghost_consensus::MpcHandler`]:
+/// the handler only applies contributions it RECEIVED into its
+/// `pending_contributions` map, and a node's own broadcast is never in that map.
+/// So once the voters reach quorum and BFT-apply, and the row gossips back into
+/// `mpc_contributions`, the contributor is recorded as an elder at `position`
+/// while its own `current.bin` + singleton stay at `position - 1` — a fail-closed
+/// crash-loop on restart (on-disk head < recorded chain tip). This drives the
+/// canonical adopt so the head catches up.
+///
+/// Params source, in order: (1) the node's OWN local candidate serving file
+/// (`note_spend_params_candidate_<new_hash>.bin`, hash-checked); (2) the network
+/// (a voter's applied head, hash-checked). For a position this node did NOT
+/// contribute, the fetched params are additionally run through the SAME catch-up
+/// crypto verification (Schnorr + pairing transform against OUR prev) a
+/// voter/callback runs — never adopt a foreign lineage on hash-match alone. An
+/// OWN contribution is self-authored (we produced `new_params_hash`) so the
+/// hash-match to our own BFT-approved row is the gate.
+///
+/// Returns `true` ONLY when the post-adopt invariant holds. `false` means the
+/// node did NOT reach a consistent applied head and the caller MUST NOT declare
+/// elder success.
+#[cfg(feature = "mpc-ceremony")]
+async fn adopt_applied_position(
+    ceremony_mgr: &Arc<ghost_mpc::CeremonyManager>,
+    db: &Arc<ghost_storage::Database>,
+    peers: &ghost_consensus::peer::PeerManager,
+    seeds: &[String],
+    our_node_id_hex: &str,
+    position: u32,
+) -> bool {
+    // The recorded (BFT-approved) row is the authority for what to adopt.
+    let row = match db.get_mpc_contribution(position) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(
+                position,
+                "MPC adopt: no contribution row for position — cannot adopt"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, position, "MPC adopt: contribution row lookup failed");
+            return false;
+        }
+    };
+
+    // Fast path: already at this applied head — just make sure the singleton
+    // reflects it (a lagged singleton on an otherwise-consistent head).
+    if ceremony_mgr.contribution_count() == position
+        && ceremony_mgr.current_params_hash() == row.new_params_hash
+    {
+        return persist_singleton_from_manager(ceremony_mgr, db);
+    }
+
+    // apply_contribution_multi only accepts the IMMEDIATE next position
+    // (position == count + 1). Callers advance positions in order, so this holds.
+    if ceremony_mgr.contribution_count() + 1 != position {
+        tracing::warn!(
+            position,
+            count = ceremony_mgr.contribution_count(),
+            "MPC adopt: manager not positioned at position-1 — cannot apply out of order"
+        );
+        return false;
+    }
+
+    let is_own = row.contributor_node_id == our_node_id_hex;
+    let params_dir = ceremony_mgr.params_dir().clone();
+    let new_hash = row.new_params_hash;
+
+    // Serialise param writes against the other writers (startup fetch, BFT apply,
+    // params_callback) on the shared parameter files.
+    let _param_write_guard = param_write_lock().lock().await;
+
+    // (1) Local candidate serving file first (parse off the async thread).
+    let local = {
+        let dir = params_dir.clone();
+        tokio::task::spawn_blocking(move || load_local_candidate_note_spend(&dir, &new_hash))
+            .await
+            .ok()
+            .flatten()
+    };
+
+    let note_spend = match local {
+        Some(p) => {
+            tracing::info!(position, is_own, "MPC adopt: using local candidate params");
+            p
+        }
+        None => {
+            // (2) Network fallback: a voter serves the applied head by hash. A
+            // contributor adopting its OWN lost candidate resolves nothing for
+            // itself (it is not its own peer) → seeds-only, and any voter's
+            // current.bin now hashes to `new_hash`.
+            let contributor_addr = if is_own {
+                None
+            } else {
+                hex::decode(&row.contributor_node_id)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .and_then(|c| resolve_contributor_addr(peers, db, &c))
+            };
+            let sources = ordered_fetch_sources(contributor_addr.as_deref(), seeds);
+            match fetch_ceremony_params_bundle(&sources, new_hash).await {
+                Some(b) => {
+                    tracing::info!(
+                        position,
+                        is_own,
+                        "MPC adopt: fetched applied params from network"
+                    );
+                    (*b.note_spend).clone()
+                }
+                None => {
+                    tracing::warn!(
+                        position,
+                        "MPC adopt: no local candidate and no network source served matching params"
+                    );
+                    return false;
+                }
+            }
+        }
+    };
+
+    let contribution = contribution_from_row(&row);
+
+    // Never adopt a FOREIGN lineage on hash-match alone: run the same catch-up
+    // crypto verification (Schnorr proof bound to ceremony_id + h/l pairing
+    // transform against OUR prev) a voter/callback runs. OWN contributions are
+    // self-authored and gated by the hash-match to our own approved row (their
+    // proof may not even be locally present yet).
+    if !is_own && position >= 2 && ceremony_mgr.has_current_params() {
+        let prev = match ceremony_mgr.note_spend_params() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    position,
+                    "MPC adopt: no current params to verify a non-own contribution against"
+                );
+                return false;
+            }
+        };
+        let mgr = Arc::clone(ceremony_mgr);
+        let ns = note_spend.clone();
+        let c = contribution.clone();
+        let verified =
+            tokio::task::spawn_blocking(move || mgr.verify_contribution_catchup(&prev, &ns, &c))
+                .await;
+        if !matches!(verified, Ok(Ok(true))) {
+            tracing::warn!(
+                position,
+                result = ?verified,
+                "MPC adopt: non-own candidate FAILED catch-up verification — refusing"
+            );
+            return false;
+        }
+    }
+
+    // Apply through the manager + persist the singleton, off the async thread.
+    let mgr = Arc::clone(ceremony_mgr);
+    let db2 = Arc::clone(db);
+    let applied = tokio::task::spawn_blocking(move || {
+        apply_and_persist_adopted_note_spend(&mgr, &db2, note_spend, &contribution)
+    })
+    .await;
+    matches!(applied, Ok(true))
+}
+
+/// Catch THIS node's on-disk head + singleton up to the recorded chain tip by
+/// adopting every un-adopted applied position in order. Used both when a
+/// contributor first learns (via gossip) that its contribution was BFT-applied
+/// and at startup for a contributor whose head lags the chain (the restart
+/// self-heal). Returns `true` only when the manager count reaches the recorded
+/// max position (`get_mpc_max_contribution_position`) with each step's invariant
+/// satisfied; `false` if any position could not be adopted (caller then avoids
+/// declaring elder success and lets a later retry / restart heal it).
+#[cfg(feature = "mpc-ceremony")]
+async fn adopt_all_applied_positions(
+    ceremony_mgr: &Arc<ghost_mpc::CeremonyManager>,
+    db: &Arc<ghost_storage::Database>,
+    peers: &ghost_consensus::peer::PeerManager,
+    seeds: &[String],
+    our_node_id_hex: &str,
+) -> bool {
+    let max_pos = db
+        .get_mpc_max_contribution_position()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    while ceremony_mgr.contribution_count() < max_pos {
+        let next = ceremony_mgr.contribution_count() + 1;
+        // Before adopting, make sure this position's FULL data is present locally.
+        // A row that arrived via lightweight gossip (or the proof-less
+        // `/contributors` sync) carries an EMPTY proof and NO retained votes, so:
+        //   * a FOREIGN lineage could not be re-verified (`verify_contribution_catchup`
+        //     needs the real Schnorr/pairing proof), and
+        //   * a later restart's genesis-anchored check would fail closed (it
+        //     requires the retained ≥quorum BFT votes for every position 2..N).
+        // Pull the real proof + retained votes from a peer's
+        // `/api/v1/mpc/votes/{pos}` endpoint (best-effort; safe proof-fill upsert
+        // preserves an applied row). If no seed serves it we still attempt the
+        // adopt with whatever is local — an OWN position needs neither, and a
+        // FOREIGN one without a valid proof simply fails the crypto verify below
+        // and we stop (fail-safe), never adopting on hash-match alone.
+        sync_mpc_proof_and_votes(seeds, next, db).await;
+        if !adopt_applied_position(ceremony_mgr, db, peers, seeds, our_node_id_hex, next).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reconcile the `mpc_ceremony` singleton to the recorded contribution-chain
+/// head. The SINGLE source of the "singleton count == chain tip == head lineage
+/// hash" invariant shared by the fresh-join SYNC path (Part A) and the startup
+/// self-heal guard (Part B).
+///
+/// * ZERO contribution rows → returns `Ok(None)` and writes NOTHING: the node
+///   is legitimately pre-genesis (a brand-new genesis node) and must stay so.
+/// * `n > 0` rows AND singleton absent-or-BEHIND → creates / advances the
+///   singleton to `contribution_count = n` with
+///   `current_params_hash = mpc_contributions[n].new_params_hash` (the lineage
+///   head) and `ceremony_id = position-1.prev_params_hash` (the genesis anchor).
+/// * `n > 0` rows AND singleton already at/ahead of `n` → no-op, `Ok(Some(n))`.
+///
+/// Fail-CLOSED + honest: it reconciles ONLY to contributions that actually
+/// exist, never fabricates a genesis or invents a head, and NEVER lowers an
+/// already-ahead singleton (that would be a rollback).
+#[cfg(feature = "mpc-ceremony")]
+fn reconcile_singleton_to_recorded_head(
+    db: &ghost_storage::Database,
+) -> anyhow::Result<Option<u32>> {
+    let max_pos = match db.get_mpc_max_contribution_position()? {
+        Some(n) if n > 0 => n,
+        // No contribution rows: genuinely pre-genesis — leave the DB untouched.
+        _ => return Ok(None),
+    };
+
+    // Only create-if-absent or advance-if-behind; never lower an ahead singleton.
+    if let Some(state) = db.get_mpc_ceremony_state()? {
+        if state.contribution_count >= max_pos {
+            return Ok(Some(max_pos));
+        }
+    }
+
+    let head = db.get_mpc_contribution(max_pos)?.ok_or_else(|| {
+        anyhow::anyhow!("MPC: chain tip position {max_pos} has no contribution row")
+    })?;
+    // Canonical ceremony anchor = position-1's prev_params_hash (genesis lineage).
+    let anchor = db.mpc_genesis_ceremony_id()?.unwrap_or([0u8; 32]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    db.reconcile_mpc_singleton_to_head(max_pos, &head.new_params_hash, &anchor, now)?;
+    Ok(Some(max_pos))
+}
+
+/// Ensure the on-disk `note_spend_params_current.bin` IS the recorded
+/// contribution-chain head (`mpc_contributions[MAX].new_params_hash`).
+///
+/// If the manager already holds head parameters whose lineage
+/// [`hash_parameters`] equals the recorded head, this is a no-op (`Ok(true)`) —
+/// the common case for both a fresh join (the generic params fetch already
+/// installed the head) and a node7-style restart (the head is on disk, only the
+/// singleton was missing). Otherwise the head is fetched BY ITS LINEAGE HASH
+/// (contributor-first, then seeds; hash-checked inside
+/// [`fetch_ceremony_params_bundle`]) and installed through the manager's atomic
+/// params writer ([`ghost_mpc::CeremonyManager::install_synced_head`]), then the
+/// on-disk head is guaranteed to match.
+///
+/// Returns `Ok(false)` when there is no recorded head (zero contributions —
+/// pre-genesis). Returns `Err` (fail-safe) when a head is recorded but no source
+/// can supply matching parameters, so the caller does NOT persist a singleton it
+/// cannot back with on-disk params.
+#[cfg(feature = "mpc-ceremony")]
+async fn ensure_recorded_head_installed(
+    ceremony_mgr: &Arc<ghost_mpc::CeremonyManager>,
+    db: &ghost_storage::Database,
+    peers: &ghost_consensus::peer::PeerManager,
+    seeds: &[String],
+) -> anyhow::Result<bool> {
+    let max_pos = match db.get_mpc_max_contribution_position()? {
+        Some(n) if n > 0 => n,
+        _ => return Ok(false),
+    };
+    let head = db.get_mpc_contribution(max_pos)?.ok_or_else(|| {
+        anyhow::anyhow!("MPC: chain tip position {max_pos} has no contribution row")
+    })?;
+
+    // Already at the recorded head on disk (loaded into the manager)?
+    let on_disk_ok = ceremony_mgr
+        .note_spend_params()
+        .and_then(|p| ghost_mpc::contribution::hash_parameters(&p).ok())
+        .map(|h| h == head.new_params_hash)
+        .unwrap_or(false);
+    if on_disk_ok {
+        return Ok(true);
+    }
+
+    // current.bin is missing / stale: fetch the exact head by its lineage hash
+    // and install it through the atomic params writer. Serialise against the
+    // other trusted-setup writers on the shared parameter files.
+    let _guard = param_write_lock().lock().await;
+    let contributor_addr = hex::decode(&head.contributor_node_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .and_then(|c| resolve_contributor_addr(peers, db, &c));
+    let sources = ordered_fetch_sources(contributor_addr.as_deref(), seeds);
+    let bundle = fetch_ceremony_params_bundle(&sources, head.new_params_hash)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MPC: no source served head params matching recorded lineage at position {max_pos}"
+            )
+        })?;
+    let note_spend = (*bundle.note_spend).clone();
+    let new_hash = head.new_params_hash;
+    // `install_synced_head` is CPU-heavy (serialise + hash hundreds of MB); run it
+    // off the async runtime on a blocking thread (mirrors the adopt path).
+    let mgr = Arc::clone(ceremony_mgr);
+    let installed = tokio::task::spawn_blocking(move || {
+        mgr.install_synced_head(max_pos, &note_spend, new_hash)
+    })
+    .await;
+    match installed {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(e)) => Err(anyhow::anyhow!("MPC: install_synced_head failed: {e}")),
+        Err(e) => Err(anyhow::anyhow!(
+            "MPC: install_synced_head task join failed: {e}"
+        )),
+    }
 }
 
 /// Stage C task 3: fetch a single position's FULL contribution (with the real
@@ -2808,7 +3494,50 @@ async fn main() -> Result<()> {
         use ghost_consensus::MpcHandler;
         use ghost_mpc::CeremonyManager;
 
-        // Load MPC ceremony state from database (the backfilled singleton)
+        // Part B — defensive startup self-heal (node7 recovery).
+        //
+        // A node that SYNCED contribution rows (+ proofs/votes) but never
+        // persisted the `mpc_ceremony` singleton (the fresh-join gap Part A fixes
+        // at the source) would otherwise fall through `load_or_init(None)` into
+        // the PRE-GENESIS branch and DISCARD its synced position-1..n state,
+        // regenerating genesis. Detect that inconsistency BEFORE `load_or_init`
+        // and reconcile the singleton to the recorded chain-tip head, so the
+        // manager loads the synced position cleanly instead.
+        //
+        // "Inconsistent" = contribution rows EXIST (`max_pos > 0`) AND the
+        // singleton is absent, or present but BEHIND the recorded chain tip
+        // (`count < max_pos`). A node with ZERO contribution rows is left
+        // untouched — it is legitimately pre-genesis (this is how a brand-new
+        // genesis node starts). Fail-CLOSED + honest: reconcile only from
+        // contributions that actually exist; never fabricate a genesis or head.
+        {
+            let singleton_count = db.get_mpc_ceremony_state()?.map(|s| s.contribution_count);
+            let max_pos = db.get_mpc_max_contribution_position()?.unwrap_or(0);
+            let inconsistent = max_pos > 0 && singleton_count.map(|c| c < max_pos).unwrap_or(true);
+            if inconsistent {
+                match reconcile_singleton_to_recorded_head(&db) {
+                    Ok(Some(head)) => info!(
+                        head,
+                        had_singleton = singleton_count.is_some(),
+                        prior_count = singleton_count.unwrap_or(0),
+                        "MPC startup self-heal: reconciled mpc_ceremony singleton to the recorded \
+                         contribution-chain head (contributions present but singleton absent/behind) \
+                         — loading the synced position instead of re-initialising pre-genesis"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => warn!(
+                        error = %e,
+                        "MPC startup self-heal: singleton reconcile failed — startup verification \
+                         will decide (fail-closed)"
+                    ),
+                }
+            }
+        }
+
+        // Load MPC ceremony state from database (reconciled above if it was
+        // absent/behind, so a synced node now passes `Some(state)` — with
+        // `count == chain tip` — into `load_or_init` and loads current.bin,
+        // rather than the pre-genesis `None` path).
         let mpc_state = db.get_mpc_ceremony_state()?;
 
         // Stage A task 2: derive the STABLE ceremony_id.
@@ -2864,6 +3593,40 @@ async fn main() -> Result<()> {
                 Arc::new(CeremonyManager::new(mpc_params_dir))
             }
         };
+
+        // Part B — current.bin consistency for the reconciled head.
+        //
+        // The Part-B guard above ensured the singleton == chain tip, so
+        // `load_or_init` above loaded whatever `note_spend_params_current.bin`
+        // holds at that count. In the node7 case current.bin IS the synced head
+        // (the fetch installed it), so this is a no-op. But if current.bin is
+        // MISSING or STALE (e.g. a partial sync, or a head fetched under a
+        // pre-reconcile count), a synced node has no sequential apply path to
+        // rebuild it (`adopt_all_applied_positions` is a no-op once
+        // count == chain tip). Re-install the recorded head by its lineage hash
+        // through the atomic params writer so the genesis-anchored FATAL check
+        // below passes on a genuinely-consistent head — rather than the node
+        // silently proving against stale params or falsely advancing.
+        // Fail-CLOSED: if the head can't be installed we leave current.bin as-is
+        // and let the FATAL verification decide.
+        if ceremony_manager.contribution_count() > 0 {
+            match ensure_recorded_head_installed(
+                &ceremony_manager,
+                &db,
+                mesh.peers(),
+                &config.network.seed_nodes,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(e) => warn!(
+                    error = %e,
+                    "MPC startup self-heal: could not (re)install the recorded head to current.bin \
+                     — genesis-anchored verification will decide (fail-closed)"
+                ),
+            }
+        }
 
         // Stage A task 3: startup lineage cross-check (fail-closed).
         //
@@ -2950,6 +3713,57 @@ async fn main() -> Result<()> {
         // a node that abstained on some position is reconciled to the verified
         // head + chain length.
         if let Some(genesis_anchor) = zk_rolling_anchor {
+            // 7th contribution-flow gap — CONTRIBUTOR restart self-heal (fail-safe,
+            // runs BEFORE the FATAL verification below).
+            //
+            // A node that GENERATED a contribution never applies it through its own
+            // MpcHandler (the handler applies only contributions it RECEIVED into
+            // `pending_contributions`; a node's own broadcast is never there). So
+            // after the voters BFT-apply it and the row gossips back into
+            // `mpc_contributions`, the contributor is an elder at the new position
+            // while its own `current.bin` + singleton stay at the previous head. On
+            // restart the genesis-anchored verification below sees
+            // `contributions[MAX].new != on-disk head` and fails closed → crash-loop
+            // (the exact node5→position-5 incident).
+            //
+            // Catch the on-disk head + singleton up to the recorded chain tip by
+            // adopting each un-adopted position from THIS node's own local candidate
+            // (network fallback if the candidate is gone). This only advances
+            // positions this node contributed (or ones it can fetch + crypto-verify),
+            // and is a no-op once the head already equals the chain tip (voters, and
+            // an already-healed contributor). If it cannot fully heal we do NOT force
+            // it — the verification below stays authoritative and fail-closed.
+            let our_node_id_hex = hex::encode(identity.node_id());
+            let max_pos = db
+                .get_mpc_max_contribution_position()
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            if ceremony_manager.contribution_count() < max_pos {
+                if adopt_all_applied_positions(
+                    &ceremony_manager,
+                    &db,
+                    mesh.peers(),
+                    &config.network.seed_nodes,
+                    &our_node_id_hex,
+                )
+                .await
+                {
+                    info!(
+                        head = ceremony_manager.contribution_count(),
+                        "MPC restart self-heal: adopted own applied contribution(s) into on-disk head \
+                         before genesis-anchored verification"
+                    );
+                } else {
+                    warn!(
+                        head = ceremony_manager.contribution_count(),
+                        max_pos,
+                        "MPC restart self-heal: could not fully adopt applied position(s) — \
+                         genesis-anchored verification may fail-close"
+                    );
+                }
+            }
+
             // Head lineage hash of the on-disk current params (None if not loaded).
             let head_lineage: Option<[u8; 32]> = ceremony_manager
                 .note_spend_params()
@@ -3033,13 +3847,16 @@ async fn main() -> Result<()> {
         let ceremony_mgr_for_callback = Arc::clone(&ceremony_manager);
         let seed_nodes_for_callback = config.network.seed_nodes.clone();
         let db_for_callback = Arc::clone(&db);
+        let peers_for_callback = Arc::clone(mesh.peers());
         type ParamsUpdateFn = dyn Fn(&[u8; 32], &[u8; 32]) + Send + Sync;
         let params_update_callback: Arc<ParamsUpdateFn> = Arc::new(
-            move |expected_hash: &[u8; 32], _contributor: &[u8; 32]| {
+            move |expected_hash: &[u8; 32], contributor: &[u8; 32]| {
                 let ceremony_mgr = Arc::clone(&ceremony_mgr_for_callback);
                 let seeds = seed_nodes_for_callback.clone();
                 let db = Arc::clone(&db_for_callback);
+                let peers = Arc::clone(&peers_for_callback);
                 let expected = *expected_hash;
+                let contributor = *contributor;
                 tokio::spawn(async move {
                     // Small delay to let the contributing node finish writing.
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -3093,12 +3910,24 @@ async fn main() -> Result<()> {
                     let _param_write_guard = param_write_lock().lock().await;
 
                     // Fetch the candidate bundle (note-spend hash MUST match).
-                    let bundle = match fetch_ceremony_params_bundle(&seeds, expected).await {
+                    // Same root-cause fix as the voter path: the contributor is
+                    // the only node serving its un-applied candidate, so resolve
+                    // its address and try it FIRST, then the seeds (a peer that has
+                    // already adopted the head can serve a historical catch-up).
+                    let contributor_addr = resolve_contributor_addr(&peers, &db, &contributor);
+                    if contributor_addr.is_none() {
+                        tracing::info!(
+                            contributor = %hex::encode(&contributor[..8]),
+                            "MPC params_callback: contributor address unresolved — seeds only"
+                        );
+                    }
+                    let sources = ordered_fetch_sources(contributor_addr.as_deref(), &seeds);
+                    let bundle = match fetch_ceremony_params_bundle(&sources, expected).await {
                         Some(b) => b,
                         None => {
                             tracing::warn!(
                                 expected = %hex::encode(&expected[..8]),
-                                "MPC params_callback: no peer had matching params"
+                                "MPC params_callback: no source had matching params"
                             );
                             return;
                         }
@@ -3205,12 +4034,41 @@ async fn main() -> Result<()> {
         // Stage 1a: the network fetcher the voter uses to obtain a candidate's
         // parameters before running real cryptographic verification. Fetches the
         // bundle in memory (no disk writes — verification is read-only).
+        //
+        // ROOT-CAUSE FIX: the contributor's freshly-generated candidate is served
+        // ONLY by the contributor node (from a separate candidate file, never
+        // `current.bin`), so the seeds return their own applied params whose hash
+        // never matches and the voter abstained forever. The fetcher now resolves
+        // the contributor's reachable address from the mesh peer registry (the
+        // same registry the mesh uses for Noise/health) — falling back to the
+        // persisted `nodes` table — and tries the CONTRIBUTOR FIRST, then the
+        // seeds. If the address cannot be resolved we log and fall back to seeds
+        // only (a peer that already adopted the candidate could still serve it),
+        // preserving the fail-closed posture (no hash-match ⇒ abstain).
         let seed_nodes_for_fetch = config.network.seed_nodes.clone();
-        let params_fetcher: ghost_consensus::mpc_handler::MpcParamsFetchFn =
-            Arc::new(move |expected: [u8; 32]| {
+        let peers_for_fetch = Arc::clone(mesh.peers());
+        let db_for_fetch = Arc::clone(&db);
+        let params_fetcher: ghost_consensus::mpc_handler::MpcParamsFetchFn = Arc::new(
+            move |expected: [u8; 32], contributor: ghost_common::types::NodeId| {
                 let seeds = seed_nodes_for_fetch.clone();
-                Box::pin(async move { fetch_ceremony_params_bundle(&seeds, expected).await })
-            });
+                let peers = Arc::clone(&peers_for_fetch);
+                let db = Arc::clone(&db_for_fetch);
+                Box::pin(async move {
+                    // Resolve the contributor's reachable host: live mesh peer
+                    // registry first (freshest), then the persisted nodes table.
+                    let contributor_addr = resolve_contributor_addr(&peers, &db, &contributor);
+                    if contributor_addr.is_none() {
+                        tracing::info!(
+                            contributor = %hex::encode(&contributor[..8]),
+                            "MPC fetch: contributor address unresolved from mesh/db — \
+                             falling back to seeds only"
+                        );
+                    }
+                    let sources = ordered_fetch_sources(contributor_addr.as_deref(), &seeds);
+                    fetch_ceremony_params_bundle(&sources, expected).await
+                })
+            },
+        );
 
         let mpc_handler = Arc::new(
             MpcHandler::new(Arc::clone(&identity), Arc::clone(&db))
@@ -3264,6 +4122,26 @@ async fn main() -> Result<()> {
                 let position = db_for_mpc
                     .get_mpc_elder_position(&node_id_hex)
                     .unwrap_or(None);
+                // Self-heal (idempotent): a recorded elder whose own `current.bin`
+                // + singleton lag its applied position must catch up (the restart
+                // scenario). The synchronous restart self-heal above already ran in
+                // rolling mode; this covers non-rolling starts and any residual lag.
+                // A no-op when the head already equals the applied position.
+                if !adopt_all_applied_positions(
+                    &ceremony_manager_for_startup,
+                    &db_for_mpc,
+                    mesh_for_mpc_startup.peers(),
+                    &seed_nodes_for_mpc,
+                    &node_id_hex,
+                )
+                .await
+                {
+                    warn!(
+                        position = ?position,
+                        "MPC: elder on record but could not self-heal on-disk head to its applied \
+                         position — will re-attempt on next restart"
+                    );
+                }
                 info!(position = ?position, "Already an MPC contributor (elder)");
                 return;
             }
@@ -3314,28 +4192,60 @@ async fn main() -> Result<()> {
                 return;
             }
 
-            // Retry loop: attempt contribution up to 5 times with random 10-100s intervals.
+            // Retry loop: attempt contribution up to MPC_CONTRIBUTION_MAX_ATTEMPTS
+            // times with a randomised 60-90s interval (~15-20 min total window).
             // This handles race conditions where multiple nodes try the same position
-            // simultaneously — the loser retries at the next position.
-            // Between retries: sync contributors, re-fetch latest params from network
-            // (prevents stale prev_params_hash), and randomize delay to avoid races.
-            // Cache the signed message so retries broadcast the same hash (votes accumulate).
+            // simultaneously — the loser rebases onto the new head and retries at the
+            // next position.
+            // Between retries: sync contributors, and ONLY when the ceremony position
+            // has actually advanced, re-fetch the latest applied params (prevents stale
+            // prev_params_hash) and regenerate. When the position is UNCHANGED we keep
+            // the cached candidate and rebroadcast the SAME signed message so voters
+            // accumulate votes for one hash toward quorum (no "moving target").
             let mut cached_msg: Option<(ghost_consensus::message::MpcContributionMessage, u32)> =
                 None;
-            for attempt in 1..=5u32 {
+            for attempt in 1..=MPC_CONTRIBUTION_MAX_ATTEMPTS {
                 // Re-check if we became an elder (e.g., via P2P sync of our own contribution)
                 if db_for_mpc.is_mpc_elder(&node_id_hex).unwrap_or(false) {
                     let position = db_for_mpc
                         .get_mpc_elder_position(&node_id_hex)
                         .unwrap_or(None);
-                    info!(position = ?position, "Now an MPC contributor (elder)");
-                    // Update live capabilities so health pings reflect elder status
-                    mesh_for_mpc_startup.update_elder_status(true);
-                    let mut updated_caps = initial_capabilities;
-                    updated_caps.elder_status = true;
-                    round_manager_for_mpc
-                        .update_node_capabilities(identity_for_mpc.node_id(), updated_caps);
-                    return;
+                    // ADOPT our own BFT-applied contribution BEFORE declaring elder
+                    // success. The handler never self-applied it (a node's own
+                    // broadcast is not in its `pending_contributions`), so our
+                    // `current.bin` + `mpc_ceremony` singleton still lag the applied
+                    // position that gossiped back into `mpc_contributions`. Catch the
+                    // head up (own local candidate first, network fallback) so it
+                    // matches the chain tip — otherwise the next restart fails closed
+                    // (on-disk head < chain tip) and crash-loops.
+                    if adopt_all_applied_positions(
+                        &ceremony_manager_for_startup,
+                        &db_for_mpc,
+                        mesh_for_mpc_startup.peers(),
+                        &seed_nodes_for_mpc,
+                        &node_id_hex,
+                    )
+                    .await
+                    {
+                        info!(position = ?position, "Now an MPC contributor (elder)");
+                        // Update live capabilities so health pings reflect elder status
+                        mesh_for_mpc_startup.update_elder_status(true);
+                        let mut updated_caps = initial_capabilities;
+                        updated_caps.elder_status = true;
+                        round_manager_for_mpc
+                            .update_node_capabilities(identity_for_mpc.node_id(), updated_caps);
+                        return;
+                    }
+                    // Could not adopt yet (e.g. candidate gone AND seeds unreachable).
+                    // Do NOT declare elder success on a lagging head; wait and re-check
+                    // (the next iteration retries the adopt; a restart also self-heals).
+                    warn!(
+                        position = ?position,
+                        "MPC: became an elder but could not adopt applied params yet — retrying \
+                         (not declaring success on a lagging head)"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    continue;
                 }
 
                 // Ensure we have parameters loaded.
@@ -3585,6 +4495,51 @@ async fn main() -> Result<()> {
                             warn!("MPC: Failed to fetch genesis parameters from network. Use --genesis on the first node.");
                             return;
                         }
+
+                        // Part A — persist a CONSISTENT synced head.
+                        //
+                        // The sync above populated `mpc_contributions` (+ proofs/
+                        // votes) and fetched the head params into current.bin, but
+                        // it never wrote the `mpc_ceremony` singleton. Left there,
+                        // the next restart reads NO singleton, re-initialises
+                        // PRE-GENESIS, and DISCARDS the synced position-1..n state
+                        // (the node7 onboarding bug). Leave the node fully
+                        // consistent at the synced head:
+                        //   1. guarantee current.bin IS the recorded chain-tip head
+                        //      (re-fetch by lineage hash + atomic install if the
+                        //      generic fetch left it stale), then
+                        //   2. persist the singleton (count == chain tip ==
+                        //      on-disk head lineage hash).
+                        // Fail-SAFE: if the head can't be made consistent we do NOT
+                        // persist a singleton we cannot back with on-disk params —
+                        // the next attempt / restart re-syncs.
+                        match ensure_recorded_head_installed(
+                            &ceremony_manager_for_startup,
+                            &db_for_mpc,
+                            mesh_for_mpc_startup.peers(),
+                            &seed_nodes_for_mpc,
+                        )
+                        .await
+                        {
+                            Ok(true) => match reconcile_singleton_to_recorded_head(&db_for_mpc) {
+                                Ok(Some(head)) => info!(
+                                    head,
+                                    "MPC: persisted synced ceremony head (current.bin + mpc_ceremony \
+                                     singleton) — the node will load this position cleanly on restart"
+                                ),
+                                Ok(None) => {}
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "MPC: failed to persist synced ceremony singleton"
+                                ),
+                            },
+                            Ok(false) => {}
+                            Err(e) => warn!(
+                                error = %e,
+                                "MPC: could not install the synced head params to current.bin; \
+                                 singleton NOT persisted — a restart will re-sync (fail-safe)"
+                            ),
+                        }
                     }
                 }
 
@@ -3605,14 +4560,88 @@ async fn main() -> Result<()> {
                     return;
                 }
 
+                // ── Attempt-start catch-up (behind-the-head rolling gap) ─────────
+                // A node that joined / un-pinned while the ceremony had ALREADY
+                // advanced receives the applied-contribution ROWS via gossip (its
+                // `mpc_contributions` MAX climbs) but NOTHING drives its on-disk
+                // head + `mpc_ceremony` singleton forward — so its authoritative
+                // count lags the recorded chain tip. Left unhandled it computes
+                // `next_position = count + 1` and keeps contributing an
+                // ALREADY-FILLED position forever (the node6→stuck-at-5 incident)
+                // instead of catching up and contributing the next FREE one.
+                //
+                // "Behind" = authoritative singleton count < recorded MAX position.
+                // Catch the head up by adopting every un-adopted applied position in
+                // order via the shared adopt driver: params are fetched
+                // contributor-aware + hash-checked, FOREIGN lineages are additionally
+                // crypto-verified (`verify_contribution_catchup`), and each
+                // position's retained BFT quorum votes are synced so a later
+                // restart's genesis-anchored check still passes. `next_position`
+                // below is then recomputed from the advanced count.
+                //
+                // Idempotent + free when NOT behind: the inner while-loop is a no-op
+                // (count == max_pos) and no fetch happens — the normal same-position
+                // rolling path is untouched. Fail-safe: if catch-up can't complete
+                // (peer unreachable / a position won't verify) we do NOT contribute a
+                // stale position — wait and let the next attempt / a restart retry.
+                {
+                    let authoritative = db_for_mpc
+                        .mpc_contribution_count_authoritative()
+                        .unwrap_or(0);
+                    let chain_tip = db_for_mpc
+                        .get_mpc_max_contribution_position()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    if authoritative < chain_tip {
+                        info!(
+                            authoritative,
+                            chain_tip,
+                            "MPC: adopted head lags the recorded chain tip — catching up before \
+                             computing the next contribution position"
+                        );
+                        if adopt_all_applied_positions(
+                            &ceremony_manager_for_startup,
+                            &db_for_mpc,
+                            mesh_for_mpc_startup.peers(),
+                            &seed_nodes_for_mpc,
+                            &node_id_hex,
+                        )
+                        .await
+                        {
+                            info!(
+                                head = ceremony_manager_for_startup.contribution_count(),
+                                "MPC: caught up to the recorded chain tip"
+                            );
+                        } else {
+                            warn!(
+                                head = ceremony_manager_for_startup.contribution_count(),
+                                chain_tip,
+                                "MPC: could not fully catch up to the chain tip this attempt — \
+                                 NOT contributing a stale position; will retry"
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    }
+                }
+
                 // Determine position from DB (authoritative source, not stale in-memory state).
                 // Progression count comes from the mpc_ceremony singleton (falls back to
                 // COUNT(mpc_contributions) when absent). Voter-set sizing still uses
                 // get_mpc_elder_count() in the handler — these are deliberately distinct.
+                // After the catch-up above, `db_count == chain_tip`, so targeting one
+                // past the tip (via `mpc_next_contribution_position`) is the next FREE
+                // position — never an already-filled one.
                 let db_count = db_for_mpc
                     .mpc_contribution_count_authoritative()
                     .unwrap_or(0);
-                let next_position = db_count + 1;
+                let chain_tip = db_for_mpc
+                    .get_mpc_max_contribution_position()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let next_position = mpc_next_contribution_position(db_count, chain_tip);
 
                 info!(
                     attempt,
@@ -3673,23 +4702,41 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             } else {
-                                // Non-genesis: save params to disk for serving via API.
-                                // We can't use apply_contribution here because it modifies
-                                // internal state (contribution_count) which breaks retries
-                                // if BFT rejects. Instead, write the binary directly.
+                                // Non-genesis: save the generated CANDIDATE to a
+                                // SEPARATE serving file keyed by its lineage hash —
+                                // NEVER the active note_spend_params_current.bin.
+                                //
+                                // We can't use apply_contribution here because it
+                                // modifies internal state (contribution_count) which
+                                // breaks retries if BFT rejects. And we must NOT
+                                // overwrite current.bin (the last BFT-APPLIED head):
+                                // doing so left node5 serving an un-applied candidate
+                                // as its "current" params and crash-looped it on
+                                // restart (on-disk candidate != chain head). Voters
+                                // fetch this candidate by hash via
+                                // GET /api/v1/mpc/params?new_hash=<hash>; our own
+                                // current.bin only advances when (and if) the apply
+                                // path runs after BFT approval.
                                 let params_dir = ceremony_manager_for_startup.params_dir().clone();
-                                let _ = std::fs::create_dir_all(&params_dir);
-                                let current_path = params_dir.join("note_spend_params_current.bin");
                                 let mut buf = Vec::new();
                                 if new_params.write(&mut buf).is_ok() {
-                                    if let Err(e) = std::fs::write(&current_path, &buf) {
-                                        warn!(error = %e, "MPC: Failed to save params to disk");
-                                    } else {
-                                        info!(
-                                            position = position,
-                                            size = buf.len(),
-                                            "MPC: Saved generated params to disk for serving"
-                                        );
+                                    match write_candidate_note_spend_params(
+                                        &params_dir,
+                                        &contribution.new_params_hash,
+                                        &buf,
+                                    ) {
+                                        Ok(candidate_path) => {
+                                            info!(
+                                                position = position,
+                                                size = buf.len(),
+                                                new_hash = %hex::encode(&contribution.new_params_hash[..8]),
+                                                path = %candidate_path.display(),
+                                                "MPC: Saved generated CANDIDATE params for serving (active current.bin unchanged)"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "MPC: Failed to save candidate params to disk");
+                                        }
                                     }
                                 }
                             }
@@ -3771,12 +4818,17 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Wait random 10-100s before retry to prevent race conditions
-                // where multiple nodes fight for the same position simultaneously.
-                if attempt < 5 {
+                // Wait a randomised 60-90s before retry: long enough for voters to
+                // fetch + Groth16-verify + vote + reach quorum + apply + propagate
+                // back, and randomised to prevent races where multiple nodes fight
+                // for the same position simultaneously.
+                if attempt < MPC_CONTRIBUTION_MAX_ATTEMPTS {
                     let delay_secs = {
                         use rand::Rng;
-                        rand::thread_rng().gen_range(10..=100)
+                        rand::thread_rng().gen_range(
+                            MPC_CONTRIBUTION_RETRY_DELAY_MIN_SECS
+                                ..=MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS,
+                        )
                     };
                     info!(
                         attempt,
@@ -3869,10 +4921,45 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // Re-fetch latest MPC params from network before next attempt.
-                    // Without this, the ceremony manager holds stale params and any
-                    // new contribution will fail hash-chain validation because
-                    // prev_params_hash won't match the latest applied contribution.
+                    // Decide whether to re-fetch + regenerate, or keep our stable
+                    // candidate. Read the authoritative count AFTER the contributor
+                    // sync above: if a new contribution was applied while we waited,
+                    // our candidate is chained onto a stale head and must be rebased
+                    // (re-fetch the new applied head + regenerate). If the position is
+                    // UNCHANGED, re-fetching would invalidate the cache and force the
+                    // next attempt to regenerate a DIFFERENT candidate with fresh
+                    // randomness (the "moving target" that stopped voters converging) —
+                    // so we skip it and rebroadcast the SAME cached candidate next
+                    // attempt, letting votes accumulate for one hash toward quorum.
+                    let current_count = db_for_mpc
+                        .mpc_contribution_count_authoritative()
+                        .unwrap_or(db_count);
+                    let position_advanced = match &cached_msg {
+                        Some((_, cached_count)) => {
+                            !cached_contribution_still_valid(*cached_count, current_count)
+                        }
+                        // No cached candidate (generation failed this attempt): re-fetch
+                        // so the next attempt regenerates on the freshest head.
+                        None => true,
+                    };
+                    if !position_advanced {
+                        info!(
+                            attempt,
+                            db_count = current_count,
+                            "MPC: ceremony position unchanged — keeping cached candidate, \
+                             will rebroadcast the same hash next attempt"
+                        );
+                        continue;
+                    }
+
+                    // Position ADVANCED (or no cache): re-fetch the latest applied MPC
+                    // params before the next attempt so we rebase onto the new head.
+                    // Without this, the ceremony manager holds stale params and the
+                    // regenerated contribution would fail hash-chain validation because
+                    // prev_params_hash won't match the latest applied contribution. Note
+                    // this writes the genuinely-newer APPLIED head to current.bin, which
+                    // is correct — the candidate-serving rule only forbids writing our
+                    // own UN-applied candidate to current.bin.
                     let params_dir = ceremony_manager_for_startup.params_dir().clone();
                     for seed in &seed_nodes_for_mpc {
                         let host = seed.split(':').next().unwrap_or(seed);
@@ -4034,7 +5121,10 @@ async fn main() -> Result<()> {
                 round_manager_for_mpc
                     .update_node_capabilities(identity_for_mpc.node_id(), updated_caps);
             } else {
-                warn!("MPC: Failed to contribute after 5 attempts. Node will not be an elder.");
+                warn!(
+                    attempts = MPC_CONTRIBUTION_MAX_ATTEMPTS,
+                    "MPC: Failed to contribute after all attempts. Node will not be an elder."
+                );
             }
         });
         info!("MPC auto-contribution task scheduled (15s delay)");
@@ -5665,206 +6755,18 @@ async fn main() -> Result<()> {
     });
     info!("P2P mesh network started");
 
-    // C-1: Start Noise Protocol listener for encrypted P2P connections
-    // This listens for incoming encrypted TCP connections from peers
-    if let Some(noise_pool) = mesh.noise_pool() {
-        let noise_pool_clone = Arc::clone(noise_pool);
+    // C-1: Start the Noise Protocol RECEIVE listener for encrypted P2P.
+    // The accept/handshake/dispatch loop now lives in MeshNetwork
+    // (`run_noise_listener`) so the receive side of the Noise plane is owned and
+    // tested alongside the send side, instead of being hand-rolled here.
+    if mesh.noise_pool().is_some() {
         let mesh_for_noise = Arc::clone(&mesh);
-        let noise_port = ghost_consensus::mesh::DEFAULT_NOISE_PORT;
-
-        // M-17 SECURITY: Limit concurrent Noise connections to prevent resource exhaustion.
-        // 100 concurrent connections is sufficient for a healthy P2P mesh while preventing
-        // DoS attacks that exhaust file descriptors or memory.
-        let noise_connection_limit = Arc::new(Semaphore::new(100));
-        let mut noise_shutdown = shutdown_tx.subscribe();
-        // MESH REGISTRATION FIX: an inbound Noise connection (a node dialling us)
-        // must trigger a reverse SUB-dial back to that node. Health pings are
-        // ZMQ PUB/SUB broadcasts, so the ONLY way we register a peer is by
-        // subscribing to its PUB sockets — which the SUB loop only does for peers
-        // already in the PeerManager. A dynamically-joining node dials us over
-        // Noise (so its verifications arrive, but are rejected as "unknown
-        // challenger"); without dialling back we never receive its health pings
-        // and never learn it. Only the static seed list got this today, so
-        // non-seed nodes could never join. Captured into the listener task below.
+        let noise_shutdown = shutdown_tx.subscribe();
         let noise_is_mainnet = is_mainnet_round;
-        let noise_disc_port = config.network.p2p.discovery;
-        let reverse_subscribed: Arc<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-
         tokio::spawn(async move {
-            use tokio::net::TcpListener;
-
-            let bind_addr = format!("0.0.0.0:{}", noise_port);
-            let listener = match TcpListener::bind(&bind_addr).await {
-                Ok(l) => {
-                    info!(
-                        port = noise_port,
-                        max_connections = 100,
-                        "Noise Protocol listener started (encrypted P2P)"
-                    );
-                    l
-                }
-                Err(e) => {
-                    error!(error = %e, port = noise_port, "Failed to start Noise listener");
-                    return;
-                }
-            };
-
-            loop {
-                // M-17: Acquire permit before accepting connection
-                let permit = match noise_connection_limit.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // Semaphore closed - should not happen
-                        error!("Noise connection semaphore closed unexpectedly");
-                        return;
-                    }
-                };
-
-                let accept_result = tokio::select! {
-                    result = listener.accept() => result,
-                    _ = noise_shutdown.recv() => {
-                        tracing::info!("Noise listener shutting down");
-                        return;
-                    }
-                };
-
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        let pool = Arc::clone(&noise_pool_clone);
-                        let mesh = Arc::clone(&mesh_for_noise);
-                        let conn_is_mainnet = noise_is_mainnet;
-                        let conn_disc_port = noise_disc_port;
-                        let conn_rev_sub = Arc::clone(&reverse_subscribed);
-
-                        tokio::spawn(async move {
-                            // M-17: Hold permit for connection lifetime - released when dropped
-                            let _permit = permit;
-
-                            // H2: Timeout Noise handshake to prevent resource exhaustion
-                            // from peers that connect but never complete the handshake
-                            let accept_result = tokio::time::timeout(
-                                std::time::Duration::from_secs(30),
-                                pool.accept_connection(stream),
-                            )
-                            .await;
-
-                            let accept_result = match accept_result {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    tracing::warn!(
-                                        peer = %addr,
-                                        "Noise handshake timed out after 30s"
-                                    );
-                                    return;
-                                }
-                            };
-
-                            match accept_result {
-                                Ok(conn) => {
-                                    tracing::debug!(
-                                        peer = %addr,
-                                        peer_key = %hex::encode(&conn.peer_key[..8]),
-                                        "Accepted Noise connection"
-                                    );
-
-                                    // MESH REGISTRATION FIX: reverse-subscribe to this
-                                    // inbound peer so we receive its PUB/SUB health pings
-                                    // (the only path that registers it in the PeerManager).
-                                    // connect_peer mints a placeholder peer; the SUB loop
-                                    // dials its 8555-8562 PUBs; the real node_id then arrives
-                                    // via the first PoW-gated, signed health ping and retires
-                                    // the placeholder. No new trust is granted — counting a
-                                    // peer still requires that valid health ping. Skip
-                                    // private/reserved source IPs on mainnet (SSRF guard) and
-                                    // dial back only once per host (the addr.ip() is the real
-                                    // TCP source of a completed handshake).
-                                    {
-                                        let ip = addr.ip();
-                                        let routable = if conn_is_mainnet {
-                                            match ip {
-                                                std::net::IpAddr::V4(v4) => {
-                                                    !(v4.is_loopback()
-                                                        || v4.is_private()
-                                                        || v4.is_link_local()
-                                                        || v4.is_unspecified())
-                                                }
-                                                std::net::IpAddr::V6(v6) => {
-                                                    !(v6.is_loopback() || v6.is_unspecified())
-                                                }
-                                            }
-                                        } else {
-                                            true
-                                        };
-                                        let first_time = routable
-                                            && conn_rev_sub
-                                                .lock()
-                                                .map(|mut s| s.insert(ip))
-                                                .unwrap_or(false);
-                                        if first_time {
-                                            let mesh_cb = Arc::clone(&mesh);
-                                            let addr_str = format!("{}:{}", ip, conn_disc_port);
-                                            tokio::spawn(async move {
-                                                match mesh_cb.connect_peer(&addr_str).await {
-                                                    Ok(()) => tracing::info!(
-                                                        peer = %addr_str,
-                                                        "Reverse-subscribed to inbound peer (mesh registration)"
-                                                    ),
-                                                    Err(e) => tracing::debug!(
-                                                        peer = %addr_str,
-                                                        error = %e,
-                                                        "Reverse-subscribe connect_peer failed"
-                                                    ),
-                                                }
-                                            });
-                                        }
-                                    }
-
-                                    // Handle incoming messages from this connection
-                                    // Messages are received, validated, and dispatched to handlers
-                                    loop {
-                                        match conn.recv().await {
-                                            Ok(payload) => {
-                                                // Process received encrypted message through the mesh handler
-                                                if let Err(e) = mesh.handle_received(&payload).await
-                                                {
-                                                    tracing::debug!(
-                                                        peer = %addr,
-                                                        error = %e,
-                                                        "Error handling Noise message"
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::debug!(
-                                                    peer = %addr,
-                                                    error = %e,
-                                                    "Noise connection error"
-                                                );
-                                                // Remove broken connection
-                                                pool.remove_connection(&conn.peer_key);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        peer = %addr,
-                                        error = %e,
-                                        "Noise handshake failed"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Noise accept error");
-                        // Drop permit on error so we don't leak it
-                        drop(permit);
-                    }
-                }
-            }
+            mesh_for_noise
+                .run_noise_listener(noise_is_mainnet, noise_shutdown)
+                .await;
         });
     } else {
         warn!("Noise Protocol DISABLED - P2P traffic is unencrypted");
@@ -6735,6 +7637,736 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    // ── ordered_fetch_sources (MPC candidate fetch ordering) ─────────
+    //
+    // These lock in the contributor-first-then-seeds ordering that lets a voter
+    // reach the candidate parameters served ONLY by the contributor node.
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_ordered_fetch_sources_contributor_first() {
+        let seeds = vec!["seed1.example:8559".to_string(), "9.9.9.9:8559".to_string()];
+        let got = ordered_fetch_sources(Some("1.2.3.4:8559"), &seeds);
+        // Contributor host leads, then the seeds — all reduced to host-only.
+        assert_eq!(got, vec!["1.2.3.4", "seed1.example", "9.9.9.9"]);
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_ordered_fetch_sources_dedups_contributor_that_is_also_a_seed() {
+        let seeds = vec!["1.2.3.4:8559".to_string(), "9.9.9.9:8559".to_string()];
+        // The contributor is also a configured seed → it must appear ONCE, first.
+        let got = ordered_fetch_sources(Some("1.2.3.4:8559"), &seeds);
+        assert_eq!(got, vec!["1.2.3.4", "9.9.9.9"]);
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_ordered_fetch_sources_unresolved_contributor_falls_back_to_seeds() {
+        let seeds = vec!["seed1.example:8559".to_string(), "9.9.9.9:8559".to_string()];
+        // Address unresolved → seeds-only (prior behaviour), never empty/hard-fail.
+        let got = ordered_fetch_sources(None, &seeds);
+        assert_eq!(got, vec!["seed1.example", "9.9.9.9"]);
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_fetch_host_of_variants() {
+        assert_eq!(fetch_host_of("1.2.3.4:8559"), "1.2.3.4");
+        assert_eq!(fetch_host_of("1.2.3.4"), "1.2.3.4");
+        assert_eq!(fetch_host_of("host.example:8080"), "host.example");
+        assert_eq!(fetch_host_of("tcp://1.2.3.4:8559"), "1.2.3.4");
+        assert_eq!(fetch_host_of("[2001:db8::1]:8559"), "2001:db8::1");
+    }
+
+    // ── contributor self-adopt (7th contribution-flow gap) ───────────
+    //
+    // A node that GENERATES a contribution never applies it through its own
+    // MpcHandler, so after the voters BFT-apply it and the row gossips back,
+    // the contributor is an elder on record while its own `current.bin` +
+    // singleton stay at the PREVIOUS position. These lock in the fix: the adopt
+    // path advances the on-disk head + singleton to the applied position.
+
+    /// Build a fresh in-memory DB + a genesis+position-1 ceremony manager in
+    /// `dir`, returning the manager, the DB, the node id hex, and the position-1
+    /// lineage hash. After this the manager is an applied-position-1 head.
+    #[cfg(feature = "mpc-ceremony")]
+    fn ceremony_at_position_1(
+        dir: &Path,
+    ) -> (
+        std::sync::Arc<ghost_mpc::CeremonyManager>,
+        std::sync::Arc<ghost_storage::Database>,
+        String,
+        [u8; 32],
+    ) {
+        use ghost_common::identity::NodeIdentity;
+
+        let manager = std::sync::Arc::new(ghost_mpc::CeremonyManager::new(dir.to_path_buf()));
+        manager.ensure_genesis_initialized().expect("genesis init");
+
+        let id = NodeIdentity::generate();
+        let id_hex = hex::encode(id.node_id());
+
+        // Position 1 contributed + applied by this node → manager count 0 -> 1.
+        let (p1, c1) = manager
+            .generate_contribution(&id_hex)
+            .expect("generate position 1");
+        manager
+            .apply_contribution(p1, &c1)
+            .expect("apply position 1");
+
+        let db = std::sync::Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+        db.save_mpc_contribution(&ghost_storage::queries::MpcContributionRecord {
+            elder_position: 1,
+            contributor_node_id: id_hex.clone(),
+            prev_params_hash: c1.prev_params_hash,
+            new_params_hash: c1.new_params_hash,
+            contribution_proof: serde_json::to_vec(&c1.proof).unwrap(),
+            epoch: 0,
+            created_at: c1.timestamp,
+        })
+        .expect("save position 1 row");
+        // Singleton reflects the applied head (count 1).
+        persist_singleton_from_manager(&manager, &db);
+
+        (manager, db, id_hex, c1.new_params_hash)
+    }
+
+    /// The core self-adopt: a contributor whose own position-2 contribution was
+    /// BFT-applied by the voters (row gossiped back) but whose manager +
+    /// singleton still sit at position 1 must advance its `current.bin` +
+    /// singleton to position 2 when it adopts its OWN local candidate.
+    ///
+    /// Pre-fix behaviour was to detect elder status and RETURN without adopting
+    /// (the asserted PRE state below); the fix drives the candidate through
+    /// `apply_contribution_multi` + persists the singleton (the asserted POST
+    /// state). The POST assertions FAIL under the pre-fix "return without adopt".
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn contributor_adopts_own_applied_position_from_local_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, id_hex, p1_hash) = ceremony_at_position_1(dir.path());
+
+        // Generate our position-2 candidate WITHOUT applying it (mirrors the
+        // contributor: it writes a candidate serving file, never current.bin).
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&id_hex, 2)
+            .expect("generate position 2");
+        let mut buf = Vec::new();
+        p2.write(&mut buf).expect("serialize position 2 params");
+        write_candidate_note_spend_params(dir.path(), &c2.new_params_hash, &buf)
+            .expect("write candidate");
+
+        // The voters applied position 2 and it gossiped back: our DB has the
+        // position-2 row (contributed by US), but our manager/singleton lag at 1.
+        db.save_mpc_contribution(&ghost_storage::queries::MpcContributionRecord {
+            elder_position: 2,
+            contributor_node_id: id_hex.clone(),
+            prev_params_hash: c2.prev_params_hash,
+            new_params_hash: c2.new_params_hash,
+            contribution_proof: serde_json::to_vec(&c2.proof).unwrap(),
+            epoch: 0,
+            created_at: c2.timestamp,
+        })
+        .expect("save position 2 row");
+
+        // ---- PRE (the bug state the pre-fix "return without adopt" leaves) ----
+        assert_eq!(
+            manager.contribution_count(),
+            1,
+            "pre-adopt: manager head lags at position 1"
+        );
+        assert_eq!(
+            manager.current_params_hash(),
+            p1_hash,
+            "pre-adopt: current.bin is still the position-1 params"
+        );
+        assert_eq!(
+            db.get_mpc_ceremony_state()
+                .unwrap()
+                .unwrap()
+                .contribution_count,
+            1,
+            "pre-adopt: singleton lags at position 1"
+        );
+
+        // ---- ADOPT (the fix): load our own candidate + apply + persist --------
+        let params = load_local_candidate_note_spend(dir.path(), &c2.new_params_hash)
+            .expect("local candidate must load + hash-match the applied head");
+        let row = db.get_mpc_contribution(2).unwrap().unwrap();
+        let contribution = contribution_from_row(&row);
+        assert!(
+            apply_and_persist_adopted_note_spend(&manager, &db, params, &contribution),
+            "adopt must satisfy the post-apply invariant"
+        );
+
+        // ---- POST (fails under pre-fix; passes after) -------------------------
+        assert_eq!(
+            manager.contribution_count(),
+            2,
+            "post-adopt: manager head advanced to position 2"
+        );
+        assert_eq!(
+            manager.current_params_hash(),
+            c2.new_params_hash,
+            "post-adopt: current.bin is the position-2 applied head"
+        );
+        // On-disk current params re-hash to the applied head (lineage).
+        let on_disk = ghost_mpc::contribution::hash_parameters(
+            &manager.note_spend_params().expect("current params loaded"),
+        )
+        .expect("hash current params");
+        assert_eq!(
+            on_disk, c2.new_params_hash,
+            "post-adopt: note_spend_params_current.bin is the applied head"
+        );
+        let singleton = db.get_mpc_ceremony_state().unwrap().unwrap();
+        assert_eq!(
+            singleton.contribution_count, 2,
+            "post-adopt: singleton advanced to position 2"
+        );
+        assert_eq!(
+            singleton.current_params_hash, c2.new_params_hash,
+            "post-adopt: singleton head == applied head"
+        );
+    }
+
+    /// Restart self-heal: a contributor restarts with its recorded chain AHEAD of
+    /// its on-disk head (mpc_contributions has position 2, but current.bin +
+    /// singleton are at position 1 — node5's exact restart state). Pre-fix, the
+    /// genesis-anchored startup verification sees `contributions[MAX].new !=
+    /// on-disk head` and fail-closes → crash-loop. This proves the self-heal
+    /// advances the head so that mismatch is gone.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn restart_self_heal_advances_lagging_contributor_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, id_hex, _p1_hash) = ceremony_at_position_1(dir.path());
+
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&id_hex, 2)
+            .expect("generate position 2");
+        let mut buf = Vec::new();
+        p2.write(&mut buf).expect("serialize position 2 params");
+        write_candidate_note_spend_params(dir.path(), &c2.new_params_hash, &buf)
+            .expect("write candidate");
+        db.save_mpc_contribution(&ghost_storage::queries::MpcContributionRecord {
+            elder_position: 2,
+            contributor_node_id: id_hex.clone(),
+            prev_params_hash: c2.prev_params_hash,
+            new_params_hash: c2.new_params_hash,
+            contribution_proof: serde_json::to_vec(&c2.proof).unwrap(),
+            epoch: 0,
+            created_at: c2.timestamp,
+        })
+        .expect("save position 2 row");
+
+        // The exact fail-closed condition: recorded chain tip != on-disk head.
+        let chain_tip = db.get_mpc_max_contribution_position().unwrap().unwrap();
+        let head_pre =
+            ghost_mpc::contribution::hash_parameters(&manager.note_spend_params().unwrap())
+                .unwrap();
+        let tip_hash = db
+            .get_mpc_contribution(chain_tip)
+            .unwrap()
+            .unwrap()
+            .new_params_hash;
+        assert_eq!(chain_tip, 2);
+        assert_ne!(
+            head_pre, tip_hash,
+            "pre-heal: on-disk head lags the chain tip (the crash-loop condition)"
+        );
+
+        // Self-heal by adopting each un-adopted position in order (what the
+        // startup restart self-heal / retry-loop drivers do, sans network).
+        while manager.contribution_count() < chain_tip {
+            let next = manager.contribution_count() + 1;
+            let params = load_local_candidate_note_spend(dir.path(), &tip_hash)
+                .expect("local candidate available for the lagging position");
+            let row = db.get_mpc_contribution(next).unwrap().unwrap();
+            let contribution = contribution_from_row(&row);
+            assert!(apply_and_persist_adopted_note_spend(
+                &manager,
+                &db,
+                params,
+                &contribution
+            ));
+        }
+
+        // Post-heal: on-disk head now equals the chain tip — verification passes.
+        let head_post =
+            ghost_mpc::contribution::hash_parameters(&manager.note_spend_params().unwrap())
+                .unwrap();
+        assert_eq!(
+            head_post, tip_hash,
+            "post-heal: on-disk head == chain tip (fail-closed mismatch resolved)"
+        );
+        assert_eq!(manager.contribution_count(), 2);
+        assert_eq!(
+            db.get_mpc_ceremony_state()
+                .unwrap()
+                .unwrap()
+                .contribution_count,
+            2
+        );
+    }
+
+    // ── fresh-join singleton self-heal (node7 onboarding gap) ────────
+    //
+    // node7 joined genesis-anchored, synced the full lineage (contribution rows
+    // + proofs + votes) and fetched the head params into current.bin, but the
+    // sync NEVER wrote the `mpc_ceremony` singleton. On restart
+    // `get_mpc_ceremony_state()` returned None, `load_or_init(None)`
+    // re-initialised PRE-GENESIS, and the node DISCARDED its synced position-1..n
+    // state. These lock in the fix: with contribution rows present but no
+    // singleton, the startup reconcile creates the singleton at the chain tip
+    // (current_params_hash == contributions[MAX].new_params_hash) so the node is
+    // NOT pre-genesis; with ZERO contributions it stays pre-genesis.
+
+    /// Build a node7-shaped state in `dir`: an in-memory DB with contribution
+    /// rows 1..=n (+ proofs) and an on-disk head (`current.bin`) at position n,
+    /// but DELIBERATELY no `mpc_ceremony` singleton (the fresh-join sync gap).
+    #[cfg(feature = "mpc-ceremony")]
+    fn synced_ceremony_no_singleton(
+        dir: &Path,
+        n: u32,
+    ) -> (
+        std::sync::Arc<ghost_mpc::CeremonyManager>,
+        std::sync::Arc<ghost_storage::Database>,
+        String,
+    ) {
+        use ghost_common::identity::NodeIdentity;
+
+        let manager = std::sync::Arc::new(ghost_mpc::CeremonyManager::new(dir.to_path_buf()));
+        manager.ensure_genesis_initialized().expect("genesis init");
+        let id_hex = hex::encode(NodeIdentity::generate().node_id());
+        let db = std::sync::Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+
+        // Position 1 (genesis contribution), then 2..=n, applied in order so
+        // current.bin ends at the position-n head; every position saved as a row.
+        let (p1, c1) = manager
+            .generate_contribution(&id_hex)
+            .expect("generate position 1");
+        manager
+            .apply_contribution(p1, &c1)
+            .expect("apply position 1");
+        db.save_mpc_contribution(&foreign_row(1, &id_hex, &c1))
+            .unwrap();
+        for pos in 2..=n {
+            let (p, c) = manager
+                .generate_contribution_at_position(&id_hex, pos)
+                .expect("generate position");
+            manager.apply_contribution(p, &c).expect("apply position");
+            db.save_mpc_contribution(&foreign_row(pos, &id_hex, &c))
+                .unwrap();
+        }
+        // NODE7 GAP: deliberately do NOT persist the mpc_ceremony singleton.
+        assert!(
+            db.get_mpc_ceremony_state().unwrap().is_none(),
+            "helper must reproduce the node7 state: rows present, NO singleton"
+        );
+        (manager, db, id_hex)
+    }
+
+    /// Storage/reconcile: N contribution rows (+ proofs) but NO singleton → the
+    /// startup reconcile CREATES the singleton at count=N with
+    /// `current_params_hash == contributions[N].new_params_hash` (NOT pre-genesis).
+    /// Pre-fix this scenario stayed singleton-less → pre-genesis on restart.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn startup_reconcile_creates_singleton_from_synced_contributions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, _id) = synced_ceremony_no_singleton(dir.path(), 3);
+
+        assert_eq!(db.get_mpc_max_contribution_position().unwrap(), Some(3));
+        let head_hash = db.get_mpc_contribution(3).unwrap().unwrap().new_params_hash;
+
+        // ── the fix ─────────────────────────────────────────────────────────
+        let n = reconcile_singleton_to_recorded_head(&db).unwrap();
+        assert_eq!(n, Some(3));
+
+        let singleton = db
+            .get_mpc_ceremony_state()
+            .unwrap()
+            .expect("singleton created — node is NO LONGER pre-genesis");
+        assert_eq!(
+            singleton.contribution_count, 3,
+            "singleton count == chain tip"
+        );
+        assert_eq!(
+            singleton.current_params_hash, head_hash,
+            "singleton head == recorded contributions[MAX].new_params_hash (lineage hash)"
+        );
+        // Invariant: singleton head == on-disk current.bin head lineage hash.
+        let on_disk =
+            ghost_mpc::contribution::hash_parameters(&manager.note_spend_params().unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk, head_hash,
+            "singleton head == on-disk current.bin head"
+        );
+    }
+
+    /// The genuine pre-genesis path is preserved: ZERO contribution rows AND no
+    /// singleton → the reconcile is a no-op and the node stays pre-genesis (this
+    /// is how a brand-new genesis node starts). No singleton is fabricated.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn startup_reconcile_zero_contributions_stays_pregenesis() {
+        let db = std::sync::Arc::new(ghost_storage::Database::in_memory().unwrap());
+        assert!(db.get_mpc_ceremony_state().unwrap().is_none());
+        assert_eq!(db.get_mpc_max_contribution_position().unwrap(), None);
+
+        assert_eq!(
+            reconcile_singleton_to_recorded_head(&db).unwrap(),
+            None,
+            "no contributions → pre-genesis, nothing to reconcile"
+        );
+        assert!(
+            db.get_mpc_ceremony_state().unwrap().is_none(),
+            "must NOT fabricate a singleton for a brand-new genesis node"
+        );
+    }
+
+    /// Sync-path (Part A): after the finalize runs, the singleton is present at
+    /// the synced count AND current.bin on disk hashes to the head lineage hash.
+    /// (current.bin was already installed by the params fetch, so no network is
+    /// needed — `ensure_recorded_head_installed` returns Ok(true) immediately.)
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn sync_path_persists_head_and_singleton() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, _id) = synced_ceremony_no_singleton(dir.path(), 2);
+        let head_hash = db.get_mpc_contribution(2).unwrap().unwrap().new_params_hash;
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(
+            ensure_recorded_head_installed(&manager, &db, &peers, &[])
+                .await
+                .unwrap(),
+            "current.bin already at the recorded head — no re-fetch needed"
+        );
+        assert_eq!(reconcile_singleton_to_recorded_head(&db).unwrap(), Some(2));
+
+        let singleton = db.get_mpc_ceremony_state().unwrap().unwrap();
+        assert_eq!(singleton.contribution_count, 2);
+        assert_eq!(singleton.current_params_hash, head_hash);
+
+        // current.bin on disk hashes to the head lineage hash.
+        let current = dir.path().join("note_spend_params_current.bin");
+        let on_disk = ghost_mpc::contribution::hash_parameters(
+            &ghost_mpc::params::load_parameters(&current).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk, head_hash,
+            "on-disk current.bin == head lineage hash"
+        );
+    }
+
+    /// Regression: the caller reconciles BEFORE `load_or_init`, so the ceremony
+    /// state handed to `load_or_init` is `Some(state)` — never `None` — when
+    /// contributions are present. `load_or_init(dir, None)` with contributions is
+    /// the exact node7 crash-path and must be unreachable after the guard.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn load_or_init_receives_some_after_startup_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_manager, db, _id) = synced_ceremony_no_singleton(dir.path(), 2);
+
+        // Pre-reconcile: state is None — load_or_init(None) would go PRE-GENESIS.
+        assert!(db.get_mpc_ceremony_state().unwrap().is_none());
+
+        // Part B guard runs the reconcile before load_or_init.
+        reconcile_singleton_to_recorded_head(&db).unwrap();
+
+        // The value load_or_init now receives is Some(state), count == chain tip.
+        let state = db.get_mpc_ceremony_state().unwrap();
+        assert!(
+            state.is_some(),
+            "caller must pass Some(state) to load_or_init after reconcile, never None"
+        );
+        assert_eq!(state.unwrap().contribution_count, 2);
+    }
+
+    // ── attempt-start catch-up (behind-the-head rolling gap) ─────────
+    //
+    // A node that joined / un-pinned while the ceremony had already advanced
+    // receives applied-contribution ROWS via gossip (its `mpc_contributions` MAX
+    // climbs) but nothing drives its adopted head + singleton forward. Pre-fix it
+    // computed `next_position = singleton_count + 1` and contributed an
+    // ALREADY-FILLED position forever (node6→stuck-at-5). These lock in the fix:
+    // detect "behind", catch the head up by adopting every un-adopted position,
+    // then target one past the recorded chain tip (the next FREE position).
+
+    /// Directly write a note-spend candidate serving file WITHOUT the
+    /// supersede-cleanup that `write_candidate_note_spend_params` performs, so a
+    /// multi-step test can stage several positions' candidates simultaneously.
+    #[cfg(feature = "mpc-ceremony")]
+    fn stage_candidate(dir: &Path, new_hash: &[u8; 32], params: &ghost_mpc::Groth16Params) {
+        let mut buf = Vec::new();
+        params.write(&mut buf).expect("serialize candidate params");
+        let name = ghost_common::mpc::candidate_note_spend_filename(new_hash);
+        std::fs::write(dir.join(name), &buf).expect("write candidate file");
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    fn foreign_row(
+        position: u32,
+        contributor: &str,
+        c: &ghost_mpc::MpcContribution,
+    ) -> ghost_storage::queries::MpcContributionRecord {
+        ghost_storage::queries::MpcContributionRecord {
+            elder_position: position,
+            contributor_node_id: contributor.to_string(),
+            prev_params_hash: c.prev_params_hash,
+            new_params_hash: c.new_params_hash,
+            contribution_proof: serde_json::to_vec(&c.proof).unwrap(),
+            epoch: 0,
+            created_at: c.timestamp,
+        }
+    }
+
+    /// The pure targeting decision, at the EXACT node6 numbers. Pre-fix targeted
+    /// `count + 1` off a lagging singleton (an already-filled position); the fix
+    /// targets one past the recorded chain tip (the next free position).
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn mpc_next_contribution_position_targets_next_free_after_catchup() {
+        // node6: adopted head (singleton) lagged at 4 while the chain tip advanced
+        // to 5. The PRE-FIX formula `count + 1` == 5 — ALREADY node5's position.
+        assert_eq!(
+            4 + 1,
+            5,
+            "pre-fix formula targets the FILLED position (bug)"
+        );
+        // The FIX targets one past the tip → 6 (next FREE), both before the
+        // catch-up (count 4) and after it advances the head to the tip (count 5).
+        assert_eq!(mpc_next_contribution_position(4, 5), 6);
+        assert_eq!(mpc_next_contribution_position(5, 5), 6);
+        // Behind by two (count 4, tip 6): target 7 (after adopting 5 then 6).
+        assert_eq!(mpc_next_contribution_position(4, 6), 7);
+        assert_eq!(mpc_next_contribution_position(6, 6), 7);
+        // Not behind (fresh genesis / already caught up): normal count+1, and never
+        // a phantom advance past the head.
+        assert_eq!(mpc_next_contribution_position(0, 0), 1);
+        assert_eq!(mpc_next_contribution_position(3, 3), 4);
+    }
+
+    /// node6 reproduction: singleton at 1 while the chain tip advanced to a FOREIGN
+    /// position 2 (received only as a row). The attempt-start catch-up must ADOPT
+    /// position 2 (params + singleton advance to 2), after which the node targets
+    /// position 3 — NOT the already-filled 2. Pre-fix (no catch-up) it stayed
+    /// stuck targeting 2.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn attempt_start_catchup_adopts_foreign_position_and_targets_next_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, _p1) = ceremony_at_position_1(dir.path());
+
+        // A DIFFERENT node contributed position 2 (a VALID foreign lineage
+        // transform of our position-1 head). We are the "behind" node: we received
+        // the ROW + the contributor's candidate params but never adopted the head.
+        let foreign_id = hex::encode(NodeIdentity::generate().node_id());
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&foreign_id, 2)
+            .expect("generate foreign position 2");
+        stage_candidate(dir.path(), &c2.new_params_hash, &p2);
+        db.save_mpc_contribution(&foreign_row(2, &foreign_id, &c2))
+            .unwrap();
+
+        // ── PRE (the node6 stuck state) ──────────────────────────────────────
+        let pre_count = db.mpc_contribution_count_authoritative().unwrap();
+        let tip = db.get_mpc_max_contribution_position().unwrap().unwrap();
+        assert_eq!(pre_count, 1, "adopted head still lags at position 1");
+        assert_eq!(tip, 2, "the chain tip advanced to position 2 via the row");
+        // Pre-fix targeted `count + 1` == 2 — the position ALREADY filled by the
+        // foreign contributor. That is the forever-stuck condition.
+        assert_eq!(pre_count + 1, tip, "pre-fix targets the FILLED position");
+
+        // ── CATCH UP (the fix) ───────────────────────────────────────────────
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(
+            adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await,
+            "attempt-start catch-up must adopt the foreign applied position"
+        );
+
+        // ── POST (fails under pre-fix) ───────────────────────────────────────
+        assert_eq!(manager.contribution_count(), 2, "head advanced to the tip");
+        assert_eq!(
+            manager.current_params_hash(),
+            c2.new_params_hash,
+            "current.bin is the position-2 applied head"
+        );
+        let post_count = db.mpc_contribution_count_authoritative().unwrap();
+        assert_eq!(post_count, 2, "singleton advanced to the tip");
+        // Now the node targets position 3 — the next FREE position, not the filled 2.
+        assert_eq!(
+            mpc_next_contribution_position(post_count, tip),
+            3,
+            "after catch-up the node targets the next FREE position (3), not 2"
+        );
+    }
+
+    /// Multi-step catch-up: behind by two. The singleton sits at 1 while the chain
+    /// tip advanced to position 3 (rows for 2 and 3 received). The catch-up must
+    /// adopt 2 THEN 3 in order, after which the node targets 4.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn attempt_start_catchup_multi_step_adopts_all_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, _p1) = ceremony_at_position_1(dir.path());
+
+        // Our own positions 2 and 3 were BFT-applied and gossiped back as rows; we
+        // hold both candidate serving files but adopted neither (singleton at 1).
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&our_id, 2)
+            .expect("generate position 2");
+        let (p3, c3) = manager
+            .generate_contribution_at_position(&our_id, 3)
+            .expect("generate position 3");
+        stage_candidate(dir.path(), &c2.new_params_hash, &p2);
+        stage_candidate(dir.path(), &c3.new_params_hash, &p3);
+        db.save_mpc_contribution(&foreign_row(2, &our_id, &c2))
+            .unwrap();
+        db.save_mpc_contribution(&foreign_row(3, &our_id, &c3))
+            .unwrap();
+
+        let pre_count = db.mpc_contribution_count_authoritative().unwrap();
+        let tip = db.get_mpc_max_contribution_position().unwrap().unwrap();
+        assert_eq!(pre_count, 1);
+        assert_eq!(tip, 3, "behind by two positions");
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(
+            adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await,
+            "catch-up must adopt BOTH lagging positions in order"
+        );
+
+        assert_eq!(manager.contribution_count(), 3, "head advanced 1 -> 2 -> 3");
+        assert_eq!(manager.current_params_hash(), c3.new_params_hash);
+        let post_count = db.mpc_contribution_count_authoritative().unwrap();
+        assert_eq!(post_count, 3);
+        assert_eq!(
+            mpc_next_contribution_position(post_count, tip),
+            4,
+            "after a two-step catch-up the node targets position 4"
+        );
+    }
+
+    /// Fail-closed on FOREIGN lineage: a caught-up position this node did NOT
+    /// author is adopted ONLY after cryptographic `verify_contribution_catchup`
+    /// (Schnorr + pairing transform), never on hash-match alone. A forged
+    /// candidate whose file hashes to the recorded head but whose params are not a
+    /// valid transform must be REJECTED and must NOT advance the head.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn catchup_rejects_forged_foreign_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, p1_hash) = ceremony_at_position_1(dir.path());
+
+        // Borrow a foreign node's REAL position-2 proof (valid Schnorr bound to
+        // this ceremony_id), so the forgery clears the proof checks and is caught
+        // specifically by the pairing TRANSFORM check.
+        let foreign_id = hex::encode(NodeIdentity::generate().node_id());
+        let (_p2, c2) = manager
+            .generate_contribution_at_position(&foreign_id, 2)
+            .expect("generate foreign position 2 (for its valid proof)");
+
+        // FORGERY: the "position-2 params" are actually the UNCHANGED position-1
+        // params (an identity transform that applied no tau). The candidate file
+        // hashes to the row's new_params_hash (hash-match PASSES), but
+        // e(new_h, tau_G2) != e(old_h, G2) when new_h == old_h and tau != 1, so
+        // `verify_contribution_catchup` MUST reject it.
+        let prev = manager.note_spend_params().unwrap();
+        let forged_hash = ghost_mpc::contribution::hash_parameters(&prev).unwrap();
+        assert_eq!(
+            forged_hash, p1_hash,
+            "forged candidate == the position-1 head"
+        );
+        stage_candidate(dir.path(), &forged_hash, &prev);
+        db.save_mpc_contribution(&ghost_storage::queries::MpcContributionRecord {
+            elder_position: 2,
+            contributor_node_id: foreign_id.clone(),
+            prev_params_hash: p1_hash,
+            new_params_hash: forged_hash,
+            contribution_proof: serde_json::to_vec(&c2.proof).unwrap(),
+            epoch: 0,
+            created_at: c2.timestamp,
+        })
+        .unwrap();
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        let adopted = adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await;
+
+        assert!(!adopted, "a forged foreign candidate must NOT be adopted");
+        assert_eq!(
+            manager.contribution_count(),
+            1,
+            "head must stay at position 1 — no false advance on a rejected forgery"
+        );
+        assert_eq!(
+            db.get_mpc_ceremony_state()
+                .unwrap()
+                .unwrap()
+                .contribution_count,
+            1,
+            "singleton must not advance on a rejected forgery"
+        );
+    }
+
+    /// Restart-safety of a caught-up position: after adopting position N the node
+    /// must hold params AND the retained ≥quorum BFT votes for it, so a later
+    /// restart's genesis-anchored startup check passes without manual backfill
+    /// (the node6 votes I had to backfill by hand). The network vote sync runs
+    /// against a peer's `/api/v1/mpc/votes/{pos}` endpoint (no HTTP server in a
+    /// unit test); here the votes are seeded as that sync would deliver them, and
+    /// we assert they SURVIVE the adopt and are queryable for the restart check.
+    #[cfg(feature = "mpc-ceremony")]
+    #[tokio::test]
+    async fn catchup_retains_votes_for_restart_safety() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, db, our_id, _p1) = ceremony_at_position_1(dir.path());
+
+        let foreign_id = hex::encode(NodeIdentity::generate().node_id());
+        let (p2, c2) = manager
+            .generate_contribution_at_position(&foreign_id, 2)
+            .expect("generate foreign position 2");
+        stage_candidate(dir.path(), &c2.new_params_hash, &p2);
+        db.save_mpc_contribution(&foreign_row(2, &foreign_id, &c2))
+            .unwrap();
+
+        // The retained BFT quorum votes for position 2 (as the votes endpoint
+        // would serve them).
+        for i in 0..3u8 {
+            let voter = hex::encode(NodeIdentity::generate().node_id());
+            db.save_mpc_vote(&ghost_storage::queries::MpcVerificationVote {
+                contribution_position: 2,
+                voter_node_id: voter,
+                approve: true,
+                signature: vec![i.wrapping_add(1); 64],
+                voted_at: 1_700_000_000 + i as u64,
+            })
+            .unwrap();
+        }
+
+        let peers = ghost_consensus::peer::PeerManager::new([0u8; 32], 100);
+        assert!(adopt_all_applied_positions(&manager, &db, &peers, &[], &our_id).await);
+
+        // Params present at the adopted head …
+        assert_eq!(manager.contribution_count(), 2);
+        assert_eq!(manager.current_params_hash(), c2.new_params_hash);
+        // … AND the retained quorum votes for the caught-up position survive, so
+        // the genesis-anchored restart verification has what it needs.
+        let votes = db.get_mpc_votes(2).unwrap();
+        assert_eq!(
+            votes.len(),
+            3,
+            "retained BFT votes for the caught-up position are present after catch-up"
+        );
+        assert!(votes.iter().all(|v| v.approve));
+    }
+
     // ── reaper_config_from_settings ──────────────────────────────────
 
     #[test]
@@ -6774,6 +8406,41 @@ mod tests {
         assert_eq!(cfg.min_drop_data_size, 64);
         // valid for the analyzer
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── cached_contribution_still_valid (MPC retry loop) ─────────────
+
+    #[test]
+    fn cached_contribution_valid_when_position_unchanged() {
+        // Candidate generated at authoritative count N (targets position N+1).
+        // A retry where the count is STILL N must keep the cached candidate so
+        // the SAME new_hash is rebroadcast and votes accumulate toward quorum
+        // (the fix for the "moving target" that stalled node5 on mainnet).
+        let cached_count = 6u32;
+        let current_count = 6u32;
+        assert!(
+            cached_contribution_still_valid(cached_count, current_count),
+            "unchanged position must NOT invalidate the cached candidate"
+        );
+    }
+
+    #[test]
+    fn cached_contribution_invalid_when_position_advanced() {
+        // Another contribution was applied while we waited (count N -> N+1):
+        // our candidate is chained onto a stale head and MUST be regenerated
+        // (rebased) onto the new head, so it is no longer valid to rebroadcast.
+        let cached_count = 6u32;
+        let current_count = 7u32;
+        assert!(
+            !cached_contribution_still_valid(cached_count, current_count),
+            "advanced position MUST invalidate the cached candidate (rebase)"
+        );
+    }
+
+    #[test]
+    fn cached_contribution_invalid_on_multi_step_advance() {
+        // Robust to more than one applied contribution during a long wait.
+        assert!(!cached_contribution_still_valid(6, 9));
     }
 
     // ── expand_path ──────────────────────────────────────────────────
@@ -7106,6 +8773,47 @@ mod tests {
         assert!(current.exists());
         assert!(v0.exists());
         assert_eq!(sha256_file(&current).unwrap(), pinned);
+    }
+
+    /// Bug-1 regression: generating a candidate must write a SEPARATE serving
+    /// file keyed by its lineage hash and must NEVER touch the active
+    /// `note_spend_params_current.bin`. Writing the un-applied candidate over
+    /// current.bin crash-looped node5 (on-disk candidate != BFT chain head).
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn write_candidate_does_not_touch_current() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-existing applied head — must remain byte-for-byte untouched.
+        let current = dir.path().join("note_spend_params_current.bin");
+        let applied = vec![0x11u8; 4096];
+        std::fs::write(&current, &applied).unwrap();
+
+        let new_hash = [0xCDu8; 32];
+        let candidate_blob = vec![0x22u8; 2048];
+        let path =
+            write_candidate_note_spend_params(dir.path(), &new_hash, &candidate_blob).unwrap();
+
+        // The candidate lives in its own hash-keyed file, distinct from current.
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            ghost_common::mpc::candidate_note_spend_filename(&new_hash)
+        );
+        assert_ne!(path, current);
+        assert_eq!(std::fs::read(&path).unwrap(), candidate_blob);
+        // The active current.bin is unchanged — only the apply path may move it.
+        assert_eq!(std::fs::read(&current).unwrap(), applied);
+
+        // Writing a candidate for a NEW position purges the stale one but keeps
+        // current.bin intact (serving dir never accumulates blobs).
+        let new_hash2 = [0xEFu8; 32];
+        let path2 =
+            write_candidate_note_spend_params(dir.path(), &new_hash2, &vec![0x33u8; 1024]).unwrap();
+        assert!(path2.exists());
+        assert!(
+            !path.exists(),
+            "stale candidate from old position must be purged"
+        );
+        assert_eq!(std::fs::read(&current).unwrap(), applied);
     }
 
     /// SECURITY: if the on-disk file does not match the pinned hash after the

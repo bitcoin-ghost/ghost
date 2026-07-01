@@ -103,6 +103,37 @@ pub fn mpc_bft_threshold(contributor_count: u32) -> u32 {
     }
 }
 
+/// Filename prefix for an on-disk note-spend CANDIDATE (un-applied) parameter
+/// file. Kept distinct from the active `note_spend_params_current.bin` so the
+/// two are never confused on disk or in the serving directory.
+pub const CANDIDATE_NOTE_SPEND_PREFIX: &str = "note_spend_params_candidate_";
+
+/// Filesystem name of the serving file for a note-spend CANDIDATE (un-applied)
+/// parameter set, keyed by its lineage `new_params_hash`.
+///
+/// A contributor writes its freshly generated candidate here — NEVER to the
+/// active `note_spend_params_current.bin`, which only the BFT apply path
+/// (`CeremonyManager::apply_contribution_multi`) or the install/self-heal fetch
+/// may repoint. The params-serving endpoint resolves a voter's by-hash request
+/// (`GET /api/v1/mpc/params?new_hash=<hex>`) to this file, so a voter fetching
+/// position-N's candidate gets the candidate while the contributor's own active
+/// params stay at the last BFT-applied head.
+///
+/// SINGLE SOURCE OF TRUTH: the writer (`ghost-pool`) and the server
+/// (`ghost-verification`) both derive the name here so they can never drift.
+/// Keying the filename by the hex lineage hash lets the serving side answer a
+/// by-hash fetch with a direct filesystem lookup (no re-hashing of params), and
+/// lets distinct candidates coexist without clobbering one another. The hex is
+/// fixed-width lower-case (64 chars), so a decoded-and-re-encoded request hash
+/// can never contain path separators.
+pub fn candidate_note_spend_filename(new_params_hash: &[u8; 32]) -> String {
+    format!(
+        "{}{}.bin",
+        CANDIDATE_NOTE_SPEND_PREFIX,
+        hex::encode(new_params_hash)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +175,28 @@ mod tests {
         hasher.update([1u8]);
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(approve, expected);
+    }
+
+    #[test]
+    fn test_candidate_note_spend_filename_keyed_by_hash() {
+        let h1 = [0x11u8; 32];
+        let h2 = [0x22u8; 32];
+        let n1 = candidate_note_spend_filename(&h1);
+        let n2 = candidate_note_spend_filename(&h2);
+
+        // Distinct candidates get distinct files (no clobbering).
+        assert_ne!(n1, n2);
+        // Pinned layout: prefix + 64 lower-case hex chars + ".bin".
+        assert_eq!(
+            n1,
+            "note_spend_params_candidate_1111111111111111111111111111111111111111111111111111111111111111.bin"
+        );
+        assert!(n1.starts_with(CANDIDATE_NOTE_SPEND_PREFIX));
+        assert!(n1.ends_with(".bin"));
+        // NEVER the active current-params file — these must stay distinct.
+        assert_ne!(n1, "note_spend_params_current.bin");
+        // Fixed-width hex (64) ⇒ no path separators can ever appear.
+        assert!(!n1.contains('/') && !n1.contains("..") && !n1.contains('\\'));
     }
 
     #[test]

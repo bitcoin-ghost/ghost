@@ -21,8 +21,21 @@ POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 GHOSTD_URL="${GHOSTD_URL:-https://get.bitcoinghost.org/bin/ghostd}"
 GHOSTD_SHA256="bb3a864248cea6ece930eb76fef525a0f5b1fde65976a886935df34e9e95859d"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
-# ZK params are auto-fetched from peers on first run; this is the pinned hash.
-ZK_PARAMS_HASH="BLOCK:fa9db2b79ee55bd181c33943a466aad24e58618c7cf1e2f23daf91462115ce77"
+# ── MPC ceremony: genesis-anchored trust root ────────────────────────────────
+# A fresh community node JOINS a still-rolling MPC ceremony GENESIS-ANCHORED: it
+# trusts the immutable genesis lineage anchor below and accepts whatever params
+# the ceremony has currently rolled to (each contribution is verified to chain
+# back to this anchor) — rather than pinning ONE static position hash. A stale
+# `BLOCK:<hash>` pin makes a late joiner REJECT the ceremony's current params,
+# which is exactly the manual step a fresh node hit before this change.
+#
+# The value below is the mainnet genesis MPC params hash: the IMMUTABLE trust
+# root of the ceremony lineage, hardcoded here exactly like a genesis block hash
+# is baked into a client. It is NEVER fetched from a peer (an untrusted source).
+# The node self-pins automatically once the ceremony ossifies at position 101, so
+# genesis-anchored is the correct startup mode for BOTH the rolling and ossified
+# states — there is deliberately no static ZK_PARAMS_HASH on the join path.
+ZK_GENESIS_PARAMS_HASH="c9c907f688fc11023d2202de44d6826c2b3f320646b70867009696d632515533"
 # Bootstrap peers (the current Elders). The node discovers the rest via gossip.
 SEED_NODES='"83.136.251.162:8555", "85.9.198.212:8555", "213.163.207.46:8555", "95.111.221.169:8555"'
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
@@ -711,7 +724,7 @@ chown -R ghost:ghost /home/ghost /var/lib/ghost /var/lib/bitcoin
 
 # ─────────────────────────── 7. node identity ────────────────────────────────
 log "Generating node identity"
-sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_PARAMS_HASH="$ZK_PARAMS_HASH" \
+sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" \
   /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
 
 # ───────────────────────── 8. sync gate (auto) ───────────────────────────────
@@ -801,12 +814,30 @@ WorkingDirectory=/var/lib/ghost
 ExecStart=/opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --tdp-enabled --tdp-port 8442 --stratum-port 3333
 Environment=RUST_LOG=info
 Environment=ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params
-Environment=ZK_PARAMS_HASH=${ZK_PARAMS_HASH}
 Restart=on-failure
 RestartSec=15
 LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# MPC startup mode — GENESIS-ANCHORED (join path), written as a systemd drop-in
+# to match the fleet convention (ghost-pool.service.d/genesis-anchor.conf). A
+# fresh community node joining a still-rolling ceremony must NOT carry a static
+# ZK_PARAMS_HASH pin (a stale pin makes it reject the ceremony's current params);
+# it runs genesis-anchored instead, validating the current params back to the
+# immutable mainnet genesis lineage anchor. `cat >` overwrites on every run, so
+# this is idempotent; the later `systemctl daemon-reload` picks it up.
+mkdir -p /etc/systemd/system/ghost-pool.service.d
+cat > /etc/systemd/system/ghost-pool.service.d/genesis-anchor.conf <<EOF
+[Service]
+# ZK_GENESIS_PARAMS_HASH is the IMMUTABLE mainnet genesis MPC params hash — the
+# ceremony's trust root, baked into the installer exactly like a genesis block
+# hash is baked into a client. It is NEVER fetched from a peer (untrusted). With
+# this set and NO static ZK_PARAMS_HASH, ghost-pool accepts the ceremony's
+# current rolling params (verified to chain back to this anchor) and self-pins
+# once the ceremony ossifies at position 101 — correct for both states.
+Environment=ZK_GENESIS_PARAMS_HASH=${ZK_GENESIS_PARAMS_HASH}
 EOF
 
 # ghost-pay L2 service (also serves the Wraith bond ledger on 8800). Only
@@ -848,7 +879,9 @@ ufw allow 22/tcp        >/dev/null 2>&1   # ssh FIRST so we don't lock out
 ufw allow 8333/tcp      >/dev/null 2>&1   # bitcoin P2P
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
 ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
-ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus
+ufw allow 8555:8562/tcp >/dev/null 2>&1   # mesh consensus (ZMQ pub/sub)
+ufw allow 8563/tcp      >/dev/null 2>&1   # Noise mesh (verifications + MPC contribution/vote exchange)
+ufw allow 8443/tcp      >/dev/null 2>&1   # verification HTTPS (peers fetch MPC params + votes)
 # Ghost Pay L2 / Wraith bond ledger (peers issue Ghost Pay verification
 # challenges here, and wallets escrow Wraith bonds here) — only when enabled.
 [[ "$GHOST_PAY" == "true" ]] && ufw allow 8800/tcp >/dev/null 2>&1   # ghost-pay / bond ledger
@@ -1615,7 +1648,7 @@ fi
 systemctl enable --now ghost-pool-gate >/dev/null 2>&1
 sleep 5
 
-NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_PARAMS_HASH="$ZK_PARAMS_HASH" /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
+NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
 cat <<EOF
 
   ✅ Bitcoin Ghost node installed.

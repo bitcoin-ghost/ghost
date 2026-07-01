@@ -41,6 +41,8 @@ members = [
     # ZK-BFT Infrastructure
     "crates/ghost-zkp",
     "crates/ghost-mpc",
+    # Cross-process MPC ceremony contribution harness (test-only, feature-gated)
+    "crates/mpc-xproc-harness",
     # Visual Identity
     "crates/ghost-glyph",
     # GSP
@@ -82,7 +84,7 @@ exclude = []
 # Use scripts/build-all-wallets.sh to build all wallet types.
 
 [workspace.package]
-version = "1.10.9"
+version = "1.10.16"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Bitcoin Ghost Team"]

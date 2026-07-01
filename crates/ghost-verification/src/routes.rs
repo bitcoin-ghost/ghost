@@ -6034,11 +6034,59 @@ async fn api_glyph_relay_registered_handler(
     }
 }
 
-async fn api_mpc_params_handler(State(_state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    // Get MPC params path from home directory
-    let params_path =
+/// Optional query for the note-spend params endpoint.
+///
+/// A BFT voter fetching a specific CANDIDATE (un-applied) parameter set passes
+/// `?new_hash=<64-hex>` — the candidate's lineage hash. Absent (the self-heal /
+/// refresh / manifest callers), the endpoint serves the applied current head.
+#[derive(Debug, Default, Deserialize)]
+pub struct MpcParamsQuery {
+    /// Hex of the candidate lineage `new_params_hash` to serve, if any.
+    #[serde(default)]
+    pub new_hash: Option<String>,
+}
+
+/// Resolve which note-spend parameter file the params endpoint should serve.
+///
+/// When `requested_hash` is a well-formed 32-byte hex lineage hash AND the
+/// matching CANDIDATE file exists, serve the candidate (so a voter gets the
+/// un-applied params it must cryptographically verify). Otherwise — no / blank /
+/// malformed hash, or no such candidate on disk — serve the active
+/// `note_spend_params_current.bin` (applied head), preserving the self-heal /
+/// refresh / manifest behaviour. The hash is decoded and re-encoded through the
+/// shared `ghost_common::mpc` helper, so a malicious `new_hash` can never escape
+/// the params directory (no path traversal).
+fn resolve_mpc_note_spend_path(
+    base_dir: &std::path::Path,
+    requested_hash: Option<&str>,
+) -> std::path::PathBuf {
+    if let Some(h) = requested_hash.filter(|h| !h.is_empty()) {
+        if let Some(bytes) = hex::decode(h).ok().filter(|b| b.len() == 32) {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let candidate = base_dir.join(ghost_common::mpc::candidate_note_spend_filename(&arr));
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    base_dir.join("note_spend_params_current.bin")
+}
+
+// NOTE: `pub` so the cross-process MPC ceremony harness
+// (`crates/mpc-xproc-harness`) can mount this EXACT production handler in a
+// minimal router and prove the `?new_hash=` candidate-vs-current serving works
+// across real OS process boundaries. Behaviour is unchanged.
+pub async fn api_mpc_params_handler(
+    State(_state): State<Arc<VerificationState>>,
+    Query(query): Query<MpcParamsQuery>,
+) -> impl IntoResponse {
+    // Get MPC params dir from home directory, then resolve to the applied head
+    // or — when a voter asks by `new_hash` — the matching candidate file.
+    let base_dir =
         std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".ghost/mpc_params/note_spend_params_current.bin");
+            .join(".ghost/mpc_params");
+    let params_path = resolve_mpc_note_spend_path(&base_dir, query.new_hash.as_deref());
 
     if !params_path.exists() {
         return (
@@ -7341,6 +7389,48 @@ async fn api_system_mempool_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_mpc_note_spend_path_serves_candidate_then_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let current = base.join("note_spend_params_current.bin");
+        std::fs::write(&current, b"applied-head").unwrap();
+
+        let new_hash = [0xABu8; 32];
+        let candidate = base.join(ghost_common::mpc::candidate_note_spend_filename(&new_hash));
+        let hash_hex = hex::encode(new_hash);
+
+        // No hash → always the applied current head.
+        assert_eq!(resolve_mpc_note_spend_path(base, None), current);
+        assert_eq!(resolve_mpc_note_spend_path(base, Some("")), current);
+
+        // A by-hash request BEFORE the candidate exists falls back to current
+        // (never a 404 that would break the applied-params refresh path).
+        assert_eq!(resolve_mpc_note_spend_path(base, Some(&hash_hex)), current);
+
+        // Once the contributor has written the candidate, the by-hash request
+        // resolves to the candidate — while a bare request still serves current.
+        std::fs::write(&candidate, b"un-applied-candidate").unwrap();
+        assert_eq!(
+            resolve_mpc_note_spend_path(base, Some(&hash_hex)),
+            candidate
+        );
+        assert_eq!(resolve_mpc_note_spend_path(base, None), current);
+
+        // A request for a DIFFERENT candidate hash (none on disk) → current.
+        let other = hex::encode([0x01u8; 32]);
+        assert_eq!(resolve_mpc_note_spend_path(base, Some(&other)), current);
+
+        // Malformed / traversal attempts can never escape the params dir.
+        for bad in ["../../etc/passwd", "zz", "not-hex", "%2e%2e", "ab/cd"] {
+            assert_eq!(
+                resolve_mpc_note_spend_path(base, Some(bad)),
+                current,
+                "malformed new_hash {bad:?} must fall back to current"
+            );
+        }
+    }
 
     #[test]
     fn test_share_difficulty_from_hash_hex() {
