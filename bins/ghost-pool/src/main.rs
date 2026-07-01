@@ -1120,21 +1120,93 @@ async fn fetch_and_parse_params(
     .ok()?
 }
 
+/// Host portion of an `address` that may be a bare host, `host:port`,
+/// `[ipv6]:port`, or carry a `scheme://` prefix. Mirrors the mesh's own
+/// `extract_host_from_address` so a contributor's advertised mesh address
+/// (`ip:8559`) reduces to just the host we then hit on the fetch port (`:8080`).
+#[cfg(feature = "mpc-ceremony")]
+fn fetch_host_of(address: &str) -> String {
+    let s = match address.find("://") {
+        Some(i) => &address[i + 3..],
+        None => address,
+    };
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    match s.rfind(':') {
+        Some(i) if !s[i + 1..].is_empty() && s[i + 1..].chars().all(|c| c.is_ascii_digit()) => {
+            s[..i].to_string()
+        }
+        _ => s.to_string(),
+    }
+}
+
+/// Resolve a contributor node id to its reachable address: the live mesh peer
+/// registry FIRST (freshest — the same registry the mesh uses for Noise/health),
+/// then the persisted `nodes` table. Empty strings are treated as unresolved.
+/// `None` means we could not find an address and must fall back to seeds only.
+#[cfg(feature = "mpc-ceremony")]
+fn resolve_contributor_addr(
+    peers: &ghost_consensus::peer::PeerManager,
+    db: &ghost_storage::Database,
+    contributor: &ghost_common::types::NodeId,
+) -> Option<String> {
+    peers
+        .get_peer(contributor)
+        .map(|p| p.public_address)
+        .filter(|a| !a.is_empty())
+        .or_else(|| {
+            db.get_node(&hex::encode(contributor))
+                .ok()
+                .flatten()
+                .and_then(|n| n.public_address)
+        })
+        .filter(|a| !a.is_empty())
+}
+
+/// Build the ordered list of fetch hosts for a candidate parameter bundle: the
+/// CONTRIBUTOR first (the only node serving its un-applied candidate), then the
+/// configured seeds. Entries are reduced to host-only and de-duplicated by host
+/// so the contributor is never retried as a seed and duplicate seeds are dropped.
+/// When `contributor_addr` is `None` (address unresolved) the result is exactly
+/// the seed hosts — preserving the prior seeds-only behaviour as a fallback.
+#[cfg(feature = "mpc-ceremony")]
+fn ordered_fetch_sources(contributor_addr: Option<&str>, seeds: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(seeds.len() + 1);
+    if let Some(addr) = contributor_addr {
+        let h = fetch_host_of(addr);
+        if !h.is_empty() {
+            out.push(h);
+        }
+    }
+    for seed in seeds {
+        let h = fetch_host_of(seed);
+        if h.is_empty() || out.iter().any(|existing| existing == &h) {
+            continue;
+        }
+        out.push(h);
+    }
+    out
+}
+
 /// Fetch a full candidate parameter bundle (note-spend + payout + unshield) from
 /// the network for one contribution.
 ///
 /// The primary note-spend parameters MUST hash-match `expected_note_spend_hash`
 /// (the contribution's claimed lineage head) — only then is a bundle returned.
 /// `payout`/`unshield` ride along best-effort (they share the same toxic waste).
-/// Returns `None` if no seed can supply matching note-spend parameters, which
-/// forces the voter to ABSTAIN rather than approve blind.
+/// Returns `None` if no source can supply matching note-spend parameters, which
+/// forces the voter to ABSTAIN rather than approve blind. Sources are tried in
+/// the given order (contributor-first per [`ordered_fetch_sources`]).
 #[cfg(feature = "mpc-ceremony")]
 async fn fetch_ceremony_params_bundle(
-    seeds: &[String],
+    sources: &[String],
     expected_note_spend_hash: [u8; 32],
 ) -> Option<ghost_consensus::mpc_handler::FetchedCeremonyParams> {
-    for seed in seeds {
-        let host = seed.split(':').next().unwrap_or(seed);
+    for source in sources {
+        let host = source.split(':').next().unwrap_or(source);
         let note_spend =
             match fetch_and_parse_params(host, "params", Some(expected_note_spend_hash)).await {
                 Some(p) => p,
@@ -3135,13 +3207,16 @@ async fn main() -> Result<()> {
         let ceremony_mgr_for_callback = Arc::clone(&ceremony_manager);
         let seed_nodes_for_callback = config.network.seed_nodes.clone();
         let db_for_callback = Arc::clone(&db);
+        let peers_for_callback = Arc::clone(mesh.peers());
         type ParamsUpdateFn = dyn Fn(&[u8; 32], &[u8; 32]) + Send + Sync;
         let params_update_callback: Arc<ParamsUpdateFn> = Arc::new(
-            move |expected_hash: &[u8; 32], _contributor: &[u8; 32]| {
+            move |expected_hash: &[u8; 32], contributor: &[u8; 32]| {
                 let ceremony_mgr = Arc::clone(&ceremony_mgr_for_callback);
                 let seeds = seed_nodes_for_callback.clone();
                 let db = Arc::clone(&db_for_callback);
+                let peers = Arc::clone(&peers_for_callback);
                 let expected = *expected_hash;
+                let contributor = *contributor;
                 tokio::spawn(async move {
                     // Small delay to let the contributing node finish writing.
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -3195,12 +3270,24 @@ async fn main() -> Result<()> {
                     let _param_write_guard = param_write_lock().lock().await;
 
                     // Fetch the candidate bundle (note-spend hash MUST match).
-                    let bundle = match fetch_ceremony_params_bundle(&seeds, expected).await {
+                    // Same root-cause fix as the voter path: the contributor is
+                    // the only node serving its un-applied candidate, so resolve
+                    // its address and try it FIRST, then the seeds (a peer that has
+                    // already adopted the head can serve a historical catch-up).
+                    let contributor_addr = resolve_contributor_addr(&peers, &db, &contributor);
+                    if contributor_addr.is_none() {
+                        tracing::info!(
+                            contributor = %hex::encode(&contributor[..8]),
+                            "MPC params_callback: contributor address unresolved — seeds only"
+                        );
+                    }
+                    let sources = ordered_fetch_sources(contributor_addr.as_deref(), &seeds);
+                    let bundle = match fetch_ceremony_params_bundle(&sources, expected).await {
                         Some(b) => b,
                         None => {
                             tracing::warn!(
                                 expected = %hex::encode(&expected[..8]),
-                                "MPC params_callback: no peer had matching params"
+                                "MPC params_callback: no source had matching params"
                             );
                             return;
                         }
@@ -3307,12 +3394,41 @@ async fn main() -> Result<()> {
         // Stage 1a: the network fetcher the voter uses to obtain a candidate's
         // parameters before running real cryptographic verification. Fetches the
         // bundle in memory (no disk writes — verification is read-only).
+        //
+        // ROOT-CAUSE FIX: the contributor's freshly-generated candidate is served
+        // ONLY by the contributor node (from a separate candidate file, never
+        // `current.bin`), so the seeds return their own applied params whose hash
+        // never matches and the voter abstained forever. The fetcher now resolves
+        // the contributor's reachable address from the mesh peer registry (the
+        // same registry the mesh uses for Noise/health) — falling back to the
+        // persisted `nodes` table — and tries the CONTRIBUTOR FIRST, then the
+        // seeds. If the address cannot be resolved we log and fall back to seeds
+        // only (a peer that already adopted the candidate could still serve it),
+        // preserving the fail-closed posture (no hash-match ⇒ abstain).
         let seed_nodes_for_fetch = config.network.seed_nodes.clone();
-        let params_fetcher: ghost_consensus::mpc_handler::MpcParamsFetchFn =
-            Arc::new(move |expected: [u8; 32]| {
+        let peers_for_fetch = Arc::clone(mesh.peers());
+        let db_for_fetch = Arc::clone(&db);
+        let params_fetcher: ghost_consensus::mpc_handler::MpcParamsFetchFn = Arc::new(
+            move |expected: [u8; 32], contributor: ghost_common::types::NodeId| {
                 let seeds = seed_nodes_for_fetch.clone();
-                Box::pin(async move { fetch_ceremony_params_bundle(&seeds, expected).await })
-            });
+                let peers = Arc::clone(&peers_for_fetch);
+                let db = Arc::clone(&db_for_fetch);
+                Box::pin(async move {
+                    // Resolve the contributor's reachable host: live mesh peer
+                    // registry first (freshest), then the persisted nodes table.
+                    let contributor_addr = resolve_contributor_addr(&peers, &db, &contributor);
+                    if contributor_addr.is_none() {
+                        tracing::info!(
+                            contributor = %hex::encode(&contributor[..8]),
+                            "MPC fetch: contributor address unresolved from mesh/db — \
+                             falling back to seeds only"
+                        );
+                    }
+                    let sources = ordered_fetch_sources(contributor_addr.as_deref(), &seeds);
+                    fetch_ceremony_params_bundle(&sources, expected).await
+                })
+            },
+        );
 
         let mpc_handler = Arc::new(
             MpcHandler::new(Arc::clone(&identity), Arc::clone(&db))
@@ -6713,6 +6829,48 @@ fn resolve_signer_path(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // ── ordered_fetch_sources (MPC candidate fetch ordering) ─────────
+    //
+    // These lock in the contributor-first-then-seeds ordering that lets a voter
+    // reach the candidate parameters served ONLY by the contributor node.
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_ordered_fetch_sources_contributor_first() {
+        let seeds = vec!["seed1.example:8559".to_string(), "9.9.9.9:8559".to_string()];
+        let got = ordered_fetch_sources(Some("1.2.3.4:8559"), &seeds);
+        // Contributor host leads, then the seeds — all reduced to host-only.
+        assert_eq!(got, vec!["1.2.3.4", "seed1.example", "9.9.9.9"]);
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_ordered_fetch_sources_dedups_contributor_that_is_also_a_seed() {
+        let seeds = vec!["1.2.3.4:8559".to_string(), "9.9.9.9:8559".to_string()];
+        // The contributor is also a configured seed → it must appear ONCE, first.
+        let got = ordered_fetch_sources(Some("1.2.3.4:8559"), &seeds);
+        assert_eq!(got, vec!["1.2.3.4", "9.9.9.9"]);
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_ordered_fetch_sources_unresolved_contributor_falls_back_to_seeds() {
+        let seeds = vec!["seed1.example:8559".to_string(), "9.9.9.9:8559".to_string()];
+        // Address unresolved → seeds-only (prior behaviour), never empty/hard-fail.
+        let got = ordered_fetch_sources(None, &seeds);
+        assert_eq!(got, vec!["seed1.example", "9.9.9.9"]);
+    }
+
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn test_fetch_host_of_variants() {
+        assert_eq!(fetch_host_of("1.2.3.4:8559"), "1.2.3.4");
+        assert_eq!(fetch_host_of("1.2.3.4"), "1.2.3.4");
+        assert_eq!(fetch_host_of("host.example:8080"), "host.example");
+        assert_eq!(fetch_host_of("tcp://1.2.3.4:8559"), "1.2.3.4");
+        assert_eq!(fetch_host_of("[2001:db8::1]:8559"), "2001:db8::1");
+    }
 
     // ── reaper_config_from_settings ──────────────────────────────────
 

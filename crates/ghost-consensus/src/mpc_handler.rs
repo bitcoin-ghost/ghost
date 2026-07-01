@@ -93,15 +93,25 @@ pub struct FetchedCeremonyParams {
 
 /// Async callback that fetches a candidate's parameter bundle from the network.
 ///
-/// Input: the expected note-spend lineage hash (`hash_parameters`) of the new
-/// parameters. Output: `Some(bundle)` only when a peer supplied parameters whose
+/// Inputs:
+/// - `expected`: the expected note-spend lineage hash (`hash_parameters`) of the
+///   new parameters.
+/// - `contributor`: the node id of the contributor whose freshly-generated
+///   candidate is being verified. This is LOAD-BEARING: the contributor is the
+///   ONLY node that holds its un-applied candidate (served from a separate
+///   candidate file, never `current.bin`), so the fetcher must be able to reach
+///   the contributor directly — the seed nodes only serve their own applied
+///   parameters. The fetcher resolves the contributor's reachable address from
+///   the mesh peer registry and tries it FIRST, then falls back to the seeds.
+///
+/// Output: `Some(bundle)` only when a source supplied parameters whose
 /// `hash_parameters()` matches the request; `None` on any fetch/parse/mismatch.
 ///
 /// A `None` result means the voter could not obtain the parameters and MUST
 /// abstain — it must never weaken verification or vote approve blind.
 #[cfg(feature = "mpc-ceremony")]
 pub type MpcParamsFetchFn = Arc<
-    dyn Fn([u8; 32]) -> Pin<Box<dyn Future<Output = Option<FetchedCeremonyParams>> + Send>>
+    dyn Fn([u8; 32], NodeId) -> Pin<Box<dyn Future<Output = Option<FetchedCeremonyParams>> + Send>>
         + Send
         + Sync,
 >;
@@ -616,13 +626,17 @@ impl MpcHandler {
         };
 
         // 1. Fetch the candidate's parameters. None => cannot verify => ABSTAIN.
+        //    The contributor (`msg.candidate`) is the ONLY node holding its
+        //    un-applied candidate, so it is passed to the fetcher which tries the
+        //    contributor's address first, then the seeds.
         let claimed = msg.new_params_hash;
-        let bundle = match fetcher(claimed).await {
+        let bundle = match fetcher(claimed, msg.candidate).await {
             Some(b) => b,
             None => {
                 info!(
                     position = msg.elder_position,
                     expected = %hex::encode(&claimed[..8]),
+                    contributor = %hex::encode(&msg.candidate[..8]),
                     "MPC: could not fetch candidate parameters — abstaining (fail-closed)"
                 );
                 return VoteDecision::Abstain;
@@ -1395,7 +1409,7 @@ mod ceremony_vote_tests {
     }
 
     fn fetcher_returning(params: Arc<Groth16Params>) -> MpcParamsFetchFn {
-        Arc::new(move |_expected| {
+        Arc::new(move |_expected, _contributor| {
             let p = Arc::clone(&params);
             Box::pin(async move {
                 Some(FetchedCeremonyParams {
@@ -1408,7 +1422,48 @@ mod ceremony_vote_tests {
     }
 
     fn fetcher_failing() -> MpcParamsFetchFn {
-        Arc::new(move |_expected| Box::pin(async move { Option::<FetchedCeremonyParams>::None }))
+        Arc::new(move |_expected, _contributor| {
+            Box::pin(async move { Option::<FetchedCeremonyParams>::None })
+        })
+    }
+
+    /// A fetcher that models the real network topology: the candidate params are
+    /// held ONLY by the contributor node (keyed by its node id), exactly as in
+    /// production where the contributor serves its un-applied candidate and the
+    /// seeds serve only their own applied `current.bin`.
+    ///
+    /// `serving` maps `contributor_node_id -> that contributor's candidate params`.
+    /// The fetcher returns the params ONLY when asked for the matching contributor
+    /// AND the hash lines up. If `use_contributor_arg` is false it IGNORES the
+    /// contributor argument entirely (the pre-fix `seeds`-only behaviour), so the
+    /// candidate — reachable only via the contributor — can never be found.
+    fn fetcher_serving_from_contributor(
+        serving: std::collections::HashMap<NodeId, Arc<Groth16Params>>,
+        use_contributor_arg: bool,
+    ) -> MpcParamsFetchFn {
+        Arc::new(move |expected, contributor| {
+            // Pre-fix model: a seeds-only fetcher never consults the contributor,
+            // so it cannot reach the candidate that only the contributor serves.
+            let lookup = if use_contributor_arg {
+                serving.get(&contributor).cloned()
+            } else {
+                None
+            };
+            Box::pin(async move {
+                let p = lookup?;
+                // Preserve the production hash filter: a source must serve params
+                // whose lineage hash matches the claim, else it is skipped.
+                let h = ghost_mpc::contribution::hash_parameters(&p).ok()?;
+                if h != expected {
+                    return None;
+                }
+                Some(FetchedCeremonyParams {
+                    note_spend: p,
+                    payout: None,
+                    unshield: None,
+                })
+            })
+        })
     }
 
     fn insert_pending(handler: &MpcHandler, msg: &MpcContributionMessage) {
@@ -1612,5 +1667,141 @@ mod ceremony_vote_tests {
             rejections >= 1,
             "the verify gate must reject foreign-lineage params"
         );
+    }
+
+    /// (5) FETCH-FROM-CONTRIBUTOR — the exact mainnet scenario that stalled the
+    /// ceremony. The candidate parameters exist ONLY on the contributor's serving
+    /// path (never on the voter's seeds). The voter must therefore fetch them FROM
+    /// THE CONTRIBUTOR, which requires the contributor's node id to be threaded to
+    /// the fetcher. With that in place the contribution verifies, is approved, and
+    /// applies.
+    ///
+    /// The paired assertion below (`test_seeds_only_fetch_abstains_repro`) drives
+    /// the SAME serving map through a fetcher that ignores the contributor id (the
+    /// pre-fix `seeds`-only behaviour) and shows it abstains — proving the id is
+    /// what closes the gap.
+    #[tokio::test]
+    async fn test_fetch_from_contributor_approves_and_applies() {
+        let voter_identity = Arc::new(NodeIdentity::generate());
+        // The CONTRIBUTOR is a DIFFERENT node — its id is what the voter must use
+        // to locate the candidate (matching production, where `msg.candidate` is
+        // the remote contributor, not the local voter).
+        let contributor_identity = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().unwrap());
+        let (manager, _dir) = genesis_manager();
+
+        let (new_params, contribution) = manager.generate_contribution("node1").unwrap();
+        let new_params = Arc::new(new_params);
+        let msg = message_for(&contribution, &contributor_identity);
+
+        // Model the network: only the contributor serves its candidate.
+        let mut serving = std::collections::HashMap::new();
+        serving.insert(contributor_identity.node_id(), Arc::clone(&new_params));
+
+        let handler = MpcHandler::new(Arc::clone(&voter_identity), Arc::clone(&db))
+            .with_ceremony_manager(Arc::clone(&manager))
+            // use_contributor_arg = true → the fixed fetcher reaches the contributor.
+            .with_params_fetcher(fetcher_serving_from_contributor(serving, true))
+            .with_state(0, false);
+        insert_pending(&handler, &msg);
+
+        handler.verify_and_vote(&msg).await.unwrap();
+
+        // Fetched from the contributor, verified, approved, and APPLIED.
+        let row = db.get_mpc_contribution(1).unwrap();
+        assert!(
+            row.is_some(),
+            "contribution must apply after contributor fetch"
+        );
+        assert_eq!(row.unwrap().new_params_hash, contribution.new_params_hash);
+        assert_eq!(manager.contribution_count(), 1);
+        assert_eq!(manager.current_params_hash(), contribution.new_params_hash);
+        let (approvals, rejections) = db.count_mpc_approvals(1).unwrap();
+        assert_eq!(approvals, 1);
+        assert_eq!(rejections, 0);
+    }
+
+    /// (5-repro) PRE-FIX REGRESSION GUARD. Same candidate, same serving map, but
+    /// the fetcher IGNORES the contributor id — modelling the old `seeds`-only
+    /// fetcher whose signature could not carry the contributor. The candidate is
+    /// unreachable, so the voter ABSTAINS (fail-closed): no vote, no apply, and the
+    /// pending contribution survives. This is the precise mainnet stall this fix
+    /// removes — it FAILS (would apply) only if the contributor id were reachable.
+    #[tokio::test]
+    async fn test_seeds_only_fetch_abstains_repro() {
+        let voter_identity = Arc::new(NodeIdentity::generate());
+        let contributor_identity = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().unwrap());
+        let (manager, _dir) = genesis_manager();
+        let genesis_hash = manager.current_params_hash();
+
+        let (new_params, contribution) = manager.generate_contribution("node1").unwrap();
+        let new_params = Arc::new(new_params);
+        let msg = message_for(&contribution, &contributor_identity);
+
+        // The candidate IS being served by the contributor …
+        let mut serving = std::collections::HashMap::new();
+        serving.insert(contributor_identity.node_id(), Arc::clone(&new_params));
+
+        let handler = MpcHandler::new(Arc::clone(&voter_identity), Arc::clone(&db))
+            .with_ceremony_manager(Arc::clone(&manager))
+            // … but use_contributor_arg = false → seeds-only, never asks the
+            // contributor, so it cannot find the candidate.
+            .with_params_fetcher(fetcher_serving_from_contributor(serving, false))
+            .with_state(0, false);
+        insert_pending(&handler, &msg);
+
+        handler.verify_and_vote(&msg).await.unwrap();
+
+        // Abstained: no vote, nothing applied, pending survives (ceremony stalled
+        // — exactly the observed mainnet behaviour before the fix).
+        let (approvals, rejections) = db.count_mpc_approvals(1).unwrap();
+        assert_eq!(approvals, 0, "seeds-only fetch must not approve");
+        assert_eq!(rejections, 0, "seeds-only fetch abstains, casts no vote");
+        assert!(db.get_mpc_contribution(1).unwrap().is_none());
+        assert_eq!(manager.contribution_count(), 0);
+        assert_eq!(manager.current_params_hash(), genesis_hash);
+        assert!(
+            handler
+                .pending_contributions
+                .read()
+                .contains_key(&msg.contribution_hash()),
+            "pending must survive the abstention"
+        );
+    }
+
+    /// (6) NEGATIVE — contributor UNREACHABLE. The fetcher is contributor-aware,
+    /// but the contributor's address cannot be resolved (its id is absent from the
+    /// serving set, mirroring an unresolved mesh address with no matching seed).
+    /// The voter must ABSTAIN (fail-closed) — never vote on unverified params.
+    #[tokio::test]
+    async fn test_contributor_unreachable_abstains() {
+        let voter_identity = Arc::new(NodeIdentity::generate());
+        let contributor_identity = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().unwrap());
+        let (manager, _dir) = genesis_manager();
+        let genesis_hash = manager.current_params_hash();
+
+        let (_new_params, contribution) = manager.generate_contribution("node1").unwrap();
+        let msg = message_for(&contribution, &contributor_identity);
+
+        // Empty serving set → contributor unreachable, no seed can supply it.
+        let serving: std::collections::HashMap<NodeId, Arc<Groth16Params>> =
+            std::collections::HashMap::new();
+
+        let handler = MpcHandler::new(Arc::clone(&voter_identity), Arc::clone(&db))
+            .with_ceremony_manager(Arc::clone(&manager))
+            .with_params_fetcher(fetcher_serving_from_contributor(serving, true))
+            .with_state(0, false);
+        insert_pending(&handler, &msg);
+
+        handler.verify_and_vote(&msg).await.unwrap();
+
+        let (approvals, rejections) = db.count_mpc_approvals(1).unwrap();
+        assert_eq!(approvals, 0, "unreachable contributor must not approve");
+        assert_eq!(rejections, 0, "unreachable contributor abstains, no vote");
+        assert!(db.get_mpc_contribution(1).unwrap().is_none());
+        assert_eq!(manager.contribution_count(), 0);
+        assert_eq!(manager.current_params_hash(), genesis_hash);
     }
 }
