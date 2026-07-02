@@ -183,3 +183,87 @@ trust with deferred verification".
   headers/PoW) → **Phantom** (L1, economic graph — double-spend-safe,
   authorisation trusted) → **Apparition** (L2, signatures verified — fully real).
 - Individual passes: descriptive for now (header / economic / signature).
+
+## 9. Prototype results
+
+A self-contained benchmark prototype lives at `prototypes/ghast-bench/`
+(standalone crate, empty `[workspace]` table, real secp256k1 ECDSA + Schnorr —
+no mocked crypto). It synthesizes a chain segment in memory and times three
+validation strategies over the **identical** workload: **(A)** row-wise
+single-threaded (naive), **(B)** row-wise parallel-per-block (the strong
+baseline — what Bitcoin Core does), and **(C)** GHAST columnar (pass 1 headers,
+pass 2 serial UTXO, pass 3 all signatures collected up front and verified in one
+batched parallel sweep). B and C are made fair: both flat-collect inputs and
+`par_iter`, so the only difference is batch granularity (per-block vs
+whole-chain). See `prototypes/ghast-bench/README.md` for how to run and full
+caveats.
+
+### 9.1 Headline run (default workload)
+
+Machine: 16-core WSL2, `rayon` 16 threads. Workload: 300 blocks × 30 tx ×
+40 inputs = **360,000 real signatures**. Median of 3 runs after warm-up.
+
+| Strategy | Median | sigs/s | Speedup vs **B** |
+|----------|-------:|-------:|-----------------:|
+| A row-wise single-threaded | 11.839 s | 30,407 | 0.21× |
+| **B row-wise parallel (baseline)** | 2.437 s | 147,740 | 1.00× |
+| C GHAST columnar batch (ECDSA) | 1.837 s | 195,993 | **1.33×** |
+| C-schnorr columnar (Schnorr, per-sig parallel) | 1.861 s | 193,448 | 1.31× |
+
+- **Hazed bandwidth ratio: 3.49×.** Full blocks = 53.0 MB; economic-graph-only =
+  15.2 MB; the witness/signature column is **71.3 %** of full-block bytes.
+  Economic-only sync moves **~29 %** of the bytes.
+- **Time-to-usable (Phantom / L1): 0.072 s** for passes 1+2 (headers + UTXO, a
+  double-spend-safe coin set) vs **2.437 s** for full validation (B) —
+  **~34× faster to usable** by deferring the signature pass. (In a real sync the
+  gap is far larger, because deferral also defers downloading the witness
+  column — the 71 % of bytes above.)
+
+### 9.2 The honest question: does columnar batching (C) actually beat B?
+
+Only at small block sizes. C holds a near-constant ~195k sigs/s regardless of
+how the chain is chopped into blocks (one work-stealing pool over everything). B
+degrades when blocks are small, because each block is a separate `rayon` join
+barrier and a small per-block batch can't fill 16 cores. Sweeping the same
+360k-signature workload across block sizes:
+
+| Block size (inputs/block) | B (baseline) | C columnar | **C vs B** |
+|---------------------------|-------------:|-----------:|-----------:|
+| ~120 (many tiny blocks) | 4.979 s | 1.851 s | **2.69×** |
+| ~1,200 (default) | 2.437 s | 1.837 s | **1.33×** |
+| ~6,000 (≈ real full block) | 1.913 s | 1.835 s | **1.04×** |
+
+**Verdict: at realistic Bitcoin full-block sizes (~2–6k inputs), columnar
+batching gives essentially nothing over per-block parallelism (1.04×) — B
+already saturates the cores.** The columnar batch only wins when blocks are
+small enough that per-block parallel passes leave cores idle. So Idea B (§4) is
+**not** where the real speed comes from on a modern chain.
+
+### 9.3 What the numbers do and do not support
+
+- **Supported — deferral (time-to-usable).** Reaching a double-spend-safe UTXO
+  set without the signature pass is ~34× faster here, and far more in a real
+  sync where it also avoids downloading the witness column. This is the strongest
+  measured GHAST win and directly backs the Wisp→Phantom→Apparition staging and
+  the L1-usable state (§5).
+- **Supported — bandwidth (hazed ratio).** The witness/signature column is
+  ~71 % of block bytes on this (inscription-era-shaped) workload, giving a
+  3.49× economic-only bandwidth reduction. This backs Idea A (§3) and answers
+  open question §7.2: separating + deferring the witness column is a large, real
+  win, independent of any CPU batching.
+- **Not supported — columnar batching as a CPU win (Idea B, §4).** At real
+  full-block sizes it is ~parity with what Bitcoin Core already does. The design
+  should present Idea B honestly as "no worse, and it enables the streaming
+  columnar store that makes deferral + bandwidth cheap", **not** as a
+  signature-throughput win. `assumevalid`-style deferral already captures the CPU
+  savings; columnar batching does not add to them at scale.
+
+### 9.4 Caveats
+
+Synthetic data; single machine; **verification-only** (no real disk/network
+I/O — real IBD is often I/O/bandwidth-bound, which would only raise the value of
+the bandwidth win); UTXO pass modelled serial over an in-memory `HashMap` (a
+real disk-backed coin DB is slower); Schnorr measured as per-signature parallel
+verify, not libsecp256k1's experimental aggregate `schnorrsig_verify_batch`
+(not exposed by rust-secp256k1 0.30 — a true batch check would make Schnorr
+faster than shown).

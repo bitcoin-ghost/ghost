@@ -1,0 +1,24 @@
+# Standalone crate — the empty [workspace] table below stops Cargo from
+# treating this as a member of the giant main workspace (which is slow and
+# OOM-prone in WSL2). Build with `-j2`.
+[workspace]
+
+[package]
+name = "ghast-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark prototype for GHAST Block Download: columnar vs row-wise block validation"
+
+[[bin]]
+name = "ghast-bench"
+path = "src/main.rs"
+
+[dependencies]
+secp256k1 = { version = "0.30", features = ["std"] }
+rayon = "1.10"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
