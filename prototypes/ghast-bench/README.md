@@ -43,6 +43,12 @@ It also reports:
    **network transfer is modelled** (bandwidth arithmetic); the **CPU rate is
    measured** (the header+UTXO throughput from above). Sweeps N peers across
    downlink tiers and shows where added peers stop helping (downlink saturation).
+5. **Mesh-attested fast-start (design §13)** — trust a BFT-attested commitment to
+   the ~11.4 GB surviving UTXO set (from §12) to be usable in minutes, then sync
+   the full 174 GB in the background. **Measured:** real SHA-256 commitment
+   compute/verify throughput and real secp256k1 N-elder attestation (sign +
+   verify + wire size). **Modelled:** the 11.4 GB download (reuses the §10 math).
+   Reports fast-start total vs the full trustless path per tier/peer count.
 
 ## How to run
 
@@ -76,6 +82,13 @@ runtime):
 | `--downlinks-mbps` | `12.5,125` | comma-list of downlink tiers, MB/s (100 Mbit, 1 Gbit) |
 | `--peers` | `1,10,20,30,40` | comma-list of peer counts to sweep |
 
+Mesh-attested fast-start args (§13, all optional):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--surviving-gb` | `11.4` | surviving UTXO set size, decimal GB (from §12 measurement) |
+| `--elders` | `8` | number of BFT mesh signers attesting the commitment |
+
 This crate has an **empty `[workspace]` table** in its `Cargo.toml` so it does
 NOT join the giant main workspace (which is slow and OOM-prone in WSL2).
 
@@ -102,6 +115,12 @@ NOT join the giant main workspace (which is slow and OOM-prone in WSL2).
   rates. Its CPU input is the measured header+UTXO throughput extrapolated to
   the modelled chain size (a real disk-backed coin DB at ~174 GB is slower, but
   CPU is dominated by download regardless).
+- The **fast-start** uses **SHA-256 as a stand-in** for the real UTXO commitment
+  (Bitcoin uses a muhash — same order, not identical), models the 8-elder BFT set
+  as independent Schnorr sigs (a real threshold/aggregate attestation would be
+  smaller/faster), and reuses the analytical 11.4 GB download. "Usable" means
+  "has the surviving UTXO set" under the mesh's trust — L1/Phantom semantics still
+  apply until the background sig pass reaches L2.
 
 ## Headline result (this machine)
 
@@ -116,3 +135,11 @@ range-fetch is a large but **downlink-bounded** win: on a 100 Mbit pipe it caps
 at ~5 peers (4.17×); on 1 Gbit it scales linearly through ~42 peers (40×). More
 peers past saturation buy resilience, not speed — and never trust (integrity is
 cryptographic via PoW + per-range merkle, not peer agreement).
+
+The mesh-attested fast-start (§13) trades a bounded trust window for speed:
+downloading the ~11.4 GB surviving UTXO set (15× smaller than the full graph)
+makes a node usable in **~1.7 min on 1 Gbit** (≈22× faster than the ~37 min full
+trustless sync) or **~15 min on 100 Mbit** (≈16×). The commitment verify (~5 s
+SHA-256 hash + sub-ms sigs) is negligible — it is purely a download-size win, and
+still downlink-bound. You trust the mesh only until the background 174 GB sync
+completes and audits the attestation.

@@ -521,3 +521,117 @@ This is strictly stronger than assumeUTXO — not static, not blind, self-auditi
 snapshot, and it is only viable *because* churn is ~95%, making the surviving set
 small enough to ship quickly. **This is the recommended "better than assumeUTXO"
 direction.**
+
+## 13. Can the surviving UTXO set be verified without the full sync? (No.)
+
+§12.1 proposes shipping the ~11 GB surviving set with a mesh attestation. The
+obvious question a sceptic asks: *can a fresh node verify that set is correct on
+its own, cheaply, without downloading the 174 GB economic graph?* The honest
+answer is **no** — and it is worth being precise about why, because it is what
+forces the trust-then-audit model rather than a pure trustless shortcut.
+
+A UTXO set is correct iff **every** entry (a) was really created by some block
+(`created`) and (b) has **never** been spent since (`unspent`). Both halves must
+hold. They have very different costs:
+
+- **Proving `created` — possible, but not a shortcut.** Each surviving output can
+  carry a merkle proof to the PoW-committed merkle root of the block that created
+  it (the headers, Wisp/L0, are already synced and PoW-checked). That proves the
+  output once existed, trustlessly. But a merkle branch is ~log₂(txs-in-block)
+  hashes (~hundreds of bytes) *per UTXO*, and there are **166 M** of them — the
+  proofs in aggregate approach or exceed the size of the economic graph you were
+  trying to avoid downloading. It proves creation; it saves nothing.
+
+- **Proving `unspent` — impossible without processing every spend.** This is the
+  killer. To know an output was *never later spent*, you need a **non-membership
+  proof against the set of all spends** — "no block anywhere spent this coin".
+  **Bitcoin consensus commits to no UTXO set and no spent-set accumulator**, so
+  there is nothing to prove non-membership *against*. The only way to establish
+  that no block spent a given coin is to **look at every block's inputs** — i.e.
+  replay the spends of the entire chain, which is exactly processing the full
+  174 GB economic graph (§12). No commitment exists to shortcut it, and no
+  quantity of merkle-creation-proofs substitutes for it: creation proofs say a
+  coin was born, never that it is still alive.
+
+**Conclusion.** On Bitcoin as it is, you cannot independently verify a UTXO set
+without doing the full economic-graph sync. So the only way to be *usable in
+minutes* is to **trust** an attested commitment; the only way to be *trustless*
+is to **download and process the 174 GB**. GHAST's answer is to do both, in
+order:
+
+1. **Instantly trust** the mesh-attested commitment to the ~11 GB surviving set
+   → usable in minutes (measured in §13.1), trusting the live BFT mesh (§12.1)
+   rather than a hardcoded snapshot.
+2. **Run the full trustless GHAST sync in the background**, which simultaneously
+   (a) *earns* full trustlessness (Apparition/L2) and (b) **audits** the
+   attestation: the UTXO set reconstructed genesis→tip must equal the attested
+   set. Any mismatch is a detectable, attributable mesh fault (the attesting
+   elders signed it). Because the reconstruction is incremental, the audit can be
+   run *as the set grows* — surviving coins can be checked off against the
+   attested set continuously, not only at the end.
+
+The one thing you *cannot* do is skip the download and remain trustless. Trust is
+the price of speed here, and the background sync is what pays it back.
+
+### 13.1 Fast-start prototype results (measured crypto + modelled bandwidth)
+
+`ghast-bench` measures the fast-start path. **Measured:** SHA-256 throughput
+(used as the UTXO-commitment compute/verify rate — Bitcoin's assumeUTXO uses a
+muhash, a similar order of magnitude) and the real secp256k1 BFT attestation.
+**Modelled:** the ~11.4 GB download, reusing the §10 multi-peer bandwidth math.
+Figures use the §12 live-node measurement (11.4 GB surviving set, 166 M UTXOs)
+and the §10 assumptions (600 GB chain → 174 GB graph; 3 MB/s per peer; 100 Mbit
+& 1 Gbit tiers). Measured on this machine:
+
+- **SHA-256: 2.17 GB/s** single-thread → hashing the 11.4 GB set to compute (mesh
+  side) or verify (fresh-node side) the commitment takes **~5.3 s each**. (A
+  muhash / multi-core hash would be faster; this is a conservative upper bound.)
+- **BFT attestation, 8 elders (real Schnorr sigs):** sign **0.15 ms**, verify
+  **0.26 ms** total, wire size **544 bytes** (8 × 64-byte sig + 32-byte
+  commitment). Trivial, as expected.
+- Fast-start total = download(11.4 GB) + commitment verify (5.3 s) + BFT verify
+  (0.26 ms). The full trustless path is the §10 174 GB download + UTXO build.
+
+**Downlink tier: 100 Mbit (12.5 MB/s)**
+
+| Peers | Eff BW (MB/s) | dl 11.4 GB | Fast-start total | Full 174 GB | Fast vs full |
+|------:|--------------:|-----------:|-----------------:|------------:|-------------:|
+| 1 | 3.0 | 3,800 s | 63.4 min | 16.33 h | 15.4× |
+| 10 | 12.5 | 912 s | **15.3 min** | 4.08 h | 16.0× |
+| 20 | 12.5 | 912 s | 15.3 min | 4.08 h | 16.0× |
+| 40 | 12.5 | 912 s | 15.3 min | 4.08 h | 16.0× |
+
+**Downlink tier: 1 Gbit (125 MB/s)**
+
+| Peers | Eff BW (MB/s) | dl 11.4 GB | Fast-start total | Full 174 GB | Fast vs full |
+|------:|--------------:|-----------:|-----------------:|------------:|-------------:|
+| 1 | 3.0 | 3,800 s | 63.4 min | 16.33 h | 15.4× |
+| 10 | 30.0 | 380 s | 6.4 min | 1.83 h | 17.1× |
+| 20 | 60.0 | 190 s | 3.3 min | 1.02 h | 18.8× |
+| 30 | 90.0 | 127 s | 2.2 min | 0.75 h | 20.5× |
+| 40 | 120.0 | 95 s | **1.7 min** | 0.62 h (~37 min) | 22.2× |
+
+### 13.2 Verdict
+
+- **Fast-start is minutes, not tens of minutes.** On a 1 Gbit line with ~40
+  peers, a node is usable in **~1.7 min** (95 s download + 5.3 s commitment
+  hash + sub-ms sig checks) versus **~37 min** for the full trustless sync —
+  **~22× faster**. On a 100 Mbit line it is **~15 min** vs ~4 h, ~16× faster.
+- **The commitment verify is negligible next to the download.** Hashing 11.4 GB
+  (~5 s) and verifying 8 signatures (~0.26 ms) are rounding error; fast-start is
+  *entirely* a download-size win (11.4 GB vs 174 GB, ~15× less data). It is still
+  **downlink-bound** — same §10 ceiling; more peers past saturation add
+  resilience, not speed.
+- **The cost is a bounded trust window.** You trust the mesh attestation from
+  minute ~2 until the background 174 GB sync completes (~37 min on 1 Gbit, hours
+  on slower links) — after which the node is fully trustless *and* the
+  attestation has been audited. This is strictly better than assumeUTXO, whose
+  trust in a shipped snapshot hash never expires and is never audited.
+
+Assumptions/caveats: SHA-256 stands in for the real UTXO commitment (muhash) —
+same order, not identical; the 11.4 GB download reuses the §10 analytical model
+(no real sockets, TCP slow-start, per-peer variance, or stitching overhead); the
+BFT set is modelled as 8 independent Schnorr signers (a real Ghost attestation
+may use aggregate/threshold sigs, which would be *smaller and faster* than shown);
+"usable" here means "has the surviving UTXO set" — L1/Phantom trust semantics
+(§5) still apply until the background sig pass reaches L2/Apparition.

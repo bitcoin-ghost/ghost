@@ -26,6 +26,7 @@ use secp256k1::{
     ecdsa::Signature as EcdsaSig, schnorr::Signature as SchnorrSig, Keypair, Message, PublicKey,
     Secp256k1, SecretKey, XOnlyPublicKey,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -399,6 +400,9 @@ struct Config {
     peer_mbps: f64,           // per-peer serve bandwidth (MB/s)
     downlinks_mbps: Vec<f64>, // downlink tiers to model (MB/s)
     peers_sweep: Vec<usize>,  // peer counts to sweep
+    // Mesh-attested fast-start (§13): surviving UTXO set + BFT attestation.
+    surviving_gb: f64, // surviving UTXO set size (decimal GB) — §12 measurement
+    elders: usize,     // number of BFT mesh signers attesting the commitment
 }
 
 impl Default for Config {
@@ -422,6 +426,10 @@ impl Default for Config {
             peer_mbps: 3.0,
             downlinks_mbps: vec![12.5, 125.0],
             peers_sweep: vec![1, 10, 20, 30, 40],
+            // §12 live-node measurement: 11.4 GB surviving set, ~166 M UTXOs.
+            // 8 elders = a representative Ghost BFT signer set.
+            surviving_gb: 11.4,
+            elders: 8,
         }
     }
 }
@@ -468,6 +476,8 @@ fn parse_args() -> Config {
                     }
                 }
             }
+            "surviving-gb" => cfg.surviving_gb = fval.unwrap_or(cfg.surviving_gb),
+            "elders" => cfg.elders = val.unwrap_or(cfg.elders),
             _ => {}
         }
         i += 2;
@@ -578,6 +588,178 @@ fn run_bandwidth_model(cfg: &Config, cpu_mbps_measured: f64) {
 
 fn throughput(sigs: usize, d: Duration) -> f64 {
     sigs as f64 / d.as_secs_f64()
+}
+
+// ---------------------------------------------------------------------------
+// Mesh-attested fast-start (design §13).
+//
+// MEASURED here: (a) real SHA-256 hash throughput over an in-memory buffer, used
+// as the UTXO-commitment compute/verify rate (Bitcoin's assumeUTXO uses a
+// muhash, a similar order of magnitude); (b) real secp256k1 BFT attestation —
+// N elders each Schnorr-sign the 32-byte commitment; sign + verify timed.
+// MODELLED (reuses the §10 bandwidth math): downloading the ~11.4 GB surviving
+// UTXO set from N peers, bounded by the local downlink.
+//
+// Fast-start = download(surviving set) + verify commitment + verify N BFT sigs.
+// You TRUST the mesh-attested set to be usable immediately; the full trustless
+// 174 GB GHAST sync (§10) then runs in the BACKGROUND to earn trustlessness and
+// audit the attestation.
+// ---------------------------------------------------------------------------
+
+/// (effective MB/s, download seconds, saturated?) for `mb` from `n` peers.
+#[inline]
+fn dl_stats(mb: f64, n: usize, peer: f64, downlink: f64) -> (f64, f64, bool) {
+    let offered = n as f64 * peer;
+    let eff = offered.min(downlink);
+    (eff, mb / eff, offered >= downlink)
+}
+
+/// Measure real SHA-256 throughput (GB/s) over a representative buffer.
+fn measure_sha256_gbps() -> f64 {
+    let buf = vec![0xA5u8; 64 * 1024 * 1024]; // 64 MiB representative buffer
+    let iters = 4;
+    // warm-up
+    let mut h = Sha256::new();
+    h.update(&buf);
+    std::hint::black_box(h.finalize());
+    let start = Instant::now();
+    for _ in 0..iters {
+        let mut hasher = Sha256::new();
+        hasher.update(&buf);
+        std::hint::black_box(hasher.finalize());
+    }
+    let secs = start.elapsed().as_secs_f64();
+    let bytes = buf.len() as f64 * iters as f64;
+    bytes / secs / 1e9
+}
+
+/// N elders each produce a REAL Schnorr signature over the 32-byte commitment.
+/// Returns (sign_secs, verify_secs, attestation_bytes).
+fn measure_bft_attestation(
+    n: usize,
+    secp: &Secp256k1<secp256k1::All>,
+    commitment: &[u8; 32],
+) -> (f64, f64, usize) {
+    let mut rng = StdRng::seed_from_u64(0xE1DE7);
+    let keypairs: Vec<Keypair> = (0..n)
+        .map(|_| {
+            let mut sk = [0u8; 32];
+            rng.fill(&mut sk);
+            let sk = SecretKey::from_slice(&sk).unwrap_or_else(|_| SecretKey::from_slice(&[7u8; 32]).unwrap());
+            Keypair::from_secret_key(secp, &sk)
+        })
+        .collect();
+
+    let sign_start = Instant::now();
+    let sigs: Vec<SchnorrSig> = keypairs
+        .iter()
+        .map(|kp| secp.sign_schnorr_no_aux_rand(commitment, kp))
+        .collect();
+    let sign_secs = sign_start.elapsed().as_secs_f64();
+
+    let xonlys: Vec<XOnlyPublicKey> = keypairs.iter().map(|kp| kp.x_only_public_key().0).collect();
+    let verify_start = Instant::now();
+    let mut ok = 0usize;
+    for (sig, xo) in sigs.iter().zip(xonlys.iter()) {
+        if secp.verify_schnorr(sig, commitment, xo).is_ok() {
+            ok += 1;
+        }
+    }
+    let verify_secs = verify_start.elapsed().as_secs_f64();
+    assert_eq!(ok, n, "all BFT attestation sigs must verify");
+
+    // Attestation on the wire: N 64-byte Schnorr sigs + the 32-byte commitment.
+    let att_bytes = n * SCHNORR_SIG_BYTES + 32;
+    (sign_secs, verify_secs, att_bytes)
+}
+
+const SCHNORR_SIG_BYTES: usize = 64;
+
+fn run_fast_start(cfg: &Config, cpu_mbps_measured: f64, secp: &Secp256k1<secp256k1::All>) {
+    let surviving_mb = cfg.surviving_gb * 1e9 / 1e6;
+    let economic_full_mb = cfg.chain_gb * 1e9 * cfg.economic_ratio / 1e6;
+    let cpu_build_full_s = economic_full_mb / cpu_mbps_measured;
+
+    // --- Measured crypto -----------------------------------------------------
+    let hash_gbps = measure_sha256_gbps();
+    // Commitment compute (mesh side) and verify (fresh-node side): hash the whole
+    // surviving set once. Both are the same single-pass hash cost.
+    let commit_secs = cfg.surviving_gb / hash_gbps;
+    let commitment: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(b"ghast-utxo-commitment@height-956410");
+        h.finalize().into()
+    };
+    let (bft_sign_s, bft_verify_s, att_bytes) =
+        measure_bft_attestation(cfg.elders, secp, &commitment);
+
+    println!();
+    println!("============== MESH-ATTESTED FAST-START (design §13 model) ==============");
+    println!("Surviving UTXO set (from §12 live-node measurement):");
+    println!(
+        "  surviving set = {:.1} GB (~166 M UTXOs)  vs full economic graph {:.0} GB ({:.1}x smaller)",
+        cfg.surviving_gb,
+        economic_full_mb / 1000.0,
+        economic_full_mb / surviving_mb
+    );
+    println!("MEASURED crypto:");
+    println!(
+        "  SHA-256 throughput           = {:.2} GB/s (single-thread; muhash is similar order)",
+        hash_gbps
+    );
+    println!(
+        "  commitment compute / verify  = {:.2} s each (hash the {:.1} GB set once)",
+        commit_secs, cfg.surviving_gb
+    );
+    println!(
+        "  BFT attestation ({} elders)   = sign {:.3} ms, verify {:.3} ms, size {} bytes",
+        cfg.elders,
+        bft_sign_s * 1e3,
+        bft_verify_s * 1e3,
+        att_bytes
+    );
+    println!("  [network transfer = MODELLED §10 bandwidth math; hashing + sigs = MEASURED]");
+
+    let post_dl_cpu = commit_secs + bft_verify_s; // fresh-node verify after download
+
+    for &downlink in &cfg.downlinks_mbps {
+        println!();
+        println!(
+            "--- downlink tier: {:.1} MB/s ({:.0} Mbit/s) ---",
+            downlink,
+            downlink * 8.0
+        );
+        println!(
+            "{:>6} {:>13} {:>13} {:>17} {:>15} {:>14}",
+            "peers", "eff BW MB/s", "dl 11.4GB", "fast-start total", "full 174GB", "fast vs full"
+        );
+        println!("{}", "-".repeat(84));
+        for &n in &cfg.peers_sweep {
+            let (eff, dl_fast, _sat) = dl_stats(surviving_mb, n, cfg.peer_mbps, downlink);
+            let (_e2, dl_full, _s2) = dl_stats(economic_full_mb, n, cfg.peer_mbps, downlink);
+            let fast_total = dl_fast + post_dl_cpu;
+            let full_total = dl_full + cpu_build_full_s;
+            let speedup = full_total / fast_total;
+            println!(
+                "{:>6} {:>13.1} {:>10.0}s {:>13.0}s ({:>4.1}m) {:>11.0}s ({:>4.2}h) {:>11.1}x",
+                n,
+                eff,
+                dl_fast,
+                fast_total,
+                fast_total / 60.0,
+                full_total,
+                full_total / 3600.0,
+                speedup
+            );
+        }
+        println!("{}", "-".repeat(84));
+    }
+    println!();
+    println!("VERDICT (fast-start): trusting the mesh-attested {:.1} GB commitment makes a node", cfg.surviving_gb);
+    println!("usable in MINUTES vs the ~37 min full trustless sync — the commitment verify");
+    println!("({:.1} s hash + {:.3} ms sigs) is trivial next to the download. Still downlink-bound.", commit_secs, bft_verify_s * 1e3);
+    println!("TRUST WINDOW: you trust the mesh only until the background 174 GB GHAST sync");
+    println!("completes (which also AUDITS the attestation); after that the node is fully trustless.");
 }
 
 fn main() {
@@ -747,4 +929,7 @@ fn main() {
     // download model to give total time-to-usable(N).
     let cpu_mbps_measured = (economic_total as f64 / 1e6) / t_usable.as_secs_f64().max(1e-9);
     run_bandwidth_model(&cfg, cpu_mbps_measured);
+
+    // --- Mesh-attested fast-start (design §13) ------------------------------
+    run_fast_start(&cfg, cpu_mbps_measured, &secp);
 }
