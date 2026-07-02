@@ -480,6 +480,16 @@ log "Creating ghost user and directories"
 id ghost >/dev/null 2>&1 || useradd -r -m -d /home/ghost -s /bin/bash ghost
 mkdir -p /opt/ghost/bin /etc/ghost /etc/bitcoin /var/lib/bitcoin /var/lib/ghost /home/ghost/.ghost/data /home/ghost/.ghost/ghost-pay
 
+# Grant the operator read access to the service journals so that
+# `journalctl -u ghost-pool` works without sudo. When installed via `sudo bash`,
+# $SUDO_USER is the human who invoked it; add them to systemd-journal (a
+# read-only group). Root operators already see everything; a non-root sudo user
+# would otherwise get empty output and mistake it for "no logs".
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id "$SUDO_USER" >/dev/null 2>&1; then
+  usermod -aG systemd-journal "$SUDO_USER" 2>/dev/null \
+    && log "Granted ${SUDO_USER} journal read access (takes effect on next login; use 'sudo journalctl' until then)"
+fi
+
 # ─────────────────────── 3. download + verify binaries ───────────────────────
 log "Downloading and verifying binaries (${GHOST_VERSION})"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
@@ -1669,12 +1679,12 @@ cat <<EOF
 
   ✅ Bitcoin Ghost node installed.
      ${NODE_ID}
-     ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: journalctl -u ghostd -f)
+     ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: sudo journalctl -u ghostd -f)
      ghost-pool-gate: $(systemctl is-active ghost-pool-gate)  (waiting for sync, then auto-starts ghost-pool)
 
   ghost-pool starts AUTOMATICALLY once ghostd finishes syncing — then your node
   joins the mesh and registers as an Elder if slots remain (first 101).
-  Watch the gate:  journalctl -u ghost-pool-gate -f
+  Watch the gate:  sudo journalctl -u ghost-pool-gate -f
 EOF
 
 # Private modes need a miner password — show it now (and where it lives) so the

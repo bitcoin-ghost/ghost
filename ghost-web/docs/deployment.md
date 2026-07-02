@@ -366,7 +366,7 @@ If the log stops at `MAINNET SECURITY: …` — fix the mainnet hard-fail and re
 Within 1-2 minutes the node should:
 
 1. **Appear in `/api/v1/mesh/status`** on a peer node, with `last_seen` updating every 10 seconds.
-2. **Be receiving health pings** — `journalctl -u ghost-pool | grep "Received HealthPing"` should show entries.
+2. **Be receiving health pings** — `sudo journalctl -u ghost-pool | grep "Received HealthPing"` should show entries.
 3. **Have a registered Elder slot** if it's among the first 101 — visible via `/api/v1/mesh/elders`.
 
 Run `curl -s http://localhost:8080/api/v1/mining/status | jq` to see the local view. Run the same against any peer's public IP to compare.
@@ -394,7 +394,7 @@ The capability is verified by random L2-block-lookup challenges from peers. Pass
 
 | Symptom | First check |
 |---|---|
-| ghost-pool exits at startup | `journalctl -u ghost-pool -n 50` — most config errors are explicit |
+| ghost-pool exits at startup | `sudo journalctl -u ghost-pool -n 50` — most config errors are explicit |
 | Stuck at "Connecting to seed nodes" | Outbound 8559 not allowed by firewall, or seed nodes unreachable |
 | Mesh count = 0 | Inbound 8563 (Noise) or 8559 (discovery) blocked, or peer reachability problem |
 | Verification challenges all failing | HTTP API not reachable from peers, or `internal_api_secret` mismatch between this node and its peers |

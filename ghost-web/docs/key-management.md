@@ -237,7 +237,7 @@ ghost-pool --show-identity
 
 # 7. Start the node
 sudo systemctl start ghost-pool
-journalctl -u ghost-pool -f --since "1 min ago"
+sudo journalctl -u ghost-pool -f --since "1 min ago"
 ```
 
 Within ~60 seconds the new identity should appear in peer mesh databases. Check from a peer:

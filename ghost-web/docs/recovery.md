@@ -27,7 +27,7 @@ A peer with `last_seen` more than 60 seconds old isn't pinging the mesh. More th
 ```bash
 sudo systemctl restart ghost-pool
 sudo systemctl restart ghost-pay
-journalctl -u ghost-pool -f --since "1 min ago" | grep -i "peer\|connect"
+sudo journalctl -u ghost-pool -f --since "1 min ago" | grep -i "peer\|connect"
 ```
 
 Watch for "connected to peer" lines. If they appear, the node has rejoined the mesh.
@@ -57,7 +57,7 @@ sudo systemctl restart ghost-pool
 sudo systemctl restart ghost-pay
 
 # Verify quorum restored:
-journalctl -u ghost-pool -f | grep -i "voting\|quorum\|payout"
+sudo journalctl -u ghost-pool -f | grep -i "voting\|quorum\|payout"
 ```
 
 Within ~30 seconds you should see voting sessions completing. Pending payouts will fire on the next confirmed block.
@@ -88,7 +88,7 @@ ls /home/ghost/.ghost/mpc_params/unshield_vk.bin
 
 # 7. Start services
 sudo systemctl start ghost-pool ghost-pay
-journalctl -u ghost-pool -f | grep -i "peer\|connect\|elder"
+sudo journalctl -u ghost-pool -f | grep -i "peer\|connect\|elder"
 ```
 
 The replacement node uses the same node_id as the lost one, so its Elder slot is preserved. The mesh discovery protocol reconnects it within ~60 seconds.
@@ -214,10 +214,10 @@ The blast radius of this scenario is the reason MPC backups should be the most p
 
 ```bash
 # Count voting timeouts in the last 30 min
-journalctl -u ghost-pool --since "30 min ago" | grep -c "VotingSession timed out"
+sudo journalctl -u ghost-pool --since "30 min ago" | grep -c "VotingSession timed out"
 
 # Check connected peer count (in a full mesh this is total elders minus 1)
-journalctl -u ghost-pool --since "1 min ago" | grep "connected_peers"
+sudo journalctl -u ghost-pool --since "1 min ago" | grep "connected_peers"
 ```
 
 **Recover (short partition <1 h):**
@@ -318,8 +318,8 @@ sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA integrity_check"
 sqlite3 /home/ghost/.ghost/ghost.db "PRAGMA wal_checkpoint(TRUNCATE)"
 
 # Recent logs
-journalctl -u ghost-pool -f --since "5 min ago"
-journalctl -u ghost-pay  -f --since "5 min ago"
+sudo journalctl -u ghost-pool -f --since "5 min ago"
+sudo journalctl -u ghost-pay  -f --since "5 min ago"
 
 # Service control
 sudo systemctl restart ghost-pool
