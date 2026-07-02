@@ -1,11 +1,12 @@
-# Design: Progressive Hazed Sync
+# Design: GHAST Block Download (GBD)
 
-> **Status:** Draft / theoretical. No implementation, no consensus change. This
-> captures a line of thinking about a faster, less-trusting initial block
-> download (IBD) built on Ghost Haze, so the ideas are recorded and can be
-> argued about before anyone writes code.
+> **GHAST** = **Gh**ost + f**ast**, and a mirror of Bitcoin's IBD (Initial Block
+> Download). A faster, less-trusting block download built on Ghost Haze: sync the
+> hazed economic graph fast, then progressively complete validation.
 >
-> **Codename:** provisional — see [Naming](#naming-open).
+> **Status:** Draft / theoretical. No implementation, no consensus change — this
+> records the idea so it can be argued about, plus a prototype to test the core
+> speed hypothesis before committing to it.
 
 ## 1. Motivation
 
@@ -174,12 +175,11 @@ trust with deferred verification".
 5. **Pool safety window.** Exactly how deep before `assumevalid`-style trust is
    acceptable; the recent window stays fully validated.
 
-## 8. Naming (open)
+## 8. Naming
 
-The passes and the overall process want Ghost-house names (cf. Haze, Shroud,
-Wraith, Reaper, Elder, Quasar). To be decided together — candidates and the
-final choice go here.
-
-- Overall process: _TBD_
-- The progressive fill / "block materialises more each pass": _TBD_
-- The individual passes (headers / economic / signatures): _TBD_
+- **Process:** **GHAST Block Download** (GBD) — Ghost + fast; the Ghost analogue
+  of Bitcoin's IBD.
+- **Safety levels** (provisional — a ghost gaining corporeality): **Wisp** (L0,
+  headers/PoW) → **Phantom** (L1, economic graph — double-spend-safe,
+  authorisation trusted) → **Apparition** (L2, signatures verified — fully real).
+- Individual passes: descriptive for now (header / economic / signature).
