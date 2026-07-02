@@ -98,7 +98,7 @@ jobs:
       - name: Build ghostd (Linux release only)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          cmake -B ghost-core/build \
+          cmake -S ghost-core -B ghost-core/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DWITH_ZMQ=ON \
             -DBUILD_TESTS=OFF \
