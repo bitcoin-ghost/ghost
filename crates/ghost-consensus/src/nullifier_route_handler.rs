@@ -30,7 +30,7 @@ use ghost_zkp::{
 use crate::epoch_manager::{EpochManager, PROPOSER_GRACE_SECS};
 use crate::mesh::MessageHandler;
 use crate::message::{
-    L2CheckpointBlockMessage, L2CheckpointVoteMessage, L2ConfidentialTransferMessage,
+    L2CheckpointBlockMessage, L2CheckpointVoteMessage, L2ConfidentialTransferMessage, L2EpochSync,
     L2NoteGapRequest, L2NoteGapResponse, L2Transaction, L2TransferBroadcastMessage,
     L2TransferConfirmationMessage, L2TreeSyncRequest, L2TreeSyncResponse, MessageEnvelope,
     MessageType, ShieldCommitment,
@@ -1566,6 +1566,42 @@ impl NullifierRouteHandler {
             }
         }
 
+        // Attach the parent epoch record for every epoch referenced by the
+        // checkpoints being sent. The requesting node upserts these BEFORE
+        // persisting the checkpoints so the l2_checkpoints.epoch -> l2_epochs
+        // FK is satisfied even when this batch starts past an epoch boundary
+        // (the requester may never have replayed the boundary transition that
+        // would otherwise create the epoch row locally).
+        let mut epochs: Vec<L2EpochSync> = Vec::new();
+        let mut seen_epochs = std::collections::HashSet::new();
+        for block in &checkpoint_blocks {
+            if !seen_epochs.insert(block.epoch) {
+                continue;
+            }
+            match self.db.get_l2_epoch(block.epoch) {
+                Ok(Some(rec)) => epochs.push(L2EpochSync {
+                    epoch: rec.epoch,
+                    start_height: rec.start_height,
+                    end_height: rec.end_height,
+                    initial_root: rec.initial_root,
+                    final_root: rec.final_root,
+                    notes_migrated: rec.notes_migrated,
+                    status: rec.status,
+                }),
+                Ok(None) => {
+                    // Our own checkpoint references an epoch we don't have —
+                    // should not happen, but don't fail the whole sync.
+                    warn!(
+                        epoch = block.epoch,
+                        "Tree sync: local epoch record missing for checkpoint being sent"
+                    );
+                }
+                Err(e) => {
+                    warn!(epoch = block.epoch, error = %e, "Tree sync: failed to load epoch record");
+                }
+            }
+        }
+
         // Use checkpoint_base_root (last finalized canonical root) instead of current_root()
         // which includes pending shields. This gives the requesting node a stable target
         // to verify against after replaying the checkpoints.
@@ -1576,6 +1612,7 @@ impl NullifierRouteHandler {
             checkpoints: checkpoint_blocks,
             current_epoch: self.epoch_manager.current_epoch(),
             commitment_root: canonical_root,
+            epochs,
             has_more,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
         };
@@ -1653,9 +1690,50 @@ impl NullifierRouteHandler {
             }
         }
 
+        // Materialise the parent epoch rows BEFORE replaying any checkpoint.
+        // Checkpoints foreign-key l2_checkpoints.epoch -> l2_epochs.epoch; a
+        // fresh node that starts syncing past an epoch boundary (pruned early
+        // checkpoints, or a dropped boundary batch) never replayed the local
+        // transition that would create those epoch rows. Upserting the peer's
+        // authoritative epoch records here satisfies the FK legitimately
+        // instead of tripping the trigger on every sync round.
+        for epoch in &response.epochs {
+            let record = ghost_storage::L2EpochRecord {
+                epoch: epoch.epoch,
+                start_height: epoch.start_height,
+                end_height: epoch.end_height,
+                initial_root: epoch.initial_root,
+                final_root: epoch.final_root,
+                notes_migrated: epoch.notes_migrated,
+                status: epoch.status.clone(),
+            };
+            self.db.upsert_l2_epoch(&record)?;
+        }
+
         // Replay checkpoint blocks in order
+        let mut last_applied_root: Option<[u8; 32]> = None;
         for block in &response.checkpoints {
             let height = block.height;
+
+            // Defence in depth: if a checkpoint's parent epoch is still absent
+            // (e.g. a peer predating the `epochs` field, or a malformed batch),
+            // DEFER rather than force the insert and trip the FK trigger every
+            // round. Stop at the first unsatisfiable checkpoint — later ones in
+            // the batch would cascade — and return cleanly so the mesh does not
+            // log a handler error. The next sync round (from an upgraded peer)
+            // supplies the epoch and replay resumes from here.
+            match self.db.get_l2_epoch(block.epoch) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    warn!(
+                        height,
+                        epoch = block.epoch,
+                        "Tree sync: deferring checkpoint — parent epoch not yet available"
+                    );
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
 
             // Apply shield commitments first (they may be needed for tx roots)
             for sc in &block.shield_commitments {
@@ -1721,11 +1799,14 @@ impl NullifierRouteHandler {
                 state.finalized = true;
                 state.checkpoint_hash = canonical_root;
             }
+
+            last_applied_root = Some(canonical_root);
         }
 
-        // Update checkpoint base root to the last replayed checkpoint's canonical root
-        if let Some(last) = response.checkpoints.last() {
-            *self.checkpoint_base_root.write() = last.new_commitment_root;
+        // Update checkpoint base root to the last checkpoint we actually applied
+        // (not response.checkpoints.last(), which may have been deferred above).
+        if let Some(root) = last_applied_root {
+            *self.checkpoint_base_root.write() = root;
         }
 
         // Pagination follow-up: if peer has more checkpoints, request next batch
@@ -2971,6 +3052,153 @@ mod tests {
         // The late proposal should not produce a vote (already finalized returns early)
         // or if it does, the finalized flag should block supersede
         let _ = vote_result; // Result doesn't matter as long as state is preserved
+    }
+
+    /// Regression (l2-checkpoint-epoch-fk): a freshly-joined node whose
+    /// `l2_epochs` only contains genesis (epoch 0) receives a tree-sync batch
+    /// whose checkpoints reference a higher epoch it never replayed the
+    /// boundary for. The parent epoch rows now travel in the response, so the
+    /// checkpoint persists and the `l2_checkpoints.epoch -> l2_epochs.epoch` FK
+    /// is satisfied — no FK-violation error, no infinite re-attempt loop. When
+    /// the epoch is absent from the payload (a peer predating the field), the
+    /// checkpoint is DEFERRED rather than force-inserted, and the FK trigger is
+    /// still enforced against a genuinely orphan checkpoint.
+    #[test]
+    fn test_tree_sync_materialises_missing_epoch() {
+        use ghost_common::identity::NodeIdentity;
+
+        // Proposer identity — signs the checkpoint so the joining node accepts it.
+        let proposer = NodeIdentity::generate();
+        let proposer_id = proposer.node_id();
+
+        // Checkpoint for epoch 5 at a non-boundary height (epoch_length = 100).
+        let mut block = L2CheckpointBlockMessage {
+            height: 550,
+            epoch: 5,
+            prev_commitment_root: [0u8; 32],
+            new_commitment_root: [0xAB; 32],
+            transactions: vec![],
+            shield_commitments: vec![],
+            active_node_count: 1,
+            proposer: proposer_id,
+            proposer_signature: [0u8; 64],
+            timestamp: 0,
+            epoch_transition: None,
+        };
+        block.proposer_signature = proposer.sign(&block.to_signable_bytes());
+
+        let epoch5 = L2EpochSync {
+            epoch: 5,
+            start_height: 500,
+            end_height: None,
+            initial_root: [0x11; 32],
+            final_root: None,
+            notes_migrated: 0,
+            status: "active".to_string(),
+        };
+
+        // Fresh joining node: only genesis epoch 0 present.
+        let make_node = || {
+            let identity = NodeIdentity::generate();
+            let db = Arc::new(Database::in_memory().expect("in-memory db"));
+            let config = EpochManagerConfig {
+                epoch_length: 100,
+                transition_window: 10,
+                tree_depth: 4,
+                max_valid_roots: 16,
+            };
+            let epoch_mgr = Arc::new(EpochManager::new(db.clone(), config));
+            epoch_mgr.initialize_genesis().unwrap();
+            let handler = NullifierRouteHandler::with_defaults(
+                identity.node_id(),
+                epoch_mgr.clone(),
+                db.clone(),
+            );
+            handler.set_sign_fn(Arc::new(move |msg: &[u8]| identity.sign(msg)));
+            (db, handler)
+        };
+
+        // --- Case 1: epoch supplied in payload -> checkpoint persists, no error ---
+        let (db_ok, handler_ok) = make_node();
+        assert!(
+            db_ok.get_l2_epoch(5).unwrap().is_none(),
+            "epoch 5 should be absent before sync"
+        );
+        let response = L2TreeSyncResponse {
+            responding_node: proposer_id,
+            checkpoints: vec![block.clone()],
+            current_epoch: 5,
+            commitment_root: block.new_commitment_root,
+            epochs: vec![epoch5.clone()],
+            has_more: false,
+            timestamp: 0,
+        };
+        // Must NOT return a FK-violation error (that is the bug being fixed).
+        handler_ok
+            .handle_tree_sync_response(&response)
+            .expect("sync carrying the parent epoch must succeed");
+        assert!(
+            db_ok.get_l2_epoch(5).unwrap().is_some(),
+            "epoch 5 must be materialised from the payload"
+        );
+        let cps = db_ok.get_l2_checkpoints_from_height(550, 10).unwrap();
+        assert_eq!(cps.len(), 1, "checkpoint must be persisted");
+        assert_eq!(cps[0].epoch, 5);
+
+        // Replaying the SAME response again must remain error-free and idempotent
+        // (no FK violation, no PK conflict on the epoch upsert) — proves there is
+        // no re-attempt error loop across sync rounds.
+        handler_ok
+            .handle_tree_sync_response(&response)
+            .expect("re-replay must stay error-free");
+        assert_eq!(
+            db_ok.get_l2_checkpoints_from_height(550, 10).unwrap().len(),
+            1,
+            "re-replay must not duplicate the checkpoint"
+        );
+
+        // --- Case 2: epoch missing from payload -> deferred, not force-inserted ---
+        let (db_defer, handler_defer) = make_node();
+        let response_no_epoch = L2TreeSyncResponse {
+            responding_node: proposer_id,
+            checkpoints: vec![block.clone()],
+            current_epoch: 5,
+            commitment_root: block.new_commitment_root,
+            epochs: vec![], // peer predating the `epochs` field
+            has_more: false,
+            timestamp: 0,
+        };
+        // No FK-violation error surfaces (returns Ok), so the mesh logs no
+        // "Handler error" and the round does not spam — it defers instead.
+        handler_defer
+            .handle_tree_sync_response(&response_no_epoch)
+            .expect("must defer cleanly rather than error");
+        assert!(
+            db_defer.get_l2_epoch(5).unwrap().is_none(),
+            "epoch must not be fabricated when the peer did not supply it"
+        );
+        assert!(
+            db_defer
+                .get_l2_checkpoints_from_height(550, 10)
+                .unwrap()
+                .is_empty(),
+            "orphan checkpoint must be deferred, not persisted"
+        );
+
+        // --- FK still enforced: a genuinely orphan checkpoint is rejected ---
+        let orphan = ghost_storage::L2CheckpointRecord {
+            height: 550,
+            epoch: 5,
+            commitment_root: [0xAB; 32],
+            tx_count: 0,
+            proposer_id: hex::encode(proposer_id),
+            active_node_count: 1,
+            block_data: vec![],
+        };
+        assert!(
+            db_defer.upsert_l2_checkpoint(&orphan).is_err(),
+            "FK trigger must still reject a checkpoint with no parent epoch"
+        );
     }
 
     /// Test that a transfer with an invalid (wrong) commitment root is rejected

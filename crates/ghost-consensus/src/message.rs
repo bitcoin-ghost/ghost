@@ -1526,10 +1526,48 @@ pub struct L2TreeSyncResponse {
     /// Current commitment root for verification
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub commitment_root: [u8; 32],
+    /// Epoch records for every epoch referenced by the checkpoints above.
+    ///
+    /// Sent so a joining node can materialise the parent `l2_epochs` rows
+    /// BEFORE persisting checkpoints that reference them, satisfying the
+    /// `l2_checkpoints.epoch -> l2_epochs.epoch` foreign-key trigger even when
+    /// the batch begins past an epoch boundary (e.g. early checkpoints were
+    /// pruned, or a prior boundary batch was dropped). Without this, a fresh
+    /// node relied on locally re-deriving epoch rows by replaying every
+    /// boundary in sequence — any gap left the epoch row missing and every
+    /// sync round re-failed the FK. `#[serde(default)]` keeps wire-compat with
+    /// peers that predate this field.
+    #[serde(default)]
+    pub epochs: Vec<L2EpochSync>,
     /// Whether there are more checkpoints to sync
     pub has_more: bool,
     /// Timestamp
     pub timestamp: u64,
+}
+
+/// L2: Epoch metadata carried inside a tree-sync response.
+///
+/// Mirrors `ghost_storage::L2EpochRecord` on the wire (hex-encoded roots) so a
+/// joining node can upsert the parent epoch row for each synced checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2EpochSync {
+    /// Epoch number
+    pub epoch: u64,
+    /// First checkpoint height of this epoch
+    pub start_height: u64,
+    /// Last checkpoint height of this epoch (None while active)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_height: Option<u64>,
+    /// Commitment root at epoch start
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub initial_root: [u8; 32],
+    /// Commitment root at epoch end (None while active)
+    #[serde(default, with = "ghost_common::serde_hex::option_bytes32")]
+    pub final_root: Option<[u8; 32]>,
+    /// Number of notes migrated into this epoch at compaction
+    pub notes_migrated: u64,
+    /// Lifecycle status ("active" | "archived")
+    pub status: String,
 }
 
 /// L2: Note gap request — sent when tree sync replay didn't fix root mismatch.

@@ -66,4 +66,16 @@ ignore = [
     # TDP coinbase construction — i.e. it is gated on a deliberate Bitcoin Core
     # version migration. Re-evaluate when that migration happens.
     "RUSTSEC-2025-0143",  # capnp (unsound) — unreachable; fix gated on a Bitcoin Core IPC version migration
+    # --- quick-xml DoS (RUSTSEC-2026-0194 + -0195): reviewed, GUI/macOS-bundling only. ---
+    # Two DoS advisories (quadratic run time on duplicate start-tag attributes;
+    # unbounded namespace-declaration allocation in NsReader). quick-xml is pulled
+    # ONLY via `plist` (Apple .plist parsing) in the desktop / macOS app-bundling
+    # path — not in any shipped node binary (ghost-pool / translator_sv2 / pool_sv2
+    # / ghost-pay / ghostd; confirmed via cargo tree — no host-target dependents).
+    # `plist` reads local, trusted property lists, never untrusted network input, so
+    # the DoS is unreachable in ghost's usage. The fix (quick-xml >= 0.41) is
+    # upstream-gated: the latest `plist` (1.9.0) still pins quick-xml 0.39, so there
+    # is no patched version to adopt. Re-evaluate when `plist` moves to quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",  # quick-xml (DoS) — GUI/macOS-bundling only via plist, unreachable; fix upstream-gated
+    "RUSTSEC-2026-0195",  # quick-xml (DoS) — same: GUI/macOS-bundling only via plist, unreachable; fix upstream-gated
 ]
