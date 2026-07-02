@@ -2,7 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/bitcoin-ghost/ghost/ci.yml?label=CI)](https://github.com/bitcoin-ghost/ghost/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.10.17-informational)
+[![Version](https://img.shields.io/github/v/release/bitcoin-ghost/ghost?label=version)](https://github.com/bitcoin-ghost/ghost/releases/latest)
 
 Bitcoin Ghost is a Bitcoin mainnet project built around a Bitcoin Core fork
 (`ghostd`) and a decentralised mining pool (`ghost-pool`). Nodes form a
@@ -14,7 +14,7 @@ includes an L2 payments layer (`ghost-pay`) and a CoinJoin privacy protocol
 
 - **Website:** <https://bitcoinghost.org>
 - **Documentation:** <https://bitcoinghost.org/docs/>
-- **Current version:** 1.10.17
+- **Latest release:** <https://github.com/bitcoin-ghost/ghost/releases/latest>
 
 ## Components
 
