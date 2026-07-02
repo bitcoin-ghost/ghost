@@ -386,12 +386,19 @@ fn bench<F: FnMut() -> u64>(runs: usize, mut f: F) -> Duration {
 // ---------------------------------------------------------------------------
 
 struct Config {
+    // CPU benchmark (measured) workload.
     blocks: usize,
     txs_per_block: usize,
     inputs_per_tx: usize,
     outputs_per_tx: usize,
     runs: usize,
     seed: u64,
+    // Multi-peer parallel-fetch model (analytical bandwidth math + measured CPU).
+    chain_gb: f64,            // total full-block data of a realistic chain (decimal GB)
+    economic_ratio: f64,      // economic-only fraction of full blocks (hazed strip)
+    peer_mbps: f64,           // per-peer serve bandwidth (MB/s)
+    downlinks_mbps: Vec<f64>, // downlink tiers to model (MB/s)
+    peers_sweep: Vec<usize>,  // peer counts to sweep
 }
 
 impl Default for Config {
@@ -404,8 +411,26 @@ impl Default for Config {
             outputs_per_tx: 2,
             runs: 3,
             seed: 1,
+            // ASSUMPTIONS (all CLI-overridable, all echoed in the output):
+            //  - ~600 GB of Bitcoin full-block data today.
+            //  - economic-only ratio ~0.29 (from the §9 hazed measurement:
+            //    the witness/sig column is ~71% of block bytes).
+            //  - 3 MB/s (= 24 Mbit/s) per peer connection.
+            //  - two downlink tiers: 100 Mbit (~12.5 MB/s), 1 Gbit (~125 MB/s).
+            chain_gb: 600.0,
+            economic_ratio: 0.29,
+            peer_mbps: 3.0,
+            downlinks_mbps: vec![12.5, 125.0],
+            peers_sweep: vec![1, 10, 20, 30, 40],
         }
     }
+}
+
+fn parse_f64_list(s: &str) -> Vec<f64> {
+    s.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect()
+}
+fn parse_usize_list(s: &str) -> Vec<usize> {
+    s.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).collect()
 }
 
 fn parse_args() -> Config {
@@ -414,7 +439,9 @@ fn parse_args() -> Config {
     let mut i = 0;
     while i < args.len() {
         let key = args[i].trim_start_matches("--");
-        let val = args.get(i + 1).and_then(|s| s.parse::<usize>().ok());
+        let raw = args.get(i + 1);
+        let val = raw.and_then(|s| s.parse::<usize>().ok());
+        let fval = raw.and_then(|s| s.parse::<f64>().ok());
         match key {
             "blocks" => cfg.blocks = val.unwrap_or(cfg.blocks),
             "txs" | "txs-per-block" => cfg.txs_per_block = val.unwrap_or(cfg.txs_per_block),
@@ -422,11 +449,131 @@ fn parse_args() -> Config {
             "outputs" | "outputs-per-tx" => cfg.outputs_per_tx = val.unwrap_or(cfg.outputs_per_tx),
             "runs" => cfg.runs = val.unwrap_or(cfg.runs),
             "seed" => cfg.seed = val.map(|v| v as u64).unwrap_or(cfg.seed),
+            "chain-gb" => cfg.chain_gb = fval.unwrap_or(cfg.chain_gb),
+            "economic-ratio" => cfg.economic_ratio = fval.unwrap_or(cfg.economic_ratio),
+            "peer-mbps" => cfg.peer_mbps = fval.unwrap_or(cfg.peer_mbps),
+            "downlinks-mbps" => {
+                if let Some(s) = raw {
+                    let l = parse_f64_list(s);
+                    if !l.is_empty() {
+                        cfg.downlinks_mbps = l;
+                    }
+                }
+            }
+            "peers" => {
+                if let Some(s) = raw {
+                    let l = parse_usize_list(s);
+                    if !l.is_empty() {
+                        cfg.peers_sweep = l;
+                    }
+                }
+            }
             _ => {}
         }
         i += 2;
     }
     cfg
+}
+
+// ---------------------------------------------------------------------------
+// Multi-peer parallel-fetch model (design §10).
+//
+// MEASURED: the CPU throughput of the header+UTXO passes (MB of economic graph
+// verified per second), taken from the real time-to-usable run on the synthetic
+// segment.
+// MODELLED (analytical, NOT a real network): downloading the hazed economic
+// graph from N peers, each serving `peer_mbps`, bounded by the local downlink.
+//
+// Integrity of each fetched height-range is checked CRYPTOGRAPHICALLY against
+// its own header-PoW-committed merkle root — NOT by peer agreement — so a lying
+// peer's range simply fails its merkle check and is re-requested elsewhere. Peer
+// count buys SPEED + RESILIENCE, never trust.
+// ---------------------------------------------------------------------------
+
+fn run_bandwidth_model(cfg: &Config, cpu_mbps_measured: f64) {
+    let economic_bytes = cfg.chain_gb * 1e9 * cfg.economic_ratio; // decimal GB
+    let economic_mb = economic_bytes / 1e6;
+    let full_mb = cfg.chain_gb * 1e9 / 1e6;
+    // CPU (measured throughput) applied to the modelled real economic size.
+    let cpu_time_s = economic_mb / cpu_mbps_measured;
+
+    println!();
+    println!("============== MULTI-PEER PARALLEL FETCH (design §10 model) ==============");
+    println!("ASSUMED rates (all --overridable):");
+    println!(
+        "  chain full-block data    = {:.0} GB  (economic ratio {:.2} -> {:.0} GB hazed graph)",
+        cfg.chain_gb,
+        cfg.economic_ratio,
+        economic_mb / 1000.0
+    );
+    println!(
+        "  per-peer serve bandwidth = {:.1} MB/s ({:.0} Mbit/s) per connection",
+        cfg.peer_mbps,
+        cfg.peer_mbps * 8.0
+    );
+    println!(
+        "  bytes to move: full IBD  = {:.0} GB   vs hazed {:.0} GB ({:.0}% less to download)",
+        full_mb / 1000.0,
+        economic_mb / 1000.0,
+        (1.0 - cfg.economic_ratio) * 100.0
+    );
+    println!(
+        "MEASURED CPU: header+UTXO passes verify {:.0} MB/s of economic graph (from §9 run)",
+        cpu_mbps_measured
+    );
+    println!(
+        "  -> modelled CPU time to build UTXO for the {:.0} GB hazed graph = {:.0} s ({:.2} h)",
+        economic_mb / 1000.0,
+        cpu_time_s,
+        cpu_time_s / 3600.0
+    );
+    println!("  [network transfer = MODELLED bandwidth math; CPU rate = MEASURED]");
+
+    for &downlink in &cfg.downlinks_mbps {
+        println!();
+        println!(
+            "--- downlink tier: {:.1} MB/s ({:.0} Mbit/s) ---",
+            downlink,
+            downlink * 8.0
+        );
+        println!(
+            "{:>6} {:>13} {:>13} {:>11} {:>10} {:>19}",
+            "peers", "eff BW MB/s", "download", "dl speedup", "saturated", "total to-usable"
+        );
+        println!("{}", "-".repeat(76));
+        let base_eff = cfg.peer_mbps.min(downlink); // N=1 baseline
+        let base_dl = economic_mb / base_eff;
+        for &n in &cfg.peers_sweep {
+            let offered = n as f64 * cfg.peer_mbps;
+            let eff = offered.min(downlink);
+            let dl_time = economic_mb / eff;
+            let saturated = offered >= downlink;
+            let speedup = base_dl / dl_time;
+            // Serial upper bound: download then verify (conservative; pipelined
+            // they overlap toward max(dl, cpu) — noted in the doc).
+            let total = dl_time + cpu_time_s;
+            println!(
+                "{:>6} {:>13.1} {:>11.0}s {:>10.2}x {:>10} {:>12.0}s ({:.2} h)",
+                n,
+                eff,
+                dl_time,
+                speedup,
+                if saturated { "yes" } else { "no" },
+                total,
+                total / 3600.0
+            );
+        }
+        let sat_peers = (downlink / cfg.peer_mbps).ceil() as usize;
+        println!("{}", "-".repeat(76));
+        println!(
+            "  downlink saturates at ceil({:.1}/{:.1}) = {} peers; beyond that, added peers buy 0 speed (only resilience).",
+            downlink, cfg.peer_mbps, sat_peers
+        );
+    }
+    println!();
+    println!("VERDICT (multi-peer): parallelism is linear ONLY until the downlink saturates.");
+    println!("'How fast can we get' is bounded by YOUR pipe, not peer count. Extra peers past");
+    println!("saturation give resilience (drop a slow/lying peer, re-request its range), not speed.");
 }
 
 fn throughput(sigs: usize, d: Duration) -> f64 {
@@ -593,4 +740,11 @@ fn main() {
         );
         println!("    The GHAST wins are DEFERRAL and BANDWIDTH, not the batching.");
     }
+
+    // --- Multi-peer parallel-fetch model (design §10) -----------------------
+    // Measured CPU throughput of the header+UTXO passes on the synthetic
+    // segment: economic MB processed per second. Fed into the analytical
+    // download model to give total time-to-usable(N).
+    let cpu_mbps_measured = (economic_total as f64 / 1e6) / t_usable.as_secs_f64().max(1e-9);
+    run_bandwidth_model(&cfg, cpu_mbps_measured);
 }

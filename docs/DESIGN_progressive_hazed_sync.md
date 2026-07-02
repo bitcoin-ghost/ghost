@@ -74,6 +74,10 @@ hazed blocks come **only from Ghost mesh peers**. This is therefore a fast
 *mesh bootstrap*, not a general Bitcoin-network sync. The backfill (step 4) is
 what re-anchors the node to the wider network trustlessly.
 
+Because the hazed economic pass is bandwidth-bound (confirmed by the prototype,
+§9.3), it parallelises across mesh peers by height range — see **§10 Multi-peer
+parallel fetch** for the design and measured sweep.
+
 ## 4. Idea B — Columnar, multi-pass validation
 
 Instead of validating each block fully before moving on (row-wise), decompose
@@ -250,7 +254,9 @@ small enough that per-block parallel passes leave cores idle. So Idea B (§4) is
   ~71 % of block bytes on this (inscription-era-shaped) workload, giving a
   3.49× economic-only bandwidth reduction. This backs Idea A (§3) and answers
   open question §7.2: separating + deferring the witness column is a large, real
-  win, independent of any CPU batching.
+  win, independent of any CPU batching. Bandwidth being the true bottleneck is
+  what motivates **§10 (multi-peer parallel fetch)** — it parallelises across
+  peers where the CPU passes cannot.
 - **Not supported — columnar batching as a CPU win (Idea B, §4).** At real
   full-block sizes it is ~parity with what Bitcoin Core already does. The design
   should present Idea B honestly as "no worse, and it enables the streaming
@@ -267,3 +273,120 @@ real disk-backed coin DB is slower); Schnorr measured as per-signature parallel
 verify, not libsecp256k1's experimental aggregate `schnorrsig_verify_batch`
 (not exposed by rust-secp256k1 0.30 — a true batch check would make Schnorr
 faster than shown).
+
+## 10. Multi-peer parallel fetch
+
+The prototype (§9) settles which layer is actually the bottleneck: **not CPU**.
+At real full-block sizes, signature verification already saturates all cores
+(§9.2) and the UTXO/economic pass is trivially cheap (§9.1: ~223 MB/s of
+economic graph, ~13 min of CPU for the whole 174 GB hazed graph). What is left,
+and what dominates time-to-usable in the real world, is **downloading the hazed
+economic graph** — a bandwidth problem. See §9.3: the two supported wins are
+deferral and bandwidth, and this section attacks the bandwidth one.
+
+**Bandwidth parallelises across peers where CPU does not help.** A fresh node
+fetches **different height ranges from N peers concurrently** and stitches them
+together. This is the natural refinement of Idea A (§3, hazed economic pass) and
+Idea B (§4, columnar passes): a columnar store is exactly what lets you request
+"the economic column for heights `[a, b)`" from one peer while another serves
+`[b, c)`.
+
+### 10.1 Integrity is cryptographic, not by peer vote
+
+Each fetched range is verified against **its own header-PoW-committed merkle
+root**. The headers (Wisp / L0, §5) are synced and PoW-checked first, so every
+block's merkle root is already known and pinned by the most-work chain *before*
+any economic data is pulled. The hazed economic graph for a range either hashes
+up to the committed merkle root for those heights or it does not. Integrity is
+therefore checked **cryptographically, per range, against work the attacker
+cannot forge** — the §5 guarantees (PoW trustless, double-spend trustless)
+applied per-range.
+
+**We explicitly reject "trust by N-peer agreement".** Deciding a range is
+correct because several peers returned the same bytes is:
+
+- **Sybil/eclipse-game-able** — an attacker who supplies your peers (or your
+  view of them) manufactures the "agreement" for free; and
+- **strictly weaker and redundant** — PoW + merkle already settles integrity
+  trustlessly and for free, so a vote adds nothing on top of it.
+
+Peer agreement's only genuine value is **speed** (parallel download) and
+**resilience** (a peer whose range fails its merkle check, or that is simply
+slow, is dropped and that range re-requested elsewhere — no single peer can
+stall or corrupt the sync). It cannot settle the one thing that *is* genuinely
+deferred: **signature authorisation** (§5, Apparition / L2). No number of
+agreeing peers verifies a signature; only the background signature pass does.
+Multi-peer fetch therefore accelerates reaching **Phantom / L1** and changes
+nothing about the trust model of **L2**.
+
+### 10.2 The hard ceiling: your own downlink
+
+Fetching from more peers is linear **only until your own downlink saturates**.
+Effective bandwidth is `min(N × per_peer_bandwidth, downlink)`; once
+`N × per_peer ≥ downlink`, extra peers add **zero** speed (they still add
+resilience). "How fast can we get" is bounded by the user's pipe, not by peer
+count.
+
+### 10.3 Prototype results (measured CPU + modelled bandwidth)
+
+The `ghast-bench` prototype adds an analytical multi-peer download model. The
+**network transfer is modelled** (bandwidth arithmetic, not a real socket); the
+**CPU rate is measured** (the §9 header+UTXO throughput, ~223 MB/s of economic
+graph, applied to the modelled real size). Assumptions, all CLI-overridable and
+echoed at runtime:
+
+- Chain full-block data **600 GB**; economic-only ratio **0.29** (from the §9
+  hazed measurement) → **174 GB** hazed economic graph to download.
+- Per-peer serve bandwidth **3 MB/s** (= 24 Mbit/s) per connection *(assumption)*.
+- Downlink tiers **100 Mbit (12.5 MB/s)** and **1 Gbit (125 MB/s)** *(assumption)*.
+- Modelled CPU to build the UTXO set for 174 GB ≈ **779 s (~13 min)** at the
+  measured rate. `total to-usable` below is the conservative serial sum
+  `download + CPU`; a pipelined implementation overlaps them toward
+  `max(download, CPU)`, and since download dominates, `total ≈ download`.
+
+**Downlink tier: 100 Mbit (12.5 MB/s)**
+
+| Peers | Eff BW (MB/s) | Download | Speedup vs N=1 | Saturated? | Total to-usable |
+|------:|--------------:|---------:|---------------:|:----------:|----------------:|
+| 1 | 3.0 | 58,000 s | 1.00× | no | 16.33 h |
+| 10 | 12.5 | 13,920 s | 4.17× | **yes** | 4.08 h |
+| 20 | 12.5 | 13,920 s | 4.17× | yes | 4.08 h |
+| 30 | 12.5 | 13,920 s | 4.17× | yes | 4.08 h |
+| 40 | 12.5 | 13,920 s | 4.17× | yes | 4.08 h |
+
+Saturates at **5 peers**. Peers 10→40 are identical — the 100 Mbit pipe is the
+wall; more peers buy nothing but resilience.
+
+**Downlink tier: 1 Gbit (125 MB/s)**
+
+| Peers | Eff BW (MB/s) | Download | Speedup vs N=1 | Saturated? | Total to-usable |
+|------:|--------------:|---------:|---------------:|:----------:|----------------:|
+| 1 | 3.0 | 58,000 s | 1.00× | no | 16.33 h |
+| 10 | 30.0 | 5,800 s | 10.00× | no | 1.83 h |
+| 20 | 60.0 | 2,900 s | 20.00× | no | 1.02 h |
+| 30 | 90.0 | 1,933 s | 30.00× | no | 0.75 h |
+| 40 | 120.0 | 1,450 s | 40.00× | no | 0.62 h |
+
+Linear all the way through N=40 (40×), saturating only at **~42 peers**. On a fat
+pipe, peer count is the constraint and each added peer pays off — until the pipe.
+
+### 10.4 Verdict
+
+- **Multi-peer fetch is a large, real win — for bandwidth, which §9 showed is the
+  actual bottleneck.** Combined with the 3.49× hazed reduction (downloading
+  174 GB instead of 600 GB), it is what makes "usable in well under an hour on a
+  1 Gbit line" plausible without a trusted snapshot.
+- **It is bounded by the user's downlink.** On 100 Mbit it caps at ~5 peers /
+  4.17×; on 1 Gbit it scales linearly to ~42 peers / 40×. Advertising "N peers →
+  N× faster" is dishonest past saturation.
+- **It changes speed and resilience, never trust.** Integrity stays cryptographic
+  (PoW + per-range merkle); authorisation stays deferred to the L2 signature
+  pass. Peer agreement is explicitly *not* part of the security argument.
+
+Caveats: network transfer is modelled arithmetic, not real sockets (no TCP
+slow-start, no per-peer variance, no stitching/re-request overhead, assumes
+perfectly divisible ranges and steady per-peer rates); real peers vary and some
+lie (handled by the merkle re-request, but at a latency cost not modelled here);
+the CPU rate is measured on a synthetic in-memory segment and extrapolated (a
+real disk-backed coin DB at 174 GB is slower — but CPU is dominated by download
+regardless).
