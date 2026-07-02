@@ -470,12 +470,27 @@ mod tests {
     #[tokio::test]
     async fn ghost_pay_check_failure_carries_remediation_hint() {
         let mut cfg = NodeConfig::default();
-        cfg.ghost_pay = Some(GhostPayConfig::default());
+        // ghost-pay ENABLED (claimed) but not running — the remediation scenario.
+        cfg.ghost_pay = Some(GhostPayConfig {
+            enabled: true,
+            ..Default::default()
+        });
         // 127.0.0.1:8800 almost certainly not bound in test env
         let r = check_ghost_pay(&cfg).await;
         assert!(r.claimed);
         if !r.passed {
             assert!(r.reason.as_ref().unwrap().contains("ghost-pay"));
         }
+    }
+
+    #[tokio::test]
+    async fn ghost_pay_check_disabled_block_is_unclaimed() {
+        // v1.10.20: a present-but-disabled `[ghost_pay]` block must NOT claim the
+        // capability (gate on `enabled`, not mere block presence) — otherwise
+        // pool-only nodes advertise GhostPay and peers waste probes on port 8800.
+        let mut cfg = NodeConfig::default();
+        cfg.ghost_pay = Some(GhostPayConfig::default()); // default enabled = false
+        let r = check_ghost_pay(&cfg).await;
+        assert!(!r.claimed && !r.passed && r.reason.is_none());
     }
 }
