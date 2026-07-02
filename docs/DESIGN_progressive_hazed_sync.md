@@ -4,9 +4,14 @@
 > Download). A faster, less-trusting block download built on Ghost Haze: sync the
 > hazed economic graph fast, then progressively complete validation.
 >
-> **Status:** Draft / theoretical. No implementation, no consensus change — this
-> records the idea so it can be argued about, plus a prototype to test the core
-> speed hypothesis before committing to it.
+> **Status:** Design + measured prototype — **but a substantial hazed-sync
+> implementation already exists** in `ghost-core/src/haze/` (wired into ghostd via
+> `-hazemode`/`-exorcist`/`-loadtxoutset`: block stripping, SwiftSync bloom-filter
+> churn elision, stripped-block P2P, checkpoint signing, chunk downloader,
+> reconstruction, with integration + sync tests). So this doc is being reframed
+> from "design from scratch" to "map what exists → identify the delta to the
+> better-than-assumeUTXO, safety-levelled vision." The load-bearing §5.1 question
+> (does Haze strip signatures?) is now **answered: yes** — see §5.1.
 
 ## 0. Recommended architecture (what to build)
 
@@ -186,9 +191,16 @@ fully validated.
 - If Haze strips the **signatures themselves**, then level 1 is a real trust
   step (as in §5) and level 2 requires the backfill.
 
-This must be pinned down in the Haze implementation before the security model is
-final. It changes whether hazed sync is "faster full validation" or "staged
-trust with deferred verification".
+**ANSWERED (from the code, 2026-07-03):** Haze strips the **signatures**.
+`ghost-core/src/haze/block_stripper.h` states the stripper *"Removes all hazeable
+content: **witness data, scriptSig**, OP_RETURN payloads, and coinbase scriptSig.
+Preserves the complete economic graph."* Signatures live in the witness (segwit)
+and `scriptSig` (legacy), and both are removed wholesale — not merely padding
+(the README's "padding/stuffing" wording is euphemistic). So a hazed block is
+**not self-validatable**, and the **staged-trust model of §5 is correct and not
+optional**: L1/Phantom trusts authorisation until the background signature pass
+restores the witness/scriptSig and reaches L2/Apparition. This resolves the
+load-bearing question — the security model above stands as written.
 
 ## 6. Relationship to the current fleet
 
