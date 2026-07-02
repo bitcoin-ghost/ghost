@@ -34,7 +34,8 @@ use crate::contribution::{
 };
 use crate::errors::{MpcError, MpcResult};
 use crate::params::{
-    load_parameters, save_parameters, save_verifying_key, update_current_params, ParameterFiles,
+    hash_params_file, load_parameters, save_parameters, save_verifying_key, update_current_params,
+    ParameterFiles,
 };
 use crate::MAX_CEREMONY_CONTRIBUTORS;
 use bellperson::groth16::{prepare_verifying_key, Parameters, PreparedVerifyingKey};
@@ -68,6 +69,13 @@ pub struct CeremonyState {
     pub ceremony_id: [u8; 32],
     /// CRIT-2 FIX: Number of pending commitments (not yet fulfilled)
     pub pending_commitment_count: u32,
+    /// Autonomous-ossification pin: the raw-file SHA-256 of the final
+    /// `note_spend_params_current.bin`, recorded the instant the ceremony reaches
+    /// [`MAX_CEREMONY_CONTRIBUTORS`]. This is the SAME digest a `ZK_PARAMS_HASH`
+    /// static pin holds (NOT the structured lineage hash). `None` until ossified;
+    /// once set it is permanent. Persisted to `mpc_ceremony.ossified_file_hash`
+    /// and drives the self-activating `OssifiedPinned` startup mode.
+    pub ossified_file_hash: Option<[u8; 32]>,
 }
 
 /// Manager for the MPC ceremony
@@ -713,12 +721,36 @@ impl CeremonyManager {
             "Applied MPC contribution - parameters updated"
         );
 
-        // Check for ossification
+        // Check for ossification. At the cap the trusted setup is FINAL, so
+        // record the deterministic ossified FILE hash — the raw SHA-256 of the
+        // just-written `note_spend_params_current.bin`, the SAME digest a
+        // `ZK_PARAMS_HASH` static pin holds. Every node computes the identical
+        // value from the identical final params, so no coordination is needed;
+        // this pin then drives the self-activating `OssifiedPinned` startup mode.
+        // Fail-CLOSED: if the final file cannot be hashed we refuse to declare a
+        // successful apply of the ceremony-closing contribution rather than
+        // ossify without a recorded pin.
         if contribution.position >= MAX_CEREMONY_CONTRIBUTORS {
+            let file_hash = hash_params_file(&self.files.current_note_spend_params_path())?;
+            state.ossified_file_hash = Some(file_hash);
             self.ossify_internal(&mut state)?;
+            info!(
+                file_hash = %hex::encode(file_hash),
+                "MPC ceremony reached cap — recorded permanent ossified params file hash"
+            );
         }
 
         Ok(())
+    }
+
+    /// Raw-file SHA-256 of the current `note_spend_params_current.bin`.
+    ///
+    /// This is the FILE hash (matching `ghost_zkp::compute_params_file_hash` and
+    /// a `ZK_PARAMS_HASH=BLOCK:<hex>` pin), NOT the structured lineage hash. Used
+    /// to record / re-derive the autonomous ossification pin from the on-disk
+    /// head (e.g. a fresh node that synced an already-complete chain).
+    pub fn current_params_file_hash(&self) -> MpcResult<[u8; 32]> {
+        hash_params_file(&self.files.current_note_spend_params_path())
     }
 
     /// Durably install an already-obtained, hash-verified note-spend parameter
@@ -1307,6 +1339,46 @@ mod tests {
         // Attempting to generate a contribution should fail
         let result = manager.generate_contribution("node1");
         assert!(matches!(result, Err(MpcError::CeremonyOssified(_))));
+    }
+
+    /// Drive a REAL-crypto ceremony to the cap (4 under `mpc-test-cap`) and prove
+    /// autonomous ossification: at the cap the ceremony ossifies AND records the
+    /// permanent file-hash pin equal to SHA-256(current.bin); a further
+    /// contribution is refused (the cap is a hard ceiling).
+    #[cfg(feature = "mpc-test-cap")]
+    #[test]
+    fn test_ceremony_autonomously_ossifies_and_records_file_hash_at_cap() {
+        let (manager, _temp) = create_test_manager();
+        manager.ensure_genesis_initialized().unwrap();
+
+        for i in 0..MAX_CEREMONY_CONTRIBUTORS {
+            assert!(!manager.is_ossified(), "must not ossify before the cap");
+            let (new_params, contribution) =
+                manager.generate_contribution(&format!("node{i}")).unwrap();
+            manager
+                .apply_contribution(new_params, &contribution)
+                .unwrap();
+        }
+
+        // Ossified, with the pin recorded and equal to the raw file hash.
+        assert!(manager.is_ossified(), "ceremony must ossify at the cap");
+        assert_eq!(manager.contribution_count(), MAX_CEREMONY_CONTRIBUTORS);
+        let expected = manager.current_params_file_hash().unwrap();
+        assert_eq!(
+            manager.state().ossified_file_hash,
+            Some(expected),
+            "ossified_file_hash must equal SHA-256(note_spend_params_current.bin)"
+        );
+
+        // The cap is a hard ceiling — a further contribution is refused by the
+        // freeze guard (no MAX+1 contribution ever).
+        assert!(
+            matches!(
+                manager.generate_contribution("node-extra"),
+                Err(MpcError::CeremonyOssified(_))
+            ),
+            "no contribution may be generated past the cap"
+        );
     }
 
     #[test]

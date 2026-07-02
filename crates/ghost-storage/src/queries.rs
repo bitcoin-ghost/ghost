@@ -6012,6 +6012,14 @@ pub struct MpcCeremonyState {
     /// the life of the ceremony. `[0u8; 32]` if not yet established (pre-genesis
     /// or a legacy row written before this column existed).
     pub ceremony_id: [u8; 32],
+    /// Autonomous-ossification latch: the raw-file SHA-256 of the FINAL
+    /// `note_spend_params_current.bin`, recorded the moment the ceremony reached
+    /// `MAX_CEREMONY_CONTRIBUTORS`. This is the SAME digest a `ZK_PARAMS_HASH`
+    /// static pin holds — NOT the structured lineage hash. `None` until the
+    /// ceremony ossifies. Once set it is PERMANENT: `save_mpc_ceremony_state`
+    /// refuses to null it (a one-way latch at the storage layer), and it drives
+    /// the self-activating `OssifiedPinned` startup mode with no operator action.
+    pub ossified_file_hash: Option<[u8; 32]>,
 }
 
 /// MPC contribution record
@@ -6063,10 +6071,12 @@ impl Database {
                 Option<Vec<u8>>,
                 i64,
                 Option<Vec<u8>>,
+                Option<Vec<u8>>,
             )> = conn
                 .query_row(
                     "SELECT contribution_count, current_params_hash, is_ossified, ossified_at,
-                            block_vk_hash, payout_vk_hash, updated_at, ceremony_id
+                            block_vk_hash, payout_vk_hash, updated_at, ceremony_id,
+                            ossified_file_hash
                      FROM mpc_ceremony WHERE id = 1",
                     [],
                     |row| {
@@ -6079,6 +6089,7 @@ impl Database {
                             row.get(5)?,
                             row.get(6)?,
                             row.get(7)?,
+                            row.get(8)?,
                         ))
                     },
                 )
@@ -6095,6 +6106,7 @@ impl Database {
                     payout_vk,
                     updated,
                     ceremony_id_bytes,
+                    ossified_file_hash_bytes,
                 )) => {
                     let mut params_hash = [0u8; 32];
                     if hash_bytes.len() == 32 {
@@ -6130,6 +6142,17 @@ impl Database {
                         }
                     });
 
+                    // Ossification latch: nullable for pre-ossified / legacy rows.
+                    let ossified_file_hash = ossified_file_hash_bytes.and_then(|v| {
+                        if v.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&v);
+                            Some(arr)
+                        } else {
+                            None
+                        }
+                    });
+
                     // M-10 FIX: Use safe conversions
                     Ok(Some(MpcCeremonyState {
                         contribution_count: i64_to_u32_count(count, "contribution_count")
@@ -6148,6 +6171,7 @@ impl Database {
                         updated_at: i64_to_u64(updated, "updated_at")
                             .map_err(|e| GhostError::Database(e.to_string()))?,
                         ceremony_id,
+                        ossified_file_hash,
                     }))
                 }
                 None => Ok(None),
@@ -6155,23 +6179,34 @@ impl Database {
         })
     }
 
-    /// Save or update MPC ceremony state
+    /// Save or update MPC ceremony state.
+    ///
+    /// IRREVERSIBLE OSSIFICATION LATCH (storage layer): the `is_ossified`,
+    /// `ossified_at` and `ossified_file_hash` columns are ONE-WAY. Once the row
+    /// is ossified (`is_ossified = 1`) no subsequent save can clear it, and once
+    /// `ossified_at` / `ossified_file_hash` are set they are never overwritten or
+    /// nulled — `excluded` is only adopted where the stored value is still
+    /// absent/false. This makes the ossified pin permanent regardless of what any
+    /// caller passes, so a stale or buggy code path can never un-ossify a node.
     pub fn save_mpc_ceremony_state(&self, state: &MpcCeremonyState) -> GhostResult<()> {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO mpc_ceremony (id, contribution_count, current_params_hash, is_ossified,
                                           ossified_at, block_vk_hash, payout_vk_hash, updated_at,
-                                          ceremony_id)
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                          ceremony_id, ossified_file_hash)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                     contribution_count = excluded.contribution_count,
                     current_params_hash = excluded.current_params_hash,
-                    is_ossified = excluded.is_ossified,
-                    ossified_at = excluded.ossified_at,
+                    is_ossified = CASE WHEN mpc_ceremony.is_ossified = 1 THEN 1
+                                       ELSE excluded.is_ossified END,
+                    ossified_at = COALESCE(mpc_ceremony.ossified_at, excluded.ossified_at),
                     block_vk_hash = excluded.block_vk_hash,
                     payout_vk_hash = excluded.payout_vk_hash,
                     updated_at = excluded.updated_at,
-                    ceremony_id = excluded.ceremony_id",
+                    ceremony_id = excluded.ceremony_id,
+                    ossified_file_hash =
+                        COALESCE(mpc_ceremony.ossified_file_hash, excluded.ossified_file_hash)",
                 params![
                     state.contribution_count as i64,
                     &state.current_params_hash[..],
@@ -6181,11 +6216,57 @@ impl Database {
                     state.payout_vk_hash.as_ref().map(|v| &v[..]),
                     state.updated_at as i64,
                     &state.ceremony_id[..],
+                    state.ossified_file_hash.as_ref().map(|v| &v[..]),
                 ],
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
         })
+    }
+
+    /// Latch the autonomous-ossification pin: mark the singleton ossified and
+    /// record the FINAL params file hash, PERMANENTLY.
+    ///
+    /// This is the join/adopt/self-heal entry point (a fresh node that syncs an
+    /// already-complete `MAX_CEREMONY_CONTRIBUTORS` chain, or any node that
+    /// reaches the cap and needs the pin recorded). It is a strict one-way latch:
+    /// * if the singleton already carries an `ossified_file_hash`, it is left
+    ///   untouched and `Ok(false)` is returned (idempotent, never re-pins);
+    /// * otherwise `is_ossified` is set, `ossified_file_hash` is recorded, and
+    ///   `ossified_at` is set if not already present. Returns `Ok(true)`.
+    ///
+    /// Fails closed if no singleton exists yet (the caller must have a head to
+    /// pin — ossification cannot be fabricated from nothing).
+    pub fn latch_mpc_ossification(
+        &self,
+        ossified_file_hash: &[u8; 32],
+        ossified_at: u64,
+    ) -> GhostResult<bool> {
+        let existing = self.get_mpc_ceremony_state()?;
+        match existing {
+            Some(state) => {
+                if state.ossified_file_hash.is_some() {
+                    // Already latched — irreversible, never re-pin.
+                    return Ok(false);
+                }
+                let mut new_state = state.clone();
+                new_state.is_ossified = true;
+                new_state.ossified_file_hash = Some(*ossified_file_hash);
+                if new_state.ossified_at.is_none() {
+                    new_state.ossified_at = Some(ossified_at);
+                }
+                if new_state.updated_at < ossified_at {
+                    new_state.updated_at = ossified_at;
+                }
+                self.save_mpc_ceremony_state(&new_state)?;
+                Ok(true)
+            }
+            None => Err(GhostError::Database(
+                "latch_mpc_ossification: no mpc_ceremony singleton to pin — refusing to \
+                 fabricate ossification without a recorded head"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Save an MPC contribution.
@@ -11568,6 +11649,7 @@ mod tests {
             payout_vk_hash: None,
             updated_at: 42,
             ceremony_id: [200u8; 32],
+            ossified_file_hash: None,
         };
         db.save_mpc_ceremony_state(&state).unwrap();
 
@@ -11576,6 +11658,83 @@ mod tests {
         assert_eq!(loaded.current_params_hash, [5u8; 32]);
         assert_eq!(loaded.ceremony_id, [200u8; 32]);
         assert_eq!(loaded.updated_at, 42);
+        assert_eq!(loaded.ossified_file_hash, None);
+    }
+
+    fn mk_state(count: u32) -> MpcCeremonyState {
+        MpcCeremonyState {
+            contribution_count: count,
+            current_params_hash: [count as u8; 32],
+            is_ossified: false,
+            ossified_at: None,
+            block_vk_hash: None,
+            payout_vk_hash: None,
+            updated_at: 1,
+            ceremony_id: [200u8; 32],
+            ossified_file_hash: None,
+        }
+    }
+
+    #[test]
+    fn test_ossified_file_hash_roundtrips() {
+        let db = Database::in_memory().unwrap();
+        let mut s = mk_state(4);
+        s.is_ossified = true;
+        s.ossified_at = Some(123);
+        s.ossified_file_hash = Some([0xAB; 32]);
+        db.save_mpc_ceremony_state(&s).unwrap();
+
+        let loaded = db.get_mpc_ceremony_state().unwrap().unwrap();
+        assert!(loaded.is_ossified);
+        assert_eq!(loaded.ossified_file_hash, Some([0xAB; 32]));
+        assert_eq!(loaded.ossified_at, Some(123));
+    }
+
+    #[test]
+    fn test_latch_mpc_ossification_is_one_way_and_irreversible() {
+        let db = Database::in_memory().unwrap();
+        // Need an existing head to pin.
+        db.save_mpc_ceremony_state(&mk_state(4)).unwrap();
+
+        // First latch records the pin + ossifies.
+        assert!(db.latch_mpc_ossification(&[0x11; 32], 100).unwrap());
+        let s = db.get_mpc_ceremony_state().unwrap().unwrap();
+        assert!(s.is_ossified);
+        assert_eq!(s.ossified_file_hash, Some([0x11; 32]));
+        assert_eq!(s.ossified_at, Some(100));
+
+        // Re-latching with a DIFFERENT hash is a no-op — the pin is permanent.
+        assert!(!db.latch_mpc_ossification(&[0x22; 32], 200).unwrap());
+        let s = db.get_mpc_ceremony_state().unwrap().unwrap();
+        assert_eq!(
+            s.ossified_file_hash,
+            Some([0x11; 32]),
+            "ossified pin must never be re-written"
+        );
+        assert_eq!(s.ossified_at, Some(100), "ossified_at must not change");
+
+        // A stale/rolling save (is_ossified=false, hash=None) can NOT un-ossify:
+        // the storage layer latch preserves both the flag and the pin.
+        let mut rolling = mk_state(3);
+        rolling.is_ossified = false;
+        rolling.ossified_file_hash = None;
+        rolling.ossified_at = None;
+        db.save_mpc_ceremony_state(&rolling).unwrap();
+        let s = db.get_mpc_ceremony_state().unwrap().unwrap();
+        assert!(s.is_ossified, "is_ossified must remain latched true");
+        assert_eq!(
+            s.ossified_file_hash,
+            Some([0x11; 32]),
+            "ossified pin must remain latched after a rolling save"
+        );
+        assert_eq!(s.ossified_at, Some(100), "ossified_at must remain latched");
+    }
+
+    #[test]
+    fn test_latch_mpc_ossification_refuses_without_singleton() {
+        let db = Database::in_memory().unwrap();
+        // No singleton yet — ossification cannot be fabricated from nothing.
+        assert!(db.latch_mpc_ossification(&[0x11; 32], 100).is_err());
     }
 
     #[test]
@@ -11608,6 +11767,7 @@ mod tests {
             payout_vk_hash: None,
             updated_at: 0,
             ceremony_id: [200u8; 32],
+            ossified_file_hash: None,
         })
         .unwrap();
         assert_eq!(db.mpc_contribution_count_authoritative().unwrap(), 3);

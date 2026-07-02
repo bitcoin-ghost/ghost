@@ -139,6 +139,7 @@ impl Node {
             payout_vk_hash: None,
             updated_at: st.updated_at,
             ceremony_id: st.ceremony_id,
+            ossified_file_hash: None,
         })
         .unwrap();
         Self {
@@ -162,6 +163,7 @@ fn persist_singleton_from_manager(db: &Database, manager: &CeremonyManager) {
         payout_vk_hash: st.payout_vk_hash,
         updated_at: st.updated_at,
         ceremony_id: st.ceremony_id,
+        ossified_file_hash: st.ossified_file_hash,
     })
     .unwrap();
 }

@@ -73,3 +73,4 @@ ghost-common = { path = "../ghost-common" }
 
 [dev-dependencies]
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }
+tempfile = "3.10"

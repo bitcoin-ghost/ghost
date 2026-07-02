@@ -1246,6 +1246,10 @@ fn persist_singleton(db: &Database, manager: &CeremonyManager) -> GhostResult<()
         payout_vk_hash: s.payout_vk_hash,
         updated_at: s.updated_at,
         ceremony_id: s.ceremony_id,
+        // Carry the autonomous-ossification pin through to the singleton. At the
+        // cap `apply_contribution_multi` records it in the manager state; the
+        // storage-layer latch then makes it permanent.
+        ossified_file_hash: s.ossified_file_hash,
     };
     db.save_mpc_ceremony_state(&db_state)
 }
