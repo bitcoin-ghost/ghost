@@ -8,6 +8,44 @@
 > records the idea so it can be argued about, plus a prototype to test the core
 > speed hypothesis before committing to it.
 
+## 0. Recommended architecture (what to build)
+
+Pressure-tested against the prototype (§9) and the multi-peer model (§10), GHAST
+distils to **four build decisions plus one optional accelerator**:
+
+1. **Hazed economic-graph sync.** Fetch the witness-stripped economic graph
+   (~29% of block bytes; 3.49× less data — §9) rather than full blocks. The
+   substrate.
+2. **Multi-peer parallel range fetch, integrity by PoW + merkle.** Pull disjoint
+   height ranges from N peers concurrently; verify each range against its
+   header's proof-of-work and merkle root — integrity is *cryptographic, never
+   peer-vote* (§10). **Auto-size N to fill but not exceed the local downlink**
+   (~5 peers on 100 Mbit, ~40 on 1 Gbit — §10). Drop any peer whose range fails
+   its merkle check and re-request elsewhere.
+3. **Deferred signature verification (Wisp → Phantom → Apparition).** Reach a
+   usable, double-spend-safe UTXO set (**Phantom**/L1) *without* verifying
+   signatures — ~34× faster to usable (§9). Verify signatures in a background
+   pass to reach full validation (**Apparition**/L2). Expose the safety level as
+   honest node state; a mining pool fully validates the recent window regardless.
+4. **Pipeline download and processing.** Verify + apply each range as it arrives.
+   Download dominates (~37 min on 1 Gbit); CPU is seconds — so this hides CPU
+   entirely: total time ≈ download time.
+
+Optional accelerator (best UX):
+
+5. **assumeUTXO hybrid.** Start from a recent UTXO commitment to be usable in
+   *seconds* (temporarily trusted, like today's `--sync fast`), then run GHAST in
+   the background to *earn back* trustlessness and history. Instant-usable now,
+   trustless soon.
+
+Explicitly **not** building (measured dead ends): columnar-CPU batching (~1.04×
+at real block sizes — §9) and trust-by-N-peer-agreement (Sybil/eclipse-game-able,
+redundant to PoW + merkle — §10).
+
+**Bottom line:** trustless, snapshot-free, *usable in well under an hour on a fat
+pipe* — instant with the assumeUTXO hybrid. Bounded by the operator's downlink,
+not by CPU or peer count.
+
 ## 1. Motivation
 
 A new node has three bad options today:
@@ -390,3 +428,42 @@ lie (handled by the merkle re-request, but at a latency cost not modelled here);
 the CPU rate is measured on a synthetic in-memory segment and extrapolated (a
 real disk-backed coin DB at 174 GB is slower — but CPU is dominated by download
 regardless).
+
+## 11. Further speed ideas (unmeasured — candidates)
+
+We are now **downlink-bound** (§10). Further speed can only come from three
+levers: move *less* data, need less *before* usable, or bypass the internet path.
+Ranked by expected payoff:
+
+1. **assumeUTXO hybrid — the "usable sooner" axis.** (Promoted to §0 item 5.)
+   Orthogonal to bandwidth: trust a recent UTXO commitment to be usable in
+   seconds, then backfill the hazed graph + signatures to earn trustlessness.
+   Biggest UX win and it stacks with everything below.
+2. **Shrink the economic graph (move less data).**
+   - *Churn elision / net-UTXO:* outputs created *and* spent within the synced
+     span do not survive into the final coin set. Transmit surviving UTXOs plus
+     only the spend records needed for the double-spend check, eliding
+     intermediate detail where it is provably safe. Could push well below 174 GB.
+   - *Domain-specific compression:* script-template dictionaries, varint amounts,
+     address/script dedup — beats generic gzip on structured economic data. Free,
+     if marginal.
+   - *Utreexo (research):* replace the full UTXO set with a hash accumulator +
+     per-input inclusion proofs — slashes the *state* a node must hold, at the
+     cost of per-tx proof bandwidth. Worth evaluating against the churn-elision
+     approach.
+3. **LAN / sneakernet bootstrap — the only way past the §10 ceiling.** When a
+   fast local source exists (another Ghost node on the LAN, an NVMe drive), fetch
+   the hazed graph over Gbit LAN / local disk and bypass the internet downlink
+   entirely. Turns ~37 min into minutes.
+4. **Grow the mesh.** Ghost peers store hazed data *ready to serve* (no
+   re-hazing); Bitcoin peers require fetching full blocks + hazing locally. More
+   mesh peers = more hazed-serving sources to fill fat downlinks.
+5. **Shard the UTXO pass.** Partition the coin set (e.g. by txid prefix) and apply
+   ranges in parallel with a merge, partially parallelising the otherwise-serial
+   pass. Low priority — CPU is not the bottleneck (§9), but relevant once the coin
+   DB is disk-backed at 174 GB.
+
+None of these is measured yet; each is a candidate for the next prototype
+iteration if/when GHAST is picked up. The obvious next experiment is **churn
+elision** — measure how much of the 174 GB is created-and-spent-within-span and
+therefore elidable, since that is the one lever that shrinks the download itself.
