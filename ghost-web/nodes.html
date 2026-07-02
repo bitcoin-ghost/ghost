@@ -82,13 +82,14 @@
 <section class="block node-diff-section">
   <div class="container">
     <div class="section-label">what makes a ghost node</div>
-    <h2 class="section-title">Bitcoin Core, plus everything Ghost adds.</h2>
+    <h2 class="section-title">Ghost's own node — forked from Bitcoin Core, built well beyond it.</h2>
     <p class="section-lead">
-      A Ghost node runs <code>ghostd</code> — a clean Bitcoin Core v30 fork —
-      with <code>ghost-pool</code> and <code>ghost-pay</code> alongside it on
-      the same box. It adds a mesh layer, an incentive layer, and a privacy
-      layer on top of a full Bitcoin node — every feature below is built into
-      the Ghost binaries, every one toggles in config.
+      A Ghost node runs <code>ghostd</code> — Ghost's own daemon, forked from
+      Bitcoin Core v30 — with <code>ghost-pool</code> and <code>ghost-pay</code>
+      alongside it on the same box. It validates Bitcoin mainnet like any full
+      node, then adds a mesh layer, an incentive layer, and a privacy layer that
+      stock Bitcoin Core doesn't have — every feature below is built into the
+      Ghost binaries, and every one toggles in config.
     </p>
 
     <ul class="feature-list node-core-pink">
@@ -316,7 +317,7 @@
             <td>4 GB</td>
             <td>700 GB SSD</td>
             <td>1 Mbps ↑↓</td>
-            <td>Bitcoin Core full node + Ghost consensus. No archive, no Pay.</td>
+            <td>Full Bitcoin validation + Ghost consensus. No archive, no Pay.</td>
           </tr>
           <tr>
             <td><strong>Recommended</strong></td>
