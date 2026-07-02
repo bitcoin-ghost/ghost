@@ -68,6 +68,7 @@ MessageEnvelope {
   sequence:  u64,           // Per-sender sequence number (dedup / replay guard)
   signature: [u8; 64],      // Ed25519 signature over the payload
   payload:   Vec<u8>,       // JSON-serialized message
+  ttl:       u8,            // Hop count for gossip fan-out
 }
 ```
 
@@ -174,7 +175,7 @@ Ghost consensus is designed to resist Byzantine (malicious) nodes:
 | --- | --- |
 | Share Consensus | All honest nodes agree on valid shares if 67% are honest |
 | Payout Consensus | Correct payouts enforced by honest majority |
-| Elder Consensus | Elder list immutable, revocation requires 67% witness |
+| Elder Consensus | Elder list is append-only up to 101 via deterministic Node ID ordering; revocation requires 67% witness and reopens the slot |
 | Liveness | System never deadlocks; honest nodes converge on the same ledger + split |
 
 ### Cryptographic Security
@@ -201,7 +202,7 @@ Ghost consensus is designed to resist Byzantine (malicious) nodes:
 
 **Attack:** Attacker registers many nodes to dominate Elder slots.
 
-**Defense:** Only first 101 nodes become Elders. One-time event at launch. Deterministic ordering by (timestamp, hash) prevents manipulation.
+**Defense:** Every Node ID must carry a **proof-of-work** to be eligible, so minting many identities is expensive. Elder slots are capped at 101 and filled by deterministic Node ID ordering (lowest first) among PoW-valid nodes — registration is rolling rather than a one-time launch event, but the ordering is fixed data so no node can reorder itself ahead of another.
 
 ### Network Partition Attack
 

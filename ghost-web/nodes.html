@@ -84,10 +84,11 @@
     <div class="section-label">what makes a ghost node</div>
     <h2 class="section-title">Bitcoin Core, plus everything Ghost adds.</h2>
     <p class="section-lead">
-      A Ghost node runs alongside your Bitcoin Core daemon. It adds a
-      mesh layer, an incentive layer, and a privacy layer on top of
-      stock Bitcoin — every feature below is built into the Ghost
-      binary, every one toggles in config.
+      A Ghost node runs <code>ghostd</code> — a clean Bitcoin Core v30 fork —
+      with <code>ghost-pool</code> and <code>ghost-pay</code> alongside it on
+      the same box. It adds a mesh layer, an incentive layer, and a privacy
+      layer on top of a full Bitcoin node — every feature below is built into
+      the Ghost binaries, every one toggles in config.
     </p>
 
     <ul class="feature-list node-core-pink">
@@ -292,10 +293,10 @@
     <div class="section-label">hardware</div>
     <h2 class="section-title">What you need.</h2>
     <p class="section-lead">
-      Ghost runs alongside Bitcoin Core on the same box. Minimum
-      specs scale with the capabilities you opt into — a pruned
-      Bitcoin-only node is far cheaper than a full-archive node with
-      Pay enabled.
+      Ghost runs its own Bitcoin full node (<code>ghostd</code>) plus the
+      pool and Pay daemons on the same box. Minimum specs scale with the
+      capabilities you opt into — a pruned Bitcoin-only node is far cheaper
+      than a full-archive node with Pay enabled.
     </p>
 
     <div class="hw-table-wrap">
@@ -364,15 +365,15 @@
       <li>
         <div class="qs-n">1</div>
         <div class="qs-body">
-          <div class="qs-title">Install Bitcoin Ghost</div>
-          <div class="qs-desc">Download the binary from the <a href="/downloads.html">downloads page</a>, verify the signature, and run <code>ghost-pool --help</code> to confirm.</div>
+          <div class="qs-title">Run the installer</div>
+          <div class="qs-desc">One command installs <code>ghostd</code>, <code>ghost-pool</code> and <code>ghost-pay</code> with signed binaries and systemd units:<br><code>curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q…</code><br>The script verifies the GPG release signature before writing anything. Prefer to do it by hand? Grab the tarball from the <a href="/downloads.html">downloads page</a> and verify it yourself.</div>
         </div>
       </li>
       <li>
         <div class="qs-n">2</div>
         <div class="qs-body">
-          <div class="qs-title">Point at Bitcoin Core</div>
-          <div class="qs-desc">Ghost talks to your existing Bitcoin Core daemon via RPC + ZMQ. Add an RPC user and open the two ZMQ ports (<code>hashblock</code>, <code>hashtx</code>) in <code>bitcoin.conf</code>.</div>
+          <div class="qs-title">Choose your sync</div>
+          <div class="qs-desc">Full initial block download (the default) validates every block from genesis — fully trustless. In a hurry? <code>--sync fast</code> loads a verified assumeUTXO snapshot at height 910000 and back-fills history behind it, so the node is usable in minutes rather than days.</div>
         </div>
       </li>
       <li>

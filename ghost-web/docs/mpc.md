@@ -85,13 +85,28 @@ Existing contributors (current Elders), upon receipt:
    3. Verify the Schnorr PoK.
    4. Cast MpcVerificationVote (approve / reject + reason).
 
-When ≥67 % of existing contributors approve:
+When the approval threshold is met:
    - Contribution is applied; the candidate is admitted.
    - New params hash becomes the network's current.
    - Candidate's position is permanent.
 ```
 
+The approval threshold is a **67 % supermajority of existing contributors**, with a small bootstrap exception: while there are fewer than four contributors (the earliest positions), the threshold floor is one — the genesis node alone can admit the first couple of contributions so the ceremony can get off the ground. From the fourth contributor onward the full `ceil(count × 67 / 100)` supermajority applies.
+
 Only existing MPC contributors can vote on new ones. Non-Elder nodes observe but don't have a vote.
+
+### Joining mid-ceremony (catch-up)
+
+Because the ceremony is rolling, a node can come online at position 30 — or reconnect after days offline — and must trust a chain that was built without it. It does this by **genesis-anchored verification**, not by trusting whoever it synced from:
+
+1. Fetch the full contribution chain and the retained BFT quorum votes from peers (large params transfer in hash-verified chunks).
+2. Check the positions are a contiguous `1..=N`.
+3. Check position 1's `prev_params_hash` equals the genesis anchor (the genesis params hash, which doubles as the immutable ceremony ID).
+4. Check every link: each position's `prev_params_hash` equals the previous position's `new_params_hash`.
+5. Check the params on disk hash to the head of the chain.
+6. Check each position retained a valid supermajority of signed approval votes.
+
+Catch-up verification runs the same cryptographic checks as live verification but skips the timestamp-freshness window, so a node re-verifying old, already-approved contributions doesn't reject them for being stale. Any mismatch is fail-closed — the node refuses the chain rather than adopt an unverifiable one.
 
 ## Toxic waste handling
 
@@ -148,7 +163,7 @@ After the 101st contribution to a circuit:
 - The verifying key extracted from the final params is what every node uses to validate Ghost Pay shielded transactions forever.
 - Elder positions for that ceremony are frozen — no new Elders can join via that circuit.
 
-The three circuits ossify independently. As of writing, all three slots have completed across the four mainnet VMs (params at `/home/ghost/.ghost/mpc_params/` on each VM).
+The three circuits ossify independently. On mainnet the ceremonies are **still rolling** — none of the three circuits has reached position 101 yet. Contributions accrue as new operators onboard, so the ceremonies sit in their early positions and grow toward the cap. Until a circuit ossifies, every node runs against the *current* (latest) params for that circuit (`*_params_current.bin`), and the versioned chain on disk records each position reached so far. The live position is a runtime value — `SELECT contribution_count FROM mpc_ceremony` on any node — not a compiled-in constant.
 
 ## What goes wrong if the MPC fails
 
@@ -158,7 +173,7 @@ Two failure modes are worth distinguishing:
 
 2. **Liveness failure (no contributors arrive).** The genesis node generates valid params; nobody else contributes. The chain is sound (the 1-of-N argument trivially holds with only one contributor) but the anonymity set of "who could have created this honest setup" is one. This is a privacy concern, not a soundness concern — and it's mitigated as more contributors join.
 
-In practice, Ghost's mainnet completed all three ceremonies during initial bootstrap; the mainnet VMs have ossified params with the full 101-contributor chain.
+In practice, Ghost's mainnet ceremonies are still rolling — they are in their early positions and have not ossified. Each is sound today (the 1-of-N argument holds at every position from genesis onward); the anonymity set of honest contributors simply grows with each new Elder until the chain reaches 101 and freezes.
 
 ## Why this matters
 

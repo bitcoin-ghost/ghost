@@ -10,7 +10,7 @@ The mesh is BFT-tolerant: it survives one node going down without operator inter
 
 ## 1. Single elder offline
 
-**Impact:** Minimal. BFT consensus needs 67% (so 3 of 4 in the standard cluster). Payouts, voting, and L2 checkpoints continue.
+**Impact:** Minimal. BFT consensus needs a 67% supermajority of active elders. Losing a single elder in a healthy mesh stays comfortably above the threshold, so payouts, voting, and L2 checkpoints continue.
 
 **Detect:**
 
@@ -34,9 +34,9 @@ Watch for "connected to peer" lines. If they appear, the node has rejoined the m
 
 **If the elder is offline >24 hours:** investigate hardware/network. If permanent loss, see scenario 2 (replacement).
 
-## 2. Two elders offline simultaneously
+## 2. Enough elders offline to drop below quorum
 
-**Impact:** BFT halts. 2/4 = 50% < 67%. Payouts pause. L2 checkpoints pause. Mining continues but shares accumulate without payout. Network is **safe** — no conflicting decisions can land — but stalled.
+**Impact:** BFT halts. If enough elders go offline that the survivors fall below the 67% supermajority (for example, losing 2 of a 4-elder mesh — 50% < 67%), payouts pause, L2 checkpoints pause, and mining continues but shares accumulate without payout. Network is **safe** — no conflicting decisions can land — but stalled.
 
 **Detect:**
 
@@ -95,7 +95,7 @@ The replacement node uses the same node_id as the lost one, so its Elder slot is
 
 ## 3. Genesis node permanent loss
 
-**Impact:** None ongoing. The genesis node has no special role after the MPC ceremony completed. All elders are equal peers thereafter.
+**Impact:** None ongoing. The genesis node has no special role once it has contributed position 1 of the MPC ceremony — its randomness is already mixed into the chain, and it is an equal peer thereafter. This holds even though the ceremony is still rolling toward ossification: genesis is a bootstrap role, not an ongoing one.
 
 **Recover:** follow scenario 2's hardware-loss procedure.
 
@@ -216,7 +216,7 @@ The blast radius of this scenario is the reason MPC backups should be the most p
 # Count voting timeouts in the last 30 min
 journalctl -u ghost-pool --since "30 min ago" | grep -c "VotingSession timed out"
 
-# Check connected peer count (should be 3 in a 4-node cluster)
+# Check connected peer count (in a full mesh this is total elders minus 1)
 journalctl -u ghost-pool --since "1 min ago" | grep "connected_peers"
 ```
 

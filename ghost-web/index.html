@@ -76,8 +76,8 @@
       A bitcoin node stack built on three layers. Incentivised node. Decentralised mining. Private payments. Open source, running on mainnet today.
     </p>
     <div class="hero-actions">
-      <a href="/get-started.html" class="btn btn-primary">Run a node <span class="arrow">→</span></a>
-      <a href="/protocol.html" class="btn btn-ghost">Read the docs</a>
+      <a href="/nodes.html" class="btn btn-primary">Run a node <span class="arrow">→</span></a>
+      <a href="/docs/" class="btn btn-ghost">Read the docs</a>
     </div>
   </div>
 </section>
@@ -429,12 +429,12 @@
       <div class="row">
         <div class="cell phase now">now</div>
         <div class="cell title">Mainnet testing</div>
-        <div class="cell desc">Observe-only deployment across four production nodes. Hardening the checkpoint pipeline and consensus. Soak tests running continuously.</div>
+        <div class="cell desc">Observe-only deployment across a growing production mesh. Hardening the checkpoint pipeline and consensus. Soak tests running continuously.</div>
       </div>
       <div class="row">
         <div class="cell phase">target</div>
-        <div class="cell title">Mainnet launch · July 2026</div>
-        <div class="cell desc">Full production with elder registration, mining, and Ghost Pay active from block 1.</div>
+        <div class="cell title">Mainnet launch</div>
+        <div class="cell desc">Full production with open elder registration, mining, and Ghost Pay active. Follows completion of the observe-mode soak.</div>
       </div>
     </div>
   </div>
@@ -650,10 +650,25 @@
             hosts[(i > 0 ? s.slice(0, i) : s) || ('id:' + ((n && n.node_id) || ''))] = 1;
           });
           meshCount = Object.keys(hosts).length;
+          // Persist the last good reading so a transient all-seed failure never
+          // reverts the tile to a misleading fixed number.
+          try { localStorage.setItem('ghost-mesh-count-v1', String(meshCount)); } catch (e) {}
         }
         if (nodesEl) {
-          if (meshCount != null) nodesEl.textContent = String(meshCount);
-          else nodesEl.innerHTML = online + '<span class="unit"> / ' + VMS.length + '</span>';
+          // The live mesh size (self + connected peers from any one seed,
+          // deduped by host) — it grows automatically as nodes join and is
+          // NEVER a hard-coded figure. If every seed is briefly unreachable,
+          // fall back to the last count we saw; only show "—" if we've never
+          // had a reading. We deliberately do NOT render "reachable / 4" here:
+          // the mesh is not four nodes, and the seed list is only an entry
+          // point, not the network size.
+          if (meshCount != null) {
+            nodesEl.textContent = String(meshCount);
+          } else {
+            var cachedMesh = null;
+            try { cachedMesh = localStorage.getItem('ghost-mesh-count-v1'); } catch (e) {}
+            nodesEl.textContent = (cachedMesh != null) ? cachedMesh : '—';
+          }
         }
         if (heightEl) heightEl.textContent = height ? height.toLocaleString() : '—';
         console.debug('[index] refresh ok · ' + online + '/' + VMS.length + ' seeds · ' + (meshCount != null ? meshCount + ' mesh nodes · ' : '') + hash.toFixed(2) + ' TH/s · ' + rawMiners + ' miners');

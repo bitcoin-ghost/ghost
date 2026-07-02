@@ -268,7 +268,7 @@ LimitNOFILE=65536
 
 # Ensure ZK params are findable
 Environment=ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params
-Environment=ZK_PARAMS_HASH=<sha256-of-final-ossified-params>
+Environment=ZK_PARAMS_HASH=<sha256-of-the-params-your-cluster-runs>
 
 [Install]
 WantedBy=multi-user.target
@@ -276,7 +276,7 @@ WantedBy=multi-user.target
 
 Two environment variables matter on mainnet:
 
-- `ZK_PARAMS_PATH` — directory containing the ossified MPC ceremony params (`note_spend_vk.bin`, `payout_vk.bin`, `unshield_vk.bin`).
+- `ZK_PARAMS_PATH` — directory containing the current MPC ceremony params and verifying keys (`note_spend_vk.bin`, `payout_vk.bin`, `unshield_vk.bin`). The ceremony is rolling, so these are the current chain head, not necessarily a final ossified set.
 - `ZK_PARAMS_HASH` — SHA256 of the params used to verify the binary loaded the right ones. The release notes for each version include the expected hash.
 
 If the params don't match the hash, ghost-pool refuses to start. This protects against a node accidentally running with stale or test params.
@@ -305,7 +305,7 @@ Before flipping the service on, walk this checklist. Every item must pass:
 **ZK pipeline:**
 
 - [ ] All three VK files present: `note_spend_vk.bin`, `payout_vk.bin`, `unshield_vk.bin`.
-- [ ] MPC ceremony has completed for the cluster you're joining (not test params).
+- [ ] MPC params match the cluster you're joining (the current rolling-ceremony chain head, not test params).
 - [ ] `ZK_PARAMS_HASH` env matches the published hash for your ghost-pool version.
 
 **Database:**
