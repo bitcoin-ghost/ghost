@@ -686,5 +686,74 @@ in rough priority:
 4. **Serving incentives.** Ghost's verified-capability share system could reward
    peers that serve hazed ranges / attest commitments — turning fast bootstrap
    into a paid node capability alongside Archive / GhostPay / Reaper.
-5. **The Haze signature question (§5.1).** Confirm whether Haze strips signatures
-   or only spam/padding — still the load-bearing unknown for the trust model.
+5. **The Haze signature question (§5.1).** ANSWERED — Haze strips signatures
+   (whole witness + scriptSig). See §5.1 and §16.
+
+## 16. Implementation audit — what already exists vs the real delta (2026-07-03)
+
+A read-only audit of `ghost-core/src/haze/` (evidence cited inline) shows the
+module is real, wired end-to-end, and unit-tested — but it implements a
+**different trust model than the GHAST §0 vision**, and in one crucial respect
+the *opposite* of it.
+
+### Already built + reusable
+- **Hazed storage / stripping** (`block_stripper.cpp`, `stripped_block.h`) —
+  scriptSig and witness fully removed, OP_RETURN → `OP_RETURN OP_0`. Mature,
+  tested, wired at `validation.cpp:4557`. *Caveat: non-standard scriptPubKeys are
+  also replaced (`OP_RETURN OP_1`, script discarded, value kept) — the "complete
+  economic graph" has an asterisk for non-standard outputs.*
+- **Stripped-block P2P (GSB)** — service bits `NODE_GHOST_HAZE`/`NODE_HAZE_CHECKPOINT`,
+  serve/redirect + merkle-vs-header check on receipt (`net_processing.cpp:2383,
+  4824`). But **single-block** (not a range protocol) and **storage-only** (a
+  stripped block cannot be connected to build UTXO).
+- **SwiftSync** (`swiftsync.cpp`, wired `validation.cpp:2680`) — bloom-filtered
+  churn elision. **Important scope correction to §12:** it saves *LevelDB write
+  churn / state I/O during connect*, **not** download or CPU, and not the
+  trustless download. Conceptually matches the ~95% churn insight; operationally
+  it's a write-saver on full connect.
+- **Parallel chunk downloader** (`chunk_downloader.cpp`, 8-way, resume) — solid
+  plumbing, but it fetches **UTXO-snapshot chunks** (SHA-256 vs a signed
+  manifest), not hazed economic-graph height ranges.
+
+### The critical finding — today's bootstrap is HARDCODED assumeUTXO, not mesh-attested
+The live fast-bootstrap trust root is **doubly hardcoded and centralised — strictly
+weaker than §12.1's mesh-attested rolling commitment, and arguably *more*
+centralised than plain assumeUTXO:**
+1. The checkpoint manifest is verified with **one hardcoded Ed25519 key**
+   (`checkpoint_signing.cpp:57-89`, `GetTrustedCheckpointKeys`) — not the BFT
+   mesh, not rotating, not challengeable.
+2. Chunks assemble into an assumeUTXO snapshot and call `ActivateSnapshot`, which
+   **requires the base hash to match a compiled-in chainparams assumeUTXO entry**
+   (`validation.cpp:5801`, `AssumeutxoForBlockhash`; `-loadtxoutset` "must match a
+   hardcoded assumeutxo entry").
+3. **A hazed node never earns back trustlessness.** Background IBD is *disabled*
+   for hazed nodes (`validation.cpp:5935-5943, 6200-6210`); `ReconstructPartialBlock`
+   rebuilds with empty scriptSig+witness (signatures are permanently gone), so
+   there is **no economic-graph replay and no signature backfill** — the node
+   stays permanently on the trusted snapshot. This is the *inverse* of GHAST's
+   trust-then-audit model.
+
+Also: **per-range PoW is never verified** — `VerifyHeadersChain`
+(`headers_file.cpp:100-136`) checks only `hashPrevBlock` linkage and never calls
+`CheckProofOfWork`. Chain validity currently chains to the signing key, not PoW.
+
+### Delta to build (to reach the better-than-assumeUTXO, safety-levelled vision)
+- **P0 — replace the trust root:** (1) mesh-BFT attestation over `{height,
+  block_hash, utxo_hash}` replacing the single hardcoded key, with rotation +
+  challenge/fault-attribution; (2) let `ActivateSnapshot` accept a mesh-attested
+  *rolling* commitment instead of a compiled-in hash; (3) re-enable a
+  hazed-compatible background pass that audits the attested set → earns trustless.
+- **P1 — the missing GHAST mechanisms:** (4) economic-graph *replay* to build the
+  UTXO set from stripped blocks (does not exist); (5) true multi-peer *range*
+  fetch with real per-range PoW + merkle (add `CheckProofOfWork`; auto-size
+  parallelism to downlink); (6) safety-level state (Wisp/Phantom/Apparition) in
+  `gethazestatus` + a "don't mine below L2 near tip" guard; (7) deferred-signature
+  background pass + witness backfill from archive peers.
+- **P2 — prerequisite:** chunked/streamed framing over the Noise transport (§14).
+
+**Reframe:** GHAST is *not* a from-scratch build. The **storage, GSB serving,
+SwiftSync and parallel-download plumbing are done and reusable**; what's missing
+is the **trust model** (mesh-attested rolling commitment vs hardcoded assumeUTXO)
+and the **validation-progress half** (economic-graph replay, safety levels,
+earn-back to trustless). Those two are the whole point — and they're exactly what
+isn't there yet.
