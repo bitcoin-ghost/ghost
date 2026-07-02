@@ -390,35 +390,31 @@ impl ZmqSubscriber {
                         Some(Ok(msg)) => {
                             // tmq returns Multipart - collect frames as Vec<Message>
                             let frames: Vec<tmq::Message> = msg.into_iter().collect();
-                            // Format: [topic, hash (32), label (1), sequence (8)]
-                            if frames.len() >= 3 {
-                                let hash_bytes = &frames[1];
-                                let label_bytes = &frames[2];
-
-                                if hash_bytes.len() >= 32 && !label_bytes.is_empty() {
-                                    // Reverse hash for display (Bitcoin uses little-endian internally)
-                                    let mut hash_arr = [0u8; 32];
-                                    hash_arr.copy_from_slice(&hash_bytes[..32]);
-                                    hash_arr.reverse();
-                                    let hash = hex::encode(hash_arr);
-
-                                    let label = label_bytes[0] as char;
-
-                                    match label {
-                                        'C' => {
-                                            // Block connected - normal new block
-                                            let _ = block_event_tx.send(BlockEvent::Connected { hash: hash.clone() });
-                                            info!(hash = %&hash[..16], "Block connected");
-                                        }
-                                        'D' => {
-                                            // Block disconnected - REORG DETECTED!
-                                            let _ = block_event_tx.send(BlockEvent::Disconnected { hash: hash.clone() });
-                                            warn!(hash = %&hash[..16], "⚠️ REORG DETECTED: Block disconnected!");
-                                        }
-                                        _ => {
-                                            // Other labels: 'R' (removed from mempool), 'A' (added to mempool)
-                                            // We only care about block connect/disconnect
-                                        }
+                            // Bitcoin Core sends the sequence notification as three
+                            // frames: [topic, body, msg-counter]. The body — NOT a set
+                            // of separate frames — is:
+                            //   <32-byte hash><1-byte label>[<8-byte LE mempool seq>]
+                            // where label is 'C' (block connect), 'D' (block disconnect),
+                            // 'A' (mempool add) or 'R' (mempool remove).
+                            //
+                            // The label therefore lives at body[32]. The previous code
+                            // read frames[2][0] — the low byte of the trailing 4-byte
+                            // message counter — which collides with 'C' (0x43) / 'D'
+                            // (0x44) roughly 1 message in 256, firing phantom block
+                            // connect/disconnect (reorg) events on whatever hash the body
+                            // carried (often a mempool txid). Read the label from the body.
+                            if frames.len() >= 2 {
+                                match parse_sequence_body(&frames[1]) {
+                                    Some(BlockEvent::Connected { hash }) => {
+                                        info!(hash = %&hash[..16], "Block connected");
+                                        let _ = block_event_tx.send(BlockEvent::Connected { hash });
+                                    }
+                                    Some(BlockEvent::Disconnected { hash }) => {
+                                        warn!(hash = %&hash[..16], "⚠️ REORG DETECTED: Block disconnected!");
+                                        let _ = block_event_tx.send(BlockEvent::Disconnected { hash });
+                                    }
+                                    None => {
+                                        // Non-chain label ('A'/'R' mempool) or malformed body.
                                     }
                                 }
                             }
@@ -434,6 +430,89 @@ impl ZmqSubscriber {
                 }
             }
         }
+    }
+}
+
+/// Parse a Bitcoin Core ZMQ `sequence`-topic body into a chain [`BlockEvent`].
+///
+/// The body layout is `<32-byte hash (internal little-endian)><1-byte label>`,
+/// optionally followed by an 8-byte little-endian mempool sequence for mempool
+/// events. The label is `C` (block connect), `D` (block disconnect), `A`
+/// (mempool add) or `R` (mempool remove).
+///
+/// Only `C`/`D` are chain events. Mempool events (`A`/`R`) and malformed/short
+/// bodies return `None`. The hash is reversed to big-endian display order.
+///
+/// Note the label is read from `body[32]` — never from a separate frame or the
+/// trailing message-counter frame, whose low byte collides with `C`/`D` ~1 in
+/// 256 messages and used to fire phantom reorgs.
+fn parse_sequence_body(body: &[u8]) -> Option<BlockEvent> {
+    if body.len() < 33 {
+        return None;
+    }
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&body[..32]);
+    hash_arr.reverse();
+    let hash = hex::encode(hash_arr);
+    match body[32] {
+        b'C' => Some(BlockEvent::Connected { hash }),
+        b'D' => Some(BlockEvent::Disconnected { hash }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod sequence_parse_tests {
+    use super::*;
+
+    fn body(hash: [u8; 32], label: u8, mempool_seq: Option<u64>) -> Vec<u8> {
+        let mut b = hash.to_vec();
+        b.push(label);
+        if let Some(s) = mempool_seq {
+            b.extend_from_slice(&s.to_le_bytes());
+        }
+        b
+    }
+
+    fn display_hash(mut h: [u8; 32]) -> String {
+        h.reverse();
+        hex::encode(h)
+    }
+
+    #[test]
+    fn block_connect_and_disconnect_parse_from_label_byte() {
+        let h = [0x11u8; 32];
+        let want = display_hash(h);
+        assert!(matches!(parse_sequence_body(&body(h, b'C', None)),
+                Some(BlockEvent::Connected { hash }) if hash == want));
+        assert!(matches!(parse_sequence_body(&body(h, b'D', None)),
+                Some(BlockEvent::Disconnected { hash }) if hash == want));
+    }
+
+    #[test]
+    fn mempool_add_and_remove_are_ignored() {
+        let h = [0x22u8; 32];
+        assert!(parse_sequence_body(&body(h, b'A', Some(42))).is_none());
+        assert!(parse_sequence_body(&body(h, b'R', Some(42))).is_none());
+    }
+
+    #[test]
+    fn trailing_counter_byte_never_leaks_as_a_reorg() {
+        // Regression for the phantom-reorg bug: a mempool 'R' event whose trailing
+        // mempool-sequence bytes contain 0x44 ('D') must still be ignored — the label
+        // is body[32], not any trailing byte.
+        let h = [0x33u8; 32];
+        let b = body(h, b'R', Some(0x0000_0000_0000_0044));
+        assert!(
+            parse_sequence_body(&b).is_none(),
+            "mempool event must never be read as a block disconnect"
+        );
+    }
+
+    #[test]
+    fn short_or_empty_body_rejected() {
+        assert!(parse_sequence_body(&[0u8; 32]).is_none()); // hash only, no label
+        assert!(parse_sequence_body(&[]).is_none());
     }
 }
 
