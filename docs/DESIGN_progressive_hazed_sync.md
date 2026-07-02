@@ -635,3 +635,44 @@ BFT set is modelled as 8 independent Schnorr signers (a real Ghost attestation
 may use aggregate/threshold sigs, which would be *smaller and faster* than shown);
 "usable" here means "has the surviving UTXO set" — L1/Phantom trust semantics
 (§5) still apply until the background sig pass reaches L2/Apparition.
+
+## 14. Mesh transport — a live prerequisite (from a real fleet finding)
+
+The live Ghost mesh **already hits the Noise transport's per-message ceiling.**
+On 2026-07-02 the fleet logged, 70–130× per node:
+
+```
+Noise send failed: Message too large: 84241 > 65519
+```
+
+— a checkpoint / tree-sync proposal (84 KB) exceeding the ~64 KB Noise frame
+limit, which then drives repeated `Checkpoint reached quorum but proposal data
+missing — requesting tree sync` self-healing. GHAST inherits this **exactly**:
+hazed range payloads and the ~11 GB surviving set are orders of magnitude larger
+than one Noise frame.
+
+So a **chunked / streamed framing layer over the Noise transport is a shared
+prerequisite** — it is needed to fix the current checkpoint churn *and* to serve
+GHAST ranges at all. Design options: application-level length-prefixed
+fragmentation across multiple Noise frames with reassembly, or a dedicated
+bulk-transfer stream negotiated per range. This is not optional for GHAST; it is
+the same fix the live mesh needs today, so the two efforts share it.
+
+## 15. Open research questions (for direction)
+
+The measured architecture (§0) is solid; these are the next unanswered questions,
+in rough priority:
+
+1. **Mesh-attestation protocol (§12.1).** How does the BFT mesh *produce, sign,
+   rotate* the UTXO commitment, and how does a fresh node *challenge* it? Cadence,
+   quorum, fault attribution, and what a challenger presents when the background
+   sync disagrees with the attested set.
+2. **Commitment format.** muhash (rolling, cheap incremental update — what
+   assumeUTXO uses) vs a Utreexo/merkle accumulator (enables per-UTXO inclusion
+   proofs). Trade-off: update cost vs proof capability.
+3. **Mesh transport framing (§14).** Prerequisite — needed regardless.
+4. **Serving incentives.** Ghost's verified-capability share system could reward
+   peers that serve hazed ranges / attest commitments — turning fast bootstrap
+   into a paid node capability alongside Archive / GhostPay / Reaper.
+5. **The Haze signature question (§5.1).** Confirm whether Haze strips signatures
+   or only spam/padding — still the load-bearing unknown for the trust model.
