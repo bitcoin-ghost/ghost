@@ -5,15 +5,17 @@
 # Runs as root from `ghost-auto-update.timer` (every 6h, randomised). It is a
 # strict no-op unless the operator has opted in via /etc/ghost/auto-update.conf
 # (AUTO_UPDATE=true). When opted in, it resolves the latest published release,
-# and — ONLY if it is newer than what is installed — downloads the release
-# tarball + ghostd, verifies the detached GPG signature against the pinned
-# release key AND the ghostd SHA256 against the freshly-fetched install.sh,
-# backs up the current binaries, swaps them with a stop→verify-inactive→swap→
-# start sequence, health-checks, and rolls back on any failure.
+# and — ONLY if it is newer than what is installed — downloads the signed
+# release tarball (which now bundles ghostd alongside ghost-pool/ghost-pay),
+# verifies the detached GPG signature against the pinned release key and the
+# tarball's SHA256, backs up the current binaries, swaps them with a
+# stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
+# failure.
 #
-# SUPPLY-CHAIN-CRITICAL: a binary is NEVER written unless BOTH the GPG signature
-# and the ghostd checksum verify. The verification logic mirrors the first-run
-# installer (scripts/install-node.sh) exactly.
+# SUPPLY-CHAIN-CRITICAL: a binary is NEVER written unless the GPG signature over
+# the tarball verifies. ghostd rides that SAME signature (it lives inside the
+# tarball now), so there is no longer a separate ghostd checksum side-channel.
+# The verification logic mirrors the first-run installer (scripts/install-node.sh).
 #
 # This file is the canonical source. scripts/install-node.sh installs a verbatim
 # copy at /opt/ghost/bin/ghost-auto-update.sh.
@@ -28,7 +30,8 @@ set -euo pipefail
 GPG_KEY_FP="${GHOST_GPG_KEY_FP:-777FE81F8CC077FD3D08055E852C2B3190F5B928}"
 RELEASE_KEY_URL="${GHOST_RELEASE_KEY_URL:-https://get.bitcoinghost.org/ghost-release-key.asc}"
 INSTALL_SH_URL="${GHOST_INSTALL_SH_URL:-https://get.bitcoinghost.org/install.sh}"
-GHOSTD_URL="${GHOSTD_URL:-https://get.bitcoinghost.org/bin/ghostd}"
+# NOTE: ghostd is no longer fetched from a standalone URL — it ships inside the
+# signed release tarball (below), so the old GHOSTD_URL side-channel is gone.
 # Release tarball base. When GHOST_RELEASE_BASE is set it is used verbatim;
 # otherwise it is constructed per-version from the GitHub releases download URL.
 RELEASE_BASE_OVERRIDE="${GHOST_RELEASE_BASE:-}"
@@ -224,7 +227,7 @@ main() {
   log "auto-update enabled${DRY_RUN:+ }$([[ "$DRY_RUN" == "true" ]] && echo '(dry-run)')"
 
   # 2. Resolve installed + latest versions.
-  local installed latest install_sh ghostd_sha
+  local installed latest install_sh
   installed="$(read_installed_version || true)"
   [[ -n "$installed" ]] || { err "could not determine installed version"; write_status "error" "installed version unknown"; exit 1; }
 
@@ -232,9 +235,7 @@ main() {
   [[ -n "$install_sh" ]] || { err "could not fetch install.sh from $INSTALL_SH_URL"; write_status "error" "install.sh unreachable"; exit 1; }
   latest="$(echo "$install_sh" | grep -m1 -oE 'GHOST_VERSION="?v?[0-9]+\.[0-9]+\.[0-9]+"?' | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
   [[ "$latest" == v* ]] || latest="v${latest}"
-  ghostd_sha="$(echo "$install_sh" | grep -m1 -oE 'GHOSTD_SHA256="?[0-9a-fA-F]{64}"?' | grep -oE '[0-9a-fA-F]{64}' | head -1 || true)"
   [[ -n "$latest" && "$latest" != "v" ]] || { err "could not parse latest version from install.sh"; write_status "error" "version parse failed"; exit 1; }
-  [[ -n "$ghostd_sha" ]] || { err "could not parse GHOSTD_SHA256 from install.sh"; write_status "error" "ghostd sha parse failed"; exit 1; }
 
   log "installed=$installed latest=$latest"
   if ! is_newer "$installed" "$latest"; then
@@ -256,18 +257,17 @@ main() {
   gnupg="$tmp/gnupg"; mkdir -m700 "$gnupg"
   export GNUPGHOME="$gnupg"
 
-  log "downloading $tarball + signature + ghostd"
+  log "downloading $tarball + signature (ghostd is inside the tarball)"
   curl -fsSL --max-time 600 "${release_base}/${tarball}"            -o "$tmp/$tarball"          || { err "download tarball failed"; write_status "error" "tarball download failed" "$latest"; exit 1; }
   curl -fsSL --max-time 60  "${release_base}/SHA256SUMS.txt"        -o "$tmp/SHA256SUMS.txt"    || { err "download SHA256SUMS.txt failed"; write_status "error" "checksums download failed" "$latest"; exit 1; }
   curl -fsSL --max-time 60  "${release_base}/SHA256SUMS.txt.asc"    -o "$tmp/SHA256SUMS.txt.asc" || { err "download signature failed"; write_status "error" "signature download failed" "$latest"; exit 1; }
-  curl -fsSL --max-time 600 "$GHOSTD_URL"                           -o "$tmp/ghostd"           || { err "download ghostd failed"; write_status "error" "ghostd download failed" "$latest"; exit 1; }
 
   # ══════════════════════════════════════════════════════════════════════════
   # 4. MANDATORY VERIFICATION GATE — no binary is touched unless this passes.
   #    (a) detached GPG signature over SHA256SUMS.txt is VALID *and* the signer
   #        is EXACTLY the pinned release-key fingerprint;
-  #    (b) the release tarball's SHA256 matches SHA256SUMS.txt;
-  #    (c) ghostd's SHA256 matches the value in the freshly-fetched install.sh.
+  #    (b) the release tarball's SHA256 matches SHA256SUMS.txt (this transitively
+  #        covers ghostd, which now lives inside the tarball).
   #    ANY failure → loud abort, binaries untouched, non-zero exit.
   # ══════════════════════════════════════════════════════════════════════════
   curl -fsSL --max-time 60 "$RELEASE_KEY_URL" 2>/dev/null | gpg --quiet --import 2>/dev/null || true
@@ -293,26 +293,21 @@ main() {
     exit 1
   fi
 
-  if ( cd "$tmp" && echo "${ghostd_sha}  ghostd" | sha256sum -c - >/dev/null 2>&1 ); then
-    log "VERIFY ok: ghostd checksum matches install.sh (${ghostd_sha})"
-  else
-    err "VERIFY FAILED: ghostd SHA256 mismatch against install.sh — ABORTING, no binary touched."
-    write_status "verify-failed" "ghostd checksum mismatch for $latest" "$latest"
-    exit 1
-  fi
-
-  # 5. Unpack the verified tarball and locate the binaries it carries.
+  # 5. Unpack the verified tarball and locate the binaries it carries (ghostd is
+  #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  local new_pool new_pay new_cli
+  local new_pool new_pay new_cli new_ghostd
   new_pool="$(find "$tmp" -name ghost-pool -type f | head -1 || true)"
   new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
+  new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
   [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-pool"; write_status "error" "tarball missing ghost-pool" "$latest"; exit 1; }
+  [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
   # Build the swap plan: (dest <- src), only for binaries currently installed
   # (so we never introduce ghost-pay onto a node that opted out of it).
   local -a SWAP_DEST=() SWAP_SRC=()
-  SWAP_DEST+=("$BIN_DIR/ghostd");     SWAP_SRC+=("$tmp/ghostd")
+  SWAP_DEST+=("$BIN_DIR/ghostd");     SWAP_SRC+=("$new_ghostd")
   SWAP_DEST+=("$BIN_DIR/ghost-pool"); SWAP_SRC+=("$new_pool")
   if [[ -x "$BIN_DIR/ghost-pay" && -n "$new_pay" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-pay"); SWAP_SRC+=("$new_pay")

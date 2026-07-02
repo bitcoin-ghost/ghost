@@ -40,7 +40,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev capnproto libcapnp-dev
+          # ghost-pool/ghost-pay (Rust) need libsqlite3 + capnproto (the SV2
+          # stratum-core dep). The Linux job ALSO builds ghostd (the C++ Bitcoin
+          # Core daemon) below, which needs the standard Core build deps: a
+          # compiler + CMake + pkgconf, libevent, boost, and libzmq. WITH_ZMQ is
+          # ON (see the ghostd build step) because ghost-pool subscribes to
+          # ghostd's ZMQ hashblock/sequence feed, so libzmq3-dev is required; the
+          # capnproto/libsqlite3 packages above double as ghostd's IPC
+          # (ENABLE_IPC) and wallet (ENABLE_WALLET) dependencies.
+          sudo apt-get install -y \
+            libsqlite3-dev capnproto libcapnp-dev \
+            build-essential cmake pkgconf python3 libevent-dev libboost-dev libzmq3-dev
 
       # Install system dependencies (macOS) — capnproto for the SV2 stratum-core dep
       - name: Install dependencies (macOS)
@@ -64,6 +74,44 @@ jobs:
             -p ghost-pool -p ghost-cli -p ghost-pay -p ghost-gsp-bin \
             -p translator_sv2 -p pool_sv2 -p jd_client_sv2 -p jd_server_sv2
 
+      # Build ghostd (the C++ Bitcoin Core daemon) so all THREE node binaries
+      # (ghost-pool + ghost-pay + ghostd) ship in ONE signed release at ONE
+      # version and can never drift apart. Linux only — the pool/elder fleet is
+      # Linux, and a Bitcoin Core build is neither needed nor attempted on the
+      # macOS targets.
+      #
+      # CMake derives the client version from the workspace Cargo.toml (watch for
+      # the "Ghost client version (from workspace Cargo.toml)" log line), so the
+      # tag's version is baked into ghostd automatically with no extra wiring.
+      #
+      # WITH_ZMQ=ON is REQUIRED, not optional: ghost-pool subscribes to ghostd's
+      # ZMQ hashblock/sequence feed for new-block and reorg detection, so a
+      # non-ZMQ ghostd would silently break the pool. ENABLE_IPC/ENABLE_WALLET
+      # keep their defaults (ON) to match the fleet's reference binary; their
+      # deps (capnproto, libsqlite3) are already installed above.
+      #
+      # We build only the `ghostd` target and disable tests/bench/gui/tx/util/
+      # wallet-tool to keep the release build tractable (a Core build is ~20-40
+      # min on the 4-core runner). If the runner ever OOMs, cap `-j"$(nproc)"` at
+      # -j2 and/or add -DCMAKE_CXX_FLAGS="--param ggc-min-expand=1 --param
+      # ggc-min-heapsize=32768".
+      - name: Build ghostd (Linux release only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cmake -B ghost-core/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_ZMQ=ON \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_BENCH=OFF \
+            -DBUILD_GUI=OFF \
+            -DBUILD_FUZZ_BINARY=OFF \
+            -DBUILD_TX=OFF \
+            -DBUILD_UTIL=OFF \
+            -DBUILD_WALLET_TOOL=OFF
+          cmake --build ghost-core/build --target ghostd -j"$(nproc)"
+          # Fail loudly here (not at packaging time) if the daemon didn't build.
+          test -x ghost-core/build/bin/ghostd
+
       # Package binaries
       - name: Package
         shell: bash
@@ -76,6 +124,14 @@ jobs:
               cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
             fi
           done
+
+          # ghostd (C++) is built only on the Linux target (step above). Stage it
+          # into the SAME dist/ so it lands inside the linux tarball alongside
+          # ghost-pool + ghost-pay and is covered — with zero extra signing logic
+          # — by the existing SHA256SUMS + GPG signature over the tarball.
+          if [ -f "ghost-core/build/bin/ghostd" ]; then
+            cp "ghost-core/build/bin/ghostd" dist/
+          fi
 
           # Create archive only if dist has files
           cd dist
