@@ -131,6 +131,12 @@ const RECORD_WINDOWS: [(&str, i64); 4] = [
 ///
 /// 15 attempts with a randomised 60-90s delay ⇒ 14 sleeps × ~75s ≈ 17.5 min.
 /// These are consensus-affecting timings and are deliberately NOT env-tunable.
+///
+/// This is NO LONGER a terminal cap: a node that genuinely wants to be an elder
+/// keeps retrying indefinitely (with escalating backoff) rather than declaring
+/// "Node will not be an elder" after this many rounds. This constant now only
+/// marks the boundary between the fast converge window (fixed 60-90s delay) and
+/// the slow long-tail (exponential backoff up to `MPC_CONTRIBUTION_BACKOFF_MAX_SECS`).
 const MPC_CONTRIBUTION_MAX_ATTEMPTS: u32 = 15;
 /// Minimum per-attempt retry delay — enough for a voter to fetch the candidate,
 /// run the Groth16 verify, gossip its vote, reach quorum, apply and propagate
@@ -139,6 +145,30 @@ const MPC_CONTRIBUTION_RETRY_DELAY_MIN_SECS: u64 = 60;
 /// Maximum per-attempt retry delay. The delay is randomised in
 /// `[MIN, MAX]` to avoid a thundering herd when several nodes retry at once.
 const MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS: u64 = 90;
+/// Upper bound (seconds) on the escalating inter-round backoff once a node has
+/// spent its initial `MPC_CONTRIBUTION_MAX_ATTEMPTS` fast rounds without being
+/// voted in. A node that wants to be an elder NEVER permanently gives up (the
+/// node7/node8 onboarding bug that needed a manual restart); it keeps retrying
+/// and re-checking mesh readiness, but throttles to at most one round every few
+/// minutes so it does not hammer the mesh forever.
+#[cfg(feature = "mpc-ceremony")]
+const MPC_CONTRIBUTION_BACKOFF_MAX_SECS: u64 = 300;
+
+/// Freshness window (seconds) for counting an elder peer as "connected" in the
+/// MPC mesh-registration readiness gate. Health pings arrive every ~10s, so 60s
+/// tolerates a few missed pings without admitting long-dead peers.
+#[cfg(feature = "mpc-ceremony")]
+const MPC_READINESS_ELDER_FRESHNESS_SECS: u64 = 60;
+/// Poll interval (seconds) while waiting for mesh registration before the first
+/// contribution attempt. The gate sleeps between polls — it never busy-loops.
+#[cfg(feature = "mpc-ceremony")]
+const MPC_READINESS_POLL_SECS: u64 = 10;
+/// Overall ceiling (seconds) on the pre-contribution mesh-registration wait.
+/// Fail-safe: after this the node proceeds to attempt anyway. The contribution
+/// loop itself re-checks readiness every round, so a node that is still not
+/// meshed simply keeps retrying (with backoff) rather than blocking here forever.
+#[cfg(feature = "mpc-ceremony")]
+const MPC_READINESS_MAX_WAIT_SECS: u64 = 600;
 
 /// Decide whether a cached MPC contribution candidate is still valid to
 /// rebroadcast unchanged on the next retry.
@@ -182,6 +212,91 @@ fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> boo
 #[cfg(feature = "mpc-ceremony")]
 fn mpc_next_contribution_position(authoritative_count: u32, max_position: u32) -> u32 {
     authoritative_count.max(max_position) + 1
+}
+
+/// Pure readiness predicate for the MPC mesh-registration gate.
+///
+/// A freshly joined node must NOT start broadcasting its ceremony candidate
+/// until enough elders have DISCOVERED it (learned its address via mesh
+/// discovery + health-ping propagation) that they can actually fetch its
+/// candidate parameters and vote on them. Start too early and the voters cannot
+/// resolve the new node's address, every vote abstains, and — under the old
+/// fixed 15-attempt cap — the node wrongly concluded it "will not be an elder"
+/// and needed a manual `ghost-pool` restart to re-trigger the loop once the mesh
+/// had caught up (the node7/node8 onboarding bug this gate eliminates).
+///
+/// "Ready" iff BOTH hold:
+///   * our own candidate-serving HTTP endpoint is up (`endpoint_up`) — voters
+///     fetch `/api/v1/mpc/params?new_hash=…` from it, so it must be listening; and
+///   * we have live (recent health-ping) connectivity with at least
+///     `quorum` elders — the same BFT quorum the voters need to APPROVE the
+///     contribution. Receiving their pings proves they have discovered us and
+///     know our address, i.e. the reverse fetch path can succeed.
+#[cfg(feature = "mpc-ceremony")]
+fn mpc_contribution_ready(connected_elders: u32, quorum: u32, endpoint_up: bool) -> bool {
+    endpoint_up && connected_elders >= quorum
+}
+
+/// Inter-round backoff (seconds) for the indefinite MPC contribution retry loop.
+///
+/// For the first `MPC_CONTRIBUTION_MAX_ATTEMPTS` rounds the ceremony is still in
+/// its fast converge window, so this returns the upper bound of the tuned 60-90s
+/// delay (`MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS`) — the post-attempt delay site
+/// applies its own random jitter within `[MIN, MAX]`, while the readiness-wait
+/// site uses this value directly. Beyond the fast window the delay escalates
+/// exponentially and SATURATES at `MPC_CONTRIBUTION_BACKOFF_MAX_SECS`, so a node
+/// that cannot yet get voted in keeps retrying forever (never the old permanent
+/// "will not be an elder" giveup) without hammering the mesh.
+#[cfg(feature = "mpc-ceremony")]
+fn mpc_retry_backoff_secs(attempt: u32) -> u64 {
+    if attempt <= MPC_CONTRIBUTION_MAX_ATTEMPTS {
+        MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS
+    } else {
+        // over ∈ {1,2,…}; cap the shift so 1<<over cannot overflow.
+        let over = (attempt - MPC_CONTRIBUTION_MAX_ATTEMPTS).min(6);
+        MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS
+            .saturating_mul(1u64 << over)
+            .min(MPC_CONTRIBUTION_BACKOFF_MAX_SECS)
+    }
+}
+
+/// Count peers that are currently LIVE elders: they advertised `elder_status`
+/// in their most recent health ping AND that ping arrived within
+/// `freshness_secs` of `now`. `now` is passed explicitly so the count is
+/// deterministic under test.
+///
+/// NOTE: this reads `capabilities.elder_status` (refreshed on every health ping
+/// via `PeerManager::update_health_metrics`), NOT the `Peer::is_elder` field —
+/// the latter is only ever set true in unit tests and stays false in production,
+/// so counting it would always yield zero on a real mesh.
+#[cfg(feature = "mpc-ceremony")]
+fn count_connected_elders(
+    peers: &[ghost_consensus::peer::Peer],
+    now: u64,
+    freshness_secs: u64,
+) -> u32 {
+    let cutoff = now.saturating_sub(freshness_secs);
+    peers
+        .iter()
+        .filter(|p| p.capabilities.elder_status && p.last_seen >= cutoff)
+        .count() as u32
+}
+
+/// Probe our own candidate-serving HTTP endpoint — the same `:{http_port}` from
+/// which voters fetch `/api/v1/mpc/params`. Returns true once it answers, so the
+/// readiness gate never lets us advertise a candidate the voters could not
+/// actually fetch back from us. Binds to loopback (the listener is `0.0.0.0`).
+#[cfg(feature = "mpc-ceremony")]
+async fn local_mpc_endpoint_up(http_port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{}/api/v1/mpc/status", http_port);
+    matches!(
+        reqwest::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await,
+        Ok(resp) if resp.status().is_success()
+    )
 }
 
 /// Build this node's best (rarest) valid share per records window from the
@@ -4236,6 +4351,9 @@ async fn main() -> Result<()> {
         let args_genesis_password = args.genesis_password.clone();
         let genesis_password = config.pool.genesis_password.clone();
         let seed_nodes_for_mpc = config.network.seed_nodes.clone();
+        // Local HTTP port for the mesh-registration readiness probe (voters fetch
+        // our candidate from `:{http_port}/api/v1/mpc/params`).
+        let http_port_for_mpc = config.network.http_port;
 
         tokio::spawn(async move {
             // Wait a bit for network to stabilize
@@ -4324,6 +4442,76 @@ async fn main() -> Result<()> {
                 return;
             }
 
+            // === MESH-REGISTRATION READINESS GATE ===
+            // Before starting (and counting) contribution attempts, WAIT until
+            // the mesh has registered this node — i.e. enough elders have
+            // discovered it that they can fetch its candidate and vote on it.
+            // A fresh node that broadcast its candidate before the voters knew
+            // its address had every vote abstain, exhausted the fixed attempt
+            // cap, and wrongly gave up ("Node will not be an elder") — needing a
+            // manual restart once the mesh had caught up (the node7/node8 bug).
+            //
+            // Skipped for the genesis-bootstrap case: a genesis node with an
+            // empty ceremony creates position 1 itself and has no other elders to
+            // connect to, so gating it would pointlessly stall ceremony formation.
+            {
+                let bootstrap_genesis = is_genesis_node
+                    && db_for_mpc
+                        .mpc_contribution_count_authoritative()
+                        .unwrap_or(0)
+                        == 0;
+                if !bootstrap_genesis {
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(MPC_READINESS_MAX_WAIT_SECS);
+                    loop {
+                        // Already voted in while we waited: fall through to the
+                        // loop below (its is_mpc_elder branch adopts + returns).
+                        if db_for_mpc.is_mpc_elder(&node_id_hex).unwrap_or(false) {
+                            break;
+                        }
+                        let contributor_count = db_for_mpc
+                            .mpc_contribution_count_authoritative()
+                            .unwrap_or(0);
+                        let quorum = ghost_mpc::mpc_bft_threshold(contributor_count);
+                        let now = chrono::Utc::now().timestamp() as u64;
+                        let connected_elders = count_connected_elders(
+                            &mesh_for_mpc_startup.peers().get_all_peers(),
+                            now,
+                            MPC_READINESS_ELDER_FRESHNESS_SECS,
+                        );
+                        let endpoint_up = local_mpc_endpoint_up(http_port_for_mpc).await;
+                        if mpc_contribution_ready(connected_elders, quorum, endpoint_up) {
+                            info!(
+                                connected_elders,
+                                quorum, "MPC: mesh registration complete — beginning contribution"
+                            );
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            warn!(
+                                connected_elders,
+                                quorum,
+                                endpoint_up,
+                                "MPC: mesh-registration wait ceiling reached — proceeding to \
+                                 contribute anyway (the loop re-checks readiness every round)"
+                            );
+                            break;
+                        }
+                        info!(
+                            connected_elders,
+                            quorum,
+                            endpoint_up,
+                            "MPC: waiting for mesh registration before contributing — connected to \
+                             {}/{} elders",
+                            connected_elders,
+                            quorum
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(MPC_READINESS_POLL_SECS))
+                            .await;
+                    }
+                }
+            }
+
             // Retry loop: attempt contribution up to MPC_CONTRIBUTION_MAX_ATTEMPTS
             // times with a randomised 60-90s interval (~15-20 min total window).
             // This handles race conditions where multiple nodes try the same position
@@ -4336,7 +4524,28 @@ async fn main() -> Result<()> {
             // accumulate votes for one hash toward quorum (no "moving target").
             let mut cached_msg: Option<(ghost_consensus::message::MpcContributionMessage, u32)> =
                 None;
-            for attempt in 1..=MPC_CONTRIBUTION_MAX_ATTEMPTS {
+            // INDEFINITE retry: a node that wants to be an elder never permanently
+            // gives up. The first MPC_CONTRIBUTION_MAX_ATTEMPTS rounds use the tuned
+            // 60-90s converge window; beyond that the inter-round delay backs off
+            // (up to MPC_CONTRIBUTION_BACKOFF_MAX_SECS) so a still-unregistered node
+            // keeps retrying without hammering the mesh. The ONLY exits are: voted
+            // in (is_mpc_elder success → return) or the ceremony ossifies (clean
+            // break). Each round re-checks mesh readiness so a node that lost its
+            // elder connectivity waits rather than broadcasting into the void.
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+
+                // Clean exit if the ceremony ossified (101 contributors reached)
+                // while we were retrying — nothing more to contribute.
+                if ceremony_manager_for_startup.is_ossified() {
+                    info!(
+                        attempt,
+                        "MPC: ceremony ossified while retrying — stopping contribution attempts"
+                    );
+                    break;
+                }
+
                 // Re-check if we became an elder (e.g., via P2P sync of our own contribution)
                 if db_for_mpc.is_mpc_elder(&node_id_hex).unwrap_or(false) {
                     let position = db_for_mpc
@@ -4378,6 +4587,51 @@ async fn main() -> Result<()> {
                     );
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                     continue;
+                }
+
+                // Re-check mesh registration each round (skipped for the
+                // genesis-bootstrap case, which has no other elders). If we are no
+                // longer connected to a BFT quorum of elders — or our own
+                // candidate-serving endpoint went away — broadcasting a candidate
+                // now would just abstain-vote into the void. Wait (with the same
+                // escalating backoff as a failed attempt) and re-check instead of
+                // burning a round. This is what stops a node from ever wrongly
+                // concluding it "will not be an elder" while the mesh catches up.
+                {
+                    let bootstrap_genesis = is_genesis_node
+                        && db_for_mpc
+                            .mpc_contribution_count_authoritative()
+                            .unwrap_or(0)
+                            == 0;
+                    if !bootstrap_genesis {
+                        let contributor_count = db_for_mpc
+                            .mpc_contribution_count_authoritative()
+                            .unwrap_or(0);
+                        let quorum = ghost_mpc::mpc_bft_threshold(contributor_count);
+                        let now = chrono::Utc::now().timestamp() as u64;
+                        let connected_elders = count_connected_elders(
+                            &mesh_for_mpc_startup.peers().get_all_peers(),
+                            now,
+                            MPC_READINESS_ELDER_FRESHNESS_SECS,
+                        );
+                        let endpoint_up = local_mpc_endpoint_up(http_port_for_mpc).await;
+                        if !mpc_contribution_ready(connected_elders, quorum, endpoint_up) {
+                            let delay_secs = mpc_retry_backoff_secs(attempt);
+                            warn!(
+                                attempt,
+                                connected_elders,
+                                quorum,
+                                endpoint_up,
+                                delay_secs,
+                                "MPC: not adequately meshed to contribute (connected to {}/{} \
+                                 elders) — waiting before re-checking (no permanent giveup)",
+                                connected_elders,
+                                quorum
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                            continue;
+                        }
+                    }
                 }
 
                 // Ensure we have parameters loaded.
@@ -4950,17 +5204,23 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Wait a randomised 60-90s before retry: long enough for voters to
-                // fetch + Groth16-verify + vote + reach quorum + apply + propagate
-                // back, and randomised to prevent races where multiple nodes fight
-                // for the same position simultaneously.
-                if attempt < MPC_CONTRIBUTION_MAX_ATTEMPTS {
-                    let delay_secs = {
+                // Wait before the next round, then sync contributors + conditionally
+                // refetch. ALWAYS runs now (the loop is indefinite): during the fast
+                // converge window the delay is a randomised 60-90s — long enough for
+                // voters to fetch + Groth16-verify + vote + reach quorum + apply +
+                // propagate back, and randomised to prevent races where multiple
+                // nodes fight for the same position simultaneously; beyond the fast
+                // window it escalates to a capped backoff so a not-yet-voted-in node
+                // keeps retrying without hammering the mesh.
+                {
+                    let delay_secs = if attempt < MPC_CONTRIBUTION_MAX_ATTEMPTS {
                         use rand::Rng;
                         rand::thread_rng().gen_range(
                             MPC_CONTRIBUTION_RETRY_DELAY_MIN_SECS
                                 ..=MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS,
                         )
+                    } else {
+                        mpc_retry_backoff_secs(attempt)
                     };
                     info!(
                         attempt,
@@ -5240,7 +5500,13 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Final check after all attempts
+            // The loop only exits by BREAK (ceremony ossified) — the elder-success
+            // path returns from inside it. So reaching here means the ceremony
+            // ossified. If we were nonetheless voted in on the same tick we broke,
+            // finalise elder state; otherwise the ceremony filled before we could
+            // register. Either way this is a legitimate terminal state, NOT the old
+            // misleading "gave up after N attempts / will not be an elder" — until
+            // ossification a node that wants to be an elder retries indefinitely.
             if db_for_mpc.is_mpc_elder(&node_id_hex).unwrap_or(false) {
                 let position = db_for_mpc
                     .get_mpc_elder_position(&node_id_hex)
@@ -5253,9 +5519,9 @@ async fn main() -> Result<()> {
                 round_manager_for_mpc
                     .update_node_capabilities(identity_for_mpc.node_id(), updated_caps);
             } else {
-                warn!(
-                    attempts = MPC_CONTRIBUTION_MAX_ATTEMPTS,
-                    "MPC: Failed to contribute after all attempts. Node will not be an elder."
+                info!(
+                    "MPC: ceremony ossified before this node was voted in — it will not be an \
+                     elder in this ceremony (retried until ossification; no premature giveup)"
                 );
             }
         });
@@ -8283,6 +8549,113 @@ mod tests {
         // a phantom advance past the head.
         assert_eq!(mpc_next_contribution_position(0, 0), 1);
         assert_eq!(mpc_next_contribution_position(3, 3), 4);
+    }
+
+    /// Build a peer that advertises elder status with an explicit `last_seen`.
+    #[cfg(feature = "mpc-ceremony")]
+    fn elder_peer(tag: u8, last_seen: u64) -> ghost_consensus::peer::Peer {
+        let mut p = ghost_consensus::peer::Peer::new([tag; 32], format!("10.0.0.{tag}:8555"));
+        p.capabilities = NodeCapabilities {
+            elder_status: true,
+            ..NodeCapabilities::default()
+        };
+        p.last_seen = last_seen;
+        p
+    }
+
+    /// The mesh-registration readiness predicate: ready iff our candidate-serving
+    /// endpoint is up AND we are connected to at least a BFT quorum of elders.
+    /// This is the gate that stops the node7/node8 "broadcast before the voters
+    /// know my address → abstain → give up" bug.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn mpc_contribution_ready_below_at_and_above_threshold() {
+        // Below quorum: NOT ready even with the endpoint up.
+        assert!(!mpc_contribution_ready(2, 3, true));
+        // Exactly at quorum with the endpoint up: ready.
+        assert!(mpc_contribution_ready(3, 3, true));
+        // Above quorum: ready.
+        assert!(mpc_contribution_ready(4, 3, true));
+        // Endpoint down is never ready, regardless of elder count.
+        assert!(!mpc_contribution_ready(4, 3, false));
+        // Bootstrap quorum of 1 needs exactly one connected elder.
+        assert!(!mpc_contribution_ready(0, 1, true));
+        assert!(mpc_contribution_ready(1, 1, true));
+    }
+
+    /// `count_connected_elders` counts only peers that BOTH advertise elder
+    /// status AND were seen within the freshness window; a `now`-relative cutoff
+    /// keeps it deterministic.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn count_connected_elders_filters_stale_and_non_elders() {
+        let now = 10_000u64;
+        let fresh = now - 30; // within a 60s window
+        let stale = now - 120; // outside it
+
+        let mut non_elder = ghost_consensus::peer::Peer::new([9u8; 32], "10.0.0.9:8555".into());
+        non_elder.last_seen = fresh; // recent but NOT an elder
+        non_elder.capabilities = NodeCapabilities::default();
+
+        let peers = vec![
+            elder_peer(1, fresh), // counts
+            elder_peer(2, fresh), // counts
+            elder_peer(3, stale), // too old — excluded
+            non_elder,            // not an elder — excluded
+        ];
+
+        assert_eq!(count_connected_elders(&peers, now, 60), 2);
+        // Widen the window and the stale elder is admitted too.
+        assert_eq!(count_connected_elders(&peers, now, 300), 3);
+        // No peers → zero (a fresh node that nobody has discovered yet).
+        assert_eq!(count_connected_elders(&[], now, 60), 0);
+    }
+
+    /// The retry loop NEVER permanently gives up: for a node that is not yet
+    /// registered (`connected_elders < quorum`) the readiness predicate stays
+    /// false for every round, and the inter-round backoff stays a FINITE, bounded
+    /// delay no matter how many rounds elapse — so the node keeps re-checking
+    /// forever instead of hitting the old fixed 15-attempt "will not be an elder"
+    /// terminal state.
+    #[cfg(feature = "mpc-ceremony")]
+    #[test]
+    fn retry_backoff_is_indefinite_and_capped() {
+        // Fast converge window: the tuned upper bound (jitter added at the call site).
+        assert_eq!(
+            mpc_retry_backoff_secs(1),
+            MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS
+        );
+        assert_eq!(
+            mpc_retry_backoff_secs(MPC_CONTRIBUTION_MAX_ATTEMPTS),
+            MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS
+        );
+
+        // Beyond the fast window the delay escalates monotonically, then saturates
+        // at the cap — and is ALWAYS finite (never a "stop" sentinel), even for an
+        // absurd round count. This is the essence of "no permanent giveup".
+        let first_over = mpc_retry_backoff_secs(MPC_CONTRIBUTION_MAX_ATTEMPTS + 1);
+        assert!(first_over > MPC_CONTRIBUTION_RETRY_DELAY_MAX_SECS);
+        assert!(first_over <= MPC_CONTRIBUTION_BACKOFF_MAX_SECS);
+        for attempt in [MPC_CONTRIBUTION_MAX_ATTEMPTS + 5, 1_000, 100_000, u32::MAX] {
+            let d = mpc_retry_backoff_secs(attempt);
+            assert!(
+                d >= first_over,
+                "backoff must not shrink back below the first step"
+            );
+            assert_eq!(
+                d, MPC_CONTRIBUTION_BACKOFF_MAX_SECS,
+                "backoff must saturate at the cap, not overflow or reset"
+            );
+        }
+
+        // A still-unregistered node is never "ready", for any round — contrast the
+        // OLD behaviour, which stopped trying after MPC_CONTRIBUTION_MAX_ATTEMPTS.
+        for attempt in [1u32, MPC_CONTRIBUTION_MAX_ATTEMPTS, 10_000] {
+            assert!(
+                !mpc_contribution_ready(1, 3, true),
+                "unregistered node stays not-ready at round {attempt}, so the loop keeps retrying"
+            );
+        }
     }
 
     /// node6 reproduction: singleton at 1 while the chain tip advanced to a FOREIGN
