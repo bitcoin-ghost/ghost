@@ -240,7 +240,9 @@ fn check_archive(config: &NodeConfig) -> CapabilityCheck {
 }
 
 async fn check_ghost_pay(config: &NodeConfig) -> CapabilityCheck {
-    let claimed = config.ghost_pay.is_some();
+    // Match the capability advertisement: claim GhostPay only when enabled, not
+    // on mere presence of a (possibly disabled) `[ghost_pay]` block.
+    let claimed = config.ghost_pay_enabled();
     let last_checked_unix = now_unix();
     if !claimed {
         return CapabilityCheck {

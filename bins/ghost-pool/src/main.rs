@@ -2372,7 +2372,14 @@ async fn main() -> Result<()> {
     // We'll update after registering with the database
     let mut capabilities = NodeCapabilities {
         archive_mode: config.storage.archive_mode,
-        ghost_pay: config.ghost_pay.is_some(),
+        // Advertise GhostPay only when it is actually enabled — NOT on mere
+        // presence of a `[ghost_pay]` block. Pool-only nodes carry a default
+        // (disabled) block; advertising `is_some()` made them claim GhostPay,
+        // so every peer port-probed their (absent) ghost-pay API and logged a
+        // `GhostPay verification failed: Verification timeout` warning. Gating on
+        // `ghost_pay_enabled()` stops the false claim (verification still
+        // correctly denied them the +4 share, but silently now).
+        ghost_pay: config.ghost_pay_enabled(),
         public_mining: is_public_mining, // Derived from mining_mode
         reaper: config.reaper.enabled,
         elder_status: false,
