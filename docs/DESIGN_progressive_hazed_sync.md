@@ -465,5 +465,59 @@ Ranked by expected payoff:
 
 None of these is measured yet; each is a candidate for the next prototype
 iteration if/when GHAST is picked up. The obvious next experiment is **churn
-elision** — measure how much of the 174 GB is created-and-spent-within-span and
-therefore elidable, since that is the one lever that shrinks the download itself.
+elision** — measured below in §12.
+
+## 12. Churn elision — measured
+
+Measured on a live, fully-synced node (`ghostd`, height 956,410, 2026-07-03):
+
+| Metric | Value |
+|---|---|
+| Total transactions ever (`getchaintxstats`) | 1,389,346,171 |
+| Surviving UTXOs (`gettxoutsetinfo none`) | 166,121,169 (~166 M) |
+| Surviving set on disk | **11.4 GB** |
+| Est. outputs ever created (~2.4 outs/tx) | ~3.3 B |
+
+**Churn ≈ 95%** (94.6–95.4% across 2.2–2.6 outputs/tx) — roughly 19 of every 20
+outputs ever created have already been spent. Equivalently, the surviving UTXO
+set (11.4 GB) is **~6.6% of the ~174 GB economic graph — about 15× smaller.**
+
+**The catch, and it is the load-bearing one for a trustless design:** churn
+elision shrinks the *state you must store*, **not the trustless *download*.** To
+prove no double-spend without trusting anyone, every input must be matched to a
+real, previously-unspent output — so every spend (hence every churned output's
+create *and* spend) must be *processed*. You cannot skip *downloading* a churned
+output and still prove trustlessly it was created once and spent once. The only
+routes below the 174 GB floor are:
+
+- **trust** a summary of the surviving set — that is exactly `assumeutxo`, which
+  we are avoiding; or
+- a **commitment** to the UTXO set a fresh node can verify — and **Bitcoin
+  consensus commits to no such thing** (assumeUTXO's snapshot hash ships in the
+  software, not in the chain).
+
+So on Bitcoin as-is, **the 174 GB economic-graph download is the irreducible
+trustless minimum** — and multi-peer fetch (§10) already brings that to ~37 min
+on 1 Gbit. Churn elision is a *storage* win (~15×), not a download win.
+
+### 12.1 Where this points: a mesh-attested rolling UTXO commitment
+
+The 95% churn result is exactly what makes a genuinely-better-than-assumeUTXO
+path attractive. The surviving set is only ~11 GB, and Ghost already runs a BFT
+mesh. So instead of assumeUTXO's *single, static, software-shipped* snapshot
+hash, GHAST could use a **rolling UTXO commitment attested by the Ghost mesh's
+BFT consensus** at a recent height:
+
+- A fresh node downloads the ~11 GB surviving set + the mesh attestation → usable
+  in minutes, trusting the **mesh** (multi-party, live, rotating, *challengeable*)
+  rather than one hardcoded value.
+- It then runs the trustless GHAST sync (the 174 GB economic graph) **in the
+  background to earn full trustlessness** and to *audit* the attestation it
+  started from. If the background sync ever disagrees with the attested set,
+  that is a detectable, attributable mesh fault.
+
+This is strictly stronger than assumeUTXO — not static, not blind, self-auditing
+— while still giving the ~11 GB fast start. It is a real protocol, not a shipped
+snapshot, and it is only viable *because* churn is ~95%, making the surviving set
+small enough to ship quickly. **This is the recommended "better than assumeUTXO"
+direction.**
