@@ -6,24 +6,20 @@ Contributions are welcome. This is Bitcoin infrastructure -- correctness matters
 
 ### Requirements
 
-- Rust 1.75+ (stable toolchain)
-- Git with submodule support
+- Rust 1.85+ (stable toolchain)
 - SQLite3 development headers
+- A C++ toolchain and CMake (for `ghost-core`)
 - Linux recommended (Ubuntu 22.04+)
 
 ### Clone and Build
 
 ```bash
-git clone --recurse-submodules https://github.com/bitcoin-ghost/ghost.git
+git clone https://github.com/bitcoin-ghost/ghost.git
 cd ghost
 cargo build --workspace
 ```
 
-If you already cloned without submodules:
-
-```bash
-git submodule update --init --recursive
-```
+`ghost-core` has its own build system; see [ghost-core/INSTALL.md](ghost-core/INSTALL.md).
 
 ## Code Style
 
