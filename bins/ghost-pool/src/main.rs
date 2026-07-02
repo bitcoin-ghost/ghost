@@ -189,6 +189,51 @@ fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> boo
     current_count == cached_count
 }
 
+/// Local ghost-pay endpoint that accepts L2 checkpoint finalization notices.
+/// ghost-pay serves identity-derived TLS on 8800; the caller uses a client with
+/// `danger_accept_invalid_certs(true)` since this is loopback-only IPC.
+const GHOST_PAY_FINALIZE_URL: &str = "https://127.0.0.1:8800/api/v1/l2/finalize";
+
+/// Notify the local ghost-pay daemon that an L2 checkpoint finalized at `height`.
+///
+/// Retries up to 3 times with exponential backoff (500ms, then 1000ms). On
+/// success returns the zero-based index of the attempt that succeeded (so the
+/// caller can log a plain success vs. a succeeded-after-retry); on total failure
+/// returns the last error string. This is only ever invoked when
+/// [`NodeConfig::ghost_pay_enabled`] is true, so a returned `Err` always means a
+/// genuine problem reaching a ghost-pay that is supposed to be running locally —
+/// worth logging as an error — rather than the "ghost-pay isn't installed" case,
+/// which is now gated out entirely at the call site.
+async fn notify_ghost_pay_finalize(
+    client: &reqwest::Client,
+    endpoint: &str,
+    height: u64,
+    state_root: [u8; 32],
+    nullifiers: &[[u8; 32]],
+) -> Result<u32, String> {
+    let body = serde_json::json!({
+        "height": height,
+        "state_root": hex::encode(state_root),
+        "attestation_count": nullifiers.len(),
+        "included_tx_ids": nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
+    });
+    let mut last_err = String::new();
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                500 * 2u64.pow(attempt - 1),
+            ))
+            .await;
+        }
+        match client.post(endpoint).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(attempt),
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(last_err)
+}
+
 /// The ceremony position this node should target next, accounting for a node
 /// whose adopted head lags the recorded chain tip.
 ///
@@ -3440,7 +3485,15 @@ async fn main() -> Result<()> {
         // call doesn't need cert-chain validation — `danger_accept_invalid_certs`
         // is appropriate for localhost-only IPC. (Not the same code path as the
         // L-29-blocked verification client; that one talks to remote peers.)
-        if config.ghost_pay.is_some() {
+        //
+        // Gate on `ghost_pay_enabled()` — NOT on `ghost_pay.is_some()`. Pool-only
+        // nodes carry a `[ghost_pay]` block (setup emits one with `enabled = false`)
+        // but never run the ghost-pay daemon; wiring the notify there produced a
+        // failed POST + 3 retries + an ERROR on every checkpoint finalization
+        // (~7/min of pure noise). Nodes that DO run ghost-pay set `enabled = true`,
+        // so they still get notified exactly as before, and a genuine notify
+        // failure there still surfaces as an error (a real, log-worthy problem).
+        if config.ghost_pay_enabled() {
             let finalize_client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .danger_accept_invalid_certs(true)
@@ -3450,56 +3503,42 @@ async fn main() -> Result<()> {
                 move |height: u64, state_root: [u8; 32], nullifiers: Vec<[u8; 32]>| {
                     let client = finalize_client.clone();
                     tokio::spawn(async move {
-                        let body = serde_json::json!({
-                            "height": height,
-                            "state_root": hex::encode(state_root),
-                            "attestation_count": nullifiers.len(),
-                            "included_tx_ids": nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
-                        });
-                        // Retry up to 3 times with exponential backoff
-                        let mut last_err = String::new();
-                        for attempt in 0..3u32 {
-                            if attempt > 0 {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    500 * 2u64.pow(attempt - 1),
-                                ))
-                                .await;
+                        match notify_ghost_pay_finalize(
+                            &client,
+                            GHOST_PAY_FINALIZE_URL,
+                            height,
+                            state_root,
+                            &nullifiers,
+                        )
+                        .await
+                        {
+                            Ok(0) => {
+                                tracing::debug!(height, "Ghost-pay finalization notified");
                             }
-                            match client
-                                .post("https://127.0.0.1:8800/api/v1/l2/finalize")
-                                .json(&body)
-                                .send()
-                                .await
-                            {
-                                Ok(resp) if resp.status().is_success() => {
-                                    if attempt > 0 {
-                                        tracing::info!(
-                                            height,
-                                            attempt = attempt + 1,
-                                            "Ghost-pay finalization notified (after retry)"
-                                        );
-                                    } else {
-                                        tracing::debug!(height, "Ghost-pay finalization notified");
-                                    }
-                                    return;
-                                }
-                                Ok(resp) => {
-                                    last_err = format!("HTTP {}", resp.status());
-                                }
-                                Err(e) => {
-                                    last_err = e.to_string();
-                                }
+                            Ok(attempt) => {
+                                tracing::info!(
+                                    height,
+                                    attempt = attempt + 1,
+                                    "Ghost-pay finalization notified (after retry)"
+                                );
+                            }
+                            Err(last_err) => {
+                                tracing::error!(
+                                    height,
+                                    error = %last_err,
+                                    "Failed to notify ghost-pay of finalization after 3 attempts"
+                                );
                             }
                         }
-                        tracing::error!(
-                            height,
-                            error = %last_err,
-                            "Failed to notify ghost-pay of finalization after 3 attempts"
-                        );
                     });
                 },
             );
             nullifier_handler.set_finalize_fn(finalize_fn);
+        } else {
+            // Pool-only node: participate in L2 checkpoint consensus/gossip as
+            // normal, just don't try to hand finalizations to a local ghost-pay
+            // that isn't there. Logged once here, never per-checkpoint.
+            info!("ghost-pay not enabled — L2 finalization notifications disabled");
         }
 
         // Initialize validators from MPC elders in DB
@@ -8033,7 +8072,71 @@ fn resolve_signer_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghost_common::config::GhostPayConfig;
     use std::path::Path;
+
+    // ── ghost-pay finalization notify gate ───────────────────────────
+    //
+    // The finalize callback must be wired ONLY when ghost-pay is actually
+    // enabled on this node. Pool-only nodes carry a `[ghost_pay]` block with
+    // `enabled = false` and no local ghost-pay daemon; wiring the notify there
+    // spammed an ERROR (+3 retries) on every checkpoint finalization.
+
+    #[test]
+    fn test_finalize_gate_disabled_without_ghost_pay() {
+        // No [ghost_pay] block at all → no notify wiring.
+        let mut config = NodeConfig::default();
+        assert!(config.ghost_pay.is_none());
+        assert!(!config.ghost_pay_enabled());
+
+        // [ghost_pay] present but disabled (what `setup` writes on a pool-only
+        // node) → still no notify wiring.
+        config.ghost_pay = Some(GhostPayConfig::default());
+        assert!(!config.ghost_pay.as_ref().unwrap().enabled);
+        assert!(
+            !config.ghost_pay_enabled(),
+            "pool-only node must not attempt the ghost-pay finalize notify"
+        );
+    }
+
+    #[test]
+    fn test_finalize_gate_enabled_with_ghost_pay() {
+        // A node running ghost-pay sets enabled = true → notify is wired.
+        let mut config = NodeConfig::default();
+        config.ghost_pay = Some(GhostPayConfig {
+            enabled: true,
+            ..GhostPayConfig::default()
+        });
+        assert!(
+            config.ghost_pay_enabled(),
+            "a ghost-pay node must attempt the finalize notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_notify_ghost_pay_finalize_surfaces_genuine_failure() {
+        // On a node WITH ghost-pay enabled but the daemon unreachable, the
+        // notify must still fail loudly (return Err) so the caller logs an
+        // error. 127.0.0.1:1 refuses connections fast, so this doesn't wait on
+        // the full 5s HTTP timeout — only the two backoff sleeps (~1.5s total).
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("build test client");
+        let result = notify_ghost_pay_finalize(
+            &client,
+            "https://127.0.0.1:1/api/v1/l2/finalize",
+            123,
+            [0u8; 32],
+            &[[1u8; 32], [2u8; 32]],
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unreachable ghost-pay must surface as an error, not be swallowed"
+        );
+    }
 
     // ── ordered_fetch_sources (MPC candidate fetch ordering) ─────────
     //

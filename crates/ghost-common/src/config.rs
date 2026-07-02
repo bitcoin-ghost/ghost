@@ -248,6 +248,19 @@ impl ConfigValidationResult {
 }
 
 impl NodeConfig {
+    /// Whether a local ghost-pay L2 daemon is enabled on this node.
+    ///
+    /// Ghost Pay counts as enabled only when the `[ghost_pay]` block is present
+    /// AND its `enabled` flag is true. Pool-only nodes carry a `[ghost_pay]`
+    /// block (setup emits one by default) but with `enabled = false` and never
+    /// run the ghost-pay daemon, so the block's mere presence must NOT be read
+    /// as "ghost-pay is running here". This mirrors `validate_ghost_pay`, which
+    /// likewise treats `enabled = false` as off, and is the single source of
+    /// truth for whether ghost-pool should talk to a local ghost-pay.
+    pub fn ghost_pay_enabled(&self) -> bool {
+        self.ghost_pay.as_ref().is_some_and(|gp| gp.enabled)
+    }
+
     /// Validate the configuration
     ///
     /// Returns validation result with any errors and warnings found.
@@ -1653,6 +1666,63 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.network.sv2_port, SV2_STRATUM_PORT);
         assert_eq!(config.bitcoin.network, BitcoinNetwork::Signet);
+    }
+
+    #[test]
+    fn test_ghost_pay_enabled_predicate() {
+        // Pool-only node: no [ghost_pay] block at all → not enabled.
+        let mut config = NodeConfig::default();
+        assert!(config.ghost_pay.is_none());
+        assert!(
+            !config.ghost_pay_enabled(),
+            "absent [ghost_pay] must read as disabled"
+        );
+
+        // Pool-only node: [ghost_pay] block present but enabled = false
+        // (this is exactly what `setup` writes via GhostPayConfig::default()).
+        // The block's presence must NOT be mistaken for a running ghost-pay.
+        config.ghost_pay = Some(GhostPayConfig::default());
+        assert!(!config.ghost_pay.as_ref().unwrap().enabled);
+        assert!(
+            !config.ghost_pay_enabled(),
+            "[ghost_pay] with enabled = false must read as disabled"
+        );
+
+        // Core node: ghost-pay actually enabled.
+        config.ghost_pay = Some(GhostPayConfig {
+            enabled: true,
+            ..GhostPayConfig::default()
+        });
+        assert!(
+            config.ghost_pay_enabled(),
+            "[ghost_pay] with enabled = true must read as enabled"
+        );
+    }
+
+    #[test]
+    fn test_ghost_pay_enabled_from_toml() {
+        // The `enabled` flag round-trips through TOML: a pool-only node writes
+        // `enabled = false`, a core node `enabled = true`. Deserialise the
+        // [ghost_pay] block in isolation to confirm the flag is what the
+        // predicate keys off (NodeConfig sections other than reaper/coordinator
+        // aren't serde(default), so we parse the sub-struct directly).
+        let pool_only: GhostPayConfig = toml::from_str(
+            "enabled = false\nvirtual_block_secs = 10\nepoch_blocks = 2160\nwraith_enabled = true\n",
+        )
+        .unwrap();
+        assert!(!pool_only.enabled);
+
+        let core: GhostPayConfig = toml::from_str(
+            "enabled = true\nvirtual_block_secs = 10\nepoch_blocks = 2160\nwraith_enabled = true\n",
+        )
+        .unwrap();
+        assert!(core.enabled);
+
+        let mut config = NodeConfig::default();
+        config.ghost_pay = Some(pool_only);
+        assert!(!config.ghost_pay_enabled());
+        config.ghost_pay = Some(core);
+        assert!(config.ghost_pay_enabled());
     }
 
     #[test]
