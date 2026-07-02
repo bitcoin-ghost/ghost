@@ -2,7 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/bitcoin-ghost/ghost/ci.yml?label=CI)](https://github.com/bitcoin-ghost/ghost/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.10.16-informational)
+![Version](https://img.shields.io/badge/version-1.10.17-informational)
 
 Bitcoin Ghost is a Bitcoin mainnet project built around a Bitcoin Core fork
 (`ghostd`) and a decentralised mining pool (`ghost-pool`). Nodes form a
@@ -14,7 +14,7 @@ includes an L2 payments layer (`ghost-pay`) and a CoinJoin privacy protocol
 
 - **Website:** <https://bitcoinghost.org>
 - **Documentation:** <https://bitcoinghost.org/docs/>
-- **Current version:** 1.10.16
+- **Current version:** 1.10.17
 
 ## Components
 
@@ -148,9 +148,10 @@ own:
 
 | Feature | What it does |
 |---------|--------------|
-| Wraith Protocol | Two-phase CoinJoin mixing at L2 entry using blind Schnorr signatures. |
+| Wraith Protocol | Single-round, coordinator-blinded atomic CoinJoin mixing at L2 entry using blind Schnorr signatures. |
 | Ghost Keys (BIP-352) | Silent Payments — a fresh on-chain address per payment from one static identifier. |
 | Ghost Pay L2 | Off-chain transfers proven with zero-knowledge proofs. |
+| Ghost Mode | Incognito node mode — the node stops accepting and advertising transactions to peers, so its mempool is never exposed to surveillance. Pairs with Tor. |
 | Ghost Shroud | Randomised relay delay on transactions to resist timing analysis. |
 | Ghost Haze | Strips witness padding, scriptSig stuffing, and OP_RETURN payloads from blocks before they are written to disk, retaining the full economic graph. |
 
