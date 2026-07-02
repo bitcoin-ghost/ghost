@@ -53,15 +53,15 @@ pub struct GhostNoteSpendCircuit<F: PrimeField> {
 
 (Recipients are addressed by the [Keys](#keys) layer's ECDH stealth-derivation, not by a pubkey field inside the spend circuit.)
 
-The circuit enforces approximately 12 675 constraints proving:
+The circuit enforces several thousand constraints (the test suite bounds the count between 5 000 and 20 000 at depth 20) proving:
 
 1. The spent note's commitment is correctly formed (MiMC Pedersen).
 2. The note ID incorporates its index, epoch, and commitment.
 3. The nullifier is derived from the spending key (proves ownership).
 4. The note exists in the commitment tree (Merkle inclusion at depth 20).
-5. **Balance conservation:** `change = note_value − amount`.
+5. **Balance conservation:** `change = note_value − amount − fee`, where `fee` is the fixed 10-satoshi L2 transfer fee (`L2_TRANSFER_FEE_SATS`).
 6. The change and recipient commitments are correctly formed.
-7. **Range proofs:** `amount ∈ [0, 2⁶⁴)` and `change ∈ [0, 2⁶⁴)` (no negative-amount tricks).
+7. **Range proofs:** `amount ∈ [0, 2⁶⁴)` and `change ∈ [0, 2⁶⁴)` (`BALANCE_BITS = 64`; no negative-amount tricks).
 
 **Public inputs (what the verifier sees):**
 
@@ -99,7 +99,7 @@ pub struct NoteConsolidateCircuit<F: PrimeField> {
 }
 ```
 
-Approximately 2 500 constraints (the test suite asserts only `> 5 000` total when summed across the four input slots), proving:
+Several thousand constraints (the test suite bounds the count between 5 000 and 50 000 for a four-input tree at depth 20), proving:
 
 1. Each input note's commitment is well-formed.
 2. Each nullifier matches its spending key (no spending notes you don't own).
@@ -118,7 +118,7 @@ The exit ramp from L2 to L1. Proves ownership of a note and burns its entire val
 
 Simpler than note-spend — no change, no recipient commitment, the whole note is being consumed:
 
-Approximately 6 300 constraints, proving:
+A few thousand constraints (the test suite bounds the count between 2 000 and 15 000 at depth 20), proving:
 
 1. The note's commitment is well-formed.
 2. The nullifier matches the spending key.

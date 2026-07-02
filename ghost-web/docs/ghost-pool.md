@@ -124,7 +124,7 @@ The system tolerates up to 33% malicious nodes. Key properties:
 
 - **67% supermajority** required for critical decisions
 - **Cryptographic proofs** prevent share forgery
-- **Median fallback** if no consensus reached
+- **Deterministic recompute, not median** — every validator recomputes the payout split from its own converged ledger and rejects a proposal that doesn't match (there is no "median of proposals" fallback)
 - **Self-healing** through periodic state verification
 
 ## Payout Flow

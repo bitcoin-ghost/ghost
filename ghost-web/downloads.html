@@ -5,18 +5,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Downloads · Bitcoin Ghost</title>
-  <meta name="description" content="Ghost Tap wallet, Ghost Core node, Ghost Pool software, and Ghost CLI. Signed, reproducible, open source.">
+  <meta name="description" content="Download Bitcoin Ghost: the node package (ghostd, ghost-pool, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, open source, MIT license.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Downloads · Bitcoin Ghost">
-  <meta property="og:description" content="Ghost Tap wallet, Ghost Core node, Ghost Pool daemon, Ghost CLI. Signed releases, reproducible builds, MIT license.">
+  <meta property="og:description" content="The node package (ghostd, ghost-pool, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, MIT license.">
   <meta property="og:url" content="https://bitcoinghost.org/downloads.html">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:site" content="@defenwycke">
   <meta name="twitter:creator" content="@defenwycke">
   <meta name="twitter:title" content="Downloads · Bitcoin Ghost">
-  <meta name="twitter:description" content="Ghost Tap wallet, Ghost Core node, Ghost Pool daemon, Ghost CLI. Signed releases, reproducible builds, MIT license.">
+  <meta name="twitter:description" content="The node package (ghostd, ghost-pool, ghost-pay), the Wraith wallet, and the node dashboard. Signed releases, MIT license.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -70,177 +70,58 @@
     <span class="eyebrow">Downloads</span>
     <h1>Ghost software.</h1>
     <p class="lead">
-      Wallet, node, mining pool, CLI. Signed releases,
-      reproducible builds, no telemetry. Everything is free and open source
+      Three things to download: the node package, the Wraith wallet, and the
+      node dashboard. Signed releases, no telemetry, free and open source
       under the MIT license.
     </p>
     <div class="hero-actions">
       <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">GitHub releases <span class="arrow">→</span></a>
-      <a href="#verify" class="btn btn-ghost">Verify signatures</a>
+      <a href="#verify" class="btn btn-ghost">Verify your download</a>
     </div>
   </div>
 </section>
 
-<!-- ───────── Ghost Tap (end users) ───────── -->
+<!-- ───────── 1 · Node package (binaries) ───────── -->
 <section class="block">
   <div class="container">
-    <div class="section-label">Ghost Tap · wallet + merchant terminal</div>
-    <h2 class="section-title">Self-custodial Ghost wallet.</h2>
-    <p class="section-lead">
-      Ghost Tap is the reference wallet for Bitcoin Ghost. Holds L1 BTC,
-      receives and spends L2 shielded notes, opens Wraith mixing sessions,
-      runs a merchant terminal for in-person Bitcoin payments. Keys live on
-      your device — the wallet never phones home and never shares a balance
-      with a server.
-    </p>
-
-    <div class="core-tiles core-tiles-3">
-      <div class="ct-tile">
-        <div class="k">iOS</div>
-        <div class="v">iPhone · iPad</div>
-        <div class="sub">
-          iOS 16+ · universal · TestFlight while App Store review is pending.
-        </div>
-        <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">TestFlight <span class="arrow">→</span></a>
-        </div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">Android</div>
-        <div class="v">Phone · Tablet</div>
-        <div class="sub">
-          Android 11+ · Play Store + signed APK (reproducible build).
-        </div>
-        <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Play Store <span class="arrow">→</span></a>
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-ghost">APK</a>
-        </div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">Desktop</div>
-        <div class="v">Linux · macOS · Windows</div>
-        <div class="sub">
-          x86_64 + arm64 builds. Same Rust core as the mobile apps.
-        </div>
-        <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Download <span class="arrow">→</span></a>
-        </div>
-      </div>
-    </div>
-
-    <ul class="feature-list pay-green" style="margin-top:44px;">
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">L1 + L2 in one wallet <span class="fl-badge">bitcoin + shielded</span></div>
-          <div class="fl-desc">Send and receive regular Bitcoin on L1, plus shielded notes on Ghost Pay's L2. One seed, one backup.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Merchant mode <span class="fl-badge">point of sale</span></div>
-          <div class="fl-desc">Accept L2 payments with instant confirmation. Generate receipts, export CSV at end of day, auto-sweep to cold storage.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Wraith mixing <span class="fl-badge">built-in</span></div>
-          <div class="fl-desc">Join a coordinator-free mixing round with one tap. Break the transaction graph whenever you want, no third party involved.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Self-custodial <span class="fl-badge">your keys</span></div>
-          <div class="fl-desc">BIP39 seed, BIP44 key derivation, encrypted device keychain. No accounts, no KYC, no server balance lookups.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Light wallet backend <span class="fl-badge">GSP</span></div>
-          <div class="fl-desc">Syncs via the Ghost Silent-payment Protocol — the backend never learns which addresses belong to you.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Tor by default <span class="fl-badge">no metadata leak</span></div>
-          <div class="fl-desc">Every network request is routed through an in-app Tor client. No exit IP leak, no ISP inference, no clearnet fallback.</div>
-        </div>
-      </li>
-    </ul>
-  </div>
-</section>
-
-<!-- ───────── Ghost Core + Ghost Pool (operators) ───────── -->
-<section class="block">
-  <div class="container">
-    <div class="section-label">Ghost Core + Ghost Pool · node software</div>
+    <div class="section-label">1 · node package · operators</div>
     <h2 class="section-title">Run a Ghost node.</h2>
     <p class="section-lead">
-      Bitcoin Ghost runs the same ghost-core full node as the network,
-      plus the ghost-pool daemon that earns rewards and votes on payouts.
-      Most operators install both — the same server runs mainnet in one
-      process and ghost-pool in another, sharing the on-disk chain.
-      See the <a href="/nodes.html">nodes</a> page for hardware requirements
-      and the full operator guide.
+      The node package is a single signed tarball containing every binary a
+      node runs: <code>ghostd</code> (a clean Bitcoin Core v30 fork),
+      <code>ghost-pool</code> (mining pool + BFT payout consensus), and
+      <code>ghost-pay</code> (the optional L2 daemon). The command-line tools
+      — <code>ghost-cli</code>, <code>ghost-light-wallet-cli</code> and
+      <code>ghost-light-wallet-tui</code> — ship in the same tarball. See the
+      <a href="/nodes.html">nodes</a> page for hardware requirements and the
+      full operator guide.
     </p>
 
     <div class="core-tiles core-tiles-3">
-      <div class="ct-tile">
-        <div class="k">ghost-core</div>
-        <div class="v accent">Full node</div>
-        <div class="sub">
-          Clean Bitcoin Core v30 fork. Validates blocks, serves peers,
-          relays transactions. Same CLI as Bitcoin Core.
+      <div class="ct-tile ct-wide">
+        <div class="k">one-command install</div>
+        <div class="v" style="font-size:15px; line-height:1.7;">
+          <code>curl -sSL https://get.bitcoinghost.org | sudo bash -s -- \</code><br>
+          <code>&nbsp;&nbsp;--payout-address bc1q…</code>
         </div>
-        <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Binary <span class="arrow">→</span></a>
-          <a href="https://github.com/bitcoin-ghost/ghost" class="btn btn-ghost">Source</a>
-        </div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">ghost-pool</div>
-        <div class="v accent">Pool daemon</div>
-        <div class="sub">
-          Earns share rewards, handles Stratum, participates in BFT payout
-          consensus with the rest of the mesh. Requires ghost-core running.
-        </div>
-        <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Binary <span class="arrow">→</span></a>
-          <a href="https://github.com/bitcoin-ghost/ghost" class="btn btn-ghost">Source</a>
+        <div class="sub" style="margin-top:14px;">
+          Downloads and installs <code>ghostd</code>, <code>ghost-pool</code>
+          and <code>ghost-pay</code> with systemd units. It verifies the GPG
+          release signature before writing any binary. Add <code>--sync fast</code>
+          to load a verified assumeUTXO snapshot (height 910000) instead of a
+          full initial block download.
         </div>
       </div>
       <div class="ct-tile">
-        <div class="k">ghost-pay</div>
-        <div class="v accent">L2 daemon</div>
+        <div class="k">release tarball</div>
+        <div class="v accent">Linux x86_64</div>
         <div class="sub">
-          Optional. Participates in Ghost Pay L2 reconciliation. Required
-          to claim the +4 Ghost Pay capability share.
+          <code>bitcoin-ghost-&lt;version&gt;-x86_64-unknown-linux-gnu.tar.gz</code>
+          from GitHub releases, alongside <code>SHA256SUMS.txt</code> and its
+          signature. Prefer to install by hand? This is the file.
         </div>
         <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Binary <span class="arrow">→</span></a>
+          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Releases <span class="arrow">→</span></a>
           <a href="https://github.com/bitcoin-ghost/ghost" class="btn btn-ghost">Source</a>
         </div>
       </div>
@@ -253,8 +134,8 @@
           <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
         </svg>
         <div>
-          <div class="fl-name">Linux binaries <span class="fl-badge">x86_64 · arm64</span></div>
-          <div class="fl-desc">Static musl builds, no runtime dependencies. Shipped as <code>.tar.gz</code> and as <code>.deb</code> / <code>.rpm</code> packages for the major distros.</div>
+          <div class="fl-name">Signed binaries <span class="fl-badge">GPG</span></div>
+          <div class="fl-desc">Every release ships a detached signature over <code>SHA256SUMS.txt</code>. The installer refuses to write a binary unless both the signature and the checksum verify — see <a href="#verify">Verify your download</a>.</div>
         </div>
       </li>
       <li>
@@ -264,7 +145,7 @@
         </svg>
         <div>
           <div class="fl-name">systemd units included <span class="fl-badge">one-shot install</span></div>
-          <div class="fl-desc"><code>ghost-core.service</code>, <code>ghost-pool.service</code>, and <code>ghost-pay.service</code> ship inside the tarball. Drop them in <code>/etc/systemd/system</code> and enable.</div>
+          <div class="fl-desc">The installer writes and enables <code>ghostd</code>, <code>ghost-pool</code> and <code>ghost-pay</code> services, plus a sync gate so the pool only starts once the node is ready.</div>
         </div>
       </li>
       <li>
@@ -273,8 +154,8 @@
           <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
         </svg>
         <div>
-          <div class="fl-name">Docker images <span class="fl-badge">ghcr.io</span></div>
-          <div class="fl-desc">Signed multi-arch images at <code>ghcr.io/bitcoin-ghost/ghost-core</code>, <code>…/ghost-pool</code>, <code>…/ghost-pay</code>. A reference <code>docker-compose.yml</code> wires the stack together.</div>
+          <div class="fl-name">assumeUTXO fast-sync <span class="fl-badge">--sync fast</span></div>
+          <div class="fl-desc">Load a verified UTXO snapshot at height 910000 and be usable in minutes; the node back-fills and validates history behind it. Full trustless IBD from genesis stays the default.</div>
         </div>
       </li>
       <li>
@@ -283,57 +164,88 @@
           <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
         </svg>
         <div>
-          <div class="fl-name">macOS + Windows <span class="fl-badge">personal use</span></div>
-          <div class="fl-desc">Desktop builds for operators who want to run a node on their workstation. Not recommended for production mesh participation — Linux is the supported server target.</div>
+          <div class="fl-name">Build from source <span class="fl-badge">reproduce it</span></div>
+          <div class="fl-desc"><code>git clone https://github.com/bitcoin-ghost/ghost</code>, check out the latest release tag, then <code>cargo build --release --workspace</code>. Binaries land in <code>target/release/</code>. Full build docs are in the repo README.</div>
         </div>
       </li>
     </ul>
   </div>
 </section>
 
-<!-- ───────── Ghost CLI ───────── -->
+<!-- ───────── 2 · Wraith wallet (frontend) ───────── -->
 <section class="block">
   <div class="container">
-    <div class="section-label">Ghost CLI · power users</div>
-    <h2 class="section-title">Command-line tools.</h2>
+    <div class="section-label">2 · Wraith wallet · in development</div>
+    <h2 class="section-title">The Ghost wallet.</h2>
     <p class="section-lead">
-      <code>ghost-cli</code> is a single static binary that talks to
-      ghost-core and ghost-pool over RPC. Generate addresses, inspect
-      blocks, query pool state, manage a light wallet from a terminal.
+      Wraith is the reference desktop wallet for Bitcoin Ghost — L1 BTC plus
+      L2 shielded notes, Silent Payments for stealth receiving, and built-in
+      Wraith CoinJoin mixing for unlinkability. It is
+      <strong>still in development and not yet released</strong>; there is no
+      signed build to download today. Follow along in the repository, and
+      check back here — a signed release will appear on this page and on
+      GitHub releases when it ships.
     </p>
 
     <div class="core-tiles core-tiles-3">
       <div class="ct-tile">
-        <div class="k">ghost-cli</div>
-        <div class="v">RPC client</div>
+        <div class="k">Wraith wallet</div>
+        <div class="v">Desktop <span class="fl-badge">in development</span></div>
         <div class="sub">
-          Node RPC + pool RPC in one binary. Works against local or
-          remote daemons over TLS.
+          Linux · macOS · Windows planned. Self-custodial, Tor by default, no
+          server-side balance lookups.
         </div>
         <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Download <span class="arrow">→</span></a>
+          <a href="https://github.com/bitcoin-ghost/ghost" class="btn btn-ghost">Track on GitHub <span class="arrow">→</span></a>
+        </div>
+      </div>
+      <div class="ct-tile ct-wide">
+        <div class="k">what it will do</div>
+        <div class="sub" style="line-height:1.7;">
+          Hold L1 Bitcoin and spend L2 shielded notes from one seed; receive
+          to a Silent Payment address; open a coordinator-free Wraith mixing
+          round to break the transaction graph; sync via the Ghost
+          Silent-payment Protocol so the backend never learns your addresses.
+          See the <a href="/pay.html">pay</a> page for how the L2 works.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────── 3 · Node dashboard (frontend) ───────── -->
+<section class="block">
+  <div class="container">
+    <div class="section-label">3 · node dashboard · operators</div>
+    <h2 class="section-title">Watch and manage your node.</h2>
+    <p class="section-lead">
+      The node dashboard is a small web frontend you run against your own
+      node. It shows hashrate, shares, capabilities, verification results and
+      payouts, and lets you adjust policy, mining mode and reaper settings. It
+      binds to localhost and is password-protected — per-operator by design,
+      with no public endpoint.
+    </p>
+
+    <div class="core-tiles core-tiles-3">
+      <div class="ct-tile ct-wide">
+        <div class="k">run it</div>
+        <div class="sub" style="line-height:1.7;">
+          A Next.js app that talks to your node's local API. Access it at
+          <code>http://localhost:3000</code> on the node, or over an SSH
+          tunnel (<code>ssh -L 3000:localhost:3000 your-node</code>) from
+          elsewhere. Build and run instructions are in the
+          <a href="/docs/#node-dashboard">dashboard docs</a>.
         </div>
       </div>
       <div class="ct-tile">
-        <div class="k">ghost-light-wallet-cli</div>
-        <div class="v">Light wallet</div>
+        <div class="k">node dashboard</div>
+        <div class="v accent">Next.js · localhost</div>
         <div class="sub">
-          Command-line light wallet backed by GSP. Send, receive, check
-          balance — no full node required.
+          Ships in the repository. Password-protected, localhost-bound, no
+          telemetry.
         </div>
         <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Download <span class="arrow">→</span></a>
-        </div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">ghost-light-wallet-tui</div>
-        <div class="v">Terminal UI</div>
-        <div class="sub">
-          Full-screen ncurses wallet for servers. Same GSP backend as the
-          CLI, prettier interface.
-        </div>
-        <div class="hero-actions" style="margin-top:18px;">
-          <a href="https://github.com/bitcoin-ghost/ghost/releases" class="btn btn-primary">Download <span class="arrow">→</span></a>
+          <a href="https://github.com/bitcoin-ghost/ghost" class="btn btn-primary">Source <span class="arrow">→</span></a>
         </div>
       </div>
     </div>
@@ -346,9 +258,11 @@
     <div class="section-label">verify your download</div>
     <h2 class="section-title">Check every binary before running it.</h2>
     <p class="section-lead">
-      Every Ghost release is signed. Verify the signature before you install
-      anything — a release you didn't verify is a release you can't trust.
-      Three steps:
+      Every Ghost release is signed with the release key
+      (<code>777FE81F8CC077FD3D08055E852C2B3190F5B928</code>). The one-command
+      installer does these checks for you and aborts on any failure. If you
+      install by hand, do them yourself — a release you didn't verify is a
+      release you can't trust.
     </p>
 
     <ol class="quickstart-steps">
@@ -357,77 +271,43 @@
         <div class="qs-body">
           <div class="qs-title">Import the release key</div>
           <div class="qs-desc">
-            <code>gpg --keyserver keys.openpgp.org --recv-keys 0xDEFENWYCKE</code>
-            — replace with the fingerprint published on the release page. Always
-            cross-check the fingerprint against <a href="https://defenwycke.org">defenwycke.org</a>
-            and the pinned GitHub commit.
+            <code>curl -fsSL https://get.bitcoinghost.org/ghost-release-key.asc | gpg --import</code><br>
+            Confirm the fingerprint is
+            <code>777FE81F8CC077FD3D08055E852C2B3190F5B928</code> before you
+            trust it.
           </div>
         </div>
       </li>
       <li>
         <div class="qs-n">2</div>
         <div class="qs-body">
-          <div class="qs-title">Verify SHA256SUMS.asc</div>
+          <div class="qs-title">Verify the checksums file</div>
           <div class="qs-desc">
-            Download <code>SHA256SUMS</code> and <code>SHA256SUMS.asc</code> from
-            the release. Run <code>gpg --verify SHA256SUMS.asc SHA256SUMS</code>.
-            You should see <code>Good signature from defenwycke</code> and a
-            matching fingerprint.
+            Download <code>SHA256SUMS.txt</code> and
+            <code>SHA256SUMS.txt.asc</code> from the release, then run
+            <code>gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt</code>. You
+            should see a good signature from the fingerprint above.
           </div>
         </div>
       </li>
       <li>
         <div class="qs-n">3</div>
         <div class="qs-body">
-          <div class="qs-title">Check the binary hash</div>
+          <div class="qs-title">Check the tarball hash</div>
           <div class="qs-desc">
-            Run <code>sha256sum -c SHA256SUMS --ignore-missing</code>. Each
-            downloaded binary must match. If any line says <code>FAILED</code>,
-            stop — delete the binary and report it on the issue tracker.
+            With the tarball in the same directory, run
+            <code>sha256sum -c SHA256SUMS.txt</code>. The line for your file
+            must say <code>OK</code>. If anything says <code>FAILED</code>,
+            stop — delete it and report it on the issue tracker.
           </div>
         </div>
       </li>
     </ol>
 
     <div class="pending-note" style="margin-top:28px;">
-      Builds are reproducible — the release tarball contains a Guix manifest
-      and a build script that produces byte-for-byte identical binaries
-      from the tagged source. Run the build yourself if you don't want to
-      trust defenwycke's machine.
-    </div>
-  </div>
-</section>
-
-<!-- ───────── Source / build ───────── -->
-<section class="block">
-  <div class="container">
-    <div class="section-label">source · reproducible builds</div>
-    <h2 class="section-title">Build it yourself.</h2>
-    <p class="section-lead">
-      Every binary on this page builds from a public git tag. Nothing is
-      compiled on a private machine and pushed as an opaque blob. If you
-      spot a divergence between your build and the signed release, that's
-      a bug — open an issue.
-    </p>
-
-    <div class="core-tiles core-tiles-3">
-      <div class="ct-tile ct-wide">
-        <div class="k">clone + build</div>
-        <div class="v" style="font-size:15px; line-height:1.7;">
-          <code>git clone https://github.com/bitcoin-ghost/ghost</code><br>
-          <code>cd ghost &amp;&amp; git checkout v1.0.0</code><br>
-          <code>cargo build --release --workspace</code>
-        </div>
-        <div class="sub" style="margin-top:14px;">
-          Binaries land in <code>target/release/</code>. Full build
-          instructions, dependencies, and Guix manifest in the repo README.
-        </div>
-      </div>
-    </div>
-
-    <div class="hero-actions" style="margin-top:28px;">
-      <a href="https://github.com/bitcoin-ghost/ghost" class="btn btn-primary">Source on GitHub <span class="arrow">→</span></a>
-      <a href="/docs/" class="btn btn-ghost">Build docs</a>
+      Prefer to trust nothing? Build from source: clone the repo, check out
+      the release tag, run <code>cargo build --release --workspace</code>, and
+      compare your binaries against the signed release.
     </div>
   </div>
 </section>

@@ -18,20 +18,20 @@ Elders receive a permanent +1 share bonus in the node reward system. This bonus 
 
 ## Selection Process
 
-Elder selection happens automatically during the network launch:
+Elder selection is **rolling** — slots fill continuously as nodes come online, not in a single event at launch:
 
-1. **Node Registration** — You install Ghost Node and it generates your unique 32-byte Node ID. Your node registers with the network.
-2. **Timestamp Recording** — Your registration timestamp is cryptographically signed and broadcast to all nodes.
-3. **Ordering** — Nodes are ordered by (timestamp, hash(node_id)) for deterministic tie-breaking.
-4. **Elder Assignment** — Once 101 nodes have registered, the Elder list is frozen. Positions 1-101 are assigned.
+1. **Node Registration** — You install Ghost Node and it generates a unique 32-byte Node ID. Generating a valid Node ID requires a **proof-of-work** (Sybil resistance — you can't cheaply mint thousands of identities).
+2. **Promotion on registration** — Every time a node registers (or refreshes its health), the network runs an atomic promotion pass: while fewer than 101 Elders exist, eligible non-Elder nodes are promoted to fill the open slots.
+3. **Ordering** — Promotion is by **Node ID ascending** (lowest Node IDs first), and only nodes that submitted a valid proof-of-work are eligible. The ordering is deterministic, so every node computes the same Elder set.
+4. **Elder Assignment** — Positions are assigned in promotion order. Once 101 Elders are held simultaneously, no further promotions happen until a slot reopens (see [Revocation](#revocation)).
 
 ### Deterministic Selection
 
-The selection is fully deterministic — all nodes calculate the same Elder list from the same data. There's no central authority deciding who becomes an Elder.
+The selection is fully deterministic — all nodes derive the same Elder list from the same on-chain-anchored data. There's no central authority deciding who becomes an Elder.
 
-### One-Time Event
+### Rolling, Not One-Shot
 
-Elder selection happens only once, at network launch. Once 101 Elders are assigned, the list is permanent. New nodes cannot become Elders.
+Elder slots are filled as nodes arrive, up to the cap of 101. Today the network holds far fewer than 101 Elders, so any node presenting a valid proof-of-work is promoted immediately; Node ID ordering only breaks ties once more than 101 proof-of-work nodes compete for the remaining slots.
 
 ## Benefits
 
@@ -58,14 +58,15 @@ Elders are visible on the network dashboard with their rank (1-101). It's a perm
 
 To become an Elder, you must:
 
-1. **Register early** — Be one of the first 101 nodes to register
-2. **Stay online** — Maintain uptime after registration
-3. **Run a valid node** — Full sync, passing health checks
+1. **Hold a slot** — Be promoted into one of the 101 slots. Promotion is by Node ID (lowest first) among proof-of-work-valid nodes; while the network is below the cap, any valid node is promoted immediately.
+2. **Present a valid proof-of-work Node ID** — Elder eligibility requires the PoW-stamped Node ID (Sybil resistance).
+3. **Stay online** — Maintain uptime after promotion, or risk revocation (see below).
+4. **Run a valid node** — Full sync, passing health checks.
 
-There's no payment, no application, no approval process. Just be early and run a good node.
+There's no payment, no application, no approval process. Run a valid node while slots remain and you're promoted automatically.
 
 :::callout Current Status
-The Elder Genesis Event has occurred. 4 Elder nodes are currently active (out of 101 maximum). 97 slots remain for new Elders. Check the [Network page](/pool.html) for the latest status.
+Elder registration is open and rolling. The network currently holds well under the 101-Elder cap, so slots remain available for new operators who run a valid node. Check the [Network page](/pool.html) for the live Elder count and registry.
 :::
 
 ## Revocation
@@ -84,14 +85,13 @@ If your Elder node is offline for **7 continuous days**, your Elder status is pe
 4. 67% of active nodes must witness/confirm
 5. Revocation is recorded permanently
 
-### Slots Are Not Refilled
+### Slots Reopen on Revocation
 
-When an Elder is revoked, their slot is **not** given to someone else. The total number of Elders decreases permanently. This means:
+When an Elder is revoked, its slot **reopens**. The promotion pass runs continuously, so the next eligible node (lowest Node ID with a valid proof-of-work) is promoted into the freed slot. The cap stays at 101 — the network doesn't shrink permanently below it while eligible candidates exist.
 
-- Starting with 101 Elders
-- If 5 are revoked → 96 Elders remain
-- Those 96 share the Elder pool among fewer nodes
-- Remaining Elders get slightly more
+- A revoked Elder loses its `is_elder` status and `elder_order`, and is recorded in the retired-nodes table for audit.
+- If eligible non-Elder nodes are waiting, one is promoted into the vacated slot on the next registration pass.
+- If no eligible candidate is online, the slot simply sits open until one registers.
 
 ### Why So Strict?
 
@@ -113,7 +113,7 @@ The dashboard UI sometimes refers to a `ghostnode.dat` label, but the node itsel
 
 ### Can I run multiple Elder nodes?
 
-Technically yes, if you register multiple nodes in the first 101. But each node requires separate infrastructure and must maintain uptime independently.
+Technically yes, if you get multiple nodes promoted while slots remain. But each node requires separate infrastructure, its own proof-of-work Node ID, and must maintain uptime independently.
 
 ### What if I'm offline for 6 days?
 
