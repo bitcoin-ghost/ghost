@@ -779,17 +779,26 @@ impl EpochManager {
             notes_migrated,
         )?;
 
-        // Insert new epoch record before any l2_notes reference it
-        // Initial root computed after tree build; use placeholder, update below
-        self.db.insert_l2_epoch(&ghost_storage::L2EpochRecord {
-            epoch: new_epoch,
-            start_height: boundary_height,
-            end_height: None,
-            initial_root: [0u8; 32], // placeholder, updated after tree build
-            final_root: None,
-            notes_migrated: 0,
-            status: "active".to_string(),
-        })?;
+        // Insert new epoch record before any l2_notes reference it.
+        // Initial root computed after tree build; use placeholder, update below.
+        //
+        // The row may already exist if it was materialised by a tree-sync
+        // payload (a joining node can receive the peer's authoritative epoch
+        // record before it locally replays this boundary). In that case leave
+        // the existing row untouched — the peer's data is authoritative and a
+        // plain INSERT would trip the PRIMARY KEY constraint.
+        let epoch_row_exists = self.db.get_l2_epoch(new_epoch)?.is_some();
+        if !epoch_row_exists {
+            self.db.insert_l2_epoch(&ghost_storage::L2EpochRecord {
+                epoch: new_epoch,
+                start_height: boundary_height,
+                end_height: None,
+                initial_root: [0u8; 32], // placeholder, updated after tree build
+                final_root: None,
+                notes_migrated: 0,
+                status: "active".to_string(),
+            })?;
+        }
 
         // 5. Build new tree from unspent notes (deterministic order)
         let mut new_tree = CommitmentTree::new(self.config.tree_depth);
@@ -805,9 +814,12 @@ impl EpochManager {
             .root()
             .map_err(|e| GhostError::Internal(format!("Failed to compute new root: {}", e)))?;
 
-        // Update epoch record with actual initial root
-        self.db
-            .update_l2_epoch_initial_root(new_epoch, &new_initial_root)?;
+        // Update epoch record with actual initial root (only for a freshly
+        // inserted row — do not overwrite an authoritative synced record).
+        if !epoch_row_exists {
+            self.db
+                .update_l2_epoch_initial_root(new_epoch, &new_initial_root)?;
+        }
 
         // 6. Swap trees and move nullifiers to transition set for cross-epoch protection
         *self.commitment_tree.write() = new_tree;

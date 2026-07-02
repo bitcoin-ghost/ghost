@@ -8610,6 +8610,41 @@ impl Database {
         })
     }
 
+    /// Idempotently insert or update an L2 epoch, keyed by `epoch`.
+    ///
+    /// Used when applying epoch records received during tree-sync: a joining
+    /// node must materialise the parent `l2_epochs` row before persisting any
+    /// checkpoint that references it (FK: `l2_checkpoints.epoch`). The peer's
+    /// record is authoritative, so on conflict every field is replaced. Unlike
+    /// `insert_l2_epoch`, this never fails when the row already exists (e.g. the
+    /// genesis epoch 0, or an epoch re-sent across paginated batches).
+    pub fn upsert_l2_epoch(&self, record: &L2EpochRecord) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO l2_epochs (epoch, start_height, end_height, initial_root, final_root, notes_migrated, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(epoch) DO UPDATE SET
+                     start_height = excluded.start_height,
+                     end_height = excluded.end_height,
+                     initial_root = excluded.initial_root,
+                     final_root = excluded.final_root,
+                     notes_migrated = excluded.notes_migrated,
+                     status = excluded.status",
+                params![
+                    record.epoch as i64,
+                    record.start_height as i64,
+                    record.end_height.map(|h| h as i64),
+                    record.initial_root.as_slice(),
+                    record.final_root.as_ref().map(|r| r.as_slice()),
+                    record.notes_migrated as i64,
+                    record.status,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Get the current (active) L2 epoch
     pub fn get_active_l2_epoch(&self) -> GhostResult<Option<L2EpochRecord>> {
         self.with_connection(|conn| {
@@ -11819,5 +11854,59 @@ mod tests {
             db.save_mpc_contribution(&mk_contribution(pos)).unwrap();
         }
         assert_eq!(db.get_mpc_max_contribution_position().unwrap(), Some(4));
+    }
+
+    /// `upsert_l2_epoch` materialises a missing epoch row and is idempotent, so
+    /// a tree-sync replay can satisfy the `l2_checkpoints.epoch -> l2_epochs`
+    /// FK without ever hitting a PRIMARY KEY conflict on re-application. The FK
+    /// trigger is still enforced for a checkpoint whose epoch was not upserted.
+    #[test]
+    fn test_upsert_l2_epoch_idempotent_and_fk_enforced() {
+        let db = Database::in_memory().expect("create in-memory db");
+
+        // A checkpoint for an epoch with no parent row is rejected by the FK trigger.
+        let checkpoint = |epoch: u64| L2CheckpointRecord {
+            height: 550,
+            epoch,
+            commitment_root: [0xAB; 32],
+            tx_count: 0,
+            proposer_id: "node".to_string(),
+            active_node_count: 1,
+            block_data: vec![],
+        };
+        assert!(
+            db.upsert_l2_checkpoint(&checkpoint(7)).is_err(),
+            "checkpoint with no parent epoch must be rejected"
+        );
+
+        // Materialise epoch 7, then the same checkpoint inserts cleanly.
+        let epoch = L2EpochRecord {
+            epoch: 7,
+            start_height: 700,
+            end_height: None,
+            initial_root: [0x11; 32],
+            final_root: None,
+            notes_migrated: 0,
+            status: "active".to_string(),
+        };
+        db.upsert_l2_epoch(&epoch).expect("first upsert inserts");
+        db.upsert_l2_checkpoint(&checkpoint(7))
+            .expect("checkpoint persists once parent epoch exists");
+
+        // Re-upserting the same epoch (e.g. re-sent across sync batches) must
+        // not conflict, and may carry updated authoritative fields.
+        let archived = L2EpochRecord {
+            end_height: Some(800),
+            final_root: Some([0x22; 32]),
+            notes_migrated: 3,
+            status: "archived".to_string(),
+            ..epoch.clone()
+        };
+        db.upsert_l2_epoch(&archived)
+            .expect("re-upsert must be idempotent");
+        let loaded = db.get_l2_epoch(7).unwrap().expect("epoch present");
+        assert_eq!(loaded.status, "archived");
+        assert_eq!(loaded.end_height, Some(800));
+        assert_eq!(loaded.final_root, Some([0x22; 32]));
     }
 }
