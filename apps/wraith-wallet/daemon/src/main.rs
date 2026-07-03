@@ -521,7 +521,7 @@ mod server {
         let network = std::env::var(NETWORK_ENV)
             .ok()
             .and_then(|s| parse_network(&s))
-            .unwrap_or(bitcoin::Network::Signet);
+            .unwrap_or(bitcoin::Network::Bitcoin);
         tracing::info!(
             ghost_pay = ?ghost_pay_urls,
             gsp = ?gsp_urls,
