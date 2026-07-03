@@ -207,20 +207,14 @@ jobs:
     runs-on: macos-latest
     env:
       TRIPLE: aarch64-apple-darwin
-      # Apple Developer ID signing + notarization material from repo secrets.
-      # Tauri reads these env vars natively: when APPLE_CERTIFICATE +
-      # APPLE_SIGNING_IDENTITY are set it code-signs the app/dmg (setting up a
-      # temporary keychain from the base64 PFX itself), and when APPLE_ID +
-      # APPLE_PASSWORD + APPLE_TEAM_ID are also set it notarizes via notarytool.
-      # When the secrets are unset these are empty strings and Tauri skips
-      # signing/notarization entirely — the DMG builds unsigned (functional, but
-      # Gatekeeper warns) so certless CI runs keep working.
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Whether Apple Developer ID signing material is present. Tauri reads the
+      # APPLE_* env vars NATIVELY during `tauri build`, and — critically — it
+      # attempts a keychain import whenever APPLE_CERTIFICATE is merely SET, even
+      # to an empty string (which fails: "failed to import keychain certificate").
+      # So we must NOT expose empty APPLE_* vars to the build step. This boolean
+      # gates two build steps below: signed (vars present) vs unsigned (no vars),
+      # so certless CI runs produce a clean unsigned DMG.
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -254,13 +248,31 @@ jobs:
           cp "target/${TRIPLE}/release/wraithd" "$SIDECAR_DIR/wraithd-${TRIPLE}"
           ls -la "$SIDECAR_DIR"
 
-      - name: Build DMG installer
+      # Two mutually-exclusive build steps. The APPLE_* signing/notarization
+      # material is injected ONLY into the signed step, and ONLY when the cert
+      # secret is present — so the unsigned path never exposes empty APPLE_* vars
+      # to Tauri (which would fail the keychain import). Tauri signs with the
+      # Developer ID + notarizes via notarytool when all six vars are set.
+      - name: Build DMG installer (signed + notarized)
+        if: env.HAS_APPLE_SIGNING == 'true'
+        working-directory: apps/wraith-wallet/gui
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri build -- --target "$TRIPLE" --bundles dmg
+
+      - name: Build DMG installer (unsigned)
+        if: env.HAS_APPLE_SIGNING != 'true'
         working-directory: apps/wraith-wallet/gui
         shell: bash
         run: |
-          # `tauri build` compiles the GUI crate for the mac target and runs the
-          # bundler for the dmg. The APPLE_* env vars above drive signing +
-          # notarization when present; empty vars mean an unsigned DMG.
+          # No cert secret present — build a clean unsigned DMG (functional;
+          # Gatekeeper warns on first open). No APPLE_* env vars are set here.
           npm run tauri build -- --target "$TRIPLE" --bundles dmg
 
       - name: Locate DMG
