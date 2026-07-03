@@ -1039,6 +1039,10 @@ set -euo pipefail
 GPG_KEY_FP="${GHOST_GPG_KEY_FP:-777FE81F8CC077FD3D08055E852C2B3190F5B928}"
 RELEASE_KEY_URL="${GHOST_RELEASE_KEY_URL:-https://get.bitcoinghost.org/ghost-release-key.asc}"
 INSTALL_SH_URL="${GHOST_INSTALL_SH_URL:-https://get.bitcoinghost.org/install.sh}"
+# Latest-release source of truth. install.sh auto-tracks this same API, so we
+# resolve the newest version straight from it rather than scraping install.sh
+# (whose GHOST_VERSION is now a dynamic ${...} expansion with no literal version).
+RELEASES_API_URL="${GHOST_RELEASES_API_URL:-https://api.github.com/repos/bitcoin-ghost/ghost/releases/latest}"
 # NOTE: ghostd is no longer fetched from a standalone URL — it ships inside the
 # signed release tarball (below), so the old GHOSTD_URL side-channel is gone.
 # Release tarball base. When GHOST_RELEASE_BASE is set it is used verbatim;
@@ -1240,11 +1244,11 @@ main() {
   installed="$(read_installed_version || true)"
   [[ -n "$installed" ]] || { err "could not determine installed version"; write_status "error" "installed version unknown"; exit 1; }
 
-  install_sh="$(curl -fsSL --max-time 30 "$INSTALL_SH_URL" 2>/dev/null || true)"
-  [[ -n "$install_sh" ]] || { err "could not fetch install.sh from $INSTALL_SH_URL"; write_status "error" "install.sh unreachable"; exit 1; }
-  latest="$(echo "$install_sh" | grep -m1 -oE 'GHOST_VERSION="?v?[0-9]+\.[0-9]+\.[0-9]+"?' | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  # Resolve the latest published release directly from the GitHub releases API
+  # (the same source install.sh auto-tracks). Robust to install.sh's format.
+  latest="$(curl -fsSL --max-time 30 "$RELEASES_API_URL" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
+  [[ -n "$latest" ]] || { err "could not resolve latest release from $RELEASES_API_URL"; write_status "error" "latest version unresolved"; exit 1; }
   [[ "$latest" == v* ]] || latest="v${latest}"
-  [[ -n "$latest" && "$latest" != "v" ]] || { err "could not parse latest version from install.sh"; write_status "error" "version parse failed"; exit 1; }
 
   log "installed=$installed latest=$latest"
   if ! is_newer "$installed" "$latest"; then
