@@ -270,13 +270,14 @@ enum LightCommand {
         #[arg(short, long, default_value_t = 0)]
         offset: u32,
     },
-    /// Send a payment. Mode is one of `ghostpay` (default), `wraith`, or `confidential`.
+    /// Send an instant L2 payment. Mode is `ghostpay` (the only accepted
+    /// value; default). For unlinkable L1 spends use the Mix flow instead.
     Send {
         /// Recipient: a Bitcoin address or a Ghost ID.
         recipient: String,
         /// Amount in satoshis.
         amount_sats: u64,
-        /// Payment mode.
+        /// Payment mode. Only `ghostpay` (instant L2) is supported.
         #[arg(long, default_value = "ghostpay")]
         mode: String,
         /// Optional memo, included with the payment metadata.

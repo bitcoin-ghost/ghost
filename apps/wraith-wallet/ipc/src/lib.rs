@@ -147,8 +147,11 @@ pub enum Request {
         /// refuses fee >= prev_value_sats.
         fee_sats: u64,
     },
-    /// Prepare + sign + submit an on-chain / L2 payment.
-    /// Mode is one of: "ghostpay" (default), "wraith", "confidential".
+    /// Prepare + sign + submit an L2 payment.
+    /// Mode is `ghostpay` (the instant L2 ledger transfer); it is the
+    /// only accepted value and the default. The legacy `wraith` and
+    /// `confidential` values are rejected — unlinkable L1 spends go
+    /// through the Mix flow, not Send.
     ///
     /// `shroud_max_ms` overrides the daemon's default outbound-broadcast
     /// shroud window for *this one* payment.

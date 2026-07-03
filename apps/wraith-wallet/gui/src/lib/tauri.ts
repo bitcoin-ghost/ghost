@@ -452,7 +452,11 @@ export async function lightReceive(index = 0): Promise<LightReceiveResponse> {
   return unwrap<LightReceiveResponse>(resp).payload;
 }
 
-export type LightSendMode = "ghostpay" | "wraith" | "confidential";
+// `ghostpay` is the only real Send mode — the instant L2 ledger
+// transfer. The former `wraith`/`confidential` values were cosmetic:
+// they took the same plaintext L2 path, so the daemon now rejects
+// them. Unlinkable L1 spends live in the Mix flow, not Send.
+export type LightSendMode = "ghostpay";
 
 export async function lightSend(
   recipient: string,
