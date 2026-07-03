@@ -4,14 +4,21 @@
 > Download). A faster, less-trusting block download built on Ghost Haze: sync the
 > hazed economic graph fast, then progressively complete validation.
 >
-> **Status:** Design + measured prototype — **but a substantial hazed-sync
-> implementation already exists** in `ghost-core/src/haze/` (wired into ghostd via
-> `-hazemode`/`-exorcist`/`-loadtxoutset`: block stripping, SwiftSync bloom-filter
-> churn elision, stripped-block P2P, checkpoint signing, chunk downloader,
-> reconstruction, with integration + sync tests). So this doc is being reframed
-> from "design from scratch" to "map what exists → identify the delta to the
-> better-than-assumeUTXO, safety-levelled vision." The load-bearing §5.1 question
-> (does Haze strip signatures?) is now **answered: yes** — see §5.1.
+> **Status:** Design + measured prototype for a **new project.**
+>
+> **GHAST is its own project. Its target: the fastest *and* safest IBD for
+> Bitcoin.** It is **not** an extension of Ghost Haze. Haze is a separate, already-
+> shipped feature whose target is entirely different — **storage reduction + the
+> legal concerns of storage for node runners** (stripping data from blocks on
+> disk). GHAST *adapts* a few Haze primitives as reusable building blocks (the
+> stripped-block format, the chunk downloader, stripped-block P2P, SwiftSync), but
+> **GHAST's trust model and design are its own, driven by the IBD goal.** Do not
+> measure GHAST against Haze's bootstrap — Haze's hardcoded-assumeUTXO delivery
+> correctly serves Haze's goal and is simply not GHAST's design.
+>
+> The load-bearing §5.1 question (does the stripping remove signatures?) is
+> answered: **yes** — see §5.1. §16 catalogues which Haze primitives GHAST can
+> reuse; everything else GHAST designs fresh for fast-and-safe IBD.
 
 ## 0. Recommended architecture (what to build)
 
@@ -751,9 +758,13 @@ Also: **per-range PoW is never verified** — `VerifyHeadersChain`
   background pass + witness backfill from archive peers.
 - **P2 — prerequisite:** chunked/streamed framing over the Noise transport (§14).
 
-**Reframe:** GHAST is *not* a from-scratch build. The **storage, GSB serving,
-SwiftSync and parallel-download plumbing are done and reusable**; what's missing
-is the **trust model** (mesh-attested rolling commitment vs hardcoded assumeUTXO)
-and the **validation-progress half** (economic-graph replay, safety levels,
-earn-back to trustless). Those two are the whole point — and they're exactly what
-isn't there yet.
+**Framing — GHAST is its own project, borrowing Haze parts.** The items above are
+**Haze primitives GHAST can reuse as components** — the stripped-block format, GSB
+serving, SwiftSync, and the parallel-download plumbing are built and sound.
+Everything else GHAST **designs fresh for its own goal (fast *and* safe IBD)**: its
+trust model (mesh-attested rolling commitment + safety levels + earn-back to
+trustless) and the validation-progress machinery (economic-graph replay, real
+per-range PoW). Haze's hardcoded-assumeUTXO bootstrap is **not a GHAST gap** — it
+is Haze correctly serving Haze's *storage/legal* goal. GHAST has a different
+target, so it gets a different design. The point of this audit was to find the
+reusable parts, and it did: substantial plumbing, zero of the IBD trust model.
