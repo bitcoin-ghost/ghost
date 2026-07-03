@@ -181,16 +181,65 @@ an unsigned manifest in production.**
 
 ### CI
 
-`.github/workflows/release-wraith.yml` runs `release-wraith.sh` on
-`wraith-v*` tag pushes (or via `workflow_dispatch`) and uploads the
-artifacts to a draft GitHub release. The CI job deliberately does NOT
-sign — automated signing in CI would defeat the threat model the
-manifests guard against. The expected workflow is:
+`.github/workflows/release-wraith.yml` runs on `wraith-v*` tag pushes (or via
+`workflow_dispatch`) and produces three installer artifacts, then uploads them
+to a draft GitHub release:
+
+| Job | Runner | Output |
+|---|---|---|
+| `build`     | `ubuntu-latest`  | Linux tarball + GPG-signable manifest (`release-wraith.sh`) |
+| `build-msi` | `windows-latest` | Windows `.msi` (Tauri WiX bundler, `wraithd` bundled as sidecar) |
+| `build-dmg` | `macos-latest`   | macOS `.dmg`, **Apple Silicon (aarch64) only** for v1 |
+
+The macOS job targets `aarch64-apple-darwin` only — that is the native target
+of the Apple-Silicon `macos-latest` runners, so there is no cross-compile of
+the C deps (`aws-lc-sys`, `secp256k1-sys`). A universal binary would double
+build time and add cross-compile surface for exactly those deps; revisit if
+Intel-Mac demand appears.
+
+The **manifest** is still deliberately NOT GPG-signed in CI — automated GPG
+signing would defeat the threat model the manifests guard against. The expected
+manifest workflow is:
 
 1. Push a `wraith-v…` tag → CI builds + uploads tarball + manifest to a draft.
 2. Pull the manifest down to a build host with the offline release key.
 3. `gpg --detach-sign --armor --local-user <key> -o manifest.json.asc manifest.json`
 4. Attach the `.asc` to the draft release and publish.
+
+### Installer code-signing (Windows Authenticode + macOS Developer ID)
+
+The `.msi` and `.dmg` jobs are wired to code-sign **automatically once the
+signing secrets exist**, and to build **unsigned but functional** installers
+when they don't. Nothing is hardcoded — signing is gated purely on secret
+presence, so today's certless builds keep working and signing "just turns on"
+the moment the secrets are added to the repo.
+
+**Until the secrets below are configured, installers are UNSIGNED.** They still
+install and run, but users see a warning: Windows SmartScreen ("unknown
+publisher") and macOS Gatekeeper ("cannot verify the developer" / needs
+right-click → Open). Signing removes those warnings.
+
+What the maintainer must obtain and add as GitHub Actions repo secrets:
+
+| Platform | What you need | Cost | GitHub secret(s) |
+|---|---|---|---|
+| **Windows** | Authenticode code-signing certificate — an **OV or EV** cert from a CA (DigiCert, Sectigo, SSL.com, …), or **Azure Trusted Signing**. Export the cert + key as a password-protected **PFX**, then base64-encode it (`base64 -w0 cert.pfx`). EV/hardware-token certs earn SmartScreen reputation fastest. | ~$100–400/yr | `WINDOWS_CERTIFICATE` (base64 of the `.pfx`)<br>`WINDOWS_CERTIFICATE_PASSWORD` (PFX password) |
+| **macOS** | **Apple Developer Program** membership → a **"Developer ID Application"** certificate. Export it + key as a password-protected `.p12`, base64-encode it. Also create an **app-specific password** for your Apple ID (appleid.apple.com) for notarization, and note your 10-char **Team ID**. | $99/yr | `APPLE_CERTIFICATE` (base64 of the `.p12`)<br>`APPLE_CERTIFICATE_PASSWORD` (p12 password)<br>`APPLE_SIGNING_IDENTITY` (e.g. `Developer ID Application: Your Name (TEAMID)`)<br>`APPLE_ID` (Apple ID email)<br>`APPLE_PASSWORD` (app-specific password)<br>`APPLE_TEAM_ID` (10-char Team ID) |
+
+How the gating works in `release-wraith.yml`:
+
+- **Windows** (`build-msi`): a `Configure Windows code signing` step runs only
+  `if: env.WINDOWS_CERTIFICATE != ''`. It decodes the PFX, imports it into the
+  runner's certificate store, and patches the thumbprint into
+  `tauri.conf.json`'s `bundle.windows`, so the WiX bundler signs both
+  `wraithd.exe` and the `.msi`. No secret → step skipped → unsigned `.msi`.
+- **macOS** (`build-dmg`): the six `APPLE_*` secrets are passed as env vars on
+  the build step. Tauri reads them natively — it signs with the Developer ID
+  cert and notarizes via `xcrun notarytool` when they're set, and skips signing
+  entirely when they're empty. No secret → unsigned `.dmg`.
+
+Set the secrets under **Settings → Secrets and variables → Actions**. They take
+effect on the next `wraith-v*` tag build; no workflow edit is needed.
 
 ### Update check
 

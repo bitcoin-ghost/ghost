@@ -88,6 +88,14 @@ jobs:
       # Default MSVC target on windows-latest — the toolchain the IPC port
       # targets (avoids the mingw/aws-lc-sys issues the gnu target hits).
       TRIPLE: x86_64-pc-windows-msvc
+      # Authenticode signing material, surfaced from repo secrets. Mapped to
+      # env at the job level so the signing step can gate on presence with a
+      # plain `env.WINDOWS_CERTIFICATE != ''` check (the `secrets` context is
+      # not reliably usable inside step-level `if:`). When the secret is unset
+      # these are empty strings and the signing step is skipped, leaving an
+      # unsigned-but-functional MSI.
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -126,13 +134,45 @@ jobs:
           cp "target/${TRIPLE}/release/wraithd.exe" "$SIDECAR_DIR/wraithd-${TRIPLE}.exe"
           ls -la "$SIDECAR_DIR"
 
+      # Authenticode signing — only runs when the WINDOWS_CERTIFICATE secret is
+      # present. Decodes the base64 PFX, imports it into the runner's CurrentUser
+      # certificate store, reads back the thumbprint, and patches it into
+      # tauri.conf.json's bundle.windows block. Tauri's WiX bundler then signs
+      # BOTH the bundled wraithd.exe/app and the resulting .msi. When the secret
+      # is absent this step is skipped and the config is untouched, so the MSI
+      # builds unsigned (functional, but SmartScreen shows a publisher warning).
+      - name: Configure Windows code signing
+        if: env.WINDOWS_CERTIFICATE != ''
+        working-directory: apps/wraith-wallet/gui/src-tauri
+        shell: pwsh
+        run: |
+          $pfxBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $pfxPath = Join-Path $env:RUNNER_TEMP "wraith-signing.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+          $securePwd = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePwd
+          Remove-Item $pfxPath -Force
+          $thumbprint = $cert.Thumbprint
+          $confPath = "tauri.conf.json"
+          $conf = Get-Content $confPath -Raw | ConvertFrom-Json
+          if (-not $conf.bundle.PSObject.Properties['windows']) {
+            $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([PSCustomObject]@{})
+          }
+          $conf.bundle.windows | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $thumbprint -Force
+          $conf.bundle.windows | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue "sha256" -Force
+          $conf.bundle.windows | Add-Member -NotePropertyName timestampUrl -NotePropertyValue "http://timestamp.digicert.com" -Force
+          $conf | ConvertTo-Json -Depth 32 | Set-Content $confPath -Encoding utf8
+          Write-Host "Signing enabled with certificate thumbprint $thumbprint"
+
       - name: Build MSI installer
         working-directory: apps/wraith-wallet/gui
         shell: bash
         run: |
           # `tauri build` compiles the GUI crate (for the host MSVC target) and
           # runs the WiX bundler. --target keeps the sidecar triple in sync with
-          # the wraithd we just staged. Only the msi bundle is requested.
+          # the wraithd we just staged. Only the msi bundle is requested. If the
+          # signing step above ran, tauri.conf.json now carries a thumbprint and
+          # the bundler signs the output; otherwise the MSI is unsigned.
           npm run tauri build -- --target "$TRIPLE" --bundles msi
 
       - name: Locate MSI
@@ -149,9 +189,94 @@ jobs:
           path: |
             target/${{ env.TRIPLE }}/release/bundle/msi/*.msi
 
+  # macOS installer. Mirrors the Windows job: build wraithd for the mac target,
+  # stage it as the Tauri sidecar, then run Tauri's bundler to produce a `.dmg`.
+  #
+  # Architecture choice: aarch64-apple-darwin (Apple Silicon) ONLY for v1.
+  #   - macos-latest runners are Apple Silicon (macos-14+), so aarch64 is the
+  #     NATIVE host target: no cross-toolchain, fastest build, and no risk of
+  #     the C deps (aws-lc-sys, secp256k1-sys) mis-cross-compiling.
+  #   - A `universal-apple-darwin` binary would additionally require building
+  #     every Rust+C dep for x86_64 and lipo-ing the two, doubling build time
+  #     and adding cross-compile surface for exactly the deps most likely to
+  #     break. Intel Macs are a shrinking minority; Apple Silicon-only is the
+  #     simplest correct v1 target. Revisit with `universal-apple-darwin` if
+  #     Intel demand materialises.
+  build-dmg:
+    name: Build macOS installer (aarch64-apple-darwin)
+    runs-on: macos-latest
+    env:
+      TRIPLE: aarch64-apple-darwin
+      # Apple Developer ID signing + notarization material from repo secrets.
+      # Tauri reads these env vars natively: when APPLE_CERTIFICATE +
+      # APPLE_SIGNING_IDENTITY are set it code-signs the app/dmg (setting up a
+      # temporary keychain from the base64 PFX itself), and when APPLE_ID +
+      # APPLE_PASSWORD + APPLE_TEAM_ID are also set it notarizes via notarytool.
+      # When the secrets are unset these are empty strings and Tauri skips
+      # signing/notarization entirely — the DMG builds unsigned (functional, but
+      # Gatekeeper warns) so certless CI runs keep working.
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        working-directory: apps/wraith-wallet/gui
+        run: npm ci
+
+      - name: Build wraithd for the macOS target
+        shell: bash
+        run: cargo build --release --target "$TRIPLE" -p wraith-wallet-daemon
+
+      - name: Stage wraithd as the Tauri sidecar
+        shell: bash
+        run: |
+          # externalBin requires the binary named with the exact target-triple
+          # suffix (no extension on macOS) under src-tauri/binaries/.
+          SIDECAR_DIR="apps/wraith-wallet/gui/src-tauri/binaries"
+          mkdir -p "$SIDECAR_DIR"
+          cp "target/${TRIPLE}/release/wraithd" "$SIDECAR_DIR/wraithd-${TRIPLE}"
+          ls -la "$SIDECAR_DIR"
+
+      - name: Build DMG installer
+        working-directory: apps/wraith-wallet/gui
+        shell: bash
+        run: |
+          # `tauri build` compiles the GUI crate for the mac target and runs the
+          # bundler for the dmg. The APPLE_* env vars above drive signing +
+          # notarization when present; empty vars mean an unsigned DMG.
+          npm run tauri build -- --target "$TRIPLE" --bundles dmg
+
+      - name: Locate DMG
+        shell: bash
+        run: find target -type f -name '*.dmg' | sort
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wraith-wallet-${{ env.TRIPLE }}-dmg
+          path: |
+            target/${{ env.TRIPLE }}/release/bundle/dmg/*.dmg
+
   release:
     name: Create Draft Release
-    needs: [build, build-msi]
+    needs: [build, build-msi, build-dmg]
     if: startsWith(github.ref, 'refs/tags/wraith-v')
     runs-on: ubuntu-latest
     permissions:
@@ -186,3 +311,4 @@ jobs:
             artifacts/**/*.tar.gz.sha256
             artifacts/**/*.manifest.json
             artifacts/**/*.msi
+            artifacts/**/*.dmg
