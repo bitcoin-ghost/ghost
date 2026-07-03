@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createHmac } from "crypto";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL;
-if (!BACKEND_URL) {
-  console.error("NEXT_PUBLIC_API_URL environment variable is required");
-}
+// The node's local API is always reachable on loopback:8080. Default to it so a
+// fresh install works with no configuration; honour NEXT_PUBLIC_API_URL when set.
+const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8080";
 
 function signRequest(body: string): { signature: string; timestamp: string } {
   const key = process.env.INTERNAL_AUTH_KEY;
