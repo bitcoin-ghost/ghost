@@ -20,8 +20,8 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Ghost Node Dashboard",
-  description: "Bitcoin Ghost Node Operator Dashboard",
+  title: "Agathion Node",
+  description: "Agathion Node — the familiar spirit that watches your Ghost node",
 };
 
 // Inline script that runs before paint so there's no flash of wrong theme on

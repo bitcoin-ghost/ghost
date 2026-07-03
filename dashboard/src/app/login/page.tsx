@@ -41,8 +41,8 @@ function LoginForm() {
       <div className="w-full max-w-sm p-8 space-y-6">
         <div className="flex flex-col items-center space-y-2">
           <GhostLogo />
-          <h1 className="text-xl font-semibold text-gray-100">Ghost Node Dashboard</h1>
-          <p className="text-sm text-gray-400">Enter your dashboard password</p>
+          <h1 className="text-xl font-semibold text-gray-100">Agathion Node</h1>
+          <p className="text-sm text-gray-400">Your node&apos;s familiar — enter your password</p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">

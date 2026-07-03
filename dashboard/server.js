@@ -221,6 +221,38 @@ module.exports = {
 // ---------------------------------------------------------------------------
 
 if (require.main === module) {
+  // Standalone-config hydration. Next's `output: 'standalone'` build strips the
+  // build toolchain (swc / browserslist / the webpack config hook) from the
+  // minimal `node_modules`. The generated standalone entrypoint copes by handing
+  // Next its pre-serialised config via `__NEXT_PRIVATE_STANDALONE_CONFIG` BEFORE
+  // requiring `next`, so `next()` never re-loads (and, for a TypeScript
+  // `next.config.ts`, re-transpiles) the config at runtime. This custom server
+  // replaces that generated entrypoint, so it must do the same — otherwise
+  // `app.prepare()` reaches for modules that aren't in the standalone bundle and
+  // crashes on boot. The config is read from `.next/required-server-files.json`
+  // (the build writes it as the single source of truth). Gated on production +
+  // file presence, so `npm run dev` (no standalone build) is completely
+  // unaffected and falls back to Next's normal config load.
+  if (
+    process.env.NODE_ENV === "production" &&
+    !process.env.__NEXT_PRIVATE_STANDALONE_CONFIG
+  ) {
+    try {
+      const rsfPath = require("path").join(
+        __dirname,
+        ".next",
+        "required-server-files.json",
+      );
+      const rsf = require(rsfPath);
+      if (rsf && rsf.config) {
+        process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(rsf.config);
+      }
+    } catch {
+      // No standalone build alongside this server (e.g. a full production
+      // build) — leave the env var unset and let Next load the config normally.
+    }
+  }
+
   const next = require("next");
   const dev = process.env.NODE_ENV !== "production";
   const hostname = process.env.HOSTNAME || "127.0.0.1";

@@ -1,6 +1,19 @@
-# Ghost Node Dashboard
+# Agathion Node
 
-Web-based dashboard for monitoring and managing Ghost Network nodes. Built with Next.js 14 and React.
+**Agathion Node** — the familiar spirit that watches your Ghost node. A web-based
+dashboard for monitoring and managing Ghost Network nodes, bound to serve and
+report to its keeper (the node operator). Built with Next.js and React.
+
+> **Infrastructure naming:** the on-disk directory is still `dashboard/` and the
+> systemd unit on production nodes is historically named `ghost-dashboard.service`.
+> Those names are kept stable so the deployed fleet keeps working; only the
+> user-facing product identity is "Agathion Node". A future infra rename can
+> happen separately.
+
+> **Releases:** Agathion Node is a **separate download** from the node binaries.
+> It ships as a Next.js standalone tarball (`agathion-<version>-node.tar.gz`) cut
+> by the `Release Agathion` workflow (tag `agathion-v*`); see the packaged
+> `RUN.md` for how to launch it.
 
 ## Overview
 

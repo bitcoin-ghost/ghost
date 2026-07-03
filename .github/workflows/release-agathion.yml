@@ -1,0 +1,271 @@
+name: Release Agathion
+
+# Triggered on Agathion-specific tags so the repo-wide `v*` tags (which build
+# ghost-pool / ghost-cli / etc.) and the `wraith-v*` tags don't accidentally cut
+# an Agathion Node release. Agathion Node is the operator dashboard and is a
+# SEPARATE download from the node binaries — packaged as a Next.js standalone
+# bundle, launched with its custom auth-relay `server.js`.
+on:
+  push:
+    tags:
+      - 'agathion-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the artifact (e.g. 1.2.0). Defaults to the tag (agathion-v* → *) or dashboard/package.json version."
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build Agathion Node (Next.js standalone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Node 22 matches dashboard/Dockerfile (node:22-alpine). Operators must
+      # have a Node.js runtime of this major (>=22) installed to run the bundle
+      # — the standalone output does NOT embed a Node runtime, only the minimal
+      # app node_modules.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Build (standalone)
+        working-directory: dashboard
+        run: npm run build
+
+      # `output: 'standalone'` (next.config.ts) is REQUIRED — the custom
+      # server.js + this packaging both depend on it. Fail loudly if the build
+      # didn't emit a standalone tree so a regression can't silently ship a
+      # bundle that won't run.
+      - name: Verify standalone output exists
+        working-directory: dashboard
+        run: |
+          set -euo pipefail
+          test -f .next/standalone/server.js \
+            || { echo "ERROR: .next/standalone/server.js missing — is output:'standalone' set in next.config?"; exit 1; }
+          test -d .next/static \
+            || { echo "ERROR: .next/static missing"; exit 1; }
+          echo "OK: standalone tree present"
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Precedence: explicit workflow_dispatch input > tag (agathion-v* → *)
+          # > dashboard/package.json version. Keeps the tag and package.json as
+          # the source of truth on tag pushes.
+          INPUT="${{ github.event.inputs.version }}"
+          REF="${{ github.ref_name }}"
+          if [ -n "$INPUT" ]; then
+            VERSION="$INPUT"
+          elif [[ "$REF" == agathion-v* ]]; then
+            VERSION="${REF#agathion-v}"
+          else
+            VERSION="$(node -p "require('./dashboard/package.json').version")"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Assemble standalone bundle
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="agathion-${VERSION}-node"
+          STAGING="dist/${NAME}"
+          rm -rf dist
+          mkdir -p "$STAGING"
+
+          # Mirror dashboard/Dockerfile's standalone assembly exactly:
+          #   1. Copy the standalone tree (minimal node_modules + generated
+          #      server.js + package.json + .next server chunks) to the root.
+          #   2. Copy .next/static beside it (standalone omits static assets).
+          #   3. Copy public/ beside it.
+          #   4. OVERRIDE the generated server.js with the custom auth-relay
+          #      server.js — this is the launch entrypoint (adds the
+          #      JWT-authenticated /api/ws WebSocket relay). `next start` will
+          #      NOT work with standalone and does not run the relay.
+          cp -r dashboard/.next/standalone/. "$STAGING/"
+          mkdir -p "$STAGING/.next"
+          cp -r dashboard/.next/static "$STAGING/.next/static"
+          cp -r dashboard/public "$STAGING/public"
+          cp dashboard/server.js "$STAGING/server.js"
+
+          # Sanity: the custom server must be the one on disk (its banner string
+          # differs from the generated standalone server).
+          grep -q "Custom Next.js server for the Ghost Node Dashboard" "$STAGING/server.js" \
+            || { echo "ERROR: staged server.js is not the custom auth-relay server"; exit 1; }
+          test -f "$STAGING/package.json"     || { echo "ERROR: package.json missing from bundle"; exit 1; }
+          test -d "$STAGING/node_modules/next" || { echo "ERROR: minimal node_modules/next missing from standalone"; exit 1; }
+
+          # Operator-facing run instructions.
+          cat > "$STAGING/RUN.md" <<'RUNEOF'
+          # Running Agathion Node
+
+          Agathion Node is your Ghost node's familiar — a local dashboard that
+          watches the node and reports to you, the operator. This is the
+          **standalone** Next.js bundle; it needs a **Node.js runtime (>= 22)**
+          installed on the machine (the bundle ships only the app's minimal
+          `node_modules`, not Node itself).
+
+          ## Start
+
+          ```bash
+          # from inside this directory
+          DASHBOARD_PASSWORD='choose-a-strong-password' node server.js
+          ```
+
+          The launch command is **`node server.js`** — NOT `next start`. The
+          custom `server.js` is the auth entrypoint: it wraps Next.js and owns
+          the HTTP `upgrade` event so the real-time `/api/ws` WebSocket is gated
+          by the same session JWT as the REST API. `next start` does not run that
+          relay and is incompatible with the standalone output.
+
+          ## Environment
+
+          | Variable | Required | Default | Purpose |
+          |----------|----------|---------|---------|
+          | `DASHBOARD_PASSWORD` | yes | — | Login password. Also derives the JWT signing secret when `DASHBOARD_JWT_SECRET` is unset. |
+          | `DASHBOARD_JWT_SECRET` | no | derived from `DASHBOARD_PASSWORD` | Explicit HS256 signing secret (must be >= 32 chars). |
+          | `PORT` | no | `3000` | Listen port. |
+          | `HOSTNAME` | no | `127.0.0.1` | Bind address. Loopback by design — reach it via SSH tunnel: `ssh -L 3000:localhost:3000 <node>`. Set `0.0.0.0` only for deliberate LAN exposure (password still enforced). |
+          | `NEXT_PUBLIC_API_URL` | no | `http://127.0.0.1:8080` | Ghost node REST/WS backend. |
+          | `GHOST_PAY_URL` | no | — | Ghost Pay (L2) backend URL; the L2 pages log a startup notice when unset but the server still runs. |
+
+          Then open http://localhost:3000 (through your SSH tunnel).
+
+          ## Deploying as a service
+
+          On the production fleet the unit is historically named
+          `ghost-dashboard.service` and launches `node server.js` from the
+          install directory. Keep that name for compatibility; only the
+          user-facing product is "Agathion Node".
+          RUNEOF
+
+          # Convenience launcher.
+          cat > "$STAGING/start.sh" <<'STARTEOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          : "${DASHBOARD_PASSWORD:?Set DASHBOARD_PASSWORD before starting Agathion Node}"
+          export HOSTNAME="${HOSTNAME:-127.0.0.1}"
+          export PORT="${PORT:-3000}"
+          export NODE_ENV=production
+          exec node server.js
+          STARTEOF
+          chmod +x "$STAGING/start.sh"
+
+          # Build metadata.
+          BUILT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+          NODEV="$(node --version)"
+          {
+            echo "product:     Agathion Node"
+            echo "version:     ${VERSION}"
+            echo "built:       ${BUILT}"
+            echo "commit:      ${COMMIT}"
+            echo "node:        ${NODEV}"
+            echo "entrypoint:  node server.js"
+          } > "$STAGING/BUILDINFO.txt"
+
+          # Pack.
+          ( cd dist && tar czf "${NAME}.tar.gz" "${NAME}" )
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+
+          # Machine-readable manifest (mirrors the Wraith release manifest shape).
+          TARBALL_SHA="$(sha256sum "dist/${NAME}.tar.gz" | cut -d' ' -f1)"
+          TARBALL_SIZE="$(wc -c < "dist/${NAME}.tar.gz" | tr -d ' ')"
+          cat > "dist/${NAME}.manifest.json" <<MEOF
+          {
+            "product":        "agathion-node",
+            "version":        "${VERSION}",
+            "built":          "${BUILT}",
+            "commit":         "${COMMIT}",
+            "node":           "${NODEV}",
+            "entrypoint":     "node server.js",
+            "tarball":        "${NAME}.tar.gz",
+            "tarball_sha256": "${TARBALL_SHA}",
+            "tarball_size":   ${TARBALL_SIZE}
+          }
+          MEOF
+
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "== dist =="
+          ls -la dist/
+          echo "== bundle top-level =="
+          ls -la "$STAGING/"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: agathion-node
+          path: |
+            dist/agathion-*-node.tar.gz
+            dist/agathion-*-node.tar.gz.sha256
+            dist/agathion-*-node.manifest.json
+
+  release:
+    name: Create Draft Release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/agathion-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Layout
+        shell: bash
+        run: find artifacts -type f | sort
+
+      - name: Generate SHA256SUMS over the release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Combined checksum file covering the shipped tarball. This is the
+          # primary trust anchor a user verifies before running. The release
+          # engineer signs it OFFLINE into SHA256SUMS.asc with the release key —
+          # CI never holds the signing key (same model as the Wraith release).
+          # Entries use the asset name as PUBLISHED (GitHub replaces spaces with
+          # '.') so `sha256sum -c SHA256SUMS` matches the downloaded files.
+          : > SHA256SUMS
+          while IFS= read -r -d '' f; do
+            name="$(basename "$f" | tr ' ' '.')"
+            hash="$(sha256sum "$f" | cut -d' ' -f1)"
+            printf '%s  %s\n' "$hash" "$name" >> SHA256SUMS
+          done < <(find artifacts -type f -name '*.tar.gz' -print0 | sort -z)
+          echo "== SHA256SUMS =="
+          cat SHA256SUMS
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          # Always draft — the release engineer:
+          #   1. Downloads SHA256SUMS + the tarball locally
+          #   2. Signs SHA256SUMS with the offline release key → SHA256SUMS.asc
+          #   3. Uploads the .asc back to the draft
+          #   4. Publishes
+          # Automated signing in CI would defeat the threat model these
+          # checksums guard against, so it is intentionally NOT wired here.
+          draft: true
+          generate_release_notes: true
+          name: "Agathion Node ${{ github.ref_name }}"
+          files: |
+            SHA256SUMS
+            artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
+            artifacts/**/*.manifest.json
