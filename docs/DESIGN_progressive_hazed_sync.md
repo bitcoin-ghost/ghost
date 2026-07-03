@@ -768,3 +768,414 @@ per-range PoW). Haze's hardcoded-assumeUTXO bootstrap is **not a GHAST gap** —
 is Haze correctly serving Haze's *storage/legal* goal. GHAST has a different
 target, so it gets a different design. The point of this audit was to find the
 reusable parts, and it did: substantial plumbing, zero of the IBD trust model.
+
+## 17. GHAST trust model — mesh-attested rolling UTXO commitment
+
+This is the P0 from §16: the mechanism that is *genuinely* better than assumeUTXO.
+It is designed fresh for GHAST's goal (fastest **and** safest IBD), and it reuses
+the Ghost mesh's existing BFT signing infrastructure rather than inventing new
+consensus. The design was pinned to real code by a read-only audit of both the
+Rust consensus layer (`crates/ghost-consensus/`) and the C++ Haze layer
+(`ghost-core/src/haze/`); the reusable primitives it names are cited inline.
+
+### 17.0 The one-paragraph version
+
+Instead of assumeUTXO's *single, static, compiled-in* snapshot hash — or Haze's
+*single hardcoded Ed25519 key* (`checkpoint_signing.cpp:81-89`, strictly worse:
+one live key vs a release-scrutinised constant) — GHAST attests
+`{height, block_hash, utxo_commitment}` with a **BFT quorum of elder Ed25519
+signatures**, rolled forward at a buried height on a cadence, verified by a fresh
+node against a **chain-of-trust rooted in the mesh's genesis elder set** (the
+network's constitution, not a perishable data snapshot). The fresh node trusts it
+for *minutes* to be usable, then runs the full trustless GHAST sync in the
+background which simultaneously earns trustlessness **and audits the attestation**
+— any disagreement is a cryptographically-attributable mesh fault that is
+propagated, independently verified, and slashed. Trust is bounded, challengeable,
+and self-terminating; assumeUTXO's is permanent, blind, and never audited.
+
+### 17.1 (a) What the mesh attests, and which commitment
+
+**The attested tuple:** `{ height H, block_hash, utxo_commitment C }`, where `H` is
+a *buried* height (`H = validated_tip − D`, `D ≥ ~1000` blocks) so no reorg can
+ever invalidate a published attestation, and `block_hash` is the hash of the block
+at `H` on the most-work header chain (which the fresh node has independently
+PoW-verified — §5 Wisp/L0).
+
+**Which commitment — muhash, not merkle/Utreexo.** GHAST attests a **rolling
+MuHash** of the UTXO set:
+
+- `MuHash3072` already exists in ghost-core (`src/crypto/muhash.h`), with
+  incremental `ApplyCoinHash()` / `RemoveCoinHash()` (`kernel/coinstats.h`) and
+  `CoinStatsHashType::MUHASH`. Each connected block updates the commitment in O(new
+  outputs + spent inputs) — `insert(created) − remove(spent)`, order-independent,
+  no full re-scan. This is exactly what an elder (a fully-synced node) can maintain
+  *continuously* so that producing an attestation at height `H` is free.
+- The alternative the manifest uses **today** is `hash_serialized_3`
+  (`CheckpointManifest.utxo_hash`, `checkpoint.h:93`) — an order-dependent
+  full-iteration hash. It is fine to compute *occasionally* (hashing the 11.4 GB
+  surviving set is ~5.3 s at the measured 2.17 GB/s, §13.1) but far too slow to
+  *roll* every block. **Decision: attest the muhash `C` as the rolling commitment**;
+  retain `hash_serialized` only as the snapshot-integrity hash the existing Haze
+  chunk-assembly machinery already checks (`AssembleSnapshot`), unchanged.
+- **Merkle / Utreexo accumulator — rejected for the attestation.** Its only extra
+  capability over muhash is per-UTXO *inclusion proofs*. §13 already proved those
+  buy the bootstrap **nothing**: proving a coin was `created` costs ≈ the size of
+  the graph you were avoiding (166 M × a merkle branch each), and proving `unspent`
+  is *impossible* against a chain that commits to no spent-set. Utreexo's real value
+  is shrinking a *running node's stored state* (§18), which is orthogonal to
+  GHAST's IBD goal, and no Utreexo implementation exists in the tree. Muhash is the
+  right primitive: cheapest to roll, already implemented, and the fresh node
+  verifies it by hashing the downloaded set once (§13.1: ~5.3 s — rounding error
+  next to the ~95 s–15 min download).
+
+Why `C` is trust-then-audit and not trustless-on-arrival: §13 is the load-bearing
+proof. A fresh node cannot verify `C` alone is correct without replaying every
+spend (there is no Bitcoin-consensus commitment to shortcut the `unspent` check).
+So `C` is *attested* (trusted briefly) and *audited* (earned trustless) — §17.4.
+
+### 17.2 (b) How the BFT mesh produces and signs the attestation
+
+**Reuse the existing checkpoint pipeline, do not build new consensus.** The Rust
+consensus layer already runs a BFT checkpoint vote that reaches quorum on a
+`{height, commitment_root}` tuple:
+
+- `VotingSession` (`voting.rs:174`) with a **67% BFT threshold** (`voting.rs:25`),
+  `MIN_VOTERS_FOR_BFT = 7` on mainnet (bootstrap floor `clamp(4,7)`, GHOST-04).
+- `L2CheckpointBlockMessage` (`message.rs:1382`) already carries
+  `prev_commitment_root` / `new_commitment_root` and is voted on via
+  `L2CheckpointVoteMessage` (`message.rs:1444`); memory records this as the live
+  "BFT payout consensus … hardened checkpoint pipeline."
+- Votes are **individual Ed25519 signatures** `[u8;64]` collected per voter in a
+  `HashMap<NodeId, Vote>` (`voting.rs:657`, `Vote{voter, approve, signature,
+  timestamp}`); `NodeId` *is* the elder's Ed25519 public key (`identity.rs`). This
+  matches the C++ manifest signature primitive (also Ed25519,
+  `checkpoint_signing.cpp`) — one scheme end to end.
+
+**The GHAST attestation:** add `utxo_commitment: [u8;32]` (the muhash `C`) and the
+buried `height H` + `block_hash` to the checkpoint block, fold them into
+`checkpoint_hash()` (`message.rs:1415`), and vote via the existing path. The
+critical rule — reusing the GHOST-02 fix pattern (validators recompute rather than
+rubber-stamp): **an elder votes `approve` iff it has independently recomputed the
+muhash over its own coin DB at height `H` and it equals the proposer's `C`.** No
+elder ever signs a commitment it has not reproduced. This makes a false attestation
+require *forging* a quorum, not merely fooling a lazy validator.
+
+**The attestation certificate** (the artefact a fresh node consumes) =
+`{ H, block_hash, C, roster_epoch, [ (NodeId, sig) × q ] }` where `q ≥ ⌈2n/3⌉` of
+the `n` elders in `roster_epoch`. Wire size is tiny: 7 elders → 448 B of sigs; a
+full 68-of-101 quorum → ~6.5 KB — both far under the Noise 64 KB frame, though the
+snapshot itself needs the §14 chunked framing. (§13.1 modelled this as 8 Schnorr
+sigs / 544 B; the real scheme is Ed25519, same order of magnitude. A future
+optimisation is a **threshold/aggregate** signature — FROST or MuSig2 over an elder
+group key — collapsing `q` sigs into a single 64-byte attestation; noted, not
+required for v1.)
+
+**Cadence / rotation.** Two independent clocks:
+
+1. *Attestation roll:* re-attest at a fresh buried height every epoch (reuse
+   `epoch_manager.rs`; e.g. ~daily / 144 blocks). Because `H` is buried by `D`, the
+   published attestation is always reorg-stable, and a node syncing *today* gets an
+   attestation near *today's* tip — the "rolling" win over assumeUTXO's months-old
+   compiled 840k/880k/910k snapshots (`chainparams.cpp:170-189`).
+2. *Elder-set rotation:* elders join/leave via the existing MPC-gated + uptime-gated
+   + capability-verified membership (they are not open-join Sybils). Each membership
+   change is a signed transition — see §17.3 roster chain.
+
+### 17.3 (c) How a fresh node verifies — vs one hardcoded key, vs a compiled hash
+
+**Trust-root comparison:**
+
+| Design | Trust root | Static? | Expires? | Audited? | To subvert, attacker must… |
+|---|---|---|---|---|---|
+| plain assumeUTXO | compiled-in hash (`chainparams.cpp:170-189`) | yes | never | never | compromise the release / your distro |
+| Haze today | **one** hardcoded Ed25519 key (`checkpoint_signing.cpp:81`) | yes | never | never | compromise **1** live signing key |
+| **GHAST** | quorum ≥⌈2n/3⌉ elder Ed25519 sigs, roster-chained to genesis | **no (rolls)** | **yes (audited out)** | **yes (§17.4)** | forge **⌈2n/3⌉** elder keys of the epoch roster |
+
+**Fresh-node verification steps:**
+
+1. **Headers / PoW (Wisp/L0).** Sync all headers, verify PoW + chain work. This is
+   the Sybil/eclipse anchor — you cannot be fed a low-work fake chain, so
+   `block_hash@H` is real with real work behind it. **This is why per-range/header
+   `CheckProofOfWork` MUST be added** (the §16 gap: `headers_file.cpp:100-136`
+   checks only `hashPrevBlock` linkage today). The entire model rests on this
+   anchor.
+2. **Obtain + verify the elder roster for `roster_epoch`.** The roster is not
+   hardcoded either; only a small **genesis elder set** is shipped in chainparams —
+   and *that is a strictly better thing to hardcode than a UTXO hash*: it is the
+   network's founding identity (the same keys that already run Ghost consensus and
+   payouts), and it never goes stale. From genesis the node walks a **hash-chain of
+   signed roster transitions** (each rotation signed by the *prior* quorum) up to
+   `roster_epoch`, exactly the pattern GHOST-11 already uses for propagating signed
+   membership/equivocation facts. (Optional hardening: also anchor roster roots in
+   Bitcoin via `OP_RETURN` for an external witness — heavier, deferred.)
+3. **Download the ~11.4 GB surviving set**, recompute its muhash, check `== C`
+   (~5.3 s, §13.1). Garbage from an eclipsing peer fails here (and fails per-range
+   merkle/PoW) and is re-requested — it cannot be *accepted*.
+4. **Verify the quorum:** ≥⌈2n/3⌉ valid Ed25519 sigs over `{H, block_hash, C}` from
+   **distinct** roster members (~sub-ms, §13.1).
+5. **Activate** the snapshot at `C` (§17.5) → usable in minutes at L1/Phantom.
+
+**Security analysis (Sybil / eclipse / what must be compromised):**
+
+- **Fake-chain feeding — defeated by PoW**, independent of peer honesty. An
+  eclipser cannot manufacture `block_hash@H` with real work.
+- **Sybil the quorum — infeasible by construction.** Elder membership is
+  MPC-ceremony-gated, 95%/7-day-uptime-gated, and capability-verified; it is not
+  open registration. Spinning up nodes does not get you votes. To make a fresh node
+  accept a *false* set (phantom coins / spent-coin resurrection = inflation/theft)
+  the attacker must hold **⌈2n/3⌉ elder secret keys of that epoch's roster** —
+  vs **one** key for Haze-today and "compromise the build" for assumeUTXO. Strictly
+  the hardest of the three.
+- **Eclipse during download — DoS only, never a false accept.** A total eclipse can
+  *stall* you (withhold data) or feed garbage (rejected by muhash/merkle/PoW), or
+  replay a *stale-but-genuine* attestation — the last is bounded by the freshness
+  check (step 1: `H` must be within a recent window of the PoW-verified tip) and the
+  rotation cadence. None of these yields acceptance of an unauthorised UTXO.
+- **Trust is bounded** to the fast-start window (minutes → background-sync
+  completion); assumeUTXO's and Haze's never end.
+
+### 17.4 (d) Challenge, fault attribution, slashing — the self-audit
+
+This is what makes GHAST *strictly* stronger than assumeUTXO rather than "a nicer
+assumeUTXO." The trust is not just bounded in time — it is **actively checked**.
+
+- **Audit.** The fresh node runs the full trustless GHAST sync in the background
+  (174 GB economic-graph replay, §10/§12). Replaying genesis→`H` it reconstructs the
+  UTXO set and computes a running muhash `C'`. At `H`, **`C'` must equal the attested
+  `C`.** Because reconstruction is incremental the audit runs *continuously* — each
+  surviving coin is checked off as the set grows, not only at the end (§13).
+- **Detection.** `C' ≠ C` ⇒ the attestation was false. The node holds *both* sets
+  (the downloaded snapshot and its own reconstruction), so it can **diff them to the
+  exact offending outpoint(s)** — a phantom output that no block created, or a coin
+  spent in the replay but present in the attested set (or vice-versa). Optional:
+  attest intermediate muhashes at sub-heights to bisect faster.
+- **Attribution — cryptographic, no vote.** The certificate binds every one of the
+  ≥⌈2n/3⌉ signers to the false `C`. The challenger publishes a **fraud proof**:
+  `{ the signed certificate, the offending outpoint, its evidence }` where the
+  evidence is either a merkle-creation-proof to the PoW-committed root (proving a
+  "created" coin was never created → contradiction) or the block+input that already
+  spent a supposedly-unspent coin (a double-spend witness). Any node verifies the
+  fraud proof **independently** — replay to `H`, or check the specific-coin evidence
+  — no quorum needed. Fault attribution is trustless.
+- **Slashing / rotation — reuse GHOST-11.** A signed-but-false attestation is
+  equivocation against the real chain; GHOST-11's machinery already
+  **propagates equivocation proofs, independently re-verifies them per peer, bans
+  the equivocator, and persists the ban across restarts** (`ban_manager.rs`). GHAST
+  routes the fraud proof through it: the offending elders are **evicted from the
+  eligible voter set** and their roster entry revoked, and they **forfeit** node
+  rewards (elder = +1 share plus their capability shares) — tie to a bond if/when
+  the Mix-style bond (#112) lands. The economics hold because detection is
+  **certain, not probabilistic**: *every* node that finishes a background sync
+  detects the fraud, so the expected cost (all future pool income + bond, globally,
+  forever) dominates any transient gain from deceiving nodes still inside their
+  minutes-long trust window.
+
+The asymmetry over assumeUTXO in one line: **a corrupt assumeUTXO snapshot is never
+detected and deceives forever; a corrupt GHAST attestation is detected by every
+full sync and slashes its signers.**
+
+### 17.5 (e) Activation — accept the rolling commitment, not the compiled gate
+
+Today `ChainstateManager::ActivateSnapshot` refuses any snapshot whose base hash is
+not a compiled-in entry: `GetParams().AssumeutxoForBlockhash(base_blockhash)` must
+return a value (`validation.cpp:5801`; data at `chainparams.cpp:170-189`). GHAST
+adds a second acceptance path:
+
+1. Replace the single-key `VerifyCheckpoint` / `GetTrustedCheckpointKeys`
+   (`checkpoint_signing.cpp:57-89`) with `VerifyMeshAttestation(manifest, roster)`:
+   check (a) ≥⌈2n/3⌉ valid elder sigs over `{H, block_hash, C}` via the
+   roster-chain (§17.3), (b) the recomputed muhash of the **loaded** snapshot equals
+   the attested `C`, and (c) `block_hash` is on the PoW-verified most-work chain at
+   `H`, buried ≥ `D`.
+2. Change the manifest's fixed `signature: std::array<uint8_t,64>` (`checkpoint.h:96`)
+   to a variable-length attestation `{ roster_epoch, Vec<(NodeId, sig)> }` — a wire
+   /format bump (`CHECKPOINT_VERSION`), and add `utxo_commitment` (muhash) alongside
+   the retained `hash_serialized` `utxo_hash`.
+3. Gate `ActivateSnapshot` on `VerifyMeshAttestation` **OR** the legacy compiled-in
+   entry (keep the latter as an air-gapped fallback and as the genesis anchor).
+   Because the attestation is *rolling*, activation is no longer pinned to stale
+   heights — the node activates near today's tip.
+4. **Re-enable a hazed-compatible background pass** (undo the hazed-node IBD disable
+   at `validation.cpp:5935-5943, 6200-6210`). Without this GHAST degenerates into
+   Haze's permanent-trust model: this pass is what runs the §17.4 audit and earns
+   L2/Apparition.
+
+### 17.6 What to build (§17 concrete list)
+
+**P0 — the trust root (the actual "better than assumeUTXO"):**
+1. Fold `utxo_commitment` (rolling muhash) + buried `{H, block_hash}` into
+   `L2CheckpointBlockMessage` / `checkpoint_hash()`; vote via the existing
+   `VotingSession` (67% / floor 7) + `L2CheckpointVoteMessage`. Elder recomputes the
+   muhash from its own coin DB before voting (GHOST-02 recompute pattern).
+2. Continuous muhash maintenance on elders via `ApplyCoinHash`/`RemoveCoinHash`
+   (`crypto/muhash.h`) on each connect; emit an attestation at a buried height per
+   epoch (`epoch_manager.rs`).
+3. **Elder-roster chain:** ship the *genesis elder set* in chainparams (replacing
+   the compiled UTXO hash as the trust anchor); signed roster transitions; fresh-node
+   roster walk (reuse GHOST-11 signed-membership propagation).
+4. `VerifyMeshAttestation` replacing single-key `VerifyCheckpoint`; variable-length
+   attestation cert replacing the fixed 64-byte `signature` field.
+5. `ActivateSnapshot` acceptance path for the mesh-attested rolling commitment
+   (alongside the `AssumeutxoForBlockhash` gate at `validation.cpp:5801`);
+   recompute-and-compare the loaded snapshot's muhash to `C`.
+6. Re-enable the hazed background audit pass (`validation.cpp:5935-5943/6200-6210`) →
+   earns L2/Apparition and runs the §17.4 audit.
+7. **Fraud-proof pipeline:** detect (`C'≠C`, diff to outpoint), attribute (signed
+   cert), propagate + ban + slash (reuse GHOST-11 + share/bond forfeiture).
+8. **Add per-range/per-header `CheckProofOfWork`** (`headers_file.cpp:100-136`) — the
+   PoW anchor the whole model depends on. Non-negotiable.
+
+**P1:**
+9. Freshness/burial policy (`D`, cadence); attestation gossip topic (reuse elder
+   port 8560 or add one); chunked framing over Noise (§14) for the cert + snapshot.
+10. *(optional)* threshold/aggregate signature (FROST / MuSig2 over the elder group
+    key) → a single 64-byte attestation instead of `q` sigs.
+
+## 18. Ways to improve GHAST — brainstorm + honest evaluation
+
+Ground rule from the prototype (§9–§13): **the bottleneck is download bandwidth,
+not CPU.** At real block sizes signature verification already saturates all cores
+(§9.2, columnar batching = 1.04×) and the UTXO build is ~13 min of CPU for the whole
+174 GB (§10.3) — dwarfed by the ~37 min (1 Gbit) / ~4 h (100 Mbit) download. So the
+honest filter for every idea below is: *does it move less data, need less before
+usable, bypass the internet path, or make the result safer?* Ideas that only speed
+up CPU are graded down on principle — the numbers say CPU isn't where the time goes.
+
+Ranked, best first.
+
+### 18.1 (HIGH, strategic) A consensus-level UTXO commitment in Ghost's own chain
+**Idea.** §12/§13's whole "you must trust-then-audit" result hinges on one fact:
+*Bitcoin consensus commits to no UTXO set*, so a fresh node has nothing to verify a
+surviving-set against. **Ghost is a fork and controls its own consensus** — it can
+commit a rolling muhash of the UTXO set into each block (a coinbase/header
+commitment, soft-forkable, like an assumeUTXO the chain itself signs with PoW).
+**What it buys.** On Ghost's own chain the fast-start surviving set becomes
+**trustlessly verifiable against PoW in minutes** — the §17 mesh attestation
+becomes a *convenience/liveness* layer rather than the trust root, and the trust
+window in §17.4 shrinks toward zero. It is the one thing §12 said is structurally
+impossible on Bitcoin-as-is, made possible precisely because GHAST's home chain is
+not Bitcoin-as-is. **Cost.** A Ghost consensus change (soft/hard fork); miners
+compute the incremental muhash per block (cheap — `ApplyCoinHash`/`RemoveCoinHash`
+already exist and it's O(coins touched)). **Verdict.** Highest-leverage *safety*
+idea in the list; only applies to Ghost's own chain (not the Bitcoin mainnet the
+current fleet tracks), so it's strategic, not a quick win — but it is the credible
+route from "trust-then-audit" to "trustless-in-minutes."
+
+### 18.2 (HIGH, cheap) Incentivise hazed-serving via the verified-capability share system
+**Idea.** Add a **Haze-serving / attestation capability** to Ghost's existing
+5-4-3-2-1 verified-capability system (Archive+5, GhostPay+4, …), challenge-verified
+exactly like the others: a verifier requests a random hazed height-range and checks
+it hashes to the PoW-committed merkle root (the same challenge-response framework in
+`crates/ghost-verification/` — `task.rs`, `client.rs`, `qualification.rs`).
+**What it buys.** It attacks the *supply side* of the only real bottleneck. §10
+shows a fresh node on 1 Gbit needs ~42 serving peers to saturate; §11 item 4 flags
+"grow the mesh" as a lever. Paying nodes to serve hazed ranges (and to attest)
+directly grows that supply and turns fast bootstrap into a first-class paid node
+capability. **Cost.** Low — the capability framework, challenge tables, and payout
+integration already exist; this is one new capability + one challenge type +
+service-bit advertisement (`NODE_GHOST_HAZE`/`NODE_HAZE_CHECKPOINT` already exist,
+`protocol.h:369-375`). **Verdict.** Best value-for-effort improvement: high impact
+on the actual bottleneck, most of the machinery is built. Ship alongside §17.
+
+### 18.3 (MEDIUM-HIGH, measure next) Domain-specific economic-graph compression
+**Idea.** Compress the 174 GB economic graph with structure-aware coding —
+script-template dictionaries, varint amounts, address/script dedup across the span —
+beating generic gzip on this highly-regular data (§11 item 2). **What it buys.** It
+shrinks the *actual bottleneck* (the trustless download) beyond the 3.49× hazing
+win; even a further 1.3–2× turns ~37 min into ~20–28 min on 1 Gbit and proportionally
+more on thin pipes, and it *stacks* with multi-peer fetch. **Cost.** A shared
+compression format both ends agree on; CPU to (de)compress is cheap relative to
+bandwidth (the §9 lesson). Gains are **unmeasured** — could be marginal. **Verdict.**
+Directly hits the bottleneck at low risk; the obvious **next prototype experiment**
+after churn elision. Worth measuring before committing.
+
+### 18.4 (MEDIUM-HIGH, cheap, safety) Safety level as a requestable, advertised service
+**Idea.** §5's Wisp/Phantom/Apparition levels already exist as node state; §16 P1
+already puts them in `gethazestatus`. Go further: **advertise a node's current
+safety level** (service bit / gossip field) and let clients *request* a target
+level — a light/SPV client or a bootstrapping peer asks a serving node for "data
+sufficient to reach L1" vs "L2," and security-sensitive queries route only to
+Apparition/L2 peers. **What it buys.** Turns the honest-labelling from a status
+readout into an actionable safety control: the mesh can route around not-yet-fully-
+validated nodes, and a pool can *prove* it is mining on L2 (§5 "no mining below L2
+near tip"). **Cost.** Low — the state is already computed; expose via service bit +
+RPC + one gossip field. **Verdict.** Cheap safety win that complements §17; pairs
+naturally with 18.2 (serving capability advertises its level).
+
+### 18.5 (MEDIUM, cheap) Pipeline download↔verify + serve-while-syncing
+**Idea.** (a) Overlap range download with verify+apply so total ≈ `max(download,
+CPU)` not `download + CPU` (already §0 item 4 — call it out as adopted). (b) Once
+past L1, **serve the ranges you have already verified to other bootstrappers while
+you finish your own L2** — a node contributes upload capacity before it is fully
+synced. **What it buys.** (a) saves the ~13 min CPU tail (§10.3) — real but small
+against a 37 min+ download. (b) a network-effect multiplier on serving supply
+(compounds 18.2). **Cost.** Low (both are scheduling/plumbing). **Verdict.** (a) is
+free and already recommended; (b) is a cheap compounding win. Solid, unspectacular.
+
+### 18.6 (LOW-MEDIUM) Erasure-coding ranges across peers for straggler resilience
+**Idea.** Fetch `k`-of-`n` erasure-coded fragments of each range so a slow/failing
+peer doesn't force a full re-request. **What it buys.** Lower *tail* latency near
+downlink saturation (1 Gbit, ~40 peers) where a single straggler stalls a range.
+**Cost.** Coding overhead; peers must precompute/store coded fragments; it fights the
+per-range merkle model (coded fragments don't individually hash to the merkle root —
+you can only verify *after* reconstruction, losing per-fragment attribution).
+**Verdict.** The existing merkle-re-request (§10.1) already gives correctness-
+resilience for free; erasure coding only trims the straggler tail near saturation.
+Marginal — revisit only if real-socket measurements show straggler stalls dominate.
+
+### 18.7 (LOW for GHAST's goal) Shard the serial UTXO pass by outpoint prefix
+**Idea.** Partition the coin set by txid/outpoint prefix and apply ranges in parallel
+with a merge (§11 item 5). **What it buys.** Speeds up a pass that §9 measured as
+**not the bottleneck** (~13 min CPU vs 37 min+ download). **Cost.** Non-trivial —
+correct parallel double-spend detection across shards + merge. **Verdict.** Low
+priority by the numbers; only becomes relevant once the coin DB is disk-backed at
+174 GB and the UTXO build itself slows materially. Don't build speculatively.
+
+### 18.8 (LOW for GHAST's goal) Utreexo-style accumulator to shrink state
+**Idea.** Replace the stored UTXO set with a hash accumulator + per-input inclusion
+proofs (§11 item 2). **What it buys.** Shrinks a *running node's* stored state (166 M
+/ 11.4 GB → a small accumulator). **Cost.** Per-input proof bandwidth that §13 showed
+can exceed the state saved; a large implementation (none exists in-tree); and it does
+**not** help the trustless bootstrap download or the §17 trust decision (§13). Same
+category as SwiftSync/churn-elision: a *storage/footprint* play, orthogonal to
+fast-and-safe IBD. **Verdict.** Interesting for node footprint, out of scope for
+GHAST's stated goal; the numbers say it buys the *bootstrap* nothing.
+
+### 18.9 (situational HIGH) LAN / sneakernet bootstrap
+**Idea.** When a fast local source exists (another Ghost node on Gbit LAN, an NVMe
+drive), fetch the hazed graph + surviving set locally and bypass the internet
+downlink entirely (§11 item 3). **What it buys.** The *only* way past the §10
+downlink ceiling — turns ~37 min into minutes. **Cost.** Low (it's a source, not a
+protocol change) but requires a local source to exist. **Verdict.** High payoff where
+applicable, niche otherwise. Cheap to support; ship as an option.
+
+### 18.10 (LOW-MEDIUM, safety hardening) Attestation-cohort diversity
+**Idea.** Require §17 attestations to carry sigs from ≥2 *independent* elder cohorts
+(distinct operators/jurisdictions), not just any ⌈2n/3⌉. **What it buys.** Raises the
+collusion bar beyond raw key-count toward genuine independence — mitigates a quorum
+captured by one operator running many elders. **Cost.** Low (a policy predicate on
+top of the quorum) but depends on having a meaningful independence signal for the
+roster. **Verdict.** Cheap safety hardening for §17; gate on the elder set actually
+being operator-diverse (today it is ~4 operators — GHOST-04).
+
+### 18.11 Ranking summary
+
+| # | Idea | Axis | Impact | Cost | Verdict |
+|---|------|------|-------:|-----:|---------|
+| 18.1 | Ghost-native consensus UTXO commitment | safety | High | High (fork) | Strategic — trustless-in-minutes on Ghost's chain |
+| 18.2 | Incentivise hazed-serving (share system) | speed (supply) | High | **Low** | **Build with §17** — best value/effort |
+| 18.3 | Economic-graph compression | speed (download) | Med-High | Low-Med | **Measure next** |
+| 18.4 | Safety level as a service | safety/UX | Med-High | Low | Cheap, pairs with §17 |
+| 18.5 | Pipeline + serve-while-syncing | speed | Med | Low | Free; (b) compounds 18.2 |
+| 18.6 | Erasure-coding ranges | resilience | Low-Med | Med | Marginal vs merkle-re-request |
+| 18.7 | Shard the UTXO pass | speed (CPU) | Low | Med | Not the bottleneck — defer |
+| 18.8 | Utreexo accumulator | state size | Low* | High | Out of scope (*storage, not IBD) |
+| 18.9 | LAN / sneakernet | speed | High* | Low | *When a local source exists |
+| 18.10 | Attestation-cohort diversity | safety | Low-Med | Low | Cheap §17 hardening |
+
+**Top three to act on:** **(18.2)** serving-incentive capability — highest
+value-for-effort, most infra already exists, attacks the real (bandwidth-supply)
+bottleneck; **(18.3)** economic-graph compression — the next measurement, directly
+shrinks the download; **(18.1)** Ghost-native consensus UTXO commitment — the
+strategic move that upgrades §17 from trust-then-audit to trustless-in-minutes on
+Ghost's own chain, doing what Bitcoin structurally cannot.
