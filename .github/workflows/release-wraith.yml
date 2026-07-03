@@ -266,18 +266,58 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri build -- --target "$TRIPLE" --bundles dmg
 
-      - name: Build DMG installer (unsigned)
+      - name: Build DMG installer (ad-hoc signed)
         if: env.HAS_APPLE_SIGNING != 'true'
         working-directory: apps/wraith-wallet/gui
         shell: bash
+        env:
+          # No paid cert — ad-hoc sign instead. Setting APPLE_SIGNING_IDENTITY
+          # to "-" (and leaving APPLE_CERTIFICATE unset) makes Tauri's bundler
+          # take its identity-only signing path: it builds a Keychain via
+          # `with_signing_identity("-")` and runs `codesign -s -` INSIDE-OUT
+          # (sidecar wraithd first, then the .app), i.e. ad-hoc signing that
+          # needs NO Apple account, identity, or keychain import. This is the
+          # fix for the Apple-Silicon "app is damaged and can't be opened"
+          # hard-fail on unsigned bundles: an ad-hoc signature lets the app
+          # launch after the one-time Gatekeeper bypass (right-click → Open).
+          # Because it signs the nested wraithd sidecar too, the daemon the GUI
+          # spawns isn't killed for a missing signature. Not notarized (that
+          # needs an account); notarization stays gated on the APPLE_* secrets.
+          APPLE_SIGNING_IDENTITY: "-"
         run: |
-          # No cert secret present — build a clean unsigned DMG (functional;
-          # Gatekeeper warns on first open). No APPLE_* env vars are set here.
           npm run tauri build -- --target "$TRIPLE" --bundles dmg
 
       - name: Locate DMG
         shell: bash
         run: find target -type f -name '*.dmg' | sort
+
+      # Prove the .app inside the produced DMG is ad-hoc signed. `codesign -dv`
+      # prints `Signature=adhoc` for an ad-hoc signature (vs `Signature=<len>`
+      # for a real cert). Fail the build if it isn't, so a regression in the
+      # ad-hoc path can never ship a bundle that hard-fails to launch. Only runs
+      # on the certless (ad-hoc) path; the signed path is verified by Apple.
+      - name: Verify DMG app is ad-hoc signed
+        if: env.HAS_APPLE_SIGNING != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG="$(find target/${TRIPLE}/release/bundle/dmg -type f -name '*.dmg' | head -1)"
+          echo "Inspecting $DMG"
+          MOUNT="$(mktemp -d)"
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT"
+          APP="$(find "$MOUNT" -maxdepth 1 -name '*.app' | head -1)"
+          # codesign writes to stderr; capture both streams.
+          CSOUT="$(codesign -dv --verbose=4 "$APP" 2>&1 || true)"
+          echo "$CSOUT"
+          # Deep-verify nested code (main binary + wraithd sidecar) is sealed.
+          VERIFY="$(codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 || true)"
+          echo "$VERIFY"
+          hdiutil detach "$MOUNT" || true
+          if ! grep -q 'Signature=adhoc' <<<"$CSOUT"; then
+            echo "ERROR: app in DMG is not ad-hoc signed (expected Signature=adhoc)"
+            exit 1
+          fi
+          echo "OK: app is ad-hoc signed"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
@@ -305,6 +345,33 @@ jobs:
         shell: bash
         run: find artifacts -type f | sort
 
+      - name: Generate SHA256SUMS over the installer assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # One combined checksum file covering every installer artifact
+          # (Linux tarball + Windows .msi + macOS .dmg). This is the primary
+          # trust anchor a user verifies before installing on ANY platform —
+          # the per-triple manifest.json only carries the tarball + Linux
+          # binary hashes, so without this the .msi/.dmg had no signed hash.
+          #
+          # Entries use the asset name as PUBLISHED (GitHub replaces spaces in
+          # uploaded asset filenames with '.'), so `sha256sum -c SHA256SUMS`
+          # matches the files a user downloads from the release. The release
+          # engineer signs this offline into SHA256SUMS.asc with the same key
+          # and flow as the manifest — CI never holds the release key. Scoop /
+          # Homebrew autoupdate also read installer hashes from here.
+          : > SHA256SUMS
+          while IFS= read -r -d '' f; do
+            name="$(basename "$f" | tr ' ' '.')"
+            hash="$(sha256sum "$f" | cut -d' ' -f1)"
+            printf '%s  %s\n' "$hash" "$name" >> SHA256SUMS
+          done < <(find artifacts -type f \
+                     \( -name '*.tar.gz' -o -name '*.msi' -o -name '*.dmg' \) \
+                     -print0 | sort -z)
+          echo "== SHA256SUMS =="
+          cat SHA256SUMS
+
       - name: Create draft release
         uses: softprops/action-gh-release@v3
         with:
@@ -319,6 +386,7 @@ jobs:
           generate_release_notes: true
           name: "Wraith Wallet ${{ github.ref_name }}"
           files: |
+            SHA256SUMS
             artifacts/**/*.tar.gz
             artifacts/**/*.tar.gz.sha256
             artifacts/**/*.manifest.json
