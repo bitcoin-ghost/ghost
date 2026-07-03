@@ -70,7 +70,7 @@ pub fn windows_pipe_name() -> String {
 /// Unix returns a filesystem-path name pointing at the same
 /// Unix-domain socket as [`default_socket_path`]; Windows returns a
 /// namespaced name that `interprocess` maps under `\\.\pipe\` (see
-/// [`windows_pipe_name`]). The daemon feeds this to its listener and
+/// `windows_pipe_name`). The daemon feeds this to its listener and
 /// clients feed it to the connector, so both ends address the same
 /// object without duplicating the platform logic.
 #[cfg(unix)]
@@ -1656,10 +1656,7 @@ mod tests {
         // Explicit override is used as-is.
         std::env::set_var("WRAITHD_SOCKET", "wraithd-test-instance");
         assert_eq!(super::windows_pipe_name(), "wraithd-test-instance");
-        assert_eq!(
-            super::endpoint_display(),
-            r"\\.\pipe\wraithd-test-instance"
-        );
+        assert_eq!(super::endpoint_display(), r"\\.\pipe\wraithd-test-instance");
         std::env::remove_var("WRAITHD_SOCKET");
     }
 }
