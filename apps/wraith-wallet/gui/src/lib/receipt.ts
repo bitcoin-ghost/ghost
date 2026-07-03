@@ -176,7 +176,7 @@ export function receiptHtml(
     <div>${escapeHtml(receipt.txid)}</div>
   </div>
   <div class="footer" style="margin-top:12px; text-align:center;">
-    Thank you · powered by Wraith Wallet
+    Thank you · powered by Ghost Wallet
   </div>
 </body>
 </html>`;

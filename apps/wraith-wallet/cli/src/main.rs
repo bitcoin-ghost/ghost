@@ -6,7 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
 #[derive(Parser)]
-#[command(version, about = "Wraith Wallet CLI", long_about = None)]
+#[command(version, about = "Ghost Wallet CLI", long_about = None)]
 struct Cli {
     /// Print the response as JSON instead of human-readable output.
     /// Errors are printed as JSON too (`{"error": {"message": "..."}}`).

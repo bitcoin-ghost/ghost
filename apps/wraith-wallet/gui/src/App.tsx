@@ -266,7 +266,7 @@ export default function App() {
       <header className="app-header">
         <div className="title">
           <Logo className="logo-ghost" size={28} />
-          <span className="wordmark">wraith</span>
+          <span className="wordmark">ghost wallet</span>
         </div>
 
         <div className="spacer" />

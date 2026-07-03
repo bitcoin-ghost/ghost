@@ -199,7 +199,9 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
         <h2>Daemon</h2>
         <div className="kv">
           <div className="k">Version</div>
-          <div className="v mono">{health?.version ?? "—"}</div>
+          <div className="v mono">
+            {health?.version ? `Wraith ${health.version}` : "—"}
+          </div>
           <div className="k">Uptime</div>
           <div className="v">{fmtUptime(health?.uptime_secs)}</div>
           <div className="k">Network</div>
@@ -366,7 +368,9 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
       <div className="card">
         <div className="card-header">
           <h2>Updates</h2>
-          <span className="pill mute">v{health?.version ?? "—"}</span>
+          <span className="pill mute">
+            {health?.version ? `Wraith ${health.version}` : "—"}
+          </span>
         </div>
         <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
           Asks the daemon to fetch a signed release manifest and compare
@@ -536,8 +540,12 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
 
       <div className="card surface">
         <h2>About</h2>
+        <p className="mono" style={{ marginTop: 0 }}>
+          Ghost Wallet — Version: Wraith{" "}
+          {health?.version ?? "—"}
+        </p>
         <p>
-          Wraith Wallet is the desktop interface for{" "}
+          Ghost Wallet is the desktop interface for{" "}
           <strong>Bitcoin Ghost</strong> — incentivised nodes,
           decentralised mining, private payments. Open source,
           self-custodial, ossifying.
