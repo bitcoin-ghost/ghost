@@ -28,7 +28,7 @@ type Step =
 ///
 /// Two paths share the shell:
 ///   create:  welcome → name+pass → daemon-create returns mnemonic
-///         →  show full 12 words → user types 3 random ones back
+///         →  show all 24 words → user types 3 random ones back
 ///         →  done
 ///   import:  welcome → name+pass → enter mnemonic → daemon-import
 ///         →  done
@@ -269,7 +269,7 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
           <>
             <div className="card warn" style={{ margin: 0 }}>
               <p style={{ margin: 0 }}>
-                <strong>Write these 12 words on paper.</strong> Anyone
+                <strong>Write these 24 words on paper.</strong> Anyone
                 with this phrase can spend funds in this wallet. The
                 daemon doesn't keep it in plaintext anywhere — without
                 it, recovery is impossible if the keystore file or its
@@ -277,15 +277,13 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
               </p>
               <div className="mnemonic-block">
                 {generatedMnemonic
+                  .trim()
                   .split(/\s+/)
                   .map((w, i) => (
-                    <span key={i}>
-                      <span className="muted" style={{ fontSize: 11, marginRight: 4 }}>
-                        {i + 1}.
-                      </span>
-                      {w}
-                      {i < 11 ? "  " : ""}
-                    </span>
+                    <div className="mnemonic-word" key={i}>
+                      <span className="mnemonic-idx">{i + 1}</span>
+                      <span className="mnemonic-text">{w}</span>
+                    </div>
                   ))}
               </div>
               <button

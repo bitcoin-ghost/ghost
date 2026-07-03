@@ -184,6 +184,12 @@ async fn wallet_select(name: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn wallet_delete(name: String) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::WalletDelete { name }).await?;
+    to_value(&resp)
+}
+
+#[tauri::command]
 async fn wallet_create(name: String, passphrase: String) -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletCreate { name, passphrase }).await?;
     to_value(&resp)
@@ -835,6 +841,7 @@ pub fn run() {
             wallet_unlock,
             wallet_lock,
             wallet_select,
+            wallet_delete,
             wallet_create,
             wallet_import,
             wallet_show_mnemonic,

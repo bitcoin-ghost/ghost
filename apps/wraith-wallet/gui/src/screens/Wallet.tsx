@@ -3,6 +3,7 @@ import {
   daemonEnv,
   lightBalance,
   lightHistory,
+  walletDelete,
   walletList,
   walletSelect,
   walletShowMnemonic,
@@ -52,6 +53,14 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
     | { kind: "unlock" | "show_mnemonic"; wallet: string; error?: string }
     | null
   >(null);
+  /// Delete-confirmation modal. Deleting a wallet erases its keystore
+  /// from disk, so we require the user to type the wallet name back
+  /// before the action is armed.
+  const [deleteModal, setDeleteModal] = useState<{
+    wallet: string;
+    confirm: string;
+    error?: string;
+  } | null>(null);
 
   const refresh = async () => {
     setErr(null);
@@ -141,6 +150,34 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
     setPassModal({ kind: "unlock", wallet: name });
   };
 
+  const onDelete = (name: string) => {
+    setDeleteModal({ wallet: name, confirm: "" });
+  };
+
+  const onConfirmDelete = async () => {
+    if (!deleteModal) return;
+    if (deleteModal.confirm !== deleteModal.wallet) {
+      setDeleteModal({
+        ...deleteModal,
+        error: "Type the wallet name exactly to confirm.",
+      });
+      return;
+    }
+    setBusy(true);
+    try {
+      await walletDelete(deleteModal.wallet);
+      setDeleteModal(null);
+      await refresh();
+    } catch (e) {
+      setDeleteModal({
+        ...deleteModal,
+        error: (e as Error).message ?? String(e),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onPassSubmit = async (passphrase: string) => {
     if (!passModal) return;
     const { kind, wallet } = passModal;
@@ -215,6 +252,73 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
         />
       )}
 
+      {deleteModal && (
+        <div className="modal-overlay">
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="card-header">
+              <h2 style={{ margin: 0 }}>Delete wallet</h2>
+              <span className="eyebrow eyebrow-dim">irreversible</span>
+            </div>
+            <p style={{ margin: 0 }}>
+              This permanently removes the keystore for{" "}
+              <strong>{deleteModal.wallet}</strong> from disk. If you
+              have not written down its backup phrase,{" "}
+              <strong>any funds in this wallet will be lost forever.</strong>
+            </p>
+            {deleteModal.error && (
+              <div className="pill fail" style={{ alignSelf: "flex-start" }}>
+                {deleteModal.error}
+              </div>
+            )}
+            <div className="col">
+              <label>
+                Type <span className="mono">{deleteModal.wallet}</span> to
+                confirm
+              </label>
+              <input
+                className="mono"
+                value={deleteModal.confirm}
+                onChange={(e) =>
+                  setDeleteModal({
+                    ...deleteModal,
+                    confirm: e.target.value,
+                    error: undefined,
+                  })
+                }
+                disabled={busy}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    deleteModal.confirm === deleteModal.wallet
+                  )
+                    onConfirmDelete();
+                }}
+              />
+            </div>
+            <div
+              className="row"
+              style={{ justifyContent: "flex-end", gap: 8 }}
+            >
+              <button
+                className="btn-secondary"
+                onClick={() => setDeleteModal(null)}
+                disabled={busy}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn-danger"
+                onClick={onConfirmDelete}
+                disabled={busy || deleteModal.confirm !== deleteModal.wallet}
+              >
+                {busy ? "Deleting…" : "Delete wallet"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {err && <div className="card" style={{ borderColor: "var(--fail)" }}>{err}</div>}
 
       {mnemonicReveal && (
@@ -230,27 +334,22 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
             {`Backup phrase: ${mnemonicReveal.name}`}
           </h2>
           <p style={{ margin: 0 }}>
-            <strong>Write these 12 words down on paper.</strong> Anyone
+            <strong>Write these 24 words down on paper.</strong> Anyone
             with this phrase can spend funds in this wallet. The
             daemon does not keep it in plaintext — without it, fund
             recovery is impossible if the keystore file or its
             passphrase are lost.
           </p>
-          <div
-            className="mono"
-            style={{
-              marginTop: 12,
-              padding: 16,
-              background: "var(--bg-subtle, rgba(0,0,0,0.06))",
-              border: "1px solid var(--border)",
-              borderRadius: 6,
-              wordSpacing: 4,
-              lineHeight: 1.8,
-              fontSize: 16,
-              userSelect: "text",
-            }}
-          >
-            {mnemonicReveal.mnemonic}
+          <div className="mnemonic-block" style={{ marginTop: 12 }}>
+            {mnemonicReveal.mnemonic
+              .trim()
+              .split(/\s+/)
+              .map((w, i) => (
+                <div className="mnemonic-word" key={i}>
+                  <span className="mnemonic-idx">{i + 1}</span>
+                  <span className="mnemonic-text">{w}</span>
+                </div>
+              ))}
           </div>
           <div className="row" style={{ marginTop: 12 }}>
             <button
@@ -412,9 +511,9 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
             <span style={{ color: "var(--accent)" }}>Bitcoin Ghost</span>.
           </h1>
           <p className="welcome-lead">
-            Self-custodial. Open source. Ossifying. Create a new
-            wallet to receive your first sats, or restore an existing
-            one from its 12-word backup phrase.
+            Self-custodial. Open source. Create a new wallet to
+            receive your first sats, or restore an existing one from
+            its 24-word backup phrase.
           </p>
           <div className="row" style={{ gap: 8, marginTop: 12 }}>
             <button
@@ -504,8 +603,17 @@ export function Wallet({ paymentTick = 0 }: WalletProps) {
                       onClick={() => onShowMnemonic(w.name)}
                       disabled={busy}
                       title="Decrypt and display the BIP-39 backup phrase"
+                      style={{ marginRight: 6 }}
                     >
                       Backup
+                    </button>
+                    <button
+                      className="btn-danger btn-sm"
+                      onClick={() => onDelete(w.name)}
+                      disabled={busy}
+                      title="Permanently delete this wallet from disk"
+                    >
+                      Delete
                     </button>
                   </td>
                 </tr>

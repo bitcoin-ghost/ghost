@@ -331,6 +331,16 @@ export async function walletSelect(name: string): Promise<unknown> {
   return unwrap(resp).payload;
 }
 
+/// Permanently delete a wallet: the daemon removes its on-disk
+/// keystore + data directory and drops it from the unlocked set.
+/// Irreversible — callers must confirm with the user first.
+export async function walletDelete(
+  name: string,
+): Promise<{ name: string }> {
+  const resp = await invoke("wallet_delete", { name });
+  return unwrap<{ name: string }>(resp).payload;
+}
+
 export async function walletGhostId(): Promise<{
   ghost_id: string;
   network: string;

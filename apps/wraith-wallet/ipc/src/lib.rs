@@ -259,6 +259,14 @@ pub enum Request {
     WalletLock {
         name: Option<String>,
     },
+    /// Permanently delete a named wallet: remove its on-disk keystore
+    /// (and per-wallet data directory) and drop it from the daemon's
+    /// unlocked set. Irreversible — the caller MUST confirm with the
+    /// user first, since losing the keystore means losing the funds
+    /// unless the backup phrase was written down.
+    WalletDelete {
+        name: String,
+    },
     /// List all on-disk wallets with unlocked / active status.
     WalletList,
     /// Set the active wallet (must already be unlocked).
@@ -611,6 +619,11 @@ pub enum Response {
     },
     WalletUnlocked,
     WalletLocked {
+        name: String,
+    },
+    /// Reply to [`Request::WalletDelete`]. The wallet's keystore and
+    /// data directory have been removed from disk.
+    WalletDeleted {
         name: String,
     },
     WalletList(WalletListResponse),

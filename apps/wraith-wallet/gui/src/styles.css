@@ -152,6 +152,26 @@ button { cursor: pointer; }
 .app-sidebar nav {
   display: flex; flex-direction: column;
 }
+/* Grouped navigation — a small caps heading precedes each cluster of
+   routes. Groups are separated by vertical rhythm, not rules, to keep
+   the sidebar quiet. */
+.nav-group {
+  display: flex;
+  flex-direction: column;
+}
+.nav-group + .nav-group {
+  margin-top: 18px;
+}
+.nav-heading {
+  padding: 0 24px 6px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  opacity: 0.7;
+}
 .app-sidebar nav button {
   display: flex; align-items: center; gap: 12px;
   appearance: none; background: transparent; border: 0;
@@ -565,18 +585,44 @@ code {
   overflow: auto;
 }
 
-/* Mnemonic display block — used by Onboarding + backup reveal */
+/* Mnemonic display block — used by Onboarding + backup reveal.
+   A fixed-column grid gives every word its own cell, so the phrase
+   renders identically for 12- and 24-word seeds with no reliance on
+   collapsing whitespace or a hard-coded word count. auto-fill keeps
+   it responsive inside the modal's max-width. */
 .mnemonic-block {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 6px 14px;
   padding: 16px;
   background: var(--surface);
   border: 1px solid var(--rule-strong);
   border-radius: 6px;
   font-family: var(--font-mono);
   font-size: 15px;
-  line-height: 1.85;
-  word-spacing: 4px;
+  line-height: 1.6;
   user-select: text;
   letter-spacing: 0.01em;
+}
+
+.mnemonic-word {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.mnemonic-idx {
+  flex: 0 0 auto;
+  min-width: 1.6em;
+  text-align: right;
+  font-size: 11px;
+  color: var(--dim);
+  user-select: none;
+}
+
+.mnemonic-text {
+  overflow-wrap: anywhere;
 }
 
 /* QR card surrounding */
