@@ -4274,7 +4274,10 @@ mod server {
                 active: RwLock::new(None),
                 session: RwLock::new(None),
                 network: bitcoin::Network::Regtest,
-                socket_path: std::env::temp_dir().join("wraithd-modegate-test.sock"),
+                endpoint_display: std::env::temp_dir()
+                    .join("wraithd-modegate-test.sock")
+                    .display()
+                    .to_string(),
                 last_activity: std::sync::atomic::AtomicU64::new(0),
                 idle_lock_secs: 0,
                 shroud_max_ms: 0,
