@@ -39,6 +39,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Key by the exact runner image. The default cache key only carries
+          # runner.os (Linux), so an ubuntu-22.04 build would otherwise restore
+          # artifacts compiled on ubuntu-latest (glibc 2.39) and fail with
+          # "can't find crate for tauri". Pin per-image so glibc stays consistent.
+          key: ${{ matrix.os }}
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
