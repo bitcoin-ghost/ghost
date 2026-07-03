@@ -946,13 +946,29 @@ mod server {
     }
 
     fn parse_payment_mode(s: &str) -> Result<PaymentMode, String> {
+        // Send only exposes the instant L2 ledger transfer (`ghostpay`).
+        // The `wraith` and `confidential` modes were retired here because
+        // they never had a real code path in Send — both silently took the
+        // plaintext L2 ledger route, so advertising them was a
+        // truth-in-advertising defect. Unlinkable L1 spends live in the Mix
+        // tab (Wraith CoinJoin); a shielded confidential L2 transfer needs
+        // client-side ZK proving the wallet-core cannot yet produce, so it
+        // is not offered rather than faked. Both are rejected below instead
+        // of silently accepted — a rejected send can never leak as a
+        // plaintext one.
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "ghostpay" | "ghost-pay" | "ghost_pay" => Ok(PaymentMode::GhostPay),
-            "wraith" => Ok(PaymentMode::Wraith),
-            "confidential" => Ok(PaymentMode::Confidential),
-            other => Err(format!(
-                "unknown payment mode '{other}' (try ghostpay, wraith, confidential)"
-            )),
+            "wraith" => Err(
+                "payment mode 'wraith' is not available from Send — unlinkable L1 spends go \
+                 through the Mix tab (Wraith CoinJoin)"
+                    .to_string(),
+            ),
+            "confidential" => Err(
+                "payment mode 'confidential' is not available: shielded L2 transfers require \
+                 client-side ZK proving that is not yet supported"
+                    .to_string(),
+            ),
+            other => Err(format!("unknown payment mode '{other}' (try ghostpay)")),
         }
     }
 
@@ -966,11 +982,11 @@ mod server {
         memo: Option<String>,
         shroud_override_ms: Option<u64>,
     ) -> Result<LightSentResponse, String> {
-        // The `mode` field on the IPC is parsed for validation /
-        // forward-compat (we may want to differentiate L2 transfer
-        // tiers later) but the wire path is the same one-shot
-        // SendL2Payment for every mode in v1. ghost-pay's L2 ledger
-        // doesn't differentiate.
+        // The `mode` field on the IPC is parsed and validated. Only
+        // `ghostpay` (the instant L2 ledger transfer) is accepted; the
+        // retired `wraith`/`confidential` modes are rejected here so a
+        // stale caller can never fall through to a plaintext send it
+        // did not intend (see `parse_payment_mode`).
         let mode = parse_payment_mode(&mode_str)?;
         let mode_label = format!("{mode}");
 
@@ -4115,6 +4131,159 @@ mod server {
                 }
             }
             panic!("did not see both 0 and 1 across 1000 samples");
+        }
+
+        // ---- payment-mode gating -------------------------------------
+        //
+        // Send exposes exactly one real mode (`ghostpay`). The former
+        // `wraith`/`confidential` modes were cosmetic — they parsed into
+        // a label but took the same plaintext L2 ledger path — so they
+        // are now refused. These tests lock that in: a retired mode must
+        // never resolve into an accepted send.
+
+        #[test]
+        fn parse_payment_mode_accepts_ghostpay_aliases_and_default() {
+            for s in [
+                "",
+                "ghostpay",
+                "GhostPay",
+                "ghost-pay",
+                "ghost_pay",
+                "  ghostpay  ",
+            ] {
+                assert!(
+                    matches!(super::parse_payment_mode(s), Ok(PaymentMode::GhostPay)),
+                    "{s:?} should resolve to GhostPay"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_payment_mode_rejects_retired_modes() {
+            for s in ["wraith", "Wraith", "confidential", "CONFIDENTIAL"] {
+                let err = super::parse_payment_mode(s)
+                    .expect_err(&format!("retired mode {s:?} must be rejected"));
+                assert!(
+                    err.contains("not available"),
+                    "{s:?} rejection should explain it is unavailable; got: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_payment_mode_rejects_unknown() {
+            let err =
+                super::parse_payment_mode("banana").expect_err("an unknown mode must be rejected");
+            assert!(
+                err.contains("unknown payment mode"),
+                "unexpected error text: {err}"
+            );
+        }
+
+        /// Minimal `ChainClient` stub — `light_send` never touches the
+        /// chain (its gating happens before any I/O), so a status-only
+        /// error stub is all we need to satisfy the `DaemonState` field.
+        struct RejectChain;
+
+        #[async_trait::async_trait]
+        impl ChainClient for RejectChain {
+            async fn status(
+                &self,
+            ) -> Result<wraith_wallet_core::chain::ChainStatus, wraith_wallet_core::chain::ChainError>
+            {
+                Err(wraith_wallet_core::chain::ChainError::Backend(
+                    "test stub".into(),
+                ))
+            }
+        }
+
+        /// A session-less `DaemonState` sufficient to exercise
+        /// `light_send`'s mode gate. Everything past the gate needs a
+        /// live GSP session, which the IPC integration tests cover; here
+        /// we only care that the gate accepts/rejects the right modes.
+        fn test_state() -> Arc<DaemonState> {
+            Arc::new(DaemonState {
+                started: Instant::now(),
+                chain: Arc::new(RejectChain),
+                gsp: GspClient::new("ws://127.0.0.1:0"),
+                ghost_pay_urls: vec!["http://127.0.0.1:0".to_string()],
+                gsp_urls: vec!["ws://127.0.0.1:0".to_string()],
+                tor_proxy: None,
+                wraith_coordinator_url: None,
+                kiosk_mode: false,
+                wallets_dir: std::env::temp_dir(),
+                wallets: RwLock::new(HashMap::new()),
+                active: RwLock::new(None),
+                session: RwLock::new(None),
+                network: bitcoin::Network::Regtest,
+                socket_path: std::env::temp_dir().join("wraithd-modegate-test.sock"),
+                last_activity: std::sync::atomic::AtomicU64::new(0),
+                idle_lock_secs: 0,
+                shroud_max_ms: 0,
+                update_manifest_url: None,
+                http: reqwest::Client::new(),
+                wraith_mixes: RwLock::new(HashMap::new()),
+                prepared_locks: RwLock::new(HashMap::new()),
+                next_recovery_index: AtomicU32::new(0),
+                ghostd_url: None,
+                ghostd_cookie_path: None,
+                ghostd_user: None,
+                ghostd_pass: None,
+            })
+        }
+
+        #[tokio::test]
+        async fn light_send_refuses_retired_modes_before_any_send() {
+            let state = test_state();
+            for mode in ["wraith", "confidential"] {
+                let err = super::light_send(
+                    &state,
+                    "tghost1qexample".into(),
+                    1000,
+                    mode.into(),
+                    None,
+                    Some(0),
+                )
+                .await
+                .expect_err("a retired mode must be refused, never silently sent");
+                // Must fail at the mode gate — NOT by reaching the session
+                // step. If it reached the session it would return the
+                // "no GSP session" error, which would mean the mode was
+                // (wrongly) accepted as sendable.
+                assert!(
+                    !err.contains("no GSP session"),
+                    "mode `{mode}` must be rejected at the gate before the send path; got: {err}"
+                );
+                assert!(
+                    err.contains("not available"),
+                    "mode `{mode}` rejection should explain it is unavailable; got: {err}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn light_send_accepts_ghostpay_past_the_mode_gate() {
+            // ghostpay (and the empty default) must pass the mode gate.
+            // With no session configured the send can't complete, but it
+            // must advance to the session step — proven by the
+            // "no GSP session" error rather than a mode-rejection error.
+            let state = test_state();
+            for mode in ["ghostpay", ""] {
+                let err = super::light_send(
+                    &state,
+                    "tghost1qexample".into(),
+                    1000,
+                    mode.into(),
+                    None,
+                    Some(0),
+                )
+                .await
+                .expect_err("no session is configured in this unit test");
+                assert!(
+                    err.contains("no GSP session"),
+                    "ghostpay must clear the mode gate and reach the session step; got: {err}"
+                );
+            }
         }
     }
 }

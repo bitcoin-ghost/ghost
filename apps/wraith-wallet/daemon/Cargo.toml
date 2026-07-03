@@ -45,3 +45,5 @@ axum = { workspace = true }
 bitcoin = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+# Implement the `ChainClient` trait on a test stub for `light_send` gating tests.
+async-trait = { workspace = true }

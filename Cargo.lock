@@ -10794,6 +10794,7 @@ dependencies = [
 name = "wraith-wallet-daemon"
 version = "1.10.21"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "base64 0.22.1",
  "bitcoin",
