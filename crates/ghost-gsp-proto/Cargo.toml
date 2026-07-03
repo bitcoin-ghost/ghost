@@ -29,8 +29,15 @@ license.workspace = true
 description = "Shared protocol types for Ghost Service Provider (GSP) and Light Wallet communication"
 
 [dependencies]
-# Internal crates
-ghost-common = { workspace = true }
+# Internal crates.
+# A direct path dep (NOT `workspace = true`) so `default-features = false` is
+# honoured — Cargo ignores that key on workspace-inherited deps. This drops
+# ghost-common's UNIX-only `zmq`/`tmq` feature so the Wraith Wallet (which
+# depends on this crate) builds for Windows. This crate only uses
+# `ghost_common::instant`, never the zmq module. Node builds re-enable zmq via
+# their own direct ghost-common dependency (Cargo unifies features per build
+# graph), so the node is unaffected.
+ghost-common = { path = "../ghost-common", default-features = false }
 
 # Serialization
 serde = { workspace = true }
