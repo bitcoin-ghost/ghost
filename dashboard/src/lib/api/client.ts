@@ -3,6 +3,8 @@
 // All API calls go through Next.js API proxy routes (/api/proxy/...)
 // which handle HMAC signing for internal endpoints server-side.
 
+import { getWsUrl } from "./ws";
+
 const FETCH_TIMEOUT = 5000;
 
 /// Get the API base URL for proxied requests
@@ -11,15 +13,6 @@ function getProxyBase(): string {
     return window.location.origin;
   }
   return "http://localhost:3000";
-}
-
-/// Get the direct backend URL (for WebSocket only)
-function getBackendWsUrl(): string {
-  if (typeof window !== "undefined") {
-    const { hostname } = window.location;
-    return `ws://${hostname}:8080`;
-  }
-  return "ws://localhost:8080";
 }
 
 // Legacy exports for compatibility
@@ -105,10 +98,9 @@ export async function fetchApiWithFormData<T>(
   return response.json();
 }
 
-// WebSocket connection (direct to backend — not proxied)
+// WebSocket connection — routed through the same-origin, JWT-authenticated
+// `/api/ws` relay (see server.js), NOT straight to the backend :8080.
 export function createWebSocket(): WebSocket | null {
   if (typeof window === "undefined") return null;
-
-  const wsUrl = getBackendWsUrl() + "/ws";
-  return new WebSocket(wsUrl);
+  return new WebSocket(getWsUrl());
 }
