@@ -123,6 +123,9 @@ wraith-wallet-core = { path = "apps/wraith-wallet/core" }
 wraith-wallet-ipc = { path = "apps/wraith-wallet/ipc" }
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
+# Cross-platform local IPC: Unix-domain sockets on unix, named pipes on Windows,
+# behind one API. Powers the wraithd <-> CLI/GUI transport.
+interprocess = { version = "2.2", features = ["tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

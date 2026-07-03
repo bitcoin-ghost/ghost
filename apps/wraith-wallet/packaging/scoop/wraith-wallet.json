@@ -1,0 +1,42 @@
+{
+    "version": "1.10.21",
+    "description": "Wraith Wallet - desktop wallet for Bitcoin Ghost (light wallet + Wraith CoinJoin + Ghost Locks + TAP payments).",
+    "homepage": "https://github.com/bitcoin-ghost/ghost",
+    "license": "MIT",
+    "notes": [
+        "This MSI is unsigned by a commercial CA (no paid Authenticode cert, by design). SmartScreen may warn 'unknown publisher' - that is expected.",
+        "The real trust anchor is the GPG-signed SHA256SUMS on the release. Scoop also verifies the 'hash' below on download and aborts on any mismatch.",
+        "wraithd (the daemon) keeps running after you close the GUI window. Use the wraith CLI 'wraith ...' or the tray menu to manage it."
+    ],
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/bitcoin-ghost/ghost/releases/download/wraith-v1.10.21/Wraith.Wallet_1.10.21_x64_en-US.msi#/wraith-wallet.msi",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+    },
+    "shortcuts": [
+        [
+            "Wraith Wallet.exe",
+            "Wraith Wallet"
+        ]
+    ],
+    "bin": [
+        "wraithd.exe"
+    ],
+    "checkver": {
+        "url": "https://github.com/bitcoin-ghost/ghost/releases",
+        "regex": "releases/tag/wraith-v([\\d.]+)"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/bitcoin-ghost/ghost/releases/download/wraith-v$version/Wraith.Wallet_$version_x64_en-US.msi#/wraith-wallet.msi"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/bitcoin-ghost/ghost/releases/download/wraith-v$version/SHA256SUMS",
+            "regex": "$sha256\\s+Wraith\\.Wallet_$version_x64_en-US\\.msi"
+        }
+    },
+    "_comment": "TEMPLATE - a release step must fill the real per-release sha256 in architecture.64bit.hash (from the SHA256SUMS asset); do NOT ship an invented hash. The MSI bundles only the GUI (renamed to productName, 'Wraith Wallet.exe') and the wraithd sidecar ('wraithd.exe') - the 'wraith' CLI is NOT bundled. Confirm those two exe basenames against the first real MSI's extracted layout (Tauri may emit 'wraith-gui.exe' if it does not rename to productName) and adjust shortcuts/bin accordingly. The '#/wraith-wallet.msi' URL fragment gives Scoop a clean local filename despite the spaces-to-dots asset name."
+}

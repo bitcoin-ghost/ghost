@@ -12,12 +12,18 @@ import {
   type PsbtCreateResponse,
 } from "../lib/tauri";
 
-/// Send "mode" widening — the daemon side has 3 modes
-/// (ghostpay/wraith/confidential), but the GUI also exposes a 4th:
-/// `psbt`, which doesn't go through `lightSend` at all. Instead
-/// it builds an unsigned PSBT and lets the user download / sign
-/// it elsewhere. This keeps the mode-card UX consistent without
+/// Send "mode" widening — the daemon exposes exactly one real send
+/// mode (`ghostpay`, the instant L2 ledger transfer). The GUI adds a
+/// second option, `psbt`, which doesn't go through `lightSend` at all:
+/// it builds an unsigned PSBT and lets the user download / sign it
+/// elsewhere. This keeps the mode-card UX consistent without
 /// pretending PSBT is a daemon send mode.
+///
+/// The former `wraith`/`confidential` cards were removed: neither had
+/// a real Send code path (both silently took the plaintext L2 route),
+/// so offering them was a truth-in-advertising defect. Unlinkable L1
+/// spends live in the Mix tab; a shielded confidential L2 transfer is
+/// post-v1 (needs client-side ZK proving the wallet can't yet do).
 type UiSendMode = LightSendMode | "psbt";
 
 interface SendProps {
@@ -30,28 +36,35 @@ interface ModeOption {
   hint: string;
 }
 
-const MODES: ModeOption[] = [
+const MODES = [
   {
     id: "ghostpay",
     label: "Ghost Pay (instant L2)",
-    hint: "Instant off-chain transfer through the operator. No on-chain tx, no confirmation wait — settles to L1 in batches later.",
-  },
-  {
-    id: "wraith",
-    label: "Wraith (L1 CoinJoin)",
-    hint: "Routes through a Wraith Lite mix round so the on-chain trail is unlinked from the wallet's UTXOs. Slower (waits for the round to fill).",
-  },
-  {
-    id: "confidential",
-    label: "Confidential (L2)",
-    hint: "Zero-knowledge-shielded L2 transfer. Server learns nothing about amount or sender.",
+    hint: "Instant off-chain transfer through the operator. No on-chain tx, no confirmation wait — settles to L1 in batches later. For an unlinkable on-chain spend, use the Mix tab (Wraith CoinJoin).",
   },
   {
     id: "psbt",
     label: "PSBT export (L1)",
     hint: "Builds an unsigned BIP-174 PSBT spending your L1 UTXOs. Sign here, on a hardware wallet, or with cosigners — then broadcast from the Sign tab. Use for cold-storage flows or multisig.",
   },
-];
+] as const satisfies readonly ModeOption[];
+
+// Compile-time guard: Send must offer *exactly* the real modes, no
+// more. The GUI has no unit-test runner — its check is `tsc --noEmit`
+// (the `lint`/`build` scripts) — so this type-level assertion is the
+// stand-in. It fails the build if the set of card ids ever drifts from
+// `UiSendMode` (`ghostpay` | `psbt`): dropping a real mode, or letting
+// a retired one (`wraith`/`confidential`) back in, both break here.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
+    ? true
+    : false;
+type Expect<T extends true> = T;
+// Exported so `noUnusedLocals` doesn't strip it — the export is the
+// only reference it needs; the assertion still runs at compile time.
+export type _ModesAreExactlyTheRealModes = Expect<
+  Equal<(typeof MODES)[number]["id"], UiSendMode>
+>;
 
 /// Recipient prefix → human-readable network/format identifier.
 /// Surfaced to the user as a "we recognise this as X" hint so a
@@ -178,6 +191,17 @@ export function Send({ activeWallet }: SendProps) {
     setRecents(loadRecents(activeWallet));
     setCoinControl(loadCoinControl(activeWallet));
   }, [activeWallet]);
+
+  // Safety net: if `mode` ever holds a value that is no longer a real
+  // mode (e.g. a `wraith`/`confidential` string surviving from an old
+  // build's persisted state), fall back to the safe default so the UI
+  // never sits on a retired mode. Today `mode` isn't persisted, but
+  // this keeps the invariant explicit and future-proof.
+  useEffect(() => {
+    if (mode !== "psbt" && !MODES.some((m) => m.id === mode)) {
+      setMode("ghostpay");
+    }
+  }, [mode]);
 
   // Reload UTXOs whenever we enter PSBT mode (or the wallet changes
   // while already in PSBT mode). One-shot — coin control is a
@@ -428,10 +452,10 @@ export function Send({ activeWallet }: SendProps) {
           <span className="eyebrow">outgoing</span>
           <h1>Send</h1>
           <p className="lead">
-            Three modes: Ghost Pay (instant L2, no on-chain tx),
-            Wraith (L1 CoinJoin), Confidential (ZK-shielded L2).
-            Recipient field accepts both ghost-id and any Bitcoin
-            address.
+            Two ways to send: Ghost Pay (instant L2, no on-chain tx) or
+            PSBT export (unsigned L1 spend to sign yourself). For an
+            unlinkable on-chain spend, use the Mix tab. Recipient field
+            accepts both ghost-id and any Bitcoin address.
           </p>
         </div>
       </div>

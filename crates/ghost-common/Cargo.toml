@@ -41,7 +41,11 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
-tmq = { workspace = true }
+# ZMQ block/tx feed for Bitcoin Core notifications. Optional + on by default so
+# node crates (ghost-pool, ghost-gsp, …) are unaffected, but wallet crates can
+# opt out with `default-features = false` — `tmq` is UNIX-only and won't build
+# for the Windows target the Wraith Wallet ships to.
+tmq = { workspace = true, optional = true }
 tokio = { workspace = true }
 base64 = { workspace = true }
 parking_lot = { workspace = true }
@@ -58,6 +62,13 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
+
+[features]
+# `zmq` gates the Bitcoin Core ZMQ subscriber (`zmq` module + the `tmq` dep).
+# Default-on so every node crate keeps it with zero changes; wallet crates set
+# `default-features = false` to drop the UNIX-only `tmq` dependency.
+default = ["zmq"]
+zmq = ["dep:tmq"]
 
 [dev-dependencies]
 tempfile = "3"

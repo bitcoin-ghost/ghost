@@ -270,13 +270,14 @@ enum LightCommand {
         #[arg(short, long, default_value_t = 0)]
         offset: u32,
     },
-    /// Send a payment. Mode is one of `ghostpay` (default), `wraith`, or `confidential`.
+    /// Send an instant L2 payment. Mode is `ghostpay` (the only accepted
+    /// value; default). For unlinkable L1 spends use the Mix flow instead.
     Send {
         /// Recipient: a Bitcoin address or a Ghost ID.
         recipient: String,
         /// Amount in satoshis.
         amount_sats: u64,
-        /// Payment mode.
+        /// Payment mode. Only `ghostpay` (instant L2) is supported.
         #[arg(long, default_value = "ghostpay")]
         mode: String,
         /// Optional memo, included with the payment metadata.
@@ -440,18 +441,15 @@ enum WalletCommand {
     },
 }
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("wraith: only Unix-like platforms are supported in phase 0");
-    std::process::exit(1);
-}
-
-#[cfg(unix)]
 fn main() -> std::process::ExitCode {
     // Restore default SIGPIPE so `wraith ... | head -1` exits cleanly instead of
     // panicking when the consumer closes the pipe early.
     // Safety: setting SIG_DFL is always sound; we do it before spawning threads.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    // No-op on Windows, which has no SIGPIPE.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL)
+    };
 
     let cli = Cli::parse();
 
@@ -473,14 +471,25 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    runtime.block_on(unix::run(cli.command, cli.json, cli.no_spawn))
+    runtime.block_on(client::run(cli.command, cli.json, cli.no_spawn))
 }
 
-#[cfg(unix)]
-mod unix {
+/// Client side of the wraithd IPC. Talks to the daemon over a
+/// cross-platform local socket (Unix-domain socket on unix, named pipe
+/// on Windows) via the `interprocess` crate.
+mod client {
+    use interprocess::local_socket::traits::tokio::Stream as _;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-    use wraith_wallet_ipc::{default_socket_path, Envelope, Request, Response};
+    use wraith_wallet_ipc::{Envelope, Request, Response};
+
+    /// Full-duplex IPC stream to the daemon.
+    type IpcStream = interprocess::local_socket::tokio::Stream;
+
+    /// Connect to the running `wraithd` over its local IPC endpoint.
+    async fn connect_daemon() -> std::io::Result<IpcStream> {
+        let name = wraith_wallet_ipc::endpoint_name()?;
+        IpcStream::connect(name).await
+    }
 
     use crate::{
         ChainCommand, Command, GspCommand, LightCommand, LocksCommand, MixCommand, UpdateCommand,
@@ -1376,21 +1385,22 @@ mod unix {
         }
     }
 
-    /// Connect to the wraithd socket; if absent, find `wraithd` next to ourselves
-    /// and spawn it detached. Polls the socket up to ~3 s.
+    /// Connect to the wraithd endpoint; if absent, find `wraithd` next to ourselves
+    /// and spawn it detached. Polls the endpoint up to ~3 s.
     async fn ensure_daemon() -> Result<(), String> {
-        let socket = default_socket_path();
-
         // Fast path: already up.
-        if UnixStream::connect(&socket).await.is_ok() {
+        if connect_daemon().await.is_ok() {
             return Ok(());
         }
 
-        // Find `wraithd` next to ourselves.
+        // Find `wraithd` next to ourselves (`wraithd.exe` on Windows).
         let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let dir = me
             .parent()
             .ok_or_else(|| "current_exe has no parent dir".to_string())?;
+        #[cfg(windows)]
+        let daemon_bin = dir.join("wraithd.exe");
+        #[cfg(not(windows))]
         let daemon_bin = dir.join("wraithd");
         if !daemon_bin.is_file() {
             return Err(format!(
@@ -1399,15 +1409,18 @@ mod unix {
             ));
         }
 
-        // Spawn detached. Stdin/out/err → /dev/null so the daemon doesn't keep our
+        // Spawn detached. Stdin/out/err → null so the daemon doesn't keep our
         // terminal alive; environment is inherited so WRAITHD_* vars work.
         let mut cmd = std::process::Command::new(&daemon_bin);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
-        // Detach into a new session so SIGHUP from the controlling terminal
-        // doesn't kill it when the user closes the shell.
+        // Detach from the controlling terminal / console so the daemon
+        // outlives the shell that launched it. Unix: start a new session
+        // (setsid) so a terminal SIGHUP doesn't kill it. Windows: the
+        // DETACHED_PROCESS flag (0x0000_0008) drops the inherited console.
+        #[cfg(unix)]
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
@@ -1417,19 +1430,25 @@ mod unix {
                 Ok(())
             });
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            cmd.creation_flags(DETACHED_PROCESS);
+        }
 
         cmd.spawn().map_err(|e| format!("spawn wraithd: {e}"))?;
 
-        // Poll for the socket. ~3s budget at 60ms each.
+        // Poll for the endpoint. ~3s budget at 60ms each.
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-            if UnixStream::connect(&socket).await.is_ok() {
+            if connect_daemon().await.is_ok() {
                 return Ok(());
             }
         }
         Err(format!(
             "wraithd did not bind {} within 3s",
-            socket.display()
+            wraith_wallet_ipc::endpoint_display()
         ))
     }
 
@@ -1523,15 +1542,14 @@ mod unix {
     }
 
     async fn call(request: Request) -> Result<Response, String> {
-        let socket = default_socket_path();
-        let stream = UnixStream::connect(&socket).await.map_err(|e| {
+        let stream = connect_daemon().await.map_err(|e| {
             format!(
                 "could not connect to wraithd at {}: {e} \
                  (is the daemon running?)",
-                socket.display()
+                wraith_wallet_ipc::endpoint_display()
             )
         })?;
-        let (reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = stream.split();
         let mut line = serde_json::to_string(&Envelope::new(1, request))
             .map_err(|e| format!("failed to serialise request: {e}"))?;
         line.push('\n');
@@ -1819,8 +1837,7 @@ mod unix {
     /// (or the user hits Ctrl-C). With `--json`, every line is the raw
     /// envelope JSON exactly as the daemon emits it.
     pub(crate) async fn run_watch(json: bool) -> std::process::ExitCode {
-        let socket = default_socket_path();
-        let stream = match UnixStream::connect(&socket).await {
+        let stream = match connect_daemon().await {
             Ok(s) => s,
             Err(e) => {
                 if json {
@@ -1831,13 +1848,13 @@ mod unix {
                 } else {
                     eprintln!(
                         "wraith: could not connect to wraithd at {}: {e}",
-                        socket.display()
+                        wraith_wallet_ipc::endpoint_display()
                     );
                 }
                 return std::process::ExitCode::FAILURE;
             }
         };
-        let (reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = stream.split();
         let req = Envelope::new(1, Request::WatchPayments);
         let mut line = match serde_json::to_string(&req) {
             Ok(s) => s,

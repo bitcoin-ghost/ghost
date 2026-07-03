@@ -181,16 +181,168 @@ an unsigned manifest in production.**
 
 ### CI
 
-`.github/workflows/release-wraith.yml` runs `release-wraith.sh` on
-`wraith-v*` tag pushes (or via `workflow_dispatch`) and uploads the
-artifacts to a draft GitHub release. The CI job deliberately does NOT
-sign — automated signing in CI would defeat the threat model the
-manifests guard against. The expected workflow is:
+`.github/workflows/release-wraith.yml` runs on `wraith-v*` tag pushes (or via
+`workflow_dispatch`) and produces three installer artifacts, then uploads them
+to a draft GitHub release:
 
-1. Push a `wraith-v…` tag → CI builds + uploads tarball + manifest to a draft.
-2. Pull the manifest down to a build host with the offline release key.
-3. `gpg --detach-sign --armor --local-user <key> -o manifest.json.asc manifest.json`
-4. Attach the `.asc` to the draft release and publish.
+| Job | Runner | Output |
+|---|---|---|
+| `build`     | `ubuntu-latest`  | Linux tarball + GPG-signable manifest (`release-wraith.sh`) |
+| `build-msi` | `windows-latest` | Windows `.msi` (Tauri WiX bundler, `wraithd` bundled as sidecar) |
+| `build-dmg` | `macos-latest`   | macOS `.dmg`, **Apple Silicon (aarch64) only** for v1, **ad-hoc signed** |
+
+The macOS job targets `aarch64-apple-darwin` only — that is the native target
+of the Apple-Silicon `macos-latest` runners, so there is no cross-compile of
+the C deps (`aws-lc-sys`, `secp256k1-sys`). A universal binary would double
+build time and add cross-compile surface for exactly those deps; revisit if
+Intel-Mac demand appears.
+
+The **manifest** and the combined **`SHA256SUMS`** are deliberately NOT
+GPG-signed in CI — automated GPG signing would defeat the threat model they
+guard against. The expected signing workflow (offline release key) is:
+
+1. Push a `wraith-v…` tag → CI builds all installers and uploads them, the
+   per-triple `manifest.json`, and a combined `SHA256SUMS` to a draft release.
+2. Pull `manifest.json` + `SHA256SUMS` down to a build host with the offline key.
+3. Sign both:
+   `gpg --detach-sign --armor --local-user <key> -o manifest.json.asc manifest.json`
+   `gpg --detach-sign --armor --local-user <key> -o SHA256SUMS.asc SHA256SUMS`
+4. Attach the two `.asc` files to the draft release and publish.
+
+## Installing a release (the free path)
+
+Wraith Wallet ships **free installers with no paid code-signing certificates**
+— no Apple Developer Program, no Authenticode CA, no accounts, nothing to sign
+up for. The trust anchor is **not** a vendor certificate; it's the **GPG-signed
+checksum manifest** you verify yourself before you run anything. Verify first,
+then do the one-time OS bypass for your platform.
+
+### 1. Verify first (this is the real trust anchor)
+
+Every release is a GitHub Release carrying, for each platform, the installer
+(`.tar.gz` / `.msi` / `.dmg`) plus two verification files:
+
+- **`SHA256SUMS`** — one line per installer asset (`<sha256>  <asset-name>`),
+  covering the Linux tarball, the Windows `.msi`, and the macOS `.dmg`.
+- **`SHA256SUMS.asc`** — a detached **GPG signature** over `SHA256SUMS`, made
+  with the offline release key. (The per-triple `*.manifest.json` +
+  `*.manifest.json.asc` are also published — they additionally pin the SHA-256
+  of each individual Linux binary inside the tarball.)
+
+```sh
+# 1. Import the Ghost release key once (fingerprint is published on
+#    bitcoinghost.org and pinned in the repo; confirm it out-of-band).
+gpg --recv-keys <RELEASE_KEY_FINGERPRINT>
+
+# 2. Verify the SHA256SUMS signature. This proves the whole checksum list —
+#    and therefore every installer hash in it — came from the release key.
+gpg --verify SHA256SUMS.asc SHA256SUMS
+#   → "Good signature from Bitcoin Ghost Releases <…>"
+
+# 3. Check the file you downloaded against the signed list.
+#    Linux/macOS (run in the folder holding SHA256SUMS + your download):
+sha256sum -c --ignore-missing SHA256SUMS       # Linux
+shasum -a 256 -c --ignore-missing SHA256SUMS   # macOS
+#    Windows (PowerShell) — hash the .msi and eyeball it against SHA256SUMS:
+CertUtil -hashfile "Wraith.Wallet_<ver>_x64_en-US.msi" SHA256
+```
+
+If the GPG signature is **not** "Good", or a hash doesn't match, **stop** — do
+not install. A valid signature + matching hash is worth far more than any
+"verified publisher" badge a paid cert would buy.
+
+### 2. Install + one-time OS bypass
+
+The installers are unsigned by a commercial CA (on purpose — see below), so each
+OS shows a first-run speed-bump. That warning is expected; your real assurance
+is the GPG/checksum check you already did.
+
+**Windows (`.msi`)** — double-click the `.msi`. SmartScreen may show
+**"Windows protected your PC"** because the publisher is unknown (no paid
+Authenticode cert). Click **More info → Run anyway** — once. This is normal for
+unsigned software; it does **not** mean the file is tampered with — you already
+proved integrity with the checksum/GPG step above.
+
+**macOS (`.dmg`)** — open the `.dmg`, drag **Wraith Wallet** to Applications.
+The app is **ad-hoc signed** (so it launches) but **not notarized** (that needs
+an Apple account), so first launch is gated by Gatekeeper. Bypass it once:
+
+- **Right-click (or Control-click) the app → Open**, then confirm **Open** in
+  the dialog. macOS remembers the choice; normal double-click works afterward.
+- Or clear the quarantine flag from a terminal:
+  ```sh
+  xattr -cr "/Applications/Wraith Wallet.app"
+  ```
+
+Ad-hoc signing is what prevents the Apple-Silicon **"app is damaged and can't be
+opened"** hard-fail on a fully unsigned bundle — the app carries a valid
+(self-issued) signature; it just isn't from a paid Developer ID.
+
+**Linux (`.tar.gz` / AppImage)** — after the GPG + `sha256sum -c` check, unpack
+and run:
+
+```sh
+tar xzf wraith-wallet-<ver>-x86_64-unknown-linux-gnu.tar.gz
+cd wraith-wallet-<ver>
+./bin/wraith-gui        # GUI
+./bin/wraith --help     # CLI
+```
+
+No OS gate on Linux — the checksum/GPG verification is the whole trust story.
+
+### Smoother installs (optional, still no accounts)
+
+The repo ships a self-hosted **Scoop bucket** (Windows) and **Homebrew tap**
+(macOS) so you can `scoop install` / `brew install --cask` and get updates.
+**Nothing is submitted to any registry** — you opt in by adding the bucket/tap,
+which are just files in this repo ([`packaging/scoop/`](packaging/scoop/) and
+[`packaging/homebrew/`](packaging/homebrew/)). Both still verify the download's
+SHA-256 against the (per-release) hash pinned in the manifest, and both point
+at the same GitHub release assets.
+
+**Windows (Scoop):**
+
+```powershell
+scoop bucket add ghost https://github.com/bitcoin-ghost/ghost
+scoop install wraith-wallet
+```
+
+Scoop verifies the manifest's `hash` on download and aborts on any mismatch.
+Updates: `scoop update wraith-wallet`.
+
+**macOS (Homebrew):**
+
+```sh
+brew tap bitcoin-ghost/ghost https://github.com/bitcoin-ghost/ghost
+brew install --cask wraith-wallet
+```
+
+The cask strips the download quarantine flag for you, so the ad-hoc-signed app
+opens without the manual right-click → Open step. Updates:
+`brew upgrade --cask wraith-wallet`.
+
+### Optional: adding real code-signing certificates later
+
+Everything above is the primary, permanent shipping path. **You never have to
+buy or apply for anything.** If a maintainer *chooses* to add paid certificates
+later, the release workflow already contains a **dormant** signing pipeline that
+"just turns on" the moment the matching secrets exist — no workflow edit needed.
+Signing only removes the first-run warnings above; it changes nothing about the
+GPG-manifest trust model.
+
+The secret names the dormant pipeline looks for (under **Settings → Secrets and
+variables → Actions**):
+
+| Platform | GitHub secret(s) | Effect when present |
+|---|---|---|
+| **Windows** | `WINDOWS_CERTIFICATE` (base64 `.pfx`), `WINDOWS_CERTIFICATE_PASSWORD` | `build-msi` signs `wraithd.exe` + the `.msi` (Authenticode) — no SmartScreen prompt |
+| **macOS** | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | `build-dmg` swaps ad-hoc signing for a real Developer ID signature **and** notarizes via `notarytool` — no Gatekeeper prompt |
+
+Gating logic (unchanged): Windows signing runs only
+`if: env.WINDOWS_CERTIFICATE != ''`; the macOS `HAS_APPLE_SIGNING` flag selects
+the real-signed/notarized build when `APPLE_CERTIFICATE` + `APPLE_SIGNING_IDENTITY`
+are set, otherwise the **ad-hoc** build (`APPLE_SIGNING_IDENTITY="-"`) runs. The
+certless path is the default and is fully supported.
 
 ### Update check
 

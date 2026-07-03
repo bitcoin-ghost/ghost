@@ -69,11 +69,21 @@ mkdir -p dist
 rm -rf "$STAGING" "$TARBALL" "${TARBALL}.sha256" "$MANIFEST" "${MANIFEST}.asc"
 mkdir -p "$STAGING/bin" "$STAGING/completions"
 
-echo "==> Building release binaries (this will take a while on a cold cache)"
+echo "==> Building daemon + CLI (this will take a while on a cold cache)"
+# Build the daemon + CLI first: the GUI's Tauri sidecar (externalBin) needs a
+# freshly-built `wraithd` staged under src-tauri/binaries/ with a target-triple
+# suffix before its build.rs runs, otherwise tauri-build fails resolving it.
 cargo build --release \
   -p wraith-wallet-daemon \
-  -p wraith-wallet-cli \
-  -p wraith-wallet-gui
+  -p wraith-wallet-cli
+
+echo "==> Staging wraithd as the Tauri sidecar (wraithd-${TRIPLE})"
+SIDECAR_DIR="apps/wraith-wallet/gui/src-tauri/binaries"
+mkdir -p "$SIDECAR_DIR"
+cp target/release/wraithd "$SIDECAR_DIR/wraithd-${TRIPLE}"
+
+echo "==> Building GUI"
+cargo build --release -p wraith-wallet-gui
 
 cp target/release/wraithd      "$STAGING/bin/"
 cp target/release/wraith       "$STAGING/bin/"

@@ -2,10 +2,12 @@
 //!
 //! Phase 14 first slice: scaffold + a single Tauri command (`gsp_health`)
 //! that round-trips a `Request::Health` to a running `wraithd` over its
-//! Unix socket. Frontend is a static `index.html` (no bundler needed) — a
+//! local IPC endpoint (a Unix-domain socket on unix, a named pipe on
+//! Windows). Frontend is a static `index.html` (no bundler needed) — a
 //! React/Tauri/Vite migration can layer on top once the protocol surface
 //! is fleshed out.
 
+use interprocess::local_socket::traits::tokio::Stream as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{
@@ -14,9 +16,110 @@ use tauri::{
     AppHandle, Emitter, Manager, WindowEvent,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixStream;
-use wraith_wallet_ipc::{default_socket_path, Envelope, Request, Response};
+use wraith_wallet_ipc::{Envelope, Request, Response};
+
+/// Full-duplex IPC stream to the daemon (Unix-domain socket on unix,
+/// named pipe on Windows) via the `interprocess` crate.
+type IpcStream = interprocess::local_socket::tokio::Stream;
+
+/// Connect to the running `wraithd` over its local IPC endpoint.
+async fn connect_daemon() -> std::io::Result<IpcStream> {
+    let name = wraith_wallet_ipc::endpoint_name()?;
+    IpcStream::connect(name).await
+}
+
+/// Resolve the path to a bundled binary shipped next to this executable.
+///
+/// Tauri's `externalBin` sidecars are installed alongside the main GUI
+/// binary with the target-triple suffix stripped (`wraithd.exe` on
+/// Windows, `wraithd` elsewhere). In a `cargo tauri dev` / cargo build
+/// tree the same layout holds: `wraithd` sits next to `wraith-gui` in
+/// `target/<profile>/`. So resolving relative to `current_exe` covers
+/// both the packaged install and the dev flow with one codepath.
+fn sidecar_path(name: &str) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    #[cfg(windows)]
+    let file = dir.join(format!("{name}.exe"));
+    #[cfg(not(windows))]
+    let file = dir.join(name);
+    Some(file)
+}
+
+/// Best-effort: make sure a `wraithd` is running so the GUI has a daemon
+/// to talk to on a packaged install.
+///
+/// The daemon is the unit of life, not the GUI (see the wallet's design
+/// notes), so we never kill it and we never spawn a second one on top of
+/// a live daemon: if the IPC endpoint already answers we leave it alone —
+/// it may have been started by the CLI or a previous GUI session. Only
+/// when nothing is listening do we launch the bundled `wraithd` sidecar,
+/// detached so it outlives this window.
+///
+/// Every failure path here is non-fatal: the frontend already renders a
+/// "daemon offline" state and surfaces connection errors, and the user
+/// can start `wraithd` by hand. We must never block or panic app startup
+/// over daemon management.
+async fn ensure_daemon() {
+    // Fast path: a daemon is already listening — do not disturb it.
+    if connect_daemon().await.is_ok() {
+        return;
+    }
+
+    let daemon_bin = match sidecar_path("wraithd") {
+        Some(p) if p.is_file() => p,
+        _ => {
+            tracing::warn!(
+                "no running wraithd and no bundled wraithd sidecar found next to the GUI; \
+                 start the daemon manually"
+            );
+            return;
+        }
+    };
+
+    // Spawn detached with stdio → null so the daemon outlives the GUI and
+    // doesn't keep a dev console alive. Environment is inherited so the
+    // usual WRAITHD_* configuration flows through.
+    let mut cmd = std::process::Command::new(&daemon_bin);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach from the GUI's process group / console so terminal signals
+    // (Ctrl-C in `cargo tauri dev`) and GUI exit don't take the daemon
+    // down with them. Unix: new process group. Windows: DETACHED_PROCESS.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+
+    match cmd.spawn() {
+        Ok(_) => {
+            // Poll the endpoint for up to ~3s so early frontend calls land
+            // on a bound daemon instead of racing the spawn.
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                if connect_daemon().await.is_ok() {
+                    tracing::info!(bin = %daemon_bin.display(), "started bundled wraithd");
+                    return;
+                }
+            }
+            tracing::warn!(
+                bin = %daemon_bin.display(),
+                "spawned wraithd but it did not bind its IPC endpoint within 3s"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(bin = %daemon_bin.display(), error = %e, "failed to spawn bundled wraithd");
+        }
+    }
+}
 
 /// Coordinates the long-lived watch task so we don't accidentally spawn a
 /// second one if the frontend calls `start_watch()` twice. Frontends that need
@@ -560,13 +663,11 @@ async fn start_watch(
     Ok(())
 }
 
-#[cfg(unix)]
 async fn run_watch_loop(app: &AppHandle) -> Result<(), String> {
-    let socket = default_socket_path();
-    let stream = UnixStream::connect(&socket)
+    let stream = connect_daemon()
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.split();
     let mut line = serde_json::to_string(&Envelope::new(1, Request::WatchPayments))
         .map_err(|e| format!("serialise: {e}"))?;
     line.push('\n');
@@ -608,23 +709,16 @@ async fn run_watch_loop(app: &AppHandle) -> Result<(), String> {
     }
 }
 
-#[cfg(not(unix))]
-async fn run_watch_loop(_: &AppHandle) -> Result<(), String> {
-    Err("watch only supported on unix".to_string())
-}
-
-/// Send a request to the running wraithd daemon over its local IPC socket.
+/// Send a request to the running wraithd daemon over its local IPC endpoint.
 /// Returns the parsed [`Response`] payload (without the JSON-RPC envelope).
-#[cfg(unix)]
 async fn call_daemon(request: Request) -> Result<Response, String> {
-    let socket = default_socket_path();
-    let stream = UnixStream::connect(&socket).await.map_err(|e| {
+    let stream = connect_daemon().await.map_err(|e| {
         format!(
             "could not connect to wraithd at {}: {e} (is the daemon running?)",
-            socket.display()
+            wraith_wallet_ipc::endpoint_display()
         )
     })?;
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.split();
     let mut line =
         serde_json::to_string(&Envelope::new(1, request)).map_err(|e| format!("serialise: {e}"))?;
     line.push('\n');
@@ -646,11 +740,6 @@ async fn call_daemon(request: Request) -> Result<Response, String> {
     Ok(envelope.payload)
 }
 
-#[cfg(not(unix))]
-async fn call_daemon(_: Request) -> Result<Response, String> {
-    Err("Wraith Wallet GUI currently only supports Unix-like platforms".to_string())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -662,6 +751,12 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Arc::new(WatchState::new()))
         .setup(|app| {
+            // Make sure a daemon is up. On a packaged install `wraithd` ships
+            // as a Tauri sidecar next to this binary; spawn it if nothing is
+            // already listening. Async + best-effort so startup never blocks
+            // on it (the frontend tolerates the daemon being briefly absent).
+            tauri::async_runtime::spawn(ensure_daemon());
+
             // Build a minimal tray menu — show / hide / quit. Daemon ("wraithd")
             // runs as a separate process, so quitting the GUI never stops the
             // wallet itself; the menu wording reflects that.

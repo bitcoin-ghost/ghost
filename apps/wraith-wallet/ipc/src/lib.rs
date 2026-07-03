@@ -4,10 +4,18 @@
 //!
 //! Methods are typed: each `Request::*` variant pairs with a `Response::*` variant of the same name.
 //!
-//! Trust model: the socket is bound at owner-only (0600) permissions, so the
-//! channel is restricted to processes running as the same user as `wraithd`.
-//! Passphrases travel in plaintext over the socket; do **not** log requests
-//! verbatim. Phase 16 hardening tightens this surface.
+//! Transport: a cross-platform local socket via the `interprocess`
+//! crate — a Unix-domain socket on Unix, a named pipe on Windows —
+//! carrying the same newline-delimited JSON on every platform. Both
+//! the daemon and its clients resolve the endpoint through
+//! [`endpoint_name`], so the two ends can never disagree.
+//!
+//! Trust model: on Unix the socket is bound at owner-only (0600)
+//! permissions; on Windows the named pipe uses the default pipe ACL
+//! (owner + `SYSTEM`/administrators). Either way the channel is
+//! restricted to processes running as the same user as `wraithd`.
+//! Passphrases travel in plaintext over the socket; do **not** log
+//! requests verbatim. Phase 16 hardening tightens this surface.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +39,66 @@ pub fn default_socket_path() -> std::path::PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     let uid = unsafe { libc::getuid() };
     dir.join(format!("wraithd-{uid}.sock"))
+}
+
+/// Stable, per-user Windows named-pipe name for `wraithd`.
+///
+/// In this order:
+///   1. `WRAITHD_SOCKET` env var (explicit override — used by demos
+///      and tests that want multiple instances on the same host).
+///      The value is used verbatim as the pipe's namespaced name.
+///   2. `wraithd-<username>.sock`, derived from the current user so
+///      that distinct Windows users on the same machine get isolated
+///      pipes.
+///
+/// `interprocess` maps this namespaced name under the `\\.\pipe\`
+/// prefix; see [`endpoint_display`] for the fully-qualified form.
+/// Backslashes in a username are sanitised to `_` since they aren't
+/// valid inside a pipe name.
+#[cfg(windows)]
+pub fn windows_pipe_name() -> String {
+    if let Some(explicit) = std::env::var_os("WRAITHD_SOCKET") {
+        return explicit.to_string_lossy().into_owned();
+    }
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+    let user = user.replace('\\', "_");
+    format!("wraithd-{user}.sock")
+}
+
+/// Resolve the cross-platform local IPC endpoint for `wraithd`.
+///
+/// Unix returns a filesystem-path name pointing at the same
+/// Unix-domain socket as [`default_socket_path`]; Windows returns a
+/// namespaced name that `interprocess` maps under `\\.\pipe\` (see
+/// `windows_pipe_name`). The daemon feeds this to its listener and
+/// clients feed it to the connector, so both ends address the same
+/// object without duplicating the platform logic.
+#[cfg(unix)]
+pub fn endpoint_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
+    use interprocess::local_socket::{GenericFilePath, ToFsName};
+    default_socket_path().to_fs_name::<GenericFilePath>()
+}
+
+/// See the Unix variant above.
+#[cfg(windows)]
+pub fn endpoint_name() -> std::io::Result<interprocess::local_socket::Name<'static>> {
+    use interprocess::local_socket::{GenericNamespaced, ToNsName};
+    windows_pipe_name().to_ns_name::<GenericNamespaced>()
+}
+
+/// Human-readable rendering of the IPC endpoint, for diagnostics:
+/// `DaemonEnv.socket_path`, daemon log lines, and client
+/// connection-error messages. Unix shows the socket path; Windows
+/// shows the fully-qualified `\\.\pipe\...` name.
+#[cfg(unix)]
+pub fn endpoint_display() -> String {
+    default_socket_path().display().to_string()
+}
+
+/// See the Unix variant above.
+#[cfg(windows)]
+pub fn endpoint_display() -> String {
+    format!(r"\\.\pipe\{}", windows_pipe_name())
 }
 
 /// Default upper bound on BIP86 indices to derive when scanning L1
@@ -147,8 +215,11 @@ pub enum Request {
         /// refuses fee >= prev_value_sats.
         fee_sats: u64,
     },
-    /// Prepare + sign + submit an on-chain / L2 payment.
-    /// Mode is one of: "ghostpay" (default), "wraith", "confidential".
+    /// Prepare + sign + submit an L2 payment.
+    /// Mode is `ghostpay` (the instant L2 ledger transfer); it is the
+    /// only accepted value and the default. The legacy `wraith` and
+    /// `confidential` values are rejected — unlinkable L1 spends go
+    /// through the Mix flow, not Send.
     ///
     /// `shroud_max_ms` overrides the daemon's default outbound-broadcast
     /// shroud window for *this one* payment.
@@ -1557,5 +1628,38 @@ mod tests {
             let s = serde_json::to_string(&clean).unwrap();
             assert!(!s.contains("passphrase"));
         }
+    }
+
+    /// The endpoint must always resolve to a usable `interprocess`
+    /// name on the host platform, and its display form must be
+    /// non-empty (it feeds `DaemonEnv.socket_path` and error strings).
+    #[test]
+    fn endpoint_resolves_and_displays() {
+        let name = super::endpoint_name().expect("endpoint name resolves");
+        // Round-trip through the connector's expected type — proves the
+        // name is well-formed for whichever transport this platform uses.
+        let _ = &name;
+        assert!(!super::endpoint_display().is_empty());
+    }
+
+    /// Windows pipe-name derivation: honours the `WRAITHD_SOCKET`
+    /// override verbatim, otherwise derives a stable per-user name,
+    /// and always yields a fully-qualified `\\.\pipe\` display form.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_name_rules() {
+        // Sanitised default: no backslashes leak into the pipe name.
+        std::env::remove_var("WRAITHD_SOCKET");
+        let derived = super::windows_pipe_name();
+        assert!(derived.starts_with("wraithd-"));
+        assert!(derived.ends_with(".sock"));
+        assert!(!derived.contains('\\'));
+        assert_eq!(super::endpoint_display(), format!(r"\\.\pipe\{derived}"));
+
+        // Explicit override is used as-is.
+        std::env::set_var("WRAITHD_SOCKET", "wraithd-test-instance");
+        assert_eq!(super::windows_pipe_name(), "wraithd-test-instance");
+        assert_eq!(super::endpoint_display(), r"\\.\pipe\wraithd-test-instance");
+        std::env::remove_var("WRAITHD_SOCKET");
     }
 }

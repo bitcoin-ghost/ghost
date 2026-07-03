@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Cross-platform local IPC endpoint naming (UDS path on unix, named pipe on Windows).
+interprocess = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
