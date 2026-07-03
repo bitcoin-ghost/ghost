@@ -28,6 +28,99 @@ async fn connect_daemon() -> std::io::Result<IpcStream> {
     IpcStream::connect(name).await
 }
 
+/// Resolve the path to a bundled binary shipped next to this executable.
+///
+/// Tauri's `externalBin` sidecars are installed alongside the main GUI
+/// binary with the target-triple suffix stripped (`wraithd.exe` on
+/// Windows, `wraithd` elsewhere). In a `cargo tauri dev` / cargo build
+/// tree the same layout holds: `wraithd` sits next to `wraith-gui` in
+/// `target/<profile>/`. So resolving relative to `current_exe` covers
+/// both the packaged install and the dev flow with one codepath.
+fn sidecar_path(name: &str) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    #[cfg(windows)]
+    let file = dir.join(format!("{name}.exe"));
+    #[cfg(not(windows))]
+    let file = dir.join(name);
+    Some(file)
+}
+
+/// Best-effort: make sure a `wraithd` is running so the GUI has a daemon
+/// to talk to on a packaged install.
+///
+/// The daemon is the unit of life, not the GUI (see the wallet's design
+/// notes), so we never kill it and we never spawn a second one on top of
+/// a live daemon: if the IPC endpoint already answers we leave it alone —
+/// it may have been started by the CLI or a previous GUI session. Only
+/// when nothing is listening do we launch the bundled `wraithd` sidecar,
+/// detached so it outlives this window.
+///
+/// Every failure path here is non-fatal: the frontend already renders a
+/// "daemon offline" state and surfaces connection errors, and the user
+/// can start `wraithd` by hand. We must never block or panic app startup
+/// over daemon management.
+async fn ensure_daemon() {
+    // Fast path: a daemon is already listening — do not disturb it.
+    if connect_daemon().await.is_ok() {
+        return;
+    }
+
+    let daemon_bin = match sidecar_path("wraithd") {
+        Some(p) if p.is_file() => p,
+        _ => {
+            tracing::warn!(
+                "no running wraithd and no bundled wraithd sidecar found next to the GUI; \
+                 start the daemon manually"
+            );
+            return;
+        }
+    };
+
+    // Spawn detached with stdio → null so the daemon outlives the GUI and
+    // doesn't keep a dev console alive. Environment is inherited so the
+    // usual WRAITHD_* configuration flows through.
+    let mut cmd = std::process::Command::new(&daemon_bin);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach from the GUI's process group / console so terminal signals
+    // (Ctrl-C in `cargo tauri dev`) and GUI exit don't take the daemon
+    // down with them. Unix: new process group. Windows: DETACHED_PROCESS.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+
+    match cmd.spawn() {
+        Ok(_) => {
+            // Poll the endpoint for up to ~3s so early frontend calls land
+            // on a bound daemon instead of racing the spawn.
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                if connect_daemon().await.is_ok() {
+                    tracing::info!(bin = %daemon_bin.display(), "started bundled wraithd");
+                    return;
+                }
+            }
+            tracing::warn!(
+                bin = %daemon_bin.display(),
+                "spawned wraithd but it did not bind its IPC endpoint within 3s"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(bin = %daemon_bin.display(), error = %e, "failed to spawn bundled wraithd");
+        }
+    }
+}
+
 /// Coordinates the long-lived watch task so we don't accidentally spawn a
 /// second one if the frontend calls `start_watch()` twice. Frontends that need
 /// per-window subscriptions should manage that themselves; this is a
@@ -658,6 +751,12 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Arc::new(WatchState::new()))
         .setup(|app| {
+            // Make sure a daemon is up. On a packaged install `wraithd` ships
+            // as a Tauri sidecar next to this binary; spawn it if nothing is
+            // already listening. Async + best-effort so startup never blocks
+            // on it (the frontend tolerates the daemon being briefly absent).
+            tauri::async_runtime::spawn(ensure_daemon());
+
             // Build a minimal tray menu — show / hide / quit. Daemon ("wraithd")
             // runs as a separate process, so quitting the GUI never stops the
             // wallet itself; the menu wording reflects that.

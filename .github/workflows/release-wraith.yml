@@ -76,9 +76,82 @@ jobs:
             dist/wraith-wallet-*.tar.gz.sha256
             dist/wraith-wallet-*.manifest.json
 
+  # Windows installer. Separate from the Linux tarball job because the packaging
+  # is fundamentally different: we run Tauri's bundler (`tauri build`) to produce
+  # a `.msi`, bundling `wraithd` as a sidecar so the installed app is complete
+  # (GUI + daemon). windows-latest already ships WebView2, so no extra runtime is
+  # needed; Tauri downloads the WiX v3 toolset it uses for MSI on first run.
+  build-msi:
+    name: Build Windows installer (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    env:
+      # Default MSVC target on windows-latest — the toolchain the IPC port
+      # targets (avoids the mingw/aws-lc-sys issues the gnu target hits).
+      TRIPLE: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # aws-lc-sys (pulled in transitively by rustls 0.23's default aws-lc-rs
+      # backend, via ghost-common / wraith-protocol / reqwest) needs NASM to
+      # build its assembly on Windows MSVC. windows-latest ships MSVC + CMake
+      # but NOT NASM, so install it and put it on PATH before the Rust build.
+      - name: Install NASM (required by aws-lc-sys on Windows)
+        uses: ilammy/setup-nasm@v1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        working-directory: apps/wraith-wallet/gui
+        run: npm ci
+
+      - name: Build wraithd for the Windows target
+        shell: bash
+        run: cargo build --release --target "$TRIPLE" -p wraith-wallet-daemon
+
+      - name: Stage wraithd as the Tauri sidecar
+        shell: bash
+        run: |
+          # Tauri's externalBin requires the binary named with the exact target
+          # triple suffix (and .exe on Windows) next to src-tauri/binaries/.
+          SIDECAR_DIR="apps/wraith-wallet/gui/src-tauri/binaries"
+          mkdir -p "$SIDECAR_DIR"
+          cp "target/${TRIPLE}/release/wraithd.exe" "$SIDECAR_DIR/wraithd-${TRIPLE}.exe"
+          ls -la "$SIDECAR_DIR"
+
+      - name: Build MSI installer
+        working-directory: apps/wraith-wallet/gui
+        shell: bash
+        run: |
+          # `tauri build` compiles the GUI crate (for the host MSVC target) and
+          # runs the WiX bundler. --target keeps the sidecar triple in sync with
+          # the wraithd we just staged. Only the msi bundle is requested.
+          npm run tauri build -- --target "$TRIPLE" --bundles msi
+
+      - name: Locate MSI
+        shell: bash
+        run: |
+          # Workspace target dir lives at the repo root, so the bundle lands in
+          # target/<triple>/release/bundle/msi/.
+          find target -type f -name '*.msi' | sort
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wraith-wallet-${{ env.TRIPLE }}-msi
+          path: |
+            target/${{ env.TRIPLE }}/release/bundle/msi/*.msi
+
   release:
     name: Create Draft Release
-    needs: build
+    needs: [build, build-msi]
     if: startsWith(github.ref, 'refs/tags/wraith-v')
     runs-on: ubuntu-latest
     permissions:
@@ -112,3 +185,4 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*.tar.gz.sha256
             artifacts/**/*.manifest.json
+            artifacts/**/*.msi

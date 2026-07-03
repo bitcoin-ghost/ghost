@@ -81,3 +81,7 @@ dashboard/.next/
 # Fuzz corpus and artifacts (machine-generated, ~100MB)
 fuzz/corpus/
 fuzz/artifacts/
+
+# Wraith Wallet Tauri sidecars — staged at build time from freshly-built
+# wraithd binaries (target-triple-suffixed), never committed.
+apps/wraith-wallet/gui/src-tauri/binaries/
