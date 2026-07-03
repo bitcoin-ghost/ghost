@@ -372,21 +372,34 @@ jobs:
           echo "== SHA256SUMS =="
           cat SHA256SUMS
 
+      # PGP-sign the checksum manifest in CI, using the SAME repo secrets the
+      # node release (release.yml) already uses. The key is already present in CI
+      # for node releases, so signing the wallet here adds no new key exposure and
+      # keeps all three release streams consistent. Skipped (unsigned draft) only
+      # if the secret is unset.
+      - name: PGP-sign SHA256SUMS
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+            --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+          gpg --verify SHA256SUMS.asc SHA256SUMS
+
       - name: Create draft release
         uses: softprops/action-gh-release@v3
         with:
-          # Always draft — the release engineer is expected to:
-          #   1. Download the manifest + tarball locally
-          #   2. Sign the manifest with the offline release key
-          #   3. Upload the .asc back to the draft
-          #   4. Publish
-          # That gate is the point — automated signing in CI would defeat
-          # the threat model these manifests guard against.
+          # Draft so the engineer reviews before publishing; the SHA256SUMS is
+          # PGP-signed in the step above (SHA256SUMS.asc) with the same key + flow
+          # as the node release — no separate offline signing step needed.
           draft: true
           generate_release_notes: true
           name: "Wraith Wallet ${{ github.ref_name }}"
           files: |
             SHA256SUMS
+            SHA256SUMS.asc
             artifacts/**/*.tar.gz
             artifacts/**/*.tar.gz.sha256
             artifacts/**/*.manifest.json

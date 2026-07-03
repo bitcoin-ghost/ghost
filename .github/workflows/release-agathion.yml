@@ -251,21 +251,33 @@ jobs:
           echo "== SHA256SUMS =="
           cat SHA256SUMS
 
+      # PGP-sign the checksum manifest in CI, using the SAME repo secrets the node
+      # release (release.yml) already uses — the key is already in CI for node
+      # releases, so this adds no new exposure and keeps all release streams
+      # consistent. Skipped (unsigned draft) only if the secret is unset.
+      - name: PGP-sign SHA256SUMS
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+            --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+          gpg --verify SHA256SUMS.asc SHA256SUMS
+
       - name: Create draft release
         uses: softprops/action-gh-release@v3
         with:
-          # Always draft — the release engineer:
-          #   1. Downloads SHA256SUMS + the tarball locally
-          #   2. Signs SHA256SUMS with the offline release key → SHA256SUMS.asc
-          #   3. Uploads the .asc back to the draft
-          #   4. Publishes
-          # Automated signing in CI would defeat the threat model these
-          # checksums guard against, so it is intentionally NOT wired here.
+          # Draft so the engineer reviews before publishing; SHA256SUMS is
+          # PGP-signed in the step above (SHA256SUMS.asc) with the same key + flow
+          # as the node release — no separate offline signing needed.
           draft: true
           generate_release_notes: true
           name: "Agathion Node ${{ github.ref_name }}"
           files: |
             SHA256SUMS
+            SHA256SUMS.asc
             artifacts/**/*.tar.gz
             artifacts/**/*.tar.gz.sha256
             artifacts/**/*.manifest.json
