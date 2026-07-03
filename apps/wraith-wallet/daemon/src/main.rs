@@ -4099,8 +4099,8 @@ mod unix {
 
         #[test]
         fn parse_payment_mode_rejects_unknown() {
-            let err = super::parse_payment_mode("banana")
-                .expect_err("an unknown mode must be rejected");
+            let err =
+                super::parse_payment_mode("banana").expect_err("an unknown mode must be rejected");
             assert!(
                 err.contains("unknown payment mode"),
                 "unexpected error text: {err}"
@@ -4116,10 +4116,8 @@ mod unix {
         impl ChainClient for RejectChain {
             async fn status(
                 &self,
-            ) -> Result<
-                wraith_wallet_core::chain::ChainStatus,
-                wraith_wallet_core::chain::ChainError,
-            > {
+            ) -> Result<wraith_wallet_core::chain::ChainStatus, wraith_wallet_core::chain::ChainError>
+            {
                 Err(wraith_wallet_core::chain::ChainError::Backend(
                     "test stub".into(),
                 ))
@@ -4165,10 +4163,16 @@ mod unix {
         async fn light_send_refuses_retired_modes_before_any_send() {
             let state = test_state();
             for mode in ["wraith", "confidential"] {
-                let err =
-                    super::light_send(&state, "tghost1qexample".into(), 1000, mode.into(), None, Some(0))
-                        .await
-                        .expect_err("a retired mode must be refused, never silently sent");
+                let err = super::light_send(
+                    &state,
+                    "tghost1qexample".into(),
+                    1000,
+                    mode.into(),
+                    None,
+                    Some(0),
+                )
+                .await
+                .expect_err("a retired mode must be refused, never silently sent");
                 // Must fail at the mode gate — NOT by reaching the session
                 // step. If it reached the session it would return the
                 // "no GSP session" error, which would mean the mode was
@@ -4192,10 +4196,16 @@ mod unix {
             // "no GSP session" error rather than a mode-rejection error.
             let state = test_state();
             for mode in ["ghostpay", ""] {
-                let err =
-                    super::light_send(&state, "tghost1qexample".into(), 1000, mode.into(), None, Some(0))
-                        .await
-                        .expect_err("no session is configured in this unit test");
+                let err = super::light_send(
+                    &state,
+                    "tghost1qexample".into(),
+                    1000,
+                    mode.into(),
+                    None,
+                    Some(0),
+                )
+                .await
+                .expect_err("no session is configured in this unit test");
                 assert!(
                     err.contains("no GSP session"),
                     "ghostpay must clear the mode gate and reach the session step; got: {err}"
