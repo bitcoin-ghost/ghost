@@ -44,6 +44,7 @@ pub mod mesh;
 pub mod message;
 pub mod message_validator;
 pub mod noise;
+pub mod noise_fragment;
 pub mod noise_pool;
 pub mod noise_receiver;
 #[cfg(feature = "zk-consensus")]

@@ -51,7 +51,10 @@ use tracing::{debug, info};
 
 use ghost_common::types::NodeId;
 
-use crate::noise::{NoiseConfig, NoiseError, NoiseKeypair, NoiseManager, NoiseTransport};
+use crate::noise::{
+    NoiseConfig, NoiseError, NoiseKeypair, NoiseManager, NoiseTransport, MAX_PAYLOAD_SIZE,
+};
+use crate::noise_fragment::{fragment_message, FragmentReassembler};
 
 /// Maximum time a connection can be idle before cleanup
 pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(300); // 5 minutes
@@ -98,6 +101,12 @@ pub struct NoiseConnection {
     pub peer_addr: SocketAddr,
     /// The encrypted transport (wrapped in Mutex for thread-safe access)
     transport: Mutex<NoiseTransport<TcpStream>>,
+    /// Reassembles fragmented inbound messages that exceed one Noise frame.
+    ///
+    /// Guarded by its own async mutex so a partially-received large message is
+    /// buffered across successive `recv`/`try_recv` polls without blocking the
+    /// transport lock between frames.
+    reassembler: Mutex<FragmentReassembler>,
     /// When this connection was established
     pub established_at: Instant,
     /// Last time the connection was used
@@ -116,42 +125,69 @@ impl NoiseConnection {
             peer_key,
             peer_addr,
             transport: Mutex::new(transport),
+            reassembler: Mutex::new(FragmentReassembler::new()),
             established_at: now,
             last_used: RwLock::new(now),
         }
     }
 
-    /// Send an encrypted message
+    /// Send an encrypted message.
+    ///
+    /// A message that fits in a single Noise frame is sent unchanged (fast
+    /// path). A larger message is split into ordered fragments, all emitted
+    /// under the same transport lock so they stay contiguous on the wire and do
+    /// not interleave with another message's fragments.
     pub async fn send(&self, payload: &[u8]) -> Result<(), NoiseError> {
         let mut transport = self.transport.lock().await;
-        transport.send(payload).await?;
+        if payload.len() <= MAX_PAYLOAD_SIZE {
+            transport.send(payload).await?;
+        } else {
+            for frame in fragment_message(payload) {
+                transport.send(&frame).await?;
+            }
+        }
         *self.last_used.write() = Instant::now();
         Ok(())
     }
 
-    /// Receive an encrypted message (non-blocking poll)
+    /// Receive an encrypted message (non-blocking poll).
     ///
-    /// Returns None if no data is available, Some(data) if message received.
+    /// Returns `None` if no complete message is available yet — including when a
+    /// fragment was received but the logical message is not yet complete.
+    /// Fragmented messages are reassembled transparently; callers see only whole
+    /// logical messages.
     pub async fn try_recv(&self) -> Result<Option<Vec<u8>>, NoiseError> {
         let mut transport = self.transport.lock().await;
 
         // Use a short timeout to make this non-blocking
         match tokio::time::timeout(Duration::from_millis(1), transport.recv()).await {
-            Ok(Ok(data)) => {
+            Ok(Ok(frame)) => {
                 *self.last_used.write() = Instant::now();
-                Ok(Some(data))
+                // Drop the transport lock before reassembly bookkeeping.
+                drop(transport);
+                self.reassembler.lock().await.accept(frame)
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Ok(None), // Timeout = no data
         }
     }
 
-    /// Receive an encrypted message (blocking)
+    /// Receive an encrypted message (blocking).
+    ///
+    /// Loops over Noise frames until a complete logical message is available,
+    /// reassembling fragments transparently.
     pub async fn recv(&self) -> Result<Vec<u8>, NoiseError> {
-        let mut transport = self.transport.lock().await;
-        let data = transport.recv().await?;
-        *self.last_used.write() = Instant::now();
-        Ok(data)
+        loop {
+            let frame = {
+                let mut transport = self.transport.lock().await;
+                transport.recv().await?
+            };
+            *self.last_used.write() = Instant::now();
+            if let Some(message) = self.reassembler.lock().await.accept(frame)? {
+                return Ok(message);
+            }
+            // Incomplete fragment: await the next frame.
+        }
     }
 
     /// Get the peer's public key as a NodeId
@@ -487,6 +523,51 @@ mod tests {
 
         let received_reply = conn1.recv().await.unwrap();
         assert_eq!(received_reply, reply);
+    }
+
+    /// End-to-end: a message larger than one Noise frame is fragmented on send,
+    /// crosses a real TCP + ChaCha20-Poly1305 transport, and is reassembled to
+    /// the identical bytes on recv. This reproduces the ~84 KB checkpoint /
+    /// tree-sync proposal that previously failed with `Message too large`.
+    #[tokio::test]
+    async fn test_oversized_message_fragments_end_to_end() {
+        use crate::noise::MAX_PAYLOAD_SIZE;
+
+        let pool1 = Arc::new(
+            NoiseConnectionPool::new(NoiseKeypair::generate(), test_pool_config()).unwrap(),
+        );
+        let pool2 = Arc::new(
+            NoiseConnectionPool::new(NoiseKeypair::generate(), test_pool_config()).unwrap(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let pool2_clone = Arc::clone(&pool2);
+        let accept_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            pool2_clone.accept_connection(stream).await
+        });
+
+        let conn1 = pool1.get_connection(addr).await.unwrap();
+        let conn2 = accept_handle.await.unwrap().unwrap();
+
+        // 84_241 bytes — the exact size seen in the fleet logs, well over the
+        // 65_519-byte single-frame limit.
+        let big: Vec<u8> = (0..84_241u32)
+            .map(|i| (i.wrapping_mul(31) % 253) as u8)
+            .collect();
+        assert!(big.len() > MAX_PAYLOAD_SIZE);
+
+        conn1.send(&big).await.unwrap();
+        let received = conn2.recv().await.unwrap();
+        assert_eq!(received, big, "reassembled bytes must match exactly");
+
+        // A small message on the same connection still works afterwards
+        // (reassembly slot released cleanly).
+        let small = b"{\"ok\":true}".to_vec();
+        conn2.send(&small).await.unwrap();
+        assert_eq!(conn1.recv().await.unwrap(), small);
     }
 
     #[tokio::test]
