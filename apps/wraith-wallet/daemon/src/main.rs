@@ -1861,6 +1861,30 @@ mod unix {
         }
     }
 
+    /// Error text for `locks_recover` when we hold no local metadata for the
+    /// requested lock. Prepared locks are persisted to `<wallet>/locks.json`
+    /// and reloaded on `WalletUnlock`, so a miss means the entry belongs to a
+    /// different wallet/daemon or its `locks.json` row is gone — not that the
+    /// index was lost to a restart. Pulled out so the message is unit-testable.
+    fn missing_lock_metadata_error(lock_id: &str) -> String {
+        format!(
+            "no local metadata for lock '{lock_id}' — either it was prepared \
+            by a different wallet/daemon, or its locks.json entry is missing. \
+            Unlock the wallet that prepared it and retry."
+        )
+    }
+
+    /// Error text for `WraithMixSubmit` when the `session_id` is unknown. The
+    /// `wraith_mixes` map is in-memory only by design (the coordinator's
+    /// no-sign deadline is ticking), so a miss means the round expired or the
+    /// daemon restarted mid-round. Pulled out so the message is unit-testable.
+    fn unknown_mix_session_error(session_id: &str) -> String {
+        format!(
+            "mix session '{session_id}' not found — it expired or the daemon \
+            restarted mid-round; start the mix again"
+        )
+    }
+
     fn now_unix_secs() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2550,11 +2574,7 @@ mod unix {
                         return Envelope::new(
                             id,
                             Response::Error(ErrorResponse {
-                                message: format!(
-                                    "no local metadata for lock '{lock_id}' \
-                                    (was it prepared by THIS daemon? in-memory \
-                                    only in v1 — restarts lose the index)"
-                                ),
+                                message: missing_lock_metadata_error(&lock_id),
                             }),
                         );
                     }
@@ -3409,9 +3429,7 @@ mod unix {
                         return Envelope::new(
                             id,
                             Response::Error(ErrorResponse {
-                                message: format!(
-                                    "no in-flight wraith mix for session '{session_id}'"
-                                ),
+                                message: unknown_mix_session_error(&session_id),
                             }),
                         );
                     }
@@ -4001,6 +4019,46 @@ mod unix {
                 perm.mode() & 0o777,
                 0o600,
                 "locks file must be wallet-owner-only readable",
+            );
+        }
+
+        #[test]
+        fn missing_lock_metadata_error_is_accurate() {
+            let msg = super::missing_lock_metadata_error("lock-XYZ");
+            // Names the offending lock so the operator can act on it.
+            assert!(msg.contains("lock-XYZ"), "must name the lock: {msg}");
+            // Points at the real recovery path now that locks persist to
+            // locks.json and reload on WalletUnlock.
+            assert!(msg.contains("locks.json"), "must mention locks.json: {msg}");
+            assert!(
+                msg.contains("different wallet/daemon"),
+                "must explain the cross-wallet/daemon case: {msg}"
+            );
+            // Regression guard: the old message falsely claimed the index was
+            // in-memory only and lost on restart. That is no longer true.
+            assert!(
+                !msg.contains("restarts lose the index"),
+                "stale, now-false claim must be gone: {msg}"
+            );
+            assert!(
+                !msg.contains("in-memory"),
+                "stale in-memory claim must be gone: {msg}"
+            );
+        }
+
+        #[test]
+        fn unknown_mix_session_error_is_clear() {
+            let msg = super::unknown_mix_session_error("sess-123");
+            assert!(msg.contains("sess-123"), "must name the session: {msg}");
+            assert!(msg.contains("not found"), "must say not found: {msg}");
+            // Honest about why it's gone: expired or daemon restart mid-round.
+            assert!(
+                msg.contains("expired") && msg.contains("restarted"),
+                "must explain expiry/restart cause: {msg}"
+            );
+            assert!(
+                msg.contains("start the mix again"),
+                "must tell the user how to recover: {msg}"
             );
         }
 
