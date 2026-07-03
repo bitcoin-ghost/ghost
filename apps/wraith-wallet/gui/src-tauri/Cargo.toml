@@ -21,6 +21,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 wraith-wallet-ipc = { workspace = true }
 tokio = { workspace = true }
+# Cross-platform local IPC client (UDS on unix, named pipes on Windows).
+interprocess = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

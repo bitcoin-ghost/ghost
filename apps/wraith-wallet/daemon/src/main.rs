@@ -13,13 +13,6 @@
 /// (fetch path lands with the GUI toggle; see the module docs).
 mod coordinator_resolve;
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("wraithd: only Unix-like platforms are supported in phase 0");
-    std::process::exit(1);
-}
-
-#[cfg(unix)]
 fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -29,24 +22,34 @@ fn main() -> std::io::Result<()> {
         .init();
 
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(unix::serve())
+    runtime.block_on(server::serve())
 }
 
-#[cfg(unix)]
-mod unix {
+/// Daemon core. The IPC transport is a cross-platform local socket
+/// (Unix-domain socket on unix, named pipe on Windows) via the
+/// `interprocess` crate; everything else in here is platform-neutral.
+mod server {
     use std::collections::HashMap;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
     use std::time::Instant;
 
     use ghost_gsp_proto::{PaymentMode, SessionToken};
+    use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
+    use interprocess::local_socket::ListenerOptions;
     use secrecy::SecretString;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::RwLock;
+
+    /// Full-duplex IPC stream (splits into [`IpcRecvHalf`] + [`IpcSendHalf`]).
+    type IpcStream = interprocess::local_socket::tokio::Stream;
+    /// Read half of a connection — feeds the newline-delimited request reader.
+    type IpcRecvHalf = interprocess::local_socket::tokio::RecvHalf;
+    /// Write half of a connection — carries JSON responses / pushes.
+    type IpcSendHalf = interprocess::local_socket::tokio::SendHalf;
     use wraith_wallet_core::auth;
     use wraith_wallet_core::chain::ChainClient;
     use wraith_wallet_core::gsp::GspClient;
@@ -57,7 +60,7 @@ mod unix {
     use wraith_wallet_core::light;
     use wraith_wallet_core::signer::{Signer, SoftwareSigner};
     use wraith_wallet_ipc::{
-        default_socket_path, ChainStatusResponse, CheckForUpdateResponse, DaemonEnvResponse,
+        ChainStatusResponse, CheckForUpdateResponse, DaemonEnvResponse,
         DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope, ErrorResponse,
         GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse,
         HealthResponse, LightBalanceResponse, LightDetectedResponse, LightHistoryEntry,
@@ -108,6 +111,10 @@ mod unix {
     const GHOSTD_COOKIE_ENV: &str = "WRAITHD_GHOSTD_COOKIE";
     const GHOSTD_USER_ENV: &str = "WRAITHD_GHOSTD_USER";
     const GHOSTD_PASS_ENV: &str = "WRAITHD_GHOSTD_PASS";
+    // Unix reads this here to locate the socket file for housekeeping; on
+    // Windows the same override is honoured inside `wraith_wallet_ipc`'s
+    // pipe-name derivation, so the daemon never references it directly.
+    #[cfg(unix)]
     const SOCKET_ENV: &str = "WRAITHD_SOCKET";
     const IDLE_LOCK_ENV: &str = "WRAITHD_IDLE_LOCK_SECS";
     const DEFAULT_IDLE_LOCK_SECS: u64 = 900;
@@ -192,8 +199,9 @@ mod unix {
         active: RwLock<Option<String>>,
         session: RwLock<Option<StoredSession>>,
         network: bitcoin::Network,
-        /// Absolute IPC socket path. Surfaced via DaemonEnv for diagnostics.
-        socket_path: PathBuf,
+        /// Human-readable IPC endpoint (Unix socket path, or Windows
+        /// `\\.\pipe\...` name). Surfaced via DaemonEnv for diagnostics.
+        endpoint_display: String,
         /// Unix-seconds timestamp of the last user-driven IPC request.
         /// Health/Doctor/DaemonEnv don't bump this; everything else does.
         last_activity: std::sync::atomic::AtomicU64,
@@ -409,10 +417,14 @@ mod unix {
             f.write_all(&bytes)?;
             f.sync_all()?;
         }
-        // mode 0600 on Unix.
-        let mut perm = std::fs::metadata(&tmp)?.permissions();
-        perm.set_mode(0o600);
-        std::fs::set_permissions(&tmp, perm)?;
+        // mode 0600 on Unix; Windows inherits the user-profile ACL.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&tmp)?.permissions();
+            perm.set_mode(0o600);
+            std::fs::set_permissions(&tmp, perm)?;
+        }
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
@@ -482,13 +494,17 @@ mod unix {
 
     pub async fn serve() -> std::io::Result<()> {
         // WRAITHD_SOCKET override lets operators run multiple daemons (one
-        // per wallet "profile") without socket-path collisions, and lets
+        // per wallet "profile") without endpoint collisions, and lets
         // integration tests bind their own ephemeral socket. Falls back to
-        // the OS-default path so the common case is unchanged.
+        // the OS-default path so the common case is unchanged. On Unix the
+        // concrete filesystem path is needed for stale-file removal and the
+        // 0600 chmod; Windows named pipes have no filesystem presence.
+        #[cfg(unix)]
         let socket_path = match std::env::var(SOCKET_ENV) {
             Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-            _ => default_socket_path(),
+            _ => wraith_wallet_ipc::default_socket_path(),
         };
+        let endpoint_display = wraith_wallet_ipc::endpoint_display();
         // Both env vars accept a comma-separated list of URLs. Endpoints are tried
         // in order; failover is sticky-during-outage but resets to primary on success.
         let ghost_pay_raw =
@@ -576,7 +592,7 @@ mod unix {
             active: RwLock::new(None),
             session: RwLock::new(None),
             network,
-            socket_path: socket_path.clone(),
+            endpoint_display: endpoint_display.clone(),
             last_activity: std::sync::atomic::AtomicU64::new(now_unix_secs()),
             idle_lock_secs,
             shroud_max_ms,
@@ -597,32 +613,48 @@ mod unix {
             tokio::spawn(idle_lock_task(state.clone()));
         }
 
-        if socket_path.exists() {
-            tracing::warn!(
-                path = %socket_path.display(),
-                "stale socket file present, removing"
-            );
-            fs::remove_file(&socket_path)?;
-        }
-        if let Some(parent) = socket_path.parent() {
-            fs::create_dir_all(parent)?;
+        // Unix-domain sockets leave a filesystem entry; clear any stale one
+        // and ensure the parent dir exists before binding. Windows named
+        // pipes have no such artefact, so this housekeeping is unix-only.
+        #[cfg(unix)]
+        {
+            if socket_path.exists() {
+                tracing::warn!(
+                    path = %socket_path.display(),
+                    "stale socket file present, removing"
+                );
+                fs::remove_file(&socket_path)?;
+            }
+            if let Some(parent) = socket_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
         }
 
-        let listener = UnixListener::bind(&socket_path)?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-        tracing::info!(path = %socket_path.display(), "wraithd listening");
+        let name = wraith_wallet_ipc::endpoint_name()?;
+        let listener = ListenerOptions::new().name(name).create_tokio()?;
+        // Restrict the endpoint to the current user. On Unix we chmod the
+        // socket to 0600; on Windows the default named-pipe ACL already
+        // limits access to the pipe's creator plus SYSTEM/administrators,
+        // which is equivalent for a per-user daemon.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        }
+        tracing::info!(endpoint = %endpoint_display, "wraithd listening");
 
-        // Watch for SIGTERM / SIGINT (Ctrl-C) so we can drop the listener, kill
-        // any active session task, and remove the socket file before exiting.
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        // Watch for shutdown signals (SIGTERM / SIGINT on Unix, Ctrl-C on
+        // Windows) so we can drop the listener, kill any active session
+        // task, and clean up before exiting. Created once and polled each
+        // loop iteration via `&mut`.
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
                 accept = listener.accept() => {
                     match accept {
-                        Ok((stream, _)) => {
+                        Ok(stream) => {
                             let state = Arc::clone(&state);
                             tokio::spawn(handle_connection(stream, state));
                         }
@@ -631,12 +663,8 @@ mod unix {
                         }
                     }
                 }
-                _ = sigterm.recv() => {
-                    tracing::info!("SIGTERM received, shutting down");
-                    break;
-                }
-                _ = sigint.recv() => {
-                    tracing::info!("SIGINT received, shutting down");
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown signal received, shutting down");
                     break;
                 }
             }
@@ -647,13 +675,52 @@ mod unix {
         // Wallets clear on drop (zeroized).
         state.wallets.write().await.clear();
         // Remove the socket so the next startup doesn't see a stale file.
+        // (Named pipes vanish with the listener; nothing to unlink on Windows.)
+        #[cfg(unix)]
         let _ = fs::remove_file(&socket_path);
         tracing::info!("wraithd stopped");
         Ok(())
     }
 
-    async fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
-        let (reader, mut writer) = stream.into_split();
+    /// Resolve when the OS asks the daemon to shut down. Unix listens for
+    /// SIGTERM and SIGINT; Windows listens for Ctrl-C (the portable
+    /// `tokio::signal::ctrl_c`, which also fires on `CTRL_CLOSE`/logoff).
+    #[cfg(unix)]
+    async fn shutdown_signal() {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If a handler can't be installed the daemon still runs; it just
+        // won't get a graceful-shutdown notification for that signal.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?e, "could not install SIGTERM handler");
+                return std::future::pending().await;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?e, "could not install SIGINT handler");
+                return std::future::pending().await;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+        }
+    }
+
+    /// See the Unix variant above.
+    #[cfg(windows)]
+    async fn shutdown_signal() {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(?e, "could not listen for Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    }
+
+    async fn handle_connection(stream: IpcStream, state: Arc<DaemonState>) {
+        let (reader, mut writer) = stream.split();
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             // Streaming subscriptions short-circuit the request/response cycle:
@@ -677,10 +744,7 @@ mod unix {
         }
     }
 
-    async fn write_envelope(
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        env: &Envelope<Response>,
-    ) -> bool {
+    async fn write_envelope(writer: &mut IpcSendHalf, env: &Envelope<Response>) -> bool {
         let mut out = match serde_json::to_string(env) {
             Ok(s) => s,
             Err(e) => {
@@ -701,8 +765,8 @@ mod unix {
     /// (id=0). Exits when the client disconnects, the active session is
     /// rotated out, or the broadcast channel is closed.
     async fn run_watch_payments(
-        mut writer: tokio::net::unix::OwnedWriteHalf,
-        mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        mut writer: IpcSendHalf,
+        mut lines: tokio::io::Lines<BufReader<IpcRecvHalf>>,
         state: Arc<DaemonState>,
     ) {
         let mut rx = match state.session.read().await.as_ref() {
@@ -2219,7 +2283,7 @@ mod unix {
                     network,
                     wallets_dir: state.wallets_dir.display().to_string(),
                     tor_proxy: state.tor_proxy.clone(),
-                    socket_path: state.socket_path.display().to_string(),
+                    socket_path: state.endpoint_display.clone(),
                     idle_lock_secs: state.idle_lock_secs,
                     shroud_max_ms: state.shroud_max_ms,
                     update_manifest_url: state.update_manifest_url.clone(),
@@ -3175,11 +3239,16 @@ mod unix {
                             match std::fs::copy(&src, &dst) {
                                 Ok(bytes) => {
                                     // Match the keystore's own owner-only permissions.
-                                    use std::os::unix::fs::PermissionsExt;
-                                    let _ = std::fs::set_permissions(
-                                        &dst,
-                                        std::fs::Permissions::from_mode(0o600),
-                                    );
+                                    // Windows inherits the user-profile ACL from the
+                                    // parent directory, so no explicit chmod is needed.
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        let _ = std::fs::set_permissions(
+                                            &dst,
+                                            std::fs::Permissions::from_mode(0o600),
+                                        );
+                                    }
                                     Response::WalletExported {
                                         name,
                                         path: dst.display().to_string(),
@@ -3225,11 +3294,14 @@ mod unix {
                             }
                             match std::fs::copy(&src, &dst) {
                                 Ok(bytes) => {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    let _ = std::fs::set_permissions(
-                                        &dst,
-                                        std::fs::Permissions::from_mode(0o600),
-                                    );
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        let _ = std::fs::set_permissions(
+                                            &dst,
+                                            std::fs::Permissions::from_mode(0o600),
+                                        );
+                                    }
                                     Response::WalletRestored {
                                         name,
                                         path: dst.display().to_string(),
@@ -3988,6 +4060,7 @@ mod unix {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn save_writes_with_mode_0600() {
             use std::os::unix::fs::PermissionsExt;

@@ -2,10 +2,12 @@
 //!
 //! Phase 14 first slice: scaffold + a single Tauri command (`gsp_health`)
 //! that round-trips a `Request::Health` to a running `wraithd` over its
-//! Unix socket. Frontend is a static `index.html` (no bundler needed) — a
+//! local IPC endpoint (a Unix-domain socket on unix, a named pipe on
+//! Windows). Frontend is a static `index.html` (no bundler needed) — a
 //! React/Tauri/Vite migration can layer on top once the protocol surface
 //! is fleshed out.
 
+use interprocess::local_socket::traits::tokio::Stream as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{
@@ -14,9 +16,17 @@ use tauri::{
     AppHandle, Emitter, Manager, WindowEvent,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixStream;
-use wraith_wallet_ipc::{default_socket_path, Envelope, Request, Response};
+use wraith_wallet_ipc::{Envelope, Request, Response};
+
+/// Full-duplex IPC stream to the daemon (Unix-domain socket on unix,
+/// named pipe on Windows) via the `interprocess` crate.
+type IpcStream = interprocess::local_socket::tokio::Stream;
+
+/// Connect to the running `wraithd` over its local IPC endpoint.
+async fn connect_daemon() -> std::io::Result<IpcStream> {
+    let name = wraith_wallet_ipc::endpoint_name()?;
+    IpcStream::connect(name).await
+}
 
 /// Coordinates the long-lived watch task so we don't accidentally spawn a
 /// second one if the frontend calls `start_watch()` twice. Frontends that need
@@ -560,13 +570,11 @@ async fn start_watch(
     Ok(())
 }
 
-#[cfg(unix)]
 async fn run_watch_loop(app: &AppHandle) -> Result<(), String> {
-    let socket = default_socket_path();
-    let stream = UnixStream::connect(&socket)
+    let stream = connect_daemon()
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.split();
     let mut line = serde_json::to_string(&Envelope::new(1, Request::WatchPayments))
         .map_err(|e| format!("serialise: {e}"))?;
     line.push('\n');
@@ -608,23 +616,16 @@ async fn run_watch_loop(app: &AppHandle) -> Result<(), String> {
     }
 }
 
-#[cfg(not(unix))]
-async fn run_watch_loop(_: &AppHandle) -> Result<(), String> {
-    Err("watch only supported on unix".to_string())
-}
-
-/// Send a request to the running wraithd daemon over its local IPC socket.
+/// Send a request to the running wraithd daemon over its local IPC endpoint.
 /// Returns the parsed [`Response`] payload (without the JSON-RPC envelope).
-#[cfg(unix)]
 async fn call_daemon(request: Request) -> Result<Response, String> {
-    let socket = default_socket_path();
-    let stream = UnixStream::connect(&socket).await.map_err(|e| {
+    let stream = connect_daemon().await.map_err(|e| {
         format!(
             "could not connect to wraithd at {}: {e} (is the daemon running?)",
-            socket.display()
+            wraith_wallet_ipc::endpoint_display()
         )
     })?;
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.split();
     let mut line =
         serde_json::to_string(&Envelope::new(1, request)).map_err(|e| format!("serialise: {e}"))?;
     line.push('\n');
@@ -644,11 +645,6 @@ async fn call_daemon(request: Request) -> Result<Response, String> {
     let envelope: Envelope<Response> =
         serde_json::from_str(&response_line).map_err(|e| format!("decode: {e}"))?;
     Ok(envelope.payload)
-}
-
-#[cfg(not(unix))]
-async fn call_daemon(_: Request) -> Result<Response, String> {
-    Err("Wraith Wallet GUI currently only supports Unix-like platforms".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

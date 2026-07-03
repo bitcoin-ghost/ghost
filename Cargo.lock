@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-ghost-tests"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_core_sv2"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin-capnp-types",
@@ -2273,6 +2273,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
+
+[[package]]
 name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3083,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-accounting"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "ghost-common",
@@ -3097,7 +3103,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-buds"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "ghost-common",
@@ -3111,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-cli"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3129,7 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-common"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -3162,7 +3168,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-consensus"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3194,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-glyph"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "hex",
  "serde",
@@ -3205,7 +3211,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-gsp"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3267,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-gsp-proto"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -3284,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-keys"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -3306,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-locks"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
@@ -3350,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-pay"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3398,7 +3404,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-policy"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -3411,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-pool"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -3466,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reaper"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3478,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reconciliation"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -3504,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-registry"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -3539,7 +3545,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-setup"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "clap",
  "dirs 5.0.1",
@@ -3550,7 +3556,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-storage"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -3571,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-tap-core"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3613,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-tap-desktop"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "dirs 6.0.0",
  "getrandom 0.2.17",
@@ -3639,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-tap-integration"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "ghost-gsp-proto",
  "ghost-tap-core",
@@ -3653,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-template"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -3669,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-verification"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "axum 0.7.9",
  "bitcoin",
@@ -4540,6 +4546,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "interprocess"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b"
+dependencies = [
+ "doctest-file",
+ "futures-core",
+ "libc",
+ "recvmsg",
+ "tokio",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "io-lifetimes"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4642,7 +4663,7 @@ dependencies = [
 
 [[package]]
 name = "jd_client_sv2"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin_core_sv2",
@@ -4658,7 +4679,7 @@ dependencies = [
 
 [[package]]
 name = "jd_server_sv2"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-channel 1.9.0",
  "async-trait",
@@ -6181,7 +6202,7 @@ dependencies = [
 
 [[package]]
 name = "pool_sv2"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin_core_sv2",
@@ -6692,6 +6713,12 @@ dependencies = [
  "time",
  "yasna",
 ]
+
+[[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_syscall"
@@ -7905,7 +7932,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-apps"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-channel 1.9.0",
  "axum 0.8.9",
@@ -9118,7 +9145,7 @@ dependencies = [
 
 [[package]]
 name = "translator_sv2"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "async-channel 1.9.0",
  "clap",
@@ -9903,6 +9930,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10449,7 +10482,7 @@ checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 
 [[package]]
 name = "wraith-coordinator"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -10486,7 +10519,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-protocol"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
@@ -10507,10 +10540,11 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-cli"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "clap",
  "clap_complete",
+ "interprocess",
  "libc",
  "rpassword",
  "serde_json",
@@ -10520,7 +10554,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-core"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -10557,7 +10591,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-daemon"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
@@ -10565,6 +10599,7 @@ dependencies = [
  "ghost-gsp-proto",
  "ghost-keys",
  "hex",
+ "interprocess",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "secrecy",
@@ -10582,8 +10617,9 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-gui"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
+ "interprocess",
  "serde",
  "serde_json",
  "tauri",
@@ -10596,8 +10632,9 @@ dependencies = [
 
 [[package]]
 name = "wraith-wallet-ipc"
-version = "1.10.20"
+version = "1.10.21"
 dependencies = [
+ "interprocess",
  "libc",
  "proptest",
  "serde",
