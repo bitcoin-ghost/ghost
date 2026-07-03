@@ -5,6 +5,15 @@ import nextTs from "eslint-config-next/typescript";
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
+  // The custom Node server and its test harness are plain CommonJS modules that
+  // run outside the Next/browser bundle, so the ESM-only `require` ban does not
+  // apply to them.
+  {
+    files: ["server.js", "tests/**/*.js"],
+    rules: {
+      "@typescript-eslint/no-require-imports": "off",
+    },
+  },
   // Override default ignores of eslint-config-next.
   globalIgnores([
     // Default ignores of eslint-config-next:

@@ -61,9 +61,57 @@ NEXT_PUBLIC_API_URL=http://localhost:8080
 # Production build
 npm run build
 
-# Start production server
+# Start production server (custom Node server — see below)
 npm start
 ```
+
+## WebSocket authentication (custom server)
+
+Real-time updates use a WebSocket. App-Router route handlers cannot upgrade a
+connection, so the dashboard ships a **custom Node server** (`server.js`) that
+wraps Next.js and owns the HTTP `upgrade` event:
+
+- The browser connects to the **same-origin** endpoint `wss?://<host>/api/ws`
+  (never straight to the backend `:8080`).
+- On upgrade, `server.js` validates the `ghost-session` JWT — the *same* cookie
+  the middleware and REST proxy enforce. An unauthenticated upgrade is answered
+  with `401` and never becomes a socket.
+- Only after the token verifies does the server open a socket to the loopback
+  backend `/ws` and pipe frames through (the operator's cookie is stripped
+  before forwarding).
+
+This closes the previous hole where the browser opened a raw, unauthenticated
+socket directly to `ws://<host>:8080/ws`.
+
+### Deployment note (IMPORTANT)
+
+The dashboard entry point is now `server.js`, not `next start`:
+
+- `npm start` runs `NODE_ENV=production node server.js`.
+- With `output: 'standalone'`, the Docker image copies `server.js` over the
+  generated `.next/standalone/server.js`. **Any systemd unit / process manager
+  must launch `node server.js` (from the standalone dir), not `next start`** —
+  `next start` does not run the WS relay and is incompatible with standalone.
+- `HOSTNAME` defaults to `127.0.0.1` (loopback); access remotely via SSH tunnel
+  (`ssh -L 3000:localhost:3000 <node>`).
+
+### Defence-in-depth: backend `:8080`
+
+The node API (`ghost-verification`) listens on `0.0.0.0:8080` because mesh peers
+challenge each other over it, and its `/ws` runs unauthenticated
+(`WsState::new()` → `require_auth:false`). The `/api/ws` relay is therefore the
+**user-auth boundary** for the browser. Operators should still confirm the API
+is not needlessly exposed:
+
+```bash
+# Expect the node API bound as intended (mesh reachability is by design):
+ss -ltnp 'sport = :8080'
+```
+
+Locking `:8080` to loopback would break inter-node verification, so it is left
+as-is; hardening the backend `/ws` (enabling `require_auth` in prod wiring, or
+serving `/ws` on a separate loopback listener) is tracked as a backend follow-up
+and is out of scope for this dashboard change.
 
 ## Pages
 
