@@ -201,6 +201,9 @@ async fn spawn_daemon(gsp_url: &str) -> (Child, PathBuf, tempfile::TempDir) {
     let child = Command::new(wraithd_binary())
         .env("WRAITHD_SOCKET", &socket)
         .env("WRAITHD_WALLETS_DIR", &wallets)
+        // This test imports a publicly-known test mnemonic, which the daemon now
+        // (correctly) refuses on the mainnet default. Pin the test to signet.
+        .env("WRAITHD_NETWORK", "signet")
         .env("WRAITHD_GSP", gsp_url)
         // ghost-pay is unused on this test path. Point it at a dead address
         // so the daemon doesn't accidentally hit a real local instance.
