@@ -773,7 +773,7 @@ pub fn run() {
 
             let _tray = TrayIconBuilder::with_id("wraith-tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Wraith Wallet")
+                .tooltip("Ghost Wallet")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
