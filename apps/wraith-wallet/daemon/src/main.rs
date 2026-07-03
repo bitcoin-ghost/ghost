@@ -3007,6 +3007,43 @@ mod server {
                     Response::WalletLocked { name: target }
                 }
             }
+            Request::WalletDelete { name } => {
+                if let Some(refused) = refuse_in_kiosk_mode(state, "wallet delete") {
+                    return Envelope::new(id, refused);
+                }
+                if let Err(e) = validate_wallet_name(&name) {
+                    Response::Error(ErrorResponse { message: e })
+                } else {
+                    let keystore = keystore_path(&state.wallets_dir, &name);
+                    // The per-wallet directory holds the keystore plus any
+                    // saved descriptors; removing it wipes every on-disk
+                    // trace of the wallet.
+                    let wallet_dir = state.wallets_dir.join(&name);
+                    if !keystore.is_file() {
+                        Response::Error(ErrorResponse {
+                            message: format!("no wallet '{name}' at {}", keystore.display()),
+                        })
+                    } else if let Err(e) = std::fs::remove_dir_all(&wallet_dir) {
+                        Response::Error(ErrorResponse {
+                            message: format!("delete '{name}': {e}"),
+                        })
+                    } else {
+                        // Drop the in-memory keystore and clear the active
+                        // pointer / bound GSP session so nothing keeps
+                        // referencing a wallet whose backing is now gone.
+                        state.wallets.write().await.remove(&name);
+                        let mut active = state.active.write().await;
+                        if active.as_deref() == Some(name.as_str()) {
+                            *active = None;
+                        }
+                        let mut session = state.session.write().await;
+                        if session.as_ref().is_some_and(|s| s.wallet_name == name) {
+                            *session = None;
+                        }
+                        Response::WalletDeleted { name }
+                    }
+                }
+            }
             Request::WalletList => {
                 let on_disk = list_on_disk(&state.wallets_dir);
                 let unlocked = state.wallets.read().await;
@@ -4260,6 +4297,10 @@ mod server {
         /// live GSP session, which the IPC integration tests cover; here
         /// we only care that the gate accepts/rejects the right modes.
         fn test_state() -> Arc<DaemonState> {
+            test_state_in(std::env::temp_dir())
+        }
+
+        fn test_state_in(wallets_dir: std::path::PathBuf) -> Arc<DaemonState> {
             Arc::new(DaemonState {
                 started: Instant::now(),
                 chain: Arc::new(RejectChain),
@@ -4269,7 +4310,7 @@ mod server {
                 tor_proxy: None,
                 wraith_coordinator_url: None,
                 kiosk_mode: false,
-                wallets_dir: std::env::temp_dir(),
+                wallets_dir,
                 wallets: RwLock::new(HashMap::new()),
                 active: RwLock::new(None),
                 session: RwLock::new(None),
@@ -4345,6 +4386,74 @@ mod server {
                     "ghostpay must clear the mode gate and reach the session step; got: {err}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn wallet_delete_removes_keystore_and_forgets_active() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+
+            // Create a wallet through the real dispatch path so the test
+            // exercises the same code the GUI drives.
+            let create = serde_json::to_string(&Envelope::new(
+                1,
+                Request::WalletCreate {
+                    name: "doomed".into(),
+                    passphrase: "hunter2hunter2".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&create, &state).await;
+            assert!(
+                matches!(resp.payload, Response::WalletCreate(_)),
+                "create should succeed; got {:?}",
+                resp.payload
+            );
+            let wallet_dir = dir.path().join("doomed");
+            let keystore = wallet_dir.join("keystore.bin");
+            assert!(keystore.is_file(), "keystore should exist after create");
+            assert_eq!(state.active.read().await.as_deref(), Some("doomed"));
+
+            // Delete it.
+            let del = serde_json::to_string(&Envelope::new(
+                2,
+                Request::WalletDelete {
+                    name: "doomed".into(),
+                },
+            ))
+            .unwrap();
+            let resp = super::dispatch(&del, &state).await;
+            match resp.payload {
+                Response::WalletDeleted { name } => assert_eq!(name, "doomed"),
+                other => panic!("expected WalletDeleted, got {other:?}"),
+            }
+
+            // On-disk directory gone, in-memory state cleared.
+            assert!(!keystore.exists(), "keystore file must be removed");
+            assert!(!wallet_dir.exists(), "wallet dir must be removed");
+            assert!(state.wallets.read().await.get("doomed").is_none());
+            assert!(state.active.read().await.is_none());
+
+            // No longer surfaced by WalletList.
+            let list =
+                serde_json::to_string(&Envelope::new(3, Request::WalletList)).unwrap();
+            let resp = super::dispatch(&list, &state).await;
+            match resp.payload {
+                Response::WalletList(l) => assert!(
+                    l.wallets.iter().all(|w| w.name != "doomed"),
+                    "deleted wallet must not appear in the list"
+                ),
+                other => panic!("expected WalletList, got {other:?}"),
+            }
+
+            // Deleting a wallet that no longer exists is a clean error,
+            // never a panic.
+            let resp = super::dispatch(&del, &state).await;
+            assert!(
+                matches!(resp.payload, Response::Error(_)),
+                "second delete should error; got {:?}",
+                resp.payload
+            );
         }
     }
 }

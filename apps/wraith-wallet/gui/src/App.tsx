@@ -44,20 +44,47 @@ type Screen =
   | "network"
   | "settings";
 
-const NAV: Array<{ id: Screen; label: string }> = [
-  { id: "wallet", label: "Wallet" },
-  { id: "receive", label: "Receive" },
-  { id: "send", label: "Send" },
-  { id: "sign", label: "Sign" },
-  { id: "cosigner", label: "Cosigner" },
-  { id: "mix", label: "Mix" },
-  { id: "glyph", label: "Glyph" },
-  { id: "merchant", label: "Merchant" },
-  { id: "reports", label: "Reports" },
-  { id: "locks", label: "Locks" },
-  { id: "history", label: "History" },
-  { id: "network", label: "Network" },
-  { id: "settings", label: "Settings" },
+// Sidebar navigation grouped into a few plain-language categories.
+// Keep the grouping shallow — end users scan headings, not a flat
+// list of thirteen links. Every existing route is preserved; only
+// the presentation changes.
+const NAV_GROUPS: Array<{
+  heading: string;
+  items: Array<{ id: Screen; label: string }>;
+}> = [
+  {
+    heading: "Wallet",
+    items: [
+      { id: "wallet", label: "Wallet" },
+      { id: "history", label: "History" },
+      { id: "locks", label: "Locks" },
+    ],
+  },
+  {
+    heading: "Payments",
+    items: [
+      { id: "receive", label: "Receive" },
+      { id: "send", label: "Send" },
+      { id: "sign", label: "Sign" },
+      { id: "cosigner", label: "Cosigner" },
+      { id: "mix", label: "Mix" },
+      { id: "glyph", label: "Glyph" },
+    ],
+  },
+  {
+    heading: "Merchant",
+    items: [
+      { id: "merchant", label: "Merchant" },
+      { id: "reports", label: "Reports" },
+    ],
+  },
+  {
+    heading: "System",
+    items: [
+      { id: "network", label: "Network" },
+      { id: "settings", label: "Settings" },
+    ],
+  },
 ];
 
 export default function App() {
@@ -379,14 +406,19 @@ export default function App() {
       {!kioskMode && (
         <aside className="app-sidebar">
           <nav>
-            {NAV.map((item) => (
-              <button
-                key={item.id}
-                className={screen === item.id ? "active" : ""}
-                onClick={() => setScreen(item.id)}
-              >
-                {item.label}
-              </button>
+            {NAV_GROUPS.map((group) => (
+              <div className="nav-group" key={group.heading}>
+                <div className="nav-heading">{group.heading}</div>
+                {group.items.map((item) => (
+                  <button
+                    key={item.id}
+                    className={screen === item.id ? "active" : ""}
+                    onClick={() => setScreen(item.id)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
             ))}
           </nav>
         </aside>
