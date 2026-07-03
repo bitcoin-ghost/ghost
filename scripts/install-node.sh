@@ -511,6 +511,16 @@ fi
 grep " ${POOL_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${POOL_TARBALL}."
 tar -xzf "$POOL_TARBALL"
 install -m755 -o root -g root "$(find . -name ghost-pool -type f | head -1)" /opt/ghost/bin/ghost-pool
+# ghost-cli (the ghostd RPC client, like bitcoin-cli) ships in the same signed
+# tarball. Install it so operators can query their node's ghostd directly — it is
+# not required for ghost-pool operation (ghost-pool talks to ghostd over RPC/ZMQ),
+# but without it a node has no CLI to inspect its own daemon.
+cli_bin="$(find . -name ghost-cli -type f | head -1)"
+if [[ -n "$cli_bin" ]]; then
+  install -m755 -o root -g root "$cli_bin" /opt/ghost/bin/ghost-cli
+else
+  log "ghost-cli not found in ${POOL_TARBALL} (older release?) — skipping."
+fi
 # ghost-pay (L2 + Wraith bond ledger) ships in the same signed tarball; install
 # it only when Ghost Pay is enabled.
 if [[ "$GHOST_PAY" == "true" ]]; then
