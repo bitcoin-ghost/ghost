@@ -225,6 +225,11 @@ export interface MiningStatus {
   round_id?: number;
   blocks_found?: number;
   is_synced?: boolean;
+  // SV2/Noise authority public key that miners must pin. Sourced from the
+  // node's `[network] sv2_authority_public_key`, falling back to the
+  // network-wide default. Optional: absent on pre-redeploy nodes, in which
+  // case the frontend falls back to its bundled constant.
+  authority_public_key?: string;
 }
 
 export interface MinerInfo {
@@ -247,8 +252,16 @@ export interface MinerInfo {
 }
 
 export interface MinersResponse {
-  total: number;
+  // `/api/v1/mining/miners/full` returns `total`; the operator-authed
+  // `/api/v1/mining/miners` returns `total_miners`. Both are optional so the
+  // count can be sourced from whichever endpoint answered.
+  total?: number;
+  total_miners?: number;
   miners?: MinerInfo[];
+  // True when the backend withheld the per-miner list (public/unauthed path or
+  // a pre-redeploy node that lacks the operator-authed detail mode). When true,
+  // `miners` is absent and the UI shows the aggregate count instead of a table.
+  miners_redacted?: boolean;
   // Aggregate stats returned when miners array is not available (no HMAC auth)
   total_hashrate_th?: number;
   total_shares_accepted?: number;

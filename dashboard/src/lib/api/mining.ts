@@ -7,8 +7,12 @@ export async function getMiningStatus(): Promise<MiningStatus> {
 }
 
 export async function getMiners(): Promise<MinersResponse> {
-  // Use the internal unredacted endpoint (HMAC-protected, proxied via Next.js)
-  return fetchApi<MinersResponse>('/api/v1/mining/miners/full');
+  // Dual-mode endpoint: the Next.js proxy signs this GET with the operator
+  // INTERNAL_AUTH_KEY (HMAC over an empty body), so the node returns the FULL
+  // unredacted connected-miner list (`miners_redacted: false`). Pre-redeploy
+  // nodes — or an unsigned request — get the redacted aggregate instead, which
+  // the mining page renders as an aggregate count rather than a table.
+  return fetchApi<MinersResponse>('/api/v1/mining/miners');
 }
 
 export async function getBestHash(): Promise<BestHashResponse> {
