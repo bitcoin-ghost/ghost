@@ -3226,39 +3226,166 @@ async fn api_buds_capabilities_handler(
 }
 
 /// API v1 Swarm handler - for multi-node management
+/// Capability shares (0-15) from the individual capability booleans.
+/// Mirrors `NodeCapabilities::total_shares()` for the mesh-gossiped flags
+/// (Archive +5, Ghost Pay +4, Public Mining +3, Reaper +2, Elder +1).
+fn mesh_capability_shares(
+    archive: bool,
+    ghost_pay: bool,
+    public_mining: bool,
+    reaper: bool,
+    elder: bool,
+) -> u32 {
+    (archive as u32) * 5
+        + (ghost_pay as u32) * 4
+        + (public_mining as u32) * 3
+        + (reaper as u32) * 2
+        + (elder as u32)
+}
+
+/// Display name for a mesh node: the host portion of its advertised address,
+/// falling back to a short node-id label when no address has been gossiped yet.
+fn mesh_node_name(address: &str, node_id: &str) -> String {
+    let host = address.split(':').next().unwrap_or("").trim();
+    if !host.is_empty() {
+        host.to_string()
+    } else {
+        format!("node-{}", &node_id[..node_id.len().min(8)])
+    }
+}
+
+/// API v1 Swarm handler — the fleet view consumed by the dashboard Swarm page.
+///
+/// Auto-discovered mesh peers are reported with their REAL, health-ping-gossiped
+/// state (online/capabilities/hashrate/miner count) that this node already holds
+/// in the in-memory `PeerManager` — the exact source `/api/v1/pool/mesh-nodes`
+/// uses. Previously this handler returned each peer stripped down to its mesh
+/// address (`:8555`) with no `online` flag, so the dashboard rendered every mesh
+/// peer as "Offline" with zeroed stats even though the mesh reports them healthy.
+///
+/// Fields that are NOT gossiped per peer (uptime %, mesh peer count, L1/L2 chain
+/// heights, node balance) are deliberately OMITTED rather than sent as `0`, so
+/// the dashboard can render them as "—" instead of a misleading zero. Each node
+/// carries `"source": "mesh"` so the frontend can distinguish auto-discovered
+/// peers (never poll-able from here, so never "offline" just because their
+/// loopback dashboard API is unreachable) from any manually-added swarm node.
 async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
 
-    // Query database for connected peers
-    let (nodes, total) = if let Some(ref db) = state.database {
-        let peers = db.get_active_peers(50).unwrap_or_default();
-        let nodes_json: Vec<_> = peers
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "node_id": p.node_id.clone().unwrap_or_else(|| "unknown".to_string()),
-                    "address": format!("{}:{}", p.address, p.port),
-                    "last_seen": p.last_seen,
-                    "is_self": false
-                })
-            })
-            .collect();
-        let total = nodes_json.len() + 1; // +1 for self
-        (nodes_json, total)
-    } else {
-        (vec![], 1)
+    // Self node's public address (operator-configured host + HTTP port) and
+    // display name, read from the dashboard config in a single lock.
+    let (self_address, self_name) = {
+        let config = state.dashboard_config.read();
+        let addr = match config.stratum_host.clone() {
+            Some(host) if host.contains(':') => host,
+            Some(host) => format!("{host}:{}", config.http_port.unwrap_or(8080)),
+            None => String::new(),
+        };
+        let name = config
+            .node_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| mesh_node_name(&addr, &health.node_id));
+        (addr, name)
     };
+
+    let self_caps = &health.capabilities;
+    let self_hashrate = state.local_hashrate().unwrap_or(0.0);
+    let self_shares = mesh_capability_shares(
+        self_caps.archive_mode,
+        self_caps.ghost_pay,
+        self_caps.public_mining,
+        self_caps.reaper,
+        self_caps.elder_status,
+    );
+
+    let self_node = serde_json::json!({
+        "node_id": health.node_id.clone(),
+        "name": self_name.clone(),
+        "address": self_address.clone(),
+        // Self is serving this request, so it is online by definition.
+        "online": health.healthy,
+        "is_self": true,
+        "source": "mesh",
+        "version": health.version.clone(),
+        "hashrate_th": self_hashrate,
+        "miner_count": health.miner_count,
+        "shares": self_shares,
+        "max_shares": 15,
+        "archive_mode": self_caps.archive_mode,
+        "ghost_pay": self_caps.ghost_pay,
+        "public_mining": self_caps.public_mining,
+        "reaper": self_caps.reaper,
+        "elder": self_caps.elder_status,
+    });
+
+    let mut nodes = vec![self_node];
+    // Dedup by node_id; self is already in, so skip any peer that re-reports
+    // this node's id (e.g. a same-host placeholder).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(health.node_id.clone());
+
+    let mut online_nodes: u32 = if health.healthy { 1 } else { 0 };
+    let mut combined_hashrate = self_hashrate;
+    let mut combined_shares = self_shares;
+
+    for peer in state.mesh_nodes() {
+        if !seen.insert(peer.node_id.clone()) {
+            continue;
+        }
+        let shares = mesh_capability_shares(
+            peer.cap_archive,
+            peer.cap_ghost_pay,
+            peer.cap_public_mining,
+            peer.cap_reaper,
+            peer.cap_elder,
+        );
+        if peer.healthy {
+            online_nodes += 1;
+        }
+        combined_hashrate += peer.hashrate_th;
+        combined_shares += shares;
+        nodes.push(serde_json::json!({
+            "node_id": peer.node_id,
+            "name": mesh_node_name(&peer.address, &peer.node_id),
+            "address": peer.address,
+            "online": peer.healthy,
+            "is_self": false,
+            "source": "mesh",
+            "hashrate_th": peer.hashrate_th,
+            "miner_count": peer.miner_count,
+            "shares": shares,
+            "max_shares": 15,
+            "archive_mode": peer.cap_archive,
+            "ghost_pay": peer.cap_ghost_pay,
+            "public_mining": peer.cap_public_mining,
+            "reaper": peer.cap_reaper,
+            "elder": peer.cap_elder,
+        }));
+    }
+
+    let total_nodes = nodes.len() as u32;
 
     Json(serde_json::json!({
         "enabled": true,
-        "node_id": health.node_id,
+        "node_id": health.node_id.clone(),
         "self": {
             "node_id": health.node_id,
+            "name": self_name,
+            "address": self_address,
             "version": health.version,
-            "capabilities": health.capabilities
+            "capabilities": health.capabilities,
         },
         "nodes": nodes,
-        "total": total
+        "total": total_nodes,
+        "stats": {
+            "total_nodes": total_nodes,
+            "online_nodes": online_nodes,
+            "offline_nodes": total_nodes.saturating_sub(online_nodes),
+            "combined_hashrate_th": combined_hashrate,
+            "combined_shares": combined_shares,
+            "max_combined_shares": total_nodes * 15,
+        },
     }))
 }
 
@@ -8129,6 +8256,35 @@ mod tests {
         assert_eq!(v["miner_count"], 0);
         assert_eq!(v["healthy"], false);
         assert!(v["capabilities"].is_object());
+    }
+
+    #[test]
+    fn test_mesh_capability_shares() {
+        // Full stack: 5 + 4 + 3 + 2 + 1 = 15.
+        assert_eq!(mesh_capability_shares(true, true, true, true, true), 15);
+        // None: 0.
+        assert_eq!(mesh_capability_shares(false, false, false, false, false), 0);
+        // Ghost Pay (+4) + Public Mining (+3) + Reaper (+2) + Elder (+1) = 10,
+        // matching the observed production self-node total.
+        assert_eq!(mesh_capability_shares(false, true, true, true, true), 10);
+        // Individual weights.
+        assert_eq!(mesh_capability_shares(true, false, false, false, false), 5);
+        assert_eq!(mesh_capability_shares(false, false, false, false, true), 1);
+    }
+
+    #[test]
+    fn test_mesh_node_name_uses_host() {
+        // Host portion of an advertised address.
+        assert_eq!(
+            mesh_node_name("83.136.251.162:8559", "abcdef0123456789"),
+            "83.136.251.162"
+        );
+        // No port.
+        assert_eq!(mesh_node_name("myhost", "abcdef0123456789"), "myhost");
+        // No address gossiped yet -> short node-id label.
+        assert_eq!(mesh_node_name("", "abcdef0123456789"), "node-abcdef01");
+        // Address that is only a port marker (":8555") also degrades to the id.
+        assert_eq!(mesh_node_name(":8555", "abcdef0123456789"), "node-abcdef01");
     }
 
     /// Stage C task 3 — sync endpoint round-trip:
