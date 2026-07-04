@@ -24,7 +24,7 @@
 
 use axum::{
     extract::{ws::WebSocketUpgrade, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -35,7 +35,7 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use ghost_buds::{BudsClassifier, BudsTier};
-use ghost_common::constants::{SV1_STRATUM_PORT, SV2_STRATUM_PORT};
+use ghost_common::constants::{SV1_STRATUM_PORT, SV2_AUTHORITY_PUBLIC_KEY, SV2_STRATUM_PORT};
 
 use crate::auth::{verify_internal_auth, InternalAuth};
 use crate::challenge::*;
@@ -1615,6 +1615,18 @@ async fn api_mining_status_handler(
     let mesh_hashrate_th = state.mesh_total_hashrate().unwrap_or(total_hashrate_th);
     let local_hashrate_th = state.local_hashrate().unwrap_or(total_hashrate_th);
 
+    // SV2/Noise miners must pin the pool's authority public key to connect.
+    // Source it from the node's own pool config when the operator set a bespoke
+    // `[network] sv2_authority_public_key`; otherwise advertise the network-wide
+    // default so the dashboard can stop hardcoding it as a frontend constant.
+    // (Reading full_node_config is a non-async lock, safe alongside the config
+    // guard held above — no await points follow.)
+    let authority_public_key = state
+        .full_node_config
+        .as_ref()
+        .and_then(|c| c.read().network.sv2_authority_public_key.clone())
+        .unwrap_or_else(|| SV2_AUTHORITY_PUBLIC_KEY.to_string());
+
     Json(serde_json::json!({
         // Backend fields
         "active": true,
@@ -1642,6 +1654,7 @@ async fn api_mining_status_handler(
         "shares_rejected": shares_submitted - shares_accepted,
         "stratum_v1_port": SV1_STRATUM_PORT,
         "stratum_v2_port": SV2_STRATUM_PORT,
+        "authority_public_key": authority_public_key,
         "stratum_v1_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV1_STRATUM_PORT),
         "stratum_v2_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV2_STRATUM_PORT),
         "payout_address": config.payout_address,
@@ -1654,7 +1667,32 @@ async fn api_mining_status_handler(
 }
 
 /// API v1 miners handler
-async fn api_miners_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
+///
+/// Dual-mode. By default this is the PUBLIC endpoint and returns only redacted
+/// aggregate stats (M-11). When the caller presents a valid operator
+/// (`INTERNAL_AUTH_KEY`) HMAC signature — the same auth the config-set
+/// endpoints use, which the dashboard proxy adds to every request — it returns
+/// the full unredacted connected-miner list instead. This gives the operator
+/// dashboard a miner-details path that does NOT require the peer/mesh signature,
+/// while the mesh-authed `/api/v1/mining/miners/full` peer endpoint is left
+/// untouched. Unsigned or invalid callers only ever see the redacted aggregate.
+async fn api_miners_handler(
+    State(state): State<Arc<VerificationState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Operator-authed detail path: the dashboard proxy signs GET requests with
+    // the operator INTERNAL_AUTH_KEY over an empty body, so verify against that.
+    if let Some(ref auth) = state.internal_auth {
+        if verify_internal_auth(auth, &headers, b"").is_ok() {
+            let miners = build_detailed_miner_list(&state);
+            return Json(serde_json::json!({
+                "total_miners": miners.len(),
+                "miners": miners,
+                "miners_redacted": false,
+            }));
+        }
+    }
+
     let health = state.get_health().await;
 
     // M-11: Query miners but redact sensitive details from public endpoint
@@ -7471,42 +7509,51 @@ async fn api_backup_delete_handler(
     }))
 }
 
+/// Build the detailed connected-miner list (miners with a share in the last
+/// 600s). Shared by the mesh-authed `/api/v1/mining/miners/full` peer endpoint
+/// and the operator-authed detail branch of `/api/v1/mining/miners`, so both
+/// surfaces return identical per-miner rows from one source of truth.
+fn build_detailed_miner_list(state: &VerificationState) -> Vec<serde_json::Value> {
+    let Some(ref db) = state.database else {
+        return Vec::new();
+    };
+    let Ok(miner_stats) = db.get_all_miners_stats() else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    miner_stats
+        .into_iter()
+        .filter(|m| (now - m.last_seen) < 600)
+        .map(|m| {
+            // Use time from first share to now for stable estimate
+            let elapsed = (now - m.first_seen).max(1) as f64;
+            // Hashrate = SUM(difficulty) * 2^32 / elapsed / 1e12 (TH/s)
+            let hashrate_th = m.total_work * 4294967296.0 / elapsed / 1e12;
+            serde_json::json!({
+                "worker_name": m.miner_id,
+                // The SV1 authorize `<addr>.<worker>` becomes the SV2 channel
+                // user_identity, so worker_name and user_identity are the same
+                // key; expose both so either dashboard field name resolves.
+                "user_identity": m.miner_id,
+                "hashrate_th": hashrate_th,
+                "shares_submitted": m.total_shares,
+                "shares_accepted": m.valid_shares,
+                "difficulty": m.avg_difficulty,
+                "last_share": m.last_seen,
+                "connected_at": m.first_seen,
+                "active": true,
+                "ip_address": ""
+            })
+        })
+        .collect()
+}
+
 /// API v1 Miners: Full unredacted miner list (internal only)
 async fn api_miners_full_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    let miners = if let Some(ref db) = state.database {
-        match db.get_all_miners_stats() {
-            Ok(miner_stats) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                miner_stats
-                    .into_iter()
-                    .filter(|m| (now - m.last_seen) < 600)
-                    .map(|m| {
-                        // Use time from first share to now for stable estimate
-                        let elapsed = (now - m.first_seen).max(1) as f64;
-                        // Hashrate = SUM(difficulty) * 2^32 / elapsed / 1e12 (TH/s)
-                        let hashrate_th = m.total_work * 4294967296.0 / elapsed / 1e12;
-                        serde_json::json!({
-                            "worker_name": m.miner_id,
-                            "hashrate_th": hashrate_th,
-                            "shares_submitted": m.total_shares,
-                            "shares_accepted": m.valid_shares,
-                            "last_share": m.last_seen,
-                            "connected_at": m.first_seen,
-                            "active": true,
-                            "ip_address": ""
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            }
-            Err(_) => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-
+    let miners = build_detailed_miner_list(&state);
     Json(serde_json::json!({
         "total": miners.len(),
         "miners": miners
@@ -8480,5 +8527,231 @@ mod tests {
             .verify_mpc_genesis_anchored_lineage(&anchor, Some(&new2))
             .expect("fresh node startup quorum check must pass after sync");
         assert_eq!(verified, 2);
+    }
+
+    /// Build a state with operator auth + an in-memory DB holding one recent
+    /// `<addr>.<worker>` share, for the miner-details endpoint tests.
+    fn miner_details_state() -> Arc<crate::server::VerificationState> {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use ghost_storage::Database;
+
+        let db = Database::in_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db.insert_share(&ghost_storage::ShareRecord {
+            id: None,
+            round_id: 1,
+            miner_id: "tb1qminerexampleaddr.worker1".to_string(),
+            difficulty: 1024.0,
+            work: 4096.0,
+            share_hash: "00".repeat(32),
+            timestamp: now,
+            received_by: "test_node".to_string(),
+            valid: true,
+        })
+        .unwrap();
+
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth)
+            .with_database(db),
+        )
+    }
+
+    /// Sign an empty-body GET exactly as the dashboard proxy does with the
+    /// operator INTERNAL_AUTH_KEY, returning (signature, timestamp).
+    fn operator_get_signature() -> (String, u64) {
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        (auth.sign(timestamp, b""), timestamp)
+    }
+
+    /// Operator-authed `/api/v1/mining/miners` returns the full unredacted
+    /// per-miner list (worker, hashrate, shares, difficulty) — the data the
+    /// dashboard's Connected Miners table needs — using only INTERNAL_AUTH_KEY.
+    #[tokio::test]
+    async fn test_mining_miners_operator_auth_returns_full_list() {
+        let state = miner_details_state();
+        let app = super::create_router(state);
+        let (signature, timestamp) = operator_get_signature();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/mining/miners")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            data["miners_redacted"].as_bool(),
+            Some(false),
+            "operator-authed request must NOT be redacted"
+        );
+        let miners = data["miners"].as_array().expect("miners array");
+        assert_eq!(miners.len(), 1, "the one recent miner must be listed");
+        let m = &miners[0];
+        assert_eq!(
+            m["worker_name"].as_str(),
+            Some("tb1qminerexampleaddr.worker1")
+        );
+        assert_eq!(
+            m["user_identity"].as_str(),
+            Some("tb1qminerexampleaddr.worker1")
+        );
+        assert_eq!(m["shares_submitted"].as_u64(), Some(1));
+        assert_eq!(m["shares_accepted"].as_u64(), Some(1));
+        assert!(m["difficulty"].as_f64().unwrap() > 0.0);
+        assert!(m["hashrate_th"].as_f64().unwrap() > 0.0);
+    }
+
+    /// Without a valid operator signature `/api/v1/mining/miners` stays redacted
+    /// (M-11): no individual miner rows leak to unauthenticated callers.
+    #[tokio::test]
+    async fn test_mining_miners_unauthed_is_redacted() {
+        let state = miner_details_state();
+        let app = super::create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/mining/miners")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            data["miners_redacted"].as_bool(),
+            Some(true),
+            "unauthenticated request must be redacted"
+        );
+        assert!(
+            data.get("miners").is_none(),
+            "no individual miner list without operator auth"
+        );
+    }
+
+    /// The mesh/operator-HMAC peer endpoint `/api/v1/mining/miners/full` still
+    /// serves the full list when signed — the peer path is unchanged.
+    #[tokio::test]
+    async fn test_mining_miners_full_hmac_path_still_works() {
+        let state = miner_details_state();
+        let app = super::create_router(state);
+        let (signature, timestamp) = operator_get_signature();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/mining/miners/full")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(data["total"].as_u64(), Some(1));
+        assert_eq!(data["miners"].as_array().unwrap().len(), 1);
+    }
+
+    /// `/api/v1/mining/status` exposes the SV2 authority public key so the
+    /// dashboard can source it dynamically. Defaults to the network-wide
+    /// constant, and honours a per-node `[network] sv2_authority_public_key`.
+    #[tokio::test]
+    async fn test_mining_status_exposes_authority_key() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        async fn authority(state: Arc<crate::server::VerificationState>) -> String {
+            let app = super::create_router(state);
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/mining/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+                .await
+                .unwrap();
+            let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            data["authority_public_key"]
+                .as_str()
+                .expect("authority_public_key must be present")
+                .to_string()
+        }
+
+        // Default: the network-wide constant.
+        let default_state = Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        ));
+        assert_eq!(
+            authority(default_state).await,
+            SV2_AUTHORITY_PUBLIC_KEY,
+            "status must advertise the default SV2 authority key"
+        );
+
+        // Operator override via pool.toml wins.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        let mut cfg = FullNodeConfig::default();
+        cfg.network.sv2_authority_public_key = Some("customAuthorityKey123".to_string());
+        let override_state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_full_node_config(cfg, path),
+        );
+        assert_eq!(authority(override_state).await, "customAuthorityKey123");
     }
 }

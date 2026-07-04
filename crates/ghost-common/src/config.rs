@@ -1162,6 +1162,16 @@ pub struct NetworkConfig {
     /// Ghost Shroud: random relay delay (0-5s) to prevent origin analysis
     #[serde(default)]
     pub shroud_enabled: bool,
+    /// SV2 pool authority public key advertised on `/api/v1/mining/status`.
+    ///
+    /// SV2/Noise miners must pin the pool's authority public key to connect.
+    /// This is the `authority_public_key` that the colocated `pool_sv2` instance
+    /// publishes in its own pool config; it is identical across every node on
+    /// the public pool. Leave unset to advertise the network-wide default
+    /// (`constants::SV2_AUTHORITY_PUBLIC_KEY`); set this only when running a
+    /// bespoke authority keypair so the dashboard reports the correct value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sv2_authority_public_key: Option<String>,
 }
 
 fn default_noise_enabled() -> bool {
@@ -1192,6 +1202,7 @@ impl Default for NetworkConfig {
             tls: TlsConfig::default(),
             ghost_mode: false,
             shroud_enabled: false,
+            sv2_authority_public_key: None,
         }
     }
 }
