@@ -352,6 +352,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/config/ghost_pay",
             get(api_config_ghost_pay_handler),
         )
+        .route("/api/v1/config/wraith", get(api_config_wraith_handler))
         .route("/api/v1/config/elder", get(api_config_elder_handler))
         .route(
             "/api/v1/config/prune_profile",
@@ -482,6 +483,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/config/ghost_pay",
             post(api_config_ghost_pay_post_handler),
+        )
+        .route(
+            "/api/v1/config/wraith",
+            post(api_config_wraith_post_handler),
         )
         .route("/api/v1/config/elder", post(api_config_elder_post_handler))
         .route(
@@ -5068,6 +5073,63 @@ async fn api_config_ghost_pay_post_handler(
     }))
 }
 
+/// API v1 Config wraith GET handler — reports the operator's Wraith-mixing
+/// on/off choice (`[ghost_pay] wraith_enabled`). Prefers the persisted node
+/// config and falls back to the in-memory mirror surfaced by the status
+/// endpoints.
+async fn api_config_wraith_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let enabled = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().wraith_enabled())
+        .unwrap_or(state.wraith_enabled);
+    Json(serde_json::json!({
+        "enabled": enabled,
+        "message": "Wraith mixing configuration"
+    }))
+}
+
+/// API v1 Config wraith POST handler — sets `[ghost_pay] wraith_enabled` in the
+/// node config (pool.toml) and persists it, mirroring the reaper/ghost_pay
+/// toggles. The wraith flag is read at startup, so a ghost-pool restart applies
+/// the change. Enabling lets any L2 participant initiate a CoinJoin session;
+/// disabling means this node won't participate in mixing.
+async fn api_config_wraith_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<ToggleRequest>,
+) -> impl IntoResponse {
+    let mut persisted = false;
+    if let Some(ref full) = state.full_node_config {
+        let mut cfg = full.write();
+        cfg.ghost_pay
+            .get_or_insert_with(Default::default)
+            .wraith_enabled = payload.enabled;
+        if let Some(ref path) = state.full_node_config_path {
+            match cfg.save_atomic(path) {
+                Ok(()) => persisted = true,
+                Err(e) => error!(error = %e, "Failed to persist wraith config"),
+            }
+        }
+    }
+    // The wraith flag is read from config at startup; a restart applies it.
+    if persisted {
+        state.request_restart();
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "persisted": persisted,
+        "enabled": payload.enabled,
+        "restart_required": true,
+        "message": if persisted {
+            "Wraith mixing updated; ghost-pool will restart to apply."
+        } else {
+            "Wraith setting received but no node config path is configured — changes were not persisted."
+        },
+    }))
+}
+
 /// Request body for elder config
 #[derive(Debug, Deserialize)]
 struct ElderRequest {
@@ -7787,6 +7849,76 @@ mod tests {
         );
     }
 
+    /// The wraith toggle POST must persist `[ghost_pay] wraith_enabled` to the
+    /// node config on disk so the operator's choice survives a restart. Mirrors
+    /// the reaper toggle's persistence path.
+    #[tokio::test]
+    async fn test_config_wraith_post_persists_to_node_config() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        let post_wraith = |enabled: bool| {
+            let app = super::create_router(Arc::clone(&state));
+            let auth = auth.clone();
+            async move {
+                let body = format!(r#"{{"enabled": {enabled}}}"#);
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let signature = auth.sign(timestamp, body.as_bytes());
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/config/wraith")
+                            .header("Content-Type", "application/json")
+                            .header("X-Ghost-Signature", signature)
+                            .header("X-Ghost-Timestamp", timestamp.to_string())
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        // Disable → persisted to disk and reflected in the loaded config.
+        let off = post_wraith(false).await;
+        assert_eq!(off["persisted"].as_bool(), Some(true));
+        assert_eq!(off["enabled"].as_bool(), Some(false));
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert!(!reloaded.wraith_enabled(), "disable must persist to disk");
+
+        // Re-enable → persisted true.
+        let on = post_wraith(true).await;
+        assert_eq!(on["persisted"].as_bool(), Some(true));
+        assert_eq!(on["enabled"].as_bool(), Some(true));
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert!(reloaded.wraith_enabled(), "enable must persist to disk");
+    }
+
     /// CRIT-6: Test that all config POST endpoints require auth
     #[tokio::test]
     async fn test_all_config_post_endpoints_require_auth() {
@@ -7801,6 +7933,7 @@ mod tests {
             "/api/v1/config/template_profile",
             "/api/v1/config/reaper",
             "/api/v1/config/ghost_pay",
+            "/api/v1/config/wraith",
             "/api/v1/config/elder",
             "/api/v1/config/prune_profile",
         ];

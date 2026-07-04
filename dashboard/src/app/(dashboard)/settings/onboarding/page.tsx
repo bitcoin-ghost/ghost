@@ -20,6 +20,7 @@ import {
   useSetPublicMining,
   useSetReaper,
   useSetGhostPay,
+  useSetWraith,
   useActivateMempoolProfile,
   useSaveMempoolProfile,
   type CustomMempoolProfile,
@@ -72,6 +73,7 @@ export default function OnboardingPage() {
   const setPublicMining = useSetPublicMining();
   const setReaper = useSetReaper();
   const setGhostPay = useSetGhostPay();
+  const setWraith = useSetWraith();
   const activateMempoolProfile = useActivateMempoolProfile();
   const saveMempoolProfile = useSaveMempoolProfile();
 
@@ -85,6 +87,7 @@ export default function OnboardingPage() {
   const ghostPayRunning = Boolean(ghostPay?.l2_height);
   const ghostPayEnabled = status?.ghost_pay ?? false;
   const budsEnabled = status?.ghost_pay ?? false;
+  const wraithEnabled = ghostPay?.wraith_enabled ?? false;
 
   const handleArchiveToggle = async (enabled: boolean) => {
     try {
@@ -108,6 +111,15 @@ export default function OnboardingPage() {
     try {
       await setGhostPay.mutateAsync(enabled);
       success("Saved", `Ghost Pay ${enabled ? "enabled" : "disabled"}`);
+    } catch (err) {
+      error("Failed", err instanceof Error ? err.message : "Unknown error");
+    }
+  };
+
+  const handleWraithToggle = async (enabled: boolean) => {
+    try {
+      await setWraith.mutateAsync(enabled);
+      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-pool to apply`);
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
     }
@@ -249,6 +261,14 @@ export default function OnboardingPage() {
                   )
                 ) : null
               }
+            />
+            <ToggleRow
+              label="Wraith Mixing"
+              description="Let any L2 participant initiate a CoinJoin session through this node. Off means this node won't take part in mixing. Not a reward capability — a restart applies the change."
+              enabled={wraithEnabled}
+              onChange={handleWraithToggle}
+              disabled={setWraith.isPending}
+              badge={wraithEnabled ? <Badge variant="info">Mixing On</Badge> : null}
             />
             <ToggleRow
               label="Public Mining"

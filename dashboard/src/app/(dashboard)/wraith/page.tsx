@@ -8,7 +8,9 @@ import { Badge } from "@/components/ui/Badge";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { useGhostPayStatus, useWraithStats } from "@/hooks/queries";
+import { Toggle } from "@/components/ui/Toggle";
+import { useToast } from "@/components/ui/Toast";
+import { useGhostPayStatus, useWraithStats, useSetWraith } from "@/hooks/queries";
 
 const DENOMINATION_TIERS = [
   { name: "Tiny", amount: "10,000 sats", btc: "0.0001 BTC", desc: "Micro-transactions, tipping" },
@@ -21,9 +23,20 @@ const DENOMINATION_TIERS = [
 export default function WraithPage() {
   const { data: ghostPayStatus, isLoading: statusLoading } = useGhostPayStatus();
   const { data: wraithStats, isLoading: wraithLoading } = useWraithStats();
+  const setWraith = useSetWraith();
+  const { success, error } = useToast();
 
   const isLoading = statusLoading || wraithLoading;
   const wraithEnabled = ghostPayStatus?.wraith_enabled ?? false;
+
+  const handleWraithToggle = async (enabled: boolean) => {
+    try {
+      await setWraith.mutateAsync(enabled);
+      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-pool to apply`);
+    } catch (err) {
+      error("Failed", err instanceof Error ? err.message : "Unknown error");
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -147,11 +160,20 @@ export default function WraithPage() {
               }
             />
             <div className="space-y-3">
-              <div className="flex justify-between items-center py-2 border-b border-gray-800">
-                <span className="text-gray-400">Wraith Enabled</span>
-                <Badge variant={wraithEnabled ? "success" : "default"}>
-                  {wraithEnabled ? "Yes" : "No"}
-                </Badge>
+              <div className="flex justify-between items-start py-2 border-b border-gray-800 gap-4">
+                <div>
+                  <span className="text-gray-400">Wraith Enabled</span>
+                  <p className="text-xs text-gray-500 mt-0.5 max-w-md">
+                    Mixing lets any L2 participant initiate a CoinJoin session through this node. Off means this
+                    node won&apos;t participate. A ghost-pool restart applies the change.
+                  </p>
+                </div>
+                <Toggle
+                  enabled={wraithEnabled}
+                  onChange={handleWraithToggle}
+                  label="Toggle Wraith mixing"
+                  disabled={setWraith.isPending}
+                />
               </div>
               <div className="flex justify-between items-center py-2 border-b border-gray-800">
                 <span className="text-gray-400">Active Sessions</span>

@@ -320,6 +320,17 @@ export async function setGhostPay(enabled: boolean): Promise<NodeConfig> {
   });
 }
 
+// Wraith mixing toggle — persists `[ghost_pay] wraith_enabled` to the node
+// config. A ghost-pool restart applies the change on a live node.
+export async function setWraith(
+  enabled: boolean,
+): Promise<{ success: boolean; enabled: boolean; persisted: boolean; restart_required: boolean; message: string }> {
+  return fetchApi('/api/v1/config/wraith', {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 // Mining payout address
 export async function setMiningPayoutAddress(address: string): Promise<{ success: boolean; message: string }> {
   return fetchApi('/api/v1/mining/payout_address', {
