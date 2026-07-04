@@ -14,7 +14,7 @@ import { useMiningStatus, useMiners, useBestHash, useSetPrivateMining, useSetPub
 import { useToast } from "@/components/ui/Toast";
 import { useQueryClient } from "@tanstack/react-query";
 import PoolSetupWizard from "../settings/wizards/PoolSetupWizard";
-import type { MinerInfo, BestHashEntry } from "@/types/api";
+import type { MinerInfo, BestHashEntry, BestHashResponse } from "@/types/api";
 import type { ColumnDef } from "@tanstack/react-table";
 
 const TOOLTIPS = {
@@ -117,6 +117,25 @@ const PUBLIC_POOL_HOST = "pool.bitcoinghost.org";
 // mirrored here as a constant. Backend enhancement: surface it on
 // /api/v1/mining/status so this can be sourced dynamically.
 const SV2_AUTHORITY_PUBLIC_KEY = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
+
+// The backend currently derives every window (current round / last hour /
+// last 24h / all time) from the same source and returns an IDENTICAL entry for
+// all four — and that entry is the network tip block (miner_id === null,
+// difficulty === block-level), not the best SHARE a connected miner submitted.
+// Detect that state so the UI can flag it instead of silently showing four
+// identical "133.87T · 5s ago" cards, which reads as a bug to operators.
+// Backend follow-up: /api/v1/mining/best-hash must track per-window best miner
+// shares (with the submitting miner_id), not repeat the chain tip.
+function bestHashLooksBlockLevel(data: BestHashResponse | undefined): boolean {
+  if (!data) return false;
+  const windows = [data.current_round, data.last_hour, data.last_24h, data.all_time];
+  const populated = windows.filter((w) => w?.hash);
+  if (populated.length < 2) return false;
+  const allSameHash = populated.every((w) => w!.hash === populated[0]!.hash);
+  // Real miner best-shares carry a miner_id; the repeated chain tip does not.
+  const noMinerAttribution = populated.every((w) => !w!.miner_id);
+  return allSameHash && noMinerAttribution;
+}
 
 function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | undefined }) {
   const diff = entry?.difficulty ?? 0;
@@ -357,6 +376,27 @@ export default function MiningPage() {
                   </div>
                 </div>
                 <div className="text-xs text-gray-500 mt-2">SV2/Noise miners must pin the authority public key to connect.</div>
+
+                {/* Connection settings — the critical, easy-to-miss authorize rule */}
+                <div className="mt-3 p-3 bg-orange-900/10 border border-orange-800/40 rounded">
+                  <div className="text-sm text-orange-300 font-medium mb-1">Connection settings</div>
+                  <p className="text-xs text-gray-400 leading-relaxed">
+                    Set your miner&apos;s username to your{" "}
+                    <span className="text-gray-300 font-medium">bech32 payout address</span> followed by a
+                    worker suffix:
+                  </p>
+                  <code className="text-orange-400 text-xs block my-1.5">
+                    &lt;your-payout-address&gt;.&lt;worker&gt;
+                    <span className="text-gray-500"> — e.g. bc1q….worker1</span>
+                  </code>
+                  <p className="text-xs text-gray-400 leading-relaxed">
+                    This is how block rewards are routed to you, and applies to{" "}
+                    <span className="text-gray-300">both SV1 and SV2</span>. Bare worker names (no{" "}
+                    <code className="text-gray-300">.</code> separator, no address) are{" "}
+                    <span className="text-gray-300">rejected</span> — the miner would mine for nobody. The
+                    password field is ignored.
+                  </p>
+                </div>
               </div>
             )}
           </div>
@@ -382,6 +422,13 @@ export default function MiningPage() {
               <BestHashCard title="All Time" entry={bestHashData?.all_time} />
             </div>
           )}
+          {!bestHashLoading && bestHashLooksBlockLevel(bestHashData) && (
+            <div className="mt-3 text-xs text-gray-500 border-t border-gray-800 pt-3">
+              All four windows are currently reporting the same value — the network&apos;s latest block
+              hash rather than the best share submitted per window. Per-window miner best-shares are not
+              yet tracked by the node API, so these cards will read identically until that lands.
+            </div>
+          )}
         </Card>
       </SectionErrorBoundary>
 
@@ -392,16 +439,45 @@ export default function MiningPage() {
             title="Connected Miners"
             subtitle={`${connectedMinerCount} ${connectedMinerCount === 1 ? "miner" : "miners"} connected`}
           />
-          <DataTable
-            columns={minerColumns}
-            data={miners}
-            loading={minersLoading}
-            emptyMessage="No miners connected"
-            emptyDescription="Connect a miner using the Stratum endpoints above"
-            searchColumn="worker_name"
-            searchPlaceholder="Search miners..."
-            showPagination={miners.length > 10}
-          />
+          {miners.length > 0 ? (
+            <DataTable
+              columns={minerColumns}
+              data={miners}
+              loading={minersLoading}
+              emptyMessage="No miners connected"
+              emptyDescription="Connect a miner using the Stratum endpoints above"
+              searchColumn="worker_name"
+              searchPlaceholder="Search miners..."
+              showPagination={miners.length > 10}
+            />
+          ) : minersLoading ? (
+            <div className="py-8 text-center text-sm text-gray-500">Loading…</div>
+          ) : connectedMinerCount > 0 ? (
+            // The node reports an aggregate connected-miner count, but the
+            // per-miner detail endpoint (/api/v1/mining/miners/full) requires the
+            // mesh HMAC signature, which the dashboard's operator INTERNAL_AUTH_KEY
+            // cannot produce — so the individual rows come back redacted. Show the
+            // aggregate clearly instead of a blank/broken table.
+            // Backend follow-up: expose an operator-authed miner-details endpoint.
+            <div className="py-8 px-4 text-center">
+              <div className="text-3xl font-semibold text-orange-400">{connectedMinerCount}</div>
+              <div className="text-sm text-gray-400 mt-1">
+                {connectedMinerCount === 1 ? "miner" : "miners"} connected to this node
+              </div>
+              <div className="text-xs text-gray-500 mt-3 max-w-md mx-auto leading-relaxed">
+                Per-miner details (worker, hashrate, shares) require mesh authentication and are not
+                available through the operator dashboard yet. The aggregate count above is
+                authoritative.
+              </div>
+            </div>
+          ) : (
+            <div className="py-8 px-4 text-center">
+              <div className="text-sm text-gray-400">No miners connected</div>
+              <div className="text-xs text-gray-500 mt-1">
+                Connect a miner using the Stratum endpoints above.
+              </div>
+            </div>
+          )}
         </Card>
       </SectionErrorBoundary>
 
