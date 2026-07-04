@@ -153,6 +153,21 @@ function bestHashLooksBlockLevel(data: BestHashResponse | undefined): boolean {
   return allSameHash && noMinerAttribution;
 }
 
+// One labelled, copyable key/value row in the SV2 connection panel. Mirrors the
+// row style of the endpoint blocks and the public site's native-SV2 quick-start
+// (ghost-web/miners.html) so operators see the same field set in both places.
+function Sv2Field({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-2 p-2 bg-gray-900/50 rounded">
+      <div className="min-w-0">
+        <div className="text-xs text-gray-500">{label}</div>
+        <code className="text-orange-400 text-sm block truncate">{value}</code>
+      </div>
+      <CopyButton text={value} />
+    </div>
+  );
+}
+
 function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | undefined }) {
   const diff = entry?.difficulty ?? 0;
   const hasData = entry && diff > 0;
@@ -165,7 +180,15 @@ function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | 
           <div className="font-mono text-xs text-gray-400 truncate">{entry.hash}</div>
           <div className="text-xs text-gray-500 mt-0.5">{calculateLeadingZeros(diff)} leading zeros</div>
           <div className="flex justify-between items-center mt-1">
-            <span className="text-xs text-gray-500">Block #{entry.block_height?.toLocaleString() || "?"}</span>
+            {/* Block height of the round this share was solving for. Only shown
+                when the backend populated it (joined from `rounds`); some rounds
+                lack it, in which case we drop the line rather than render "?" —
+                the timestamp alone conveys recency. */}
+            {typeof entry.block_height === "number" && entry.block_height > 0 ? (
+              <span className="text-xs text-gray-500">Block #{entry.block_height.toLocaleString()}</span>
+            ) : (
+              <span />
+            )}
             <span className="text-xs text-gray-500">{formatTimeAgo(entry.timestamp ?? 0)}</span>
           </div>
         </>
@@ -383,22 +406,33 @@ export default function MiningPage() {
                     </div>
                     <CopyButton text={`stratum+tcp://${PUBLIC_POOL_HOST}:${status?.stratum_v1_port || 3333}`} />
                   </div>
-                  <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
-                    <div>
-                      <div className="text-xs text-gray-500">Stratum V2</div>
-                      <code className="text-orange-400 text-sm">stratum+tcp://{PUBLIC_POOL_HOST}:{status?.stratum_v2_port || 34255}</code>
-                    </div>
-                    <CopyButton text={`stratum+tcp://${PUBLIC_POOL_HOST}:${status?.stratum_v2_port || 34255}`} />
-                  </div>
-                  <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
-                    <div className="min-w-0">
-                      <div className="text-xs text-gray-500">SV2 authority public key</div>
-                      <code className="text-orange-400 text-sm block truncate">{authorityPublicKey}</code>
-                    </div>
-                    <CopyButton text={authorityPublicKey} />
-                  </div>
                 </div>
-                <div className="text-xs text-gray-500 mt-2">SV2/Noise miners must pin the authority public key to connect.</div>
+
+                {/* Structured, per-field copyable native-SV2 connection panel.
+                    Mirrors the public site's quick-start (ghost-web/miners.html):
+                    Port is sourced from the node's reported stratum_v2_port (34255
+                    fallback) and the authority key from status.authority_public_key
+                    (constant fallback for pre-redeploy nodes). The pool negotiates
+                    the per-miner TLV on extended channels, so Channel type is
+                    "Extended"; the authority public key is the Noise static key —
+                    no separate TLS/cert or device flag is required. */}
+                <div className="mt-4 pt-3 border-t border-gray-700/60">
+                  <div className="text-sm text-gray-300 font-medium">Stratum V2 (native)</div>
+                  <div className="text-xs text-emerald-400/90 mb-2">No account needed — no KYC</div>
+                  <div className="space-y-1.5">
+                    <Sv2Field label="Host" value={PUBLIC_POOL_HOST} />
+                    <Sv2Field label="Port" value={String(status?.stratum_v2_port || 34255)} />
+                    <Sv2Field label="Username" value="<your-address>.worker1" />
+                    <Sv2Field label="Protocol" value="Stratum V2" />
+                    <Sv2Field label="Channel type" value="Extended" />
+                    <Sv2Field label="Authority public key" value={authorityPublicKey} />
+                  </div>
+                  <p className="text-xs text-gray-500 mt-2 leading-relaxed">
+                    For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). The authority key is the
+                    same on every public Ghost node. Username is the same{" "}
+                    <code className="text-gray-300">address.worker</code> as SV1; the password is ignored.
+                  </p>
+                </div>
 
                 {/* Connection settings — the critical, easy-to-miss authorize rule */}
                 <div className="mt-3 p-3 bg-orange-900/10 border border-orange-800/40 rounded">
