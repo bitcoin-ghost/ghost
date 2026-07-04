@@ -172,9 +172,11 @@ async fn doctor_mainnet_flags_plaintext_remote_endpoints() {
 
 #[tokio::test]
 async fn doctor_mainnet_passes_loopback_plaintext() {
-    // Loopback URLs are exempt — a wallet talking to ghost-pay on the
-    // same box doesn't need TLS. Default URLs ship with 127.0.0.1, so
-    // a plain mainnet daemon should pass the TLS rows.
+    // A plain mainnet daemon (no endpoint env vars, no persisted node.json)
+    // defaults to the bundled public preset, which is https:// + wss:// — so
+    // the TLS rows pass. Loopback http:// / ws:// is also exempt (a wallet
+    // talking to ghost-pay on the same box doesn't need TLS); either way a
+    // default mainnet daemon should pass the TLS rows.
     let (mut child, socket, _tmp) = spawn_daemon("mainnet").await;
     match rpc(&socket, 1, Request::Doctor).await {
         Response::Doctor(d) => {

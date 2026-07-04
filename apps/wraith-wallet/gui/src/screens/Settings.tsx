@@ -6,12 +6,18 @@ import {
   walletExport,
   walletRestore,
   checkForUpdate,
+  connectionStatus,
+  setNodeEndpoints,
+  OWN_NODE_GHOST_PAY_DEFAULT,
+  OWN_NODE_GSP_DEFAULT,
   type DaemonEnvResponse,
   type HealthResponse,
   type WalletEntry,
   type WalletBackupResult,
   type CheckForUpdateResult,
+  type ConnectionStatusResponse,
 } from "../lib/tauri";
+import { ConnectionStatus } from "../components/ConnectionStatus";
 
 interface SettingsProps {
   /// GUI-side kiosk toggle (per-install, persisted in localStorage).
@@ -52,6 +58,19 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
     null,
   );
 
+  // Node connection selector.
+  const [conn, setConn] = useState<ConnectionStatusResponse | null>(null);
+  const [nodePreset, setNodePreset] = useState<"public" | "custom">("public");
+  const [customPay, setCustomPay] = useState(OWN_NODE_GHOST_PAY_DEFAULT);
+  const [customGsp, setCustomGsp] = useState(OWN_NODE_GSP_DEFAULT);
+  const [nodeBusy, setNodeBusy] = useState(false);
+  const [nodeErr, setNodeErr] = useState<string | null>(null);
+  const [nodeSaved, setNodeSaved] = useState(false);
+  // Populate the form from the daemon's live config exactly once, so typing
+  // isn't clobbered by the 8s env poll. Only the setter is used — the flag
+  // lives inside the functional updater below.
+  const [, setNodeFormInit] = useState(false);
+
   // Update check.
   const [updateUrl, setUpdateUrl] = useState("");
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -85,9 +104,31 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
         setEnv(e);
         setHealth(h);
         setErr(null);
+        // Seed the node-selector form from the daemon's live config, but only
+        // once — after that the user owns the fields and the poll must not
+        // overwrite what they're typing.
+        setNodeFormInit((done) => {
+          if (!done) {
+            const preset = e.node_preset === "custom" ? "custom" : "public";
+            setNodePreset(preset);
+            if (preset === "custom") {
+              if (e.ghost_pay_urls.length) setCustomPay(e.ghost_pay_urls.join(", "));
+              if (e.gsp_urls.length) setCustomGsp(e.gsp_urls.join(", "));
+            }
+          }
+          return true;
+        });
       } catch (e) {
         if (!alive) return;
         setErr((e as Error).message ?? String(e));
+      }
+      // Live reachability of whatever node is currently configured. Never
+      // throws for an unreachable backend — a red pill is a real answer.
+      try {
+        const c = await connectionStatus();
+        if (alive) setConn(c);
+      } catch {
+        /* daemon dropped mid-tick — the env error above covers it */
       }
     };
     tick();
@@ -97,7 +138,33 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
       alive = false;
       clearInterval(id);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const envLocked = !!env?.ghost_pay_env_override || !!env?.gsp_env_override;
+
+  const onSaveNode = async () => {
+    setNodeBusy(true);
+    setNodeErr(null);
+    setNodeSaved(false);
+    try {
+      if (nodePreset === "custom") {
+        await setNodeEndpoints("custom", customPay.trim(), customGsp.trim());
+      } else {
+        await setNodeEndpoints("public");
+      }
+      setNodeSaved(true);
+      // Pull the fresh config + reachability straight away so the card
+      // reflects the change without waiting for the next 8s poll.
+      const [e, c] = await Promise.all([daemonEnv(), connectionStatus()]);
+      setEnv(e);
+      setConn(c);
+    } catch (e) {
+      setNodeErr((e as Error).message ?? String(e));
+    } finally {
+      setNodeBusy(false);
+    }
+  };
 
   const onBackup = async () => {
     const name = backupWallet.trim();
@@ -181,9 +248,8 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
           <span className="eyebrow">configuration</span>
           <h1>Settings</h1>
           <p className="lead">
-            Daemon environment + endpoint config the running wraithd
-            picked up at boot. To change any of these, restart wraithd
-            with the relevant env var (see your stack startup script).
+            Choose which node the wallet talks to, and inspect the daemon
+            environment the running wraithd picked up at boot.
           </p>
         </div>
       </div>
@@ -447,11 +513,136 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
       </div>
 
       <div className="card">
-        <h2>Endpoints</h2>
-        <div className="kv">
-          <div className="k">ghost-pay</div>
+        <div className="card-header">
+          <h2>Node connection</h2>
+          <ConnectionStatus conn={conn} />
+        </div>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+          Like choosing a server in other wallets: use the public Ghost nodes
+          (works out of the box, no node required) or point the wallet at a
+          node you run yourself. The pills above show whether the current
+          choice is reachable.
+        </p>
+
+        {envLocked ? (
+          <div className="card surface" style={{ marginBottom: 12 }}>
+            <p style={{ margin: 0, fontSize: 13 }}>
+              The node endpoints are pinned by environment variables (
+              <code>WRAITHD_GHOST_PAY</code> / <code>WRAITHD_GSP</code>). To
+              manage the node from here, unset them and restart wraithd.
+            </p>
+          </div>
+        ) : null}
+
+        <fieldset
+          disabled={envLocked || nodeBusy}
+          style={{ border: 0, padding: 0, margin: 0 }}
+        >
+          <label className="radio-row">
+            <input
+              type="radio"
+              name="node-preset"
+              checked={nodePreset === "public"}
+              onChange={() => {
+                setNodePreset("public");
+                setNodeSaved(false);
+              }}
+            />
+            <span>
+              <strong>Public Ghost nodes</strong>{" "}
+              <span className="pill mute" style={{ fontSize: 11 }}>
+                recommended
+              </span>
+              <br />
+              <span className="muted" style={{ fontSize: 12 }}>
+                The Bitcoin Ghost fleet at <code>pool.bitcoinghost.org</code>.
+                A fresh install uses this so the wallet just works.
+              </span>
+            </span>
+          </label>
+
+          <label className="radio-row" style={{ marginTop: 8 }}>
+            <input
+              type="radio"
+              name="node-preset"
+              checked={nodePreset === "custom"}
+              onChange={() => {
+                setNodePreset("custom");
+                setNodeSaved(false);
+              }}
+            />
+            <span>
+              <strong>My own node</strong>
+              <br />
+              <span className="muted" style={{ fontSize: 12 }}>
+                Point the wallet at a ghost-pay + GSP you run yourself.
+              </span>
+            </span>
+          </label>
+
+          {nodePreset === "custom" && (
+            <div style={{ marginTop: 12 }}>
+              <div className="col">
+                <label>ghost-pay URL</label>
+                <input
+                  className="mono"
+                  value={customPay}
+                  onChange={(e) => {
+                    setCustomPay(e.target.value);
+                    setNodeSaved(false);
+                  }}
+                  placeholder={OWN_NODE_GHOST_PAY_DEFAULT}
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  <code>http://</code> or <code>https://</code>. Comma-separate
+                  for failover.
+                </span>
+              </div>
+              <div className="col">
+                <label>GSP URL</label>
+                <input
+                  className="mono"
+                  value={customGsp}
+                  onChange={(e) => {
+                    setCustomGsp(e.target.value);
+                    setNodeSaved(false);
+                  }}
+                  placeholder={OWN_NODE_GSP_DEFAULT}
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  <code>ws://</code> or <code>wss://</code>. Comma-separate for
+                  failover.
+                </span>
+              </div>
+            </div>
+          )}
+
+          <div className="row" style={{ marginTop: 12 }}>
+            <button
+              className="btn-primary"
+              onClick={onSaveNode}
+              disabled={envLocked || nodeBusy}
+            >
+              {nodeBusy ? "Applying…" : "Save & connect"}
+            </button>
+            {nodeSaved && (
+              <span className="pill pass" style={{ marginLeft: 8 }}>
+                applied
+              </span>
+            )}
+          </div>
+        </fieldset>
+
+        {nodeErr && (
+          <div className="card error-card" style={{ marginTop: 12 }}>
+            {nodeErr}
+          </div>
+        )}
+
+        <div className="kv" style={{ marginTop: 12 }}>
+          <div className="k">Active ghost-pay</div>
           <div className="v mono">{env?.ghost_pay_urls.join(", ") ?? "—"}</div>
-          <div className="k">GSP</div>
+          <div className="k">Active GSP</div>
           <div className="v mono">{env?.gsp_urls.join(", ") ?? "—"}</div>
           <div className="k">Tor proxy</div>
           <div className="v mono">{env?.tor_proxy ?? "—"}</div>

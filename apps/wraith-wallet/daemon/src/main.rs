@@ -67,7 +67,8 @@ mod server {
         LightBalanceResponse, LightDetectedResponse, LightHistoryEntry, LightHistoryResponse,
         LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse, LightSentResponse,
         LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse, LocksJumpedResponse,
-        LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse, PsbtBroadcastResponse,
+        LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse, NodeEndpointsResponse,
+        PsbtBroadcastResponse,
         PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
         PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
         WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
@@ -76,8 +77,19 @@ mod server {
         WraithMixPreparedResponse,
     };
 
-    const DEFAULT_GHOST_PAY: &str = "http://127.0.0.1:8800";
-    const DEFAULT_GSP: &str = "ws://127.0.0.1:8900/ws/v1";
+    /// Bundled public preset — the Bitcoin Ghost fleet, reachable without
+    /// running your own node. `pool.bitcoinghost.org` round-robins the four
+    /// fleet IPs; ghost-pay serves TLS on :8800 and GSP on :8900. A brand-new
+    /// install defaults here so the wallet works out of the box.
+    const PUBLIC_GHOST_PAY: &str = "https://pool.bitcoinghost.org:8800";
+    const PUBLIC_GSP: &str = "wss://pool.bitcoinghost.org:8900/ws/v1";
+    /// Node-selection preset labels. Persisted in `node.json` and surfaced via
+    /// `DaemonEnv.node_preset` so the settings UI knows which radio is active.
+    const PRESET_PUBLIC: &str = "public";
+    const PRESET_CUSTOM: &str = "custom";
+    /// Optional override for the on-disk node-selection config path. Defaults
+    /// to `<wallets_dir>/../node.json` (i.e. `~/.wraith/node.json`).
+    const NODE_CONFIG_ENV: &str = "WRAITHD_NODE_CONFIG";
     const GHOST_PAY_ENV: &str = "WRAITHD_GHOST_PAY";
     /// Optional shared secret for ghost-pay's `X-Internal-Auth`
     /// bypass. When set, the wallet can call ghost-pay's
@@ -174,14 +186,38 @@ mod server {
         funding_txid: Option<String>,
     }
 
-    struct DaemonState {
-        started: Instant,
+    /// The live node clients + their configured URLs, held together so a
+    /// runtime endpoint change (`SetNodeEndpoints`) swaps all of them
+    /// atomically under one write lock. Read paths clone the `Arc`s out and
+    /// release the lock immediately, so a slow ghost-pay/GSP call never blocks
+    /// a config change and vice-versa.
+    struct NodeClients {
         chain: Arc<dyn ChainClient>,
-        gsp: GspClient,
-        /// Ghost-pay base URLs in failover order — surfaced to clients via DaemonEnv.
+        gsp: Arc<GspClient>,
+        /// Ghost-pay base URLs in failover order — surfaced via DaemonEnv.
         ghost_pay_urls: Vec<String>,
         /// GSP WS URLs in failover order — passed to spawn_session at gsp_auth time.
         gsp_urls: Vec<String>,
+        /// Which node preset is active: `public` or `custom`. Drives the
+        /// settings UI's radio selection.
+        preset: String,
+    }
+
+    struct DaemonState {
+        started: Instant,
+        /// The active node clients + endpoint config. Swapped wholesale by
+        /// `SetNodeEndpoints` without a daemon restart.
+        clients: RwLock<NodeClients>,
+        /// True when `WRAITHD_GHOST_PAY` / `WRAITHD_GSP` pinned the endpoints at
+        /// boot. While either is set the URLs are power-user-owned: the UI shows
+        /// them read-only and `SetNodeEndpoints` refuses to change them.
+        ghost_pay_env_override: bool,
+        gsp_env_override: bool,
+        /// Absolute path to the persisted node-selection config (`node.json`).
+        node_config_path: PathBuf,
+        /// Optional ghost-pay `X-Internal-Auth` secret, kept so a runtime
+        /// endpoint swap can rebuild the chain client with the same auth.
+        ghost_pay_internal_auth: Option<String>,
         /// Optional SOCKS5 proxy for both REST and WS (e.g. socks5h://127.0.0.1:9050).
         /// Threaded into spawn_session so the persistent WS routes through Tor too.
         tor_proxy: Option<String>,
@@ -275,20 +311,217 @@ mod server {
     /// it can't expose the inherent glyph methods — rebuild from the
     /// daemon's configured ghost-pay URLs + proxy, attaching the
     /// internal-auth secret (claim is an authenticated route).
-    fn build_ghost_pay_client(
+    async fn build_ghost_pay_client(
         state: &DaemonState,
     ) -> Result<wraith_wallet_core::chain::GhostPayClient, String> {
         let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-            state.ghost_pay_urls.clone(),
+            state.ghost_pay_urls().await,
             state.tor_proxy.as_deref(),
         )
         .map_err(|e| format!("ghost-pay client: {e}"))?;
-        if let Ok(secret) = std::env::var(GHOST_PAY_INTERNAL_AUTH_ENV) {
+        if let Some(secret) = state.ghost_pay_internal_auth.as_ref() {
             if !secret.is_empty() {
-                c = c.with_internal_secret(secret);
+                c = c.with_internal_secret(secret.clone());
             }
         }
         Ok(c)
+    }
+
+    /// Node-selection config persisted to `node.json`. Loaded at boot and
+    /// rewritten whenever the user picks a node via `SetNodeEndpoints`. Absent
+    /// on a fresh install — the daemon then falls back to the public preset.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct NodeConfig {
+        /// `public` or `custom`.
+        preset: String,
+        ghost_pay_urls: Vec<String>,
+        gsp_urls: Vec<String>,
+    }
+
+    /// Resolve where the node-selection config lives. `WRAITHD_NODE_CONFIG`
+    /// overrides; otherwise it sits next to the wallets dir at
+    /// `<wallets_dir>/../node.json` (i.e. `~/.wraith/node.json`).
+    fn node_config_path(wallets_dir: &std::path::Path) -> PathBuf {
+        if let Ok(p) = std::env::var(NODE_CONFIG_ENV) {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+        let base = wallets_dir.parent().unwrap_or(wallets_dir);
+        base.join("node.json")
+    }
+
+    /// Read `node.json`. Absent or malformed → `None` (a corrupt file must not
+    /// wedge the daemon; it falls back to the public preset and the next save
+    /// overwrites it).
+    fn load_node_config(path: &std::path::Path) -> Option<NodeConfig> {
+        let raw = fs::read_to_string(path).ok()?;
+        match serde_json::from_str::<NodeConfig>(&raw) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "ignoring malformed node.json");
+                None
+            }
+        }
+    }
+
+    /// Persist `node.json` atomically (temp-file + rename) with 0600 perms on
+    /// unix — the file only lists endpoint URLs, but it lives in the wallet
+    /// data dir so we keep it user-private like the keystores.
+    fn save_node_config(path: &std::path::Path, cfg: &NodeConfig) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(cfg).map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Validate + parse a custom node's ghost-pay and GSP URL strings (each may
+    /// be a comma-separated failover list). Rejects empty input and the wrong
+    /// scheme so a typo can't silently leave the wallet pointed at nothing.
+    fn validate_custom_endpoints(
+        pay_raw: &str,
+        gsp_raw: &str,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        let pay = wraith_wallet_core::chain::GhostPayClient::parse_urls(pay_raw);
+        let gsp = wraith_wallet_core::gsp::GspClient::parse_urls(gsp_raw);
+        if pay.is_empty() {
+            return Err("a ghost-pay URL is required for a custom node".to_string());
+        }
+        if gsp.is_empty() {
+            return Err("a GSP URL is required for a custom node".to_string());
+        }
+        for u in &pay {
+            if !(u.starts_with("http://") || u.starts_with("https://")) {
+                return Err(format!(
+                    "ghost-pay URL must start with http:// or https:// — got '{u}'"
+                ));
+            }
+        }
+        for u in &gsp {
+            if !(u.starts_with("ws://") || u.starts_with("wss://")) {
+                return Err(format!("GSP URL must start with ws:// or wss:// — got '{u}'"));
+            }
+        }
+        Ok((pay, gsp))
+    }
+
+    impl DaemonState {
+        async fn chain(&self) -> Arc<dyn ChainClient> {
+            self.clients.read().await.chain.clone()
+        }
+        async fn gsp(&self) -> Arc<GspClient> {
+            self.clients.read().await.gsp.clone()
+        }
+        async fn ghost_pay_urls(&self) -> Vec<String> {
+            self.clients.read().await.ghost_pay_urls.clone()
+        }
+        async fn gsp_urls(&self) -> Vec<String> {
+            self.clients.read().await.gsp_urls.clone()
+        }
+        /// Build a fresh ghost-pay chain client for `urls`, reusing the daemon's
+        /// tor proxy + internal-auth secret.
+        fn build_chain(&self, urls: Vec<String>) -> Result<Arc<dyn ChainClient>, String> {
+            let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
+                urls,
+                self.tor_proxy.as_deref(),
+            )
+            .map_err(|e| format!("ghost-pay client: {e}"))?;
+            if let Some(secret) = self.ghost_pay_internal_auth.as_ref() {
+                if !secret.is_empty() {
+                    c = c.with_internal_secret(secret.clone());
+                }
+            }
+            Ok(Arc::new(c))
+        }
+
+        /// Apply a node selection at runtime: rebuild the ghost-pay + GSP
+        /// clients, persist the choice to `node.json`, and drop any live GSP
+        /// session so it re-authenticates against the new endpoint. Refuses
+        /// while an env-var override pins the endpoints (power-user precedence).
+        async fn set_node_endpoints(
+            &self,
+            preset: &str,
+            ghost_pay_url: Option<String>,
+            gsp_url: Option<String>,
+        ) -> Result<NodeEndpointsResponse, String> {
+            if self.ghost_pay_env_override || self.gsp_env_override {
+                return Err(
+                    "node endpoints are pinned by environment variables \
+                     (WRAITHD_GHOST_PAY / WRAITHD_GSP); unset them to manage the \
+                     node from the wallet"
+                        .to_string(),
+                );
+            }
+            let (ghost_pay_urls, gsp_urls, preset_label) = match preset {
+                PRESET_PUBLIC => (
+                    vec![PUBLIC_GHOST_PAY.to_string()],
+                    vec![PUBLIC_GSP.to_string()],
+                    PRESET_PUBLIC.to_string(),
+                ),
+                PRESET_CUSTOM => {
+                    let (pay, gsp) = validate_custom_endpoints(
+                        ghost_pay_url.as_deref().unwrap_or(""),
+                        gsp_url.as_deref().unwrap_or(""),
+                    )?;
+                    (pay, gsp, PRESET_CUSTOM.to_string())
+                }
+                other => {
+                    return Err(format!(
+                        "unknown node preset '{other}' (expected 'public' or 'custom')"
+                    ))
+                }
+            };
+            // Build the replacements before touching anything — if either fails
+            // we leave the running config untouched.
+            let chain = self.build_chain(ghost_pay_urls.clone())?;
+            let gsp = Arc::new(
+                wraith_wallet_core::gsp::GspClient::with_urls_and_proxy(
+                    gsp_urls.clone(),
+                    self.tor_proxy.as_deref(),
+                )
+                .map_err(|e| format!("gsp client: {e}"))?,
+            );
+            // Persist first: if the disk write fails we refuse rather than run
+            // on a config a restart would silently revert.
+            let cfg = NodeConfig {
+                preset: preset_label.clone(),
+                ghost_pay_urls: ghost_pay_urls.clone(),
+                gsp_urls: gsp_urls.clone(),
+            };
+            save_node_config(&self.node_config_path, &cfg)
+                .map_err(|e| format!("persist node.json: {e}"))?;
+            {
+                let mut w = self.clients.write().await;
+                w.chain = chain;
+                w.gsp = gsp;
+                w.ghost_pay_urls = ghost_pay_urls.clone();
+                w.gsp_urls = gsp_urls.clone();
+                w.preset = preset_label.clone();
+            }
+            // Old session points at the old GSP URL; drop it so the header's
+            // auto-auth re-establishes one against the new endpoint.
+            *self.session.write().await = None;
+            tracing::info!(
+                preset = %preset_label,
+                ghost_pay = ?ghost_pay_urls,
+                gsp = ?gsp_urls,
+                "node endpoints updated at runtime",
+            );
+            Ok(NodeEndpointsResponse {
+                preset: preset_label,
+                ghost_pay_urls,
+                gsp_urls,
+            })
+        }
     }
 
     /// Compute the glyph bitmap uniqueness hash exactly as
@@ -506,50 +739,91 @@ mod server {
             _ => wraith_wallet_ipc::default_socket_path(),
         };
         let endpoint_display = wraith_wallet_ipc::endpoint_display();
-        // Both env vars accept a comma-separated list of URLs. Endpoints are tried
-        // in order; failover is sticky-during-outage but resets to primary on success.
-        let ghost_pay_raw =
-            std::env::var(GHOST_PAY_ENV).unwrap_or_else(|_| DEFAULT_GHOST_PAY.to_string());
-        let ghost_pay_urls = wraith_wallet_core::chain::GhostPayClient::parse_urls(&ghost_pay_raw);
-        let gsp_raw = std::env::var(GSP_ENV).unwrap_or_else(|_| DEFAULT_GSP.to_string());
-        let gsp_urls = wraith_wallet_core::gsp::GspClient::parse_urls(&gsp_raw);
         let tor_proxy = std::env::var(TOR_PROXY_ENV).ok();
         let ghostd_url = std::env::var(GHOSTD_URL_ENV).ok();
         let ghostd_cookie_path = std::env::var(GHOSTD_COOKIE_ENV).ok().map(PathBuf::from);
         let ghostd_user = std::env::var(GHOSTD_USER_ENV).ok();
         let ghostd_pass = std::env::var(GHOSTD_PASS_ENV).ok();
+        let ghost_pay_internal_auth = std::env::var(GHOST_PAY_INTERNAL_AUTH_ENV)
+            .ok()
+            .filter(|s| !s.is_empty());
         let wallets_dir = default_wallets_dir();
+        let node_config_path = node_config_path(&wallets_dir);
         let network = std::env::var(NETWORK_ENV)
             .ok()
             .and_then(|s| parse_network(&s))
             .unwrap_or(bitcoin::Network::Bitcoin);
+
+        // Endpoint resolution precedence, per field:
+        //   1. WRAITHD_GHOST_PAY / WRAITHD_GSP env var (power-user override)
+        //   2. persisted node.json (the choice made in the wallet UI)
+        //   3. bundled public preset (so a fresh install works out of the box)
+        // Both env vars still accept a comma-separated failover list.
+        let persisted = load_node_config(&node_config_path);
+        let ghost_pay_env = std::env::var(GHOST_PAY_ENV).ok().filter(|s| !s.is_empty());
+        let gsp_env = std::env::var(GSP_ENV).ok().filter(|s| !s.is_empty());
+        let ghost_pay_env_override = ghost_pay_env.is_some();
+        let gsp_env_override = gsp_env.is_some();
+        // A persisted `public` preset is symbolic — it always resolves to the
+        // *current* bundled fleet URLs, so a client that once picked "public"
+        // follows the fleet if these constants change in a later release.
+        let persisted_is_public = persisted.as_ref().map(|c| c.preset == PRESET_PUBLIC);
+        let ghost_pay_urls = if let Some(raw) = ghost_pay_env {
+            wraith_wallet_core::chain::GhostPayClient::parse_urls(&raw)
+        } else if persisted_is_public == Some(false) {
+            persisted.as_ref().unwrap().ghost_pay_urls.clone()
+        } else {
+            vec![PUBLIC_GHOST_PAY.to_string()]
+        };
+        let gsp_urls = if let Some(raw) = gsp_env {
+            wraith_wallet_core::gsp::GspClient::parse_urls(&raw)
+        } else if persisted_is_public == Some(false) {
+            persisted.as_ref().unwrap().gsp_urls.clone()
+        } else {
+            vec![PUBLIC_GSP.to_string()]
+        };
+        // Preset label for the settings UI: a persisted choice wins; otherwise
+        // an env override reads as `custom`, and a clean fresh install reads as
+        // `public` (the bundled default it just fell back to).
+        let node_preset = if let Some(cfg) = persisted.as_ref() {
+            cfg.preset.clone()
+        } else if ghost_pay_env_override || gsp_env_override {
+            PRESET_CUSTOM.to_string()
+        } else {
+            PRESET_PUBLIC.to_string()
+        };
         tracing::info!(
+            preset = %node_preset,
             ghost_pay = ?ghost_pay_urls,
             gsp = ?gsp_urls,
             wallets_dir = %wallets_dir.display(),
             network = ?network,
             tor_proxy = ?tor_proxy,
+            ghost_pay_env_override,
+            gsp_env_override,
             "node endpoints + wallets dir + network configured",
         );
 
-        let chain = {
+        let chain: Arc<dyn ChainClient> = {
             let mut c = wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
                 ghost_pay_urls.clone(),
                 tor_proxy.as_deref(),
             )
             .map_err(|e| std::io::Error::other(format!("ghost-pay client: {e}")))?;
-            if let Ok(secret) = std::env::var(GHOST_PAY_INTERNAL_AUTH_ENV) {
+            if let Some(secret) = ghost_pay_internal_auth.as_ref() {
                 if !secret.is_empty() {
-                    c = c.with_internal_secret(secret);
+                    c = c.with_internal_secret(secret.clone());
                 }
             }
-            c
+            Arc::new(c)
         };
-        let gsp = wraith_wallet_core::gsp::GspClient::with_urls_and_proxy(
-            gsp_urls.clone(),
-            tor_proxy.as_deref(),
-        )
-        .map_err(|e| std::io::Error::other(format!("gsp client: {e}")))?;
+        let gsp = Arc::new(
+            wraith_wallet_core::gsp::GspClient::with_urls_and_proxy(
+                gsp_urls.clone(),
+                tor_proxy.as_deref(),
+            )
+            .map_err(|e| std::io::Error::other(format!("gsp client: {e}")))?,
+        );
 
         let idle_lock_secs = std::env::var(IDLE_LOCK_ENV)
             .ok()
@@ -581,10 +855,17 @@ mod server {
         }
         let state = Arc::new(DaemonState {
             started: Instant::now(),
-            chain: Arc::new(chain),
-            gsp,
-            ghost_pay_urls,
-            gsp_urls,
+            clients: RwLock::new(NodeClients {
+                chain,
+                gsp,
+                ghost_pay_urls,
+                gsp_urls,
+                preset: node_preset,
+            }),
+            ghost_pay_env_override,
+            gsp_env_override,
+            node_config_path,
+            ghost_pay_internal_auth,
             tor_proxy: tor_proxy.clone(),
             wraith_coordinator_url,
             kiosk_mode,
@@ -846,9 +1127,10 @@ mod server {
         let wallet_id = auth::wallet_id_hex(&kp);
 
         // 2. Register (idempotent — treat "already registered" server errors as success).
+        let gsp = state.gsp().await;
         let register_proof =
             auth::make_proof(&kp, "register").map_err(|e| format!("register proof: {e}"))?;
-        let already_registered = match state.gsp.register(register_proof, None).await {
+        let already_registered = match gsp.register(register_proof, None).await {
             Ok(_) => false,
             Err(GspError::Server(msg)) if msg.to_ascii_lowercase().contains("already") => true,
             Err(e) => return Err(format!("register: {e}")),
@@ -862,8 +1144,7 @@ mod server {
 
         let session_proof =
             auth::make_proof(&kp, "session").map_err(|e| format!("session proof: {e}"))?;
-        let token = state
-            .gsp
+        let token = gsp
             .create_session(session_proof, Some(session_nonce))
             .await
             .map_err(|e| format!("session: {e}"))?;
@@ -896,7 +1177,7 @@ mod server {
         //    Replacing an existing slot drops the old SessionHandle, which aborts
         //    its task before the new one starts.
         let handle = spawn_session_with_bech32(
-            state.gsp_urls.clone(),
+            state.gsp_urls().await,
             jwt_for_session,
             scan_keys,
             ghost_id_bech32,
@@ -1112,7 +1393,7 @@ mod server {
 
         // 2. ghost-pay /api/v1/status round-trip + latency.
         let t0 = std::time::Instant::now();
-        match state.chain.status().await {
+        match state.chain().await.status().await {
             Ok(s) => {
                 let rtt = t0.elapsed().as_millis();
                 checks.push(DoctorCheck {
@@ -1136,7 +1417,7 @@ mod server {
         }
 
         // 3. GSP ping round-trip.
-        match state.gsp.ping().await {
+        match state.gsp().await.ping().await {
             Ok(p) => {
                 let detail = match p.round_trip_ms {
                     Some(rtt) => format!("server_time {} — round-trip {}ms", p.server_time, rtt),
@@ -1240,7 +1521,15 @@ mod server {
         // checks here aren't run on signet / testnet / regtest because the
         // privacy-and-integrity stakes don't apply to test networks.
         if state.network == bitcoin::Network::Bitcoin {
-            mainnet_readiness_checks(state, &mut checks, &mut all_pass);
+            let ghost_pay_urls = state.ghost_pay_urls().await;
+            let gsp_urls = state.gsp_urls().await;
+            mainnet_readiness_checks(
+                &ghost_pay_urls,
+                &gsp_urls,
+                state.tor_proxy.as_deref(),
+                &mut checks,
+                &mut all_pass,
+            );
         }
 
         DoctorResponse { checks, all_pass }
@@ -1268,17 +1557,17 @@ mod server {
     /// proxy (advisory — Tor is opt-in by design, but worth surfacing so
     /// the user knows they're publishing their IP to ghost-pay/GSP).
     fn mainnet_readiness_checks(
-        state: &Arc<DaemonState>,
+        ghost_pay_urls: &[String],
+        gsp_urls: &[String],
+        tor_proxy: Option<&str>,
         checks: &mut Vec<DoctorCheck>,
         all_pass: &mut bool,
     ) {
-        let plaintext_pay: Vec<&String> = state
-            .ghost_pay_urls
+        let plaintext_pay: Vec<&String> = ghost_pay_urls
             .iter()
             .filter(|u| u.starts_with("http://") && !is_loopback_url(u))
             .collect();
-        let plaintext_gsp: Vec<&String> = state
-            .gsp_urls
+        let plaintext_gsp: Vec<&String> = gsp_urls
             .iter()
             .filter(|u| u.starts_with("ws://") && !is_loopback_url(u))
             .collect();
@@ -1339,7 +1628,7 @@ mod server {
         // it would break legitimate setups (e.g. an operator running
         // their own ghost-pay on a private network). "skip" rather than
         // "fail" so all_pass isn't lowered.
-        if state.tor_proxy.is_none() {
+        if tor_proxy.is_none() {
             checks.push(DoctorCheck {
                 name: "mainnet/tor".into(),
                 status: "skip".into(),
@@ -1351,10 +1640,7 @@ mod server {
             checks.push(DoctorCheck {
                 name: "mainnet/tor".into(),
                 status: "pass".into(),
-                detail: format!(
-                    "routing through {}",
-                    state.tor_proxy.as_deref().unwrap_or("?")
-                ),
+                detail: format!("routing through {}", tor_proxy.unwrap_or("?")),
             });
         }
     }
@@ -1450,7 +1736,8 @@ mod server {
         //    Confirmations gate at 1 — same default as
         //    light_l1_utxos.
         let scan = state
-            .chain
+            .chain()
+            .await
             .scan_utxos(&addr_strings, 1)
             .await
             .map_err(|e| format!("scan_utxos: {e}"))?;
@@ -1576,7 +1863,8 @@ mod server {
             trimmed.to_string()
         };
         state
-            .chain
+            .chain()
+            .await
             .broadcast_tx(&tx_hex)
             .await
             .map_err(|e| format!("broadcast: {e}"))
@@ -2069,7 +2357,7 @@ mod server {
                 uptime_secs: state.started.elapsed().as_secs(),
             }),
             Request::Doctor => Response::Doctor(doctor_run(state).await),
-            Request::ChainStatus => match state.chain.status().await {
+            Request::ChainStatus => match state.chain().await.status().await {
                 Ok(s) => Response::ChainStatus(ChainStatusResponse {
                     backend_version: s.backend_version,
                     network: s.network,
@@ -2087,7 +2375,7 @@ mod server {
                     message: format!("chain: {e}"),
                 }),
             },
-            Request::GspPing => match state.gsp.ping().await {
+            Request::GspPing => match state.gsp().await.ping().await {
                 Ok(p) => Response::GspPing(GspPingResponse {
                     server_time: p.server_time,
                     round_trip_ms: p.round_trip_ms,
@@ -2148,7 +2436,7 @@ mod server {
                     chain_headers,
                     chain_ibd,
                     l2_height,
-                ) = match state.chain.status().await {
+                ) = match state.chain().await.status().await {
                     Ok(s) => (
                         true,
                         Some(s.backend_version),
@@ -2302,7 +2590,12 @@ mod server {
                     .map(|d| (d.scriptpubkey_hex.clone(), (d.index, d.address.clone())))
                     .collect();
                 let addresses: Vec<String> = pairs.into_iter().map(|d| d.address).collect();
-                let scan = match state.chain.scan_utxos(&addresses, min_confirmations).await {
+                let scan = match state
+                    .chain()
+                    .await
+                    .scan_utxos(&addresses, min_confirmations)
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         return Envelope::new(
@@ -2387,9 +2680,13 @@ mod server {
                     _ => "unknown",
                 }
                 .to_string();
+                let clients = state.clients.read().await;
                 Response::DaemonEnv(DaemonEnvResponse {
-                    ghost_pay_urls: state.ghost_pay_urls.clone(),
-                    gsp_urls: state.gsp_urls.clone(),
+                    ghost_pay_urls: clients.ghost_pay_urls.clone(),
+                    gsp_urls: clients.gsp_urls.clone(),
+                    node_preset: clients.preset.clone(),
+                    ghost_pay_env_override: state.ghost_pay_env_override,
+                    gsp_env_override: state.gsp_env_override,
                     network,
                     wallets_dir: state.wallets_dir.display().to_string(),
                     tor_proxy: state.tor_proxy.clone(),
@@ -2400,6 +2697,14 @@ mod server {
                     kiosk_mode: state.kiosk_mode,
                 })
             }
+            Request::SetNodeEndpoints {
+                preset,
+                ghost_pay_url,
+                gsp_url,
+            } => match state.set_node_endpoints(&preset, ghost_pay_url, gsp_url).await {
+                Ok(applied) => Response::NodeEndpointsSet(applied),
+                Err(message) => Response::Error(ErrorResponse { message }),
+            },
             Request::CheckForUpdate { manifest_url } => {
                 match check_for_update(state, manifest_url).await {
                     Ok(r) => Response::CheckForUpdate(r),
@@ -3284,7 +3589,7 @@ mod server {
                     Err(message) => Response::Error(ErrorResponse { message }),
                 }
             }
-            Request::WalletGlyph { ghost_id } => match build_ghost_pay_client(state) {
+            Request::WalletGlyph { ghost_id } => match build_ghost_pay_client(state).await {
                 Ok(client) => match client.get_glyph(&ghost_id).await {
                     Ok(v) => match serde_json::from_value::<GlyphInfo>(v) {
                         Ok(info) => Response::WalletGlyph(info),
@@ -3298,7 +3603,7 @@ mod server {
                 },
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
-            Request::WalletGlyphCheck { pixels } => match build_ghost_pay_client(state) {
+            Request::WalletGlyphCheck { pixels } => match build_ghost_pay_client(state).await {
                 Ok(client) => {
                     let bitmap_hash_hex = glyph_bitmap_hash_hex(&pixels);
                     match client.check_glyph(&bitmap_hash_hex).await {
@@ -3316,7 +3621,7 @@ mod server {
                 }
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
-            Request::WalletGlyphClaim { ghost_id, pixels } => match build_ghost_pay_client(state) {
+            Request::WalletGlyphClaim { ghost_id, pixels } => match build_ghost_pay_client(state).await {
                 Ok(client) => match client.claim_glyph(&ghost_id, &pixels).await {
                     Ok(v) => match serde_json::from_value::<GlyphClaimResult>(v) {
                         Ok(r) => Response::WalletGlyphClaimed(r),
@@ -3567,7 +3872,7 @@ mod server {
                     change_address,
                     mix_output_address,
                 };
-                let pay = match build_ghost_pay_client(state) {
+                let pay = match build_ghost_pay_client(state).await {
                     Ok(c) => c,
                     Err(e) => {
                         return Envelope::new(
@@ -3723,7 +4028,7 @@ mod server {
                 // back to a manually-configured coordinator URL.
                 let (endpoint, epoch) =
                     match wraith_wallet_core::chain::GhostPayClient::with_urls_and_proxy(
-                        state.ghost_pay_urls.clone(),
+                        state.ghost_pay_urls().await,
                         None,
                     ) {
                         Ok(client) => match client.coordinator_election().await {
@@ -3807,7 +4112,7 @@ mod server {
                     change_address,
                     mix_output_address,
                 };
-                let pay = match build_ghost_pay_client(state) {
+                let pay = match build_ghost_pay_client(state).await {
                     Ok(c) => c,
                     Err(e) => {
                         return Envelope::new(
@@ -4371,12 +4676,20 @@ mod server {
         }
 
         fn test_state_in(wallets_dir: std::path::PathBuf) -> Arc<DaemonState> {
+            let node_config_path = wallets_dir.join("node.json");
             Arc::new(DaemonState {
                 started: Instant::now(),
-                chain: Arc::new(RejectChain),
-                gsp: GspClient::new("ws://127.0.0.1:0"),
-                ghost_pay_urls: vec!["http://127.0.0.1:0".to_string()],
-                gsp_urls: vec!["ws://127.0.0.1:0".to_string()],
+                clients: RwLock::new(NodeClients {
+                    chain: Arc::new(RejectChain),
+                    gsp: Arc::new(GspClient::new("ws://127.0.0.1:0")),
+                    ghost_pay_urls: vec!["http://127.0.0.1:0".to_string()],
+                    gsp_urls: vec!["ws://127.0.0.1:0".to_string()],
+                    preset: PRESET_CUSTOM.to_string(),
+                }),
+                ghost_pay_env_override: false,
+                gsp_env_override: false,
+                node_config_path,
+                ghost_pay_internal_auth: None,
                 tor_proxy: None,
                 wraith_coordinator_url: None,
                 kiosk_mode: false,
@@ -4550,6 +4863,123 @@ mod server {
                 }
                 other => panic!("expected ConnectionStatus, got {other:?}"),
             }
+        }
+
+        /// SetNodeEndpoints must: apply the new URLs at runtime, persist them to
+        /// node.json, and have DaemonEnv reflect the change — all without a
+        /// restart.
+        #[tokio::test]
+        async fn set_node_endpoints_applies_persists_and_surfaces() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+
+            // Switch to a custom node.
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::SetNodeEndpoints {
+                    preset: "custom".into(),
+                    ghost_pay_url: Some("https://pay.example.com:8800".into()),
+                    gsp_url: Some("wss://gsp.example.com:8900/ws/v1".into()),
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&req, &state).await.payload {
+                Response::NodeEndpointsSet(r) => {
+                    assert_eq!(r.preset, "custom");
+                    assert_eq!(r.ghost_pay_urls, vec!["https://pay.example.com:8800"]);
+                    assert_eq!(r.gsp_urls, vec!["wss://gsp.example.com:8900/ws/v1"]);
+                }
+                other => panic!("expected NodeEndpointsSet, got {other:?}"),
+            }
+
+            // Persisted to node.json, and reloadable.
+            let persisted =
+                super::load_node_config(&state.node_config_path).expect("node.json written");
+            assert_eq!(persisted.preset, "custom");
+            assert_eq!(persisted.ghost_pay_urls, vec!["https://pay.example.com:8800"]);
+
+            // Live state reflects it via the accessors + DaemonEnv.
+            assert_eq!(
+                state.ghost_pay_urls().await,
+                vec!["https://pay.example.com:8800".to_string()]
+            );
+            let env = serde_json::to_string(&Envelope::new(2, Request::DaemonEnv)).unwrap();
+            match super::dispatch(&env, &state).await.payload {
+                Response::DaemonEnv(e) => {
+                    assert_eq!(e.node_preset, "custom");
+                    assert_eq!(e.gsp_urls, vec!["wss://gsp.example.com:8900/ws/v1"]);
+                    assert!(!e.ghost_pay_env_override);
+                }
+                other => panic!("expected DaemonEnv, got {other:?}"),
+            }
+
+            // Switching to the public preset ignores the URL fields and applies
+            // the bundled fleet endpoints.
+            let pub_req = serde_json::to_string(&Envelope::new(
+                3,
+                Request::SetNodeEndpoints {
+                    preset: "public".into(),
+                    ghost_pay_url: None,
+                    gsp_url: None,
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&pub_req, &state).await.payload {
+                Response::NodeEndpointsSet(r) => {
+                    assert_eq!(r.preset, "public");
+                    assert_eq!(r.ghost_pay_urls, vec![super::PUBLIC_GHOST_PAY.to_string()]);
+                    assert_eq!(r.gsp_urls, vec![super::PUBLIC_GSP.to_string()]);
+                }
+                other => panic!("expected NodeEndpointsSet, got {other:?}"),
+            }
+        }
+
+        /// A custom node with a wrong-scheme URL is rejected, and nothing is
+        /// persisted — a typo must never silently point the wallet at nothing.
+        #[tokio::test]
+        async fn set_node_endpoints_rejects_bad_scheme() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = test_state_in(dir.path().to_path_buf());
+            let req = serde_json::to_string(&Envelope::new(
+                1,
+                Request::SetNodeEndpoints {
+                    preset: "custom".into(),
+                    // ws:// where http(s):// is required for ghost-pay.
+                    ghost_pay_url: Some("ws://pay.example.com:8800".into()),
+                    gsp_url: Some("wss://gsp.example.com:8900/ws/v1".into()),
+                },
+            ))
+            .unwrap();
+            match super::dispatch(&req, &state).await.payload {
+                Response::Error(e) => assert!(
+                    e.message.contains("http"),
+                    "error should explain the scheme requirement; got: {}",
+                    e.message
+                ),
+                other => panic!("expected Error, got {other:?}"),
+            }
+            assert!(
+                !state.node_config_path.exists(),
+                "a rejected change must not write node.json"
+            );
+        }
+
+        /// While an env-var override pins the endpoints, SetNodeEndpoints is
+        /// refused — env vars keep power-user precedence.
+        #[tokio::test]
+        async fn set_node_endpoints_refused_under_env_override() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = test_state_in(dir.path().to_path_buf());
+            // Simulate a boot with WRAITHD_GHOST_PAY set.
+            Arc::get_mut(&mut state).unwrap().ghost_pay_env_override = true;
+            let err = state
+                .set_node_endpoints("public", None, None)
+                .await
+                .expect_err("must refuse while env override is active");
+            assert!(
+                err.contains("environment"),
+                "error should point at the env-var override; got: {err}"
+            );
         }
     }
 }

@@ -285,6 +285,25 @@ async fn connection_status() -> Result<serde_json::Value, String> {
     to_value(&resp)
 }
 
+/// Choose which node the wallet talks to. `preset` is `"public"` (the
+/// bundled Ghost fleet) or `"custom"` (uses `ghost_pay_url` + `gsp_url`).
+/// The daemon rebuilds its clients in place, persists the choice, and drops
+/// any live GSP session so it re-authenticates against the new endpoint.
+#[tauri::command]
+async fn set_node_endpoints(
+    preset: String,
+    ghost_pay_url: Option<String>,
+    gsp_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::SetNodeEndpoints {
+        preset,
+        ghost_pay_url,
+        gsp_url,
+    })
+    .await?;
+    to_value(&resp)
+}
+
 #[tauri::command]
 async fn wallet_ghost_id() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletGhostId).await?;
@@ -843,6 +862,7 @@ pub fn run() {
             daemon_env,
             chain_status,
             connection_status,
+            set_node_endpoints,
             wallet_list,
             wallet_status,
             wallet_unlock,
