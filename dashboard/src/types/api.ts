@@ -684,6 +684,11 @@ export interface SwarmNode {
   is_self?: boolean;
   version?: string;
   last_seen?: number;
+  // Origin of this entry: "mesh" = auto-discovered consensus peer whose status
+  // comes from health-ping gossip (never poll-able from here, so never shown
+  // "offline" merely because its dashboard API is unreachable); "manual" (or
+  // undefined) = an operator-added node polled via its own dashboard API.
+  source?: "mesh" | "manual";
   // Capability fields
   shares?: number;
   max_shares?: number;
@@ -692,6 +697,7 @@ export interface SwarmNode {
   balance_btc?: number;
   l1_height?: number;
   l2_height?: number;
+  miner_count?: number;
   archive_mode?: boolean;
   ghost_pay?: boolean;
   public_mining?: boolean;

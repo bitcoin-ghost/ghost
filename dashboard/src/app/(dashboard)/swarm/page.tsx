@@ -42,6 +42,21 @@ function formatHashrate(th: number): string {
   return `${th.toFixed(0)} TH/s`;
 }
 
+// Em-dash placeholder for values a mesh peer does not gossip (uptime %, mesh
+// peer count, L1/L2 heights, balance). These are genuinely unknown from here,
+// so we render "—" rather than a misleading 0.
+const NO_VALUE = "—";
+
+function orDash<T>(value: T | null | undefined, fmt: (v: T) => string): string {
+  return value === null || value === undefined ? NO_VALUE : fmt(value);
+}
+
+// An auto-discovered consensus mesh peer: status is sourced from health-ping
+// gossip, so it is authoritative and cannot be polled/removed from here.
+function isMeshNode(node: SwarmNode): boolean {
+  return node.source === "mesh" && !node.is_self;
+}
+
 function getAlertIcon(severity: "info" | "warning" | "error"): string {
   switch (severity) {
     case "error":
@@ -173,7 +188,11 @@ export default function SwarmPage() {
   };
 
   const handleRefreshAll = async (showToast = true) => {
-    const remoteNodes = nodes.filter(n => n.address !== "localhost");
+    // Only manually-added remote nodes are polled via their dashboard API.
+    // Mesh peers are gossip-sourced (useSwarm refetches them every 10s), so
+    // there is nothing to poll — and their loopback dashboards are unreachable
+    // from here anyway.
+    const remoteNodes = nodes.filter(n => n.address !== "localhost" && !isMeshNode(n));
 
     if (isRefreshing) return;
     setIsRefreshing(true);
@@ -225,8 +244,8 @@ export default function SwarmPage() {
 
   // Auto-refresh all nodes every 30 seconds
   useEffect(() => {
-    // Only set up interval once we have remote nodes
-    const remoteNodes = nodes.filter(n => n.address !== "localhost");
+    // Only poll manually-added remote nodes; mesh peers are gossip-sourced.
+    const remoteNodes = nodes.filter(n => n.address !== "localhost" && !isMeshNode(n));
     if (remoteNodes.length === 0) return;
 
     const doRefresh = async () => {
@@ -389,10 +408,14 @@ export default function SwarmPage() {
               <div className="p-3 bg-gray-800/50 rounded-lg">
                 <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Connection Address</div>
                 <div className="font-mono text-sm text-gray-100 mb-2 select-all">
-                  http://&lt;your-ip&gt;:8080
+                  {swarmData?.self?.address
+                    ? `http://${swarmData.self.address}`
+                    : "http://<your-ip>:8080"}
                 </div>
                 <p className="text-xs text-gray-500">
-                  Replace &lt;your-ip&gt; with your public IP or hostname. Other nodes can add this address to their swarm.
+                  {swarmData?.self?.address
+                    ? "Other nodes can add this address to their swarm."
+                    : "Template — replace <your-ip> with your public IP or hostname, then other nodes can add this address to their swarm."}
                 </p>
               </div>
             </div>
@@ -430,6 +453,11 @@ export default function SwarmPage() {
                     <Badge variant={node.online ? "success" : "error"} className="text-xs">
                       {node.online ? "Online" : "Offline"}
                     </Badge>
+                    {isMeshNode(node) && (
+                      <Badge variant="info" className="text-xs">
+                        Mesh
+                      </Badge>
+                    )}
                     {staleNodeIds.has(node.node_id) && (
                       <Badge variant="warning" className="text-xs">
                         Stale
@@ -451,19 +479,19 @@ export default function SwarmPage() {
                 <div className="grid grid-cols-2 gap-2 text-xs mb-3">
                   <div>
                     <span className="text-gray-500">L1:</span>{" "}
-                    <span className="text-gray-300">{(node.l1_height ?? 0).toLocaleString()}</span>
+                    <span className="text-gray-300">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
                   </div>
                   <div>
                     <span className="text-gray-500">L2:</span>{" "}
-                    <span className="text-gray-300">{(node.l2_height ?? 0).toLocaleString()}</span>
+                    <span className="text-gray-300">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
                   </div>
                   <div>
                     <span className="text-gray-500">Peers:</span>{" "}
-                    <span className="text-gray-300">{node.peer_count ?? 0}</span>
+                    <span className="text-gray-300">{orDash(node.peer_count, (v) => String(v))}</span>
                   </div>
                   <div>
                     <span className="text-gray-500">Shares:</span>{" "}
-                    <span className="text-gray-300">{node.shares ?? 0}/{node.max_shares ?? 0}</span>
+                    <span className="text-gray-300">{node.shares ?? 0}/{node.max_shares ?? 15}</span>
                   </div>
                 </div>
 
@@ -479,12 +507,12 @@ export default function SwarmPage() {
                   <Button variant="ghost" size="sm" onClick={() => handleEditClick(node)} className="text-xs px-2">
                     Edit
                   </Button>
-                  {node.address !== "localhost" && (
+                  {node.address !== "localhost" && !isMeshNode(node) && (
                     <Button variant="ghost" size="sm" onClick={() => handleRefreshNode(node)} className="text-xs px-2">
                       Refresh
                     </Button>
                   )}
-                  {node.address !== "localhost" && (
+                  {node.address !== "localhost" && !isMeshNode(node) && (
                     <Button variant="danger" size="sm" onClick={() => handleRemoveNode(node)} className="text-xs px-2">
                       Remove
                     </Button>
@@ -512,6 +540,9 @@ export default function SwarmPage() {
                         <Badge variant={node.online ? "success" : "error"}>
                           {node.online ? "Online" : "Offline"}
                         </Badge>
+                        {isMeshNode(node) && (
+                          <Badge variant="info">Mesh</Badge>
+                        )}
                         {staleNodeIds.has(node.node_id) && (
                           <Badge variant="warning">Stale</Badge>
                         )}
@@ -528,10 +559,10 @@ export default function SwarmPage() {
                   </div>
                   <div className="text-right">
                     <div className="text-lg font-bold text-gray-100">
-                      {formatBtc(node.balance_btc ?? 0)} BTC
+                      {orDash(node.balance_btc, (v) => `${formatBtc(v)} BTC`)}
                     </div>
                     <div className="text-sm text-gray-400">
-                      {node.shares ?? 0}/{node.max_shares ?? 0} shares
+                      {node.shares ?? 0}/{node.max_shares ?? 15} shares
                     </div>
                   </div>
                 </div>
@@ -541,27 +572,29 @@ export default function SwarmPage() {
                     <span className="text-gray-500">Uptime</span>
                     <div
                       className={`font-medium ${
-                        (node.uptime_percent ?? 0) >= 95
-                          ? "text-green-400"
-                          : (node.uptime_percent ?? 0) >= 90
-                            ? "text-yellow-400"
-                            : "text-red-400"
+                        node.uptime_percent === undefined || node.uptime_percent === null
+                          ? "text-gray-400"
+                          : node.uptime_percent >= 95
+                            ? "text-green-400"
+                            : node.uptime_percent >= 90
+                              ? "text-yellow-400"
+                              : "text-red-400"
                       }`}
                     >
-                      {formatUptime(node.uptime_percent ?? 0)}
+                      {orDash(node.uptime_percent, formatUptime)}
                     </div>
                   </div>
                   <div>
                     <span className="text-gray-500">Peers</span>
-                    <div className="text-gray-100">{node.peer_count ?? 0}</div>
+                    <div className="text-gray-100">{orDash(node.peer_count, (v) => String(v))}</div>
                   </div>
                   <div>
                     <span className="text-gray-500">L1 Height</span>
-                    <div className="text-gray-100 font-mono">{(node.l1_height ?? 0).toLocaleString()}</div>
+                    <div className="text-gray-100 font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
                   </div>
                   <div>
                     <span className="text-gray-500">L2 Height</span>
-                    <div className="text-gray-100 font-mono">{(node.l2_height ?? 0).toLocaleString()}</div>
+                    <div className="text-gray-100 font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
                   </div>
                 </div>
 
@@ -591,7 +624,7 @@ export default function SwarmPage() {
                   >
                     Restart
                   </Button>
-                  {node.address !== "localhost" && (
+                  {node.address !== "localhost" && !isMeshNode(node) && (
                     <Button
                       variant="ghost"
                       size="sm"
@@ -601,7 +634,7 @@ export default function SwarmPage() {
                       Refresh
                     </Button>
                   )}
-                  {node.address !== "localhost" && (
+                  {node.address !== "localhost" && !isMeshNode(node) && (
                     <Button
                       variant="danger"
                       size="sm"
