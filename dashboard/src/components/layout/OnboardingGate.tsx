@@ -1,36 +1,28 @@
 'use client';
 
-import { useEffect } from 'react';
-import { usePathname, useRouter } from 'next/navigation';
-import {
-  ONBOARDING_PATH,
-  hasSeenOnboardingThisSession,
-  isOnboarded,
-  markOnboardingSeen,
-} from '@/hooks/useOnboarding';
-
 /**
- * First-run redirect. On the first dashboard load of a browser that has not yet
- * completed onboarding, send the operator to the onboarding flow exactly once
- * per session. After that (e.g. they hit "Skip for now"), they are not trapped:
- * the per-session `seen` marker stops further auto-redirects until they reopen
- * the dashboard in a fresh session, and completing the flow sets the persistent
- * flag so it never fires again.
+ * Onboarding is opt-in, not forced.
+ *
+ * WHY THERE IS NO AUTO-REDIRECT
+ * -----------------------------
+ * The only completion signal available to the dashboard is the client-side
+ * `ghost_dashboard_onboarded` localStorage flag (see `useOnboarding`) — the
+ * ghost-node API exposes no "onboarded"/"configured" marker, and the node's
+ * capability config CANNOT stand in for one: every capability defaults to `true`
+ * server-side (`DashboardConfig::default`: archive/ghost_pay/public_mining/reaper
+ * all on, mempool_profile "permissive"), so a heavily-configured production node
+ * is byte-for-byte indistinguishable from a brand-new install over the API.
+ *
+ * The previous gate keyed the first-run redirect purely on that per-browser
+ * localStorage flag, so any already-set-up node opened from a fresh browser /
+ * cleared storage / new SSH-tunnel session was force-redirected into onboarding
+ * before it could show Overview. Because "configured" can't be detected, the
+ * correct behaviour is to NOT force onboarding at all: the dashboard always
+ * lands on Overview, and onboarding remains reachable on demand as the first
+ * entry under Settings → Onboarding (and re-runnable any time).
  *
  * Renders nothing.
  */
 export function OnboardingGate() {
-  const router = useRouter();
-  const pathname = usePathname();
-
-  useEffect(() => {
-    if (pathname === ONBOARDING_PATH) return;
-    if (isOnboarded()) return;
-    if (hasSeenOnboardingThisSession()) return;
-
-    markOnboardingSeen();
-    router.replace(ONBOARDING_PATH);
-  }, [pathname, router]);
-
   return null;
 }

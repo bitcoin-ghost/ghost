@@ -71,7 +71,9 @@ export interface ReaperSettings {
   // Thresholds
   max_op_return_bytes: number;
   min_drop_size: number;
-  dustflood_threshold: number;
+  // Must match the Rust field name `dust_flood_threshold` (ghost_common::config::ReaperSettings);
+  // a mismatched key is silently dropped by serde, so the threshold never reaches the node.
+  dust_flood_threshold: number;
   min_excess_witness_bytes: number;
   legacy_max_push_bytes: number;
 }
@@ -111,7 +113,7 @@ export const REAPER_DEFAULTS: ReaperSettings = {
   validate_pubkey_curve_point: true,
   max_op_return_bytes: 82,
   min_drop_size: 76,
-  dustflood_threshold: 330,
+  dust_flood_threshold: 330,
   min_excess_witness_bytes: 500,
   legacy_max_push_bytes: 80,
 };

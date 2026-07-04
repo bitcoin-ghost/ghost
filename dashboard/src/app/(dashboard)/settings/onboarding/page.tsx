@@ -19,7 +19,7 @@ import {
   useSetArchiveMode,
   useSetPublicMining,
   useSetReaper,
-  useMempoolProfiles,
+  useSetGhostPay,
   useActivateMempoolProfile,
   useSaveMempoolProfile,
   type CustomMempoolProfile,
@@ -71,7 +71,7 @@ export default function OnboardingPage() {
   const setArchiveMode = useSetArchiveMode();
   const setPublicMining = useSetPublicMining();
   const setReaper = useSetReaper();
-  const { data: mempoolProfilesData } = useMempoolProfiles();
+  const setGhostPay = useSetGhostPay();
   const activateMempoolProfile = useActivateMempoolProfile();
   const saveMempoolProfile = useSaveMempoolProfile();
 
@@ -81,7 +81,9 @@ export default function OnboardingPage() {
   const [editingMempool, setEditingMempool] = useState<CustomMempoolProfile | null>(null);
 
   const activeMempoolProfile = String(config?.mempool_profile ?? "standard");
+  const activeTemplateProfile = String(config?.template_profile ?? "default");
   const ghostPayRunning = Boolean(ghostPay?.l2_height);
+  const ghostPayEnabled = status?.ghost_pay ?? false;
   const budsEnabled = status?.ghost_pay ?? false;
 
   const handleArchiveToggle = async (enabled: boolean) => {
@@ -97,6 +99,15 @@ export default function OnboardingPage() {
     try {
       await setPublicMining.mutateAsync(enabled);
       success("Saved", `Public Mining ${enabled ? "enabled" : "disabled"}`);
+    } catch (err) {
+      error("Failed", err instanceof Error ? err.message : "Unknown error");
+    }
+  };
+
+  const handleGhostPayToggle = async (enabled: boolean) => {
+    try {
+      await setGhostPay.mutateAsync(enabled);
+      success("Saved", `Ghost Pay ${enabled ? "enabled" : "disabled"}`);
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
     }
@@ -223,15 +234,20 @@ export default function OnboardingPage() {
               disabled={setArchiveMode.isPending}
               badge={archiveEnabled ? <Badge variant="success">+5 Shares</Badge> : null}
             />
-            <StatusRow
+            <ToggleRow
               label="Ghost Pay"
               description={`L2 payment network participation — requires ghost-pay-node${ghostPay?.l2_height ? ` (L2 height: ${ghostPay.l2_height})` : ""}. Ghost Pay +4 shares.`}
+              enabled={ghostPayEnabled}
+              onChange={handleGhostPayToggle}
+              disabled={setGhostPay.isPending}
               badge={
-                ghostPayRunning ? (
-                  <Badge variant="success">+4 Shares</Badge>
-                ) : (
-                  <Badge variant="warning">Not Running</Badge>
-                )
+                ghostPayEnabled ? (
+                  ghostPayRunning ? (
+                    <Badge variant="success">+4 Shares</Badge>
+                  ) : (
+                    <Badge variant="warning">Not Running</Badge>
+                  )
+                ) : null
               }
             />
             <ToggleRow
@@ -243,8 +259,8 @@ export default function OnboardingPage() {
               badge={publicMiningEnabled ? <Badge variant="success">+3 Shares</Badge> : null}
             />
             <ToggleRow
-              label="Bitcoin Pure (Ghost Reaper)"
-              description="Reject non-financial data (inscriptions, drop-stuffing, dust-flood) from your mempool and blocks. Bitcoin Pure +2 shares."
+              label="Ghost Reaper"
+              description="Reject non-financial data (inscriptions, drop-stuffing, dust-flood) from your mempool and blocks. Reaper +2 shares."
               enabled={reaperEnabled}
               onChange={handleReaperToggle}
               disabled={setReaper.isPending}
@@ -278,22 +294,26 @@ export default function OnboardingPage() {
               subtitle="Choose which transactions your node accepts. The default profile is a sane starting point — tune later from Settings → Policy."
             />
             <div className="space-y-4">
-              <div className="p-3 bg-gray-800/50 rounded-lg flex justify-between items-center">
+              {reaperEnabled && (
+                <div className="p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg">
+                  <div className="text-yellow-400 font-medium">Locked by Reaper Mode</div>
+                  <div className="text-sm text-yellow-500/80">
+                    Disable Reaper Mode in the previous step to change profiles.
+                  </div>
+                </div>
+              )}
+
+              <div
+                className={`p-3 bg-gray-800/50 rounded-lg flex justify-between items-center ${
+                  reaperEnabled ? "opacity-50" : ""
+                }`}
+              >
                 <div>
                   <div className="text-gray-100">Current Profile</div>
                   <div className="text-sm text-gray-400">{activeMempoolProfile}</div>
                 </div>
                 <Badge variant="info">{activeMempoolProfile}</Badge>
               </div>
-
-              {reaperEnabled && (
-                <div className="p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg">
-                  <div className="text-yellow-400 font-medium">Locked by Reaper Mode</div>
-                  <div className="text-sm text-yellow-500/80">
-                    Disable Bitcoin Pure (Reaper) in the previous step to change profiles.
-                  </div>
-                </div>
-              )}
 
               <div
                 className={`grid grid-cols-1 md:grid-cols-2 gap-2 ${
@@ -374,10 +394,29 @@ export default function OnboardingPage() {
               value={<Badge variant={publicMiningEnabled ? "success" : "default"}>{publicMiningEnabled ? "On" : "Off"}</Badge>}
             />
             <StatItem
-              label="Bitcoin Pure (Reaper)"
+              label="Ghost Reaper"
               value={<Badge variant={reaperEnabled ? "success" : "default"}>{reaperEnabled ? "On" : "Off"}</Badge>}
             />
-            <StatItem label="Mempool Profile" value={<Badge variant="info">{activeMempoolProfile}</Badge>} />
+            <StatItem
+              label="Mempool Profile"
+              value={
+                reaperEnabled ? (
+                  <Badge variant="warning">Reaper Mode</Badge>
+                ) : (
+                  <Badge variant="info">{activeMempoolProfile}</Badge>
+                )
+              }
+            />
+            <StatItem
+              label="Pool Template Profile"
+              value={
+                reaperEnabled ? (
+                  <Badge variant="warning">Reaper Mode</Badge>
+                ) : (
+                  <Badge variant="info">{activeTemplateProfile}</Badge>
+                )
+              }
+            />
             <StatItem label="Reward shares" value={`${shares?.total ?? 0} / ${shares?.max_shares ?? 15}`} />
           </div>
         </Card>
