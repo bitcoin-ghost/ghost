@@ -134,6 +134,17 @@ function L2Card() {
   const isSyncing = isRunning && gp?.sync_state !== "synced";
   const height = gp ? `${gp.l2_era ?? 1}:${(gp.virtual_block ?? gp.block_height ?? 0).toLocaleString()}` : "--";
 
+  // Wraith is an optional mixing feature layered on L2. Distinguish the three
+  // real states so the tile never reads a bare "Inactive" (which looks like a
+  // fault) when L2 itself is healthy and only mixing is simply not enabled.
+  const wraithActive = !!(isRunning && gp?.wraith_enabled);
+  const wraithLabel = isLoading ? "..." : wraithActive ? "Active" : isRunning ? "Not enabled" : "Offline";
+  const wraithReason = wraithActive
+    ? "Active sessions"
+    : isRunning
+    ? "Mixing not enabled on this node"
+    : "Requires Ghost Pay";
+
   return (
     <Card className="border-purple-600/30">
       <CardHeader
@@ -175,15 +186,17 @@ function L2Card() {
             <div className="text-xs text-gray-500 mb-1">Wraith <InfoIcon /></div>
             <div className="flex items-center gap-2">
               <StatusDot
-                status={isRunning && gp?.wraith_enabled ? "online" : "offline"}
+                status={wraithActive ? "online" : "offline"}
                 size="sm"
               />
               <span className="text-sm font-mono text-gray-100">
-                {isLoading ? "..." : (isRunning && gp?.wraith_enabled) ? "Active" : "Inactive"}
+                {wraithLabel}
               </span>
             </div>
-            {isRunning && gp?.wraith_enabled && (
-              <div className="text-xs text-purple-400 mt-0.5">Active sessions</div>
+            {!isLoading && (
+              <div className={`text-xs mt-0.5 ${wraithActive ? "text-purple-400" : "text-gray-500"}`}>
+                {wraithReason}
+              </div>
             )}
           </div>
         </Tooltip>

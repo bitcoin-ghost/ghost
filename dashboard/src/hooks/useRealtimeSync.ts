@@ -30,7 +30,12 @@ export function useRealtimeSync() {
     onSharesUpdate: (event) => {
       const data = (event as NodeEvent & { type: 'SharesUpdate' }).data;
       if (data) {
-        queryClient.setQueryData(nodeKeys.shares(), data);
+        // The pushed payload carries CLAIMED capabilities. Writing it straight
+        // into the cache would overwrite the verified merge getShares() performs
+        // (see lib/api/node.ts), re-showing archive-on / 15-15. Invalidate so the
+        // query refetches the verified view instead of trusting the raw push.
+        queryClient.invalidateQueries({ queryKey: nodeKeys.shares() });
+        queryClient.invalidateQueries({ queryKey: nodeKeys.health() });
         setShares(data);
       }
     },

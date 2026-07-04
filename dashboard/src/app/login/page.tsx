@@ -2,7 +2,7 @@
 
 import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { GhostLogo } from "@/components/ui/GhostLogo";
+import { Ghost } from "lucide-react";
 
 function LoginForm() {
   const [password, setPassword] = useState("");
@@ -40,7 +40,7 @@ function LoginForm() {
     <div className="min-h-screen flex items-center justify-center bg-gray-950">
       <div className="w-full max-w-sm p-8 space-y-6">
         <div className="flex flex-col items-center space-y-2">
-          <GhostLogo />
+          <Ghost size={48} strokeWidth={1.75} style={{ color: "var(--accent)" }} aria-hidden="true" />
           <h1 className="text-xl font-semibold text-gray-100">Agathion Node</h1>
           <p className="text-sm text-gray-400">Your node&apos;s familiar — enter your password</p>
         </div>

@@ -130,11 +130,31 @@ export interface SharesInfo {
   estimated_reward_btc?: number | null;
 }
 
+// VERIFIED node capabilities as reported by /health. Unlike the CLAIMED
+// capabilities on /api/v1/node/shares, these reflect what the node has actually
+// proved via challenge-response and is therefore paid for (5-4-3-2-1 model).
+export interface HealthCapabilities {
+  archive_mode?: boolean;   // +5
+  ghost_pay?: boolean;      // +4
+  public_mining?: boolean;  // +3
+  reaper?: boolean;         // +2
+  elder_status?: boolean;   // +1
+  gsp_enabled?: boolean;
+  total_shares?: number;
+}
+
 export interface HealthStatus {
   status?: string;
   healthy?: boolean;
   uptime_seconds?: number;
   uptime_secs?: number;
+  block_height?: number;
+  peer_count?: number;
+  miner_count?: number;
+  round_id?: number;
+  node_id?: string;
+  version?: string;
+  capabilities?: HealthCapabilities;
 }
 
 export type MempoolProfile =
