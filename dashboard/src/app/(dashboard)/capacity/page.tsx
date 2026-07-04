@@ -207,19 +207,22 @@ export default function CapacityPage() {
             </h3>
             <p style={{ color: "var(--dim)", fontSize: "13px" }}>
               {data.peers.length === 0
-                ? "No peers reporting capacity yet."
-                : `${data.peers.length} peers reporting capacity. New miner connections route to the lowest utilisation %.`}
+                ? "No peers reporting capacity yet — showing this node only."
+                : `${data.peers.length} ${data.peers.length === 1 ? "peer" : "peers"} plus this node reporting capacity. New miner connections route to the lowest utilisation %.`}
             </p>
             {meshTotal !== undefined && (
               <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "8px" }}>
                 <strong style={{ color: "var(--fg)" }}>{meshTotal}</strong> distinct active{" "}
                 {meshTotal === 1 ? "miner" : "miners"} across the mesh (deduplicated).{" "}
                 {dedupAvailable ? (
-                  <>The per-node counts below are deduplicated and sum to this total.</>
+                  <>
+                    Each miner is owned by exactly one node, so the per-node counts below —{" "}
+                    <em>this node included</em> — sum to this total.
+                  </>
                 ) : (
                   <>
-                    The per-peer counts below are a routing view and may overlap — a miner failing
-                    over between nodes appears on more than one peer, so{" "}
+                    The per-node counts below are a routing view and may overlap — a miner failing
+                    over between nodes appears on more than one node, so{" "}
                     <em>don&apos;t sum the rows</em>.
                   </>
                 )}
@@ -227,54 +230,36 @@ export default function CapacityPage() {
             )}
           </div>
 
-          {data.peers.length > 0 && (
-            <div style={{ overflowX: "auto" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr style={{ borderBottom: "1px solid var(--rule)" }}>
-                    <th style={thStyle}>Peer</th>
-                    <th style={thStyle}>{dedupAvailable ? "Miners" : "Miners (routed)"}</th>
-                    <th style={thStyle}>Capacity</th>
-                    <th style={thStyle}>Utilisation</th>
-                    <th style={{ ...thStyle, width: "30%" }}>&nbsp;</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.peers
-                    .slice()
-                    .sort((a, b) => utilPct(a) - utilPct(b))
-                    .map((p, idx) => {
-                      const pct = utilPct(p);
-                      const ip = p.public_address?.split(":")[0] ?? "?";
-                      return (
-                        <tr key={p.public_address ?? idx} style={{ borderBottom: "1px solid var(--rule)" }}>
-                          <td style={tdStyle}>
-                            <code style={{ color: "var(--fg)", fontSize: "13px" }}>{ip}</code>
-                            {p.public_mining === false && (
-                              <Badge variant="warning" className="ml-2">
-                                non-public
-                              </Badge>
-                            )}
-                          </td>
-                          <td style={{ ...tdStyle, fontFamily: "var(--font-mono)" }}>
-                            {dedupAvailable ? p.deduped_miner_count ?? 0 : p.miner_count}
-                          </td>
-                          <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", color: "var(--dim)" }}>
-                            {p.max_capacity || "—"}
-                          </td>
-                          <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", color: utilColor(pct) }}>
-                            {p.max_capacity ? `${pct}%` : "—"}
-                          </td>
-                          <td style={tdStyle}>
-                            <UtilisationBar pct={p.max_capacity ? pct : 0} />
-                          </td>
-                        </tr>
-                      );
-                    })}
-                </tbody>
-              </table>
-            </div>
-          )}
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid var(--rule)" }}>
+                  <th style={thStyle}>Node</th>
+                  <th style={thStyle}>{dedupAvailable ? "Miners" : "Miners (routed)"}</th>
+                  <th style={thStyle}>Capacity</th>
+                  <th style={thStyle}>Utilisation</th>
+                  <th style={{ ...thStyle, width: "30%" }}>&nbsp;</th>
+                </tr>
+              </thead>
+              <tbody>
+                {/* This node is part of the deduplicated total, so it belongs in
+                    the breakdown — otherwise the visible per-node counts under-
+                    report the mesh (they'd sum to the peers' share only). */}
+                <MeshRow node={me} isSelf dedupAvailable={dedupAvailable} />
+                {data.peers
+                  .slice()
+                  .sort((a, b) => utilPct(a) - utilPct(b))
+                  .map((p, idx) => (
+                    <MeshRow
+                      key={p.public_address ?? idx}
+                      node={p}
+                      isSelf={false}
+                      dedupAvailable={dedupAvailable}
+                    />
+                  ))}
+              </tbody>
+            </table>
+          </div>
         </Card>
       </SectionErrorBoundary>
 
@@ -285,6 +270,55 @@ export default function CapacityPage() {
         it. Translator load-balancer thresholds: 80% warn, 90% reject new, 95% critical.
       </p>
     </div>
+  );
+}
+
+function MeshRow({
+  node,
+  isSelf,
+  dedupAvailable,
+}: {
+  node: PoolNode;
+  isSelf: boolean;
+  dedupAvailable: boolean;
+}) {
+  const pct = utilPct(node);
+  // this_node carries no public_address; label it explicitly.
+  const label = isSelf ? "this node" : node.public_address?.split(":")[0] ?? "?";
+  // Deduped view = unique miners owned by this node; routed view = raw
+  // connection count (may overlap across nodes).
+  const miners = dedupAvailable ? node.deduped_miner_count ?? 0 : node.miner_count;
+  return (
+    <tr
+      style={{
+        borderBottom: "1px solid var(--rule)",
+        background: isSelf ? "var(--rule)" : undefined,
+      }}
+    >
+      <td style={tdStyle}>
+        <code style={{ color: "var(--fg)", fontSize: "13px" }}>{label}</code>
+        {isSelf && (
+          <Badge variant="info" className="ml-2">
+            you
+          </Badge>
+        )}
+        {node.public_mining === false && (
+          <Badge variant="warning" className="ml-2">
+            non-public
+          </Badge>
+        )}
+      </td>
+      <td style={{ ...tdStyle, fontFamily: "var(--font-mono)" }}>{miners}</td>
+      <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", color: "var(--dim)" }}>
+        {node.max_capacity || "—"}
+      </td>
+      <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", color: utilColor(pct) }}>
+        {node.max_capacity ? `${pct}%` : "—"}
+      </td>
+      <td style={tdStyle}>
+        <UtilisationBar pct={node.max_capacity ? pct : 0} />
+      </td>
+    </tr>
   );
 }
 

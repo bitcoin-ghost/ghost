@@ -18,7 +18,7 @@ interface PageHeaderProps {
 export function PageHeader({ eyebrow, title, subtitle, actions, className = '' }: PageHeaderProps) {
   return (
     <div className={`flex items-start justify-between gap-4 mb-8 ${className}`}>
-      <div>
+      <div className="flex-1 min-w-0">
         {eyebrow && (
           <div
             className="font-mono uppercase mb-2"
