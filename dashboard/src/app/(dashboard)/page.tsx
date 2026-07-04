@@ -19,7 +19,8 @@ import { formatHashrate } from "@/components/ui/DataTable";
 const TOOLTIPS = {
   block_height: "The current block height of the Bitcoin blockchain your node has synced to. During Initial Block Download (IBD), this shows sync progress.",
   l1_peers: "Number of Ghost mesh peers your node is directly connected to via P2P.",
-  l1_hashrate: "Combined mining hashrate of miners connected to YOUR node's stratum port. This is your pool's hashrate, not the total Ghost network.",
+  l1_hashrate: "Combined mining hashrate of miners connected to YOUR node's stratum port only. This is just your node, not the whole Ghost pool or the Bitcoin network.",
+  pool_hashrate: "Combined mining hashrate of every miner across the entire Ghost pool — all nodes in the mesh aggregated together. This is the whole Ghost pool, not just your node or the Bitcoin network.",
   network_hashrate: "Estimated total hashrate of the Bitcoin network, derived from current difficulty. This is the global network, not just Ghost.",
   l2_height: "The current block height of the Ghost Pay L2 network. Format: era:block. During IBD, shows syncing state.",
   l2_peers: "Number of Ghost Pay L2 peers your node is connected to.",
@@ -108,11 +109,19 @@ function L1Card() {
             </div>
           </div>
         </Tooltip>
+        <Tooltip content={TOOLTIPS.pool_hashrate}>
+          <div className="p-3 bg-orange-900/10 rounded-lg">
+            <div className="text-xs text-gray-500 mb-1">Ghost Pool Hashrate <InfoIcon /></div>
+            <div className="text-lg font-mono font-semibold text-gray-100">
+              {isLoading ? "..." : mining ? formatHashrate((mining.hashrate_th ?? 0) * 1e12) : "0 H/s"}
+            </div>
+          </div>
+        </Tooltip>
         <Tooltip content={TOOLTIPS.l1_hashrate}>
           <div className="p-3 bg-orange-900/10 rounded-lg">
             <div className="text-xs text-gray-500 mb-1">Your Hashrate <InfoIcon /></div>
             <div className="text-lg font-mono font-semibold text-gray-100">
-              {isLoading ? "..." : mining ? formatHashrate((mining.hashrate_th ?? 0) * 1e12) : "0 H/s"}
+              {isLoading ? "..." : mining ? formatHashrate((mining.local_hashrate_th ?? 0) * 1e12) : "0 H/s"}
             </div>
           </div>
         </Tooltip>
@@ -332,8 +341,11 @@ function PrivacySection() {
   const { data: shroud } = useShroudStatus();
   const { data: gp } = useGhostPayStatus();
 
+  // Any non-standard haze storage mode (stripping "hazed" or "full_archive")
+  // counts as Active; "standard" (default node) is Off. Kept as a clean binary
+  // Active/Off so the tile matches its siblings (single line, no wrapping).
   const hazeActive = haze?.mode === "hazed" || haze?.mode === "full_archive";
-  const hazeLabel = haze?.mode === "hazed" ? "Hazed" : haze?.mode === "full_archive" ? "Full Archive" : haze?.mode === "standard" ? "Off" : haze ? "Off" : "Loading...";
+  const hazeLabel = !haze ? "Loading..." : hazeActive ? "Active" : "Off";
 
   const shroudActive = shroud?.enabled ?? false;
   const shroudLabel = shroud ? (shroudActive ? "Active" : "Off") : "Loading...";
