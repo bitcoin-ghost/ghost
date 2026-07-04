@@ -47,6 +47,30 @@ export async function getAuthToken(): Promise<string | null> {
   return null;
 }
 
+// Extract a human-readable message from a failed response. The backend is not
+// uniform: JSON handlers return `{ "error": "..." }`, but the auth middleware
+// and axum's body extractors return PLAIN TEXT (e.g. a 401 "Missing
+// X-Ghost-Signature header" or a 422 JSON-deserialize error). The previous code
+// only ever tried `response.json()` and, when that threw, substituted the
+// literal string "Unknown error" — swallowing every one of those real messages
+// (this is what surfaced as a generic "unknown error" on the Reaper wizard's
+// Confirm). Read the body as text once, prefer a JSON `error`/`message` field
+// when present, and otherwise fall back to the raw text so the operator sees
+// the actual failure.
+async function errorFromResponse(response: Response): Promise<string> {
+  const raw = await response.text().catch(() => "");
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      const message = parsed?.error || parsed?.message;
+      if (message) return String(message);
+    } catch {
+      return raw.trim();
+    }
+  }
+  return `API error: ${response.status}`;
+}
+
 export async function fetchApi<T>(
   endpoint: string,
   options?: RequestInit,
@@ -63,10 +87,7 @@ export async function fetchApi<T>(
   });
 
   if (!response.ok) {
-    const error = await response
-      .json()
-      .catch(() => ({ error: "Unknown error" }));
-    throw new Error(error.error || `API error: ${response.status}`);
+    throw new Error(await errorFromResponse(response));
   }
 
   return response.json();
@@ -89,10 +110,7 @@ export async function fetchApiWithFormData<T>(
   );
 
   if (!response.ok) {
-    const error = await response
-      .json()
-      .catch(() => ({ error: "Unknown error" }));
-    throw new Error(error.error || `API error: ${response.status}`);
+    throw new Error(await errorFromResponse(response));
   }
 
   return response.json();
