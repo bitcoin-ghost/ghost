@@ -36,7 +36,7 @@ export function NodeHeader() {
   if (!info) {
     return (
       <header className="mb-8">
-        <h1 className="text-2xl font-bold text-gray-100">Agathion Node</h1>
+        <h1 className="text-2xl font-bold text-gray-100">Ghost Node</h1>
         <p className="text-gray-400">Unable to connect to node</p>
       </header>
     );
@@ -47,7 +47,7 @@ export function NodeHeader() {
   return (
     <header className="mb-8">
       <div className="flex items-center gap-4 mb-2">
-        <h1 className="text-2xl font-bold text-gray-100">Agathion Node</h1>
+        <h1 className="text-2xl font-bold text-gray-100">Ghost Node</h1>
         <Badge variant="success">Online</Badge>
       </div>
 
