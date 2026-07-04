@@ -268,9 +268,9 @@ jobs:
 
       - name: Clean version label
         shell: bash
-        # Strip the "agathion-" tag prefix so the title reads
-        # "Agathion Node v1.10.21", not "Agathion Node agathion-v1.10.21".
-        run: echo "REL_VERSION=${GITHUB_REF_NAME#agathion-}" >> "$GITHUB_ENV"
+        # Strip the "agathion-v" tag prefix so the title reads the codename
+        # version cleanly ("… Agathion 1.10.21").
+        run: echo "REL_VERSION=${GITHUB_REF_NAME#agathion-v}" >> "$GITHUB_ENV"
 
       - name: Create draft release
         uses: softprops/action-gh-release@v3
@@ -280,7 +280,7 @@ jobs:
           # as the node release — no separate offline signing needed.
           draft: true
           generate_release_notes: true
-          name: "Agathion Node ${{ env.REL_VERSION }}"
+          name: "Ghost Node — Version: Agathion ${{ env.REL_VERSION }}"
           files: |
             SHA256SUMS
             SHA256SUMS.asc
