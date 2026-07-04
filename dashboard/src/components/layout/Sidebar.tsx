@@ -60,15 +60,20 @@ const GROUPS: NavGroup[] = [
     label: "overview",
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
-      { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
       { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
       { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
     ],
   },
   {
+    label: "ghost pool",
+    items: [
+      { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
+      { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
+    ],
+  },
+  {
     label: "operate",
     items: [
-      { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
       { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
       { href: "/rewards", label: "Rewards", icon: <Coins {...ICON} /> },
     ],
