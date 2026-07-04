@@ -238,7 +238,6 @@ export default function MempoolPage() {
       <PageHeader
         eyebrow="mempool"
         title="Your node's mempool."
-        subtitle="Live view straight from your node's RPC — no indexer, no 50 GB, nothing to install. This is THIS node's mempool, filtered by your policy, with the Ghost class breakdown a general explorer can't show."
         actions={<Badge variant="success">rpc · lightweight</Badge>}
       />
 
@@ -316,8 +315,8 @@ function NodeMempoolExplorer() {
   // as the window / sidebar changes.
   const wrapRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
-  const DESIGN_WIDTH = 1800; // width at which mempool.space's dashboard lays out cleanly
-  const VIEW_HEIGHT = 720; // visible height of the embed
+  const DESIGN_WIDTH = 1300; // lower = more zoomed-in; the blocks row may overflow (fine — the tx/goggles content below matters more)
+  const VIEW_HEIGHT = 1050; // taller so the transactions / goggles / stats below the block row are visible
 
   useEffect(() => {
     timer.current = setTimeout(() => {
@@ -581,7 +580,10 @@ function FilterView({
           <p style={{ color: "var(--fainter)", fontSize: "12px" }}>
             Counters are cumulative since the last ghost-pool restart, sourced from your template
             builder (<code>/api/v1/reaper/status</code>). &ldquo;Evaluated&rdquo; is the unfiltered
-            baseline; &ldquo;kept&rdquo; is what survives your policy.
+            baseline; &ldquo;kept&rdquo; is what survives your policy. The by-type counts are per
+            detection — one transaction can trip several detectors (e.g. an inscription that also
+            carries excess witness data), so they sum higher than &ldquo;Stripped&rdquo;, which
+            counts each transaction once.
           </p>
         </div>
       )}
