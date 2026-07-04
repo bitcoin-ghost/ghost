@@ -356,7 +356,6 @@ function NodeMempoolExplorer() {
     <Card>
       <CardHeader
         title="Your node's mempool"
-        subtitle="The full mempool.space explorer for this node's own mempool, served straight from the dashboard. Same-origin — no external host, no certificate, nothing to trust off-box."
       />
       <div className="flex items-center gap-3" style={{ marginBottom: "12px" }}>
         <Badge variant="info">mempool.space · this node</Badge>
