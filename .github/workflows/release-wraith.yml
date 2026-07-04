@@ -399,9 +399,9 @@ jobs:
 
       - name: Clean version label
         shell: bash
-        # Strip the "wraith-" tag prefix so the release title reads
-        # "Wraith Wallet v1.10.21", not "Wraith Wallet wraith-v1.10.21".
-        run: echo "REL_VERSION=${GITHUB_REF_NAME#wraith-}" >> "$GITHUB_ENV"
+        # Strip the "wraith-v" tag prefix so the title reads the codename version
+        # cleanly ("… Wraith 1.10.21"), not "wraith-v1.10.21".
+        run: echo "REL_VERSION=${GITHUB_REF_NAME#wraith-v}" >> "$GITHUB_ENV"
 
       - name: Create draft release
         uses: softprops/action-gh-release@v3
@@ -411,7 +411,7 @@ jobs:
           # as the node release — no separate offline signing step needed.
           draft: true
           generate_release_notes: true
-          name: "Wraith Wallet ${{ env.REL_VERSION }}"
+          name: "Ghost Wallet — Version: Wraith ${{ env.REL_VERSION }}"
           files: |
             SHA256SUMS
             SHA256SUMS.asc
