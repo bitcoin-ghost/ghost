@@ -5702,6 +5702,10 @@ async fn main() -> Result<()> {
         capabilities,
     );
 
+    // Report the node's real configured chain on the status/info endpoints
+    // (dashboard + wallets) instead of the historical hardcoded "signet".
+    verification_state = verification_state.with_network(config.bitcoin.network);
+
     // VER-6: When a peer challenges this node's stratum capability, our
     // handler probes the stratum endpoint to confirm reachability. Without
     // this, the handler falls back to 127.0.0.1, which only proves loopback

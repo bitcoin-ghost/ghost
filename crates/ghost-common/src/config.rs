@@ -1002,6 +1002,17 @@ impl MiningMode {
 }
 
 impl BitcoinNetwork {
+    /// Canonical lowercase network name, matching the serde representation and
+    /// the names used by the `bitcoin` crate, ghostd (`chain`), and pool.toml.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BitcoinNetwork::Mainnet => "mainnet",
+            BitcoinNetwork::Signet => "signet",
+            BitcoinNetwork::Testnet => "testnet",
+            BitcoinNetwork::Regtest => "regtest",
+        }
+    }
+
     /// Convert to the `bitcoin` crate's `Network` type for address validation
     pub fn to_bitcoin_network(&self) -> bitcoin::Network {
         match self {
