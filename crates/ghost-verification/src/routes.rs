@@ -4651,88 +4651,113 @@ fn classify_by_weight_heuristic(weight: u64) -> BudsTier {
 }
 
 /// API v1 Mining best-hash handler
+///
+/// Returns the best (rarest hash / highest achieved difficulty) SHARE
+/// submitted by a connected miner in each window — current round, last hour,
+/// last 24h and all time — NOT the network chain tip. Each window is resolved
+/// independently from this node's `shares` table, so a lucky share only counts
+/// for the windows it actually falls within. Windows with no real-miner share
+/// yet return a null entry (the frontend renders "No data yet").
 async fn api_mining_best_hash_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
     let health = state.get_health().await;
 
-    // Query Ghost Core for best block hash and blockchain info (5s timeout)
-    if let Some(ref rpc) = state.rpc {
-        let rpc_data = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let best_hash = rpc.get_best_block_hash().await.ok();
-            let (difficulty, chain) = match rpc.get_blockchain_info().await {
-                Ok(info) => (info.difficulty, info.chain),
-                Err(_) => (0.0, "unknown".to_string()),
-            };
-            let network_hashrate = match rpc.get_mining_info().await {
-                Ok(info) => info.networkhashps,
-                Err(_) => 0.0,
-            };
-            (best_hash, difficulty, chain, network_hashrate)
+    let null_entry = || {
+        serde_json::json!({
+            "hash": null,
+            "difficulty": 0,
+            "timestamp": 0,
+            "miner_id": null,
+            "block_height": null
         })
-        .await;
+    };
 
-        if let Ok((best_hash, difficulty, chain, network_hashrate)) = rpc_data {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+    let Some(ref db) = state.database else {
+        // No local DB — cannot attribute per-miner shares. Return empty
+        // windows rather than the misleading chain tip.
+        return Json(serde_json::json!({
+            "current_round": null_entry(),
+            "last_round": null_entry(),
+            "last_hour": null_entry(),
+            "last_24h": null_entry(),
+            "all_time": null_entry(),
+            "best_hash": null,
+            "best_difficulty": 0,
+            "block_height": health.block_height,
+            "round_id": health.round_id,
+            "message": "Database not available"
+        }));
+    };
 
-            let entry = serde_json::json!({
-                "hash": best_hash,
-                "difficulty": difficulty,
-                "timestamp": now,
-                "miner_id": null,
-                "block_height": health.block_height
-            });
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
 
-            let null_entry = serde_json::json!({
-                "hash": null,
-                "difficulty": 0,
-                "timestamp": 0,
-                "miner_id": null,
-                "block_height": 0
-            });
+    // Convert a stored best share into the dashboard entry shape. The
+    // displayed `difficulty` is the ACHIEVED difficulty derived from the
+    // hash (how good the share actually was), matching the pool records /
+    // leaderboard endpoints — the stored `difficulty` column is only the
+    // vardiff target. The miner_id is redacted for public display but stays
+    // non-null so the frontend can tell a real share from the old chain-tip
+    // placeholder.
+    let to_entry = |best: Option<ghost_storage::models::BestShare>| match best {
+        Some(b) => serde_json::json!({
+            "hash": b.share_hash,
+            "difficulty": share_difficulty_from_hash_hex(&b.share_hash),
+            "timestamp": b.timestamp,
+            "miner_id": redact_miner_id(&b.miner_id),
+            "block_height": b.block_height,
+        }),
+        None => null_entry(),
+    };
 
-            return Json(serde_json::json!({
-                // Dashboard-compatible per-timerange format
-                "current_round": entry,
-                "last_round": null_entry,
-                "last_hour": entry,
-                "last_24h": entry,
-                "all_time": entry,
-                // Raw fields for backwards compat
-                "best_hash": best_hash,
-                "best_difficulty": difficulty,
-                "network_hashrate": network_hashrate,
-                "block_height": health.block_height,
-                "round_id": health.round_id,
-                "chain": chain
-            }));
-        }
-        // Timeout — fall through to fallback
-    }
+    // Per-window best shares. Current round is scoped by round_id so it tracks
+    // the live round exactly; the time windows use timestamp cutoffs; all-time
+    // uses a zero cutoff (every retained share).
+    let current_round = to_entry(db.get_best_share_in_round(health.round_id).unwrap_or(None));
+    let last_hour = to_entry(db.get_best_share_since(now_s - 3_600).unwrap_or(None));
+    let last_24h = to_entry(db.get_best_share_since(now_s - 86_400).unwrap_or(None));
+    let all_time_best = db.get_best_share_since(0).unwrap_or(None);
 
-    let null_entry = serde_json::json!({
-        "hash": null,
-        "difficulty": 0,
-        "timestamp": 0,
-        "miner_id": null,
-        "block_height": 0
-    });
+    // Raw back-compat fields mirror the all-time best share (achieved score).
+    let (best_hash, best_difficulty) = match &all_time_best {
+        Some(b) => (
+            Some(b.share_hash.clone()),
+            share_difficulty_from_hash_hex(&b.share_hash),
+        ),
+        None => (None, 0.0),
+    };
+    let all_time = to_entry(all_time_best);
 
-    // Fallback
+    // Best-effort network context (never blocks the per-window share data).
+    let (network_hashrate, chain) = if let Some(ref rpc) = state.rpc {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let network_hashrate = rpc.get_mining_info().await.map(|i| i.networkhashps).ok();
+            let chain = rpc.get_blockchain_info().await.map(|i| i.chain).ok();
+            (network_hashrate, chain)
+        })
+        .await
+        .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
     Json(serde_json::json!({
-        "current_round": null_entry,
-        "last_round": null_entry,
-        "last_hour": null_entry,
-        "last_24h": null_entry,
-        "all_time": null_entry,
-        "best_hash": null,
-        "best_difficulty": 0,
+        // Dashboard-compatible per-window format
+        "current_round": current_round,
+        "last_round": null_entry(),
+        "last_hour": last_hour,
+        "last_24h": last_24h,
+        "all_time": all_time,
+        // Raw fields for backwards compat (all-time best miner share)
+        "best_hash": best_hash,
+        "best_difficulty": best_difficulty,
+        "network_hashrate": network_hashrate,
         "block_height": health.block_height,
         "round_id": health.round_id,
-        "message": "Ghost Core RPC not configured"
+        "chain": chain
     }))
 }
 

@@ -600,27 +600,67 @@ impl Database {
                     // Only real `address.worker` miners so the best share is
                     // attributed to the miner, not its bare hex(SHA256(id))
                     // gossip-ledger twin (see get_leaderboard_best_hash).
-                    "SELECT share_hash, miner_id, timestamp, difficulty
-                     FROM shares
-                     WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
-                     ORDER BY share_hash ASC
+                    // LEFT JOIN rounds resolves the share's block height from
+                    // its round_id (NULL if the round row isn't persisted).
+                    "SELECT s.share_hash, s.miner_id, s.timestamp, s.difficulty, r.block_height
+                     FROM shares s
+                     LEFT JOIN rounds r ON r.round_id = s.round_id
+                     WHERE s.timestamp >= ?1 AND s.valid = 1 AND instr(s.miner_id, '.') > 0
+                     ORDER BY s.share_hash ASC
                      LIMIT 1",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             let row = stmt
-                .query_row(params![since_ts], |row| {
-                    Ok(crate::models::BestShare {
-                        share_hash: row.get(0)?,
-                        miner_id: row.get(1)?,
-                        timestamp: row.get(2)?,
-                        difficulty: row.get(3)?,
-                    })
-                })
+                .query_row(params![since_ts], Self::map_best_share)
                 .optional()
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             Ok(row)
+        })
+    }
+
+    /// Find the best (lowest-value hex, most-leading-zeros) valid share in a
+    /// specific round. Backs the "current round" best-hash window, which is
+    /// scoped by `round_id` rather than a timestamp cutoff so it tracks the
+    /// live round exactly. Returns `None` if the round has no real-miner
+    /// shares yet.
+    pub fn get_best_share_in_round(
+        &self,
+        round_id: u64,
+    ) -> GhostResult<Option<crate::models::BestShare>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    // Same real-miner filter as get_best_share_since; scoped
+                    // to a single round instead of a time window.
+                    "SELECT s.share_hash, s.miner_id, s.timestamp, s.difficulty, r.block_height
+                     FROM shares s
+                     LEFT JOIN rounds r ON r.round_id = s.round_id
+                     WHERE s.round_id = ?1 AND s.valid = 1 AND instr(s.miner_id, '.') > 0
+                     ORDER BY s.share_hash ASC
+                     LIMIT 1",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let row = stmt
+                .query_row(params![round_id], Self::map_best_share)
+                .optional()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(row)
+        })
+    }
+
+    /// Row mapper shared by the best-share queries: columns must be
+    /// `(share_hash, miner_id, timestamp, difficulty, block_height)`.
+    fn map_best_share(row: &rusqlite::Row) -> rusqlite::Result<crate::models::BestShare> {
+        Ok(crate::models::BestShare {
+            share_hash: row.get(0)?,
+            miner_id: row.get(1)?,
+            timestamp: row.get(2)?,
+            difficulty: row.get(3)?,
+            block_height: row.get::<_, Option<i64>>(4)?.map(|h| h as u64),
         })
     }
 
@@ -10500,6 +10540,97 @@ mod tests {
             .expect("recent");
         assert_eq!(recent.len(), 1, "quasar feed must exclude the gossip twin");
         assert_eq!(recent[0].0, "bc1qexampleaddr.bitaxe3");
+    }
+
+    #[test]
+    fn test_best_share_per_window_and_round_scoping() {
+        // Backs the /api/v1/mining/best-hash per-window records. Each window
+        // must resolve the rarest real-miner share within it (not the chain
+        // tip), attach the round's block height, and scope "current round"
+        // strictly by round_id.
+        let db = Database::in_memory().expect("create in-memory db");
+        let now_s = chrono::Utc::now().timestamp();
+
+        let round = |round_id: u64, block_height: u64| RoundRecord {
+            round_id,
+            block_height,
+            block_hash: None,
+            start_time: now_s - 100_000,
+            end_time: None,
+            total_shares: 0,
+            total_work: 0.0,
+            winning_miner: None,
+            found_by_node: None,
+            payout_status: PayoutStatus::Active,
+            subsidy_sats: None,
+            tx_fees_sats: None,
+        };
+        db.create_round(&round(1, 500)).expect("round 1");
+        db.create_round(&round(2, 501)).expect("round 2");
+
+        let share = |round_id: u64, miner_id: &str, hash: &str, ts: i64| ShareRecord {
+            id: None,
+            round_id,
+            miner_id: miner_id.to_string(),
+            difficulty: 1000.0,
+            work: 1000.0,
+            share_hash: hash.to_string(),
+            timestamp: ts,
+            received_by: "node1".to_string(),
+            valid: true,
+        };
+
+        // Round 1 (old): a very rare all-time-best share, ~30h ago so it falls
+        // OUTSIDE the last-24h and last-hour windows.
+        db.insert_share(&share(
+            1,
+            "bc1qminerA.w1",
+            "0000000000000000000000000000000000000000000000000000000000000abc",
+            now_s - 108_000,
+        ))
+        .expect("insert old best");
+        // Round 2 (current): a weaker share within the last hour.
+        db.insert_share(&share(
+            2,
+            "bc1qminerB.w1",
+            "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            now_s - 600,
+        ))
+        .expect("insert recent");
+        // A gossip-ledger twin (bare hex id, no '.') that is numerically the
+        // rarest of all — it must be excluded from every window.
+        db.insert_share(&share(
+            2,
+            "deadbeefcafef00d",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            now_s - 600,
+        ))
+        .expect("insert gossip twin");
+
+        // All-time picks the rarest real share (round 1) and resolves its
+        // block height via the round join.
+        let all_time = db.get_best_share_since(0).expect("all-time").unwrap();
+        assert_eq!(all_time.miner_id, "bc1qminerA.w1");
+        assert_eq!(all_time.block_height, Some(500));
+
+        // Last hour excludes the 30h-old round-1 share, so miner B wins.
+        let last_hour = db
+            .get_best_share_since(now_s - 3_600)
+            .expect("last-hour")
+            .unwrap();
+        assert_eq!(last_hour.miner_id, "bc1qminerB.w1");
+        assert_eq!(last_hour.block_height, Some(501));
+
+        // Current round is scoped by round_id: round 2 sees only miner B, and
+        // round 1 sees only miner A — neither leaks across, and the gossip
+        // twin never appears.
+        let cur2 = db.get_best_share_in_round(2).expect("round 2").unwrap();
+        assert_eq!(cur2.miner_id, "bc1qminerB.w1");
+        let cur1 = db.get_best_share_in_round(1).expect("round 1").unwrap();
+        assert_eq!(cur1.miner_id, "bc1qminerA.w1");
+
+        // A round with no shares yields None (frontend renders "No data yet").
+        assert!(db.get_best_share_in_round(99).expect("empty").is_none());
     }
 
     #[test]
