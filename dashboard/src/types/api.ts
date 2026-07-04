@@ -208,6 +208,7 @@ export interface MiningStatus {
   hashrate_th?: number;
   local_hashrate_th?: number;
   local_connected_miners?: number;
+  active_miners?: number;
   mesh_active_miners?: number;
   connected_miners?: number;
   shares_submitted?: number;

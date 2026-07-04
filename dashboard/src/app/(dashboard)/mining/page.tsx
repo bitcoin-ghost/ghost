@@ -94,6 +94,30 @@ function calculateLeadingZeros(difficulty: number): number {
   return Math.floor(8 + Math.log2(difficulty) / 4);
 }
 
+// Human-readable difficulty with auto-scaling K/M/G/T/P/E suffixes.
+// Mirrors `formatDifficulty` in ghost-web/pool.html so the dashboard and the
+// public pool site render identical numbers (e.g. "1.20 T", "340.00 G").
+function formatDifficulty(d: number): string {
+  if (!isFinite(d) || d <= 0) return "—";
+  if (d < 1e3) return d.toFixed(2);
+  if (d < 1e6) return (d / 1e3).toFixed(2) + "K";
+  if (d < 1e9) return (d / 1e6).toFixed(2) + "M";
+  if (d < 1e12) return (d / 1e9).toFixed(2) + "G";
+  if (d < 1e15) return (d / 1e12).toFixed(2) + "T";
+  if (d < 1e18) return (d / 1e15).toFixed(2) + "P";
+  return (d / 1e18).toFixed(2) + "E";
+}
+
+// Public pool hostname (round-robin DNS across all nodes).
+const PUBLIC_POOL_HOST = "pool.bitcoinghost.org";
+
+// SV2/Noise clients must pin the pool's authority public key to connect.
+// NOTE: the node API does NOT currently expose this — it lives in pool_sv2's
+// pool.toml as `authority_public_key`, identical across every node — so it is
+// mirrored here as a constant. Backend enhancement: surface it on
+// /api/v1/mining/status so this can be sourced dynamically.
+const SV2_AUTHORITY_PUBLIC_KEY = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
+
 function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | undefined }) {
   const diff = entry?.difficulty ?? 0;
   const hasData = entry && diff > 0;
@@ -102,7 +126,8 @@ function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | 
       <div className="text-xs text-gray-400 mb-1">{title}</div>
       {hasData ? (
         <>
-          <div className="font-mono text-sm text-orange-400 truncate">{entry.hash}</div>
+          <div className="text-lg font-semibold text-orange-400">{formatDifficulty(diff)}</div>
+          <div className="font-mono text-xs text-gray-400 truncate">{entry.hash}</div>
           <div className="text-xs text-gray-500 mt-0.5">{calculateLeadingZeros(diff)} leading zeros</div>
           <div className="flex justify-between items-center mt-1">
             <span className="text-xs text-gray-500">Block #{entry.block_height?.toLocaleString() || "?"}</span>
@@ -141,6 +166,17 @@ export default function MiningPage() {
   const [poolSetupOpen, setPoolSetupOpen] = useState(false);
 
   const miners = minersData?.miners ?? [];
+  // The miners/full `total` only counts miners seen in the last 600s, so it
+  // reads 0 for TCP-connected-but-idle miners. Use the authoritative
+  // connected-miner counts from mining status as a floor so the header never
+  // understates reality (backend `active_miners` = local miners with recent
+  // shares; `local_connected_miners` = TCP-connected on this node).
+  const connectedMinerCount = Math.max(
+    miners.length,
+    minersData?.total ?? 0,
+    status?.active_miners ?? 0,
+    status?.local_connected_miners ?? 0,
+  );
   const nodeHost = typeof window !== "undefined" ? window.location.hostname : "localhost";
   const isPending = setPrivateMining.isPending || setPublicMining.isPending;
 
@@ -287,9 +323,9 @@ export default function MiningPage() {
                   <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
                     <div>
                       <div className="text-xs text-gray-500">Stratum V2</div>
-                      <code className="text-orange-400 text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v2_port || 3334}</code>
+                      <code className="text-orange-400 text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v2_port || 34255}</code>
                     </div>
-                    <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v2_port || 3334}`} />
+                    <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v2_port || 34255}`} />
                   </div>
                 </div>
               </div>
@@ -301,18 +337,26 @@ export default function MiningPage() {
                   <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
                     <div>
                       <div className="text-xs text-gray-500">Stratum V1</div>
-                      <code className="text-orange-400 text-sm">stratum+tcp://pool.bitcoinghost.org:3333</code>
+                      <code className="text-orange-400 text-sm">stratum+tcp://{PUBLIC_POOL_HOST}:{status?.stratum_v1_port || 3333}</code>
                     </div>
-                    <CopyButton text="stratum+tcp://pool.bitcoinghost.org:3333" />
+                    <CopyButton text={`stratum+tcp://${PUBLIC_POOL_HOST}:${status?.stratum_v1_port || 3333}`} />
                   </div>
                   <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
                     <div>
                       <div className="text-xs text-gray-500">Stratum V2</div>
-                      <code className="text-orange-400 text-sm">stratum+tcp://pool.bitcoinghost.org:34265</code>
+                      <code className="text-orange-400 text-sm">stratum+tcp://{PUBLIC_POOL_HOST}:{status?.stratum_v2_port || 34255}</code>
                     </div>
-                    <CopyButton text="stratum+tcp://pool.bitcoinghost.org:34265" />
+                    <CopyButton text={`stratum+tcp://${PUBLIC_POOL_HOST}:${status?.stratum_v2_port || 34255}`} />
+                  </div>
+                  <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
+                    <div className="min-w-0">
+                      <div className="text-xs text-gray-500">SV2 authority public key</div>
+                      <code className="text-orange-400 text-sm block truncate">{SV2_AUTHORITY_PUBLIC_KEY}</code>
+                    </div>
+                    <CopyButton text={SV2_AUTHORITY_PUBLIC_KEY} />
                   </div>
                 </div>
+                <div className="text-xs text-gray-500 mt-2">SV2/Noise miners must pin the authority public key to connect.</div>
               </div>
             )}
           </div>
@@ -346,7 +390,7 @@ export default function MiningPage() {
         <Card>
           <CardHeader
             title="Connected Miners"
-            subtitle={`${minersData?.total ?? miners.length} miners connected this round`}
+            subtitle={`${connectedMinerCount} ${connectedMinerCount === 1 ? "miner" : "miners"} connected`}
           />
           <DataTable
             columns={minerColumns}
