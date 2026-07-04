@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/Badge";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { fetchApi } from "@/lib/api/client";
+import { useMiningStatus } from "@/hooks/queries";
 
 /**
  * Capacity & load-balancer view.
@@ -93,6 +94,16 @@ export default function CapacityPage() {
     refetchInterval: 30_000,
   });
 
+  // Authoritative, DEDUPED mesh miner total. The per-peer `miner_count`s below
+  // are a load-balancer routing view: a miner that reconnects or fails over
+  // between nodes is momentarily counted on more than one peer, so summing the
+  // rows over-counts (e.g. rows total 7–9 while the real distinct total is 6).
+  // `mining/status` already de-duplicates across the mesh, so source the total
+  // from there instead of adding up the breakdown.
+  // Backend follow-up: dedupe the per-peer capacity miner_counts at the source.
+  const { data: miningStatus } = useMiningStatus();
+  const meshTotal = miningStatus?.mesh_active_miners ?? miningStatus?.connected_miners;
+
   if (isLoading) {
     return (
       <div className="space-y-6">
@@ -149,7 +160,7 @@ export default function CapacityPage() {
               This node
             </h3>
             <p style={{ color: "var(--dim)", fontSize: "13px" }}>
-              Hardware-derived ceiling. Operator's <code>network.max_miners</code> can throttle this DOWN, never UP.
+              Hardware-derived ceiling. Operator&apos;s <code>network.max_miners</code> can throttle this DOWN, never UP.
             </p>
           </div>
 
@@ -188,6 +199,14 @@ export default function CapacityPage() {
                 ? "No peers reporting capacity yet."
                 : `${data.peers.length} peers reporting capacity. New miner connections route to the lowest utilisation %.`}
             </p>
+            {meshTotal !== undefined && (
+              <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "8px" }}>
+                <strong style={{ color: "var(--fg)" }}>{meshTotal}</strong> distinct active{" "}
+                {meshTotal === 1 ? "miner" : "miners"} across the mesh (deduplicated). The per-peer
+                counts below are a routing view and may overlap — a miner failing over between nodes
+                appears on more than one peer, so <em>don&apos;t sum the rows</em>.
+              </p>
+            )}
           </div>
 
           {data.peers.length > 0 && (
@@ -196,7 +215,7 @@ export default function CapacityPage() {
                 <thead>
                   <tr style={{ borderBottom: "1px solid var(--rule)" }}>
                     <th style={thStyle}>Peer</th>
-                    <th style={thStyle}>Miners</th>
+                    <th style={thStyle}>Miners (routed)</th>
                     <th style={thStyle}>Capacity</th>
                     <th style={thStyle}>Utilisation</th>
                     <th style={{ ...thStyle, width: "30%" }}>&nbsp;</th>
@@ -243,7 +262,7 @@ export default function CapacityPage() {
 
       <p style={{ color: "var(--fainter)", fontSize: "13px" }}>
         Capacity is hardware-derived (
-        <code>min(ram_mb / 3, cpu_cores * 500, fd_limit / 4)</code>) at startup. Operator's{" "}
+        <code>min(ram_mb / 3, cpu_cores * 500, fd_limit / 4)</code>) at startup. Operator&apos;s{" "}
         <code>network.max_miners</code> in <code>pool.toml</code> can throttle below the calculated value but cannot exceed
         it. Translator load-balancer thresholds: 80% warn, 90% reject new, 95% critical.
       </p>
