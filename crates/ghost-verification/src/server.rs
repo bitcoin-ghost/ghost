@@ -910,6 +910,10 @@ pub struct VerificationState {
     pub node_id: String,
     /// Software version
     pub version: String,
+    /// Configured Bitcoin network (mainnet/signet/testnet/regtest).
+    /// Reported by the public status/info endpoints so the dashboard and
+    /// wallets see the node's real chain instead of a hardcoded default.
+    pub network: ghost_common::config::BitcoinNetwork,
     /// Node identity for signing responses
     identity: Option<Arc<NodeIdentity>>,
     /// Policy engine
@@ -1149,6 +1153,9 @@ impl VerificationState {
         Self {
             node_id,
             version,
+            // Defaults to Signet (the historical hardcoded value); production
+            // ghost-pool overrides this via `with_network` from pool.toml.
+            network: ghost_common::config::BitcoinNetwork::Signet,
             identity: None,
             policy_engine: parking_lot::Mutex::new(PolicyEngine::new(policy_profile)),
             capabilities,
@@ -1466,6 +1473,12 @@ impl VerificationState {
     pub fn with_full_node_config(mut self, config: FullNodeConfig, path: PathBuf) -> Self {
         self.full_node_config = Some(parking_lot::RwLock::new(config));
         self.full_node_config_path = Some(path);
+        self
+    }
+
+    /// Set the configured Bitcoin network reported by the status/info endpoints.
+    pub fn with_network(mut self, network: ghost_common::config::BitcoinNetwork) -> Self {
+        self.network = network;
         self
     }
 

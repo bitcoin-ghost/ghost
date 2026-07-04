@@ -1422,7 +1422,7 @@ async fn api_node_status_handler(State(state): State<Arc<VerificationState>>) ->
         "online": health.healthy,
         "node_id": health.node_id,
         "version": health.version,
-        "network": "signet",
+        "network": state.network.as_str(),
         "sync_height": health.block_height,
         "block_height": health.block_height,
         "round_id": health.round_id,
@@ -1514,7 +1514,7 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "sync_height": health.block_height,
         "block_height": health.block_height,
         "round_id": health.round_id,
-        "network": "signet",
+        "network": state.network.as_str(),
         "is_synced": true,
         "peer_count": health.peer_count,
         "miner_count": health.miner_count,
@@ -3180,7 +3180,7 @@ async fn api_ghostpay_status_handler(
         "enabled": gp.sync_state != "disabled",
         "node_id": health.node_id,
         "protocol_version": 1,
-        "network": "signet",
+        "network": state.network.as_str(),
         "l2_era": gp.epoch,
         "virtual_block": gp.virtual_block,
         "l2_height": gp.virtual_block,
@@ -4723,7 +4723,7 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
         "template_profile": config.template_profile,
         "prune_profile": config.prune_profile,
         "operator_window": 100,
-        "network": "signet",
+        "network": state.network.as_str(),
         "stratum_sv2_port": 4444,
         "stratum_sv1_port": 3333,
         "http_port": 8080,
@@ -7573,6 +7573,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Regression: status/info endpoints must report the node's configured
+    /// network, not a hardcoded value. Production nodes run mainnet; the old
+    /// code always returned "signet", misleading the dashboard and wallets.
+    #[tokio::test]
+    async fn test_status_reports_configured_network() {
+        use ghost_common::config::BitcoinNetwork;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        async fn network_field(state: Arc<crate::server::VerificationState>) -> String {
+            let app = super::create_router(state);
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/node/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+                .await
+                .unwrap();
+            let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            data["network"].as_str().unwrap().to_string()
+        }
+
+        let make_state = |network| {
+            Arc::new(
+                crate::server::VerificationState::new(
+                    "test_node".to_string(),
+                    "1.0.0".to_string(),
+                    PolicyProfile::default(),
+                    NodeCapabilities::default(),
+                )
+                .with_network(network),
+            )
+        };
+
+        assert_eq!(
+            network_field(make_state(BitcoinNetwork::Mainnet)).await,
+            "mainnet",
+            "mainnet-configured node must report mainnet"
+        );
+        assert_eq!(
+            network_field(make_state(BitcoinNetwork::Regtest)).await,
+            "regtest"
+        );
+
+        // Default (no with_network) preserves the historical signet value.
+        let default_state = Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        ));
+        assert_eq!(network_field(default_state).await, "signet");
     }
 
     /// CRIT-6: Test that config POST without auth returns 401
