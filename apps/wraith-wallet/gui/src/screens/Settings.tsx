@@ -30,6 +30,9 @@ interface SettingsProps {
   /// restarts without the env var. The "real" till lock.
   daemonKiosk: boolean;
   onToggleGuiKiosk: (next: boolean) => void;
+  /// Re-open the skippable first-run tour. The "seen" flag lives in
+  /// localStorage; replaying just re-shows the tour without clearing it.
+  onReplayTour: () => void;
 }
 
 /// Read-only inspection of the daemon's environment + endpoints,
@@ -38,7 +41,7 @@ interface SettingsProps {
 /// URLs, idle-lock, shroud window) are set via env vars at
 /// wraithd boot — this screen surfaces what's currently active so
 /// you can confirm what the daemon is using vs what you intended.
-export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsProps) {
+export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk, onReplayTour }: SettingsProps) {
   const [env, setEnv] = useState<DaemonEnvResponse | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -726,6 +729,21 @@ export function Settings({ guiKiosk, daemonKiosk, onToggleGuiKiosk }: SettingsPr
               till deployment, also set the daemon lock above.
             </span>
           </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>Help &amp; guidance</h2>
+        <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+          New here, or showing someone else the ropes? Replay the short
+          guided tour of the wallet's four sections. You can skip it at
+          any point. Every screen also has a small <strong>?</strong> that
+          explains what it does.
+        </p>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button className="btn-secondary" onClick={onReplayTour}>
+            Show tour
+          </button>
         </div>
       </div>
 

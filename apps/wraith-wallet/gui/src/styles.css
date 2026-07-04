@@ -163,6 +163,9 @@ button { cursor: pointer; }
   margin-top: 18px;
 }
 .nav-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 0 24px 6px;
   font-family: var(--font-sans);
   font-size: 11px;
@@ -1159,3 +1162,103 @@ code {
 }
 .theme-toggle:hover { color: var(--fg); background: var(--surface); }
 .theme-toggle svg { width: 18px; height: 18px; }
+
+/* ===========================================================
+   HelpTip — the one contextual "?" affordance. A small round
+   trigger that reveals a concise explanation in a popover. Sized
+   independently of its surroundings (fixed 16px) so it reads the
+   same beside a 32px <h1> or an 11px nav heading.
+   =========================================================== */
+
+.helptip {
+  position: relative;
+  display: inline-flex;
+  vertical-align: middle;
+}
+.helptip-btn {
+  appearance: none;
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: color 120ms, border-color 120ms, background 120ms;
+}
+.helptip-btn:hover,
+.helptip-btn.open {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.helptip-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  z-index: 60;
+  width: min(300px, 78vw);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--fg) 18%, transparent);
+  cursor: default;
+}
+.helptip-panel.align-right { left: 0; }
+.helptip-panel.align-left { right: 0; }
+.helptip-title {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--fg);
+}
+.helptip-body {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--dim);
+}
+
+/* ===========================================================
+   First-run tour — reuses the modal shell; only the progress
+   rail is bespoke.
+   =========================================================== */
+
+.tour-card {
+  width: min(460px, 92vw);
+}
+.tour-dots {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+.tour-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--rule-strong);
+  transition: background 120ms, transform 120ms;
+}
+.tour-dot.active {
+  background: var(--accent);
+  transform: scale(1.25);
+}
