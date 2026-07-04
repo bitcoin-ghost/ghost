@@ -3189,7 +3189,15 @@ async fn api_ghostpay_status_handler(
         "peer_count": health.peer_count,
         "uptime_secs": health.uptime_secs,
         "sync_state": gp.sync_state,
-        "wraith_enabled": gp.wraith_enabled,
+        // Operator's Wraith setting from config — the user-facing "is Wraith
+        // enabled on this node" flag the dashboard's L2 card reads. Sourced
+        // from `[ghost_pay] wraith_enabled`, NOT ghost-pay's internal host flag
+        // (`gp.wraith_enabled`), which is always false since mixing moved to
+        // the wraith-coordinator binary and would misreport the operator's choice.
+        "wraith_enabled": state.wraith_enabled,
+        // Retained internal signal: whether the ghost-pay process itself hosts
+        // CoinJoin sessions (always false post-wraith-coordinator split).
+        "ghostpay_hosts_mixing": gp.wraith_enabled,
         "total_balances": 0
     }))
 }
@@ -7634,6 +7642,88 @@ mod tests {
             NodeCapabilities::default(),
         ));
         assert_eq!(network_field(default_state).await, "signet");
+    }
+
+    /// Regression: the ghostpay status endpoint's `wraith_enabled` must reflect
+    /// the operator's `[ghost_pay] wraith_enabled` config choice, not ghost-pay's
+    /// internal "hosts CoinJoin sessions" flag (always false since mixing moved
+    /// to wraith-coordinator). Nodes with wraith_enabled = true were reporting
+    /// false, so the dashboard L2 card showed Wraith "Not enabled" when it was.
+    #[tokio::test]
+    async fn test_ghostpay_status_reports_configured_wraith() {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        async fn wraith_field(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
+            let app = super::create_router(state);
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/ghostpay/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let make_state = |wraith_enabled| {
+            let state = crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_wraith_enabled(wraith_enabled);
+            // Force the fast in-process path (no ghostpay handler wired in tests)
+            // so the handler does not fall through to the 8800 network probe.
+            state.dashboard_config.write().ghost_pay = false;
+            Arc::new(state)
+        };
+
+        // Operator enabled Wraith → status must report true.
+        let enabled = wraith_field(make_state(true)).await;
+        assert_eq!(
+            enabled["wraith_enabled"].as_bool(),
+            Some(true),
+            "config wraith_enabled = true must surface as wraith_enabled: true"
+        );
+        // The internal host-mixing signal stays distinct and false.
+        assert_eq!(
+            enabled["ghostpay_hosts_mixing"].as_bool(),
+            Some(false),
+            "ghost-pay no longer hosts mixing; host flag must stay false"
+        );
+
+        // Operator disabled Wraith → status must report false.
+        let disabled = wraith_field(make_state(false)).await;
+        assert_eq!(
+            disabled["wraith_enabled"].as_bool(),
+            Some(false),
+            "config wraith_enabled = false must surface as wraith_enabled: false"
+        );
+
+        // Default (no with_wraith_enabled) preserves the historical off value.
+        let default_state = {
+            let state = crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            );
+            state.dashboard_config.write().ghost_pay = false;
+            Arc::new(state)
+        };
+        assert_eq!(
+            wraith_field(default_state).await["wraith_enabled"].as_bool(),
+            Some(false)
+        );
     }
 
     /// CRIT-6: Test that config POST without auth returns 401

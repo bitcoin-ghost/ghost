@@ -5706,6 +5706,11 @@ async fn main() -> Result<()> {
     // (dashboard + wallets) instead of the historical hardcoded "signet".
     verification_state = verification_state.with_network(config.bitcoin.network);
 
+    // Report the operator's Wraith-mixing choice from `[ghost_pay] wraith_enabled`
+    // on the ghostpay status endpoint, so the dashboard's L2 card reflects the
+    // node's actual setting rather than ghost-pay's internal "hosts mixing" flag.
+    verification_state = verification_state.with_wraith_enabled(config.wraith_enabled());
+
     // VER-6: When a peer challenges this node's stratum capability, our
     // handler probes the stratum endpoint to confirm reachability. Without
     // this, the handler falls back to 127.0.0.1, which only proves loopback

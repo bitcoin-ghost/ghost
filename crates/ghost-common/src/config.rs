@@ -261,6 +261,17 @@ impl NodeConfig {
         self.ghost_pay.as_ref().is_some_and(|gp| gp.enabled)
     }
 
+    /// Whether the operator enabled Wraith mixing on this node.
+    ///
+    /// Sourced from the `[ghost_pay] wraith_enabled` setting — the operator's
+    /// on/off choice. This is what the public status endpoints must surface,
+    /// as opposed to ghost-pay's internal "does this process host CoinJoin
+    /// sessions" signal (always false since mixing moved to wraith-coordinator).
+    /// Reads as false when no `[ghost_pay]` block is present.
+    pub fn wraith_enabled(&self) -> bool {
+        self.ghost_pay.as_ref().is_some_and(|gp| gp.wraith_enabled)
+    }
+
     /// Validate the configuration
     ///
     /// Returns validation result with any errors and warnings found.
@@ -1707,6 +1718,36 @@ mod tests {
         assert!(
             config.ghost_pay_enabled(),
             "[ghost_pay] with enabled = true must read as enabled"
+        );
+    }
+
+    #[test]
+    fn test_wraith_enabled_predicate() {
+        // No [ghost_pay] block → Wraith reads as off.
+        let mut config = NodeConfig::default();
+        assert!(config.ghost_pay.is_none());
+        assert!(
+            !config.wraith_enabled(),
+            "absent [ghost_pay] must read wraith as disabled"
+        );
+
+        // Operator disabled Wraith explicitly.
+        config.ghost_pay = Some(GhostPayConfig {
+            wraith_enabled: false,
+            ..GhostPayConfig::default()
+        });
+        assert!(!config.wraith_enabled());
+
+        // Operator enabled Wraith → predicate reflects the choice regardless of
+        // whether ghost-pay's `enabled` flag is set (it's a separate signal).
+        config.ghost_pay = Some(GhostPayConfig {
+            enabled: false,
+            wraith_enabled: true,
+            ..GhostPayConfig::default()
+        });
+        assert!(
+            config.wraith_enabled(),
+            "[ghost_pay] wraith_enabled = true must read as enabled"
         );
     }
 

@@ -914,6 +914,11 @@ pub struct VerificationState {
     /// Reported by the public status/info endpoints so the dashboard and
     /// wallets see the node's real chain instead of a hardcoded default.
     pub network: ghost_common::config::BitcoinNetwork,
+    /// Operator's Wraith-mixing on/off choice, from `[ghost_pay] wraith_enabled`.
+    /// Reported by the public status endpoints so the dashboard reflects the
+    /// node's actual setting — NOT ghost-pay's internal "hosts CoinJoin sessions"
+    /// signal, which is always false since mixing moved to wraith-coordinator.
+    pub wraith_enabled: bool,
     /// Node identity for signing responses
     identity: Option<Arc<NodeIdentity>>,
     /// Policy engine
@@ -1156,6 +1161,9 @@ impl VerificationState {
             // Defaults to Signet (the historical hardcoded value); production
             // ghost-pool overrides this via `with_network` from pool.toml.
             network: ghost_common::config::BitcoinNetwork::Signet,
+            // Defaults to off; production ghost-pool overrides this via
+            // `with_wraith_enabled` from the `[ghost_pay]` config block.
+            wraith_enabled: false,
             identity: None,
             policy_engine: parking_lot::Mutex::new(PolicyEngine::new(policy_profile)),
             capabilities,
@@ -1479,6 +1487,12 @@ impl VerificationState {
     /// Set the configured Bitcoin network reported by the status/info endpoints.
     pub fn with_network(mut self, network: ghost_common::config::BitcoinNetwork) -> Self {
         self.network = network;
+        self
+    }
+
+    /// Set the operator's Wraith-mixing setting reported by the status endpoints.
+    pub fn with_wraith_enabled(mut self, wraith_enabled: bool) -> Self {
+        self.wraith_enabled = wraith_enabled;
         self
     }
 
