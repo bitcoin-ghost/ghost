@@ -11,6 +11,8 @@ import {
   type OutpointRef,
   type PsbtCreateResponse,
 } from "../lib/tauri";
+import { HelpTip } from "../components/HelpTip";
+import { HELP_TOPICS } from "../lib/help";
 
 /// Send "mode" widening — the daemon exposes exactly one real send
 /// mode (`ghostpay`, the instant L2 ledger transfer). The GUI adds a
@@ -464,7 +466,12 @@ export function Send({ activeWallet }: SendProps) {
       <div className="page-head">
         <div>
           <span className="eyebrow">outgoing</span>
-          <h1>Send</h1>
+          <h1>
+            Send{" "}
+            <HelpTip title={HELP_TOPICS.send.title} label="About sending">
+              {HELP_TOPICS.send.body}
+            </HelpTip>
+          </h1>
           <p className="lead">
             Default is <strong>Ghost Pay</strong> — an instant, off-chain
             L2 transfer with no network fee. Need a plain on-chain spend

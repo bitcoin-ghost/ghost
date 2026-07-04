@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { walletCreate, walletImport } from "../lib/tauri";
 import { Logo } from "../components/Logo";
+import { HelpTip } from "../components/HelpTip";
+import { HELP_TOPICS } from "../lib/help";
 
 interface OnboardingProps {
   /// "create" launches the create-new flow; "import" launches the
@@ -269,11 +271,17 @@ export function Onboarding({ mode, onClose }: OnboardingProps) {
           <>
             <div className="card warn" style={{ margin: 0 }}>
               <p style={{ margin: 0 }}>
-                <strong>Write these 24 words on paper.</strong> Anyone
-                with this phrase can spend funds in this wallet. The
-                daemon doesn't keep it in plaintext anywhere — without
-                it, recovery is impossible if the keystore file or its
-                passphrase are lost.
+                <strong>Write these 24 words on paper.</strong>{" "}
+                <HelpTip
+                  title={HELP_TOPICS.mnemonic.title}
+                  label="Why write down the recovery phrase"
+                >
+                  {HELP_TOPICS.mnemonic.body}
+                </HelpTip>{" "}
+                Anyone with this phrase can spend funds in this wallet.
+                The daemon doesn't keep it in plaintext anywhere —
+                without it, recovery is impossible if the keystore file
+                or its passphrase are lost.
               </p>
               <div className="mnemonic-block">
                 {generatedMnemonic

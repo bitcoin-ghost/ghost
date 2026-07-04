@@ -27,6 +27,9 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Logo } from "./components/Logo";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { ConnectionStatus } from "./components/ConnectionStatus";
+import { HelpTip } from "./components/HelpTip";
+import { FirstRunTour } from "./components/FirstRunTour";
+import { CATEGORY_HELP } from "./lib/help";
 
 type Screen =
   | "wallet"
@@ -114,6 +117,19 @@ export default function App() {
     return localStorage.getItem("wraith.kiosk") === "1";
   });
   const kioskMode = daemonKiosk || guiKiosk;
+
+  // Skippable first-run tour. Shown until the user finishes or skips it
+  // once, then suppressed via a localStorage flag (same convention as
+  // wraith.kiosk / ghost-theme). Never shown in kiosk mode — a locked
+  // till isn't a first-run learning surface. Replayable from Settings.
+  const [showTour, setShowTour] = useState<boolean>(() => {
+    return localStorage.getItem("wraith.tour.seen") !== "1";
+  });
+  const dismissTour = () => {
+    localStorage.setItem("wraith.tour.seen", "1");
+    setShowTour(false);
+  };
+  const replayTour = () => setShowTour(true);
 
   const autoAuthInFlight = useRef<string | null>(null);
 
@@ -273,6 +289,7 @@ export default function App() {
             guiKiosk={guiKiosk}
             daemonKiosk={daemonKiosk}
             onToggleGuiKiosk={toggleGuiKiosk}
+            onReplayTour={replayTour}
           />
         );
     }
@@ -419,7 +436,17 @@ export default function App() {
           <nav>
             {NAV_GROUPS.map((group) => (
               <div className="nav-group" key={group.heading}>
-                <div className="nav-heading">{group.heading}</div>
+                <div className="nav-heading">
+                  <span>{group.heading}</span>
+                  {CATEGORY_HELP[group.heading] && (
+                    <HelpTip
+                      title={group.heading}
+                      label={`About ${group.heading}`}
+                    >
+                      {CATEGORY_HELP[group.heading]}
+                    </HelpTip>
+                  )}
+                </div>
                 {group.items.map((item) => (
                   <button
                     key={item.id}
@@ -438,6 +465,8 @@ export default function App() {
       <main className="app-main">
         <ErrorBoundary key={screen}>{activeScreen()}</ErrorBoundary>
       </main>
+
+      {showTour && !kioskMode && <FirstRunTour onClose={dismissTour} />}
     </div>
   );
 }

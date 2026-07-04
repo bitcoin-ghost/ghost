@@ -10,6 +10,8 @@ import {
   type WraithDiscoverTier,
   type WraithMixCompleted,
 } from "../lib/tauri";
+import { HelpTip } from "../components/HelpTip";
+import { HELP_TOPICS } from "../lib/help";
 
 interface MixProps {
   activeWallet: string | null;
@@ -343,7 +345,12 @@ export function Mix({ activeWallet }: MixProps) {
       <div className="page-head">
         <div>
           <span className="eyebrow">privacy · l1 coinjoin</span>
-          <h1>Wraith mix</h1>
+          <h1>
+            Wraith mix{" "}
+            <HelpTip title={HELP_TOPICS.mix.title} label="About mixing">
+              {HELP_TOPICS.mix.body}
+            </HelpTip>
+          </h1>
           <p className="lead">
             One round, five denom-sized outputs, no input→output
             linkage. The coordinator can't link your input UTXO to

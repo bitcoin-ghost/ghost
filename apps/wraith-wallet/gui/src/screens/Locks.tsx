@@ -11,6 +11,8 @@ import {
   type LocksRecoveredResult,
   type LocksJumpedResult,
 } from "../lib/tauri";
+import { HelpTip } from "../components/HelpTip";
+import { HELP_TOPICS } from "../lib/help";
 
 interface Tier {
   id: string;
@@ -193,7 +195,12 @@ export function Locks() {
       <div className="page-head">
         <div>
           <span className="eyebrow">custody primitive</span>
-          <h1>Ghost Locks</h1>
+          <h1>
+            Ghost Locks{" "}
+            <HelpTip title={HELP_TOPICS.locks.title} label="About time-locks">
+              {HELP_TOPICS.locks.body}
+            </HelpTip>
+          </h1>
           <p className="lead">
             Time-locked taproot outputs that mix you in with every
             other CoinJoin output of the same denomination. Recover

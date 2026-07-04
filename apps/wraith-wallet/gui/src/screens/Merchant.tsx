@@ -12,6 +12,8 @@ import {
 } from "../lib/tauri";
 import { Numpad } from "../components/Numpad";
 import { ProductCatalog, useProducts, type Product } from "../components/ProductCatalog";
+import { HelpTip } from "../components/HelpTip";
+import { HELP_TOPICS } from "../lib/help";
 import { printReceipt, emailReceipt, receiptPlainText } from "../lib/receipt";
 
 interface MerchantProps {
@@ -524,7 +526,16 @@ export function Merchant({
       <div className="page-head">
         <div>
           <span className="eyebrow">point of sale</span>
-          <h1>Merchant</h1>
+          <h1>
+            Merchant{" "}
+            <HelpTip
+              title={HELP_TOPICS.merchant.title}
+              label="About taking payments"
+              align="left"
+            >
+              {HELP_TOPICS.merchant.body}
+            </HelpTip>
+          </h1>
           <p className="lead">
             Tap products, punch a custom amount, take the payment.
             Customer scans the QR — terminal flips to PAID when the
