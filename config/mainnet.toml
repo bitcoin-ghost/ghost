@@ -122,6 +122,18 @@ sv1_port = 3333
 # Default: 8080
 http_port = 8080
 
+# Rate-limiter trusted-IP allowlist.
+# Requests whose REAL TCP peer address matches an entry here bypass the per-IP
+# HTTP rate limiter (5 req/s, burst 20) — e.g. the pool's own website polling the
+# public stats endpoints from a fixed host. Every unknown client keeps the exact
+# same limit. Entries may be plain IPs or CIDR ranges.
+# SECURITY: matched ONLY against the direct socket peer IP, never a spoofable
+# X-Forwarded-For / X-Real-IP header, so it cannot be used to bypass DoS limits.
+# Options: list of "IP" or "CIDR" strings
+# Default: [] (empty — opt-in, no behaviour change until set)
+# rate_limit_trusted_ips = ["83.136.255.218"]
+rate_limit_trusted_ips = []
+
 # Maximum number of connected miners
 # Options: 1-100000
 # Default: 1000

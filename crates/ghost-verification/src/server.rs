@@ -496,6 +496,44 @@ fn is_valid_cors_origin(origin: &str) -> bool {
     true
 }
 
+/// Parse the operator-configured rate-limiter trusted-IP allowlist
+/// (`[network] rate_limit_trusted_ips` in pool.toml) into concrete networks.
+///
+/// Accepts both plain IPs (`"83.136.255.218"`, treated as a single-host
+/// `/32`/`/128`) and CIDR ranges (`"10.0.0.0/8"`, `"2001:db8::/32"`).
+/// Invalid entries are logged and skipped rather than aborting startup, so one
+/// typo in the config can't take the node down — but a fully unparseable list
+/// simply yields an empty allowlist (i.e. today's behaviour, no bypass).
+fn parse_rate_limit_trusted_ips(entries: &[String]) -> Vec<ipnet::IpNet> {
+    use std::str::FromStr;
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            // CIDR form first ("10.0.0.0/8"); fall back to a bare IP promoted to
+            // a single-host network so plain addresses "just work".
+            if let Ok(net) = ipnet::IpNet::from_str(trimmed) {
+                Some(net)
+            } else if let Ok(ip) = std::net::IpAddr::from_str(trimmed) {
+                // A bare IP is a host route: /32 for IPv4, /128 for IPv6.
+                // Prefix length is always valid here, so this never errors.
+                ipnet::IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).ok()
+            } else {
+                tracing::warn!(
+                    entry = %trimmed,
+                    "HIGH-VER-5: Ignoring invalid rate_limit_trusted_ips entry \
+                     (expected a plain IP or CIDR range)"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Rate limiting state shared with the rate_limit_middleware
 #[derive(Clone)]
 struct RateLimitState {
@@ -507,25 +545,58 @@ struct RateLimitState {
             governor::clock::DefaultClock,
         >,
     >,
+    /// Operator-configured allowlist of trusted networks that bypass the rate
+    /// limiter entirely. Populated from `[network] rate_limit_trusted_ips`.
+    ///
+    /// SECURITY: this is matched ONLY against the real TCP peer address from
+    /// `ConnectInfo` (see `rate_limit_middleware`), never a client-supplied
+    /// forwarding header, so it cannot be spoofed. Empty by default.
+    trusted_ips: Arc<Vec<ipnet::IpNet>>,
 }
 
-/// Rate limiting middleware that exempts loopback (localhost) connections.
-/// External traffic is rate-limited per NodeId/IP as before.
+/// Rate limiting middleware that exempts loopback (localhost) connections and
+/// any operator-configured trusted IPs. External traffic is rate-limited per
+/// NodeId/IP as before.
 async fn rate_limit_middleware(
     axum::extract::State(state): axum::extract::State<RateLimitState>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Check peer IP from ConnectInfo
-    let is_loopback = request
+    // Read the REAL TCP peer IP from ConnectInfo. This is the actual socket
+    // source address injected by axum's `into_make_service_with_connect_info`
+    // (and by the TLS accept loop) — it is NOT derived from any request header,
+    // so it cannot be forged by a remote client.
+    let peer_ip = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(false);
+        .map(|ci| ci.0.ip());
 
-    // Exempt localhost from rate limiting - it's the node's own dashboard
-    if is_loopback {
+    // Exempt localhost from rate limiting - it's the node's own dashboard.
+    if peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false) {
         return next.run(request).await;
+    }
+
+    // Trusted-IP allowlist bypass.
+    //
+    // SECURITY (rate-limit-bypass prevention): the allowlist is matched ONLY
+    // against `peer_ip` — the direct TCP socket source from ConnectInfo — and
+    // NEVER against `X-Forwarded-For` / `X-Real-IP`, which a remote attacker
+    // fully controls. Matching a client-supplied header here would let anyone
+    // forge `X-Forwarded-For: <trusted-ip>` and skip the limiter entirely,
+    // defeating HIGH-VER-5 DoS protection. Only a request whose actual socket
+    // peer is in the allowlist bypasses; unknown clients keep 5/s + burst 20.
+    //
+    // We canonicalise first so an IPv4-mapped IPv6 socket (`::ffff:a.b.c.d`)
+    // still matches a plain IPv4 allowlist entry.
+    if let Some(ip) = peer_ip {
+        let canonical = ip.to_canonical();
+        if state
+            .trusted_ips
+            .iter()
+            .any(|net| net.contains(&canonical) || net.contains(&ip))
+        {
+            return next.run(request).await;
+        }
     }
 
     // Extract key and check rate limit for external traffic
@@ -2449,9 +2520,26 @@ pub async fn start_server(
     // - Request body limit: 1MB max to prevent DoS
     // - HIGH-API-5: Request correlation IDs for distributed tracing
     // - LOW-API-1: Security headers (X-Content-Type-Options, X-Frame-Options, etc.)
+    // HIGH-VER-5: Load the operator-configured rate-limiter trusted-IP allowlist
+    // from `[network] rate_limit_trusted_ips`. Default empty = opt-in, so with no
+    // config the limiter behaves exactly as before. Matched against the real TCP
+    // peer IP only (see rate_limit_middleware) — never a spoofable proxy header.
+    let rate_limit_trusted_ips = state
+        .full_node_config
+        .as_ref()
+        .map(|cfg| parse_rate_limit_trusted_ips(&cfg.read().network.rate_limit_trusted_ips))
+        .unwrap_or_default();
+    if !rate_limit_trusted_ips.is_empty() {
+        info!(
+            trusted_ip_count = rate_limit_trusted_ips.len(),
+            "HIGH-VER-5: Rate-limiter trusted-IP allowlist active \
+             (matched against real socket peer IP only)"
+        );
+    }
     let rate_limit_state = RateLimitState {
         key_extractor: NodeIdKeyExtractor::new(),
         limiter: governor_conf.limiter().clone(),
+        trusted_ips: Arc::new(rate_limit_trusted_ips),
     };
     let app = create_router(state)
         .layer(axum::middleware::from_fn(security_headers_middleware))
@@ -2922,6 +3010,176 @@ mod tests {
         assert_eq!(
             extractor_high.trusted_proxy_count, 10,
             "M-14: Count 100 should clamp to 10"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // HIGH-VER-5: Rate-limiter trusted-IP allowlist tests
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_rate_limit_trusted_ips_plain_and_cidr() {
+        // Plain IPs are promoted to single-host networks; CIDR ranges parse as-is.
+        let nets = parse_rate_limit_trusted_ips(&[
+            "83.136.255.218".to_string(),
+            "10.0.0.0/8".to_string(),
+            "2001:db8::/32".to_string(),
+            "  ".to_string(),          // blank -> skipped
+            "not-an-ip".to_string(),   // invalid -> skipped
+            "10.0.0.0/99".to_string(), // invalid prefix -> skipped
+        ]);
+        assert_eq!(nets.len(), 3, "only the 3 valid entries should parse");
+
+        let host: std::net::IpAddr = "83.136.255.218".parse().unwrap();
+        assert!(nets.iter().any(|n| n.contains(&host)));
+
+        let in_cidr: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        assert!(nets.iter().any(|n| n.contains(&in_cidr)));
+
+        let outside: std::net::IpAddr = "11.0.0.1".parse().unwrap();
+        assert!(!nets.iter().any(|n| n.contains(&outside)));
+    }
+
+    #[test]
+    fn test_empty_allowlist_yields_no_trusted_networks() {
+        // Empty config = opt-out = today's behaviour (no bypass for anyone).
+        assert!(parse_rate_limit_trusted_ips(&[]).is_empty());
+    }
+
+    /// Build a router whose only layer is the real `rate_limit_middleware`, wired
+    /// with the production limits (5/s, burst 20) and the given trusted allowlist.
+    fn rate_limited_test_app(trusted: Vec<ipnet::IpNet>) -> axum::Router {
+        let governor_conf = GovernorConfigBuilder::default()
+            .per_second(5)
+            .burst_size(20)
+            .key_extractor(NodeIdKeyExtractor::new())
+            .finish()
+            .expect("valid governor config for test");
+
+        let state = RateLimitState {
+            key_extractor: NodeIdKeyExtractor::new(),
+            limiter: governor_conf.limiter().clone(),
+            trusted_ips: Arc::new(trusted),
+        };
+
+        axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                rate_limit_middleware,
+            ))
+    }
+
+    /// Issue one request through `app`, injecting `socket` as the REAL TCP peer
+    /// (via ConnectInfo, exactly as axum's connect-info make-service does) and an
+    /// optional forged `X-Forwarded-For` header. Returns the response status.
+    async fn send_once(
+        app: &axum::Router,
+        socket: std::net::SocketAddr,
+        forged_xff: Option<&str>,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder().uri("/").method("GET");
+        if let Some(xff) = forged_xff {
+            builder = builder.header("X-Forwarded-For", xff);
+        }
+        let mut req = builder.body(axum::body::Body::empty()).unwrap();
+        // Inject the real socket peer address the same way the server does.
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(socket));
+
+        app.clone()
+            .oneshot(req)
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    /// Count 429s when firing `n` back-to-back requests from `socket`.
+    async fn count_429s(
+        app: &axum::Router,
+        socket: std::net::SocketAddr,
+        forged_xff: Option<&str>,
+        n: usize,
+    ) -> usize {
+        let mut throttled = 0;
+        for _ in 0..n {
+            if send_once(app, socket, forged_xff).await == axum::http::StatusCode::TOO_MANY_REQUESTS
+            {
+                throttled += 1;
+            }
+        }
+        throttled
+    }
+
+    #[tokio::test]
+    async fn test_trusted_socket_ip_bypasses_rate_limit() {
+        // A request whose REAL socket peer is in the allowlist must never be
+        // throttled, even far past the burst of 20.
+        let trusted = parse_rate_limit_trusted_ips(&["83.136.255.218".to_string()]);
+        let app = rate_limited_test_app(trusted);
+        let socket: std::net::SocketAddr = "83.136.255.218:44444".parse().unwrap();
+
+        let throttled = count_429s(&app, socket, None, 50).await;
+        assert_eq!(
+            throttled, 0,
+            "trusted socket IP must bypass the limiter entirely (got {throttled} x 429)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_cidr_bypasses_rate_limit() {
+        // CIDR allowlist entries bypass for any address inside the range.
+        let trusted = parse_rate_limit_trusted_ips(&["10.0.0.0/8".to_string()]);
+        let app = rate_limited_test_app(trusted);
+        let socket: std::net::SocketAddr = "10.9.8.7:5555".parse().unwrap();
+
+        let throttled = count_429s(&app, socket, None, 50).await;
+        assert_eq!(throttled, 0, "IP inside a trusted CIDR must bypass");
+    }
+
+    #[tokio::test]
+    async fn test_untrusted_ip_still_rate_limited() {
+        // Unknown clients keep the exact HIGH-VER-5 limit: burst 20 then 429.
+        let trusted = parse_rate_limit_trusted_ips(&["83.136.255.218".to_string()]);
+        let app = rate_limited_test_app(trusted);
+        let socket: std::net::SocketAddr = "9.9.9.9:33333".parse().unwrap();
+
+        let throttled = count_429s(&app, socket, None, 40).await;
+        assert!(
+            throttled > 0,
+            "untrusted IP must still be throttled past the burst (got 0 x 429)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forged_xff_header_does_not_bypass() {
+        // SECURITY: a non-trusted socket forging `X-Forwarded-For: <trusted-ip>`
+        // must NOT gain the bypass — the allowlist matches the socket peer only.
+        let trusted = parse_rate_limit_trusted_ips(&["83.136.255.218".to_string()]);
+        let app = rate_limited_test_app(trusted);
+        // Real peer is an untrusted address; the header claims the trusted one.
+        let socket: std::net::SocketAddr = "9.9.9.9:22222".parse().unwrap();
+
+        let throttled = count_429s(&app, socket, Some("83.136.255.218"), 40).await;
+        assert!(
+            throttled > 0,
+            "forged X-Forwarded-For must NOT bypass the limiter (rate-limit-bypass vuln)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_allowlist_is_unchanged_behaviour() {
+        // With no configured allowlist, even the would-be-trusted IP is limited
+        // exactly as before — proving the feature is strictly opt-in.
+        let app = rate_limited_test_app(Vec::new());
+        let socket: std::net::SocketAddr = "83.136.255.218:11111".parse().unwrap();
+
+        let throttled = count_429s(&app, socket, None, 40).await;
+        assert!(
+            throttled > 0,
+            "empty allowlist must preserve today's behaviour (throttle past burst)"
         );
     }
 }

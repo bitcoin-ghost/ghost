@@ -1172,6 +1172,23 @@ pub struct NetworkConfig {
     /// bespoke authority keypair so the dashboard reports the correct value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sv2_authority_public_key: Option<String>,
+    /// HTTP rate-limiter trusted-IP allowlist.
+    ///
+    /// Requests whose **real TCP peer address** matches an entry here bypass the
+    /// per-IP HTTP rate limiter (`HIGH-VER-5`: 5 req/s, burst 20). This lets the
+    /// pool's own website poll the public stats endpoints without being throttled
+    /// while every unknown client keeps the exact same limit. Entries may be plain
+    /// IPs (`"83.136.255.218"`) or CIDR ranges (`"10.0.0.0/8"`, `"2001:db8::/32"`).
+    ///
+    /// # Security
+    ///
+    /// The allowlist is matched **only** against the direct socket peer IP
+    /// (`ConnectInfo` — the actual TCP source), never a client-supplied
+    /// `X-Forwarded-For` / `X-Real-IP` header. A remote attacker therefore cannot
+    /// forge a header to obtain a bypass. Default **empty** (opt-in): with no
+    /// entries the limiter behaves identically to before for every client.
+    #[serde(default)]
+    pub rate_limit_trusted_ips: Vec<String>,
 }
 
 fn default_noise_enabled() -> bool {
@@ -1203,6 +1220,7 @@ impl Default for NetworkConfig {
             ghost_mode: false,
             shroud_enabled: false,
             sv2_authority_public_key: None,
+            rate_limit_trusted_ips: Vec::new(),
         }
     }
 }

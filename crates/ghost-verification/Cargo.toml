@@ -64,6 +64,8 @@ chrono = { workspace = true }
 getrandom = { workspace = true }
 uuid = { workspace = true }
 libc = "0.2"
+# CIDR / plain-IP parsing for the rate-limiter trusted-IP allowlist
+ipnet = "2.11"
 # TLS for HTTPS (CRIT-API-1)
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
