@@ -7,94 +7,25 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
+import { ConfirmDialog } from "@/components/ui/Dialog";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { DataTable, formatHashrate, formatDuration } from "@/components/ui/DataTable";
+import { formatHashrate } from "@/components/ui/DataTable";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { useMiningStatus, useMiners, useBestHash, useSetPrivateMining, useSetPublicMining } from "@/hooks/queries";
+import { useMiningStatus, useBestHash, useSetPrivateMining, useSetPublicMining } from "@/hooks/queries";
 import { useToast } from "@/components/ui/Toast";
 import { useQueryClient } from "@tanstack/react-query";
 import PoolSetupWizard from "../settings/wizards/PoolSetupWizard";
-import type { MinerInfo, BestHashEntry, BestHashResponse } from "@/types/api";
-import type { ColumnDef } from "@tanstack/react-table";
+import type { BestHashEntry, BestHashResponse } from "@/types/api";
 
 const TOOLTIPS = {
   network_hashrate: "Estimated total hashrate of the Bitcoin network, derived from current difficulty. This is the global network, not just Ghost.",
-  hashrate: "Combined hashrate of all miners connected to your node's stratum port. Updated every few seconds from share submissions.",
+  ghost_network_hashrate: "Combined hashrate of every node in the Ghost mesh pool, aggregated across the whole network.",
+  node_hashrate: "Combined hashrate of miners connected to this node's stratum port. Updated every few seconds from share submissions.",
   connected_miners: "Number of mining devices currently connected to your stratum port and actively submitting shares.",
   shares_round: "Total accepted shares in the current mining round. The accept rate shows valid vs rejected shares.",
   blocks_found: "Total blocks your pool has found since first startup. Each block found triggers a payout distribution.",
   best_hash: "The lowest (best) hash value submitted by miners. More leading zeros means closer to finding a block. Measured by share difficulty.",
 };
-
-const minerColumns: ColumnDef<MinerInfo>[] = [
-  {
-    accessorKey: "worker_name",
-    header: "Worker",
-    cell: ({ row }) => (
-      <div>
-        <div className="font-medium">{row.original.worker_name || "Unknown"}</div>
-        <div className="text-xs text-gray-500 font-mono">{row.original.ip_address || "N/A"}</div>
-      </div>
-    ),
-  },
-  {
-    accessorKey: "hashrate_th",
-    header: "Hashrate",
-    cell: ({ row }) => (
-      <span className="font-mono">{formatHashrate((row.original.hashrate_th ?? 0) * 1e12)}</span>
-    ),
-  },
-  {
-    id: "shares",
-    header: "Shares",
-    cell: ({ row }) => (
-      <span>
-        {(row.original.shares_accepted ?? 0).toLocaleString()} / {(row.original.shares_submitted ?? 0).toLocaleString()}
-      </span>
-    ),
-  },
-  {
-    id: "accept_rate",
-    header: "Accept Rate",
-    cell: ({ row }) => {
-      const submitted = row.original.shares_submitted ?? 0;
-      const accepted = row.original.shares_accepted ?? 0;
-      const rate = submitted > 0 ? (accepted / submitted) * 100 : 0;
-      return (
-        <Badge variant={rate >= 95 ? "success" : rate >= 80 ? "warning" : "error"}>
-          {rate.toFixed(1)}%
-        </Badge>
-      );
-    },
-  },
-  {
-    accessorKey: "difficulty",
-    header: "Difficulty",
-    cell: ({ row }) => {
-      const diff = row.original.difficulty ?? 0;
-      return <span className="font-mono">{diff > 0 ? formatDifficulty(diff) : "—"}</span>;
-    },
-  },
-  {
-    accessorKey: "last_share",
-    header: "Last Share",
-    cell: ({ row }) => {
-      const last = row.original.last_share ?? row.original.last_share_at ?? 0;
-      return <span className="text-gray-400">{formatTimeAgo(last)}</span>;
-    },
-  },
-  {
-    accessorKey: "connected_at",
-    header: "Uptime",
-    cell: ({ row }) => {
-      const connectedAt = row.original.connected_at ?? 0;
-      if (!connectedAt) return <span className="text-gray-500">N/A</span>;
-      const uptime = Math.floor(Date.now() / 1000 - connectedAt);
-      if (uptime < 0 || uptime > 86400 * 365) return <span className="text-gray-500">N/A</span>;
-      return <span className="text-gray-400">{formatDuration(uptime)}</span>;
-    },
-  },
-];
 
 function formatTimeAgo(timestamp: number): string {
   if (!timestamp) return "Never";
@@ -153,10 +84,10 @@ function bestHashLooksBlockLevel(data: BestHashResponse | undefined): boolean {
   return allSameHash && noMinerAttribution;
 }
 
-// One labelled, copyable key/value row in the SV2 connection panel. Mirrors the
-// row style of the endpoint blocks and the public site's native-SV2 quick-start
-// (ghost-web/miners.html) so operators see the same field set in both places.
-function Sv2Field({ label, value }: { label: string; value: string }) {
+// One labelled, copyable key/value row in a connection panel. Shared by both the
+// SV1 and SV2 endpoint columns, and mirrors the public site's quick-start field
+// rows (ghost-web/miners.html) so operators see the same set in both places.
+function EndpointField({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-2 p-2 bg-gray-900/50 rounded">
       <div className="min-w-0">
@@ -215,30 +146,18 @@ const MODES: { key: MiningMode; label: string; desc: string }[] = [
 
 export default function MiningPage() {
   const { data: status, isLoading: statusLoading } = useMiningStatus();
-  const { data: minersData, isLoading: minersLoading } = useMiners();
   const { data: bestHashData, isLoading: bestHashLoading } = useBestHash();
   const setPrivateMining = useSetPrivateMining();
   const setPublicMining = useSetPublicMining();
   const queryClient = useQueryClient();
   const { addToast } = useToast();
   const [poolSetupOpen, setPoolSetupOpen] = useState(false);
+  // The mode the operator has clicked but not yet confirmed. Changing mining
+  // mode on a live node is disruptive (it flips which stratum ports accept
+  // connections), so the click only stages the change — nothing is sent to the
+  // node until the confirmation dialog is accepted.
+  const [pendingMode, setPendingMode] = useState<MiningMode | null>(null);
 
-  const miners = minersData?.miners ?? [];
-  // True when the backend withheld the per-miner list — either an unsigned/
-  // public request or a pre-redeploy node without the operator-authed detail
-  // mode. In that state we show the aggregate count instead of a table.
-  const minersRedacted = minersData?.miners_redacted === true;
-  // The detailed list only counts miners seen in the last 600s, so its `total`
-  // reads 0 for TCP-connected-but-idle miners. Use the authoritative
-  // connected-miner counts from mining status as a floor so the header never
-  // understates reality (backend `active_miners` = local miners with recent
-  // shares; `local_connected_miners` = TCP-connected on this node).
-  const connectedMinerCount = Math.max(
-    miners.length,
-    minersData?.total_miners ?? minersData?.total ?? 0,
-    status?.active_miners ?? 0,
-    status?.local_connected_miners ?? 0,
-  );
   // Authority key: prefer the value the node now reports, fall back to the
   // bundled constant for pre-redeploy nodes that don't expose it yet.
   const authorityPublicKey = status?.authority_public_key ?? SV2_AUTHORITY_PUBLIC_KEY_FALLBACK;
@@ -247,8 +166,17 @@ export default function MiningPage() {
 
   const currentMode = getMiningMode(status?.private_mining, status?.public_mining);
 
-  const handleModeChange = async (mode: MiningMode) => {
+  // Stage a mode change: record the click and open the confirmation dialog.
+  // No request is fired here — that happens only on confirm.
+  const requestModeChange = (mode: MiningMode) => {
     if (mode === currentMode || isPending) return;
+    setPendingMode(mode);
+  };
+
+  // Fire the actual mode change once the operator confirms.
+  const confirmModeChange = async () => {
+    const mode = pendingMode;
+    if (!mode) return;
     try {
       // Set both flags - order doesn't matter since both must succeed
       const privateMining = mode === "private_solo" || mode === "private_pool";
@@ -267,7 +195,7 @@ export default function MiningPage() {
 
       await queryClient.invalidateQueries({ queryKey: ["mining"] });
       await queryClient.invalidateQueries({ queryKey: ["config"] });
-      addToast({ type: "success", title: `Mining mode: ${MODES.find(m => m.key === mode)?.label}` });
+      addToast({ type: "success", title: `Mining mode: ${MODES.find((m) => m.key === mode)?.label}` });
     } catch (err: unknown) {
       const message = err instanceof Error
         ? err.message
@@ -275,6 +203,8 @@ export default function MiningPage() {
           ? String((err as { message: unknown }).message)
           : "Failed to update mining mode";
       addToast({ type: "error", title: message });
+    } finally {
+      setPendingMode(null);
     }
   };
 
@@ -291,7 +221,7 @@ export default function MiningPage() {
       <PageHeader eyebrow="mining" title="Hashrate, shares, miners." subtitle="Hashrate, miners, and mining configuration" />
 
       {/* Stats row */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <StatCard
           label="Network Hashrate"
           value={bestHashData?.network_hashrate ? formatHashrate(bestHashData.network_hashrate) : "--"}
@@ -300,10 +230,17 @@ export default function MiningPage() {
           loading={bestHashLoading}
         />
         <StatCard
-          label="Pool Hashrate"
-          value={status ? formatHashrate((status.hashrate_th ?? 0) * 1e12) : "--"}
-          sublabel="your node"
-          tooltip={TOOLTIPS.hashrate}
+          label="Ghost Network Total"
+          value={status ? formatHashrate((status.hashrate_th ?? status.total_hashrate ?? 0) * 1e12) : "--"}
+          sublabel="all Ghost nodes"
+          tooltip={TOOLTIPS.ghost_network_hashrate}
+          loading={statusLoading}
+        />
+        <StatCard
+          label="This Node"
+          value={status && status.local_hashrate_th != null ? formatHashrate(status.local_hashrate_th * 1e12) : "--"}
+          sublabel="local hashrate"
+          tooltip={TOOLTIPS.node_hashrate}
           loading={statusLoading}
         />
         <StatCard
@@ -329,7 +266,8 @@ export default function MiningPage() {
         />
       </div>
 
-      {/* Mining Mode */}
+      {/* Mining Mode — the mode selector only. Connection endpoints live in
+          their own section below so the two concerns don't get conflated. */}
       <SectionErrorBoundary section="Mining Mode">
         <Card>
           <CardHeader
@@ -343,13 +281,13 @@ export default function MiningPage() {
           />
 
           {/* Mode selector - 3 radio-style options */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {MODES.map(({ key, label, desc }) => {
               const isActive = currentMode === key;
               return (
                 <button
                   key={key}
-                  onClick={() => handleModeChange(key)}
+                  onClick={() => requestModeChange(key)}
                   disabled={isPending}
                   className={`p-4 rounded-lg border text-left transition-all ${
                     isActive
@@ -371,94 +309,106 @@ export default function MiningPage() {
               );
             })}
           </div>
-
-          {/* Connection endpoints */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {showPrivateEndpoints && (
-              <div className="p-4 bg-gray-800/30 rounded-lg border border-gray-700">
-                <div className="text-sm text-gray-300 font-medium mb-3">Your Stratum Endpoints</div>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
-                    <div>
-                      <div className="text-xs text-gray-500">Stratum V1</div>
-                      <code className="text-orange-400 text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v1_port || 3333}</code>
-                    </div>
-                    <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v1_port || 3333}`} />
-                  </div>
-                  <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
-                    <div>
-                      <div className="text-xs text-gray-500">Stratum V2</div>
-                      <code className="text-orange-400 text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v2_port || 34255}</code>
-                    </div>
-                    <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v2_port || 34255}`} />
-                  </div>
-                </div>
-              </div>
-            )}
-            {showPublicEndpoints && (
-              <div className="p-4 bg-gray-800/30 rounded-lg border border-gray-700">
-                <div className="text-sm text-gray-300 font-medium mb-3">Public Pool Endpoints</div>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
-                    <div>
-                      <div className="text-xs text-gray-500">Stratum V1</div>
-                      <code className="text-orange-400 text-sm">stratum+tcp://{PUBLIC_POOL_HOST}:{status?.stratum_v1_port || 3333}</code>
-                    </div>
-                    <CopyButton text={`stratum+tcp://${PUBLIC_POOL_HOST}:${status?.stratum_v1_port || 3333}`} />
-                  </div>
-                </div>
-
-                {/* Structured, per-field copyable native-SV2 connection panel.
-                    Mirrors the public site's quick-start (ghost-web/miners.html):
-                    Port is sourced from the node's reported stratum_v2_port (34255
-                    fallback) and the authority key from status.authority_public_key
-                    (constant fallback for pre-redeploy nodes). The pool negotiates
-                    the per-miner TLV on extended channels, so Channel type is
-                    "Extended"; the authority public key is the Noise static key —
-                    no separate TLS/cert or device flag is required. */}
-                <div className="mt-4 pt-3 border-t border-gray-700/60">
-                  <div className="text-sm text-gray-300 font-medium">Stratum V2 (native)</div>
-                  <div className="text-xs text-emerald-400/90 mb-2">No account needed — no KYC</div>
-                  <div className="space-y-1.5">
-                    <Sv2Field label="Host" value={PUBLIC_POOL_HOST} />
-                    <Sv2Field label="Port" value={String(status?.stratum_v2_port || 34255)} />
-                    <Sv2Field label="Username" value="<your-address>.worker1" />
-                    <Sv2Field label="Protocol" value="Stratum V2" />
-                    <Sv2Field label="Channel type" value="Extended" />
-                    <Sv2Field label="Authority public key" value={authorityPublicKey} />
-                  </div>
-                  <p className="text-xs text-gray-500 mt-2 leading-relaxed">
-                    For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). The authority key is the
-                    same on every public Ghost node. Username is the same{" "}
-                    <code className="text-gray-300">address.worker</code> as SV1; the password is ignored.
-                  </p>
-                </div>
-
-                {/* Connection settings — the critical, easy-to-miss authorize rule */}
-                <div className="mt-3 p-3 bg-orange-900/10 border border-orange-800/40 rounded">
-                  <div className="text-sm text-orange-300 font-medium mb-1">Connection settings</div>
-                  <p className="text-xs text-gray-400 leading-relaxed">
-                    Set your miner&apos;s username to your{" "}
-                    <span className="text-gray-300 font-medium">bech32 payout address</span> followed by a
-                    worker suffix:
-                  </p>
-                  <code className="text-orange-400 text-xs block my-1.5">
-                    &lt;your-payout-address&gt;.&lt;worker&gt;
-                    <span className="text-gray-500"> — e.g. bc1q….worker1</span>
-                  </code>
-                  <p className="text-xs text-gray-400 leading-relaxed">
-                    This is how block rewards are routed to you, and applies to{" "}
-                    <span className="text-gray-300">both SV1 and SV2</span>. Bare worker names (no{" "}
-                    <code className="text-gray-300">.</code> separator, no address) are{" "}
-                    <span className="text-gray-300">rejected</span> — the miner would mine for nobody. The
-                    password field is ignored.
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
         </Card>
       </SectionErrorBoundary>
+
+      {/* Connection Endpoints — how miners reach this node. Kept separate from
+          the Mining Mode selector above. */}
+      {(showPrivateEndpoints || showPublicEndpoints) && (
+        <SectionErrorBoundary section="Connection Endpoints">
+          <Card>
+            <CardHeader
+              title="Connection Endpoints"
+              subtitle="How miners connect to your node"
+            />
+            <div className="space-y-4">
+              {showPrivateEndpoints && (
+                <div className="p-4 bg-gray-800/30 rounded-lg border border-gray-700">
+                  <div className="text-sm text-gray-300 font-medium mb-3">Your Stratum Endpoints</div>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
+                      <div>
+                        <div className="text-xs text-gray-500">Stratum V1</div>
+                        <code className="text-orange-400 text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v1_port || 3333}</code>
+                      </div>
+                      <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v1_port || 3333}`} />
+                    </div>
+                    <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
+                      <div>
+                        <div className="text-xs text-gray-500">Stratum V2</div>
+                        <code className="text-orange-400 text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v2_port || 34255}</code>
+                      </div>
+                      <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v2_port || 34255}`} />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {showPublicEndpoints && (
+                <div className="p-4 bg-gray-800/30 rounded-lg border border-gray-700">
+                  <div className="text-sm text-gray-300 font-medium mb-3">Public Pool Endpoints</div>
+
+                  {/* Two side-by-side stratum columns: SV1 left, SV2 right.
+                      Stacks on narrow screens. Every field is individually
+                      copyable. */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* SV1 */}
+                    <div className="p-3 bg-gray-900/40 rounded-lg border border-gray-700/60">
+                      <div className="text-sm text-gray-300 font-medium mb-2">Stratum V1</div>
+                      <div className="space-y-1.5">
+                        <EndpointField label="Host" value={PUBLIC_POOL_HOST} />
+                        <EndpointField label="Port" value={String(status?.stratum_v1_port || 3333)} />
+                        <EndpointField label="Username" value="<your-address>.worker1" />
+                        <EndpointField label="Protocol" value="Stratum V1" />
+                      </div>
+                      <p className="text-xs text-gray-500 mt-2 leading-relaxed">
+                        For SV1 miners and firmware — connects through the pool translator.
+                      </p>
+                    </div>
+
+                    {/* SV2 */}
+                    <div className="p-3 bg-gray-900/40 rounded-lg border border-gray-700/60">
+                      <div className="text-sm text-gray-300 font-medium mb-2">Stratum V2 (native)</div>
+                      <div className="space-y-1.5">
+                        <EndpointField label="Host" value={PUBLIC_POOL_HOST} />
+                        <EndpointField label="Port" value={String(status?.stratum_v2_port || 34255)} />
+                        <EndpointField label="Username" value="<your-address>.worker1" />
+                        <EndpointField label="Protocol" value="Stratum V2" />
+                        <EndpointField label="Channel type" value="Extended" />
+                        <EndpointField label="Authority public key" value={authorityPublicKey} />
+                      </div>
+                      <p className="text-xs text-gray-500 mt-2 leading-relaxed">
+                        For native SV2 firmware (e.g. a Bitaxe on AxeOS). The authority key is the
+                        same on every public Ghost node — no separate TLS or cert required.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Shared row — the authorize rule applies to BOTH stratums. */}
+                  <div className="mt-4 p-3 bg-orange-900/10 border border-orange-800/40 rounded">
+                    <div className="text-sm text-orange-300 font-medium mb-1">Username rule — SV1 and SV2</div>
+                    <p className="text-xs text-gray-400 leading-relaxed">
+                      Set your miner&apos;s username to your{" "}
+                      <span className="text-gray-300 font-medium">bech32 payout address</span> followed by a
+                      worker suffix:
+                    </p>
+                    <code className="text-orange-400 text-xs block my-1.5">
+                      &lt;your-payout-address&gt;.&lt;worker&gt;
+                      <span className="text-gray-500"> — e.g. bc1q….worker1</span>
+                    </code>
+                    <p className="text-xs text-gray-400 leading-relaxed">
+                      This is how block rewards are routed to you. Bare worker names (no{" "}
+                      <code className="text-gray-300">.</code> separator, no address) are{" "}
+                      <span className="text-gray-300">rejected</span> — the miner would mine for nobody. The
+                      password field is ignored.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </Card>
+        </SectionErrorBoundary>
+      )}
 
       {/* Best Hashes */}
       <SectionErrorBoundary section="Best Hashes">
@@ -489,54 +439,18 @@ export default function MiningPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* Connected Miners Table */}
-      <SectionErrorBoundary section="Connected Miners">
-        <Card>
-          <CardHeader
-            title="Connected Miners"
-            subtitle={`${connectedMinerCount} ${connectedMinerCount === 1 ? "miner" : "miners"} connected`}
-          />
-          {miners.length > 0 ? (
-            <DataTable
-              columns={minerColumns}
-              data={miners}
-              loading={minersLoading}
-              emptyMessage="No miners connected"
-              emptyDescription="Connect a miner using the Stratum endpoints above"
-              searchColumn="worker_name"
-              searchPlaceholder="Search miners..."
-              showPagination={miners.length > 10}
-            />
-          ) : minersLoading ? (
-            <div className="py-8 text-center text-sm text-gray-500">Loading…</div>
-          ) : minersRedacted && connectedMinerCount > 0 ? (
-            // Pre-redeploy fallback: the node reports an aggregate connected-miner
-            // count but withheld the per-miner list (`miners_redacted: true`),
-            // because it lacks the operator-authed detail mode on
-            // /api/v1/mining/miners. Show the aggregate clearly instead of a
-            // blank/broken table. Once the node is redeployed, the signed GET
-            // returns the full list and the table above renders instead.
-            <div className="py-8 px-4 text-center">
-              <div className="text-3xl font-semibold text-orange-400">{connectedMinerCount}</div>
-              <div className="text-sm text-gray-400 mt-1">
-                {connectedMinerCount === 1 ? "miner" : "miners"} connected to this node
-              </div>
-              <div className="text-xs text-gray-500 mt-3 max-w-md mx-auto leading-relaxed">
-                Per-miner details (worker, hashrate, shares) are not yet exposed by this node — they
-                appear here automatically once it is updated to the latest build. The aggregate count
-                above is authoritative.
-              </div>
-            </div>
-          ) : (
-            <div className="py-8 px-4 text-center">
-              <div className="text-sm text-gray-400">No miners connected</div>
-              <div className="text-xs text-gray-500 mt-1">
-                Connect a miner using the Stratum endpoints above.
-              </div>
-            </div>
-          )}
-        </Card>
-      </SectionErrorBoundary>
+      {/* Confirmation for a mining-mode change. Nothing is sent to the node
+          until this is accepted. */}
+      <ConfirmDialog
+        isOpen={pendingMode !== null}
+        onClose={() => setPendingMode(null)}
+        onConfirm={confirmModeChange}
+        title="Change mining mode?"
+        message={`Change mining mode to ${MODES.find((m) => m.key === pendingMode)?.label ?? ""}? This affects how miners connect to your node.`}
+        confirmLabel="Change mode"
+        cancelLabel="Cancel"
+        loading={isPending}
+      />
 
       {/* Wizard dialog */}
       <PoolSetupWizard isOpen={poolSetupOpen} onClose={() => setPoolSetupOpen(false)} />
