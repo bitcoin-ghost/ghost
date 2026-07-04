@@ -273,9 +273,7 @@ function ReaperControls() {
       toast.success(
         "Reaper settings saved",
         res.persisted
-          ? res.ghostd_restart_required
-            ? "Pool template reaper applied — ghost-pool is restarting. Run `ghost-setup apply-reaper` (or restart ghostd) to apply the node mempool reaper."
-            : "Settings persisted."
+          ? "Both reapers are updating automatically: the pool template reaper on the imminent ghost-pool restart, and the ghostd mempool reaper is being applied now (ghostd briefly restarts). No manual step needed."
           : "Settings received but no node config path is configured — nothing was persisted."
       );
     } catch (e) {
@@ -346,7 +344,7 @@ function ReaperControls() {
         />
         <VectorGroup
           title="Node mempool reaper only"
-          note="ghostd -ghostreaper mempool rejects. Needs `ghost-setup apply-reaper` (restarts ghostd) to take effect."
+          note="ghostd -ghostreaper mempool rejects. Applied automatically on save (ghostd briefly restarts) — no manual step."
           vectors={NODE_VECTORS}
           data={form}
           onChange={patch}
@@ -430,12 +428,12 @@ function ReaperControls() {
           }}
         >
           <p style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
-            Saving writes these settings to the node config (<code>pool.toml [reaper]</code>) and{" "}
-            <strong style={{ color: "var(--accent)" }}>restarts ghost-pool</strong> so the pool template
-            reaper picks them up. The ghostd <strong>mempool</strong> reaper is separate: it only changes
-            after you run <code>ghost-setup apply-reaper</code> (or restart ghostd), which rewrites the{" "}
-            <code>-ghostreaper</code> reject flags. Until then the node&apos;s live mempool filtering can
-            differ from what is shown here.
+            Saving writes these settings to the node config (<code>pool.toml [reaper]</code>) and applies
+            them to <strong>both</strong> reapers automatically. The pool template reaper picks them up when{" "}
+            <strong style={{ color: "var(--accent)" }}>ghost-pool restarts</strong>, and the ghostd{" "}
+            <strong>mempool</strong> reaper is regenerated for you — the node rewrites its{" "}
+            <code>-ghostreaper</code> reject flags and <strong>briefly restarts ghostd</strong>. No manual{" "}
+            <code>ghost-setup apply-reaper</code> step is needed.
           </p>
         </div>
       </div>
@@ -511,8 +509,8 @@ export default function ReaperPage() {
                 <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginBottom: "8px" }}>
                   The node&apos;s <code>-ghostreaper</code> reject vectors. Rejects junk from the mempool so it
                   never relays or gets mined. Driven by the <strong>shared</strong> + <strong>node-only</strong>{" "}
-                  toggles below, but only after <code>ghost-setup apply-reaper</code> rewrites the flags and
-                  restarts ghostd.
+                  toggles below and applied <strong>automatically</strong> when you save — the node rewrites
+                  its <code>-ghostreaper</code> flags and briefly restarts ghostd for you.
                 </p>
                 <div style={{ fontSize: "13px", color: "var(--dim)" }}>
                   Saved config:{" "}
@@ -520,7 +518,7 @@ export default function ReaperPage() {
                     {enabled ? "enabled" : "disabled"}
                   </strong>{" "}
                   <span style={{ color: "var(--fainter)" }}>
-                    (live ghostd flag state is not reported here — see note)
+                    (applied to ghostd on save)
                   </span>
                 </div>
               </div>
@@ -552,12 +550,13 @@ export default function ReaperPage() {
               </div>
             </div>
             <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6" }}>
-              <strong style={{ color: "var(--accent)" }}>State-drift caveat:</strong> the toggles below reflect
-              the saved node config (<code>pool.toml [reaper]</code>), which is exactly what the pool template
-              reaper runs. The ghostd mempool reaper only picks up changes when{" "}
-              <code>ghost-setup apply-reaper</code> is run, so the saved config can drift from the node&apos;s
-              actual <code>-ghostreaper</code> flags in between. Running a node deliberately as an{" "}
-              <strong>unfiltered control</strong> (mempool reaper off) is a valid configuration.
+              <strong style={{ color: "var(--accent)" }}>Applied to both on save:</strong> the toggles below
+              reflect the saved node config (<code>pool.toml [reaper]</code>), which is exactly what the pool
+              template reaper runs. Saving now also regenerates the ghostd mempool reaper&apos;s{" "}
+              <code>-ghostreaper</code> flags and restarts ghostd automatically, so the node&apos;s live
+              filtering tracks these toggles without a manual <code>ghost-setup apply-reaper</code> step.
+              Running a node deliberately as an <strong>unfiltered control</strong> (mempool reaper off) is a
+              valid configuration.
             </p>
           </div>
         </Card>

@@ -60,9 +60,9 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
         const res = await setReaper.mutateAsync(data);
         toast.success(
           'Ghost Reaper Updated',
-          res.ghostd_restart_required
-            ? 'Pool reaper applied. Run `ghost-setup apply-reaper` (or restart ghostd) to apply node-level mempool filtering.'
-            : 'Reaper settings saved.'
+          res.persisted
+            ? 'Applied to both reapers automatically — the pool template reaper on the ghost-pool restart and the ghostd mempool reaper (ghostd briefly restarts). No manual step needed.'
+            : 'Reaper settings received but nothing was persisted.'
         );
         onClose();
       },
@@ -142,7 +142,7 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
                 </div>
               )}
               {renderGroup('Shared detectors', 'Apply to both the pool (block templates) and the node (mempool relay).', SHARED, data, setData)}
-              {renderGroup('Node-level only', 'Apply to the ghostd mempool reaper. Needs `ghost-setup apply-reaper` to take effect.', NODE_ONLY, data, setData)}
+              {renderGroup('Node-level only', 'Apply to the ghostd mempool reaper. Applied automatically on save (ghostd briefly restarts).', NODE_ONLY, data, setData)}
               {renderGroup('Pool-level only', 'Apply to the pool template reaper (what this node mines).', POOL_ONLY, data, setData)}
             </div>
           )}
@@ -185,8 +185,9 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
               </div>
               <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
                 <p className="text-sm text-orange-300">
-                  Click Finish to save. The pool reaper applies on the next ghost-pool restart;
-                  node-level (mempool) changes require running <code>ghost-setup apply-reaper</code>.
+                  Click Finish to save. Both reapers apply automatically: the pool reaper on the next
+                  ghost-pool restart, and the ghostd mempool reaper is regenerated for you (ghostd briefly
+                  restarts). No manual <code>ghost-setup apply-reaper</code> step is needed.
                 </p>
               </div>
             </div>

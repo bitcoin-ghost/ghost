@@ -1,0 +1,27 @@
+# Bitcoin Ghost — automatic ghostd mempool-reaper apply.
+#
+# Grants the ghost-pool service user (ghost) permission to regenerate the
+# ghostd `-ghostreaper` systemd drop-in and restart ghostd, and NOTHING else.
+# The reaper config endpoint (POST /api/v1/config/reaper), which runs inside
+# ghost-pool as the unprivileged `ghost` user, shells out to:
+#     sudo -n /opt/ghost/bin/ghost-setup apply-reaper
+# so a dashboard reaper save applies to the node mempool reaper automatically,
+# with no manual `ghost-setup apply-reaper` step.
+#
+# The command is pinned with its exact argument, so `ghost` can run only that
+# one subcommand as root. Any other argument (or other command) is rejected by
+# sudo. `ghost-setup` is root-owned 0755, so the ghost user cannot rewrite what
+# runs as root. `apply-reaper` itself only reads /etc/ghost/pool.toml [reaper],
+# rewrites /etc/systemd/system/ghostd.service.d/reaper.conf, and restarts
+# ghostd — it takes no attacker-controlled input.
+#
+# Install 0440 at /etc/sudoers.d/ghost-reaper-apply; validate with:
+#     visudo -cf /etc/sudoers.d/ghost-reaper-apply
+#
+# NOTE: this requires the ghost-pool.service to NOT set `NoNewPrivileges=yes`
+# (which disables setuid sudo) nor `ProtectSystem=strict` (which makes /etc
+# read-only in the service's mount namespace, blocking the drop-in write). The
+# production units already satisfy this; the hardened template in
+# config/ghost-pool.service would need those two directives relaxed first.
+Defaults!/opt/ghost/bin/ghost-setup !requiretty
+ghost ALL=(root) NOPASSWD: /opt/ghost/bin/ghost-setup apply-reaper
