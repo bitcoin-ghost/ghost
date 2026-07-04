@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
@@ -222,6 +223,9 @@ export default function MempoolPage() {
     return (
       <div className="space-y-6">
         <PageHeader eyebrow="mempool" title="Your node's mempool." />
+        <SectionErrorBoundary section="Network mempool reference">
+          <NetworkMempoolReference />
+        </SectionErrorBoundary>
         <SkeletonCard />
       </div>
     );
@@ -237,6 +241,12 @@ export default function MempoolPage() {
         subtitle="Live view straight from your node's RPC — no indexer, no 50 GB, nothing to install. This is THIS node's mempool, filtered by your policy, with the Ghost class breakdown a general explorer can't show."
         actions={<Badge variant="success">rpc · lightweight</Badge>}
       />
+
+      {/* Unfiltered network reference (mempool.space) at the very top, so the
+          Reaper-filtered node view below reads as the direct comparison. */}
+      <SectionErrorBoundary section="Network mempool reference">
+        <NetworkMempoolReference />
+      </SectionErrorBoundary>
 
       {rpcUnavailable ? (
         <Card>
@@ -271,6 +281,116 @@ export default function MempoolPage() {
       {/* Heavy full-explorer add-on, demoted to the bottom. */}
       <AdvancedExplorer status={stackStatus} />
     </div>
+  );
+}
+
+// ─── network mempool reference (unfiltered mempool.space, at the top) ────────
+
+// The pool hosts a stock mempool.space instance at this subdomain. It's the
+// UNFILTERED / network-wide reference we embed above the node's own filtered
+// view so the Reaper comparison is visible at a glance.
+const MEMPOOL_REFERENCE_URL = "https://mempool.bitcoinghost.org";
+
+/**
+ * Compact embedded mempool.space "mini" view.
+ *
+ * Embeddability: as of writing `mempool.bitcoinghost.org` returns 200 with NO
+ * `X-Frame-Options` and NO `Content-Security-Policy: frame-ancestors`, so it
+ * frames without objection. The one real gotcha is TLS — the Let's Encrypt cert
+ * currently only covers the apex `bitcoinghost.org` (no SAN for the `mempool.`
+ * subdomain), so some browsers may refuse the https iframe with a cert error.
+ *
+ * Whichever way an embed fails (cert error, network unreachable, or a future
+ * frame-blocking header), the symptom is the same: the iframe never fires
+ * `onLoad`. We arm a timeout on mount and, if `onLoad` hasn't fired by then,
+ * degrade to a titled card + explanation + link rather than leaving a blank
+ * broken frame. The "open full explorer" link is always present regardless.
+ */
+function NetworkMempoolReference() {
+  const [state, setState] = useState<"loading" | "ok" | "blocked">("loading");
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    timer.current = setTimeout(() => {
+      setState((s) => (s === "loading" ? "blocked" : s));
+    }, 8000);
+    return () => {
+      if (timer.current) clearTimeout(timer.current);
+    };
+  }, []);
+
+  const openLink = (
+    <a
+      href={MEMPOOL_REFERENCE_URL}
+      target="_blank"
+      rel="noreferrer"
+      className="bare"
+      style={{ color: "var(--accent)", fontSize: "13px", textDecoration: "underline" }}
+    >
+      open full explorer ↗
+    </a>
+  );
+
+  return (
+    <Card>
+      <CardHeader
+        title="Network mempool — unfiltered reference"
+        subtitle="The stock mempool.space view of the network, unfiltered. Compare it against your node's Reaper-filtered mempool below to see exactly what your policy strips out."
+      />
+      <div className="flex items-center gap-3" style={{ marginBottom: "12px" }}>
+        <Badge variant="info">unfiltered · reference</Badge>
+        {openLink}
+      </div>
+
+      {state === "blocked" ? (
+        <div
+          className="space-y-2"
+          style={{
+            border: "1px solid var(--rule)",
+            borderRadius: "4px",
+            background: "var(--surface)",
+            padding: "16px 18px",
+          }}
+        >
+          <p style={{ color: "var(--fg)", fontSize: "14px" }}>
+            The embedded explorer couldn&apos;t load here.
+          </p>
+          <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+            <code>mempool.bitcoinghost.org</code> either isn&apos;t reachable from this
+            browser or declined to be framed (a TLS certificate that doesn&apos;t cover the{" "}
+            <code>mempool.</code> subdomain is the usual cause). Open it directly for the
+            full unfiltered network view: {openLink}.
+          </p>
+        </div>
+      ) : (
+        <div
+          style={{
+            border: "1px solid var(--rule)",
+            borderRadius: "4px",
+            overflow: "hidden",
+            background: "var(--surface)",
+            height: "300px",
+          }}
+        >
+          <iframe
+            src={`${MEMPOOL_REFERENCE_URL}/`}
+            title="Network mempool (mempool.space) — unfiltered reference"
+            loading="lazy"
+            onLoad={() => {
+              if (timer.current) clearTimeout(timer.current);
+              setState("ok");
+            }}
+            style={{ width: "100%", height: "100%", border: 0, display: "block" }}
+          />
+        </div>
+      )}
+
+      <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "12px" }}>
+        Served from the pool&apos;s hosted mempool.space instance at{" "}
+        <code>mempool.bitcoinghost.org</code>. This is the stock, unfiltered mempool — your
+        node&apos;s filtered view and the Reaper strip breakdown are below.
+      </p>
+    </Card>
   );
 }
 
