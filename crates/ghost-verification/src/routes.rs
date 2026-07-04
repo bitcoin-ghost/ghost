@@ -2393,6 +2393,7 @@ fn mesh_node_to_json(node: &MeshNodeInfo) -> serde_json::Value {
         },
         "hashrate_th": node.hashrate_th,
         "miner_count": node.miner_count,
+        "deduped_miner_count": node.deduped_miner_count,
         "healthy": node.healthy,
         "is_self": false,
     })
@@ -2447,6 +2448,9 @@ async fn api_pool_mesh_nodes_handler(
         // 0.0 on deploys without the local-hashrate provider wired.
         "hashrate_th": state.local_hashrate().unwrap_or(0.0),
         "miner_count": health.miner_count,
+        // Deduped share attributed to this node (see `deduped_miner_counts`);
+        // self + peers sum to the deduped mesh-wide active-miner total.
+        "deduped_miner_count": state.self_deduped_miner_count(),
         // Self is serving this request, so it is healthy by definition.
         "healthy": true,
         "is_self": true,
@@ -7525,6 +7529,9 @@ async fn pool_nodes_handler(State(state): State<Arc<VerificationState>>) -> impl
         "this_node": {
             "miner_count": state.miner_count(),
             "max_capacity": state.max_capacity(),
+            // Deduped share attributed to this node; `this_node` + every peer's
+            // `deduped_miner_count` sum to the deduped `mesh_active_miners`.
+            "deduped_miner_count": state.self_deduped_miner_count(),
         },
         "peers": state.pool_peers(),
     }))
@@ -8236,6 +8243,7 @@ mod tests {
             cap_elder: true,
             hashrate_th: 12.5,
             miner_count: 3,
+            deduped_miner_count: 2,
             healthy: true,
         };
 
@@ -8245,6 +8253,7 @@ mod tests {
         assert_eq!(v["elder"], true);
         assert_eq!(v["hashrate_th"], 12.5);
         assert_eq!(v["miner_count"], 3);
+        assert_eq!(v["deduped_miner_count"], 2);
         assert_eq!(v["healthy"], true);
         // Peers are never self.
         assert_eq!(v["is_self"], false);
@@ -8272,6 +8281,7 @@ mod tests {
             cap_elder: false,
             hashrate_th: 0.0,
             miner_count: 0,
+            deduped_miner_count: 0,
             healthy: false,
         };
 
@@ -8279,6 +8289,7 @@ mod tests {
         assert_eq!(v["address"], "");
         assert_eq!(v["hashrate_th"], 0.0);
         assert_eq!(v["miner_count"], 0);
+        assert_eq!(v["deduped_miner_count"], 0);
         assert_eq!(v["healthy"], false);
         assert!(v["capabilities"].is_object());
     }

@@ -864,6 +864,16 @@ pub struct PoolPeerInfo {
     /// reported it yet (treated as "unknown" / excluded from routing).
     #[serde(default)]
     pub max_capacity: u32,
+    /// Deduplicated share of the mesh-wide active-miner total attributed to
+    /// this peer: each unique miner-id hash is owned by exactly one node
+    /// (freshest gossip wins, ties by node id), so summing this across all
+    /// nodes (self + peers) equals the deduped `mesh_active_miners` grand total.
+    /// The raw `miner_count` above is kept unchanged for the translator load
+    /// balancer (utilisation = miner_count / max_capacity); this field is for
+    /// the Capacity page's per-node breakdown, which must not double-count a
+    /// miner that fails over between nodes.
+    #[serde(default)]
+    pub deduped_miner_count: u32,
 }
 
 /// One mesh node as surfaced by the public `/api/v1/pool/mesh-nodes`
@@ -901,6 +911,12 @@ pub struct MeshNodeInfo {
     pub hashrate_th: f64,
     /// Miners currently connected to this node.
     pub miner_count: u32,
+    /// Deduplicated share of the mesh-wide active-miner total attributed to
+    /// this node: each unique miner-id hash is owned by exactly one node, so
+    /// summing this across the mesh-nodes list (self + peers) equals the
+    /// deduped grand total. The raw `miner_count` is retained for display; this
+    /// is the sum-consistent figure that avoids double-counting fail-over.
+    pub deduped_miner_count: u32,
     /// Whether the node is considered healthy/reachable on the mesh.
     pub healthy: bool,
 }
@@ -993,6 +1009,13 @@ pub struct VerificationState {
     /// count that's stable across the round rotations and load-balancer
     /// hopping that make per-VM counts misleading when summed.
     get_mesh_active_miners: Option<Box<dyn Fn() -> u32 + Send + Sync>>,
+    /// This node's (self) deduplicated share of the mesh-wide active-miner
+    /// total — the count attributed to our own node id by the same
+    /// per-node attribution that fills each peer's `deduped_miner_count`.
+    /// Surfaced on the `this_node`/self entries of the pool-nodes and
+    /// mesh-nodes responses so `self + peers` sum to `get_mesh_active_miners`.
+    /// None on older deploys without the provider wired.
+    get_self_deduped_miners: Option<Box<dyn Fn() -> u32 + Send + Sync>>,
     /// Mesh-wide pool hashrate (TH/s): sum of every node's own realized
     /// hashrate (one term per node, scoped by `received_by` at source so it
     /// can't double-count), so load-balancer migrations don't crater or inflate
@@ -1193,6 +1216,7 @@ impl VerificationState {
             get_reaper_stats: None,
             get_coordinator_status: None,
             get_mesh_active_miners: None,
+            get_self_deduped_miners: None,
             get_mesh_total_hashrate: None,
             get_local_hashrate: None,
             get_mesh_best_records: None,
@@ -1708,6 +1732,25 @@ impl VerificationState {
     /// callback has been wired up (older deploys without the mesh provider).
     pub fn mesh_active_miners(&self) -> Option<u32> {
         self.get_mesh_active_miners.as_ref().map(|f| f())
+    }
+
+    /// Set the self (this-node) deduplicated active-miner-count callback.
+    pub fn with_self_deduped_miner_count(
+        mut self,
+        f: impl Fn() -> u32 + Send + Sync + 'static,
+    ) -> Self {
+        self.get_self_deduped_miners = Some(Box::new(f));
+        self
+    }
+
+    /// This node's deduplicated share of the mesh-wide active-miner total, or 0
+    /// when the provider isn't wired (older deploys) — in which case the
+    /// per-node breakdown simply omits self's deduped figure.
+    pub fn self_deduped_miner_count(&self) -> u32 {
+        self.get_self_deduped_miners
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or(0)
     }
 
     /// Set the mesh-wide pool hashrate (TH/s) callback.

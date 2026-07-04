@@ -5774,9 +5774,15 @@ async fn main() -> Result<()> {
     );
 
     // Wire pool-peers callback for the translator load-balancer endpoint.
+    // `deduped_miner_count` is the per-node share of the mesh-wide active-miner
+    // total (attributed over the same 300s window as `mesh_active_miners`), so
+    // the Capacity page's per-node rows sum to the deduped grand total instead
+    // of over-counting miners that fail over between nodes. The raw
+    // `miner_count` is left untouched for the LB's utilisation routing.
     let mesh_for_pool_peers = Arc::clone(&mesh);
     verification_state = verification_state.with_pool_peers(move || {
         use ghost_verification::PoolPeerInfo;
+        let deduped = mesh_for_pool_peers.deduped_miner_counts(300);
         mesh_for_pool_peers
             .peers()
             .get_connected_peers(30)
@@ -5788,6 +5794,7 @@ async fn main() -> Result<()> {
                 public_mining: true,
                 last_seen: p.last_seen,
                 max_capacity: p.max_capacity,
+                deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
             })
             .collect()
     });
@@ -5801,6 +5808,9 @@ async fn main() -> Result<()> {
     let mesh_for_node_list = Arc::clone(&mesh);
     verification_state = verification_state.with_mesh_nodes(move || {
         use ghost_verification::MeshNodeInfo;
+        // Deduped per-node counts over the 300s active-miner window (matching
+        // the mesh grand total) so the mesh-nodes list sums consistently.
+        let deduped = mesh_for_node_list.deduped_miner_counts(300);
         mesh_for_node_list
             .peers()
             .get_connected_peers(120)
@@ -5816,6 +5826,7 @@ async fn main() -> Result<()> {
                 cap_elder: p.capabilities.elder_status,
                 hashrate_th: p.local_hashrate_th,
                 miner_count: p.miner_count,
+                deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
                 // get_connected_peers already filtered to Connected + fresh.
                 healthy: true,
             })
@@ -5837,6 +5848,18 @@ async fn main() -> Result<()> {
     let mesh_for_active = Arc::clone(&mesh);
     verification_state = verification_state
         .with_mesh_active_miners(move || mesh_for_active.mesh_active_miner_count(300) as u32);
+
+    // This node's (self) deduped share of that mesh-wide total, from the same
+    // attribution that fills each peer's `deduped_miner_count`. Surfaced on the
+    // self/`this_node` entries so `self + peers` sum to `mesh_active_miners`.
+    let mesh_for_self_deduped = Arc::clone(&mesh);
+    verification_state = verification_state.with_self_deduped_miner_count(move || {
+        let counts = mesh_for_self_deduped.deduped_miner_counts(300);
+        counts
+            .get(&mesh_for_self_deduped.peers().our_node_id())
+            .copied()
+            .unwrap_or(0)
+    });
 
     // Mesh-wide pool hashrate (TH/s) — sum of every node's own realized
     // hashrate (60s peer freshness). One term per node, scoped by received_by
