@@ -243,6 +243,25 @@ $ sudo systemctl restart ghost-dashboard
 Existing `ghost-session` cookies remain valid until they expire — restart
 forces a fresh login because the JWT secret is process-scoped.
 
+### Recover a forgotten password
+
+Because the dashboard binds loopback and auth is a single `DASHBOARD_PASSWORD`,
+a *forgotten* password would lock the operator out — and there is deliberately
+no web-based reset (that would be an authentication bypass). Recovery instead
+relies on **node access**, which reaching the dashboard already implies. On the
+node, as root, run the bundled helper:
+
+```bash
+$ sudo scripts/agathion-reset-password.sh
+```
+
+It generates (or accepts, via `--password`) a strong password, writes it to the
+`override.conf` drop-in above while preserving other `Environment=` entries,
+drops any explicit `DASHBOARD_JWT_SECRET` so old sessions die, runs
+`daemon-reload` + `restart`, and prints the new password. The login page's
+"Forgot password?" link points operators to this command. See the dashboard
+README ("Password recovery") for details.
+
 ### Best Practices
 
 1. Use SSH key authentication (no passwords) for the SSH tunnel.

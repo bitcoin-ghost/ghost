@@ -193,6 +193,41 @@ User=ghost
 
 When deployed alongside ghost-node, the dashboard is accessible at the node's IP on port 3000. Ensure the ghost-node API is running on port 8080.
 
+## Password recovery
+
+Auth is a single `DASHBOARD_PASSWORD`, read from the dashboard's systemd
+drop-in (`/etc/systemd/system/ghost-dashboard.service.d/override.conf`), and
+the dashboard binds loopback. So a forgotten password can lock the operator
+out — there is **no web-based reset**, because a web endpoint that reset the
+password would be an authentication bypass (anyone who could reach the login
+page could take over the node).
+
+Instead, the recovery credential is **node access itself**: reaching the
+dashboard already implies SSH or local access to the node, and only someone
+with that access should be able to reset the password. Run this on the node,
+as root:
+
+```bash
+sudo scripts/agathion-reset-password.sh
+```
+
+It:
+
+- Generates a strong password (or accepts one via `--password <value>`).
+- Writes it to the systemd drop-in as the `DASHBOARD_PASSWORD=` line,
+  **preserving every other `Environment=` entry**, and creates the drop-in if
+  it does not exist yet.
+- Drops any explicit `DASHBOARD_JWT_SECRET=` so the JWT signing secret
+  re-derives from the new password — this plus the restart invalidates all
+  existing `ghost-session` cookies (old sessions die).
+- Runs `systemctl daemon-reload && systemctl restart ghost-dashboard`.
+- Prints the new password.
+
+The script backs up the drop-in before editing it and is idempotent (re-running
+just sets a fresh password). Useful flags: `--no-restart` (write only),
+`--service <name>` (non-default unit name), `--help`. The login page's "Forgot
+password?" link points operators here.
+
 ## Technology Stack
 
 - **Framework**: Next.js 14 (App Router)
