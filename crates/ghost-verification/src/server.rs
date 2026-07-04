@@ -197,12 +197,26 @@ fn is_trusted_proxy(ip: &std::net::IpAddr, trusted: &[std::net::IpAddr]) -> bool
     trusted.contains(ip)
 }
 
-/// AUTH4-M1: Custom key extractor that uses NodeId from X-Ghost-NodeId header
-/// with fallback to IP address.
+/// Rate-limiter key extractor. Keys STRICTLY by the real network peer IP.
 ///
-/// This provides better rate limiting by identifying nodes by their cryptographic
-/// identity rather than just IP, preventing attackers from bypassing limits by
-/// changing IPs while still providing a fallback for anonymous requests.
+/// # SYBIL-1: why this no longer keys by `X-Ghost-NodeId`
+///
+/// A previous version keyed the limiter by a client-supplied `X-Ghost-NodeId`
+/// header, validated only for FORMAT (64 hex chars) and never cryptographically
+/// verified. That was a Sybil/DoS hole: an attacker could rotate a fresh random
+/// 64-hex node id on every request, and each distinct value minted its own
+/// token bucket (`5/s + burst 20`), so a single socket obtained effectively
+/// unlimited throughput — the DoS defence was fully defeated. Ghost is a
+/// PERMISSIONLESS network, so there is no allowlist of "real" node ids to check
+/// a claimed header against, and an unverified identity is worthless as a rate
+/// key. The header branch has been REMOVED. Identity is now established only
+/// cryptographically, in `rate_limit_middleware`, by verifying the mesh HMAC
+/// signature the request carries — never by a bare, forgeable claim.
+///
+/// The key is derived exclusively from the real TCP peer address
+/// (`ConnectInfo<SocketAddr>`), optionally corrected by proxy-forwarding
+/// headers ONLY when the direct peer is a configured trusted proxy (see below).
+/// An attacker cannot change this key without controlling a different source IP.
 ///
 /// C-2: X-Forwarded-For and X-Real-IP headers are ONLY trusted when the direct
 /// peer IP is in the trusted proxy list. This prevents IP spoofing attacks.
@@ -237,7 +251,7 @@ fn is_trusted_proxy(ip: &std::net::IpAddr, trusted: &[std::net::IpAddr]) -> bool
 /// - `GHOST_TRUSTED_PROXIES`: Comma-separated list of trusted proxy IPs
 /// - `GHOST_TRUSTED_PROXY_COUNT`: Number of proxies in your infrastructure (1-10, default: 1)
 #[derive(Debug, Clone)]
-pub struct NodeIdKeyExtractor {
+pub struct PeerIpKeyExtractor {
     trusted_proxies: Vec<std::net::IpAddr>,
     /// M-14/MED-VER-6: Number of trusted proxies in the chain.
     /// MUST match your exact infrastructure to prevent IP spoofing.
@@ -246,7 +260,7 @@ pub struct NodeIdKeyExtractor {
     trusted_proxy_count: usize,
 }
 
-impl Default for NodeIdKeyExtractor {
+impl Default for PeerIpKeyExtractor {
     fn default() -> Self {
         Self::new()
     }
@@ -275,8 +289,8 @@ fn get_trusted_proxy_count() -> usize {
         .unwrap_or(1) // Default: single proxy
 }
 
-impl NodeIdKeyExtractor {
-    /// Create a new NodeIdKeyExtractor with trusted proxies from environment.
+impl PeerIpKeyExtractor {
+    /// Create a new PeerIpKeyExtractor with trusted proxies from environment.
     pub fn new() -> Self {
         let trusted_proxy_count = get_trusted_proxy_count();
         tracing::info!(
@@ -314,22 +328,17 @@ impl NodeIdKeyExtractor {
 /// Key type for NodeId-based rate limiting
 /// Either a 32-byte NodeId or an IP address (encoded as string for simplicity)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NodeIdOrIpKey(String);
+pub struct PeerIpKey(String);
 
-impl KeyExtractor for NodeIdKeyExtractor {
-    type Key = NodeIdOrIpKey;
+impl KeyExtractor for PeerIpKeyExtractor {
+    type Key = PeerIpKey;
 
     fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, GovernorError> {
-        // Try X-Ghost-NodeId header first (64-char hex-encoded NodeId)
-        if let Some(node_id) = req.headers().get("X-Ghost-NodeId") {
-            if let Ok(node_id_str) = node_id.to_str() {
-                let s: &str = node_id_str;
-                // Validate it looks like a valid node ID (64 hex chars = 32 bytes)
-                if s.len() == 64 && s.chars().all(|c: char| c.is_ascii_hexdigit()) {
-                    return Ok(NodeIdOrIpKey(format!("node:{}", s)));
-                }
-            }
-        }
+        // SYBIL-1: The unverified `X-Ghost-NodeId` keying branch has been REMOVED.
+        // Keying by a claimed, unauthenticated identity let an attacker rotate a
+        // fresh 64-hex value per request to mint a fresh token bucket each time,
+        // defeating the limiter. The key is now ALWAYS the real network peer IP
+        // (below), which an attacker cannot rotate without new source addresses.
 
         // C-2: Get actual peer IP from connection info FIRST
         let peer_ip = req
@@ -367,14 +376,14 @@ impl KeyExtractor for NodeIdKeyExtractor {
                         let client_index = ips.len() - 1 - self.trusted_proxy_count;
                         let client_ip = ips[client_index];
                         if !client_ip.is_empty() {
-                            return Ok(NodeIdOrIpKey(format!("ip:{}", client_ip)));
+                            return Ok(PeerIpKey(format!("ip:{}", client_ip)));
                         }
                     } else if !ips.is_empty() {
                         // M-14: Not enough IPs in chain, take the first (client)
                         // This handles the case where we have fewer hops than expected
                         let client_ip = ips[0];
                         if !client_ip.is_empty() {
-                            return Ok(NodeIdOrIpKey(format!("ip:{}", client_ip)));
+                            return Ok(PeerIpKey(format!("ip:{}", client_ip)));
                         }
                     }
                 }
@@ -385,14 +394,14 @@ impl KeyExtractor for NodeIdKeyExtractor {
             if let Some(xri) = req.headers().get("X-Real-IP") {
                 if let Ok(ip_str) = xri.to_str() {
                     let s: &str = ip_str;
-                    return Ok(NodeIdOrIpKey(format!("ip:{}", s)));
+                    return Ok(PeerIpKey(format!("ip:{}", s)));
                 }
             }
         }
 
         // Fall back to actual peer IP
         if let Some(ip) = peer_ip {
-            return Ok(NodeIdOrIpKey(format!("ip:{}", ip)));
+            return Ok(PeerIpKey(format!("ip:{}", ip)));
         }
 
         // Last resort: unknown source
@@ -534,17 +543,66 @@ fn parse_rate_limit_trusted_ips(entries: &[String]) -> Vec<ipnet::IpNet> {
         .collect()
 }
 
-/// Rate limiting state shared with the rate_limit_middleware
+/// Concrete keyed rate limiter used for both tiers (base + mesh).
+type IpRateLimiter = governor::RateLimiter<
+    PeerIpKey,
+    governor::state::keyed::DashMapStateStore<PeerIpKey>,
+    governor::clock::DefaultClock,
+>;
+
+/// SYBIL-1: Sustained request rate (per second) for UNAUTHENTICATED traffic —
+/// the tight DoS-defence tier. Unchanged from HIGH-VER-5.
+pub const RATE_LIMIT_BASE_PER_SEC: u32 = 5;
+/// SYBIL-1: Burst capacity for unauthenticated traffic. Unchanged from HIGH-VER-5.
+pub const RATE_LIMIT_BASE_BURST: u32 = 20;
+
+/// SYBIL-1: Sustained request rate (per second) for requests that are
+/// CRYPTOGRAPHICALLY PROVEN to come from a registered mesh peer (a valid mesh
+/// HMAC signature, see `rate_limit_middleware`). Higher than the base tier so
+/// legitimate inter-node traffic (verification challenges, gossip, swarm/health
+/// polling) is never throttled, but still strictly BOUNDED.
+///
+/// Sizing: a node is challenged/polled by every other mesh peer. With a mesh of
+/// a few dozen nodes each issuing verification challenges (every 5 min, several
+/// capabilities), gossip, and health/stats polling, legitimate peak inter-node
+/// load stays comfortably under 40 req/s from any single peer IP. 40/s is 8x the
+/// base tier — generous for honest traffic yet still a hard ceiling: even a
+/// fully compromised or key-holding peer is capped at 40/s + burst 120 PER IP,
+/// so it cannot DoS the node, and it cannot be amplified by forging identities
+/// (the tier is IP-keyed, not identity-keyed).
+pub const RATE_LIMIT_MESH_PER_SEC: u32 = 40;
+/// SYBIL-1: Burst capacity for proven mesh-peer traffic (3x sustained, mirroring
+/// the base tier's burst/sustained ratio).
+pub const RATE_LIMIT_MESH_BURST: u32 = 120;
+
+/// Rate limiting state shared with the rate_limit_middleware.
+///
+/// # SYBIL-1: two IP-keyed tiers, cryptographically gated
+///
+/// Both tiers are keyed by the REAL peer IP (never a claimed identity):
+///
+/// * `base_limiter` (`5/s + burst 20`) — every unauthenticated request. This is
+///   the DoS-defence tier and the default for all external/public traffic.
+/// * `mesh_limiter` (`40/s + burst 120`) — a request is promoted to this higher
+///   (but still bounded) tier ONLY when it carries a mesh HMAC signature
+///   (`X-Ghost-Signature` + `X-Ghost-Timestamp`) that VERIFIES against the
+///   node's shared internal-auth secret — i.e. it provably came from a holder of
+///   the mesh secret (a registered mesh participant). A forged or absent
+///   signature never elevates; those requests stay on `base_limiter`.
+///
+/// See the `rate_limit_middleware` doc comment for the full Sybil/DoS analysis.
 #[derive(Clone)]
 struct RateLimitState {
-    key_extractor: NodeIdKeyExtractor,
-    limiter: Arc<
-        governor::RateLimiter<
-            NodeIdOrIpKey,
-            governor::state::keyed::DashMapStateStore<NodeIdOrIpKey>,
-            governor::clock::DefaultClock,
-        >,
-    >,
+    key_extractor: PeerIpKeyExtractor,
+    /// Tight tier for unauthenticated traffic (`5/s + burst 20`).
+    base_limiter: Arc<IpRateLimiter>,
+    /// Higher, bounded tier for cryptographically-proven mesh peers
+    /// (`40/s + burst 120`).
+    mesh_limiter: Arc<IpRateLimiter>,
+    /// Shared mesh HMAC secret used to PROVE a request came from a registered
+    /// mesh peer. `None` in insecure/dev mode, in which case no request can be
+    /// elevated and everything stays on the base tier (fail-closed).
+    internal_auth: Option<Arc<crate::auth::InternalAuth>>,
     /// Operator-configured allowlist of trusted networks that bypass the rate
     /// limiter entirely. Populated from `[network] rate_limit_trusted_ips`.
     ///
@@ -554,9 +612,50 @@ struct RateLimitState {
     trusted_ips: Arc<Vec<ipnet::IpNet>>,
 }
 
-/// Rate limiting middleware that exempts loopback (localhost) connections and
-/// any operator-configured trusted IPs. External traffic is rate-limited per
-/// NodeId/IP as before.
+/// Rate-limiting middleware. Exempts loopback (localhost) and operator-configured
+/// trusted IPs; everything else is limited per REAL peer IP in one of two tiers.
+///
+/// # SYBIL-1 / DoS analysis (permissionless-safe rate limiting)
+///
+/// Ghost is permissionless: anyone can run a node, so we CANNOT recognise
+/// legitimate peers from a hand-maintained IP allowlist. Peers are instead
+/// recognised CRYPTOGRAPHICALLY and automatically: the mesh already signs
+/// inter-node HTTP with an HMAC-SHA256 over `timestamp || body` under a shared
+/// secret (`InternalAuth`), sent as `X-Ghost-Signature` + `X-Ghost-Timestamp`.
+/// Holding that secret is exactly what it means to be a registered mesh
+/// participant, so a valid signature is proof of mesh membership — no manual
+/// list, auto-recognises every real node.
+///
+/// Tiering (both keyed by the real socket peer IP, via `PeerIpKeyExtractor`):
+///
+/// 1. Unauthenticated request → `base_limiter` (`5/s + burst 20`). Tight DoS
+///    defence; the default for all public/external traffic.
+/// 2. Request with a mesh HMAC signature that VERIFIES → `mesh_limiter`
+///    (`40/s + burst 120`). Higher but still bounded, for legit inter-node work.
+///
+/// Why this closes the Sybil/DoS hole and cannot be abused:
+///
+/// * **Forged/absent signature earns nothing.** Elevation requires a signature
+///   that verifies under the shared secret; without the private secret an
+///   attacker cannot produce one (constant-time HMAC compare), and the 30s
+///   timestamp window blocks replay. Such requests fall through to
+///   `base_limiter` — identical to an anonymous client.
+/// * **The higher tier is IP-keyed and bounded.** Even a genuine (or somehow
+///   compromised) mesh peer is capped at `40/s + burst 120` PER SOURCE IP. It
+///   cannot exceed that by presenting many identities, because the key is the
+///   socket IP, not any claimed/signed id — signing merely selects which
+///   bounded bucket the IP's own traffic draws from.
+/// * **No identity rotation amplifies throughput.** The removed `X-Ghost-NodeId`
+///   branch let a single socket mint unlimited buckets by rotating a claimed id.
+///   Now both tiers key on IP only, so an attacker must acquire many real source
+///   IPs to raise aggregate throughput — the exact cost of the base DoS defence,
+///   unchanged by the mesh tier.
+/// * **Membership requires real mesh participation.** The secret is provisioned
+///   to operating mesh nodes, not mintable for free by a remote attacker.
+///
+/// Net: there is NO path by which a free or forged identity raises its own
+/// limit. The only lever is controlling more source IPs, which the base tier
+/// already bounds.
 async fn rate_limit_middleware(
     axum::extract::State(state): axum::extract::State<RateLimitState>,
     request: axum::extract::Request,
@@ -599,21 +698,66 @@ async fn rate_limit_middleware(
         }
     }
 
-    // Extract key and check rate limit for external traffic
-    match state.key_extractor.extract(&request) {
-        Ok(key) => match state.limiter.check_key(&key) {
-            Ok(_) => next.run(request).await,
-            Err(_not_until) => axum::http::Response::builder()
-                .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
-                .body(axum::body::Body::from("rate limited"))
-                .unwrap_or_else(|_| {
-                    axum::http::Response::new(axum::body::Body::from("rate limited"))
-                }),
-        },
-        Err(_) => {
-            // Unable to extract key - allow request rather than failing
-            next.run(request).await
+    // Derive the rate-limit key from the REAL peer IP (never a claimed identity).
+    // Computed before we touch the body so the cheap path (no signature) stays
+    // allocation-light.
+    let key = match state.key_extractor.extract(&request) {
+        Ok(key) => key,
+        // Unable to extract a key (no ConnectInfo) — allow rather than fail.
+        Err(_) => return next.run(request).await,
+    };
+
+    // SYBIL-1: Decide the tier. A request is elevated to the mesh tier ONLY if it
+    // carries a mesh HMAC signature that verifies against our shared secret. We
+    // only pay the body-buffering + HMAC cost when BOTH signature headers are
+    // present AND internal auth is configured, so unauthenticated/public traffic
+    // (the DoS target) takes the cheap path with no body buffering.
+    let presents_signature = request.headers().contains_key("X-Ghost-Signature")
+        && request.headers().contains_key("X-Ghost-Timestamp");
+
+    let (request, limiter) = match (&state.internal_auth, presents_signature) {
+        (Some(auth), true) => {
+            let auth = Arc::clone(auth);
+            // Buffer the body to verify HMAC over `timestamp || body`. Bounded by
+            // the outer DefaultBodyLimit (1 MiB) layer, so this cannot be abused
+            // to force unbounded buffering ahead of the limiter.
+            let (parts, body) = request.into_parts();
+            match axum::body::to_bytes(body, 1024 * 1024).await {
+                Ok(bytes) => {
+                    let verified =
+                        crate::auth::verify_internal_auth(&auth, &parts.headers, &bytes).is_ok();
+                    let request =
+                        axum::http::Request::from_parts(parts, axum::body::Body::from(bytes));
+                    if verified {
+                        // Proven registered mesh peer → higher, bounded tier.
+                        (request, &state.mesh_limiter)
+                    } else {
+                        // Forged/stale signature earns nothing → tight tier.
+                        (request, &state.base_limiter)
+                    }
+                }
+                // Body exceeded the limit or failed to read: treat as
+                // unauthenticated and keep the tight tier.
+                Err(_) => {
+                    let request = axum::http::Request::from_parts(
+                        parts,
+                        axum::body::Body::from("rate limited"),
+                    );
+                    (request, &state.base_limiter)
+                }
+            }
         }
+        // No signature presented, or internal auth disabled → tight tier.
+        _ => (request, &state.base_limiter),
+    };
+
+    // Enforce the selected tier against the IP key.
+    match limiter.check_key(&key) {
+        Ok(_) => next.run(request).await,
+        Err(_not_until) => axum::http::Response::builder()
+            .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+            .body(axum::body::Body::from("rate limited"))
+            .unwrap_or_else(|_| axum::http::Response::new(axum::body::Body::from("rate limited"))),
     }
 }
 
@@ -2450,33 +2594,36 @@ pub async fn start_server(
             .max_age(Duration::from_secs(3600))
     };
 
-    // Rate limiting configuration - AUTH4-M1: NodeId-based rate limiting
-    // HIGH-VER-5: Tightened rate limits for verification endpoints
-    // - 20 requests per second burst capacity (down from 50)
-    // - Refills at 5 requests per second (down from 10)
-    // - Per NodeId (from X-Ghost-NodeId header) with IP fallback
-    // This prevents abuse while allowing legitimate verification traffic
-    // (3 peers * 4 capabilities = 12 requests per 5-minute cycle)
+    // SYBIL-1: Two IP-keyed rate-limit tiers (see `rate_limit_middleware`).
+    // Both key on the REAL socket peer IP — NOT a claimed identity — so no
+    // amount of header/identity rotation from one socket mints extra buckets.
+    // - base: 5/s + burst 20 (HIGH-VER-5) — every unauthenticated request.
+    // - mesh: 40/s + burst 120 — only for requests that carry a mesh HMAC
+    //   signature verifying against the shared internal-auth secret (proof of
+    //   registered mesh participation). Higher but bounded.
     // L-28: Use proper error handling instead of expect()
-    let governor_conf = Arc::new(
+    let build_limiter = |per_second: u32, burst: u32| -> GhostResult<Arc<IpRateLimiter>> {
         GovernorConfigBuilder::default()
-            .per_second(5) // HIGH-VER-5: Reduced from 10 to 5
-            .burst_size(20) // HIGH-VER-5: Reduced from 50 to 20
-            .key_extractor(NodeIdKeyExtractor::new())
+            .per_second(per_second as u64)
+            .burst_size(burst)
+            .key_extractor(PeerIpKeyExtractor::new())
             .finish()
+            .map(|conf| conf.limiter().clone())
             .ok_or_else(|| {
                 GhostError::Config(
                     "L-28: Failed to initialize rate limiter: invalid configuration. \
                      This is an internal configuration error."
                         .to_string(),
                 )
-            })?,
-    );
-
-    let governor_limiter = governor_conf.limiter().clone();
+            })
+    };
+    let base_limiter = build_limiter(RATE_LIMIT_BASE_PER_SEC, RATE_LIMIT_BASE_BURST)?;
+    let mesh_limiter = build_limiter(RATE_LIMIT_MESH_PER_SEC, RATE_LIMIT_MESH_BURST)?;
 
     // L-28: Spawn background task to clean up rate limiter state with adaptive frequency
     // Cleanup frequency increases when there are many keys to prevent memory accumulation
+    let cleanup_base = Arc::clone(&base_limiter);
+    let cleanup_mesh = Arc::clone(&mesh_limiter);
     tokio::spawn(async move {
         // Maximum number of keys before aggressive cleanup
         const MAX_EXPECTED_KEYS: usize = 10_000;
@@ -2486,8 +2633,8 @@ pub async fn start_server(
         const MIN_CLEANUP_INTERVAL_SECS: u64 = 5;
 
         loop {
-            // Get current key count and calculate adaptive interval
-            let key_count = governor_limiter.len();
+            // Get current key count (across both tiers) and calculate interval
+            let key_count = cleanup_base.len() + cleanup_mesh.len();
 
             // Adaptive cleanup: more frequent when more keys present
             // Linear interpolation: 60s at 0 keys, 5s at 10000+ keys
@@ -2500,7 +2647,8 @@ pub async fn start_server(
             };
 
             tokio::time::sleep(Duration::from_secs(cleanup_interval)).await;
-            governor_limiter.retain_recent();
+            cleanup_base.retain_recent();
+            cleanup_mesh.retain_recent();
 
             // Log warning if key count is high
             if key_count > MAX_EXPECTED_KEYS / 2 {
@@ -2536,9 +2684,15 @@ pub async fn start_server(
              (matched against real socket peer IP only)"
         );
     }
+    // SYBIL-1: capture the shared mesh HMAC secret BEFORE `state` is moved into
+    // the router. It gates elevation to the mesh tier; `None` (insecure/dev mode)
+    // means nothing can be elevated and all traffic stays on the base tier.
+    let rate_limit_internal_auth = state.internal_auth.clone();
     let rate_limit_state = RateLimitState {
-        key_extractor: NodeIdKeyExtractor::new(),
-        limiter: governor_conf.limiter().clone(),
+        key_extractor: PeerIpKeyExtractor::new(),
+        base_limiter,
+        mesh_limiter,
+        internal_auth: rate_limit_internal_auth,
         trusted_ips: Arc::new(rate_limit_trusted_ips),
     };
     let app = create_router(state)
@@ -2974,7 +3128,7 @@ mod tests {
     #[test]
     fn test_xff_single_proxy() {
         // With 1 trusted proxy: "client, proxy1" -> take "client"
-        let extractor = NodeIdKeyExtractor::with_trusted_proxies_and_count(
+        let extractor = PeerIpKeyExtractor::with_trusted_proxies_and_count(
             vec!["127.0.0.1".parse().unwrap()],
             1,
         );
@@ -2984,7 +3138,7 @@ mod tests {
     #[test]
     fn test_xff_multi_proxy() {
         // With 2 trusted proxies: "client, cdn, lb" -> take "client"
-        let extractor = NodeIdKeyExtractor::with_trusted_proxies_and_count(
+        let extractor = PeerIpKeyExtractor::with_trusted_proxies_and_count(
             vec!["127.0.0.1".parse().unwrap()],
             2,
         );
@@ -2994,7 +3148,7 @@ mod tests {
     #[test]
     fn test_xff_proxy_count_clamped() {
         // Proxy count should be clamped to valid range [1, 10]
-        let extractor_zero = NodeIdKeyExtractor::with_trusted_proxies_and_count(
+        let extractor_zero = PeerIpKeyExtractor::with_trusted_proxies_and_count(
             vec!["127.0.0.1".parse().unwrap()],
             0,
         );
@@ -3003,7 +3157,7 @@ mod tests {
             "M-14: Count 0 should clamp to 1"
         );
 
-        let extractor_high = NodeIdKeyExtractor::with_trusted_proxies_and_count(
+        let extractor_high = PeerIpKeyExtractor::with_trusted_proxies_and_count(
             vec!["127.0.0.1".parse().unwrap()],
             100,
         );
@@ -3046,28 +3200,49 @@ mod tests {
         assert!(parse_rate_limit_trusted_ips(&[]).is_empty());
     }
 
-    /// Build a router whose only layer is the real `rate_limit_middleware`, wired
-    /// with the production limits (5/s, burst 20) and the given trusted allowlist.
-    fn rate_limited_test_app(trusted: Vec<ipnet::IpNet>) -> axum::Router {
-        let governor_conf = GovernorConfigBuilder::default()
-            .per_second(5)
-            .burst_size(20)
-            .key_extractor(NodeIdKeyExtractor::new())
+    /// Build a keyed limiter with the given quota (mirrors `start_server`).
+    fn test_limiter(per_second: u32, burst: u32) -> Arc<IpRateLimiter> {
+        GovernorConfigBuilder::default()
+            .per_second(per_second as u64)
+            .burst_size(burst)
+            .key_extractor(PeerIpKeyExtractor::new())
             .finish()
-            .expect("valid governor config for test");
+            .expect("valid governor config for test")
+            .limiter()
+            .clone()
+    }
 
+    /// Build a router whose only layer is the real `rate_limit_middleware`, wired
+    /// with the production tiers (base 5/s+20, mesh 40/s+120), the given trusted
+    /// allowlist, and an optional mesh HMAC secret for the elevated tier.
+    fn rate_limited_test_app_full(
+        trusted: Vec<ipnet::IpNet>,
+        internal_auth: Option<Arc<crate::auth::InternalAuth>>,
+    ) -> axum::Router {
         let state = RateLimitState {
-            key_extractor: NodeIdKeyExtractor::new(),
-            limiter: governor_conf.limiter().clone(),
+            key_extractor: PeerIpKeyExtractor::new(),
+            base_limiter: test_limiter(RATE_LIMIT_BASE_PER_SEC, RATE_LIMIT_BASE_BURST),
+            mesh_limiter: test_limiter(RATE_LIMIT_MESH_PER_SEC, RATE_LIMIT_MESH_BURST),
+            internal_auth,
             trusted_ips: Arc::new(trusted),
         };
 
         axum::Router::new()
-            .route("/", axum::routing::get(|| async { "ok" }))
+            // GET for plain tests; POST so signature tests can carry a body
+            // that the mesh HMAC is computed over.
+            .route(
+                "/",
+                axum::routing::get(|| async { "ok" }).post(|| async { "ok" }),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 state,
                 rate_limit_middleware,
             ))
+    }
+
+    /// Convenience: no mesh auth configured (base tier only).
+    fn rate_limited_test_app(trusted: Vec<ipnet::IpNet>) -> axum::Router {
+        rate_limited_test_app_full(trusted, None)
     }
 
     /// Issue one request through `app`, injecting `socket` as the REAL TCP peer
@@ -3181,5 +3356,235 @@ mod tests {
             throttled > 0,
             "empty allowlist must preserve today's behaviour (throttle past burst)"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // SYBIL-1: cryptographic two-tier rate limiting
+    // ---------------------------------------------------------------------
+
+    /// A deterministic, sufficiently-entropic 32-byte mesh secret for tests.
+    fn test_internal_auth() -> Arc<crate::auth::InternalAuth> {
+        let mut secret = [0u8; 32];
+        for (i, b) in secret.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(0x42);
+        }
+        Arc::new(crate::auth::InternalAuth::new(&secret).expect("valid 32-byte test secret"))
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Send a single request with explicit method/headers/body from `socket`.
+    async fn send_req(
+        app: &axum::Router,
+        socket: std::net::SocketAddr,
+        method: &str,
+        headers: &[(&str, String)],
+        body: Vec<u8>,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder().uri("/").method(method);
+        for (k, v) in headers {
+            builder = builder.header(*k, v.as_str());
+        }
+        let mut req = builder.body(axum::body::Body::from(body)).unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(socket));
+        app.clone()
+            .oneshot(req)
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_sybil_rotating_nodeid_shares_one_bucket() {
+        // SYBIL-1 CORE: a single untrusted socket that rotates a FRESH forged
+        // `X-Ghost-NodeId` on every request must NOT mint a fresh bucket each
+        // time. All requests share the one IP-keyed bucket and get throttled
+        // past the base burst of 20. (Pre-fix, each distinct id got its own
+        // 5/s+20 bucket → unlimited throughput.)
+        let app = rate_limited_test_app(Vec::new());
+        let socket: std::net::SocketAddr = "9.9.9.9:40000".parse().unwrap();
+
+        let mut throttled = 0usize;
+        for i in 0..60u64 {
+            // A different valid-format 64-hex node id every request.
+            let node_id = format!("{:064x}", i);
+            let status = send_req(
+                &app,
+                socket,
+                "GET",
+                &[("X-Ghost-NodeId", node_id)],
+                Vec::new(),
+            )
+            .await;
+            if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                throttled += 1;
+            }
+        }
+        assert!(
+            throttled > 0,
+            "rotating X-Ghost-NodeId from one socket must still be throttled \
+             (shared IP bucket) — got 0 x 429"
+        );
+        // Sanity: at most the burst (20) can pass before throttling kicks in.
+        assert!(
+            throttled >= 60 - RATE_LIMIT_BASE_BURST as usize,
+            "no more than the base burst should pass for one IP"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forged_signature_gets_tight_tier() {
+        // SYBIL-1: a request presenting a forged/garbage mesh signature must NOT
+        // be elevated. It falls through to the base tier and is throttled past
+        // burst 20 — identical to an anonymous client.
+        let app = rate_limited_test_app_full(Vec::new(), Some(test_internal_auth()));
+        let socket: std::net::SocketAddr = "9.9.9.9:41000".parse().unwrap();
+        let ts = now_secs().to_string();
+
+        let mut throttled = 0usize;
+        for _ in 0..40 {
+            let status = send_req(
+                &app,
+                socket,
+                "POST",
+                &[
+                    ("X-Ghost-Signature", "deadbeef".repeat(8)), // 64 hex, but wrong
+                    ("X-Ghost-Timestamp", ts.clone()),
+                ],
+                b"body".to_vec(),
+            )
+            .await;
+            if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                throttled += 1;
+            }
+        }
+        assert!(
+            throttled > 0,
+            "a forged signature must NOT elevate the tier (stays base 5/s+20)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_absent_signature_gets_tight_tier() {
+        // SYBIL-1: with mesh auth configured, a request WITHOUT signature headers
+        // still gets the tight base tier (no free elevation).
+        let app = rate_limited_test_app_full(Vec::new(), Some(test_internal_auth()));
+        let socket: std::net::SocketAddr = "9.9.9.9:42000".parse().unwrap();
+
+        let throttled = count_429s(&app, socket, None, 40).await;
+        assert!(
+            throttled > 0,
+            "no signature must mean the base tier (throttle past burst 20)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_signature_gets_mesh_tier() {
+        // SYBIL-1: a request carrying a VALID mesh HMAC signature (proof of
+        // registered mesh participation) is elevated to the higher, bounded tier
+        // (40/s + burst 120). 40 signed requests — which the base tier (burst 20)
+        // would throttle — pass cleanly under the mesh burst.
+        let auth = test_internal_auth();
+        let app = rate_limited_test_app_full(Vec::new(), Some(Arc::clone(&auth)));
+        let socket: std::net::SocketAddr = "9.9.9.9:43000".parse().unwrap();
+        let body = b"gossip-payload".to_vec();
+
+        let mut throttled = 0usize;
+        for _ in 0..40 {
+            // Sign HMAC-SHA256(secret, timestamp_le || body) — the mesh scheme.
+            let ts = now_secs();
+            let sig = auth.sign(ts, &body);
+            let status = send_req(
+                &app,
+                socket,
+                "POST",
+                &[
+                    ("X-Ghost-Signature", sig),
+                    ("X-Ghost-Timestamp", ts.to_string()),
+                ],
+                body.clone(),
+            )
+            .await;
+            if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                throttled += 1;
+            }
+        }
+        assert_eq!(
+            throttled, 0,
+            "a validly-signed mesh peer must reach the higher tier (0 x 429 at 40 reqs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mesh_tier_is_still_bounded() {
+        // SYBIL-1: the elevated tier is HIGHER but still BOUNDED. Even a genuine
+        // key-holding peer is capped per-IP — far past the mesh burst it 429s, so
+        // one compromised/key-holding peer cannot DoS the node.
+        let auth = test_internal_auth();
+        let app = rate_limited_test_app_full(Vec::new(), Some(Arc::clone(&auth)));
+        let socket: std::net::SocketAddr = "9.9.9.9:44000".parse().unwrap();
+        let body = b"flood".to_vec();
+
+        let mut throttled = 0usize;
+        // Well past the mesh burst of 120.
+        for _ in 0..(RATE_LIMIT_MESH_BURST as usize + 60) {
+            let ts = now_secs();
+            let sig = auth.sign(ts, &body);
+            let status = send_req(
+                &app,
+                socket,
+                "POST",
+                &[
+                    ("X-Ghost-Signature", sig),
+                    ("X-Ghost-Timestamp", ts.to_string()),
+                ],
+                body.clone(),
+            )
+            .await;
+            if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                throttled += 1;
+            }
+        }
+        assert!(
+            throttled > 0,
+            "the mesh tier must remain bounded (429 past the mesh burst)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_proxy_xff_still_keys_client_ip() {
+        // Existing trusted-proxy path unchanged: when the socket peer IS a
+        // trusted proxy, the client IP from X-Forwarded-For keys the limiter, so
+        // two distinct clients behind the same proxy get independent buckets.
+        // Loopback is a default trusted proxy, so send from 127.0.0.1... but
+        // loopback is exempt entirely; use an explicit trusted-proxy extractor
+        // path instead by checking the extractor directly.
+        let extractor =
+            PeerIpKeyExtractor::with_trusted_proxies(vec!["127.0.0.1".parse().unwrap()]);
+        let mk = |xff: &str, socket: std::net::SocketAddr| {
+            let mut req = axum::http::Request::builder()
+                .uri("/")
+                .header("X-Forwarded-For", xff)
+                .body(())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(socket));
+            extractor.extract(&req).unwrap()
+        };
+        let proxy: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let k1 = mk("1.2.3.4", proxy);
+        let k2 = mk("5.6.7.8", proxy);
+        assert_ne!(
+            k1, k2,
+            "distinct clients behind a trusted proxy must differ"
+        );
+        assert_eq!(k1, PeerIpKey("ip:1.2.3.4".to_string()));
     }
 }
