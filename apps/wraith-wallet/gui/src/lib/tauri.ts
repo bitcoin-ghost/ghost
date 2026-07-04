@@ -105,6 +105,15 @@ export interface DaemonEnvResponse {
   network: string;
   ghost_pay_urls: string[];
   gsp_urls: string[];
+  /// Active node preset: "public" (bundled Ghost fleet) or "custom"
+  /// (user-supplied URLs). Drives the settings radio. Older daemons omit
+  /// it — treat absence as "custom".
+  node_preset?: string;
+  /// True when WRAITHD_GHOST_PAY / WRAITHD_GSP pin the endpoints at boot.
+  /// The node selector is shown read-only and the daemon refuses changes
+  /// while either holds (env-var power-user precedence).
+  ghost_pay_env_override?: boolean;
+  gsp_env_override?: boolean;
   socket_path: string;
   wallets_dir: string;
   /// Optional Tor SOCKS5 URL the daemon routes outbound REST through.
@@ -126,6 +135,35 @@ export interface DaemonEnvResponse {
 export async function daemonEnv(): Promise<DaemonEnvResponse> {
   const resp = await invoke("daemon_env");
   return unwrap<DaemonEnvResponse>(resp).payload;
+}
+
+/// Localhost defaults for the "my own node" preset — pre-filled into the
+/// custom fields for someone running their own ghost-pay + GSP.
+export const OWN_NODE_GHOST_PAY_DEFAULT = "http://127.0.0.1:8800";
+export const OWN_NODE_GSP_DEFAULT = "ws://127.0.0.1:8900/ws/v1";
+
+export interface NodeEndpointsResult {
+  preset: string;
+  ghost_pay_urls: string[];
+  gsp_urls: string[];
+}
+
+/// Pick which node the wallet talks to. `preset` is `"public"` (bundled
+/// fleet) or `"custom"` (uses the URL args, each of which may be a
+/// comma-separated failover list). The daemon rebuilds its ghost-pay + GSP
+/// clients in place, persists the choice to `node.json`, and drops any live
+/// GSP session so it re-authenticates against the new endpoint — no restart.
+export async function setNodeEndpoints(
+  preset: "public" | "custom",
+  ghost_pay_url?: string,
+  gsp_url?: string,
+): Promise<NodeEndpointsResult> {
+  const resp = await invoke("set_node_endpoints", {
+    preset,
+    ghostPayUrl: ghost_pay_url,
+    gspUrl: gsp_url,
+  });
+  return unwrap<NodeEndpointsResult>(resp).payload;
 }
 
 export interface ChainStatusResponse {

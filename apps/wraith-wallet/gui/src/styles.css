@@ -297,6 +297,15 @@ button { cursor: pointer; }
 .card-header h2 { margin: 0; }
 .card.surface { background: var(--surface); }
 .card.error-card { border-color: var(--fail); border-left-width: 3px; }
+/* Node-selector radio rows: control aligned to the top of a two-line label. */
+.radio-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+.radio-row input[type="radio"] { margin-top: 3px; }
+fieldset:disabled .radio-row { cursor: default; opacity: 0.6; }
 .card.success { border-color: var(--pass); border-left-width: 3px; }
 .card.warn { border-color: var(--warn); border-left-width: 3px; }
 .card.muted { color: var(--dim); border-style: dashed; }

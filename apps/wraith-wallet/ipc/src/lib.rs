@@ -169,6 +169,26 @@ pub enum Request {
     /// it talks to, the network it's bound to, where it stores wallets.
     /// Useful for diagnostics + the GUI's settings panel.
     DaemonEnv,
+    /// Choose which node the wallet talks to, at runtime, and persist the
+    /// choice to `node.json` in the wallet data dir so it survives a restart.
+    ///
+    /// * `preset = "public"` — apply the bundled public-fleet preset. The
+    ///   `ghost_pay_url` / `gsp_url` fields are ignored.
+    /// * `preset = "custom"` — use `ghost_pay_url` + `gsp_url` (each may be a
+    ///   comma-separated failover list). Both are required and validated for
+    ///   the correct scheme (`http(s)://` for ghost-pay, `ws(s)://` for GSP).
+    ///
+    /// The daemon rebuilds its ghost-pay + GSP clients in place and drops any
+    /// live GSP session so it re-authenticates against the new endpoint — no
+    /// restart needed. Refused while `WRAITHD_GHOST_PAY` / `WRAITHD_GSP` pin
+    /// the endpoints (env vars keep power-user precedence).
+    SetNodeEndpoints {
+        preset: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ghost_pay_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gsp_url: Option<String>,
+    },
     /// Phase 15: ask the daemon to fetch a release manifest from
     /// `manifest_url` (or the daemon-configured default if `None`),
     /// compare the manifest's version against the running daemon's
@@ -603,6 +623,9 @@ pub enum Response {
     LightHistory(LightHistoryResponse),
     LightDetected(LightDetectedResponse),
     DaemonEnv(DaemonEnvResponse),
+    /// Reply to [`Request::SetNodeEndpoints`] — the endpoint config now in
+    /// force after the change was applied + persisted.
+    NodeEndpointsSet(NodeEndpointsResponse),
     CheckForUpdate(CheckForUpdateResponse),
     /// Acknowledgement of a `Request::WatchPayments`. Subsequent
     /// `PaymentDetected` envelopes (id=0) on the same connection are pushes,
@@ -1203,6 +1226,19 @@ pub struct DaemonEnvResponse {
     pub ghost_pay_urls: Vec<String>,
     /// Comma-separated list of GSP WebSocket URLs in failover order.
     pub gsp_urls: Vec<String>,
+    /// Which node preset is active: `public` (bundled fleet) or `custom`
+    /// (user-supplied URLs). Drives the settings UI's radio selection.
+    /// Defaults to `custom` for older daemons that don't send it.
+    #[serde(default = "default_node_preset")]
+    pub node_preset: String,
+    /// True when `WRAITHD_GHOST_PAY` pins the ghost-pay URL at boot. The UI
+    /// shows the endpoint read-only and the daemon refuses `SetNodeEndpoints`
+    /// while this holds (env-var power-user precedence).
+    #[serde(default)]
+    pub ghost_pay_env_override: bool,
+    /// True when `WRAITHD_GSP` pins the GSP URL at boot.
+    #[serde(default)]
+    pub gsp_env_override: bool,
     /// Network the daemon is bound to: `mainnet` / `signet` / `testnet` / `regtest`.
     pub network: String,
     /// Absolute path to the encrypted-keystore directory.
@@ -1229,6 +1265,23 @@ pub struct DaemonEnvResponse {
     /// mode".
     #[serde(default)]
     pub kiosk_mode: bool,
+}
+
+/// Back-compat default for `DaemonEnvResponse::node_preset` when talking to an
+/// older daemon that predates node selection.
+pub(crate) fn default_node_preset() -> String {
+    "custom".to_string()
+}
+
+/// Result of [`Request::SetNodeEndpoints`] — the endpoint config now in force.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeEndpointsResponse {
+    /// `public` or `custom`.
+    pub preset: String,
+    /// ghost-pay URLs now active, in failover order.
+    pub ghost_pay_urls: Vec<String>,
+    /// GSP WebSocket URLs now active, in failover order.
+    pub gsp_urls: Vec<String>,
 }
 
 /// Result of `LightSend` (PreparePayment + sign + SubmitSignedPayment).
@@ -1550,6 +1603,16 @@ mod tests {
                 capacity_sats: 1_000_000,
             },
             Request::DaemonEnv,
+            Request::SetNodeEndpoints {
+                preset: "public".into(),
+                ghost_pay_url: None,
+                gsp_url: None,
+            },
+            Request::SetNodeEndpoints {
+                preset: "custom".into(),
+                ghost_pay_url: Some("http://127.0.0.1:8800".into()),
+                gsp_url: Some("ws://127.0.0.1:8900/ws/v1".into()),
+            },
             Request::CheckForUpdate { manifest_url: None },
             Request::CheckForUpdate {
                 manifest_url: Some("https://example.invalid/manifest.json".into()),
@@ -1606,6 +1669,9 @@ mod tests {
             Response::DaemonEnv(DaemonEnvResponse {
                 ghost_pay_urls: vec!["http://127.0.0.1:8800".into()],
                 gsp_urls: vec!["ws://127.0.0.1:8900/ws/v1".into()],
+                node_preset: "custom".into(),
+                ghost_pay_env_override: false,
+                gsp_env_override: false,
                 network: "signet".into(),
                 wallets_dir: "/home/test/.wraith/wallets".into(),
                 tor_proxy: None,
@@ -1614,6 +1680,11 @@ mod tests {
                 shroud_max_ms: 5000,
                 update_manifest_url: None,
                 kiosk_mode: false,
+            }),
+            Response::NodeEndpointsSet(NodeEndpointsResponse {
+                preset: "public".into(),
+                ghost_pay_urls: vec!["https://pool.bitcoinghost.org:8800".into()],
+                gsp_urls: vec!["wss://pool.bitcoinghost.org:8900/ws/v1".into()],
             }),
             Response::WalletList(WalletListResponse {
                 wallets: vec![WalletListEntry {
