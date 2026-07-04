@@ -21,6 +21,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Vendored, pre-built mempool.space frontend served as static assets — not
+    // our source, and the minified bundles must not be linted or reformatted.
+    "public/mempool-app/**",
   ]),
 ]);
 
