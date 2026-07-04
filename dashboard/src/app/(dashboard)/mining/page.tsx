@@ -68,6 +68,22 @@ const minerColumns: ColumnDef<MinerInfo>[] = [
     },
   },
   {
+    accessorKey: "difficulty",
+    header: "Difficulty",
+    cell: ({ row }) => {
+      const diff = row.original.difficulty ?? 0;
+      return <span className="font-mono">{diff > 0 ? formatDifficulty(diff) : "—"}</span>;
+    },
+  },
+  {
+    accessorKey: "last_share",
+    header: "Last Share",
+    cell: ({ row }) => {
+      const last = row.original.last_share ?? row.original.last_share_at ?? 0;
+      return <span className="text-gray-400">{formatTimeAgo(last)}</span>;
+    },
+  },
+  {
     accessorKey: "connected_at",
     header: "Uptime",
     cell: ({ row }) => {
@@ -112,11 +128,11 @@ function formatDifficulty(d: number): string {
 const PUBLIC_POOL_HOST = "pool.bitcoinghost.org";
 
 // SV2/Noise clients must pin the pool's authority public key to connect.
-// NOTE: the node API does NOT currently expose this — it lives in pool_sv2's
-// pool.toml as `authority_public_key`, identical across every node — so it is
-// mirrored here as a constant. Backend enhancement: surface it on
-// /api/v1/mining/status so this can be sourced dynamically.
-const SV2_AUTHORITY_PUBLIC_KEY = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
+// The node now surfaces this on /api/v1/mining/status as `authority_public_key`
+// (sourced from pool_sv2's pool.toml, identical across every node). This
+// constant is the FALLBACK used only when that field is absent — i.e. a
+// pre-redeploy node — so the copyable row never renders blank.
+const SV2_AUTHORITY_PUBLIC_KEY_FALLBACK = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 
 // The backend currently derives every window (current round / last hour /
 // last 24h / all time) from the same source and returns an IDENTICAL entry for
@@ -185,17 +201,24 @@ export default function MiningPage() {
   const [poolSetupOpen, setPoolSetupOpen] = useState(false);
 
   const miners = minersData?.miners ?? [];
-  // The miners/full `total` only counts miners seen in the last 600s, so it
+  // True when the backend withheld the per-miner list — either an unsigned/
+  // public request or a pre-redeploy node without the operator-authed detail
+  // mode. In that state we show the aggregate count instead of a table.
+  const minersRedacted = minersData?.miners_redacted === true;
+  // The detailed list only counts miners seen in the last 600s, so its `total`
   // reads 0 for TCP-connected-but-idle miners. Use the authoritative
   // connected-miner counts from mining status as a floor so the header never
   // understates reality (backend `active_miners` = local miners with recent
   // shares; `local_connected_miners` = TCP-connected on this node).
   const connectedMinerCount = Math.max(
     miners.length,
-    minersData?.total ?? 0,
+    minersData?.total_miners ?? minersData?.total ?? 0,
     status?.active_miners ?? 0,
     status?.local_connected_miners ?? 0,
   );
+  // Authority key: prefer the value the node now reports, fall back to the
+  // bundled constant for pre-redeploy nodes that don't expose it yet.
+  const authorityPublicKey = status?.authority_public_key ?? SV2_AUTHORITY_PUBLIC_KEY_FALLBACK;
   const nodeHost = typeof window !== "undefined" ? window.location.hostname : "localhost";
   const isPending = setPrivateMining.isPending || setPublicMining.isPending;
 
@@ -370,9 +393,9 @@ export default function MiningPage() {
                   <div className="flex items-center justify-between p-2 bg-gray-900/50 rounded">
                     <div className="min-w-0">
                       <div className="text-xs text-gray-500">SV2 authority public key</div>
-                      <code className="text-orange-400 text-sm block truncate">{SV2_AUTHORITY_PUBLIC_KEY}</code>
+                      <code className="text-orange-400 text-sm block truncate">{authorityPublicKey}</code>
                     </div>
-                    <CopyButton text={SV2_AUTHORITY_PUBLIC_KEY} />
+                    <CopyButton text={authorityPublicKey} />
                   </div>
                 </div>
                 <div className="text-xs text-gray-500 mt-2">SV2/Noise miners must pin the authority public key to connect.</div>
@@ -452,22 +475,22 @@ export default function MiningPage() {
             />
           ) : minersLoading ? (
             <div className="py-8 text-center text-sm text-gray-500">Loading…</div>
-          ) : connectedMinerCount > 0 ? (
-            // The node reports an aggregate connected-miner count, but the
-            // per-miner detail endpoint (/api/v1/mining/miners/full) requires the
-            // mesh HMAC signature, which the dashboard's operator INTERNAL_AUTH_KEY
-            // cannot produce — so the individual rows come back redacted. Show the
-            // aggregate clearly instead of a blank/broken table.
-            // Backend follow-up: expose an operator-authed miner-details endpoint.
+          ) : minersRedacted && connectedMinerCount > 0 ? (
+            // Pre-redeploy fallback: the node reports an aggregate connected-miner
+            // count but withheld the per-miner list (`miners_redacted: true`),
+            // because it lacks the operator-authed detail mode on
+            // /api/v1/mining/miners. Show the aggregate clearly instead of a
+            // blank/broken table. Once the node is redeployed, the signed GET
+            // returns the full list and the table above renders instead.
             <div className="py-8 px-4 text-center">
               <div className="text-3xl font-semibold text-orange-400">{connectedMinerCount}</div>
               <div className="text-sm text-gray-400 mt-1">
                 {connectedMinerCount === 1 ? "miner" : "miners"} connected to this node
               </div>
               <div className="text-xs text-gray-500 mt-3 max-w-md mx-auto leading-relaxed">
-                Per-miner details (worker, hashrate, shares) require mesh authentication and are not
-                available through the operator dashboard yet. The aggregate count above is
-                authoritative.
+                Per-miner details (worker, hashrate, shares) are not yet exposed by this node — they
+                appear here automatically once it is updated to the latest build. The aggregate count
+                above is authoritative.
               </div>
             </div>
           ) : (

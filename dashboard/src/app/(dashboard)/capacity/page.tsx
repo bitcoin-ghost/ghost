@@ -24,6 +24,11 @@ interface PoolNode {
   public_address?: string;
   public_mining?: boolean;
   last_seen?: number;
+  // Deduplicated share of the mesh-wide active-miner total attributed to this
+  // node. Unlike the raw `miner_count` (kept for the load-balancer utilisation
+  // view), these DO sum to the deduped `mesh_active_miners` total because each
+  // unique miner is owned by exactly one node. Absent on pre-redeploy nodes.
+  deduped_miner_count?: number;
 }
 
 interface PoolNodesResponse {
@@ -137,6 +142,12 @@ export default function CapacityPage() {
   const me = data.this_node;
   const myPct = utilPct(me);
 
+  // Post-redeploy nodes report a `deduped_miner_count` per node that sums to the
+  // deduped mesh total. When present, the peer table shows those (labelled just
+  // "Miners") and drops the "don't sum" caveat. Pre-redeploy nodes omit it, so
+  // we fall back to the raw routed `miner_count` and keep the caveat.
+  const dedupAvailable = me.deduped_miner_count !== undefined;
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -202,9 +213,16 @@ export default function CapacityPage() {
             {meshTotal !== undefined && (
               <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "8px" }}>
                 <strong style={{ color: "var(--fg)" }}>{meshTotal}</strong> distinct active{" "}
-                {meshTotal === 1 ? "miner" : "miners"} across the mesh (deduplicated). The per-peer
-                counts below are a routing view and may overlap — a miner failing over between nodes
-                appears on more than one peer, so <em>don&apos;t sum the rows</em>.
+                {meshTotal === 1 ? "miner" : "miners"} across the mesh (deduplicated).{" "}
+                {dedupAvailable ? (
+                  <>The per-node counts below are deduplicated and sum to this total.</>
+                ) : (
+                  <>
+                    The per-peer counts below are a routing view and may overlap — a miner failing
+                    over between nodes appears on more than one peer, so{" "}
+                    <em>don&apos;t sum the rows</em>.
+                  </>
+                )}
               </p>
             )}
           </div>
@@ -215,7 +233,7 @@ export default function CapacityPage() {
                 <thead>
                   <tr style={{ borderBottom: "1px solid var(--rule)" }}>
                     <th style={thStyle}>Peer</th>
-                    <th style={thStyle}>Miners (routed)</th>
+                    <th style={thStyle}>{dedupAvailable ? "Miners" : "Miners (routed)"}</th>
                     <th style={thStyle}>Capacity</th>
                     <th style={thStyle}>Utilisation</th>
                     <th style={{ ...thStyle, width: "30%" }}>&nbsp;</th>
@@ -239,7 +257,7 @@ export default function CapacityPage() {
                             )}
                           </td>
                           <td style={{ ...tdStyle, fontFamily: "var(--font-mono)" }}>
-                            {p.miner_count}
+                            {dedupAvailable ? p.deduped_miner_count ?? 0 : p.miner_count}
                           </td>
                           <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", color: "var(--dim)" }}>
                             {p.max_capacity || "—"}
