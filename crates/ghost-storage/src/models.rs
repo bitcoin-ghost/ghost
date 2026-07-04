@@ -60,6 +60,10 @@ pub struct BestShare {
     pub timestamp: i64,
     /// Claimed share difficulty at submission time.
     pub difficulty: f64,
+    /// Block height of the round the share belongs to, resolved via the
+    /// share's `round_id` against the `rounds` table. `None` when the round
+    /// row is absent (e.g. a share recorded before its round was persisted).
+    pub block_height: Option<u64>,
 }
 
 /// Round record
