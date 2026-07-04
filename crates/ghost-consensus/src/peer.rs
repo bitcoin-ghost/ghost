@@ -96,6 +96,51 @@ fn extract_ipv4_subnet(address: &str) -> Option<String> {
 /// Limits eclipse attack surface while allowing legitimate multi-node operators.
 const MAX_PEERS_PER_SUBNET: usize = 3;
 
+/// Attribute each unique active miner-id hash to exactly one node so the
+/// per-node counts sum to the mesh-wide unique total (the same union
+/// [`MeshNetwork::mesh_active_miner_count`](crate::mesh::MeshNetwork) reports as
+/// the grand total).
+///
+/// A miner that fails over between nodes is gossiped in more than one node's
+/// `active_miner_id_hashes`, so a naive per-node sum of the raw `miner_count`s
+/// over-counts it (e.g. `0+2+1+4` reads as 7 while the deduplicated union is 6).
+/// To dedupe the per-node breakdown, each unique hash is attributed to a single
+/// owner:
+///
+///   - the node reporting it with the most recent `last_seen` (freshest gossip
+///     wins — the miner is most likely currently mining on that node);
+///   - ties broken by the lexicographically smallest `node_id`.
+///
+/// Both keys are deterministic, so every node computing this over the same peer
+/// set derives the identical attribution. Input is one `(node_id, last_seen,
+/// hashes)` triple per node (peers plus self); output maps `node_id -> deduped
+/// count`. A node that owns no hash is omitted (callers treat it as 0). The sum
+/// of all returned counts equals the number of distinct hashes across the
+/// input — i.e. the deduplicated mesh-wide active-miner total.
+pub fn attribute_miner_counts(nodes: &[(NodeId, u64, Vec<[u8; 16]>)]) -> HashMap<NodeId, u32> {
+    // Pass 1: resolve each hash's owner (max last_seen, tie -> min node_id).
+    let mut owner: HashMap<[u8; 16], (u64, NodeId)> = HashMap::new();
+    for (node_id, last_seen, hashes) in nodes {
+        for h in hashes {
+            let take = match owner.get(h) {
+                Some((seen, owner_id)) => {
+                    last_seen > seen || (last_seen == seen && node_id < owner_id)
+                }
+                None => true,
+            };
+            if take {
+                owner.insert(*h, (*last_seen, *node_id));
+            }
+        }
+    }
+    // Pass 2: tally one count per owning node.
+    let mut counts: HashMap<NodeId, u32> = HashMap::new();
+    for (_, owner_id) in owner.into_values() {
+        *counts.entry(owner_id).or_insert(0) += 1;
+    }
+    counts
+}
+
 /// Peer manager for tracking connected peers
 #[derive(Debug)]
 pub struct PeerManager {
@@ -608,6 +653,74 @@ pub fn select_best_peers(peers: &[Peer], count: usize) -> Vec<&Peer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Helper: build a 16-byte miner-id hash from a single tag byte.
+    fn h(tag: u8) -> [u8; 16] {
+        [tag; 16]
+    }
+
+    #[test]
+    fn test_attribute_miner_counts_dedupes_overlap_to_union_size() {
+        // Three nodes whose active-miner sets OVERLAP because miners fail over
+        // between them. Raw per-node counts (3, 3, 2) sum to 8, but the union
+        // of distinct hashes is {1,2,3,4,5} = 5. The deduped per-node counts
+        // must sum to exactly 5 — the same figure `mesh_active_miner_count`
+        // reports as the grand total.
+        let node_a = [0xAAu8; 32];
+        let node_b = [0xBBu8; 32];
+        let node_c = [0xCCu8; 32];
+
+        let nodes = vec![
+            // node_a seen most recently (t=300) — wins every hash it shares.
+            (node_a, 300u64, vec![h(1), h(2), h(3)]),
+            // node_b shares 2 and 3 with A, plus its own 4.
+            (node_b, 200u64, vec![h(2), h(3), h(4)]),
+            // node_c shares 3 with A/B, plus its own 5.
+            (node_c, 100u64, vec![h(3), h(5)]),
+        ];
+
+        let counts = attribute_miner_counts(&nodes);
+
+        // Sum equals the union size (deduped total).
+        let total: u32 = counts.values().sum();
+        assert_eq!(total, 5, "deduped per-node counts must sum to the union size");
+
+        // Freshest node (A, t=300) owns all three of its hashes (1,2,3).
+        assert_eq!(counts.get(&node_a).copied().unwrap_or(0), 3);
+        // B owns only its unique 4 (2 and 3 went to fresher A).
+        assert_eq!(counts.get(&node_b).copied().unwrap_or(0), 1);
+        // C owns only its unique 5 (3 went to fresher A).
+        assert_eq!(counts.get(&node_c).copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_attribute_miner_counts_tie_breaks_on_smallest_node_id() {
+        // Equal `last_seen`: the shared hash must go to the lexicographically
+        // smallest node_id, deterministically, so every node computing this
+        // agrees. node_lo < node_hi, both report hash 7 at t=50.
+        let node_lo = [0x01u8; 32];
+        let node_hi = [0x02u8; 32];
+        let nodes = vec![
+            (node_hi, 50u64, vec![h(7), h(8)]),
+            (node_lo, 50u64, vec![h(7), h(9)]),
+        ];
+
+        let counts = attribute_miner_counts(&nodes);
+        // Union {7,8,9} = 3.
+        assert_eq!(counts.values().sum::<u32>(), 3);
+        // Shared 7 attributed to the smaller id (lo), so lo=2 (7,9), hi=1 (8).
+        assert_eq!(counts.get(&node_lo).copied().unwrap_or(0), 2);
+        assert_eq!(counts.get(&node_hi).copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_attribute_miner_counts_empty_and_single() {
+        assert!(attribute_miner_counts(&[]).is_empty());
+        let only = [0x09u8; 32];
+        let counts = attribute_miner_counts(&[(only, 10, vec![h(1), h(2)])]);
+        assert_eq!(counts.get(&only).copied().unwrap_or(0), 2);
+        assert_eq!(counts.values().sum::<u32>(), 2);
+    }
 
     #[test]
     fn test_peer_manager() {

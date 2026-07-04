@@ -1128,6 +1128,34 @@ impl MeshNetwork {
         set.len()
     }
 
+    /// Deduplicated per-node active-miner counts across the mesh: every
+    /// connected peer within `freshness_secs` plus this node (self). Each unique
+    /// miner-id hash is attributed to exactly one node by
+    /// [`attribute_miner_counts`](crate::peer::attribute_miner_counts), so the returned counts sum to
+    /// [`Self::mesh_active_miner_count`] for the same window — the grand total
+    /// the frontend shows. This dedupes the per-node breakdown served by the
+    /// capacity / pool-nodes / mesh-nodes endpoints, whose raw per-peer
+    /// `miner_count`s double-count miners that fail over between nodes.
+    ///
+    /// Keyed by `NodeId`; self is keyed by our own node id. Self is given a
+    /// `last_seen` of "now" so a miner active locally right now is attributed
+    /// here rather than to a peer whose activity window is going stale. A node
+    /// absent from the map owns zero deduped miners.
+    pub fn deduped_miner_counts(&self, freshness_secs: u64) -> HashMap<NodeId, u32> {
+        let mut inputs: Vec<(NodeId, u64, Vec<[u8; 16]>)> = Vec::new();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let local_hashes = self
+            .active_miner_hashes_fn
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or_default();
+        inputs.push((self.peers.our_node_id(), now, local_hashes));
+        for peer in self.peers.get_connected_peers(freshness_secs) {
+            inputs.push((peer.node_id, peer.last_seen, peer.active_miner_id_hashes));
+        }
+        crate::peer::attribute_miner_counts(&inputs)
+    }
+
     /// Set a callback providing this node's own realized hashrate (TH/s) over a
     /// trailing window, gossiped in health pings for mesh-wide summation.
     pub fn set_local_hashrate_provider(&mut self, f: Arc<dyn Fn() -> f64 + Send + Sync>) {
