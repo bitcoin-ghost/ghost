@@ -1,14 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  chainStatus,
+  connectionStatus,
   daemonEnv,
   gspAuth,
-  gspSessionStatus,
   onPaymentDetected,
   onWatchError,
   startWatch,
   walletStatus,
-  type ChainStatusResponse,
+  type ConnectionStatusResponse,
   type DetectedPayment,
 } from "./lib/tauri";
 import { Wallet } from "./screens/Wallet";
@@ -27,7 +26,7 @@ import { Settings } from "./screens/Settings";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Logo } from "./components/Logo";
 import { ThemeToggle } from "./components/ThemeToggle";
-import { SyncIndicator } from "./components/SyncIndicator";
+import { ConnectionStatus } from "./components/ConnectionStatus";
 
 type Screen =
   | "wallet"
@@ -99,7 +98,7 @@ export default function App() {
   const [watchErr, setWatchErr] = useState<string | null>(null);
   const [hasSession, setHasSession] = useState(false);
   const [daemonOffline, setDaemonOffline] = useState(false);
-  const [chain, setChain] = useState<ChainStatusResponse | null>(null);
+  const [conn, setConn] = useState<ConnectionStatusResponse | null>(null);
   // Two layers of kiosk mode:
   //   - daemonKiosk: WRAITHD_KIOSK_MODE on the daemon. Hard lock —
   //     daemon refuses wallet-management ops, can only be exited by
@@ -132,13 +131,19 @@ export default function App() {
         setDaemonOffline(false);
         setNetworkLabel(env.network);
         setWalletState({ active: w.active, unlocked: w.unlocked });
-        // Best-effort chain probe — if ghost-pay is down we leave
-        // the previous chain state and don't flip the offline pill.
-        chainStatus()
-          .then((c) => {
-            if (alive) setChain(c);
-          })
-          .catch(() => {});
+        // Consolidated connectivity probe. Unlike the old chain probe
+        // this NEVER throws for an unreachable ghost-pay/GSP — a
+        // reachable=false snapshot is a normal, renderable result. So a
+        // thrown error here means the daemon itself dropped between
+        // calls (the offline pill covers that); we leave the previous
+        // snapshot in place rather than clearing to a spinner.
+        let conn: ConnectionStatusResponse | null = null;
+        try {
+          conn = await connectionStatus();
+          if (alive) setConn(conn);
+        } catch {
+          /* daemon dropped mid-tick — offline pill handles it */
+        }
         const wasDaemonKiosk = daemonKiosk;
         const isDaemonKiosk = !!env.kiosk_mode;
         if (isDaemonKiosk !== wasDaemonKiosk) {
@@ -146,12 +151,12 @@ export default function App() {
           if (isDaemonKiosk) setScreen("merchant");
         }
         if (w.active && w.unlocked) {
-          try {
-            const session = await gspSessionStatus();
-            if (!alive) return;
-            setHasSession(session.have_token);
+          // Only act on a fresh snapshot; a transient null leaves the
+          // session state untouched until the next tick.
+          if (conn) {
+            setHasSession(conn.gsp_have_token);
             if (
-              !session.have_token &&
+              !conn.gsp_have_token &&
               autoAuthInFlight.current !== w.active
             ) {
               autoAuthInFlight.current = w.active;
@@ -159,8 +164,6 @@ export default function App() {
                 if (alive) autoAuthInFlight.current = null;
               });
             }
-          } catch {
-            /* transient — try again next tick */
           }
         } else {
           setHasSession(false);
@@ -333,9 +336,17 @@ export default function App() {
         )}
 
         {daemonOffline ? (
-          <span className="pill fail live">daemon offline</span>
+          <span
+            className="pill fail live"
+            title="wraithd is not responding. Start the daemon (wraithd) — the GUI reconnects automatically."
+          >
+            daemon offline
+          </span>
         ) : (
-          <SyncIndicator chain={chain} compact />
+          <ConnectionStatus
+            conn={conn}
+            onOpenDiagnostics={() => setScreen("network")}
+          />
         )}
 
         {!daemonOffline && (

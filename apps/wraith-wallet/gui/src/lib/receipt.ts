@@ -11,6 +11,12 @@ interface PrintReceiptOptions {
   title?: string;
 }
 
+interface EmailReceiptOptions extends PrintReceiptOptions {
+  /// Optional recipient to prefill. Usually left blank — the merchant
+  /// types the customer's address in their own mail client.
+  to?: string;
+}
+
 const SAT = 100_000_000;
 
 /// Renders a single paid receipt to a print-only popup window and
@@ -180,6 +186,81 @@ export function receiptHtml(
   </div>
 </body>
 </html>`;
+}
+
+/// Plain-text rendering of a receipt — the email body and the
+/// "copy receipt" fallback. Mail clients and clipboards want text, not
+/// the print HTML, so this is a separate, dependency-free renderer.
+export function receiptPlainText(
+  receipt: PaidReceipt,
+  opts: PrintReceiptOptions = {},
+): string {
+  const wallet = opts.wallet ?? receipt.wallet_name ?? "wraith";
+  const ts = new Date(receipt.paid_at);
+  const lines = receipt.lines ?? [];
+  const out: string[] = [];
+  out.push(wallet.toUpperCase());
+  out.push(
+    `${opts.title ?? "Receipt"} #${receipt.invoice_id} · paid in bitcoin${
+      opts.network ? ` · ${opts.network}` : ""
+    }`,
+  );
+  out.push("");
+  out.push(`Date:    ${ts.toLocaleDateString()} ${ts.toLocaleTimeString()}`);
+  out.push(
+    `Method:  ${receipt.method === "silent_payment" ? "silent payment" : "direct"}`,
+  );
+  out.push("");
+  if (lines.length) {
+    for (const l of lines) {
+      const name = (l.emoji ? l.emoji + " " : "") + l.label;
+      out.push(`${l.qty}x ${name}  -  ${(l.unit_sats * l.qty).toLocaleString()} sats`);
+    }
+  } else {
+    out.push("(no itemised lines)");
+  }
+  out.push("");
+  out.push(
+    `TOTAL: ${receipt.amount_sats.toLocaleString()} sats (${(
+      receipt.amount_sats / SAT
+    ).toFixed(8)} BTC)`,
+  );
+  if (receipt.memo) {
+    out.push("");
+    out.push(`Memo: ${receipt.memo}`);
+  }
+  out.push("");
+  out.push(`txid: ${receipt.txid}`);
+  out.push("");
+  out.push("Thank you · powered by Ghost Wallet");
+  return out.join("\n");
+}
+
+/// Open the user's mail client with a receipt prefilled (subject +
+/// plain-text body) via a `mailto:` link. No SMTP and no daemon mail
+/// transport — the OS hands off to whatever mail app is registered.
+/// This is the pragmatic v1: the merchant's own client sends it, and
+/// there's a "Copy receipt" fallback in the UI when no mail handler is
+/// registered. Returns the composed `mailto:` URL.
+export function emailReceipt(
+  receipt: PaidReceipt,
+  opts: EmailReceiptOptions = {},
+): string {
+  const wallet = opts.wallet ?? receipt.wallet_name ?? "wraith";
+  const subject = `${opts.title ?? "Receipt"} #${receipt.invoice_id} — ${receipt.amount_sats.toLocaleString()} sats · ${wallet}`;
+  const body = receiptPlainText(receipt, opts);
+  const url = `mailto:${
+    opts.to ? encodeURIComponent(opts.to) : ""
+  }?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  // Anchor-click is the most webview-friendly way to trigger the OS
+  // mailto handler — `window.location` is blocked in some Tauri configs.
+  const a = document.createElement("a");
+  a.href = url;
+  a.rel = "noopener noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  return url;
 }
 
 function escapeHtml(s: string): string {

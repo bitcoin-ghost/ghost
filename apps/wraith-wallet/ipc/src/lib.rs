@@ -122,6 +122,13 @@ pub enum Request {
     GspAuth,
     /// Inspect the daemon's stored GSP session token + persistent connection state.
     GspSessionStatus,
+    /// One-shot connectivity snapshot for the GUI's persistent status bar:
+    /// network, ghost-pay reachability, GSP websocket state, and chain
+    /// sync/height — composed server-side so the frontend makes a single
+    /// call and never sits on a forever-"connecting" spinner. Unlike
+    /// `ChainStatus`, this never errors for an unreachable backend; an
+    /// unreachable ghost-pay is reported as `ghost_pay_reachable = false`.
+    ConnectionStatus,
     /// Register the active wallet's BIP-352 scan public key with the GSP so the
     /// server can detect incoming silent payments on its behalf.
     GspRegisterScanKey,
@@ -582,6 +589,7 @@ pub enum Response {
     Health(HealthResponse),
     Doctor(DoctorResponse),
     ChainStatus(ChainStatusResponse),
+    ConnectionStatus(ConnectionStatusResponse),
     GspPing(GspPingResponse),
     GspAuth(GspAuthResponse),
     GspSessionStatus(GspSessionStatusResponse),
@@ -915,6 +923,49 @@ pub struct ChainStatusResponse {
     /// Current L2 epoch.
     #[serde(default)]
     pub l2_epoch: Option<u64>,
+}
+
+/// Consolidated connectivity snapshot for the GUI's persistent status
+/// bar. Composes the ghost-pay reachability probe, the GSP session
+/// phase, and the chain sync fields into one round-trip. Deliberately
+/// infallible: an unreachable ghost-pay is reported as
+/// `ghost_pay_reachable = false` rather than a `Response::Error`, so the
+/// header can render a clear "unreachable" state instead of hanging on a
+/// perpetual "connecting…" spinner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionStatusResponse {
+    /// Network the daemon is bound to ("mainnet"/"signet"/"testnet"/"regtest").
+    /// Always known — read from the daemon config, never the backend.
+    pub network: String,
+    /// Whether the configured ghost-pay backend answered its status probe.
+    pub ghost_pay_reachable: bool,
+    /// ghost-pay's reported version, when it was reachable.
+    #[serde(default)]
+    pub ghost_pay_version: Option<String>,
+    /// Probe error, populated only when ghost-pay was unreachable.
+    #[serde(default)]
+    pub ghost_pay_error: Option<String>,
+    /// Whether the daemon holds a GSP session token for the active wallet.
+    pub gsp_have_token: bool,
+    /// True when the GSP websocket is live and authenticated.
+    pub gsp_connected: bool,
+    /// GSP session phase ("disconnected"/"connecting"/"authenticating"/
+    /// "authenticated"/"backoff"), or `None` when there is no session.
+    #[serde(default)]
+    pub gsp_phase: Option<String>,
+    /// L1 verified block height (`None` if bitcoind was unreachable from
+    /// ghost-pay, or ghost-pay itself was unreachable).
+    #[serde(default)]
+    pub chain_height: Option<u64>,
+    /// Highest L1 header ghost-pay's bitcoind has seen.
+    #[serde(default)]
+    pub chain_headers: Option<u64>,
+    /// True when L1 is fully synced: blocks ≥ headers (or headers
+    /// unknown) AND bitcoind is not in initial block download.
+    pub chain_synced: bool,
+    /// L2 chain tip — latest finalized ghost-pay block height.
+    #[serde(default)]
+    pub l2_height: Option<u64>,
 }
 
 /// GSP WebSocket connectivity probe result.
@@ -1572,6 +1623,34 @@ mod tests {
                     active: false,
                     signer: None,
                 }],
+            }),
+            Response::ConnectionStatus(ConnectionStatusResponse {
+                network: "mainnet".into(),
+                ghost_pay_reachable: true,
+                ghost_pay_version: Some("0.9.1".into()),
+                ghost_pay_error: None,
+                gsp_have_token: true,
+                gsp_connected: true,
+                gsp_phase: Some("authenticated".into()),
+                chain_height: Some(880_000),
+                chain_headers: Some(880_000),
+                chain_synced: true,
+                l2_height: Some(1234),
+            }),
+            // Unreachable-backend shape — the fields the header renders
+            // when nothing is configured on a user's laptop.
+            Response::ConnectionStatus(ConnectionStatusResponse {
+                network: "mainnet".into(),
+                ghost_pay_reachable: false,
+                ghost_pay_version: None,
+                ghost_pay_error: Some("connection refused".into()),
+                gsp_have_token: false,
+                gsp_connected: false,
+                gsp_phase: None,
+                chain_height: None,
+                chain_headers: None,
+                chain_synced: false,
+                l2_height: None,
             }),
         ];
         for resp in cases {

@@ -1159,6 +1159,10 @@ mod client {
                 println!("wallet '{name}' locked");
                 std::process::ExitCode::SUCCESS
             }
+            Ok(Response::WalletDeleted { name }) => {
+                println!("wallet '{name}' deleted");
+                std::process::ExitCode::SUCCESS
+            }
             Ok(Response::WalletList(l)) => {
                 if l.wallets.is_empty() {
                     println!("(no wallets)");
@@ -1347,6 +1351,32 @@ mod client {
                     None => println!(
                         "update url:   (unset — pass --manifest-url to `wraith update check`)"
                     ),
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(Response::ConnectionStatus(s)) => {
+                println!("network:    {}", s.network);
+                println!(
+                    "ghost-pay:  {}{}",
+                    if s.ghost_pay_reachable { "reachable" } else { "unreachable" },
+                    s.ghost_pay_version
+                        .as_deref()
+                        .map(|v| format!(" (v{v})"))
+                        .or_else(|| s.ghost_pay_error.as_deref().map(|e| format!(" — {e}")))
+                        .unwrap_or_default()
+                );
+                println!(
+                    "gsp:        {}",
+                    if s.gsp_connected {
+                        "connected"
+                    } else {
+                        s.gsp_phase.as_deref().unwrap_or("disconnected")
+                    }
+                );
+                match s.chain_height {
+                    Some(h) if s.chain_synced => println!("chain:      synced · #{h}"),
+                    Some(h) => println!("chain:      syncing · #{h}"),
+                    None => println!("chain:      unknown"),
                 }
                 std::process::ExitCode::SUCCESS
             }
