@@ -26,8 +26,57 @@
 const http = require("http");
 const net = require("net");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const WS_PATH = "/api/ws";
+
+// ---------------------------------------------------------------------------
+// Embedded mempool.space frontend.
+//
+// Each node runs a self-serving, Core-only mempool.space backend bound to
+// 127.0.0.1:8999 (pointed at the node's own ghostd). We ship the built
+// mempool.space SPA under `public/mempool-app/` and serve it SAME-ORIGIN at
+// the subpath `/mempool-app/`, proxying its API + WebSocket to that loopback
+// backend. Because everything is same-origin and loopback-proxied there is no
+// certificate, DNS, or mixed-content problem, and it works unchanged on any
+// node (the proxy target is always 127.0.0.1:8999).
+//
+// The SPA's compiled bundles were patched to prefix every API/WS path with
+// `/mempool-app` (it hard-codes `apiBaseUrl = ""` in the browser and ignores
+// window.__env), so all of its traffic lands under `/mempool-app/api/...` and
+// never collides with the dashboard's own `/api/*` routes.
+//
+// Both the static assets and the API/WS proxy are gated behind the SAME
+// `ghost-session` JWT as the rest of the dashboard — this is an operator tool,
+// not a public explorer.
+// ---------------------------------------------------------------------------
+
+const MEMPOOL_PREFIX = "/mempool-app";
+const MEMPOOL_STATIC_ROOT = path.join(__dirname, "public", "mempool-app");
+
+const MEMPOOL_MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json",
+  ".map": "application/json; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".svg": "image/svg+xml",
+  ".webp": "image/webp",
+  ".txt": "text/plain; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".wasm": "application/wasm",
+};
 
 // ---------------------------------------------------------------------------
 // JWT verification — a plain-Node mirror of `src/lib/jwt.ts`.
@@ -151,16 +200,24 @@ function rejectUpgrade(socket, status, message) {
   socket.destroy();
 }
 
-/** Serialise the (rewritten) upgrade request line + headers for the backend. */
-function buildBackendRequest(req, target) {
-  const qIndex = (req.url || "").indexOf("?");
-  const search = qIndex === -1 ? "" : req.url.slice(qIndex);
+/**
+ * Serialise the (rewritten) upgrade request line + headers for the backend.
+ * `backendPath` is the absolute request-target to send upstream; when omitted
+ * it defaults to `/ws` (preserving the original query), which is the dashboard
+ * event/log stream. The mempool WS proxy passes its own rewritten path.
+ */
+function buildBackendRequest(req, target, backendPath) {
+  if (backendPath === undefined) {
+    const qIndex = (req.url || "").indexOf("?");
+    const search = qIndex === -1 ? "" : req.url.slice(qIndex);
+    backendPath = `/ws${search}`;
+  }
   const headers = { ...req.headers };
   // Never leak the operator's session cookie to the backend, and rewrite Host.
   delete headers.cookie;
   headers.host = `${target.host}:${target.port}`;
 
-  let raw = `GET /ws${search} HTTP/1.1\r\n`;
+  let raw = `GET ${backendPath} HTTP/1.1\r\n`;
   for (const [k, v] of Object.entries(headers)) {
     if (Array.isArray(v)) {
       for (const item of v) raw += `${k}: ${item}\r\n`;
@@ -203,9 +260,208 @@ function handleUpgrade(req, socket, head, target = backendTarget()) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Embedded mempool.space frontend — static serving + API/WS proxy.
+// ---------------------------------------------------------------------------
+
+/** Parse MEMPOOL_BACKEND_URL into {host, port}, defaulting to loopback:8999. */
+function mempoolBackendTarget() {
+  const raw = process.env.MEMPOOL_BACKEND_URL || "http://127.0.0.1:8999";
+  try {
+    const u = new URL(raw);
+    return {
+      host: u.hostname || "127.0.0.1",
+      port: Number(u.port) || (u.protocol === "https:" ? 443 : 80),
+    };
+  } catch {
+    return { host: "127.0.0.1", port: 8999 };
+  }
+}
+
+/**
+ * Send a file from the mempool static root. Resolves true once the response is
+ * committed, false if the file does not exist (so the caller can fall back).
+ */
+function sendMempoolFile(res, filePath) {
+  return new Promise((resolve) => {
+    fs.stat(filePath, (err, stat) => {
+      if (err || !stat.isFile()) return resolve(false);
+      const type =
+        MEMPOOL_MIME[path.extname(filePath).toLowerCase()] ||
+        "application/octet-stream";
+      const isHtml = type.startsWith("text/html");
+      res.writeHead(200, {
+        "Content-Type": type,
+        "Content-Length": stat.size,
+        // index.html must never be cached (it is the SPA shell); the hashed
+        // asset filenames make everything else safely immutable.
+        "Cache-Control": isHtml
+          ? "no-cache"
+          : "public, max-age=31536000, immutable",
+      });
+      const stream = fs.createReadStream(filePath);
+      stream.on("error", () => {
+        res.destroy();
+        resolve(true);
+      });
+      stream.pipe(res);
+      resolve(true);
+    });
+  });
+}
+
+/**
+ * Serve the mempool.space SPA from `public/mempool-app`. Real files are served
+ * directly; unknown non-asset paths fall back to `index.html` so Angular's
+ * client-side routing works on deep-link/reload.
+ */
+async function serveMempoolStatic(req, res) {
+  const rawPath = (req.url || "").split("?")[0];
+
+  // Redirect the bare prefix to the trailing-slash form so the SPA's relative
+  // asset URLs (and its <base href="/mempool-app/">) resolve correctly.
+  if (rawPath === MEMPOOL_PREFIX) {
+    res.writeHead(308, { Location: `${MEMPOOL_PREFIX}/` });
+    res.end();
+    return;
+  }
+
+  let rel;
+  try {
+    rel = decodeURIComponent(rawPath.slice(MEMPOOL_PREFIX.length));
+  } catch {
+    res.writeHead(400);
+    res.end("Bad Request");
+    return;
+  }
+  if (rel === "" || rel === "/") rel = "/index.html";
+
+  const candidate = path.normalize(path.join(MEMPOOL_STATIC_ROOT, rel));
+  // Path-traversal guard: never serve anything outside the static root.
+  if (
+    candidate !== MEMPOOL_STATIC_ROOT &&
+    !candidate.startsWith(MEMPOOL_STATIC_ROOT + path.sep)
+  ) {
+    res.writeHead(403);
+    res.end("Forbidden");
+    return;
+  }
+
+  if (await sendMempoolFile(res, candidate)) return;
+
+  // Not a real file. A path with a file extension is a genuine missing asset
+  // (404); an extension-less path is a client route → serve the SPA shell.
+  const lastSeg = rel.split("/").pop() || "";
+  if (lastSeg.includes(".")) {
+    res.writeHead(404);
+    res.end("Not Found");
+    return;
+  }
+  if (!(await sendMempoolFile(res, path.join(MEMPOOL_STATIC_ROOT, "index.html")))) {
+    res.writeHead(404);
+    res.end("Not Found");
+  }
+}
+
+/** Transparently proxy a mempool `/mempool-app/api/...` HTTP request to :8999. */
+function proxyMempoolHttp(req, res, target) {
+  // Strip the `/mempool-app` prefix: `/mempool-app/api/v1/x` -> `/api/v1/x`.
+  const backendPath = (req.url || "").slice(MEMPOOL_PREFIX.length);
+  const headers = { ...req.headers };
+  delete headers.cookie; // don't leak the operator's session to the backend
+  headers.host = `${target.host}:${target.port}`;
+
+  const upstream = http.request(
+    {
+      host: target.host,
+      port: target.port,
+      method: req.method,
+      path: backendPath,
+      headers,
+    },
+    (up) => {
+      res.writeHead(up.statusCode || 502, up.headers);
+      up.pipe(res);
+    },
+  );
+  upstream.on("error", () => {
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+    }
+    res.end('{"error":"mempool backend unavailable"}');
+  });
+  req.pipe(upstream);
+}
+
+/**
+ * Own every `/mempool-app` HTTP request: gate on the dashboard session, then
+ * either proxy `/mempool-app/api/*` to the node-local backend or serve the
+ * static SPA. Returns true if this handler owned the request.
+ */
+function handleMempoolHttp(req, res, target = mempoolBackendTarget()) {
+  const pathname = (req.url || "").split("?")[0];
+  if (pathname !== MEMPOOL_PREFIX && !pathname.startsWith(`${MEMPOOL_PREFIX}/`)) {
+    return false;
+  }
+
+  // Same JWT gate as the rest of the dashboard.
+  if (!authorizeUpgrade(req)) {
+    if (pathname.startsWith(`${MEMPOOL_PREFIX}/api/`)) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end('{"error":"unauthorized"}');
+    } else {
+      res.writeHead(302, { Location: "/login" });
+      res.end();
+    }
+    return true;
+  }
+
+  if (pathname.startsWith(`${MEMPOOL_PREFIX}/api/`)) {
+    proxyMempoolHttp(req, res, target);
+  } else {
+    serveMempoolStatic(req, res).catch(() => {
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    });
+  }
+  return true;
+}
+
+/**
+ * Authenticate and proxy the mempool WebSocket upgrade
+ * (`/mempool-app/api/v1/ws`) to the node-local backend. Returns true if this
+ * handler owns the request.
+ */
+function handleMempoolUpgrade(req, socket, head, target = mempoolBackendTarget()) {
+  const pathname = (req.url || "").split("?")[0];
+  if (!pathname.startsWith(`${MEMPOOL_PREFIX}/api/`)) return false;
+
+  socket.on("error", () => socket.destroy());
+
+  if (!authorizeUpgrade(req)) {
+    rejectUpgrade(socket, 401, "Unauthorized");
+    return true;
+  }
+
+  const backendPath = (req.url || "").slice(MEMPOOL_PREFIX.length);
+  const backend = net.connect(target.port, target.host);
+  backend.on("connect", () => {
+    backend.write(buildBackendRequest(req, target, backendPath));
+    if (head && head.length) backend.write(head);
+    socket.pipe(backend);
+    backend.pipe(socket);
+  });
+  backend.on("error", () => {
+    rejectUpgrade(socket, 502, "Bad Gateway");
+  });
+  socket.on("close", () => backend.destroy());
+  return true;
+}
+
 module.exports = {
   WS_PATH,
   JWT_HEADER_B64U,
+  MEMPOOL_PREFIX,
   deriveJwtSecret,
   resolveJwtSecret,
   verifySession,
@@ -213,6 +469,9 @@ module.exports = {
   authorizeUpgrade,
   backendTarget,
   handleUpgrade,
+  mempoolBackendTarget,
+  handleMempoolHttp,
+  handleMempoolUpgrade,
 };
 
 // ---------------------------------------------------------------------------
@@ -267,12 +526,25 @@ if (require.main === module) {
       typeof app.getUpgradeHandler === "function"
         ? app.getUpgradeHandler()
         : null;
-    const server = http.createServer((req, res) => handle(req, res));
+    const server = http.createServer((req, res) => {
+      // The embedded mempool app (static assets + its API/WS proxy) is served
+      // here, ahead of Next, so it can be gated on the session and proxied to
+      // the node-local backend without colliding with the dashboard's own
+      // routes. Everything else falls through to Next unchanged.
+      try {
+        if (handleMempoolHttp(req, res)) return;
+      } catch {
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+        return;
+      }
+      handle(req, res);
+    });
 
     server.on("upgrade", (req, socket, head) => {
       let owned = false;
       try {
-        owned = handleUpgrade(req, socket, head);
+        owned = handleUpgrade(req, socket, head) || handleMempoolUpgrade(req, socket, head);
       } catch {
         rejectUpgrade(socket, 500, "Internal Server Error");
         return;

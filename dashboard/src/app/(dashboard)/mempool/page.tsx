@@ -223,8 +223,8 @@ export default function MempoolPage() {
     return (
       <div className="space-y-6">
         <PageHeader eyebrow="mempool" title="Your node's mempool." />
-        <SectionErrorBoundary section="Network mempool reference">
-          <NetworkMempoolReference />
+        <SectionErrorBoundary section="Node mempool explorer">
+          <NodeMempoolExplorer />
         </SectionErrorBoundary>
         <SkeletonCard />
       </div>
@@ -242,10 +242,11 @@ export default function MempoolPage() {
         actions={<Badge variant="success">rpc · lightweight</Badge>}
       />
 
-      {/* Unfiltered network reference (mempool.space) at the very top, so the
-          Reaper-filtered node view below reads as the direct comparison. */}
-      <SectionErrorBoundary section="Network mempool reference">
-        <NetworkMempoolReference />
+      {/* The real mempool.space UI of THIS node's own mempool, served
+          same-origin through the dashboard, at the very top. The lightweight
+          RPC cards and the Reaper filter breakdown follow below. */}
+      <SectionErrorBoundary section="Node mempool explorer">
+        <NodeMempoolExplorer />
       </SectionErrorBoundary>
 
       {rpcUnavailable ? (
@@ -284,29 +285,28 @@ export default function MempoolPage() {
   );
 }
 
-// ─── network mempool reference (unfiltered mempool.space, at the top) ────────
+// ─── node mempool explorer (real mempool.space UI, same-origin) ──────────────
 
-// The pool hosts a stock mempool.space instance at this subdomain. It's the
-// UNFILTERED / network-wide reference we embed above the node's own filtered
-// view so the Reaper comparison is visible at a glance.
-const MEMPOOL_REFERENCE_URL = "https://mempool.bitcoinghost.org";
+// The dashboard serves the built mempool.space frontend at this same-origin
+// subpath and proxies its API + WebSocket to the node's own Core-only mempool
+// backend on 127.0.0.1:8999. Because it is same-origin (no external host, no
+// certificate, no DNS) it frames without mixed-content or cross-origin issues,
+// and it shows THIS node's own mempool on any node.
+const NODE_MEMPOOL_APP_URL = "/mempool-app/";
 
 /**
- * Compact embedded mempool.space "mini" view.
+ * The real mempool.space explorer for this node's own mempool, embedded
+ * same-origin.
  *
- * Embeddability: as of writing `mempool.bitcoinghost.org` returns 200 with NO
- * `X-Frame-Options` and NO `Content-Security-Policy: frame-ancestors`, so it
- * frames without objection. The one real gotcha is TLS — the Let's Encrypt cert
- * currently only covers the apex `bitcoinghost.org` (no SAN for the `mempool.`
- * subdomain), so some browsers may refuse the https iframe with a cert error.
- *
- * Whichever way an embed fails (cert error, network unreachable, or a future
- * frame-blocking header), the symptom is the same: the iframe never fires
- * `onLoad`. We arm a timeout on mount and, if `onLoad` hasn't fired by then,
- * degrade to a titled card + explanation + link rather than leaving a blank
- * broken frame. The "open full explorer" link is always present regardless.
+ * Same-origin means the usual embed hazards (a TLS cert that doesn't cover a
+ * subdomain, a cross-origin `X-Frame-Options`, mixed content) simply cannot
+ * arise — the frontend is served by the dashboard itself under `/mempool-app/`
+ * and its traffic is proxied to the loopback backend. The only realistic
+ * failure is the app not being deployed, or the backend being down, in which
+ * case the iframe never fires `onLoad`; we arm a timeout on mount and degrade
+ * to an explanatory card with a direct link rather than leaving a blank frame.
  */
-function NetworkMempoolReference() {
+function NodeMempoolExplorer() {
   const [state, setState] = useState<"loading" | "ok" | "blocked">("loading");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -321,24 +321,24 @@ function NetworkMempoolReference() {
 
   const openLink = (
     <a
-      href={MEMPOOL_REFERENCE_URL}
+      href={NODE_MEMPOOL_APP_URL}
       target="_blank"
       rel="noreferrer"
       className="bare"
       style={{ color: "var(--accent)", fontSize: "13px", textDecoration: "underline" }}
     >
-      open full explorer ↗
+      open in a new tab ↗
     </a>
   );
 
   return (
     <Card>
       <CardHeader
-        title="Network mempool — unfiltered reference"
-        subtitle="The stock mempool.space view of the network, unfiltered. Compare it against your node's Reaper-filtered mempool below to see exactly what your policy strips out."
+        title="Your node's mempool"
+        subtitle="The full mempool.space explorer for this node's own mempool, served straight from the dashboard. Same-origin — no external host, no certificate, nothing to trust off-box."
       />
       <div className="flex items-center gap-3" style={{ marginBottom: "12px" }}>
-        <Badge variant="info">unfiltered · reference</Badge>
+        <Badge variant="info">mempool.space · this node</Badge>
         {openLink}
       </div>
 
@@ -356,10 +356,10 @@ function NetworkMempoolReference() {
             The embedded explorer couldn&apos;t load here.
           </p>
           <p style={{ color: "var(--dim)", fontSize: "13px" }}>
-            <code>mempool.bitcoinghost.org</code> either isn&apos;t reachable from this
-            browser or declined to be framed (a TLS certificate that doesn&apos;t cover the{" "}
-            <code>mempool.</code> subdomain is the usual cause). Open it directly for the
-            full unfiltered network view: {openLink}.
+            The dashboard couldn&apos;t serve <code>/mempool-app/</code>, or the node&apos;s
+            mempool backend on <code>127.0.0.1:8999</code> isn&apos;t responding. Check that the
+            mempool service is running on this node, then reload. You can also open it
+            directly: {openLink}.
           </p>
         </div>
       ) : (
@@ -369,12 +369,12 @@ function NetworkMempoolReference() {
             borderRadius: "4px",
             overflow: "hidden",
             background: "var(--surface)",
-            height: "300px",
+            height: "720px",
           }}
         >
           <iframe
-            src={`${MEMPOOL_REFERENCE_URL}/`}
-            title="Network mempool (mempool.space) — unfiltered reference"
+            src={NODE_MEMPOOL_APP_URL}
+            title="Your node's mempool (mempool.space)"
             loading="lazy"
             onLoad={() => {
               if (timer.current) clearTimeout(timer.current);
@@ -386,9 +386,9 @@ function NetworkMempoolReference() {
       )}
 
       <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "12px" }}>
-        Served from the pool&apos;s hosted mempool.space instance at{" "}
-        <code>mempool.bitcoinghost.org</code>. This is the stock, unfiltered mempool — your
-        node&apos;s filtered view and the Reaper strip breakdown are below.
+        Served same-origin from the dashboard at <code>/mempool-app/</code>, proxied to this
+        node&apos;s own mempool backend. The lightweight RPC view and the Reaper strip
+        breakdown are below.
       </p>
     </Card>
   );
