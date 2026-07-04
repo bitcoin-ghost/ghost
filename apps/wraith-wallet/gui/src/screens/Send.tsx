@@ -33,18 +33,32 @@ interface SendProps {
 interface ModeOption {
   id: UiSendMode;
   label: string;
+  /// Short badge on the card ("recommended" / "advanced") so the
+  /// primary path (L2) reads as the default at a glance.
+  badge: string;
+  /// One-line "what this is / when to use it" — the concise helper
+  /// the operator asked for. Sits above the longer `hint`.
+  tagline: string;
   hint: string;
 }
 
+// Order is load-bearing: Ghost Pay (instant L2) is listed FIRST and is
+// the default mode — it's the path most sends should take. PSBT (L1) is
+// the secondary, advanced path. Keep L2 first so the UI always leads
+// with it.
 const MODES = [
   {
     id: "ghostpay",
     label: "Ghost Pay (instant L2)",
+    badge: "recommended",
+    tagline: "Instant · off-chain · no network fee.",
     hint: "Instant off-chain transfer through the operator. No on-chain tx, no confirmation wait — settles to L1 in batches later. For an unlinkable on-chain spend, use the Mix tab (Wraith CoinJoin).",
   },
   {
     id: "psbt",
     label: "PSBT export (L1)",
+    badge: "advanced",
+    tagline: "On-chain · you sign & broadcast · for cold storage or multisig.",
     hint: "Builds an unsigned BIP-174 PSBT spending your L1 UTXOs. Sign here, on a hardware wallet, or with cosigners — then broadcast from the Sign tab. Use for cold-storage flows or multisig.",
   },
 ] as const satisfies readonly ModeOption[];
@@ -452,10 +466,11 @@ export function Send({ activeWallet }: SendProps) {
           <span className="eyebrow">outgoing</span>
           <h1>Send</h1>
           <p className="lead">
-            Two ways to send: Ghost Pay (instant L2, no on-chain tx) or
-            PSBT export (unsigned L1 spend to sign yourself). For an
-            unlinkable on-chain spend, use the Mix tab. Recipient field
-            accepts both ghost-id and any Bitcoin address.
+            Default is <strong>Ghost Pay</strong> — an instant, off-chain
+            L2 transfer with no network fee. Need a plain on-chain spend
+            instead? Switch to PSBT export (L1) and sign it yourself. For
+            an unlinkable on-chain spend, use the Mix tab. The recipient
+            field accepts both a ghost-id and any Bitcoin address.
           </p>
         </div>
       </div>
@@ -609,6 +624,11 @@ export function Send({ activeWallet }: SendProps) {
           </div>
           <div className="col">
             <label>Mode</label>
+            {/* TODO(design): richer infographic — a small illustrated
+                diagram per mode (L2 = phone→phone instant; L1 = coin→
+                block on-chain) would land the difference faster than
+                text. For now we lead with clear labels, a recommended/
+                advanced badge, and a one-line tagline + detail. */}
             <div className="tier-grid">
               {MODES.map((m) => (
                 <button
@@ -618,10 +638,32 @@ export function Send({ activeWallet }: SendProps) {
                   onClick={() => !busy && setMode(m.id)}
                   disabled={busy}
                 >
-                  <div className="tier-label">{m.label.split(" (")[0]}</div>
+                  <div
+                    className="tier-label"
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    {m.label.split(" (")[0]}
+                    <span
+                      className={`pill ${m.id === "ghostpay" ? "pass" : "mute"}`}
+                      style={{ fontSize: 9, textTransform: "uppercase" }}
+                    >
+                      {m.badge}
+                    </span>
+                  </div>
                   <div
                     className="tier-meta"
-                    style={{ marginTop: 6, lineHeight: 1.45 }}
+                    style={{ marginTop: 6, fontWeight: 500 }}
+                  >
+                    {m.tagline}
+                  </div>
+                  <div
+                    className="tier-meta muted"
+                    style={{ marginTop: 4, lineHeight: 1.45 }}
                   >
                     {m.hint}
                   </div>

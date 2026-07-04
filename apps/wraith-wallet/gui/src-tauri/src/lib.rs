@@ -280,6 +280,12 @@ async fn chain_status() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn connection_status() -> Result<serde_json::Value, String> {
+    let resp = call_daemon(Request::ConnectionStatus).await?;
+    to_value(&resp)
+}
+
+#[tauri::command]
 async fn wallet_ghost_id() -> Result<serde_json::Value, String> {
     let resp = call_daemon(Request::WalletGhostId).await?;
     to_value(&resp)
@@ -836,6 +842,7 @@ pub fn run() {
             daemon_doctor,
             daemon_env,
             chain_status,
+            connection_status,
             wallet_list,
             wallet_status,
             wallet_unlock,

@@ -12,7 +12,7 @@ import {
 } from "../lib/tauri";
 import { Numpad } from "../components/Numpad";
 import { ProductCatalog, useProducts, type Product } from "../components/ProductCatalog";
-import { printReceipt } from "../lib/receipt";
+import { printReceipt, emailReceipt, receiptPlainText } from "../lib/receipt";
 
 interface MerchantProps {
   activeWallet: string | null;
@@ -202,6 +202,8 @@ export function Merchant({
   const [paid, setPaid] = useState<PaidReceipt | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Transient positive feedback for receipt actions (email / copy).
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Persisted catalog + takings.
   const { products, setProducts } = useProducts(activeWallet);
@@ -472,6 +474,32 @@ export function Merchant({
       wallet: activeWallet ?? r.wallet_name ?? null,
       network: networkLabel,
     });
+  };
+
+  const flashNotice = (msg: string) => {
+    setNotice(msg);
+    window.setTimeout(() => setNotice(null), 3000);
+  };
+
+  const receiptOpts = (r: PaidReceipt) => ({
+    wallet: activeWallet ?? r.wallet_name ?? null,
+    network: networkLabel,
+  });
+
+  const onEmailReceipt = (r: PaidReceipt) => {
+    // mailto hand-off — opens the operator's own mail client with the
+    // receipt prefilled. No SMTP dependency in the daemon.
+    emailReceipt(r, receiptOpts(r));
+    flashNotice("Opening your mail app… no mail client? Use Copy instead.");
+  };
+
+  const onCopyReceipt = async (r: PaidReceipt) => {
+    try {
+      await navigator.clipboard.writeText(receiptPlainText(r, receiptOpts(r)));
+      flashNotice("Receipt copied to clipboard.");
+    } catch {
+      setErr("Clipboard unavailable — try Print or Email instead.");
+    }
   };
 
   if (!activeWallet) {
@@ -768,14 +796,30 @@ export function Merchant({
                   {paid.txid}
                 </div>
               </div>
-              <div className="row" style={{ justifyContent: "center" }}>
+              <div
+                className="row"
+                style={{ justifyContent: "center", flexWrap: "wrap", gap: 8 }}
+              >
                 <button
-                  className="btn-secondary"
+                  className="btn-secondary btn-sm"
                   onClick={() => onPrintReceipt(paid)}
                   title="Open the printable receipt in a new window"
-                  style={{ padding: "10px 18px" }}
                 >
                   Print receipt
+                </button>
+                <button
+                  className="btn-secondary btn-sm"
+                  onClick={() => onEmailReceipt(paid)}
+                  title="Open your mail app with the receipt prefilled (mailto)"
+                >
+                  Email receipt
+                </button>
+                <button
+                  className="btn-secondary btn-sm"
+                  onClick={() => onCopyReceipt(paid)}
+                  title="Copy the receipt as plain text"
+                >
+                  Copy
                 </button>
                 <button
                   className="btn-primary"
@@ -785,6 +829,14 @@ export function Merchant({
                   Next sale
                 </button>
               </div>
+              {notice && (
+                <div
+                  className="pill pass"
+                  style={{ alignSelf: "center", marginTop: 4 }}
+                >
+                  {notice}
+                </div>
+              )}
             </div>
           ) : open ? (
             <div

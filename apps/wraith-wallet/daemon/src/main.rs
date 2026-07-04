@@ -60,7 +60,8 @@ mod server {
     use wraith_wallet_core::light;
     use wraith_wallet_core::signer::{Signer, SoftwareSigner};
     use wraith_wallet_ipc::{
-        ChainStatusResponse, CheckForUpdateResponse, DaemonEnvResponse, DetectedPaymentEntry,
+        ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse, DaemonEnvResponse,
+        DetectedPaymentEntry,
         DoctorCheck, DoctorResponse, Envelope, ErrorResponse, GlyphClaimResult, GlyphInfo,
         GspAuthResponse, GspPingResponse, GspSessionStatusResponse, HealthResponse,
         LightBalanceResponse, LightDetectedResponse, LightHistoryEntry, LightHistoryResponse,
@@ -1368,6 +1369,18 @@ mod server {
         }
     }
 
+    /// Human-readable network label matching the strings the GUI expects
+    /// ("mainnet"/"signet"/"testnet"/"regtest").
+    fn network_label(n: bitcoin::Network) -> &'static str {
+        match n {
+            bitcoin::Network::Bitcoin => "mainnet",
+            bitcoin::Network::Signet => "signet",
+            bitcoin::Network::Testnet => "testnet",
+            bitcoin::Network::Regtest => "regtest",
+            _ => "unknown",
+        }
+    }
+
     /// Snapshot the active wallet's name + keystore for read-only use.
     /// Returns Err with a user-friendly message if no wallet is active.
     /// Reject the request if kiosk mode is active. Used by the
@@ -2121,6 +2134,63 @@ mod server {
                         last_error: None,
                     }),
                 }
+            }
+            Request::ConnectionStatus => {
+                // One probe answers "is ghost-pay reachable" AND supplies the
+                // chain fields. On error we report unreachable rather than
+                // surfacing a Response::Error — the whole point is a header
+                // that says "unreachable" instead of spinning forever.
+                let (
+                    ghost_pay_reachable,
+                    ghost_pay_version,
+                    ghost_pay_error,
+                    chain_height,
+                    chain_headers,
+                    chain_ibd,
+                    l2_height,
+                ) = match state.chain.status().await {
+                    Ok(s) => (
+                        true,
+                        Some(s.backend_version),
+                        None,
+                        s.chain_height,
+                        s.chain_headers,
+                        s.chain_initial_block_download,
+                        s.l2_height,
+                    ),
+                    Err(e) => (false, None, Some(format!("{e}")), None, None, None, None),
+                };
+                // Same rule the GUI's SyncIndicator uses: verified height has
+                // caught the header tip (or headers unknown) AND bitcoind is
+                // out of initial block download.
+                let chain_synced = ghost_pay_reachable
+                    && chain_height.is_some()
+                    && chain_headers.map_or(true, |h| chain_height.unwrap_or(0) >= h)
+                    && chain_ibd == Some(false);
+                let (gsp_have_token, gsp_phase) = {
+                    let guard = state.session.read().await;
+                    match guard.as_ref() {
+                        Some(s) => {
+                            let snap = s.handle.snapshot().await;
+                            (true, Some(phase_label(snap.phase).to_string()))
+                        }
+                        None => (false, None),
+                    }
+                };
+                let gsp_connected = gsp_phase.as_deref() == Some("authenticated");
+                Response::ConnectionStatus(ConnectionStatusResponse {
+                    network: network_label(state.network).to_string(),
+                    ghost_pay_reachable,
+                    ghost_pay_version,
+                    ghost_pay_error,
+                    gsp_have_token,
+                    gsp_connected,
+                    gsp_phase,
+                    chain_height,
+                    chain_headers,
+                    chain_synced,
+                    l2_height,
+                })
             }
             Request::LightBalance => {
                 let guard = state.session.read().await;
@@ -4454,6 +4524,32 @@ mod server {
                 "second delete should error; got {:?}",
                 resp.payload
             );
+        }
+
+        #[tokio::test]
+        async fn connection_status_reports_unreachable_without_erroring() {
+            // With the RejectChain stub (ghost-pay unreachable) and no GSP
+            // session, ConnectionStatus must still return a structured
+            // snapshot — NOT a Response::Error. This is what lets the header
+            // render a clear "unreachable" state instead of a perpetual
+            // "connecting…" spinner on a laptop with no local endpoints.
+            let state = test_state();
+            let req = serde_json::to_string(&Envelope::new(1, Request::ConnectionStatus)).unwrap();
+            let resp = super::dispatch(&req, &state).await;
+            match resp.payload {
+                Response::ConnectionStatus(s) => {
+                    assert_eq!(s.network, "regtest", "network is read from config, not the backend");
+                    assert!(!s.ghost_pay_reachable, "RejectChain stub must read as unreachable");
+                    assert!(s.ghost_pay_error.is_some(), "an unreachable backend should carry an error hint");
+                    assert!(s.ghost_pay_version.is_none());
+                    assert!(!s.gsp_have_token, "no session configured in this test");
+                    assert!(!s.gsp_connected);
+                    assert!(s.gsp_phase.is_none());
+                    assert!(!s.chain_synced, "cannot be synced while ghost-pay is unreachable");
+                    assert!(s.chain_height.is_none());
+                }
+                other => panic!("expected ConnectionStatus, got {other:?}"),
+            }
         }
     }
 }

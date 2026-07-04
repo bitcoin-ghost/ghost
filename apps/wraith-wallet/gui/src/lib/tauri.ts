@@ -154,6 +154,32 @@ export async function chainStatus(): Promise<ChainStatusResponse> {
   return unwrap<ChainStatusResponse>(resp).payload;
 }
 
+/// Consolidated connectivity snapshot for the header status bar.
+/// Composed daemon-side from the ghost-pay probe + GSP session + chain
+/// fields, so the GUI makes ONE call and — crucially — this never
+/// throws for an unreachable backend: `ghost_pay_reachable: false` is a
+/// normal, renderable result, not an error. That's what fixes the
+/// "constantly refreshing, no response" feel when a laptop has no
+/// local ghost-pay/GSP.
+export interface ConnectionStatusResponse {
+  network: string;
+  ghost_pay_reachable: boolean;
+  ghost_pay_version: string | null;
+  ghost_pay_error: string | null;
+  gsp_have_token: boolean;
+  gsp_connected: boolean;
+  gsp_phase: string | null;
+  chain_height: number | null;
+  chain_headers: number | null;
+  chain_synced: boolean;
+  l2_height: number | null;
+}
+
+export async function connectionStatus(): Promise<ConnectionStatusResponse> {
+  const resp = await invoke("connection_status");
+  return unwrap<ConnectionStatusResponse>(resp).payload;
+}
+
 // ----- Wallet ------------------------------------------------------------
 
 export interface WalletEntry {
