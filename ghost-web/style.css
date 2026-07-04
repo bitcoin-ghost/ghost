@@ -595,6 +595,27 @@ h2.section-title {
   margin-top: 8px; text-shadow: none;
 }
 
+/* Rate-limit notice — stats are throttled, not broken. Calm accent pill,
+   never a red error. Hidden until a poll returns HTTP 429; cleared the
+   moment a poll succeeds again. Shared by pool.html, index.html, miner.html. */
+.rl-notice-wrap .container { padding-top: 0; padding-bottom: 0; }
+.rl-notice {
+  display: none; align-items: center; gap: 10px;
+  margin: 14px 0 0; padding: 10px 14px;
+  border: 1px solid var(--rule-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px; background: var(--accent-weak);
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5;
+  color: var(--dim);
+}
+.rl-notice.show { display: flex; }
+.rl-notice .rl-dot {
+  flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); animation: rl-pulse 1.6s ease-in-out infinite;
+}
+.rl-notice .rl-text strong { color: var(--fg); font-weight: 500; }
+@keyframes rl-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+
 /* Pool tabs */
 .pool-tabs { padding: 56px 0 72px; }
 .tabs-nav {

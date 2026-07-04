@@ -104,6 +104,15 @@
   </div>
 </section>
 
+<div class="rl-notice-wrap">
+  <div class="container">
+    <div class="rl-notice" id="rl-notice" role="status" aria-live="polite">
+      <span class="rl-dot"></span>
+      <span class="rl-text"><strong>Live stats are catching their breath.</strong> The node rate-limits requests to protect itself — the figures above are the last good reading and will resume updating in a minute or two.</span>
+    </div>
+  </div>
+</div>
+
 <section class="viz-section">
   <div class="container">
     <div class="viz-tabs">
@@ -588,11 +597,20 @@
     document.getElementById('miners-window').textContent = formatWindow(chartHistory.miners);
   }
 
+  // Rate-limit notice: shown when the pool API throttles us (HTTP 429) and a
+  // poll yields no fresh data; cleared the moment any node answers cleanly. A
+  // 429 poll returns the { __rl: true } marker so refreshPool can tell "the
+  // node is protecting itself" apart from an ordinary dropped fetch (null).
+  var rlNotice = document.getElementById('rl-notice');
+  function setRateLimited(on) {
+    if (rlNotice) rlNotice.classList.toggle('show', !!on);
+  }
+
   function fetchNode(node) {
     var ctl = new AbortController();
     var t = setTimeout(function () { ctl.abort(); }, 5000);
     return fetch('/api/pool/' + node.id + '/api/v1/mining/status', { signal: ctl.signal })
-      .then(function (r) { clearTimeout(t); return r.ok ? r.json() : null; })
+      .then(function (r) { clearTimeout(t); if (r.status === 429) return { __rl: true }; return r.ok ? r.json() : null; })
       .catch(function () { clearTimeout(t); return null; });
   }
 
@@ -623,15 +641,25 @@
     try {
       dbg('polling 4 nodes…');
       var results = await Promise.all(POOL_NODES.map(fetchNode));
-      var okCount = results.filter(function (r) { return !!r; }).length;
-      // All four fetches failed (rate limit / transient) — don't blank the
-      // tiles. Keep the last good numbers, user can ignore one missed tick.
+      // Split the throttle markers out from real data. `good` is every node
+      // that returned usable JSON; a rate-limited (HTTP 429) poll left a
+      // { __rl: true } marker instead.
+      var rateLimited = results.some(function (r) { return r && r.__rl; });
+      var good = results.filter(function (r) { return r && !r.__rl; });
+      var okCount = good.length;
+      // Clear the notice the instant any node answers cleanly; raise it when
+      // we were throttled this tick and have no fresh data to show.
+      if (okCount > 0) setRateLimited(false);
+      else if (rateLimited) setRateLimited(true);
+      // No usable responses (throttled or transient) — don't blank the tiles.
+      // Keep the last good numbers; the notice explains the pause.
       if (okCount === 0 && lastStats.height) {
-        dbg('poll skip · 0/4 nodes — preserving last view');
+        dbg(rateLimited ? 'poll skip · rate-limited — preserving last view'
+                        : 'poll skip · 0/4 nodes — preserving last view');
         return;
       }
       var hashrate = 0, meshHashrate = null, sumLocal = 0, blocks = 0, height = 0, mesh = null, maxActive = 0;
-      results.forEach(function (r) {
+      good.forEach(function (r) {
         if (!r) return;
         // Pool hashrate: prefer the mesh-wide `total_hashrate` (every post-PR#27
         // node reports the SAME pool-wide figure, built from gossiped per-node
@@ -674,7 +702,7 @@
       // Used by the quasar HUD clock so "time since last block" is
       // real on first page load, not just "time since page open".
       var tipTime = null;
-      results.forEach(function (r) {
+      good.forEach(function (r) {
         if (r && typeof r.last_block_time === 'number') {
           if (tipTime === null || r.last_block_time > tipTime) tipTime = r.last_block_time;
         }
@@ -687,7 +715,7 @@
       lastStats.miners = mesh !== null ? mesh : maxActive;
       lastStats.blocks = blocks;
       lastStats.height = height;
-      lastStats.nodes = results;
+      lastStats.nodes = good;
       renderMetrics();
       pushHistory(hashrate, lastStats.miners);
       renderCharts();

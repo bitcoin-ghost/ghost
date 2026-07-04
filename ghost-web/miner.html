@@ -63,6 +63,15 @@
   </div>
 </header>
 
+<div class="rl-notice-wrap">
+  <div class="container">
+    <div class="rl-notice" id="rl-notice" role="status" aria-live="polite">
+      <span class="rl-dot"></span>
+      <span class="rl-text"><strong>Live stats are catching their breath.</strong> The node rate-limits requests to protect itself — the figures shown are the last good reading and will resume updating in a minute or two.</span>
+    </div>
+  </div>
+</div>
+
 <!-- ───── Address mode ───── -->
 <section class="block mp-hero" id="addr-mode" style="display:none">
   <div class="container">
@@ -338,6 +347,29 @@
 
   function showMode(id) { document.getElementById(id).style.display = 'block'; }
 
+  // ───────── Rate-limit notice ─────────
+  // A 429 from the pool API means we're being throttled, not that the miner is
+  // gone — so surface a calm notice and keep the last-known figures on screen
+  // rather than flashing "not found" or zeros. Fetch handlers return a
+  // { __rl: true } marker on HTTP 429; siftBatch strips those markers out of a
+  // per-node batch and drives the notice: any clean response hides it, a
+  // throttled batch with no clean response shows it. Nulls (ordinary transient
+  // failures) pass through untouched so existing preserve-on-failure logic
+  // behaves exactly as before.
+  var rlNotice = document.getElementById('rl-notice');
+  function siftBatch(perNode) {
+    var good = [], rl = false;
+    perNode.forEach(function (d) {
+      if (d && d.__rl) rl = true;
+      else good.push(d);
+    });
+    if (rlNotice) {
+      if (good.some(function (d) { return d !== null; })) rlNotice.classList.remove('show');
+      else if (rl) rlNotice.classList.add('show');
+    }
+    return good;
+  }
+
   if (!rawId) {
     showMode('empty-mode');
   } else if (rawId.indexOf('.') >= 0 && rawId.split('.').slice(1).join('.').length > 0) {
@@ -354,11 +386,11 @@
     document.title = address.slice(0, 10) + '… · Bitcoin Ghost';
 
     async function load() {
-      var perNode = await Promise.all(POOL_NODES.map(function (n) {
+      var perNode = siftBatch(await Promise.all(POOL_NODES.map(function (n) {
         return fetch('/api/pool/' + n.id + '/api/v1/miners/workers?address=' + encodeURIComponent(address))
-          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (r) { if (r.status === 429) return { __rl: true }; return r.ok ? r.json() : null; })
           .catch(function () { return null; });
-      }));
+      })));
       // Merge per-worker across nodes, keeping pool-wide totals
       var byWorker = new Map();
       perNode.forEach(function (d) {
@@ -585,11 +617,11 @@
 
     var lookupEverSeen = false;
     async function loadLookup() {
-      var perNode = await Promise.all(POOL_NODES.map(function (n) {
+      var perNode = siftBatch(await Promise.all(POOL_NODES.map(function (n) {
         return fetch('/api/pool/' + n.id + '/api/v1/miners/lookup?miner_id=' + encodeURIComponent(minerId))
-          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (r) { if (r.status === 429) return { __rl: true }; return r.ok ? r.json() : null; })
           .catch(function () { return null; });
-      }));
+      })));
       var okCount = perNode.filter(function (d) { return d !== null; }).length;
       var hits = perNode.filter(function (d) { return d && d.found === true; });
 

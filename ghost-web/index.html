@@ -103,6 +103,15 @@
   </div>
 </section>
 
+<div class="rl-notice-wrap">
+  <div class="container">
+    <div class="rl-notice" id="rl-notice" role="status" aria-live="polite">
+      <span class="rl-dot"></span>
+      <span class="rl-text"><strong>Live stats are catching their breath.</strong> The node rate-limits requests to protect itself — the figures above are the last good reading and will resume updating in a minute or two.</span>
+    </div>
+  </div>
+</div>
+
 <section class="block">
   <div class="container">
     <div class="section-label">What Ghost is</div>
@@ -581,6 +590,13 @@
       if (ths < 1e6)   return (ths / 1000).toFixed(2) + '<span class="unit">PH/s</span>';
       return (ths / 1e6).toFixed(2) + '<span class="unit">EH/s</span>';
     }
+    // Rate-limit notice: shown when the pool API throttles us (HTTP 429) and a
+    // poll returns no fresh data; cleared the moment any seed answers cleanly.
+    var rlNotice = document.getElementById('rl-notice');
+    function setRateLimited(on) {
+      if (rlNotice) rlNotice.classList.toggle('show', !!on);
+    }
+
     async function refresh() {
       try {
         // Kick off the whole-mesh node fetch in parallel with the per-seed
@@ -590,11 +606,19 @@
           var ctl = new AbortController();
           var t = setTimeout(function () { ctl.abort(); }, 5000);
           return fetch('/api/pool/' + vm + '/api/v1/mining/status', { signal: ctl.signal })
-            .then(function (r) { clearTimeout(t); return r.ok ? r.json() : null; })
+            .then(function (r) { clearTimeout(t); if (r.status === 429) return { __rl: true }; return r.ok ? r.json() : null; })
             .catch(function () { clearTimeout(t); return null; });
         }));
+        // A 429 poll returns { __rl: true }; keep only real data in `good`.
+        var rateLimited = results.some(function (r) { return r && r.__rl; });
+        var good = results.filter(function (r) { return r && !r.__rl; });
+        // Clear the notice as soon as any seed answers cleanly; raise it when
+        // this tick was throttled with nothing fresh to show. The tiles below
+        // keep their last-known values either way.
+        if (good.length > 0) setRateLimited(false);
+        else if (rateLimited) setRateLimited(true);
         var online = 0, hash = 0, meshHash = null, sumLocal = 0, height = 0, mesh = null, maxActive = 0;
-        results.forEach(function (r) {
+        good.forEach(function (r) {
           if (!r) return;
           online++;
           // Pool hashrate: prefer the mesh-wide `total_hashrate` (the SAME pool
