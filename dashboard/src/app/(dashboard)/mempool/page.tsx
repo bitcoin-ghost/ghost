@@ -310,6 +310,15 @@ function NodeMempoolExplorer() {
   const [state, setState] = useState<"loading" | "ok" | "blocked">("loading");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // mempool.space's UI has a wide min-width and won't shrink its own content to
+  // fit a narrower container, so we render it at a fixed design width and CSS
+  // scale-to-fit the actual container width. A ResizeObserver keeps it dynamic
+  // as the window / sidebar changes.
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(1);
+  const DESIGN_WIDTH = 1800; // width at which mempool.space's dashboard lays out cleanly
+  const VIEW_HEIGHT = 720; // visible height of the embed
+
   useEffect(() => {
     timer.current = setTimeout(() => {
       setState((s) => (s === "loading" ? "blocked" : s));
@@ -317,6 +326,19 @@ function NodeMempoolExplorer() {
     return () => {
       if (timer.current) clearTimeout(timer.current);
     };
+  }, []);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const update = () => {
+      const w = el.clientWidth;
+      if (w > 0) setScale(w / DESIGN_WIDTH);
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
   const openLink = (
@@ -364,12 +386,14 @@ function NodeMempoolExplorer() {
         </div>
       ) : (
         <div
+          ref={wrapRef}
           style={{
             border: "1px solid var(--rule)",
             borderRadius: "4px",
             overflow: "hidden",
             background: "var(--surface)",
-            height: "720px",
+            height: `${VIEW_HEIGHT}px`,
+            width: "100%",
           }}
         >
           <iframe
@@ -380,7 +404,14 @@ function NodeMempoolExplorer() {
               if (timer.current) clearTimeout(timer.current);
               setState("ok");
             }}
-            style={{ width: "100%", height: "100%", border: 0, display: "block" }}
+            style={{
+              width: `${DESIGN_WIDTH}px`,
+              height: `${VIEW_HEIGHT / scale}px`,
+              border: 0,
+              display: "block",
+              transform: `scale(${scale})`,
+              transformOrigin: "top left",
+            }}
           />
         </div>
       )}
