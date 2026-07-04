@@ -619,7 +619,9 @@ impl TemplateProcessor {
         let round_id = proposal.round_id;
 
         // Ensure round exists before inserting payout entries (FK constraint).
-        // Production never called create_round() so every payout insert was failing.
+        // The round row may already have been persisted at round start (with
+        // only its block height), so `upsert_round` fills in the block-outcome
+        // columns on conflict rather than skipping like INSERT OR IGNORE would.
         let round_record = RoundRecord {
             round_id,
             block_height: proposal.block_height,
@@ -634,8 +636,8 @@ impl TemplateProcessor {
             subsidy_sats: Some(proposal.subsidy),
             tx_fees_sats: Some(proposal.tx_fees),
         };
-        if let Err(e) = db.create_round_if_not_exists(&round_record) {
-            warn!(round_id = round_id, error = %e, "Failed to create round record");
+        if let Err(e) = db.upsert_round(&round_record) {
+            warn!(round_id = round_id, error = %e, "Failed to persist round record");
             return;
         }
 

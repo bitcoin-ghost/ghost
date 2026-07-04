@@ -7606,6 +7606,12 @@ async fn main() -> Result<()> {
     // Note: Job notifications to miners now handled by SRI via TDP
     let rm_notify = Arc::clone(&round_manager);
     let tp_for_template_events = Arc::clone(&template_processor);
+    // Persist each round at start so the `rounds` table carries its block
+    // height. The best-hash per-window queries LEFT JOIN rounds to resolve a
+    // share's block height; previously rounds were only ever written by the
+    // payout path (block-found), which almost never fires, so every per-window
+    // best share reported a null block height.
+    let db_for_rounds = Arc::clone(&db);
     // Coordinator-election recompute hook (read-only). `None` when the feature
     // is off → the recompute below is skipped entirely.
     let coord_for_events = coordinator_election.clone();
@@ -7619,7 +7625,30 @@ async fn main() -> Result<()> {
             match event {
                 TemplateEvent::NewWork { job_id: _, height } => {
                     // Start new round (SRI gets jobs via TDP automatically)
-                    rm_notify.start_round(height);
+                    let round_id = rm_notify.start_round(height);
+
+                    // Persist the round (round_id → block_height) so the
+                    // best-hash per-window join can resolve a share's block
+                    // height. INSERT OR IGNORE: the payout path later upserts
+                    // the block-outcome columns onto this row if a block is
+                    // found for the round.
+                    let round_record = ghost_storage::RoundRecord {
+                        round_id,
+                        block_height: height,
+                        block_hash: None,
+                        start_time: chrono::Utc::now().timestamp(),
+                        end_time: None,
+                        total_shares: 0,
+                        total_work: 0.0,
+                        winning_miner: None,
+                        found_by_node: None,
+                        payout_status: ghost_storage::PayoutStatus::Active,
+                        subsidy_sats: None,
+                        tx_fees_sats: None,
+                    };
+                    if let Err(e) = db_for_rounds.create_round_if_not_exists(&round_record) {
+                        warn!(round_id = round_id, error = %e, "Failed to persist round at start");
+                    }
 
                     // Refresh the coordinator-election view if the epoch has
                     // changed (cheap no-op within an epoch; a no-op entirely
