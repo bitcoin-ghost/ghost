@@ -806,7 +806,12 @@ impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             ghost_mode: true,
-            archive_mode: true,  // enabled by default
+            // Opt-in: archiving needs the full unpruned chain plus lots of disk,
+            // so the node must never advertise the Archive capability by default.
+            // The real value is synced from `storage.archive_mode` in
+            // `with_full_node_config`; leaving this false means a node whose
+            // config does not enable archiving can never claim it.
+            archive_mode: false,
             ghost_pay: true,     // enabled by default
             public_mining: true, // enabled by default
             reaper: true,        // enabled by default
@@ -1503,6 +1508,16 @@ impl VerificationState {
     /// * `config` - The full NodeConfig loaded from pool.toml
     /// * `path` - Path to the pool.toml file for atomic save
     pub fn with_full_node_config(mut self, config: FullNodeConfig, path: PathBuf) -> Self {
+        // Sync the dashboard's "Claimed" archive capability with the real node
+        // config (`[storage] archive_mode` in pool.toml). Archiving needs the
+        // full unpruned chain, so the Claimed column must track the actual
+        // config rather than a stale default — a config with archive_mode=false
+        // forces the claim false, and the two never drift. (An operator opting
+        // in via the config, or later via the POST toggle, flips it true.)
+        {
+            let mut dashboard = self.dashboard_config.write();
+            dashboard.archive_mode = config.storage.archive_mode;
+        }
         self.full_node_config = Some(parking_lot::RwLock::new(config));
         self.full_node_config_path = Some(path);
         self
@@ -2554,6 +2569,56 @@ mod tests {
             *b = (i as u8).wrapping_add(0x42);
         }
         secret
+    }
+
+    #[test]
+    fn test_dashboard_config_default_archive_mode_off() {
+        // Archiving needs the full unpruned chain, so a node must never claim
+        // the Archive capability by default. The default must be false.
+        let config = DashboardConfig::default();
+        assert!(
+            !config.archive_mode,
+            "DashboardConfig must default archive_mode to false (opt-in only)"
+        );
+    }
+
+    #[test]
+    fn test_with_full_node_config_syncs_archive_claim() {
+        // A node config with `storage.archive_mode = false` must force the
+        // dashboard's Claimed archive capability false — they must not drift,
+        // even though DashboardConfig would otherwise carry whatever value it
+        // was constructed with.
+        let mut node_config = FullNodeConfig::default();
+        node_config.storage.archive_mode = false;
+
+        let state = VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_full_node_config(node_config, std::path::PathBuf::from("/tmp/pool.toml"));
+
+        assert!(
+            !state.dashboard_config.read().archive_mode,
+            "storage.archive_mode=false must force the dashboard archive claim false"
+        );
+
+        // Conversely, an operator that genuinely enables archiving in the node
+        // config has the Claimed capability follow it true.
+        let mut node_config_on = FullNodeConfig::default();
+        node_config_on.storage.archive_mode = true;
+        let state_on = VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_full_node_config(node_config_on, std::path::PathBuf::from("/tmp/pool.toml"));
+        assert!(
+            state_on.dashboard_config.read().archive_mode,
+            "storage.archive_mode=true must let the dashboard archive claim be true"
+        );
     }
 
     #[test]
