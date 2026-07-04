@@ -32,7 +32,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use ghost_buds::{BudsClassifier, BudsTier};
 use ghost_common::constants::{SV1_STRATUM_PORT, SV2_AUTHORITY_PUBLIC_KEY, SV2_STRATUM_PORT};
@@ -5067,10 +5067,15 @@ async fn api_config_reaper_handler(
         .as_ref()
         .map(|c| c.read().reaper.clone())
         .unwrap_or_default();
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
     Json(serde_json::json!({
         "enabled": settings.enabled,
         "mode": if settings.enabled { "strict" } else { "disabled" },
         "settings": serde_json::to_value(&settings).unwrap_or_else(|_| serde_json::json!({})),
+        // Terminal result of the last automatic ghostd mempool-reaper apply so
+        // the dashboard can show whether the node picked up the change.
+        "ghostd_apply": apply,
         "message": "Reaper per-vector configuration",
     }))
 }
@@ -5209,12 +5214,120 @@ async fn api_config_public_mining_post_handler(
     }))
 }
 
+/// Resolve the `ghost-setup` binary used to apply the ghostd mempool-reaper
+/// drop-in. Overridable via `GHOST_SETUP_BIN` for packaging and for tests
+/// (point it at a non-existent path to exercise the fail-safe without touching
+/// the real node).
+fn ghost_setup_bin() -> String {
+    std::env::var("GHOST_SETUP_BIN").unwrap_or_else(|_| "/opt/ghost/bin/ghost-setup".to_string())
+}
+
+/// Run `sudo -n <ghost-setup> apply-reaper`, which regenerates the ghostd
+/// `-ghostreaper` systemd drop-in from `pool.toml [reaper]` and restarts ghostd.
+///
+/// Blocking (it waits for ghostd to restart), so callers run it off the request
+/// path. Returns `Ok(message)` on success or `Err(reason)` on any failure —
+/// never a false success. The `GHOST_REAPER_APPLY_TEST_MODE` env var short-
+/// circuits the shell-out in tests (`success` → Ok, anything else → Err).
+fn run_ghostd_apply_reaper() -> Result<String, String> {
+    // Test hook: never shell out to sudo/ghostd/systemctl from unit tests.
+    if let Ok(mode) = std::env::var("GHOST_REAPER_APPLY_TEST_MODE") {
+        return if mode == "success" {
+            Ok("test-mode: apply-reaper simulated success".to_string())
+        } else {
+            Err(format!("test-mode: apply-reaper simulated failure ({mode})"))
+        };
+    }
+
+    let bin = ghost_setup_bin();
+    // Fail-safe: if the helper isn't deployed we report the ghostd side as not
+    // applied rather than spawning a doomed process.
+    if !std::path::Path::new(&bin).exists() {
+        return Err(format!(
+            "ghost-setup binary not found at {bin}; ghostd mempool reaper not updated"
+        ));
+    }
+
+    // `sudo -n` never prompts: if the scoped sudoers drop-in isn't installed
+    // this fails fast with a clear permission error instead of hanging.
+    let output = std::process::Command::new("sudo")
+        .args(["-n", &bin, "apply-reaper"])
+        .output()
+        .map_err(|e| format!("failed to launch `sudo -n {bin} apply-reaper`: {e}"))?;
+
+    if output.status.success() {
+        Ok("ghostd `-ghostreaper` flags regenerated and ghostd restarted".to_string())
+    } else {
+        // Surface the most informative line of stderr (e.g. the sudo denial).
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .last()
+            .unwrap_or("no error output");
+        Err(format!(
+            "`ghost-setup apply-reaper` failed ({}): {detail}",
+            output.status
+        ))
+    }
+}
+
+/// Spawn the automatic ghostd apply in the background and, once it settles,
+/// trigger the pool restart. Sequencing the pool restart *after* the ghostd
+/// apply is deliberate: the pool depends on ghostd's RPC, so we let ghostd
+/// finish restarting (or fail) before ghost-pool bounces and reconnects to the
+/// freshly-flagged daemon. If the ghostd apply fails, the pool side still
+/// applies from the persisted config — the node is never left half-configured.
+fn spawn_ghostd_reaper_apply(state: Arc<VerificationState>) {
+    *state.ghostd_reaper_apply.write() =
+        ghost_common_now("applying", "Applying ghostd mempool-reaper flags…");
+
+    tokio::spawn(async move {
+        // The apply blocks (it waits for ghostd's restart); keep it off the
+        // async worker threads.
+        let result = tokio::task::spawn_blocking(run_ghostd_apply_reaper).await;
+        let outcome = match result {
+            Ok(Ok(msg)) => {
+                info!(message = %msg, "ghostd mempool reaper auto-applied");
+                ghost_common_now("applied", msg)
+            }
+            Ok(Err(reason)) => {
+                warn!(reason = %reason, "ghostd mempool reaper auto-apply failed");
+                ghost_common_now("failed", reason)
+            }
+            Err(join_err) => {
+                let reason = format!("apply task panicked: {join_err}");
+                error!(error = %reason, "ghostd mempool reaper auto-apply crashed");
+                ghost_common_now("failed", reason)
+            }
+        };
+        *state.ghostd_reaper_apply.write() = outcome;
+
+        // Now bounce the pool so the block-template reaper picks up the same
+        // config, reconnecting to the (already-restarted) ghostd.
+        state.request_restart();
+    });
+}
+
+/// Small local helper to build a timestamped apply record without importing the
+/// type name everywhere.
+fn ghost_common_now(state: &str, message: impl Into<String>) -> crate::server::GhostdReaperApply {
+    crate::server::GhostdReaperApply::now(state, message)
+}
+
 /// API v1 Config reaper POST handler — accepts the full per-vector reaper
-/// settings, persists them to the node config (pool.toml `[reaper]`), and signals
-/// a ghost-pool restart so the pool template reaper picks them up. The node-level
-/// (ghostd) mempool reaper still needs `ghost-setup apply-reaper`, surfaced via
-/// `ghostd_restart_required`. A legacy `{ "enabled": bool }` body still works
-/// (the per-vector fields fall back to their serde defaults = all-on).
+/// settings, persists them to the node config (pool.toml `[reaper]`), and then
+/// applies them to BOTH reapers automatically: the pool block-template reaper
+/// (via a ghost-pool restart) and the ghostd mempool reaper (by running
+/// `ghost-setup apply-reaper` in the background, which regenerates the
+/// `-ghostreaper` drop-in and restarts ghostd). No manual CLI step is needed.
+///
+/// The ghostd apply is slow and disruptive, so it runs off the request path;
+/// the response returns promptly with the apply *initiated* and the terminal
+/// result lands on the reaper GET endpoint's `ghostd_apply`. A legacy
+/// `{ "enabled": bool }` body still works (the per-vector fields fall back to
+/// their serde defaults = all-on).
 async fn api_config_reaper_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(payload): Json<ghost_common::config::ReaperSettings>,
@@ -5235,21 +5348,42 @@ async fn api_config_reaper_post_handler(
         let mut dc = state.dashboard_config.write();
         dc.reaper = payload.enabled;
     }
-    // The pool template reaper reads its config at startup; a restart applies it.
-    if persisted {
-        state.request_restart();
+
+    // Nothing was written to pool.toml, so there is nothing to apply to either
+    // reaper. Report skipped and don't touch ghostd or restart the pool.
+    if !persisted {
+        *state.ghostd_reaper_apply.write() =
+            ghost_common_now("skipped", "Config not persisted; ghostd reaper unchanged.");
+        let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+            .unwrap_or_else(|_| serde_json::json!({}));
+        return Json(serde_json::json!({
+            "success": true,
+            "persisted": false,
+            "enabled": payload.enabled,
+            "settings": serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({})),
+            "ghostd_apply": apply,
+            "message": "Reaper settings received but no node config path is configured — changes were not persisted.",
+        }));
     }
+
+    // Kick off the ghostd apply in the background; it triggers the pool restart
+    // once ghostd has settled (see `spawn_ghostd_reaper_apply`). We deliberately
+    // do NOT call `request_restart()` here — the background task owns the
+    // ordering so the pool always bounces after ghostd, never before.
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
+
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
     Json(serde_json::json!({
         "success": true,
-        "persisted": persisted,
+        "persisted": true,
         "enabled": payload.enabled,
         "settings": serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({})),
-        "ghostd_restart_required": true,
-        "message": if persisted {
-            "Pool reaper updated; ghost-pool will restart to apply. Run `ghost-setup apply-reaper` (or restart ghostd) to apply node-level mempool filtering."
-        } else {
-            "Reaper settings received but no node config path is configured — changes were not persisted."
-        },
+        // Superseded `ghostd_restart_required`: the node mempool reaper is now
+        // applied automatically. Kept as `false` for older dashboards.
+        "ghostd_restart_required": false,
+        "ghostd_apply": apply,
+        "message": "Reaper settings saved. The pool template reaper applies on the imminent ghost-pool restart, and the ghostd mempool reaper is being applied automatically (ghostd will briefly restart).",
     }))
 }
 
@@ -7991,6 +8125,143 @@ mod tests {
         assert_eq!(
             wraith_field(default_state).await["wraith_enabled"].as_bool(),
             Some(false)
+        );
+    }
+
+    /// The reaper config POST must auto-apply the ghostd mempool reaper: it
+    /// persists the config, then runs `ghost-setup apply-reaper` in the
+    /// background and sequences the pool restart after. This exercises both the
+    /// success path and the fail-safe (helper missing / not permitted) without
+    /// shelling out, via the `GHOST_REAPER_APPLY_TEST_MODE` / `GHOST_SETUP_BIN`
+    /// hooks. Runs both cases in one test so the process-global env vars can't
+    /// race a parallel test.
+    #[tokio::test]
+    async fn test_config_reaper_post_auto_applies_ghostd() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        // Poll the shared apply record until it leaves the "applying" state.
+        async fn settle(state: &Arc<crate::server::VerificationState>) -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let st = state.ghostd_reaper_apply.read().state.clone();
+                if st != "applying" {
+                    return st;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ghostd apply never settled"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        let post_reaper = |state: Arc<crate::server::VerificationState>,
+                           auth: crate::auth::InternalAuth,
+                           enabled: bool| {
+            let app = super::create_router(Arc::clone(&state));
+            async move {
+                let body = format!(r#"{{"enabled": {enabled}}}"#);
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let signature = auth.sign(timestamp, body.as_bytes());
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/config/reaper")
+                            .header("Content-Type", "application/json")
+                            .header("X-Ghost-Signature", signature)
+                            .header("X-Ghost-Timestamp", timestamp.to_string())
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+
+        let make_state = || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pool.toml");
+            let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+            let state = Arc::new(
+                crate::server::VerificationState::new(
+                    "test_node".to_string(),
+                    "1.0.0".to_string(),
+                    PolicyProfile::default(),
+                    NodeCapabilities::default(),
+                )
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            );
+            // Keep `dir` alive for the state's lifetime by leaking it (test-only).
+            std::mem::forget(dir);
+            (state, auth)
+        };
+
+        // --- Success path: apply-reaper "succeeds", ghostd reported applied,
+        //     and the pool restart is requested AFTER (sequenced). ---
+        std::env::remove_var("GHOST_SETUP_BIN");
+        std::env::set_var("GHOST_REAPER_APPLY_TEST_MODE", "success");
+        let (state, auth) = make_state();
+        let resp = post_reaper(Arc::clone(&state), auth.clone(), true).await;
+        assert_eq!(resp["persisted"].as_bool(), Some(true));
+        assert_eq!(resp["ghostd_restart_required"].as_bool(), Some(false));
+        // Response returns promptly while the apply is still in flight.
+        assert_eq!(resp["ghostd_apply"]["state"].as_str(), Some("applying"));
+        // Pool restart must NOT fire until the ghostd apply settles.
+        assert!(
+            !state.restart_requested(),
+            "pool restart must be sequenced after ghostd apply"
+        );
+        assert_eq!(settle(&state).await, "applied");
+        assert!(
+            state.restart_requested(),
+            "pool restart must be requested once ghostd apply succeeds"
+        );
+        std::env::remove_var("GHOST_REAPER_APPLY_TEST_MODE");
+
+        // --- Fail-safe: helper binary missing → config still persisted, ghostd
+        //     reported NOT applied with a reason, pool still applies. ---
+        std::env::set_var("GHOST_SETUP_BIN", "/nonexistent/ghost-setup-does-not-exist");
+        let (state, auth) = make_state();
+        let resp = post_reaper(Arc::clone(&state), auth.clone(), true).await;
+        assert_eq!(resp["persisted"].as_bool(), Some(true));
+        assert_eq!(settle(&state).await, "failed");
+        let msg = state.ghostd_reaper_apply.read().message.clone();
+        assert!(msg.contains("not found"), "reason should explain the miss: {msg}");
+        assert!(
+            state.restart_requested(),
+            "pool side must still apply even when ghostd apply fails"
+        );
+        std::env::remove_var("GHOST_SETUP_BIN");
+
+        // --- Not persisted: no config path → skipped, no restart, no ghostd. ---
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone()),
+        );
+        let resp = post_reaper(Arc::clone(&state), auth, true).await;
+        assert_eq!(resp["persisted"].as_bool(), Some(false));
+        assert_eq!(resp["ghostd_apply"]["state"].as_str(), Some("skipped"));
+        assert!(
+            !state.restart_requested(),
+            "nothing persisted → nothing to restart"
         );
     }
 

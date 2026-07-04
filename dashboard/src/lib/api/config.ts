@@ -78,10 +78,19 @@ export interface ReaperSettings {
   legacy_max_push_bytes: number;
 }
 
+// Terminal result of the node's last automatic ghostd mempool-reaper apply.
+// state: "idle" | "applying" | "applied" | "failed" | "skipped".
+export interface GhostdApplyStatus {
+  state: string;
+  message: string;
+  updated_at: number;
+}
+
 export interface ReaperConfigResponse {
   enabled: boolean;
   mode: string;
   settings: ReaperSettings;
+  ghostd_apply?: GhostdApplyStatus;
   message: string;
 }
 
@@ -89,7 +98,12 @@ export interface ReaperUpdateResponse {
   success: boolean;
   persisted: boolean;
   enabled: boolean;
-  ghostd_restart_required: boolean;
+  // The ghostd mempool reaper is now applied automatically after each save;
+  // this is always false and kept only for backwards compatibility.
+  ghostd_restart_required?: boolean;
+  // Status of the automatic ghostd apply the save kicked off (state is
+  // "applying" while in flight; poll the reaper GET for the terminal result).
+  ghostd_apply?: GhostdApplyStatus;
   message: string;
 }
 

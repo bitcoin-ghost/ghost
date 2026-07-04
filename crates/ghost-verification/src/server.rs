@@ -926,6 +926,51 @@ pub struct MeshNodeInfo {
     pub healthy: bool,
 }
 
+/// Outcome of the most recent automatic `ghost-setup apply-reaper` run.
+///
+/// The reaper config POST persists `[reaper]` to `pool.toml` and then, in the
+/// background, regenerates the ghostd `-ghostreaper` drop-in and restarts
+/// ghostd. That work is slow and disruptive, so it runs off the request path;
+/// this record is where its terminal result lands so the reaper GET endpoint
+/// (and the dashboard) can surface whether the node mempool reaper actually
+/// picked up the change.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct GhostdReaperApply {
+    /// Lifecycle state: `idle` (never run), `applying` (in flight), `applied`
+    /// (succeeded), `failed` (could not apply — see `message`), `skipped`
+    /// (config was not persisted, so there was nothing to apply).
+    pub state: String,
+    /// Human-readable outcome or failure reason.
+    pub message: String,
+    /// Unix seconds when this record was last updated (0 = never).
+    pub updated_at: u64,
+}
+
+impl Default for GhostdReaperApply {
+    fn default() -> Self {
+        Self {
+            state: "idle".to_string(),
+            message: "No automatic ghostd reaper apply has run yet.".to_string(),
+            updated_at: 0,
+        }
+    }
+}
+
+impl GhostdReaperApply {
+    /// Build a record stamped with the current unix time.
+    pub fn now(state: &str, message: impl Into<String>) -> Self {
+        let updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            state: state.to_string(),
+            message: message.into(),
+            updated_at,
+        }
+    }
+}
+
 pub struct VerificationState {
     /// Node ID (hex)
     pub node_id: String,
@@ -1048,6 +1093,11 @@ pub struct VerificationState {
     /// Signal to trigger graceful restart (set by config update API)
     /// When true, main.rs will initiate shutdown and exit with code 100
     pub restart_signal: Arc<AtomicBool>,
+    /// Terminal result of the most recent automatic `ghost-setup apply-reaper`
+    /// run, kicked off by the reaper config POST. Surfaced on the reaper GET
+    /// endpoint so the dashboard can report whether the ghostd mempool reaper
+    /// picked up the last change (the apply runs off the request path).
+    pub ghostd_reaper_apply: Arc<parking_lot::RwLock<GhostdReaperApply>>,
     /// L-28: Debug endpoints enabled flag - IMMUTABLE after server start
     ///
     /// This is set from DashboardConfig during construction and can be modified
@@ -1229,6 +1279,7 @@ impl VerificationState {
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
+            ghostd_reaper_apply: Arc::new(parking_lot::RwLock::new(GhostdReaperApply::default())),
             // L-28: Debug endpoints flag frozen from DashboardConfig
             debug_endpoints_frozen: AtomicBool::new(debug_enabled),
             max_capacity: AtomicU32::new(0),
