@@ -2,7 +2,6 @@
 
 import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
-import { Toggle } from '@/components/ui/Toggle';
 import { Input } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
@@ -44,7 +43,7 @@ function isValidBech32Address(address: string): boolean {
 
 const MODES: { key: MiningMode; label: string; desc: string }[] = [
   { key: 'private_solo', label: 'Private Solo', desc: 'Your miners only. Stratum port closed to external connections. All block rewards go to you.' },
-  { key: 'private_pool', label: 'Private Pool', desc: 'Your miners + accept public miners. You operate a pool and share rewards with connected miners.' },
+  { key: 'private_pool', label: 'Private Pool', desc: 'Your miners + accept connected miners. You operate a pool and share rewards with connected miners.' },
   { key: 'pool', label: 'Public Pool', desc: 'Public pool only. Your node acts as a pool server for external miners.' },
 ];
 
@@ -74,7 +73,7 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
     },
     {
       id: 'payout',
-      title: 'Payout Address',
+      title: 'Payout',
       description: 'Set your mining payout address',
       validate: (data) => {
         if ((data.mining_mode === 'private_pool' || data.mining_mode === 'pool') && !data.payout_address.trim()) {
@@ -97,7 +96,9 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
       description: 'Review and apply changes',
       onSubmit: async (data) => {
         const privateMining = data.mining_mode === 'private_solo' || data.mining_mode === 'private_pool';
-        const publicMining = data.mining_mode === 'private_pool' || data.mining_mode === 'pool';
+        // Only Public Pool claims the +3 Public Mining capability. Private Pool
+        // accepts connected miners but must NOT claim public-mining shares.
+        const publicMining = data.mining_mode === 'pool';
 
         await Promise.all([
           setPrivateMining.mutateAsync(privateMining),
@@ -150,7 +151,7 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                     key={key}
                     onClick={() => setData({
                       mining_mode: key,
-                      public_mining: key === 'private_pool' || key === 'pool',
+                      public_mining: key === 'pool',
                     })}
                     className={`w-full p-4 rounded-lg border text-left transition-all ${
                       isActive
@@ -166,7 +167,7 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                       </div>
                       <span className={`font-medium ${isActive ? 'text-orange-400' : 'text-gray-300'}`}>{label}</span>
                       {isActive && <Badge variant="success">Selected</Badge>}
-                      {(key === 'private_pool' || key === 'pool') && <Badge variant="info">+3 Shares</Badge>}
+                      {key === 'pool' && <Badge variant="info">+3 Shares</Badge>}
                     </div>
                     <div className="text-xs text-gray-500 ml-5">{desc}</div>
                   </button>
@@ -214,10 +215,10 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                   )}
                 </div>
               )}
-              {data.public_mining && !data.payout_address.trim() && (
+              {data.mining_mode !== 'private_solo' && !data.payout_address.trim() && (
                 <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
                   <p className="text-sm text-orange-300">
-                    A payout address is required when public mining is enabled.
+                    A payout address is required for pool modes (the node receives its own share of pool rewards here).
                   </p>
                 </div>
               )}
