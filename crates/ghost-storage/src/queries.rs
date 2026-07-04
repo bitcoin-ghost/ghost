@@ -1555,6 +1555,42 @@ impl Database {
         })
     }
 
+    /// Insert or update a round, always writing the block-outcome columns.
+    ///
+    /// Unlike `create_round_if_not_exists`, this overwrites `block_hash`,
+    /// `found_by_node`, `payout_status`, `subsidy_sats` and `tx_fees_sats` on
+    /// conflict, so the payout path can fill in block details on a round row
+    /// that was already persisted at round start (with only `block_height`).
+    /// `start_time` and share totals are preserved from the existing row.
+    pub fn upsert_round(&self, round: &RoundRecord) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO rounds (round_id, block_height, block_hash, start_time,
+                                     found_by_node, payout_status, subsidy_sats, tx_fees_sats)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(round_id) DO UPDATE SET
+                     block_height  = excluded.block_height,
+                     block_hash    = excluded.block_hash,
+                     found_by_node = excluded.found_by_node,
+                     payout_status = excluded.payout_status,
+                     subsidy_sats  = excluded.subsidy_sats,
+                     tx_fees_sats  = excluded.tx_fees_sats",
+                params![
+                    round.round_id,
+                    round.block_height,
+                    round.block_hash,
+                    round.start_time,
+                    round.found_by_node,
+                    round.payout_status.as_str(),
+                    round.subsidy_sats,
+                    round.tx_fees_sats,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Get a round by ID
     pub fn get_round(&self, round_id: u64) -> GhostResult<Option<RoundRecord>> {
         self.with_connection(|conn| {
@@ -10631,6 +10667,95 @@ mod tests {
 
         // A round with no shares yields None (frontend renders "No data yet").
         assert!(db.get_best_share_in_round(99).expect("empty").is_none());
+    }
+
+    #[test]
+    fn test_best_share_block_height_from_round_start_persistence() {
+        // Regression: the per-window best-hash join resolves a share's block
+        // height from the `rounds` table. In production, rounds were only
+        // written by the payout (block-found) path, which almost never fires,
+        // so the table was empty and every per-window best share reported a
+        // null block height. Persisting the round at start — with only its
+        // block height and an Active status — must make the join resolve, and
+        // a later payout upsert must fill the block-outcome columns without
+        // disturbing the height.
+        let db = Database::in_memory().expect("create in-memory db");
+        let now_s = chrono::Utc::now().timestamp();
+
+        // Round persisted at start: block height known, no block outcome yet.
+        let start_record = RoundRecord {
+            round_id: 7,
+            block_height: 956_695,
+            block_hash: None,
+            start_time: now_s - 600,
+            end_time: None,
+            total_shares: 0,
+            total_work: 0.0,
+            winning_miner: None,
+            found_by_node: None,
+            payout_status: PayoutStatus::Active,
+            subsidy_sats: None,
+            tx_fees_sats: None,
+        };
+        db.create_round_if_not_exists(&start_record)
+            .expect("persist round at start");
+
+        db.insert_share(&ShareRecord {
+            id: None,
+            round_id: 7,
+            miner_id: "bc1qminerA.w1".to_string(),
+            difficulty: 1000.0,
+            work: 1000.0,
+            share_hash: "0000000000000000000000000000000000000000000000000000000000000abc"
+                .to_string(),
+            timestamp: now_s - 300,
+            received_by: "node1".to_string(),
+            valid: true,
+        })
+        .expect("insert share");
+
+        // Every window (time-based and round-scoped) now carries the real
+        // block height resolved from the round persisted at start.
+        for best in [
+            db.get_best_share_since(0).expect("all-time").unwrap(),
+            db.get_best_share_since(now_s - 3_600)
+                .expect("last-hour")
+                .unwrap(),
+            db.get_best_share_in_round(7).expect("round 7").unwrap(),
+        ] {
+            assert_eq!(best.miner_id, "bc1qminerA.w1");
+            assert_eq!(best.block_height, Some(956_695));
+        }
+
+        // A later payout upserts the block-outcome columns onto the same row.
+        let payout_record = RoundRecord {
+            round_id: 7,
+            block_height: 956_695,
+            block_hash: Some("deadbeef".to_string()),
+            start_time: now_s, // ignored on conflict — start_time is preserved
+            end_time: None,
+            total_shares: 0,
+            total_work: 0.0,
+            winning_miner: None,
+            found_by_node: Some("node1".to_string()),
+            payout_status: PayoutStatus::Approved,
+            subsidy_sats: Some(312_500_000),
+            tx_fees_sats: Some(1_234),
+        };
+        db.upsert_round(&payout_record).expect("upsert payout details");
+
+        let round = db.get_round(7).expect("get round").unwrap();
+        assert_eq!(round.block_height, 956_695);
+        assert_eq!(round.block_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(round.payout_status, PayoutStatus::Approved);
+        assert_eq!(round.subsidy_sats, Some(312_500_000));
+        assert_eq!(round.tx_fees_sats, Some(1_234));
+        // start_time from the original (start-time) insert is preserved.
+        assert_eq!(round.start_time, now_s - 600);
+
+        // Best share still resolves the height after the upsert.
+        let best = db.get_best_share_in_round(7).expect("round 7").unwrap();
+        assert_eq!(best.block_height, Some(956_695));
     }
 
     #[test]
