@@ -65,6 +65,26 @@ function LoginForm() {
             {loading ? "Signing in..." : "Sign In"}
           </button>
         </form>
+
+        <details className="text-sm text-gray-400">
+          <summary className="cursor-pointer text-gray-500 hover:text-gray-300 transition-colors select-none">
+            Forgot password?
+          </summary>
+          <div className="mt-3 space-y-2 rounded-lg border border-gray-800 bg-gray-900/60 p-4">
+            <p>
+              There is no web reset — that would let anyone who can reach this
+              page bypass the password. Recovery requires access to the node
+              itself. On the node (over SSH or locally), run as root:
+            </p>
+            <pre className="overflow-x-auto rounded bg-gray-950 px-3 py-2 text-xs text-gray-300">
+              <code>sudo scripts/agathion-reset-password.sh</code>
+            </pre>
+            <p>
+              It sets a fresh password, prints it, and restarts the dashboard.
+              Then sign in here with the new password.
+            </p>
+          </div>
+        </details>
       </div>
     </div>
   );
