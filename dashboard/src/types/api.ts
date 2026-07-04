@@ -206,6 +206,9 @@ export interface MiningStatus {
   private_mining?: boolean;
   public_mining?: boolean;
   hashrate_th?: number;
+  local_hashrate_th?: number;
+  local_connected_miners?: number;
+  mesh_active_miners?: number;
   connected_miners?: number;
   shares_submitted?: number;
   shares_accepted?: number;
