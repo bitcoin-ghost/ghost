@@ -189,6 +189,25 @@ fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> boo
     current_count == cached_count
 }
 
+/// Decide whether to advertise the Archive capability (+5 shares).
+///
+/// The claim must reflect Ghost Core's REAL archive state, not merely the
+/// operator's `storage.archive_mode` config flag. Archive is only advertised when
+/// the operator asked for it AND ghostd is genuinely serving a full block store:
+/// - `hazed` nodes strip witness/scriptSig/OP_RETURN data, so they cannot return
+///   whole historical blocks, and
+/// - `pruned` nodes have discarded old blocks entirely, so they cannot serve the
+///   arbitrary historical block the Archive challenge asks for.
+///
+/// Claiming Archive in either state always fails qualification and wastes every
+/// peer's verification challenges, so we drop the claim up front. The `hazed` and
+/// `pruned` inputs come straight from `getblockchaininfo`; the caller only reaches
+/// this with a real response (the pool hard-exits if ghostd's RPC is unreachable),
+/// so an unknown ghostd state never newly-claims Archive — fail-safe by design.
+fn should_claim_archive(config_archive_mode: bool, hazed: bool, pruned: bool) -> bool {
+    config_archive_mode && !hazed && !pruned
+}
+
 /// Local ghost-pay endpoint that accepts L2 checkpoint finalization notices.
 /// ghost-pay serves identity-derived TLS on 8800; the caller uses a client with
 /// `danger_accept_invalid_certs(true)` since this is loopback-only IPC.
@@ -2452,9 +2471,26 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Hazed nodes cannot claim archive mode — they strip witness/scriptSig/OP_RETURN data
-    if blockchain_info.hazed && capabilities.archive_mode {
-        warn!("Ghost Core is running in haze mode — disabling archive_mode capability (+5 shares)");
+    // Only advertise Archive when Ghost Core is genuinely keeping a full archive.
+    // `storage.archive_mode = true` alone is not enough: a hazed ghostd strips
+    // block data and a pruned ghostd has discarded old blocks, so neither can
+    // serve the arbitrary historical block the Archive challenge asks for, and
+    // claiming it just burns every peer's verification challenges on a guaranteed
+    // failure. `blockchain_info` came from `getblockchaininfo` above (the pool
+    // hard-exits if that RPC is unreachable), so we never newly-claim Archive on an
+    // unknown state — fail-safe: prefer not claiming over falsely claiming.
+    if capabilities.archive_mode
+        && !should_claim_archive(
+            capabilities.archive_mode,
+            blockchain_info.hazed,
+            blockchain_info.pruned,
+        )
+    {
+        if blockchain_info.hazed {
+            warn!("Ghost Core is running in haze mode — disabling archive_mode capability (+5 shares)");
+        } else {
+            warn!("storage.archive_mode is set but Ghost Core is pruned (not keeping a full archive) — disabling archive_mode capability (+5 shares)");
+        }
         capabilities.archive_mode = false;
     }
 
@@ -9065,6 +9101,39 @@ mod tests {
     fn cached_contribution_invalid_on_multi_step_advance() {
         // Robust to more than one applied contribution during a long wait.
         assert!(!cached_contribution_still_valid(6, 9));
+    }
+
+    // ── should_claim_archive ─────────────────────────────────────────
+
+    #[test]
+    fn archive_claimed_only_when_config_on_and_ghostd_full() {
+        // Operator asked for archive AND ghostd is a full (non-pruned, non-hazed)
+        // node — this is the only combination that may advertise Archive (+5).
+        assert!(should_claim_archive(true, false, false));
+    }
+
+    #[test]
+    fn archive_not_claimed_when_ghostd_pruned() {
+        // storage.archive_mode = true but ghostd is pruned: a pruned node cannot
+        // serve arbitrary historical blocks, so the claim must be dropped even
+        // though the config asks for it. This is the operator-reported bug.
+        assert!(!should_claim_archive(true, false, true));
+    }
+
+    #[test]
+    fn archive_not_claimed_when_ghostd_hazed() {
+        // Hazed ghostd strips block data, so it also cannot satisfy the Archive
+        // challenge regardless of the config flag.
+        assert!(!should_claim_archive(true, true, false));
+    }
+
+    #[test]
+    fn archive_not_claimed_when_config_off() {
+        // Operator did not enable archive mode — never claim, whatever ghostd's
+        // real state is.
+        assert!(!should_claim_archive(false, false, false));
+        assert!(!should_claim_archive(false, false, true));
+        assert!(!should_claim_archive(false, true, false));
     }
 
     // ── expand_path ──────────────────────────────────────────────────
