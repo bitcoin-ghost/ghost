@@ -478,6 +478,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_template_profile_post_handler),
         )
         .route(
+            "/api/v1/config/policy_profile",
+            post(api_config_policy_profile_post_handler),
+        )
+        .route(
             "/api/v1/config/reaper",
             post(api_config_reaper_post_handler),
         )
@@ -5329,6 +5333,106 @@ fn ghost_common_now(state: &str, message: impl Into<String>) -> crate::server::G
 /// result lands on the reaper GET endpoint's `ghostd_apply`. A legacy
 /// `{ "enabled": bool }` body still works (the per-vector fields fall back to
 /// their serde defaults = all-on).
+/// Request body for the policy-profile POST endpoint.
+#[derive(Debug, Deserialize)]
+struct PolicyProfileRequest {
+    /// One of `strict` (legacy alias `bitcoin_pure`), `permissive`, `full_open`.
+    profile: String,
+}
+
+/// API v1 Config policy_profile POST handler.
+///
+/// This is the REAL lever for which BUDS tiers get mined: it writes
+/// `[policy].profile` into the node config (pool.toml) and persists it, then
+/// requests a graceful ghost-pool restart so the new profile is resolved at
+/// startup. Unlike the cosmetic `mempool_profile`/`template_profile` dashboard
+/// mirrors, changing this actually alters template construction.
+async fn api_config_policy_profile_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<PolicyProfileRequest>,
+) -> impl IntoResponse {
+    use ghost_common::config::PolicyProfile;
+
+    // Map the incoming string to the config enum. Accept the new `strict`
+    // spelling and the legacy `bitcoin_pure` alias; reject anything else 400.
+    let profile = match payload.profile.trim().to_ascii_lowercase().as_str() {
+        "strict" | "bitcoin_pure" => PolicyProfile::BitcoinPure,
+        "permissive" => PolicyProfile::Permissive,
+        "full_open" => PolicyProfile::FullOpen,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Unknown policy profile: {other}"),
+                    "code": "INVALID_PROFILE",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // The canonical serialized name we echo back to the caller.
+    let profile_name = match profile {
+        PolicyProfile::BitcoinPure => "strict",
+        PolicyProfile::Permissive => "permissive",
+        PolicyProfile::FullOpen => "full_open",
+        PolicyProfile::Custom => "custom",
+    };
+
+    // Require the full node config + a path to persist to; otherwise the change
+    // can't survive a restart, so fail-closed with SERVICE_UNAVAILABLE.
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    {
+        let mut cfg = full.write();
+        cfg.policy.profile = profile;
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist policy profile");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist policy profile: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // The profile is resolved at startup, so a graceful restart applies it.
+    state.request_restart();
+
+    Json(serde_json::json!({
+        "success": true,
+        "profile": profile_name,
+        "restart_pending": true,
+    }))
+    .into_response()
+}
+
 async fn api_config_reaper_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(payload): Json<ghost_common::config::ReaperSettings>,
@@ -8408,6 +8512,114 @@ mod tests {
         assert_eq!(on["enabled"].as_bool(), Some(true));
         let reloaded = FullNodeConfig::load(&path).unwrap();
         assert!(reloaded.wraith_enabled(), "enable must persist to disk");
+    }
+
+    /// The policy_profile POST is the real lever for mined BUDS tiers: without
+    /// HMAC it must 401, and with a valid signature it must persist
+    /// `[policy].profile` to pool.toml and request a graceful restart.
+    #[tokio::test]
+    async fn test_config_policy_profile_post_persists_and_restarts() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::config::PolicyProfile as CfgProfile;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        // Without auth → 401.
+        let unauth = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/policy_profile")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"profile": "strict"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unauth.status(),
+            StatusCode::UNAUTHORIZED,
+            "policy_profile POST without auth must 401"
+        );
+        assert!(!state.restart_requested());
+
+        // With valid HMAC → persists `strict` and requests restart.
+        let body = r#"{"profile": "strict"}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, body.as_bytes());
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/policy_profile")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"].as_bool(), Some(true));
+        assert_eq!(json["profile"].as_str(), Some("strict"));
+        assert_eq!(json["restart_pending"].as_bool(), Some(true));
+
+        // Persisted to disk as BitcoinPure and restart requested.
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert_eq!(reloaded.policy.profile, CfgProfile::BitcoinPure);
+        assert!(
+            state.restart_requested(),
+            "policy_profile change must request a restart"
+        );
+
+        // Unknown profile → 400.
+        let bad = r#"{"profile": "nonsense"}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, bad.as_bytes());
+        let bad_resp = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/policy_profile")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bad_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unknown policy profile must 400"
+        );
     }
 
     /// CRIT-6: Test that all config POST endpoints require auth
