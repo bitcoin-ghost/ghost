@@ -7,7 +7,6 @@ import { Badge } from "@/components/ui/Badge";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { fetchApi } from "@/lib/api/client";
-import { useMiningStatus } from "@/hooks/queries";
 
 /**
  * Capacity & load-balancer view.
@@ -99,15 +98,6 @@ export default function CapacityPage() {
     refetchInterval: 30_000,
   });
 
-  // Authoritative, DEDUPED mesh miner total. The per-peer `miner_count`s below
-  // are a load-balancer routing view: a miner that reconnects or fails over
-  // between nodes is momentarily counted on more than one peer, so summing the
-  // rows over-counts (e.g. rows total 7–9 while the real distinct total is 6).
-  // `mining/status` already de-duplicates across the mesh, so source the total
-  // from there instead of adding up the breakdown.
-  // Backend follow-up: dedupe the per-peer capacity miner_counts at the source.
-  const { data: miningStatus } = useMiningStatus();
-  const meshTotal = miningStatus?.mesh_active_miners ?? miningStatus?.connected_miners;
 
   if (isLoading) {
     return (
@@ -208,32 +198,9 @@ export default function CapacityPage() {
       <SectionErrorBoundary section="Peers">
         <Card>
           <div style={{ marginBottom: "16px" }}>
-            <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+            <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500 }}>
               Peer mesh
             </h3>
-            <p style={{ color: "var(--dim)", fontSize: "13px" }}>
-              {data.peers.length === 0
-                ? "No peers reporting capacity yet — showing this node only."
-                : `${data.peers.length} ${data.peers.length === 1 ? "peer" : "peers"} plus this node reporting capacity. New miner connections route to the lowest utilisation %.`}
-            </p>
-            {meshTotal !== undefined && (
-              <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "8px" }}>
-                <strong style={{ color: "var(--fg)" }}>{meshTotal}</strong> distinct active{" "}
-                {meshTotal === 1 ? "miner" : "miners"} across the mesh (deduplicated).{" "}
-                {dedupAvailable ? (
-                  <>
-                    Each miner is owned by exactly one node, so the per-node counts below —{" "}
-                    <em>this node included</em> — sum to this total.
-                  </>
-                ) : (
-                  <>
-                    The per-node counts below are a routing view and may overlap — a miner failing
-                    over between nodes appears on more than one node, so{" "}
-                    <em>don&apos;t sum the rows</em>.
-                  </>
-                )}
-              </p>
-            )}
           </div>
 
           <div style={{ overflowX: "auto" }}>
