@@ -89,8 +89,6 @@ export default function BudsPage() {
   const reaperEnabled = config?.reaper ?? false;
   const byTier = mempool?.by_tier ?? { T0: 0, T1: 0, T2: 0, T3: 0 };
   const sampled = mempool?.sample_size ?? TIERS.reduce((s, t) => s + (byTier[t.key] ?? 0), 0);
-  const cleanShare = sampled ? (byTier.T0 + byTier.T1) / sampled : 0;
-  const abusiveShare = sampled ? byTier.T3 / sampled : 0;
 
   return (
     <div className="space-y-6">
@@ -149,30 +147,6 @@ export default function BudsPage() {
               </p>
             ) : (
               <>
-                <div style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
-                  Most of what your node holds right now is clean payments:{" "}
-                  <strong style={{ color: "#3fb950" }}>~{Math.round(cleanShare * 100)}%</strong> of sampled
-                  transactions are ordinary payments (T0 + T1).
-                  {byTier.T3 > 0 && (
-                    <>
-                      {" "}
-                      About <strong style={{ color: "var(--fg)" }}>~{Math.round(abusiveShare * 100)}%</strong>{" "}
-                      carry abusive patterns (T3) — inscriptions, runes and oversized data. The reaper drops
-                      the ones that hide dead code; a runestone is standard, provably-unspendable OP_RETURN
-                      data — not dead code — so the reaper leaves it.
-                      {reaperEnabled && (
-                        <>
-                          {" "}
-                          Tune your reject vectors on the{" "}
-                          <Link href="/reaper" className="bare" style={{ color: "var(--fg)", textDecoration: "underline" }}>
-                            Reaper page
-                          </Link>{" "}
-                          to catch more dead-code variants.
-                        </>
-                      )}
-                    </>
-                  )}
-                </div>
                 <div style={{ display: "flex", height: "14px", borderRadius: "4px", overflow: "hidden", background: "var(--bg)" }}>
                   {TIERS.map((t) => {
                     const count = byTier[t.key] ?? 0;
