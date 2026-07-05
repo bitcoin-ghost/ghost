@@ -137,7 +137,7 @@ export default function CapabilitiesPage() {
       <PageHeader
         eyebrow="capabilities"
         title="What this node is earning."
-        subtitle="Five capability shares. The Claimed column is what your node advertises; the Qualified column is what's earning at payout. Drift between them means challenges are failing — fix the prerequisite and watch the column flip."
+        subtitle="Five capability shares. The Claimed column is what your node advertises; the Qualified column is what's earning at payout. Drift between them means challenges are failing."
         subtitleFullWidth
         actions={
           <Badge variant={totalQualified === 15 ? "success" : totalQualified >= 6 ? "warning" : "error"}>
