@@ -16,6 +16,7 @@ import {
   EyeOff,
   Skull,
   Globe,
+  MapPin,
   HeartPulse,
   ScrollText,
   Users,
@@ -62,6 +63,7 @@ const GROUPS: NavGroup[] = [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
       { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
       { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
+      { href: "/geo", label: "Geo", icon: <MapPin {...ICON} /> },
     ],
   },
   {
