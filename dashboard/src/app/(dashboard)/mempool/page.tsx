@@ -5,7 +5,6 @@ import { useQuery } from "@tanstack/react-query";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
-import { CopyButton } from "@/components/ui/CopyButton";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { StatCard } from "@/components/ui/StatCard";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
@@ -13,19 +12,14 @@ import { useConfig } from "@/hooks/queries/useConfigQueries";
 import { fetchApi } from "@/lib/api/client";
 
 /**
- * Per-node mempool view — LIGHTWEIGHT by default.
+ * Per-node mempool view — LIGHTWEIGHT, no heavy indexer.
  *
- * The primary content is sourced entirely from ghostd's RPC via the node API
- * (`/api/v1/buds/mempool` = getmempoolinfo + getrawmempool, and
- * `/api/v1/reaper/status` = template-builder filter counters). This needs NO
- * electrs index and NO 50 GB of disk — it mirrors the RPC-only mempool
- * comparison the public site shows, plus the Ghost-specific "what your node
- * filters" view that only a node-local vantage point can produce.
- *
- * The heavy mempool.space + electrs stack (address-searchable full explorer,
- * ≥50 GB) is demoted to an optional "Advanced" add-on at the bottom of the
- * page, driven by `/api/v1/system/mempool` (running / installed_not_running /
- * not_installed).
+ * Every panel is sourced from ghostd's RPC via the node API
+ * (`/api/v1/buds/mempool` = getmempoolinfo + getrawmempool + live BUDS tier
+ * classification). This needs NO electrs index and NO 50 GB of disk. On top of
+ * the plain RPC stats it derives the Ghost-specific "clean vs abusive" view of
+ * the current mempool — the node-local vantage point a stock explorer can't
+ * give — plus the same-origin mempool.space embed of this node's own mempool.
  */
 
 // ─── types ────────────────────────────────────────────────────────────────
@@ -53,61 +47,10 @@ interface BudsMempool {
   message?: string; // present when RPC unavailable
 }
 
-interface ReaperStats {
-  txs_evaluated: number;
-  txs_reaped: number;
-  txs_accepted: number;
-  dead_bytes_total: number;
-  last_reaped_unix: number | null;
-  by_type: {
-    inscription_envelope: number;
-    drop_stuffing: number;
-    unreachable_code: number;
-    fake_pubkey: number;
-    fake_pubkey_curve_point: number;
-    annex_present: number;
-    oversized_op_return: number;
-    dust_flood?: number;
-    excess_witness_data: number;
-    excess_stack_items: number;
-    legacy_scriptsig_data: number;
-  };
-}
-
-interface MempoolStatus {
-  enabled: boolean;
-  status: "running" | "installed_not_running" | "not_installed";
-  port: number;
-  marker_path: string;
-  install_command: string;
-  uninstall_command: string;
-  min_ram_gb: number;
-  min_disk_gb: number;
-}
-
 // ─── fetchers ───────────────────────────────────────────────────────────────
 
 async function fetchBudsMempool(): Promise<BudsMempool> {
   return fetchApi<BudsMempool>("/api/v1/buds/mempool");
-}
-
-async function fetchReaperStats(): Promise<ReaperStats | null> {
-  try {
-    const data = await fetchApi<unknown>("/api/v1/reaper/status");
-    return data && typeof data === "object" && "txs_evaluated" in data
-      ? (data as ReaperStats)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-async function fetchMempoolStatus(): Promise<MempoolStatus | null> {
-  try {
-    return await fetchApi<MempoolStatus>("/api/v1/system/mempool");
-  } catch {
-    return null;
-  }
 }
 
 // ─── formatting helpers ─────────────────────────────────────────────────────
@@ -128,15 +71,6 @@ function formatPercent(numerator: number, denominator: number): string {
   if (!denominator) return "—";
   const pct = (numerator / denominator) * 100;
   return pct < 0.01 ? "<0.01%" : `${pct.toFixed(2)}%`;
-}
-
-function formatRelative(unixSecs: number | null): string {
-  if (!unixSecs) return "never";
-  const ago = Math.floor(Date.now() / 1000) - unixSecs;
-  if (ago < 60) return `${ago}s ago`;
-  if (ago < 3600) return `${Math.floor(ago / 60)}m ago`;
-  if (ago < 86400) return `${Math.floor(ago / 3600)}h ago`;
-  return `${Math.floor(ago / 86400)}d ago`;
 }
 
 // min_fee from getmempoolinfo is BTC/kvB. sat/vB = BTC/kvB * 1e8 / 1000 = *1e5
@@ -177,20 +111,6 @@ const FEE_BUCKETS = [
   { label: "100+", min: 100, max: Infinity },
 ];
 
-const REAPER_VECTORS: { key: keyof ReaperStats["by_type"]; name: string }[] = [
-  { key: "inscription_envelope", name: "Inscription envelopes" },
-  { key: "fake_pubkey_curve_point", name: "Fake pubkey curve points" },
-  { key: "oversized_op_return", name: "Oversized OP_RETURN" },
-  { key: "excess_witness_data", name: "Excess witness data" },
-  { key: "excess_stack_items", name: "Excess stack items" },
-  { key: "unreachable_code", name: "Unreachable code" },
-  { key: "drop_stuffing", name: "Drop stuffing" },
-  { key: "fake_pubkey", name: "Fake pubkeys" },
-  { key: "annex_present", name: "Annex bloat" },
-  { key: "dust_flood", name: "Dust-flood spam" },
-  { key: "legacy_scriptsig_data", name: "Legacy scriptSig data" },
-];
-
 // ─── page ───────────────────────────────────────────────────────────────────
 
 export default function MempoolPage() {
@@ -203,18 +123,6 @@ export default function MempoolPage() {
     queryKey: ["buds-mempool"],
     queryFn: fetchBudsMempool,
     refetchInterval: 15_000,
-  });
-
-  const { data: reaper } = useQuery<ReaperStats | null>({
-    queryKey: ["reaper-status"],
-    queryFn: fetchReaperStats,
-    refetchInterval: 15_000,
-  });
-
-  const { data: stackStatus } = useQuery<MempoolStatus | null>({
-    queryKey: ["mempool-status"],
-    queryFn: fetchMempoolStatus,
-    refetchInterval: 30_000,
   });
 
   const reaperEnabled = config?.reaper ?? false;
@@ -264,7 +172,7 @@ export default function MempoolPage() {
         <>
           <LiveStats mempool={mempool} />
           <SectionErrorBoundary section="Ghost filter view">
-            <FilterView reaper={reaper} reaperEnabled={reaperEnabled} />
+            <FilterView mempool={mempool} reaperEnabled={reaperEnabled} />
           </SectionErrorBoundary>
           <SectionErrorBoundary section="Mempool composition">
             <Composition mempool={mempool} />
@@ -274,9 +182,6 @@ export default function MempoolPage() {
           </SectionErrorBoundary>
         </>
       )}
-
-      {/* Heavy full-explorer add-on, demoted to the bottom. */}
-      <AdvancedExplorer status={stackStatus} />
     </div>
   );
 }
@@ -456,130 +361,244 @@ function LiveStats({ mempool }: { mempool?: BudsMempool }) {
   );
 }
 
-// ─── Ghost filter view (what Reaper strips) — the node-local differentiator ──
+// ─── Ghost filter view — LIVE clean-vs-abusive from the current mempool ──────
+
+// Byte-weight groupings for the current-mempool "dead weight" view. This panel
+// deliberately reads the mempool by VIRTUAL SIZE rather than transaction count
+// (which the "Mempool composition" section below already covers per tier): the
+// point of a spam-aware policy is that abusive heavy-data transactions are few
+// in number but eat a hugely disproportionate share of block space.
+const FILTER_GROUPS = [
+  { key: "financial", name: "Financial", color: "#3fb950", desc: "T0 + T1 · standard & extended payments" },
+  { key: "data", name: "Data-anchoring", color: "#d29922", desc: "T2 · small OP_RETURN, Lightning, timestamps" },
+  { key: "abusive", name: "Abusive heavy-data", color: "#f85149", desc: "T3 · inscriptions, runes, large witness — what your policy targets" },
+] as const;
 
 function FilterView({
-  reaper,
+  mempool,
   reaperEnabled,
 }: {
-  reaper?: ReaperStats | null;
+  mempool?: BudsMempool;
   reaperEnabled: boolean;
 }) {
+  const txs = mempool?.transactions ?? [];
+  const total = mempool?.total ?? 0;
+  const totalBytes = mempool?.bytes ?? 0;
+
+  // Classify the LIVE sample by BUDS tier, tracking both transaction count and
+  // virtual size so we can express the abusive share two honest ways: how many
+  // of the mempool's transactions carry it, and how much of its weight it eats.
+  const countByTier = { T0: 0, T1: 0, T2: 0, T3: 0 };
+  const bytesByTier = { T0: 0, T1: 0, T2: 0, T3: 0 };
+  for (const tx of txs) {
+    const key = tx.tier_name as keyof typeof countByTier;
+    if (key in countByTier) {
+      countByTier[key] += 1;
+      bytesByTier[key] += tx.vsize;
+    }
+  }
+  const sampleCount = txs.length;
+  const sampleBytes = bytesByTier.T0 + bytesByTier.T1 + bytesByTier.T2 + bytesByTier.T3;
+
+  if (sampleCount === 0) {
+    return (
+      <Card>
+        <CardHeader
+          title="Filtered vs unfiltered"
+          subtitle="A live clean-vs-abusive read of the transactions your node is holding right now."
+        />
+        <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+          No transactions in the current sample to classify. This populates from your node&apos;s live
+          mempool; if it&apos;s empty there&apos;s nothing to weigh.
+        </p>
+      </Card>
+    );
+  }
+
+  // Sample fractions, extrapolated to the full mempool. These are estimates in
+  // exactly the same sense as the composition bar below — the node classifies a
+  // bounded sample per poll to stay light — so we surface them as "~" figures.
+  const abusiveCountFrac = countByTier.T3 / sampleCount;
+  const abusiveByteFrac = sampleBytes ? bytesByTier.T3 / sampleBytes : 0;
+  const cleanCountFrac = (countByTier.T0 + countByTier.T1) / sampleCount;
+  const dataCountFrac = countByTier.T2 / sampleCount;
+
+  const estAbusiveTxs = Math.round(total * abusiveCountFrac);
+  const estDeadWeight = Math.round(totalBytes * abusiveByteFrac);
+  const estCleanTxs = Math.round(total * cleanCountFrac);
+  const estDataTxs = Math.round(total * dataCountFrac);
+
+  const groupBytes: Record<(typeof FILTER_GROUPS)[number]["key"], number> = {
+    financial: bytesByTier.T0 + bytesByTier.T1,
+    data: bytesByTier.T2,
+    abusive: bytesByTier.T3,
+  };
+
   return (
     <Card>
       <CardHeader
         title="Filtered vs unfiltered"
-        subtitle="What your node keeps out of its blocks that a stock node would carry — the reason to look at the mempool from your own vantage point."
+        subtitle="Of the transactions your node is holding right now, how many carry the abusive patterns your policy targets — read live from the current mempool by weight, not cumulative history."
       />
-      {!reaper ? (
-        <p style={{ color: "var(--dim)", fontSize: "14px" }}>
-          No filter counters yet. These populate from your template builder as it evaluates
-          transactions; if Reaper has never run (or ghost-pool just restarted) there&apos;s nothing to
-          show. Enable Reaper in{" "}
-          <a
-            href="/settings/capabilities"
-            className="bare"
-            style={{ color: "var(--dim)", textDecoration: "underline" }}
+      <div className="space-y-5">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <StatCard
+            label="Abusive txs"
+            value={`~${formatCount(estAbusiveTxs)}`}
+            sublabel={`${formatPercent(countByTier.T3, sampleCount)} of the mempool (T3)`}
+            tooltip="Estimated count of T3 heavy-data transactions (inscriptions, runes, large witness) in your mempool right now, extrapolated from the live BUDS sample."
+          />
+          <StatCard
+            label="Dead weight"
+            value={`~${formatBytes(estDeadWeight)}`}
+            sublabel={`${formatPercent(bytesByTier.T3, sampleBytes)} of mempool bytes`}
+            tooltip="Share of your mempool's virtual size consumed by abusive T3 transactions. They are a small fraction of the transaction count but dominate the byte weight — this is the space a spam-aware block policy reclaims."
+          />
+          <StatCard
+            label="Clean payments"
+            value={`~${formatCount(estCleanTxs)}`}
+            sublabel="standard & extended financial (T0 + T1)"
+            tooltip="Estimated count of ordinary financial transactions (single-sig, multisig, timelocks) currently in your mempool."
+          />
+          <StatCard
+            label="Data-anchoring"
+            value={`~${formatCount(estDataTxs)}`}
+            sublabel="small OP_RETURN · Lightning / timestamps (T2)"
+            tooltip="Estimated count of small data-commitment transactions — legitimate carriers your policy does not target."
+          />
+        </div>
+
+        <div>
+          <div
+            style={{
+              fontSize: "11px",
+              fontFamily: "var(--font-mono)",
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+              color: "var(--dim)",
+              marginBottom: "10px",
+            }}
           >
-            settings
-          </a>
-          .
-        </p>
-      ) : (
-        <div className="space-y-5">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <StatCard
-              label="Evaluated"
-              value={formatCount(reaper.txs_evaluated)}
-              sublabel="unfiltered — everything seen"
-            />
-            <StatCard
-              label="Kept"
-              value={formatCount(reaper.txs_accepted)}
-              sublabel="filtered — passed into blocks"
-            />
-            <StatCard
-              label="Stripped"
-              value={formatCount(reaper.txs_reaped)}
-              sublabel={`${formatPercent(reaper.txs_reaped, reaper.txs_evaluated)} reaped`}
-            />
-            <StatCard
-              label="Dead weight removed"
-              value={formatBytes(reaper.dead_bytes_total)}
-              sublabel={`last reap ${formatRelative(reaper.last_reaped_unix)}`}
-            />
+            Where your mempool&apos;s weight is going
           </div>
-
-          {!reaperEnabled && (
-            <div
-              style={{
-                padding: "10px 12px",
-                background: "var(--surface)",
-                border: "1px solid var(--rule)",
-                borderRadius: "4px",
-                fontSize: "13px",
-                color: "var(--dim)",
-              }}
-            >
-              Reaper is currently <strong style={{ color: "var(--fg)" }}>disabled</strong> — the counters
-              below are cumulative history since the last ghost-pool restart. Turn it on to actually
-              strip this weight from your blocks.
-            </div>
-          )}
-
-          <div>
-            <div
-              style={{
-                fontSize: "11px",
-                fontFamily: "var(--font-mono)",
-                textTransform: "uppercase",
-                letterSpacing: "0.06em",
-                color: "var(--dim)",
-                marginBottom: "10px",
-              }}
-            >
-              What got stripped, by type
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {REAPER_VECTORS.map((v) => {
-                const hits = reaper.by_type[v.key] ?? 0;
-                return (
-                  <div
-                    key={v.key}
-                    className="flex items-baseline justify-between"
-                    style={{
-                      padding: "8px 12px",
-                      border: "1px solid var(--rule)",
-                      borderRadius: "4px",
-                      background: "var(--bg)",
-                    }}
-                  >
-                    <span style={{ color: "var(--fg)", fontSize: "13px" }}>{v.name}</span>
+          <div
+            style={{
+              display: "flex",
+              height: "14px",
+              borderRadius: "4px",
+              overflow: "hidden",
+              background: "var(--bg)",
+            }}
+          >
+            {FILTER_GROUPS.map((g) => {
+              const b = groupBytes[g.key];
+              const pct = sampleBytes ? (b / sampleBytes) * 100 : 0;
+              if (pct === 0) return null;
+              return (
+                <div
+                  key={g.key}
+                  title={`${g.name}: ${pct.toFixed(1)}% of mempool weight`}
+                  style={{ width: `${pct}%`, background: g.color }}
+                />
+              );
+            })}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2" style={{ marginTop: "10px" }}>
+            {FILTER_GROUPS.map((g) => {
+              const b = groupBytes[g.key];
+              const pct = sampleBytes ? (b / sampleBytes) * 100 : 0;
+              return (
+                <div
+                  key={g.key}
+                  style={{
+                    padding: "8px 12px",
+                    border: "1px solid var(--rule)",
+                    borderRadius: "4px",
+                    background: "var(--bg)",
+                  }}
+                >
+                  <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
                     <span
                       style={{
+                        width: "10px",
+                        height: "10px",
+                        borderRadius: "2px",
+                        background: g.color,
+                        display: "inline-block",
+                      }}
+                    />
+                    <span style={{ color: "var(--fg)", fontSize: "13px", fontWeight: 500 }}>
+                      {g.name}
+                    </span>
+                    <span
+                      style={{
+                        marginLeft: "auto",
                         fontFamily: "var(--font-mono)",
                         fontSize: "13px",
-                        color: hits > 0 ? "var(--accent)" : "var(--fainter)",
+                        color: "var(--fg)",
                       }}
                     >
-                      {hits.toLocaleString()}
+                      {pct.toFixed(0)}%
                     </span>
                   </div>
-                );
-              })}
-            </div>
+                  <div style={{ color: "var(--dim)", fontSize: "12px" }}>{g.desc}</div>
+                </div>
+              );
+            })}
           </div>
-
-          <p style={{ color: "var(--fainter)", fontSize: "12px" }}>
-            Counters are cumulative since the last ghost-pool restart, sourced from your template
-            builder (<code>/api/v1/reaper/status</code>). &ldquo;Evaluated&rdquo; is the unfiltered
-            baseline; &ldquo;kept&rdquo; is what survives your policy. The by-type counts are per
-            detection — one transaction can trip several detectors (e.g. an inscription that also
-            carries excess witness data), so they sum higher than &ldquo;Stripped&rdquo;, which
-            counts each transaction once.
-          </p>
         </div>
-      )}
+
+        <div
+          style={{
+            padding: "10px 12px",
+            background: "var(--surface)",
+            border: "1px solid var(--rule)",
+            borderRadius: "4px",
+            fontSize: "13px",
+            color: "var(--dim)",
+          }}
+        >
+          {reaperEnabled ? (
+            <>
+              Reaper is <strong style={{ color: "var(--fg)" }}>enabled</strong> — this abusive weight is
+              stripped from the blocks your node builds, so the space above is reclaimed for fee-paying
+              transactions.
+            </>
+          ) : (
+            <>
+              Reaper is <strong style={{ color: "var(--fg)" }}>disabled</strong> — this abusive weight is
+              currently eligible for the blocks your node builds. Enable it in{" "}
+              <a
+                href="/settings/capabilities"
+                className="bare"
+                style={{ color: "var(--fg)", textDecoration: "underline" }}
+              >
+                settings
+              </a>{" "}
+              to strip it.
+            </>
+          )}
+        </div>
+
+        {/*
+          NOTE: This panel shows what is measurable RIGHT NOW — the abusive share
+          already sitting in your node's mempool, classified live via BUDS. It is
+          deliberately NOT a "what a stock node would additionally carry" baseline:
+          that number needs ghostd's mempool-reaper reject counts (transactions its
+          admission policy dropped before they ever reached the mempool), which the
+          node does not expose live. Surfacing those real reject counts is a
+          separate backend follow-up (a new ghostd RPC / node-API endpoint); until
+          it exists we do not fabricate an unfiltered baseline here.
+        */}
+        <p style={{ color: "var(--fainter)", fontSize: "12px" }}>
+          Estimated from a live sample of {sampleCount.toLocaleString()} transactions (the node
+          classifies a bounded set per poll to stay light) extrapolated across the {formatCount(total)}{" "}
+          transactions in your mempool — representative proportions, not exact totals. This is the
+          abusive weight your node is holding <em>now</em>; a true &ldquo;what a stock node would also
+          carry&rdquo; baseline needs ghostd&apos;s mempool-reaper reject counts, which aren&apos;t
+          exposed live yet.
+        </p>
+      </div>
     </Card>
   );
 }
@@ -594,7 +613,7 @@ function Composition({ mempool }: { mempool?: BudsMempool }) {
     <Card>
       <CardHeader
         title="Mempool composition"
-        subtitle="Transaction classes flowing through your node, by BUDS tier — what an address explorer never tells you."
+        subtitle="The per-tier count breakdown behind the summary above — every BUDS class flowing through your node, by share of transactions."
       />
       <div className="space-y-3">
         <div style={{ display: "flex", height: "14px", borderRadius: "4px", overflow: "hidden", background: "var(--bg)" }}>
@@ -724,141 +743,3 @@ function FeeDistribution({ mempool }: { mempool?: BudsMempool }) {
   );
 }
 
-// ─── recent transactions from the sample ────────────────────────────────────
-
-// ─── Advanced: heavy full explorer (electrs + mempool.space) ────────────────
-
-function AdvancedExplorer({ status }: { status?: MempoolStatus | null }) {
-  const running = status?.status === "running";
-  const installedNotRunning = status?.status === "installed_not_running";
-  const port = status?.port ?? 8999;
-  const installCmd = status?.install_command ?? "sudo /opt/ghost/bin/ghost-mempool install";
-  const minRam = status?.min_ram_gb ?? 4;
-  const minDisk = status?.min_disk_gb ?? 50;
-
-  return (
-    <Card collapsible defaultCollapsed={!running}>
-      <CardHeader
-        title="Advanced: full block explorer"
-        subtitle="Optional mempool.space + electrs stack for address search and a familiar UI. Heavy — needs ≥50 GB of disk and an index. Most operators don't need this; the view above already covers day-to-day mempool watching."
-      />
-
-      {running ? (
-        <div className="space-y-3">
-          <div className="flex items-center gap-3">
-            <Badge variant="success">running on :{port}</Badge>
-            <a
-              href={`http://localhost:${port}/`}
-              target="_blank"
-              rel="noreferrer"
-              className="bare"
-              style={{ color: "var(--accent)", fontSize: "13px", textDecoration: "underline" }}
-            >
-              open full explorer in a new tab ↗
-            </a>
-          </div>
-          <p style={{ color: "var(--dim)", fontSize: "13px" }}>
-            The full mempool.space + electrs stack is installed and running on this node. Open it
-            in a new tab above — it&apos;s not embedded here to keep the dashboard light.
-          </p>
-        </div>
-      ) : installedNotRunning ? (
-        <div className="space-y-4">
-          <Badge variant="warning">installed · stopped</Badge>
-          <p style={{ color: "var(--dim)", fontSize: "14px" }}>
-            The stack is installed but nothing is listening on <code>:{port}</code>. Bring it back up:
-          </p>
-          <CodeBlock command="sudo systemctl start ghost-mempool" />
-          <p style={{ color: "var(--fainter)", fontSize: "13px" }}>
-            Or remove it entirely with <code>{status?.uninstall_command ?? "sudo /opt/ghost/bin/ghost-mempool uninstall"}</code>.
-          </p>
-        </div>
-      ) : (
-        <div className="space-y-5">
-          <Badge variant="info">not installed</Badge>
-          <div>
-            <h4 style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500, marginBottom: "6px" }}>
-              What gets installed
-            </h4>
-            <ul
-              style={{
-                color: "var(--dim)",
-                fontSize: "13px",
-                lineHeight: "1.7",
-                paddingLeft: "20px",
-                listStyle: "disc",
-              }}
-            >
-              <li><strong style={{ color: "var(--fg)" }}>electrs</strong> — Bitcoin address-index server (this is the ≥{minDisk} GB)</li>
-              <li><strong style={{ color: "var(--fg)" }}>mempool-backend</strong> + <strong style={{ color: "var(--fg)" }}>frontend</strong> — the mempool.space API and UI</li>
-              <li>Binds <code>localhost:{port}</code> only — no public exposure; reads your local <code>ghostd</code> RPC</li>
-            </ul>
-          </div>
-          <div className="grid grid-cols-2 gap-6" style={{ maxWidth: "320px" }}>
-            <Stat label="free RAM" value={`≥${minRam} GB`} />
-            <Stat label="free disk" value={`≥${minDisk} GB`} />
-          </div>
-          <div>
-            <h4 style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500, marginBottom: "6px" }}>
-              One-line install
-            </h4>
-            <CodeBlock command={installCmd} />
-            <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "8px" }}>
-              First run indexes the chain (5–15 min). This page auto-refreshes — once the stack is up
-              the embedded explorer appears here.
-            </p>
-          </div>
-          {!status && (
-            <p style={{ color: "var(--fainter)", fontSize: "12px", borderTop: "1px solid var(--rule)", paddingTop: "10px" }}>
-              <em>Note:</em> couldn&apos;t reach <code>/api/v1/system/mempool</code>; showing the install
-              panel as the safe default.
-            </p>
-          )}
-        </div>
-      )}
-    </Card>
-  );
-}
-
-// ─── small shared helpers ───────────────────────────────────────────────────
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div
-        style={{
-          fontSize: "11px",
-          fontFamily: "var(--font-mono)",
-          textTransform: "uppercase",
-          letterSpacing: "0.06em",
-          color: "var(--dim)",
-          marginBottom: "4px",
-        }}
-      >
-        {label}
-      </div>
-      <div style={{ fontSize: "20px", fontWeight: 500, color: "var(--fg)", fontFamily: "var(--font-mono)" }}>
-        {value}
-      </div>
-    </div>
-  );
-}
-
-function CodeBlock({ command }: { command: string }) {
-  return (
-    <div
-      className="flex items-center justify-between gap-3"
-      style={{
-        background: "var(--bg)",
-        border: "1px solid var(--rule)",
-        borderRadius: "4px",
-        padding: "12px 16px",
-        fontFamily: "var(--font-mono)",
-        fontSize: "13px",
-      }}
-    >
-      <code style={{ color: "var(--fg)", overflow: "auto", whiteSpace: "nowrap" }}>$ {command}</code>
-      <CopyButton text={command} />
-    </div>
-  );
-}
