@@ -467,6 +467,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_policy_profile_post_handler),
         )
         .route(
+            "/api/v1/config/policy_custom",
+            post(api_config_policy_custom_post_handler),
+        )
+        .route(
             "/api/v1/config/reaper",
             post(api_config_reaper_post_handler),
         )
@@ -5004,6 +5008,10 @@ async fn api_rewards_node_history_handler(
 async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
     let config = state.dashboard_config.read();
+    // Surface the real tier policy (pool.toml [policy]) so the dashboard can show
+    // the current preset AND, for the Custom profile, pre-fill the advanced
+    // per-field controls. Read from the full node config when it is loaded.
+    let policy = policy_json(&state);
     Json(serde_json::json!({
         "archive_mode": config.archive_mode,
         "ghost_pay": config.ghost_pay,
@@ -5013,6 +5021,7 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
         "mempool_profile": config.mempool_profile,
         "template_profile": config.template_profile,
         "prune_profile": config.prune_profile,
+        "policy": policy,
         "operator_window": 100,
         "network": state.network.as_str(),
         "stratum_sv2_port": 4444,
@@ -5482,6 +5491,215 @@ async fn api_config_policy_profile_post_handler(
         "restart_pending": true,
     }))
     .into_response()
+}
+
+/// Request body for the custom tier-policy POST endpoint. Carries the full set
+/// of operator-tunable policy fields; the per-tier booleans map onto the
+/// `[policy].custom.allowed_tiers` list.
+#[derive(Debug, Deserialize)]
+struct PolicyCustomRequest {
+    /// Allow tier T0 (core financial) transactions.
+    #[serde(default)]
+    allow_t0: bool,
+    /// Allow tier T1 (extended financial: multisig, timelocks) transactions.
+    #[serde(default)]
+    allow_t1: bool,
+    /// Allow tier T2 (small data / OP_RETURN) transactions.
+    #[serde(default)]
+    allow_t2: bool,
+    /// Allow tier T3 (heavy data: inscriptions, runes) transactions.
+    #[serde(default)]
+    allow_t3: bool,
+    /// Allow Ordinals/inscription envelopes.
+    #[serde(default)]
+    allow_inscriptions: bool,
+    /// Allow Runes runestones.
+    #[serde(default)]
+    allow_runes: bool,
+    /// Allow BRC-20 token transfers.
+    #[serde(default)]
+    allow_brc20: bool,
+    /// Maximum OP_RETURN payload size in bytes (0 = none allowed).
+    max_op_return_size: usize,
+    /// Maximum witness size per input in bytes.
+    max_witness_per_input: usize,
+    /// Maximum outputs per transaction.
+    max_tx_outputs: usize,
+    /// Maximum transaction size in vbytes.
+    max_tx_size: usize,
+    /// Minimum fee rate in sat/vB (0 = no minimum).
+    min_fee_rate: f64,
+}
+
+/// API v1 Config policy_custom POST handler.
+///
+/// Sets `[policy].profile = custom` and writes the full `[policy].custom` block
+/// to pool.toml, then requests a graceful restart so the operator-defined field
+/// values are resolved into the enforced policy profile at startup. Unlike the
+/// three presets, this exposes every per-field knob the template builder now
+/// enforces (tiers, content toggles, size limits, min fee rate).
+async fn api_config_policy_custom_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<PolicyCustomRequest>,
+) -> impl IntoResponse {
+    use ghost_common::config::{BudsTier, CustomPolicyConfig, PolicyProfile};
+
+    // Validate the fee rate: must be a finite, non-negative number.
+    if !payload.min_fee_rate.is_finite() || payload.min_fee_rate < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "min_fee_rate must be a finite, non-negative number",
+                "code": "INVALID_FEE_RATE",
+            })),
+        )
+            .into_response();
+    }
+
+    // Build the allowed-tier list from the per-tier booleans.
+    let mut allowed_tiers = Vec::new();
+    if payload.allow_t0 {
+        allowed_tiers.push(BudsTier::T0);
+    }
+    if payload.allow_t1 {
+        allowed_tiers.push(BudsTier::T1);
+    }
+    if payload.allow_t2 {
+        allowed_tiers.push(BudsTier::T2);
+    }
+    if payload.allow_t3 {
+        allowed_tiers.push(BudsTier::T3);
+    }
+
+    let custom = CustomPolicyConfig {
+        allowed_tiers,
+        max_op_return_size: payload.max_op_return_size,
+        max_witness_per_input: payload.max_witness_per_input,
+        max_tx_outputs: payload.max_tx_outputs,
+        max_tx_size: payload.max_tx_size,
+        allow_inscriptions: payload.allow_inscriptions,
+        allow_runes: payload.allow_runes,
+        allow_brc20: payload.allow_brc20,
+        min_fee_rate: payload.min_fee_rate,
+    };
+
+    // Require the full node config + a path to persist to; otherwise the change
+    // can't survive a restart, so fail-closed with SERVICE_UNAVAILABLE.
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    let custom_json = serde_json::json!({
+        "allowed_tiers": custom.allowed_tiers.iter().map(tier_key).collect::<Vec<_>>(),
+        "max_op_return_size": custom.max_op_return_size,
+        "max_witness_per_input": custom.max_witness_per_input,
+        "max_tx_outputs": custom.max_tx_outputs,
+        "max_tx_size": custom.max_tx_size,
+        "allow_inscriptions": custom.allow_inscriptions,
+        "allow_runes": custom.allow_runes,
+        "allow_brc20": custom.allow_brc20,
+        "min_fee_rate": custom.min_fee_rate,
+    });
+
+    {
+        let mut cfg = full.write();
+        cfg.policy.profile = PolicyProfile::Custom;
+        cfg.policy.custom = Some(custom);
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist custom policy");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist custom policy: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // The custom profile is resolved at startup, so a graceful restart applies it.
+    state.request_restart();
+
+    Json(serde_json::json!({
+        "success": true,
+        "profile": "custom",
+        "custom": custom_json,
+        "restart_pending": true,
+    }))
+    .into_response()
+}
+
+/// Build the `policy` JSON block for the config GET responses: the active
+/// preset name plus the resolved custom field values. When no `[policy].custom`
+/// block is persisted, the defaults are surfaced so the advanced UI panel has
+/// sensible starting values. Returns `null` when the full node config is not
+/// loaded (e.g. minimal/test servers).
+fn policy_json(state: &Arc<VerificationState>) -> serde_json::Value {
+    use ghost_common::config::{CustomPolicyConfig, PolicyProfile};
+
+    let Some(ref full) = state.full_node_config else {
+        return serde_json::Value::Null;
+    };
+    let cfg = full.read();
+
+    let profile_name = match cfg.policy.profile {
+        PolicyProfile::BitcoinPure => "strict",
+        PolicyProfile::Permissive => "permissive",
+        PolicyProfile::FullOpen => "full_open",
+        PolicyProfile::Custom => "custom",
+    };
+
+    let custom: CustomPolicyConfig = cfg.policy.custom.clone().unwrap_or_default();
+
+    serde_json::json!({
+        "profile": profile_name,
+        "custom": {
+            "allow_t0": custom.allowed_tiers.contains(&ghost_common::config::BudsTier::T0),
+            "allow_t1": custom.allowed_tiers.contains(&ghost_common::config::BudsTier::T1),
+            "allow_t2": custom.allowed_tiers.contains(&ghost_common::config::BudsTier::T2),
+            "allow_t3": custom.allowed_tiers.contains(&ghost_common::config::BudsTier::T3),
+            "allow_inscriptions": custom.allow_inscriptions,
+            "allow_runes": custom.allow_runes,
+            "allow_brc20": custom.allow_brc20,
+            "max_op_return_size": custom.max_op_return_size,
+            "max_witness_per_input": custom.max_witness_per_input,
+            "max_tx_outputs": custom.max_tx_outputs,
+            "max_tx_size": custom.max_tx_size,
+            "min_fee_rate": custom.min_fee_rate,
+        }
+    })
+}
+
+/// Serialize a config-crate BUDS tier to its lowercase wire key (`t0`..`t3`).
+fn tier_key(tier: &ghost_common::config::BudsTier) -> &'static str {
+    match tier {
+        ghost_common::config::BudsTier::T0 => "t0",
+        ghost_common::config::BudsTier::T1 => "t1",
+        ghost_common::config::BudsTier::T2 => "t2",
+        ghost_common::config::BudsTier::T3 => "t3",
+    }
 }
 
 async fn api_config_reaper_post_handler(
@@ -8683,6 +8901,210 @@ mod tests {
         );
     }
 
+    /// The policy_custom POST exposes every per-field policy knob: without HMAC
+    /// it must 401, and with a valid signature it must set `[policy].profile =
+    /// custom`, persist the full `[policy].custom` block to pool.toml and request
+    /// a graceful restart. It must also reject a negative min_fee_rate with 400.
+    #[tokio::test]
+    async fn test_config_policy_custom_post_persists_and_restarts() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::config::{BudsTier, PolicyProfile as CfgProfile};
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        // A representative custom body: T0+T1 only, all data off, tight limits.
+        let body = r#"{
+            "allow_t0": true,
+            "allow_t1": true,
+            "allow_t2": false,
+            "allow_t3": false,
+            "allow_inscriptions": false,
+            "allow_runes": false,
+            "allow_brc20": false,
+            "max_op_return_size": 40,
+            "max_witness_per_input": 500,
+            "max_tx_outputs": 8,
+            "max_tx_size": 90000,
+            "min_fee_rate": 2.5
+        }"#;
+
+        // Without auth → 401.
+        let unauth = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/policy_custom")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unauth.status(),
+            StatusCode::UNAUTHORIZED,
+            "policy_custom POST without auth must 401"
+        );
+        assert!(!state.restart_requested());
+
+        // With valid HMAC → persists + requests restart.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, body.as_bytes());
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/policy_custom")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"].as_bool(), Some(true));
+        assert_eq!(json["profile"].as_str(), Some("custom"));
+        assert_eq!(json["restart_pending"].as_bool(), Some(true));
+
+        // Persisted to disk: profile = Custom and the custom block round-trips.
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert_eq!(reloaded.policy.profile, CfgProfile::Custom);
+        let custom = reloaded.policy.custom.expect("custom block persisted");
+        assert_eq!(custom.allowed_tiers, vec![BudsTier::T0, BudsTier::T1]);
+        assert_eq!(custom.max_op_return_size, 40);
+        assert_eq!(custom.max_witness_per_input, 500);
+        assert_eq!(custom.max_tx_outputs, 8);
+        assert_eq!(custom.max_tx_size, 90000);
+        assert!(!custom.allow_inscriptions);
+        assert!(!custom.allow_runes);
+        assert!(!custom.allow_brc20);
+        assert_eq!(custom.min_fee_rate, 2.5);
+        assert!(
+            state.restart_requested(),
+            "policy_custom change must request a restart"
+        );
+
+        // Negative min_fee_rate → 400.
+        let bad = r#"{
+            "allow_t0": true, "allow_t1": false, "allow_t2": false, "allow_t3": false,
+            "allow_inscriptions": false, "allow_runes": false, "allow_brc20": false,
+            "max_op_return_size": 0, "max_witness_per_input": 500,
+            "max_tx_outputs": 8, "max_tx_size": 90000, "min_fee_rate": -1.0
+        }"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, bad.as_bytes());
+        let bad_resp = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/policy_custom")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bad_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "negative min_fee_rate must 400"
+        );
+    }
+
+    /// The extended config GET (`/api/v1/config/full`) must surface the active
+    /// policy profile and the resolved custom field values so the dashboard can
+    /// render the current preset and pre-fill the advanced panel.
+    #[tokio::test]
+    async fn test_config_full_surfaces_policy() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::config::{BudsTier, CustomPolicyConfig, PolicyProfile as CfgProfile};
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+
+        let mut cfg = FullNodeConfig::default();
+        cfg.policy.profile = CfgProfile::Custom;
+        cfg.policy.custom = Some(CustomPolicyConfig {
+            allowed_tiers: vec![BudsTier::T0, BudsTier::T2],
+            max_op_return_size: 33,
+            max_witness_per_input: 111,
+            max_tx_outputs: 7,
+            max_tx_size: 12345,
+            allow_inscriptions: true,
+            allow_runes: false,
+            allow_brc20: true,
+            min_fee_rate: 3.0,
+        });
+
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_full_node_config(cfg, path.clone()),
+        );
+
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config/full")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["policy"]["profile"].as_str(), Some("custom"));
+        let c = &json["policy"]["custom"];
+        assert_eq!(c["allow_t0"].as_bool(), Some(true));
+        assert_eq!(c["allow_t1"].as_bool(), Some(false));
+        assert_eq!(c["allow_t2"].as_bool(), Some(true));
+        assert_eq!(c["allow_t3"].as_bool(), Some(false));
+        assert_eq!(c["allow_inscriptions"].as_bool(), Some(true));
+        assert_eq!(c["allow_brc20"].as_bool(), Some(true));
+        assert_eq!(c["max_op_return_size"].as_u64(), Some(33));
+        assert_eq!(c["max_tx_outputs"].as_u64(), Some(7));
+        assert_eq!(c["min_fee_rate"].as_f64(), Some(3.0));
+    }
+
     /// CRIT-6: Test that all config POST endpoints require auth
     #[tokio::test]
     async fn test_all_config_post_endpoints_require_auth() {
@@ -8693,6 +9115,7 @@ mod tests {
             "/api/v1/config/archive_mode",
             "/api/v1/config/ghost_mode",
             "/api/v1/config/policy_profile",
+            "/api/v1/config/policy_custom",
             "/api/v1/config/public_mining",
             "/api/v1/config/reaper",
             "/api/v1/config/ghost_pay",
@@ -8706,6 +9129,9 @@ mod tests {
 
             let body = match endpoint {
                 "/api/v1/config/policy_profile" => r#"{"profile": "strict"}"#,
+                "/api/v1/config/policy_custom" => {
+                    r#"{"allow_t0": true, "allow_t1": true, "allow_t2": false, "allow_t3": false, "allow_inscriptions": false, "allow_runes": false, "allow_brc20": false, "max_op_return_size": 40, "max_witness_per_input": 500, "max_tx_outputs": 8, "max_tx_size": 90000, "min_fee_rate": 1.0}"#
+                }
                 "/api/v1/config/prune_profile" => r#"{"profile": "standard"}"#,
                 "/api/v1/config/elder" => r#"{"enabled": true, "slot": 1}"#,
                 _ => r#"{"enabled": true}"#,
