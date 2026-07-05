@@ -116,6 +116,7 @@ export default function CapacityPage() {
           eyebrow="capacity"
           title="Hardware utilisation."
           subtitle="Each node's miner count vs its hardware-derived capacity ceiling."
+          subtitleFullWidth
         />
         <SkeletonCard />
       </div>
@@ -158,6 +159,7 @@ export default function CapacityPage() {
         eyebrow="capacity"
         title="Hardware utilisation."
         subtitle="Each node's miner count vs its hardware-derived capacity ceiling. The translator's load balancer routes new connections to the under-utilised peer."
+        subtitleFullWidth
         actions={
           <Badge
             variant={myPct >= 90 ? "error" : myPct >= 80 ? "warning" : "success"}
