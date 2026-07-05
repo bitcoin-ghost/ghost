@@ -188,17 +188,17 @@ export default function BudsPage() {
         <Card>
           <CardHeader
             title="Filtering settings"
-            subtitle="How strictly this node filters transactions."
+            subtitle="Basic — pick a tier preset below. Advanced — per-vector spam controls on the Reaper page (and custom policy, when enabled)."
           />
           <div className="space-y-3">
+            <PolicyProfileSelector />
             <SettingRow
               label="Reaper"
-              value={reaperEnabled ? "On" : "Off"}
-              desc={reaperEnabled ? "Strips dead-code transactions from your mempool and blocks." : "Not removing dead-code transactions."}
+              value={`${reaperEnabled ? "On" : "Off"} · Advanced`}
+              desc={reaperEnabled ? "Advanced: per-vector dead-code / spam filtering for your mempool and blocks." : "Advanced: per-vector dead-code / spam filtering (currently off)."}
               href="/reaper"
               cta="Reaper settings"
             />
-            <PolicyProfileSelector />
           </div>
         </Card>
       </SectionErrorBoundary>
@@ -233,11 +233,14 @@ function PolicyProfileSelector() {
 
   return (
     <div>
-      <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600, marginBottom: "2px" }}>
-        Mining policy
+      <div className="flex items-center gap-2" style={{ marginBottom: "2px" }}>
+        <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>Mining policy</span>
+        <span style={{ color: "var(--accent)", fontSize: "11px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+          Basic
+        </span>
       </div>
       <div style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "10px" }}>
-        Which transaction classes this node mines into the blocks it builds. Changing this restarts the node.
+        The simple choice — how much your node filters, by transaction class. Changing it restarts the node.
       </div>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {POLICY_PRESETS.map((p) => {
