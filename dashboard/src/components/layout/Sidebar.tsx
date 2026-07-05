@@ -18,6 +18,7 @@ import {
   Layers,
   SlidersHorizontal,
   Globe,
+  MapPin,
   HeartPulse,
   ScrollText,
   Users,
@@ -64,6 +65,7 @@ const GROUPS: NavGroup[] = [
       { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
       { href: "/sync", label: "Sync", icon: <RefreshCw {...ICON} /> },
       { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
+      { href: "/geo", label: "Geo", icon: <MapPin {...ICON} /> },
     ],
   },
   {
