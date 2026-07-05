@@ -1048,47 +1048,6 @@ export default function SystemPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* ----------------------------------------------------------------- */}
-      {/* Tor Mode Status                                                    */}
-      {/* ----------------------------------------------------------------- */}
-      <SectionErrorBoundary section="Tor Mode">
-        <Card>
-          <CardHeader
-            title="Tor Mode"
-            subtitle="Onion-only networking — route all traffic through Tor"
-          />
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="p-4 bg-gray-800/50 rounded-lg">
-              <div className="text-sm text-gray-400 mb-1">Status</div>
-              <Badge variant={status?.tor_mode ? "success" : "default"}>
-                {status?.tor_mode ? "Active" : "Disabled"}
-              </Badge>
-            </div>
-            {status?.tor_mode && status?.onion_address && (
-              <div className="p-4 bg-gray-800/50 rounded-lg col-span-2">
-                <div className="text-sm text-gray-400 mb-1">Onion Address</div>
-                <code
-                  className="text-orange-400 text-sm cursor-pointer hover:text-orange-300 break-all"
-                  onClick={() => {
-                    navigator.clipboard.writeText(status.onion_address!);
-                    success("Onion address copied");
-                  }}
-                  title="Click to copy"
-                >
-                  {status.onion_address}
-                </code>
-              </div>
-            )}
-          </div>
-          {!status?.tor_mode && (
-            <p className="text-sm text-gray-500 mt-3">
-              Start ghostd with <code className="text-gray-400">-tormode</code> to
-              route all connections through Tor. Requires restart.
-            </p>
-          )}
-        </Card>
-      </SectionErrorBoundary>
-
       {/* ================================================================= */}
       {/* Dialogs                                                            */}
       {/* ================================================================= */}
