@@ -198,13 +198,19 @@ export function formatBtc(sats: number): string {
   return (sats / 100_000_000).toFixed(8);
 }
 
-export function formatHashrate(hashrate: number): string {
-  if (hashrate >= 1e15) return `${(hashrate / 1e15).toFixed(2)} PH/s`;
-  if (hashrate >= 1e12) return `${(hashrate / 1e12).toFixed(2)} TH/s`;
-  if (hashrate >= 1e9) return `${(hashrate / 1e9).toFixed(2)} GH/s`;
-  if (hashrate >= 1e6) return `${(hashrate / 1e6).toFixed(2)} MH/s`;
-  if (hashrate >= 1e3) return `${(hashrate / 1e3).toFixed(2)} KH/s`;
-  return `${hashrate.toFixed(2)} H/s`;
+// Auto-scaling hashrate formatter. `digits` controls decimal places (default 2);
+// pass 0 for the global network-hashrate tile, which reaches EH/s magnitudes and
+// needs to stay compact so the unit isn't truncated. Scales up to ZH/s so
+// exahash-scale network estimates keep their unit rather than overflowing PH/s.
+export function formatHashrate(hashrate: number, digits = 2): string {
+  if (hashrate >= 1e21) return `${(hashrate / 1e21).toFixed(digits)} ZH/s`;
+  if (hashrate >= 1e18) return `${(hashrate / 1e18).toFixed(digits)} EH/s`;
+  if (hashrate >= 1e15) return `${(hashrate / 1e15).toFixed(digits)} PH/s`;
+  if (hashrate >= 1e12) return `${(hashrate / 1e12).toFixed(digits)} TH/s`;
+  if (hashrate >= 1e9) return `${(hashrate / 1e9).toFixed(digits)} GH/s`;
+  if (hashrate >= 1e6) return `${(hashrate / 1e6).toFixed(digits)} MH/s`;
+  if (hashrate >= 1e3) return `${(hashrate / 1e3).toFixed(digits)} KH/s`;
+  return `${hashrate.toFixed(digits)} H/s`;
 }
 
 export function formatDuration(seconds: number): string {

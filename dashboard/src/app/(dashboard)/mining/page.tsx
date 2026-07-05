@@ -224,7 +224,7 @@ export default function MiningPage() {
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <StatCard
           label="Network Hashrate"
-          value={bestHashData?.network_hashrate ? formatHashrate(bestHashData.network_hashrate) : "--"}
+          value={bestHashData?.network_hashrate ? formatHashrate(bestHashData.network_hashrate, 0) : "--"}
           sublabel="global estimate"
           tooltip={TOOLTIPS.network_hashrate}
           loading={bestHashLoading}
