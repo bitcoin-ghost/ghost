@@ -207,9 +207,20 @@ export function Sidebar() {
               )}
             </div>
           ) : (
-            <div className="w-full flex justify-center">
+            <button
+              onClick={() => toggle()}
+              title="Expand sidebar"
+              aria-label="Expand sidebar"
+              className="w-full flex justify-center"
+              style={{
+                padding: "4px",
+                background: "transparent",
+                border: "none",
+                cursor: "pointer",
+              }}
+            >
               <GhostBrand size="sm" label="" />
-            </div>
+            </button>
           )}
           {!collapsed && (
             <button
