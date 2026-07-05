@@ -26,6 +26,12 @@ export interface ReaperStats {
   // Total virtual bytes of dead weight stripped from block templates.
   dead_bytes_total: number;
   last_reaped_unix: number | null;
+  // Per-block snapshot: the most-recently-built template's reaped tx count +
+  // dead bytes. last_block_unix is null until the first template is built,
+  // which distinguishes "0 reaped this block" from "no block yet".
+  last_block_reaped: number;
+  last_block_dead_bytes: number;
+  last_block_unix: number | null;
   by_type: ReaperByType;
 }
 
