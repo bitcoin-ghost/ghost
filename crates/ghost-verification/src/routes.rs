@@ -321,14 +321,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // CRIT-6: POST handlers moved to internal_router to require authentication
         .route("/api/v1/config/full", get(api_config_full_handler))
         .route(
-            "/api/v1/config/profiles/mempool",
-            get(api_config_profiles_mempool_handler),
-        )
-        .route(
-            "/api/v1/config/profiles/template",
-            get(api_config_profiles_template_handler),
-        )
-        .route(
             "/api/v1/config/archive_mode",
             get(api_config_archive_mode_handler),
         )
@@ -466,16 +458,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_ghost_mode_post_handler),
         )
         .route(
-            "/api/v1/config/mempool_profile",
-            post(api_config_mempool_profile_post_handler),
-        )
-        .route(
             "/api/v1/config/public_mining",
             post(api_config_public_mining_post_handler),
-        )
-        .route(
-            "/api/v1/config/template_profile",
-            post(api_config_template_profile_post_handler),
         )
         .route(
             "/api/v1/config/policy_profile",
@@ -4944,34 +4928,6 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
     }))
 }
 
-/// API v1 Config profiles mempool handler
-async fn api_config_profiles_mempool_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "profiles": [
-            { "name": "permissive", "description": "Accept all standard transactions", "active": true },
-            { "name": "strict", "description": "Bitcoin Core defaults only", "active": false },
-            { "name": "custom", "description": "Custom configuration", "active": false }
-        ],
-        "current": "permissive"
-    }))
-}
-
-/// API v1 Config profiles template handler
-async fn api_config_profiles_template_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "profiles": [
-            { "name": "default", "description": "Standard block template", "active": true },
-            { "name": "compact", "description": "Smaller blocks", "active": false },
-            { "name": "maximum", "description": "Maximum block size", "active": false }
-        ],
-        "current": "default"
-    }))
-}
-
 /// API v1 Config archive mode handler
 async fn api_config_archive_mode_handler(
     State(state): State<Arc<VerificationState>>,
@@ -5595,34 +5551,6 @@ async fn api_config_elder_post_handler(
         "enabled": payload.enabled,
         "slot": payload.slot,
         "message": "Elder status updated"
-    }))
-}
-
-/// API v1 Config mempool_profile POST handler
-async fn api_config_mempool_profile_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ProfileRequest>,
-) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.mempool_profile = payload.profile.clone();
-    Json(serde_json::json!({
-        "success": true,
-        "profile": payload.profile,
-        "message": "Mempool profile updated"
-    }))
-}
-
-/// API v1 Config template_profile POST handler
-async fn api_config_template_profile_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ProfileRequest>,
-) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.template_profile = payload.profile.clone();
-    Json(serde_json::json!({
-        "success": true,
-        "profile": payload.profile,
-        "message": "Template profile updated"
     }))
 }
 
@@ -7538,9 +7466,15 @@ async fn api_config_profiles_mempool_activate_handler(
     State(state): State<Arc<VerificationState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    // Delegate to the existing mempool_profile POST handler
-    api_config_mempool_profile_post_handler(State(state), Json(ProfileRequest { profile: name }))
-        .await
+    // Record the selection in the dashboard mirror. This is a cosmetic display
+    // field; the real mining lever is `/api/v1/config/policy_profile`.
+    let mut config = state.dashboard_config.write();
+    config.mempool_profile = name.clone();
+    Json(serde_json::json!({
+        "success": true,
+        "profile": name,
+        "message": "Mempool profile updated"
+    }))
 }
 
 /// API v1 Config: Save custom template profile
@@ -7586,8 +7520,15 @@ async fn api_config_profiles_template_activate_handler(
     State(state): State<Arc<VerificationState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    api_config_template_profile_post_handler(State(state), Json(ProfileRequest { profile: name }))
-        .await
+    // Cosmetic dashboard mirror; the real mining lever is
+    // `/api/v1/config/policy_profile`.
+    let mut config = state.dashboard_config.write();
+    config.template_profile = name.clone();
+    Json(serde_json::json!({
+        "success": true,
+        "profile": name,
+        "message": "Template profile updated"
+    }))
 }
 
 /// GhostPay payout address body
@@ -8631,9 +8572,8 @@ mod tests {
         let config_endpoints = [
             "/api/v1/config/archive_mode",
             "/api/v1/config/ghost_mode",
-            "/api/v1/config/mempool_profile",
+            "/api/v1/config/policy_profile",
             "/api/v1/config/public_mining",
-            "/api/v1/config/template_profile",
             "/api/v1/config/reaper",
             "/api/v1/config/ghost_pay",
             "/api/v1/config/wraith",
@@ -8645,9 +8585,8 @@ mod tests {
             let app = super::create_router(Arc::clone(&state));
 
             let body = match endpoint {
-                "/api/v1/config/mempool_profile"
-                | "/api/v1/config/template_profile"
-                | "/api/v1/config/prune_profile" => r#"{"profile": "standard"}"#,
+                "/api/v1/config/policy_profile" => r#"{"profile": "strict"}"#,
+                "/api/v1/config/prune_profile" => r#"{"profile": "standard"}"#,
                 "/api/v1/config/elder" => r#"{"enabled": true, "slot": 1}"#,
                 _ => r#"{"enabled": true}"#,
             };
