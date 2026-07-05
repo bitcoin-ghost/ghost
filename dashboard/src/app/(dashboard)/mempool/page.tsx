@@ -100,13 +100,6 @@ function formatFeeRate(satVb: number | null): string {
 
 // ─── static metadata ────────────────────────────────────────────────────────
 
-const TIERS = [
-  { key: "T0" as const, name: "T0 · Financial", color: "#3fb950", desc: "Clean monetary transactions" },
-  { key: "T1" as const, name: "T1 · Extended", color: "#58a6ff", desc: "Multisig / larger financial" },
-  { key: "T2" as const, name: "T2 · Data", color: "#d29922", desc: "OP_RETURN data carriers" },
-  { key: "T3" as const, name: "T3 · Abusive", color: "#f85149", desc: "Runes, inscriptions, stuffing" },
-];
-
 const FEE_BUCKETS = [
   { label: "0–1", min: 0, max: 1 },
   { label: "1–2", min: 1, max: 2 },
@@ -180,9 +173,6 @@ export default function MempoolPage() {
       ) : (
         <>
           <LiveStats mempool={mempool} reaperStats={reaperStats} reaperEnabled={reaperEnabled} />
-          <SectionErrorBoundary section="Mempool composition">
-            <Composition mempool={mempool} reaperEnabled={reaperEnabled} />
-          </SectionErrorBoundary>
           <SectionErrorBoundary section="Fee distribution">
             <FeeDistribution mempool={mempool} />
           </SectionErrorBoundary>
@@ -410,104 +400,6 @@ function formatRelative(unixSecs: number | null): string {
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
   if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
   return `${Math.floor(secs / 86400)}d ago`;
-}
-
-// ─── mempool composition by BUDS class ──────────────────────────────────────
-
-function Composition({
-  mempool,
-  reaperEnabled,
-}: {
-  mempool?: BudsMempool;
-  reaperEnabled: boolean;
-}) {
-  const byTier = mempool?.by_tier ?? { T0: 0, T1: 0, T2: 0, T3: 0 };
-  const sampled = mempool?.sample_size ?? TIERS.reduce((s, t) => s + (byTier[t.key] ?? 0), 0);
-  const cleanShare = sampled ? (byTier.T0 + byTier.T1) / sampled : 0;
-  const abusiveShare = sampled ? byTier.T3 / sampled : 0;
-
-  return (
-    <Card>
-      <CardHeader
-        title="Mempool composition"
-        subtitle="Every BUDS class your node is holding right now, by share of sampled transactions."
-      />
-      <div className="space-y-3">
-        {/* Plain-language read of the mix. Describes what the node is holding —
-            reaper-agnostic — and only appends the reject-vector prompt when the
-            operator actually runs the reaper. */}
-        <div style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
-          Most of what your node holds right now is clean payments:{" "}
-          <strong style={{ color: "#3fb950" }}>~{Math.round(cleanShare * 100)}%</strong> of sampled
-          transactions are ordinary payments (T0 + T1).
-          {byTier.T3 > 0 && (
-            <>
-              {" "}
-              About <strong style={{ color: "var(--fg)" }}>~{Math.round(abusiveShare * 100)}%</strong>{" "}
-              carry abusive patterns (T3) — inscriptions, runes and oversized data. The reaper drops the
-              ones that hide dead code (inscription envelopes, stuffing, fake pubkeys); a runestone is
-              standard, provably-unspendable OP_RETURN data — not dead code — so the reaper leaves it.
-              {reaperEnabled && (
-                <>
-                  {" "}
-                  Tune your reject vectors on the{" "}
-                  <a
-                    href="/reaper"
-                    className="bare"
-                    style={{ color: "var(--fg)", textDecoration: "underline" }}
-                  >
-                    Reaper page
-                  </a>{" "}
-                  to catch more dead-code variants.
-                </>
-              )}
-            </>
-          )}
-        </div>
-        <div style={{ display: "flex", height: "14px", borderRadius: "4px", overflow: "hidden", background: "var(--bg)" }}>
-          {TIERS.map((t) => {
-            const count = byTier[t.key] ?? 0;
-            const pct = sampled ? (count / sampled) * 100 : 0;
-            if (pct === 0) return null;
-            return (
-              <div
-                key={t.key}
-                title={`${t.name}: ${count} (${pct.toFixed(1)}%)`}
-                style={{ width: `${pct}%`, background: t.color }}
-              />
-            );
-          })}
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {TIERS.map((t) => {
-            const count = byTier[t.key] ?? 0;
-            const pct = sampled ? (count / sampled) * 100 : 0;
-            return (
-              <div
-                key={t.key}
-                style={{ padding: "10px 12px", border: "1px solid var(--rule)", borderRadius: "4px", background: "var(--bg)" }}
-              >
-                <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
-                  <span style={{ width: "10px", height: "10px", borderRadius: "2px", background: t.color, display: "inline-block" }} />
-                  <span style={{ color: "var(--fg)", fontSize: "13px", fontWeight: 500 }}>{t.name}</span>
-                </div>
-                <div style={{ fontFamily: "var(--font-mono)", fontSize: "18px", color: "var(--fg)" }}>
-                  {pct.toFixed(0)}%
-                </div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>
-                  {count.toLocaleString()} · {t.desc}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <p style={{ color: "var(--fainter)", fontSize: "12px" }}>
-          Based on a sample of {sampled.toLocaleString()} transactions (the node classifies up to 100
-          per poll to stay light). Proportions are representative, not exact totals.
-        </p>
-      </div>
-    </Card>
-  );
 }
 
 // ─── fee-rate distribution (computed client-side from the tx sample) ─────────
