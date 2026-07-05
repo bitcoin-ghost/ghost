@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn test_policy_profiles() {
         let bitcoin_pure = TemplateFilter::bitcoin_pure();
-        assert_eq!(bitcoin_pure.profile().name, "bitcoin_pure");
+        assert_eq!(bitcoin_pure.profile().name, "strict");
 
         let permissive = TemplateFilter::permissive();
         assert_eq!(permissive.profile().name, "permissive");

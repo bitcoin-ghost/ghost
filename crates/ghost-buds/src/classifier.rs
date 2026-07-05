@@ -393,7 +393,7 @@ impl PolicyPreset {
     /// Bitcoin Pure: Only T0 and T1 (financial transactions only)
     pub fn bitcoin_pure() -> Self {
         Self {
-            name: "bitcoin_pure",
+            name: "strict",
             allowed_tiers: vec![BudsTier::T0, BudsTier::T1],
         }
     }
