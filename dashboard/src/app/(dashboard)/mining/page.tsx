@@ -11,7 +11,8 @@ import { ConfirmDialog } from "@/components/ui/Dialog";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { formatHashrate } from "@/components/ui/DataTable";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { useMiningStatus, useBestHash, useSetPrivateMining, useSetPublicMining } from "@/hooks/queries";
+import { useMiningStatus, useBestHash, useSetPrivateMining, useSetPublicMining, useSelfCheck } from "@/hooks/queries";
+import { selfCheckFailures, type SelfCheckState } from "@/lib/api/selfCheck";
 import { useToast } from "@/components/ui/Toast";
 import { useQueryClient } from "@tanstack/react-query";
 import PoolSetupWizard from "../settings/wizards/PoolSetupWizard";
@@ -130,6 +131,15 @@ function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | 
   );
 }
 
+// Human-readable names for the self-check capabilities, used in the drift
+// warning banner. Keys mirror ghost-pool's `SelfCheckState` fields.
+const CAPABILITY_LABELS: Record<keyof SelfCheckState, string> = {
+  public_mining: "Public Mining",
+  archive: "Archive Mode",
+  ghost_pay: "Ghost Pay",
+  reaper: "Reaper",
+};
+
 type MiningMode = "private_solo" | "private_pool" | "pool";
 
 function getMiningMode(privateMining?: boolean, publicMining?: boolean): MiningMode {
@@ -147,6 +157,16 @@ const MODES: { key: MiningMode; label: string; desc: string }[] = [
 export default function MiningPage() {
   const { data: status, isLoading: statusLoading } = useMiningStatus();
   const { data: bestHashData, isLoading: bestHashLoading } = useBestHash();
+  // Capability self-check: warn when a CLAIMED capability's prerequisite is
+  // missing (e.g. public_mining enabled but no stratum listening) so the
+  // operator isn't silently failing to earn its shares. `null` (older backend,
+  // 404, or all-passing) yields no failures → banner renders nothing.
+  const { data: selfCheck } = useSelfCheck();
+  const selfCheckFailureList = selfCheckFailures(selfCheck);
+  // Dismissible per session (useState resets on reload), so the banner
+  // re-appears on the next page load while the condition persists.
+  const [selfCheckDismissed, setSelfCheckDismissed] = useState(false);
+  const showSelfCheckBanner = selfCheckFailureList.length > 0 && !selfCheckDismissed;
   const setPrivateMining = useSetPrivateMining();
   const setPublicMining = useSetPublicMining();
   const queryClient = useQueryClient();
@@ -219,6 +239,60 @@ export default function MiningPage() {
   return (
     <div className="space-y-6">
       <PageHeader eyebrow="mining" title="Hashrate, shares, miners." subtitle="Hashrate, miners, and mining configuration" />
+
+      {/* Capability drift warning — a claimed capability whose prerequisite the
+          node can't satisfy right now. Primary case: Public Mining enabled but
+          no stratum serving, so miners can't connect and the +3 shares aren't
+          being earned. Only rendered when the self-check reports a failure;
+          dismissible for the session but re-shows on reload. */}
+      {showSelfCheckBanner && (
+        <div
+          role="alert"
+          className="rounded-lg border border-amber-600/60 bg-amber-900/20 p-4"
+        >
+          <div className="flex items-start gap-3">
+            <span aria-hidden className="text-amber-400 text-lg leading-none mt-0.5">⚠</span>
+            <div className="flex-1 min-w-0 space-y-2">
+              <div className="text-sm font-semibold text-amber-300">
+                Capability prerequisite missing
+              </div>
+              <ul className="space-y-2">
+                {selfCheckFailureList.map((f) => (
+                  <li key={f.capability} className="text-sm text-amber-100/90 leading-relaxed">
+                    {f.capability === "public_mining" ? (
+                      <>
+                        You&apos;ve enabled <span className="font-medium">Public Mining</span>, but no stratum
+                        server is responding on this node (port {status?.stratum_v1_port || 3333}). Miners
+                        can&apos;t connect and you are{" "}
+                        <span className="font-semibold">NOT earning the +3 Public Mining shares</span>. Start
+                        the stratum stack (sri-translator/sri-pool) or change your mining mode.
+                      </>
+                    ) : (
+                      <>
+                        You&apos;ve enabled{" "}
+                        <span className="font-medium">{CAPABILITY_LABELS[f.capability]}</span>, but its
+                        prerequisite isn&apos;t satisfied on this node, so you are not earning its shares.
+                      </>
+                    )}
+                    {/* Exact reason straight from the node probe (true port,
+                        remediation hint) so the friendly copy above stays
+                        correct even when the configured port differs. */}
+                    <div className="text-xs text-amber-200/60 mt-1">{f.reason}</div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSelfCheckDismissed(true)}
+              className="text-amber-300/70 hover:text-amber-200 text-sm shrink-0"
+              aria-label="Dismiss warning"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Stats row */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">

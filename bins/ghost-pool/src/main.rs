@@ -5900,6 +5900,20 @@ async fn main() -> Result<()> {
         serde_json::to_value(reaper_stats_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
     });
 
+    // Capability self-check (Phase 3). Construct the coordinator here so its
+    // last snapshot can be surfaced over HTTP at /api/v1/system/self-check;
+    // the background probe loop is spawned later (after the HTTP listener is
+    // up). The dashboard reads this to warn when a claimed capability's
+    // prerequisite is missing (e.g. public_mining announced but no stratum
+    // serving). Read-only: the handler reads the snapshot, it does not probe.
+    let self_check = SelfCheck::new();
+    {
+        let self_check_for_api = self_check.clone();
+        verification_state = verification_state.with_self_check(move || {
+            serde_json::to_value(self_check_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
+        });
+    }
+
     // Decentralised Wraith coordinator election (read-only, gated off by
     // default). Constructed ONLY when `[coordinator] wraith_election_enabled`
     // is true; otherwise `None` and the service is inert (zero effect on the
@@ -7173,9 +7187,10 @@ async fn main() -> Result<()> {
     // Phase 3: capability self-check loop. Probes prerequisites for each
     // claimed capability (stratum ports, disk space, ghost-pay daemon,
     // reaper config) every 30s. Diagnostic only — surfaced via the dashboard
-    // and `/health/self_check`. Does not auto-demote claims; the verification
-    // mesh catches false claims at the consensus layer.
-    let self_check = SelfCheck::new();
+    // (`/api/v1/system/self-check`) and `/health/self_check`. Does not
+    // auto-demote claims; the verification mesh catches false claims at the
+    // consensus layer. `self_check` was constructed earlier so the HTTP
+    // handler shares this exact snapshot; here we start its probe loop.
     self_check.clone().spawn_loop(Arc::new(config.clone()));
     info!("Capability self-check loop started (30s interval)");
 
