@@ -400,12 +400,12 @@ function AdvancedPolicyPanel() {
         }}
       >
         <span>
-          <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>Advanced: custom policy</span>
+          <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>Advanced</span>
           {isCustomActive && (
             <span style={{ color: "var(--accent)", fontSize: "11px", fontWeight: 600, marginLeft: "8px" }}>· current</span>
           )}
           <div style={{ color: "var(--dim)", fontSize: "12px", marginTop: "2px" }}>
-            Set every tier, content and size rule by hand. Most operators want a preset instead.
+            Fine-grained control — only applied when you select Custom. The three presets above are the basic choice.
           </div>
         </span>
         <span style={{ color: "var(--dim)", fontSize: "13px" }}>{open ? "Hide" : "Show"}</span>
