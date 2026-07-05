@@ -10,7 +10,7 @@ import { StatCard } from "@/components/ui/StatCard";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { useConfig } from "@/hooks/queries/useConfigQueries";
 import { useReaperStatus } from "@/hooks/queries";
-import { type ReaperStats, type ReaperByType } from "@/lib/api/reaper";
+import { type ReaperStats } from "@/lib/api/reaper";
 import { fetchApi } from "@/lib/api/client";
 
 /**
@@ -180,15 +180,11 @@ export default function MempoolPage() {
       ) : (
         <>
           <LiveStats mempool={mempool} />
-          <SectionErrorBoundary section="Reaper impact">
-            <ReaperImpact
-              mempool={mempool}
-              reaperStats={reaperStats}
-              reaperEnabled={reaperEnabled}
-            />
+          <SectionErrorBoundary section="Reaper">
+            <ReaperStrip reaperStats={reaperStats} reaperEnabled={reaperEnabled} />
           </SectionErrorBoundary>
           <SectionErrorBoundary section="Mempool composition">
-            <Composition mempool={mempool} />
+            <Composition mempool={mempool} reaperEnabled={reaperEnabled} />
           </SectionErrorBoundary>
           <SectionErrorBoundary section="Fee distribution">
             <FeeDistribution mempool={mempool} />
@@ -374,23 +370,7 @@ function LiveStats({ mempool }: { mempool?: BudsMempool }) {
   );
 }
 
-// ─── Reaper impact — what the pool reaper keeps out of this node's blocks ────
-
-// Human labels for the reaper's per-DeadCodeType counters, so the "most-caught
-// pattern" tile reads in plain language instead of a raw enum key.
-const VECTOR_LABELS: Record<keyof ReaperByType, string> = {
-  inscription_envelope: "Inscription envelopes",
-  drop_stuffing: "Drop stuffing",
-  unreachable_code: "Unreachable code",
-  fake_pubkey: "Fake pubkeys",
-  fake_pubkey_curve_point: "Fake-pubkey curve points",
-  annex_present: "Annex bloat",
-  oversized_op_return: "Oversized OP_RETURN",
-  dust_flood: "Dust-flood spam",
-  excess_witness_data: "Excess witness data",
-  excess_stack_items: "Excess stack items",
-  legacy_scriptsig_data: "Legacy scriptSig data",
-};
+// ─── Reaper strip — spam stripped from the block this node is building now ───
 
 function formatRelative(unixSecs: number | null): string {
   if (!unixSecs) return "never";
@@ -401,191 +381,130 @@ function formatRelative(unixSecs: number | null): string {
   return `${Math.floor(secs / 86400)}d ago`;
 }
 
-// Largest single detection vector across the cumulative counters. The reaper
-// increments one counter per matched pattern and a tx can match several, so we
-// surface the single most-frequent vector as "what your reaper catches most".
-function topVector(byType: ReaperByType): { label: string; count: number } | null {
-  let best: { label: string; count: number } | null = null;
-  for (const [key, count] of Object.entries(byType) as [keyof ReaperByType, number][]) {
-    if (count > 0 && (!best || count > best.count)) {
-      best = { label: VECTOR_LABELS[key], count };
-    }
-  }
-  return best;
-}
-
 /**
- * "Reaper impact" — leads with the pool block-template reaper's real, countable
- * win (cumulative txs reaped + dead weight stripped from this node's blocks,
- * straight from `/api/v1/reaper/status`), then turns the abusive share still
- * sitting in the live mempool into an actionable policy-scope prompt rather than
- * an alarming "the reaper failed" number.
- *
- * The two reapers this distinguishes:
- *  - ghostd MEMPOOL reaper (admission-time reject vectors) keeps spam out of the
- *    mempool, but ghostd exposes NO reject counters, so its work isn't counted here.
- *  - pool TEMPLATE-BUILDER reaper (the +2 capability) strips spam from each block
- *    it assembles and DOES count — that's what these cumulative tiles report.
+ * Slim reaper highlight. Renders ONLY when the pool template-builder reaper is
+ * enabled, and reports ONLY the block this node is currently building — the most
+ * recent template snapshot (`last_block_*`), not cumulative history. Lifetime
+ * totals, per-vector counters and the most-caught pattern all live on the Reaper
+ * page, so this stays a single at-a-glance line for the majority of operators
+ * (reaper is opt-in) rather than a page-dominating panel.
  */
-function ReaperImpact({
-  mempool,
+function ReaperStrip({
   reaperStats,
   reaperEnabled,
 }: {
-  mempool?: BudsMempool;
   reaperStats?: ReaperStats | null;
   reaperEnabled: boolean;
 }) {
-  // Live mempool tier mix (sampled). We read composition by COUNT here, which is
-  // the honest, un-extrapolated figure — the same sample the composition panel
-  // below draws — rather than extrapolating sample bytes across the whole
-  // mempool (which previously overstated the "dead weight" share).
-  const byTier = mempool?.by_tier ?? { T0: 0, T1: 0, T2: 0, T3: 0 };
-  const sampled =
-    mempool?.sample_size ?? byTier.T0 + byTier.T1 + byTier.T2 + byTier.T3;
-  const cleanShare = sampled ? (byTier.T0 + byTier.T1) / sampled : 0;
-  const abusiveShare = sampled ? byTier.T3 / sampled : 0;
+  if (!reaperEnabled) return null;
 
-  const top = reaperStats ? topVector(reaperStats.by_type) : null;
+  const hasBlock = !!reaperStats && reaperStats.last_block_unix != null;
+  const reaped = hasBlock ? reaperStats!.last_block_reaped : 0;
+  const deadBytes = hasBlock ? reaperStats!.last_block_dead_bytes : 0;
 
   return (
-    <Card>
-      <CardHeader
-        title="Reaper impact"
-        subtitle="What your pool's block-template reaper has kept out of the blocks this node builds — cumulative, counted, not sampled."
-      />
-      <div className="space-y-5">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard
-            label="Kept out of your blocks"
-            value={reaperStats ? reaperStats.txs_reaped.toLocaleString() : "—"}
-            sublabel={
-              reaperStats
-                ? `spam txs stripped · last ${formatRelative(reaperStats.last_reaped_unix)}`
-                : "no counters yet"
-            }
-            tooltip="Cumulative transactions the pool template-builder reaper removed from the blocks this node assembled, since the last ghost-pool restart (/api/v1/reaper/status → txs_reaped)."
-          />
-          <StatCard
-            label="Dead weight stripped"
-            value={reaperStats ? formatBytes(reaperStats.dead_bytes_total) : "—"}
-            sublabel="block space returned to fee-paying txs"
-            tooltip="Cumulative virtual bytes of dead weight the reaper stripped from your block templates (/api/v1/reaper/status → dead_bytes_total). That space is reclaimed for real, fee-paying transactions."
-          />
-          <StatCard
-            label="Reaped this block"
-            value={
-              reaperStats && reaperStats.last_block_unix != null
-                ? reaperStats.last_block_reaped.toLocaleString()
-                : "—"
-            }
-            sublabel={
-              reaperStats && reaperStats.last_block_unix != null
-                ? `${formatBytes(reaperStats.last_block_dead_bytes)} dead weight · ${formatRelative(reaperStats.last_block_unix)}`
-                : "no block built yet"
-            }
-            tooltip="Transactions the template-builder reaper stripped from the most-recently-built block template (/api/v1/reaper/status → last_block_reaped). A per-block snapshot, not cumulative."
-          />
-          <StatCard
-            label="Most-caught pattern"
-            value={top ? top.label : "—"}
-            sublabel={top ? `${top.count.toLocaleString()} flagged` : "no counters yet"}
-            tooltip="The single most-frequent dead-code pattern across the reaper's cumulative counters (/api/v1/reaper/status → by_type). A transaction can match more than one vector."
-          />
-        </div>
-
-        <div
-          style={{
-            padding: "10px 12px",
-            background: reaperEnabled ? "var(--accent-weak)" : "var(--surface)",
-            border: `1px solid ${reaperEnabled ? "var(--accent)" : "var(--rule)"}`,
-            borderRadius: "4px",
-            fontSize: "13px",
-            color: reaperEnabled ? "var(--fg)" : "var(--dim)",
-          }}
-        >
-          {reaperEnabled ? (
-            <>
-              Reaper is <strong style={{ color: "var(--accent)" }}>enabled</strong> — every block this
-              node builds is stripped of dead weight before it&apos;s mined, so the totals above keep
-              climbing. Full per-vector detail is on the{" "}
-              <a href="/reaper" className="bare" style={{ color: "var(--accent)", textDecoration: "underline" }}>
-                Reaper page
-              </a>
-              .
-            </>
-          ) : (
-            <>
-              Reaper is <strong style={{ color: "var(--fg)" }}>disabled</strong> — this node currently
-              builds blocks without stripping dead weight. Turn it on from the{" "}
-              <a href="/reaper" className="bare" style={{ color: "var(--fg)", textDecoration: "underline" }}>
-                Reaper page
-              </a>{" "}
-              to start protecting your blocks.
-            </>
-          )}
-        </div>
-
-        {/* Reassuring + honest read of the current mempool, and — crucially — the
-            actionable reframing of "abusive txs are STILL here". They are not a
-            reaper failure: the pool reaper strips its reject vectors from BLOCKS,
-            while BUDS "T3 abusive" is a broader taxonomy (large witnesses,
-            OP_RETURN ≤82 bytes) that the current reject RULES deliberately admit.
-            So T3-still-present = "carries patterns your rules don't yet cover" —
-            a policy-scope knob the operator can tighten, not a bug. */}
-        <div
-          style={{
-            padding: "12px 14px",
-            background: "var(--bg)",
-            border: "1px solid var(--rule)",
-            borderRadius: "4px",
-          }}
-        >
-          <div style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
-            In your mempool right now, most of what your node holds is clean money:{" "}
-            <strong style={{ color: "#3fb950" }}>~{Math.round(cleanShare * 100)}%</strong> of sampled
-            transactions are ordinary payments (T0 + T1).
-          </div>
-          {byTier.T3 > 0 && (
-            <div style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginTop: "8px" }}>
-              About <strong style={{ color: "var(--fg)" }}>~{Math.round(abusiveShare * 100)}%</strong>{" "}
-              still carry abusive patterns (T3). That is not a reaper miss — these use large witnesses or
-              small OP_RETURN payloads that your current reject rules admit into the mempool. To keep them
-              out of the blocks you build too, tighten your reject vectors on the{" "}
-              <a href="/reaper" className="bare" style={{ color: "var(--fg)", textDecoration: "underline" }}>
-                Reaper page
-              </a>
-              .
-            </div>
-          )}
-        </div>
-
-        <p style={{ color: "var(--fainter)", fontSize: "12px" }}>
-          The tiles above are exact cumulative counts from the pool&apos;s block-template reaper
-          (<code>/api/v1/reaper/status</code>), reset only when ghost-pool restarts. The mempool mix is
-          read from a live sample of {sampled.toLocaleString()} transactions, so its percentages are
-          representative, not exact totals. Note the ghostd <em>mempool</em> reaper (admission-time) keeps
-          extra spam out before it ever reaches this view, but ghostd exposes no reject counters, so that
-          share isn&apos;t counted here.
-        </p>
-      </div>
-    </Card>
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: "12px",
+        flexWrap: "wrap",
+        padding: "10px 14px",
+        background: "var(--accent-weak)",
+        border: "1px solid var(--accent)",
+        borderRadius: "4px",
+        fontSize: "13px",
+        color: "var(--fg)",
+      }}
+    >
+      <span>
+        {!hasBlock ? (
+          <>
+            Reaper is <strong style={{ color: "var(--accent)" }}>enabled</strong> — no block template
+            built yet.
+          </>
+        ) : reaped > 0 ? (
+          <>
+            Reaper stripped{" "}
+            <strong style={{ color: "var(--accent)" }}>{reaped.toLocaleString()}</strong> spam{" "}
+            {reaped === 1 ? "tx" : "txs"} (<strong>{formatBytes(deadBytes)}</strong> dead weight) from the
+            block this node is currently building.
+          </>
+        ) : (
+          <>
+            The block this node is currently building is{" "}
+            <strong style={{ color: "var(--accent)" }}>clean</strong> — Reaper found no spam to strip.
+          </>
+        )}
+        {hasBlock && (
+          <span style={{ color: "var(--dim)" }}>
+            {" "}
+            · template updated {formatRelative(reaperStats!.last_block_unix)}
+          </span>
+        )}
+      </span>
+      <a
+        href="/reaper"
+        className="bare"
+        style={{ color: "var(--accent)", textDecoration: "underline", whiteSpace: "nowrap" }}
+      >
+        Reaper page →
+      </a>
+    </div>
   );
 }
 
 // ─── mempool composition by BUDS class ──────────────────────────────────────
 
-function Composition({ mempool }: { mempool?: BudsMempool }) {
+function Composition({
+  mempool,
+  reaperEnabled,
+}: {
+  mempool?: BudsMempool;
+  reaperEnabled: boolean;
+}) {
   const byTier = mempool?.by_tier ?? { T0: 0, T1: 0, T2: 0, T3: 0 };
   const sampled = mempool?.sample_size ?? TIERS.reduce((s, t) => s + (byTier[t.key] ?? 0), 0);
+  const cleanShare = sampled ? (byTier.T0 + byTier.T1) / sampled : 0;
+  const abusiveShare = sampled ? byTier.T3 / sampled : 0;
 
   return (
     <Card>
       <CardHeader
         title="Mempool composition"
-        subtitle="The per-tier breakdown behind the reaper impact above — every BUDS class your node is holding right now, by share of transactions."
+        subtitle="Every BUDS class your node is holding right now, by share of sampled transactions."
       />
       <div className="space-y-3">
+        {/* Plain-language read of the mix. Describes what the node is holding —
+            reaper-agnostic — and only appends the reject-vector prompt when the
+            operator actually runs the reaper. */}
+        <div style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
+          Most of what your node holds right now is clean payments:{" "}
+          <strong style={{ color: "#3fb950" }}>~{Math.round(cleanShare * 100)}%</strong> of sampled
+          transactions are ordinary payments (T0 + T1).
+          {byTier.T3 > 0 && (
+            <>
+              {" "}
+              About <strong style={{ color: "var(--fg)" }}>~{Math.round(abusiveShare * 100)}%</strong>{" "}
+              carry abusive patterns (T3) — large witnesses or small OP_RETURN payloads.
+              {reaperEnabled && (
+                <>
+                  {" "}
+                  Tighten your reject vectors on the{" "}
+                  <a
+                    href="/reaper"
+                    className="bare"
+                    style={{ color: "var(--fg)", textDecoration: "underline" }}
+                  >
+                    Reaper page
+                  </a>{" "}
+                  to keep them out of the blocks you build.
+                </>
+              )}
+            </>
+          )}
+        </div>
         <div style={{ display: "flex", height: "14px", borderRadius: "4px", overflow: "hidden", background: "var(--bg)" }}>
           {TIERS.map((t) => {
             const count = byTier[t.key] ?? 0;
