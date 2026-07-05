@@ -603,7 +603,7 @@ export default function SwarmPage() {
                   <Badge variant={node.public_mining ? "success" : "error"}>Public Mining +3</Badge>
                   <Badge variant={node.reaper ? "success" : "error"}>Reaper +2</Badge>
                   <Badge variant={node.elder ? "success" : "error"}>
-                    Elder {node.elder ? `#${node.elder_slot}` : ""} +1
+                    Elder{node.elder && node.elder_slot != null ? ` #${node.elder_slot}` : ""} +1
                   </Badge>
                 </div>
 
