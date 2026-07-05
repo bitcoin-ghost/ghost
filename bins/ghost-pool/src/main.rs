@@ -2548,12 +2548,20 @@ async fn main() -> Result<()> {
     info!(tag = %coinbase_tag, "Coinbase tag: {}", coinbase_tag);
 
     // Initialize template processor with treasury and pool payout addresses from config
+    // Per-field policy enforcement (max outputs / size / OP_RETURN / witness /
+    // content) is the "Advanced" Custom profile only. The three "Basic" presets
+    // stay tier-gate-only, so their baked-in field limits are NOT enforced at
+    // block-build time — preserving the historical preset behaviour.
+    let enforce_custom_policy_fields =
+        matches!(config.policy.profile, ghost_common::config::PolicyProfile::Custom);
+
     // The template's minimum fee-rate floor. Presets keep the historical
     // TemplateConfig default (unchanged behaviour); the Custom profile lets the
     // operator set their own floor via `[policy].custom.min_fee_rate`.
-    let template_min_fee_rate = match config.policy.profile {
-        ghost_common::config::PolicyProfile::Custom => policy.min_fee_rate,
-        _ => TemplateConfig::default().min_fee_rate,
+    let template_min_fee_rate = if enforce_custom_policy_fields {
+        policy.min_fee_rate
+    } else {
+        TemplateConfig::default().min_fee_rate
     };
 
     // Pool payout address defaults to treasury address if not explicitly configured separately
@@ -2565,6 +2573,7 @@ async fn main() -> Result<()> {
         solo_payout_address: config.network.solo_payout_address.clone(),
         coinbase_extra: coinbase_tag,
         min_fee_rate: template_min_fee_rate,
+        enforce_custom_policy_fields,
         ..Default::default()
     };
     let template_processor = Arc::new(

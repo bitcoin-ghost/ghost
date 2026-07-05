@@ -137,6 +137,15 @@ pub struct TemplateConfig {
     /// Solo payout address (required for PrivateSolo mode)
     /// All rewards (99% subsidy + 100% tx fees) go to this address
     pub solo_payout_address: Option<String>,
+    /// Whether to enforce the finer per-field policy knobs during tx selection.
+    ///
+    /// This is `true` ONLY for the operator-defined `Custom` profile. The three
+    /// built-in presets (strict/permissive/full_open) intentionally stay
+    /// tier-gate-only ("Basic" tier choice): their baked-in
+    /// `max_tx_outputs`/`max_tx_size`/`max_op_return_size`/witness/content
+    /// fields are NOT enforced at block-build time, preserving the historical
+    /// preset behaviour. Custom is the "Advanced" opt-in that turns them on.
+    pub enforce_custom_policy_fields: bool,
 }
 
 impl Default for TemplateConfig {
@@ -151,6 +160,7 @@ impl Default for TemplateConfig {
             network: BitcoinNetwork::Mainnet,
             mining_mode: MiningMode::PublicPool,
             solo_payout_address: None,
+            enforce_custom_policy_fields: false,
         }
     }
 }
@@ -1950,20 +1960,24 @@ impl TemplateProcessor {
 
             // Check if tier is allowed by policy
             if self.policy.allows_tier(tier) {
-                // Full per-field policy enforcement. The tier gate above only
-                // checks the coarse BUDS class; this runs the finer profile
-                // knobs (allow_inscriptions/runes/brc20, max_op_return_size,
-                // max_witness_per_input, max_tx_outputs, max_tx_size) that
-                // ghost_policy::PolicyEngine enforces, so non-conforming txs are
-                // actually dropped from the block rather than silently mined.
-                if let Some(reason) = policy_field_violation(&self.policy, &btc_tx, &result) {
-                    removed_fees += tx.fee;
-                    debug!(
-                        txid = %tx.txid,
-                        reason = %reason,
-                        "Transaction filtered by policy field"
-                    );
-                    continue;
+                // Full per-field policy enforcement — Custom profile ONLY. The
+                // tier gate above is the whole story for the three "Basic"
+                // presets (strict/permissive/full_open), which stay
+                // tier-gate-only exactly as before. When the operator selects
+                // the "Advanced" Custom profile, `enforce_custom_policy_fields`
+                // is set and the finer knobs (allow_inscriptions/runes/brc20,
+                // max_op_return_size, max_witness_per_input, max_tx_outputs,
+                // max_tx_size) additionally drop non-conforming txs.
+                if self.config.enforce_custom_policy_fields {
+                    if let Some(reason) = policy_field_violation(&self.policy, &btc_tx, &result) {
+                        removed_fees += tx.fee;
+                        debug!(
+                            txid = %tx.txid,
+                            reason = %reason,
+                            "Transaction filtered by custom policy field"
+                        );
+                        continue;
+                    }
                 }
 
                 // Additional policy checks
@@ -4363,10 +4377,15 @@ mod tests {
         }
     }
 
+    /// Processor on the Custom path: per-field enforcement ON, reaper OFF, so
+    /// only the policy fields can drop a tx.
     fn make_processor(policy: PolicyProfile) -> TemplateProcessor {
         let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-        // Reaper disabled → only the policy fields can drop a tx.
-        TemplateProcessor::new(TemplateConfig::default(), rpc, policy, ReaperConfig::disabled())
+        let config = TemplateConfig {
+            enforce_custom_policy_fields: true,
+            ..Default::default()
+        };
+        TemplateProcessor::new(config, rpc, policy, ReaperConfig::disabled())
     }
 
     #[test]
@@ -4571,6 +4590,43 @@ mod tests {
         let loose = PolicyProfile::full_open(); // already allows inscriptions
         let (kept, _) = make_processor(loose).filter_transactions(&[ttx]);
         assert_eq!(kept.len(), 1, "inscription must be kept when allowed");
+    }
+
+    #[test]
+    fn test_preset_does_not_enforce_custom_fields() {
+        // A preset (permissive) is tier-gate-only: enforce_custom_policy_fields
+        // is OFF (the default), so a tx that is an allowed tier but exceeds the
+        // profile's baked-in max_tx_outputs (100) must STILL be mined — the
+        // finer fields are Custom-only.
+        let tx = template_tx(&tx_with_outputs(0x60, 150));
+
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        // Default config → enforce_custom_policy_fields = false (preset path).
+        let processor = TemplateProcessor::new(
+            TemplateConfig::default(),
+            rpc,
+            PolicyProfile::permissive(),
+            ReaperConfig::disabled(),
+        );
+
+        // Sanity: permissive's field limit is indeed exceeded, so the only reason
+        // it survives is that presets don't enforce that field.
+        assert!(150 > PolicyProfile::permissive().max_tx_outputs);
+
+        let (kept, _) = processor.filter_transactions(&[tx]);
+        assert_eq!(
+            kept.len(),
+            1,
+            "preset must keep an over-limit but allowed-tier tx (tier-gate-only)"
+        );
+
+        // And the Custom path (enforcement ON) with the same profile WOULD drop it.
+        let tx2 = template_tx(&tx_with_outputs(0x61, 150));
+        let (kept2, _) = make_processor(PolicyProfile::permissive()).filter_transactions(&[tx2]);
+        assert!(
+            kept2.is_empty(),
+            "custom path must drop the over-limit tx once enforcement is on"
+        );
     }
 
     /// Test that ghost-reaper detects OP_DROP stuffing in witness scripts
