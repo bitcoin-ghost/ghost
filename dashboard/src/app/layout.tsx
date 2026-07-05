@@ -25,14 +25,13 @@ export const metadata: Metadata = {
 };
 
 // Inline script that runs before paint so there's no flash of wrong theme on
-// load. Order: explicit user choice in localStorage > OS preference > dark.
-// Mirrors the website's theme-toggle pattern.
+// load. Order: explicit user choice in localStorage > dark (default).
+// Dark is the default regardless of OS preference; light mode is opt-in only.
 const themeBootstrap = `
 (function() {
   try {
     var stored = localStorage.getItem('ghost-theme');
-    var theme = stored
-      || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    var theme = stored || 'dark';
     document.documentElement.setAttribute('data-theme', theme);
   } catch (e) {
     document.documentElement.setAttribute('data-theme', 'dark');

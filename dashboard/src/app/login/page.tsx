@@ -1,7 +1,7 @@
 "use client";
 
 import { Suspense, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { Ghost } from "lucide-react";
 
 function LoginForm() {
@@ -9,7 +9,6 @@ function LoginForm() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const router = useRouter();
-  const searchParams = useSearchParams();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -24,8 +23,9 @@ function LoginForm() {
       });
 
       if (res.ok) {
-        const redirect = searchParams.get("redirect") || "/";
-        router.push(redirect);
+        // Always land on Overview after sign-in, regardless of the page the
+        // middleware bounced from — the dashboard opens on the home view.
+        router.push("/");
       } else {
         setError("Invalid password");
       }

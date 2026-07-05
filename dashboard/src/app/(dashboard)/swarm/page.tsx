@@ -369,7 +369,6 @@ export default function SwarmPage() {
           <StatCard
             label="Nodes"
             value={stats?.total_nodes ?? 0}
-            sublabel={`${stats?.online_nodes ?? 0} online`}
             loading={swarmLoading}
           />
           <StatCard
