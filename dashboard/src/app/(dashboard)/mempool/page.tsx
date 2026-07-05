@@ -339,9 +339,12 @@ function LiveStats({
   reaperStats?: ReaperStats | null;
   reaperEnabled: boolean;
 }) {
+  // maxmempool caps memory USAGE, not the summed vsize (`bytes`), so the "how
+  // full" ratio must be usage/maxmempool — matching mempool.space's Memory
+  // Usage / 300 MB. Dividing bytes by maxmempool understated it ~4x.
   const fillPct =
-    mempool?.bytes && mempool?.max_mempool
-      ? formatPercent(mempool.bytes, mempool.max_mempool)
+    mempool?.usage && mempool?.max_mempool
+      ? formatPercent(mempool.usage, mempool.max_mempool)
       : "—";
   const minFee = btcPerKvbToSatVb(mempool?.min_fee);
 
@@ -379,14 +382,14 @@ function LiveStats({
       <StatCard
         label="Mempool size"
         value={formatBytes(mempool?.bytes)}
-        sublabel={`${fillPct} of ${formatBytes(mempool?.max_mempool)} cap`}
-        tooltip="Total virtual size of all mempool transactions vs your configured maxmempool."
+        sublabel="total virtual size"
+        tooltip="getmempoolinfo.bytes — the summed virtual size (vB) of every transaction in your mempool."
       />
       <StatCard
         label="Memory used"
         value={formatBytes(mempool?.usage)}
-        sublabel="RAM footprint"
-        tooltip="getmempoolinfo.usage — estimated memory the mempool occupies."
+        sublabel={`${fillPct} of ${formatBytes(mempool?.max_mempool)} cap`}
+        tooltip="getmempoolinfo.usage vs maxmempool — how full your mempool is by memory, the limit ghostd actually enforces (matches mempool.space's Memory Usage)."
       />
       <StatCard
         label="Min relay fee"
