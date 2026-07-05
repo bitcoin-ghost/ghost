@@ -45,3 +45,6 @@ export * from './useHazeQueries';
 
 // Shroud queries
 export * from './useShroudQueries';
+
+// Reaper queries
+export * from './useReaperQueries';

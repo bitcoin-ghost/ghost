@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { StatCard } from "@/components/ui/StatCard";
@@ -11,43 +10,8 @@ import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { useToast } from "@/components/ui/Toast";
 import { useConfig, useReaperConfig, useSetReaper } from "@/hooks/queries/useConfigQueries";
+import { useReaperStatus } from "@/hooks/queries";
 import { type ReaperSettings } from "@/lib/api/config";
-import { fetchApi } from "@/lib/api/client";
-
-interface ReaperStats {
-  txs_evaluated: number;
-  txs_reaped: number;
-  txs_accepted: number;
-  dead_bytes_total: number;
-  last_reaped_unix: number | null;
-  by_type: {
-    inscription_envelope: number;
-    drop_stuffing: number;
-    unreachable_code: number;
-    fake_pubkey: number;
-    fake_pubkey_curve_point: number;
-    annex_present: number;
-    oversized_op_return: number;
-    dust_flood: number;
-    excess_witness_data: number;
-    excess_stack_items: number;
-    legacy_scriptsig_data: number;
-  };
-}
-
-async function fetchReaperStats(): Promise<ReaperStats | null> {
-  try {
-    // Route through the proxy (fetchApi) so the HMAC-signed internal request
-    // reaches ghost-pool; a bare fetch hits the Next server and always 404s.
-    const data = await fetchApi<unknown>("/api/v1/reaper/status");
-    // Endpoint returns null when ghost-pool hasn't wired the callback yet.
-    return data && typeof data === "object" && "txs_evaluated" in data
-      ? (data as ReaperStats)
-      : null;
-  } catch {
-    return null;
-  }
-}
 
 const DETECTION_VECTORS = [
   {
@@ -443,11 +407,7 @@ function ReaperControls() {
 
 export default function ReaperPage() {
   const { data: config } = useConfig();
-  const { data: stats } = useQuery<ReaperStats | null>({
-    queryKey: ["reaper-status"],
-    queryFn: fetchReaperStats,
-    refetchInterval: 10_000,
-  });
+  const { data: stats } = useReaperStatus();
 
   const enabled = config?.reaper ?? false;
   const reapRate = stats ? formatPercent(stats.txs_reaped, stats.txs_evaluated) : "—";
