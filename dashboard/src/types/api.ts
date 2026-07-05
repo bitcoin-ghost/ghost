@@ -85,6 +85,11 @@ export interface FullNodeConfig {
     vardiff_enabled: boolean;
   };
   pruning?: PruningConfig;
+  // The real tier policy from pool.toml [policy]. `profile` is the lever that
+  // decides which BUDS tiers get mined (strict / permissive / full_open).
+  policy?: {
+    profile?: string;
+  };
   payout?: {
     address: string | null;
     ghostpay_address: string | null;

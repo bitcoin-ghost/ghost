@@ -157,6 +157,24 @@ export async function setTemplateProfile(profile: TemplateProfile): Promise<Node
   });
 }
 
+// The REAL tier policy (pool.toml [policy].profile). Unlike mempool/template
+// profile, this actually governs which BUDS tiers get mined. Writing it persists
+// to pool.toml and triggers a graceful restart to apply.
+export type PolicyProfileType = 'strict' | 'permissive' | 'full_open';
+
+export interface PolicyProfileResult {
+  success: boolean;
+  profile: PolicyProfileType;
+  restart_pending: boolean;
+}
+
+export async function setPolicyProfile(profile: PolicyProfileType): Promise<PolicyProfileResult> {
+  return fetchApi<PolicyProfileResult>('/api/v1/config/policy_profile', {
+    method: 'POST',
+    body: JSON.stringify({ profile }),
+  });
+}
+
 // Custom profiles (new)
 // Mempool Policy Profile - Bitcoin Core options + Ghost extensions + BUDS tiers
 export interface CustomMempoolProfile {
