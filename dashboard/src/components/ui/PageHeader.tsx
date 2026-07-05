@@ -6,6 +6,8 @@ interface PageHeaderProps {
   eyebrow?: string;
   title: string;
   subtitle?: string;
+  /** Let the subtitle span the full container width instead of the 60ch reading measure. */
+  subtitleFullWidth?: boolean;
   actions?: ReactNode;
   className?: string;
 }
@@ -15,7 +17,7 @@ interface PageHeaderProps {
  * rhythm: an orange uppercase mono "eyebrow" line above a large light-weight
  * title. Subtitle stays as supporting prose.
  */
-export function PageHeader({ eyebrow, title, subtitle, actions, className = '' }: PageHeaderProps) {
+export function PageHeader({ eyebrow, title, subtitle, subtitleFullWidth = false, actions, className = '' }: PageHeaderProps) {
   return (
     <div className={`flex items-start justify-between gap-4 mb-8 ${className}`}>
       <div className="flex-1 min-w-0">
@@ -45,7 +47,7 @@ export function PageHeader({ eyebrow, title, subtitle, actions, className = '' }
         {subtitle && (
           <p
             className="mt-2"
-            style={{ color: 'var(--dim)', fontSize: '15px', maxWidth: '60ch' }}
+            style={{ color: 'var(--dim)', fontSize: '15px', maxWidth: subtitleFullWidth ? 'none' : '60ch' }}
           >
             {subtitle}
           </p>
