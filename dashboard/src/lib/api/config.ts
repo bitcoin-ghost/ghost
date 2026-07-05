@@ -175,6 +175,59 @@ export async function setPolicyProfile(profile: PolicyProfileType): Promise<Poli
   });
 }
 
+// The full custom tier policy (pool.toml [policy].custom). Writing it sets
+// [policy].profile = custom, persists every field, and triggers a graceful
+// restart to apply. This is the advanced counterpart to the three presets: it
+// exposes every per-field knob the block builder now enforces.
+export interface PolicyCustomConfig {
+  // Per-tier inclusion (T0 financial .. T3 heavy data).
+  allow_t0: boolean;
+  allow_t1: boolean;
+  allow_t2: boolean;
+  allow_t3: boolean;
+  // Content-type toggles.
+  allow_inscriptions: boolean;
+  allow_runes: boolean;
+  allow_brc20: boolean;
+  // Size limits.
+  max_op_return_size: number;   // bytes; 0 = no OP_RETURN allowed
+  max_witness_per_input: number; // bytes per input
+  max_tx_outputs: number;        // outputs per tx
+  max_tx_size: number;           // vbytes per tx
+  // Fee floor.
+  min_fee_rate: number;          // sat/vB; 0 = no minimum
+}
+
+export interface PolicyCustomResult {
+  success: boolean;
+  profile: 'custom';
+  restart_pending: boolean;
+}
+
+// Sensible starting values for a fresh custom policy (mirrors the backend
+// CustomPolicyConfig defaults: T0+T1+T2, no data, small-OP_RETURN limits).
+export const POLICY_CUSTOM_DEFAULTS: PolicyCustomConfig = {
+  allow_t0: true,
+  allow_t1: true,
+  allow_t2: true,
+  allow_t3: false,
+  allow_inscriptions: false,
+  allow_runes: false,
+  allow_brc20: false,
+  max_op_return_size: 80,
+  max_witness_per_input: 400,
+  max_tx_outputs: 100,
+  max_tx_size: 100_000,
+  min_fee_rate: 1.0,
+};
+
+export async function setPolicyCustom(config: PolicyCustomConfig): Promise<PolicyCustomResult> {
+  return fetchApi<PolicyCustomResult>('/api/v1/config/policy_custom', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
 // Custom profiles (new)
 // Mempool Policy Profile - Bitcoin Core options + Ghost extensions + BUDS tiers
 export interface CustomMempoolProfile {
