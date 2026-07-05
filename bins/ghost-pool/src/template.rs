@@ -1886,6 +1886,7 @@ impl TemplateProcessor {
         let mut kept = Vec::with_capacity(original_count);
         let mut removed_fees = 0u64;
         let mut reaped_count = 0usize;
+        let mut reaped_dead_bytes = 0u64;
 
         // Track seen TXIDs to detect duplicates
         let mut seen_txids: HashSet<String> = HashSet::with_capacity(transactions.len());
@@ -1932,6 +1933,7 @@ impl TemplateProcessor {
                 if reaper_verdict.is_corpse() {
                     removed_fees += tx.fee;
                     reaped_count += 1;
+                    reaped_dead_bytes += reaper_verdict.total_dead_bytes as u64;
                     debug!(
                         txid = %tx.txid,
                         dead_bytes = reaper_verdict.total_dead_bytes,
@@ -1992,7 +1994,15 @@ impl TemplateProcessor {
             removed: original_count - kept.len(),
             removed_fees,
             reaped: reaped_count,
+            reaped_dead_bytes,
         };
+
+        // Snapshot this template's Reaper impact for the "Reaped this block"
+        // dashboard tile. Runs on EVERY build (even zero-reap ones) so the
+        // stamped timestamp lets the API distinguish "0 reaped" from "no
+        // block yet". Separate from the cumulative `record` calls above.
+        self.reaper_stats
+            .record_block(stats.reaped as u64, stats.reaped_dead_bytes);
 
         (kept, stats)
     }
@@ -3149,6 +3159,8 @@ struct FilterStats {
     removed: usize,
     removed_fees: u64,
     reaped: usize,
+    /// Dead bytes carried by the reaped transactions in this template.
+    reaped_dead_bytes: u64,
 }
 
 #[cfg(test)]
