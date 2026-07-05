@@ -180,6 +180,7 @@ export default function EldersPage() {
         eyebrow="elders & mpc"
         title="Quorum members and ceremony."
         subtitle="MPC ceremony status, elder registry, and zero-knowledge proof parameters"
+        subtitleFullWidth
         actions={
           isElder && elderSlot != null ? (
             <Badge variant="success">Elder #{elderSlot}</Badge>
