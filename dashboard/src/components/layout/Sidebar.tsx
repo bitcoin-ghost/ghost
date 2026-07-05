@@ -13,8 +13,9 @@ import {
   Shield,
   Eye,
   Cloud,
-  EyeOff,
   Skull,
+  Filter,
+  Layers,
   Globe,
   HeartPulse,
   ScrollText,
@@ -65,6 +66,14 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
+    label: "filtering",
+    items: [
+      { href: "/filtering", label: "Overview", icon: <Filter {...ICON} /> },
+      { href: "/filtering/buds", label: "BUDS", icon: <Layers {...ICON} /> },
+      { href: "/reaper", label: "Reaper", icon: <Skull {...ICON} /> },
+    ],
+  },
+  {
     label: "ghost pool",
     items: [
       { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
@@ -92,7 +101,6 @@ const GROUPS: NavGroup[] = [
       { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
       { href: "/shroud", label: "Shroud", icon: <Eye {...ICON} /> },
       { href: "/haze", label: "Haze", icon: <Cloud {...ICON} /> },
-      { href: "/reaper", label: "Reaper", icon: <Skull {...ICON} /> },
     ],
   },
   {
