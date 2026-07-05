@@ -433,8 +433,8 @@ function ReaperStrip({
           </>
         ) : (
           <>
-            The block this node is currently building is{" "}
-            <strong style={{ color: "var(--accent)" }}>clean</strong> — Reaper found no spam to strip.
+            Reaper found <strong style={{ color: "var(--accent)" }}>no dead weight</strong> to strip from
+            the block this node is currently building — nothing in it matched your active reject vectors.
           </>
         )}
         {hasBlock && (
@@ -487,11 +487,12 @@ function Composition({
             <>
               {" "}
               About <strong style={{ color: "var(--fg)" }}>~{Math.round(abusiveShare * 100)}%</strong>{" "}
-              carry abusive patterns (T3) — large witnesses or small OP_RETURN payloads.
+              carry abusive patterns (T3) — runes, inscriptions and stuffing that your current reject
+              rules still admit, which is why the reaper leaves them alone.
               {reaperEnabled && (
                 <>
                   {" "}
-                  Tighten your reject vectors on the{" "}
+                  Widen your reject vectors on the{" "}
                   <a
                     href="/reaper"
                     className="bare"
@@ -499,7 +500,7 @@ function Composition({
                   >
                     Reaper page
                   </a>{" "}
-                  to keep them out of the blocks you build.
+                  to start stripping them from the blocks you build.
                 </>
               )}
             </>
