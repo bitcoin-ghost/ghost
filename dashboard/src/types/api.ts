@@ -86,9 +86,24 @@ export interface FullNodeConfig {
   };
   pruning?: PruningConfig;
   // The real tier policy from pool.toml [policy]. `profile` is the lever that
-  // decides which BUDS tiers get mined (strict / permissive / full_open).
+  // decides which BUDS tiers get mined (strict / permissive / full_open / custom).
+  // `custom` carries the resolved per-field values for the advanced panel.
   policy?: {
     profile?: string;
+    custom?: {
+      allow_t0: boolean;
+      allow_t1: boolean;
+      allow_t2: boolean;
+      allow_t3: boolean;
+      allow_inscriptions: boolean;
+      allow_runes: boolean;
+      allow_brc20: boolean;
+      max_op_return_size: number;
+      max_witness_per_input: number;
+      max_tx_outputs: number;
+      max_tx_size: number;
+      min_fee_rate: number;
+    };
   };
   payout?: {
     address: string | null;
