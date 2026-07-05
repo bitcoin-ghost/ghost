@@ -3347,6 +3347,13 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         self_caps.elder_status,
     );
 
+    // The per-peer uptime %, peer count and L1/L2 heights are not gossiped, so
+    // they render as "—" for mesh peers — but THIS node knows its own locally,
+    // so populate them here. (uptime_percent is the trailing-7-day qualification
+    // metric and isn't available on the health snapshot; left unset for now.)
+    let self_l2_height =
+        check_ghostpay_local(&state).and_then(|gp| (gp.sync_state != "disabled").then_some(gp.virtual_block));
+
     let self_node = serde_json::json!({
         "node_id": health.node_id.clone(),
         "name": self_name.clone(),
@@ -3365,6 +3372,10 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         "public_mining": self_caps.public_mining,
         "reaper": self_caps.reaper,
         "elder": self_caps.elder_status,
+        // Locally-known stats the mesh doesn't gossip (fixes the self row's "—").
+        "peer_count": health.peer_count,
+        "l1_height": health.block_height,
+        "l2_height": self_l2_height,
     });
 
     let mut nodes = vec![self_node];
