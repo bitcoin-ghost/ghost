@@ -526,6 +526,20 @@ fi
 if [[ "$GHOST_PAY" == "true" ]]; then
   install -m755 -o root -g root "$(find . -name ghost-pay -type f | head -1)" /opt/ghost/bin/ghost-pay
 fi
+# The miner-facing SV2 stratum stack ships in the SAME signed tarball. Without
+# these two binaries a node has ghost-pool's Template Distribution Protocol
+# running but nothing for miners to connect to, so it can join the mesh yet never
+# serve a single hasher. translator_sv2 accepts Stratum V1 miners (e.g. BitAxe)
+# and translates to SV2; pool_sv2 is the SV2 pool that bridges those miners to
+# ghost-pool's TDP. Both are ALWAYS installed (a v1 node download must be a
+# complete, miner-ready node); whether the ports are exposed is decided later by
+# the mining-mode firewall reconcile.
+translator_bin="$(find . -name translator_sv2 -type f | head -1)"
+[[ -n "$translator_bin" ]] || err "translator_sv2 was not found in ${POOL_TARBALL}. This installer requires a release that bundles the SV2 stratum stack (translator_sv2 + pool_sv2). Upgrade GHOST_VERSION."
+install -m755 -o root -g root "$translator_bin" /opt/ghost/bin/translator_sv2
+pool_sv2_bin="$(find . -name pool_sv2 -type f | head -1)"
+[[ -n "$pool_sv2_bin" ]] || err "pool_sv2 was not found in ${POOL_TARBALL}. This installer requires a release that bundles the SV2 stratum stack (translator_sv2 + pool_sv2). Upgrade GHOST_VERSION."
+install -m755 -o root -g root "$pool_sv2_bin" /opt/ghost/bin/pool_sv2
 # ghostd ships in the SAME signed tarball we just GPG- + checksum-verified, so it
 # is installed straight from the extracted tree exactly like ghost-pool — its
 # integrity is covered by the release signature, with no separate download or
@@ -768,6 +782,169 @@ log "Generating node identity"
 sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" \
   /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --generate-identity 2>&1 | grep -iE "Node ID" || true
 
+# ───────────────────── 7b. SV2 stratum stack config ──────────────────────────
+# Generate the miner-facing SV2 config the same way ghost-pool's pool.toml is
+# generated above: everything per-node is derived on THIS machine, and no
+# identity or secret from any other node is ever baked in.
+#
+# Data path:  BitAxe (SV1) -> translator_sv2 (:3333) -> pool_sv2 (SV2 :34255)
+#             -> ghost-pool TDP (:8442) -> ghostd
+#
+# Two keys tie the stack together, both minted here:
+#   • The SV2 pool AUTHORITY keypair (Noise static identity that pool_sv2 presents
+#     on :34255). It is generated FRESH per node — a public installer must never
+#     ship a shared secret, or anyone could impersonate a node's SV2 endpoint to
+#     its miners. The translator pins the matching public half as its upstream
+#     authority_pubkey.
+#   • ghost-pool's TDP authority PUBLIC key, which pool_sv2 must pin to trust this
+#     node's own template server. ghost-pool derives it from the first 32 bytes of
+#     the node identity key (node.key), so we derive the identical value here from
+#     the same file rather than having to scrape it from ghost-pool's logs (which
+#     only appear once ghost-pool is running, hours later after the sync gate).
+log "Configuring SV2 stratum stack (translator + pool)"
+NODE_KEY_FILE="/home/ghost/.ghost/node.key"
+[[ -s "$NODE_KEY_FILE" ]] || err "Node identity key ${NODE_KEY_FILE} was not generated — cannot configure the SV2 pool."
+
+# ghost-pool's TDP authority public key, derived from THIS node's node.key exactly
+# as ghost-pool does at runtime (identical base58 secp256k1 encoding).
+TDP_PUBKEY="$(/opt/ghost/bin/pool_sv2 --tdp-pubkey-from-keyfile "$NODE_KEY_FILE" 2>/dev/null)" \
+  || err "Failed to derive the TDP authority public key. The installed pool_sv2 lacks --tdp-pubkey-from-keyfile; use a release that bundles the SV2 keygen support."
+[[ -n "$TDP_PUBKEY" ]] || err "Derived TDP authority public key is empty."
+
+# Fresh per-node SV2 pool authority keypair (base58 secp256k1, the format
+# pool-config.toml expects). Printed as two TOML lines; we split out each half.
+SV2_KEYPAIR="$(/opt/ghost/bin/pool_sv2 --generate-key 2>/dev/null)" \
+  || err "Failed to generate the SV2 pool authority keypair. The installed pool_sv2 lacks --generate-key; use a release that bundles the SV2 keygen support."
+SV2_AUTH_PUB="$(sed -n 's/^authority_public_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEYPAIR")"
+SV2_AUTH_SEC="$(sed -n 's/^authority_secret_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEYPAIR")"
+[[ -n "$SV2_AUTH_PUB" && -n "$SV2_AUTH_SEC" ]] || err "Could not parse the generated SV2 authority keypair."
+
+# translator_sv2 — accepts SV1 miners on :3333 and forwards SV2 to the local pool.
+# user_identity is this node's own payout address (public, not a secret): it is
+# the default miner-username prefix, and each SV1 miner may still authorise as
+# <address>.<worker> to attribute its own shares.
+cat > /etc/ghost/translator-config.toml <<EOF
+# Bitcoin Ghost — SRI Translator (Stratum V1 -> V2). Generated by install-node.sh.
+#
+# BitAxe (SV1) -> translator (:3333) -> pool_sv2 (SV2 :34255) -> ghost-pool (TDP)
+
+# Listen for SV1 miners (standard stratum port)
+downstream_address = "0.0.0.0"
+downstream_port = 3333
+
+# Protocol version
+max_supported_version = 2
+min_supported_version = 2
+
+# Extranonce size for downstream miners (CGminer max 8, min 2)
+downstream_extranonce2_size = 4
+
+# Default miner-username prefix (this node's payout address). Miners may override
+# per connection by authorising as <address>.<worker>.
+user_identity = "${PAYOUT_ADDRESS}"
+
+# Each miner gets its own upstream channel (per-miner share attribution).
+aggregate_channels = false
+
+# Protocol extensions — negotiate the Ghost per-miner TLV extension (0x0002).
+supported_extensions = []
+required_extensions = [0x0002]
+
+# Monitoring endpoint
+monitoring_address = "0.0.0.0:9092"
+
+# Difficulty configuration for SV1 miners
+[downstream_difficulty_config]
+min_individual_miner_hashrate = 500_000_000_000.0
+shares_per_minute = 6.0
+enable_vardiff = true
+idle_timeout_secs = 600
+
+# Keepalive interval for downstream miners (seconds)
+job_keepalive_interval_secs = 60
+
+# Upstream SV2 pool (local pool_sv2). authority_pubkey pins the pool's freshly
+# generated authority key so the two ends of the Noise handshake agree.
+[[upstreams]]
+address = "127.0.0.1"
+port = 34255
+authority_pubkey = "${SV2_AUTH_PUB}"
+
+[load_balancer]
+ghost_pool_url = "127.0.0.1:8080"
+poll_interval_secs = 30
+EOF
+
+# pool_sv2 — SV2 pool bridging miners/translators to ghost-pool's TDP. Holds the
+# secret half of the authority keypair, so this file is 0600 root-only.
+cat > /etc/ghost/pool-config.toml <<EOF
+# Bitcoin Ghost — SRI Pool (SV2). Generated by install-node.sh.
+#
+# ghost-pool (TDP :8442) -> pool_sv2 (SV2 :34255) -> translator (SV1 :3333) -> BitAxe
+
+# Per-node SV2 authority keypair (Ed25519/secp256k1, generated fresh at install).
+authority_public_key = "${SV2_AUTH_PUB}"
+authority_secret_key = "${SV2_AUTH_SEC}"
+cert_validity_sec = 3600
+
+# Listen for SV2 miners/translators.
+listen_address = "0.0.0.0:34255"
+
+# Coinbase reward destination. ghost-pool assembles the real coinbase via TDP
+# (it controls every output), so this mirrors the node payout address.
+coinbase_reward_script = "addr(${PAYOUT_ADDRESS})"
+
+# Pool identification. pool_signature is kept in step with ghost-pool's coinbase
+# tag by update-pool-signature.sh (sri-pool ExecStartPre); this is the fallback
+# until ghost-pool has written its coinbase_tag file.
+server_id = 1
+pool_signature = "- G H O S T -"
+
+# Difficulty settings
+shares_per_minute = 6.0
+share_batch_size = 1
+
+# Protocol extensions — support the Ghost per-miner TLV extension (0x0002).
+supported_extensions = [0x0002]
+required_extensions = []
+
+# Monitoring endpoint (localhost; the translator readiness gate polls it).
+monitoring_address = "127.0.0.1:9090"
+
+# Native share accounting into ghost-pool.
+[share_webhook]
+url = "http://127.0.0.1:8080/api/internal/shares"
+batch_size = 1
+batch_timeout_ms = 2000
+max_retries = 3
+
+# Template provider — this node's own ghost-pool TDP server. public_key is the
+# TDP authority key derived from node.key above.
+[template_provider_type.Sv2Tp]
+address = "127.0.0.1:8442"
+public_key = "${TDP_PUBKEY}"
+EOF
+
+# update-pool-signature.sh keeps pool_signature in sync with ghost-pool's coinbase
+# tag (written by ghost-pool at startup to ~/.ghost/coinbase_tag). Runs as the
+# sri-pool ExecStartPre (root) before each pool_sv2 start.
+cat > /opt/ghost/bin/update-pool-signature.sh <<'EOF'
+#!/bin/bash
+# Sync pool_sv2's pool_signature with ghost-pool's current coinbase tag.
+TAG=$(cat /home/ghost/.ghost/coinbase_tag 2>/dev/null || echo "- G H O S T -")
+sed -i "s/^pool_signature = .*/pool_signature = \"${TAG}\"/" /etc/ghost/pool-config.toml
+EOF
+chmod 755 /opt/ghost/bin/update-pool-signature.sh
+chown root:root /opt/ghost/bin/update-pool-signature.sh
+
+# Permissions: the pool config carries the authority SECRET, so root-only 0600
+# (pool_sv2 + its ExecStartPre run as root). The translator config has no secret
+# (public authority key + public payout address) and is read by the ghost user.
+chown root:root /etc/ghost/pool-config.toml
+chmod 600 /etc/ghost/pool-config.toml
+chown ghost:ghost /etc/ghost/translator-config.toml
+chmod 644 /etc/ghost/translator-config.toml
+
 # ───────────────────────── 8. sync gate (auto) ───────────────────────────────
 # Start ghost-pool only AFTER ghostd finishes its initial sync. An unsynced node
 # participating in checkpoint consensus just spams "wrong proposer" and can't
@@ -913,6 +1090,52 @@ WantedBy=multi-user.target
 EOF
 chmod 600 /etc/systemd/system/ghost-pay.service
 fi
+
+# SV2 stratum stack units. sri-pool bridges ghost-pool's TDP to SV2 miners; the
+# translator fronts it for SV1 miners. sri-pool runs as root (it rewrites its own
+# pool_signature via update-pool-signature.sh before each start); the translator
+# runs as the unprivileged ghost user. Both use Restart=always: at first boot
+# ghost-pool is still behind the sync gate, so the stack simply retries until the
+# TDP server is up, then connects — no manual ordering needed. These are installed
+# in EVERY mining mode so any node can serve miners; the firewall (below) decides
+# whether the ports are reachable from off-box.
+cat > /etc/systemd/system/sri-pool.service <<'EOF'
+[Unit]
+Description=SRI Pool (SV2) - Ghost Network
+After=network.target ghost-pool.service
+Wants=ghost-pool.service
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStartPre=/opt/ghost/bin/update-pool-signature.sh
+ExecStart=/opt/ghost/bin/pool_sv2 --config /etc/ghost/pool-config.toml
+Environment=RUST_LOG=debug
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+cat > /etc/systemd/system/sri-translator.service <<'EOF'
+[Unit]
+Description=SRI Translator (SV1 to SV2) - Ghost Network
+After=network.target sri-pool.service
+Wants=sri-pool.service
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+# Readiness gate: wait for pool_sv2's monitoring API to answer, then a short
+# settle for the first template, before connecting upstream — avoids the
+# CouldNotInitiateSystem self-restart churn when started before pool_sv2 is ready.
+ExecStartPre=/bin/sh -c 'i=0; while [ $i -lt 30 ]; do /usr/bin/curl -sf -m2 http://127.0.0.1:9090/api/v1/clients >/dev/null 2>&1 && { sleep 10; exit 0; }; sleep 2; i=$((i+1)); done; exit 0'
+ExecStart=/opt/ghost/bin/translator_sv2 --config /etc/ghost/translator-config.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # ─────────────────────────────── 9. firewall ─────────────────────────────────
 log "Configuring firewall"
@@ -1686,6 +1909,12 @@ fi
 # ghost-pool is NOT started here — the gate starts it once ghostd is synced.
 # ghost-pool.service is installed but left disabled; the (enabled) gate owns it.
 systemctl enable --now ghost-pool-gate >/dev/null 2>&1
+# The SV2 stratum stack is enabled now so it survives reboots and starts serving
+# the moment ghost-pool comes up behind the gate. Both units are Restart=always,
+# so starting them before ghost-pool is fine — they retry until the TDP server is
+# reachable rather than failing the install.
+systemctl enable --now sri-pool >/dev/null 2>&1
+systemctl enable --now sri-translator >/dev/null 2>&1
 sleep 5
 
 NODE_ID="$(sudo -u ghost ZK_PARAMS_PATH=/home/ghost/.ghost/mpc_params ZK_GENESIS_PARAMS_HASH="$ZK_GENESIS_PARAMS_HASH" /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
@@ -1695,10 +1924,16 @@ cat <<EOF
      ${NODE_ID}
      ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: sudo journalctl -u ghostd -f)
      ghost-pool-gate: $(systemctl is-active ghost-pool-gate)  (waiting for sync, then auto-starts ghost-pool)
+     sri-pool:        $(systemctl is-active sri-pool)  (SV2 pool — connects to ghost-pool's TDP once it is up)
+     sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — serves miners on port 3333)
 
   ghost-pool starts AUTOMATICALLY once ghostd finishes syncing — then your node
-  joins the mesh and registers as an Elder if slots remain (first 101).
-  Watch the gate:  sudo journalctl -u ghost-pool-gate -f
+  joins the mesh and registers as an Elder if slots remain (first 101). The SV2
+  stratum stack (sri-pool + sri-translator) is already installed and will begin
+  serving miners on Stratum port 3333 (SV1) / 34255 (SV2) as soon as ghost-pool
+  is up. Point a miner at:  stratum+tcp://${PUBIP}:3333
+  Watch the gate:    sudo journalctl -u ghost-pool-gate -f
+  Watch the stratum: sudo journalctl -u sri-pool -u sri-translator -f
 EOF
 
 # Private modes need a miner password — show it now (and where it lives) so the
