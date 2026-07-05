@@ -272,9 +272,6 @@ export default function MempoolPage() {
           <SectionErrorBoundary section="Fee distribution">
             <FeeDistribution mempool={mempool} />
           </SectionErrorBoundary>
-          <SectionErrorBoundary section="Recent transactions">
-            <RecentTxs mempool={mempool} />
-          </SectionErrorBoundary>
         </>
       )}
 
@@ -729,56 +726,6 @@ function FeeDistribution({ mempool }: { mempool?: BudsMempool }) {
 
 // ─── recent transactions from the sample ────────────────────────────────────
 
-function RecentTxs({ mempool }: { mempool?: BudsMempool }) {
-  const txs = [...(mempool?.transactions ?? [])]
-    .sort((a, b) => b.time - a.time)
-    .slice(0, 12);
-
-  if (txs.length === 0) return null;
-
-  const tierColor = (name: string) =>
-    TIERS.find((t) => t.key === name)?.color ?? "var(--dim)";
-
-  return (
-    <Card collapsible defaultCollapsed>
-      <CardHeader title="Recent transactions" subtitle="newest entries from the sample" />
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
-          <thead>
-            <tr style={{ color: "var(--dim)", textAlign: "left" }}>
-              <th style={{ padding: "6px 8px", fontWeight: 400 }}>txid</th>
-              <th style={{ padding: "6px 8px", fontWeight: 400 }}>class</th>
-              <th style={{ padding: "6px 8px", fontWeight: 400, textAlign: "right" }}>vsize</th>
-              <th style={{ padding: "6px 8px", fontWeight: 400, textAlign: "right" }}>fee rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            {txs.map((tx) => (
-              <tr key={tx.txid} style={{ borderTop: "1px solid var(--rule)" }}>
-                <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", color: "var(--fg)" }}>
-                  {tx.txid.slice(0, 10)}…{tx.txid.slice(-6)}
-                </td>
-                <td style={{ padding: "6px 8px" }}>
-                  <span style={{ color: tierColor(tx.tier_name), fontWeight: 500 }}>
-                    {tx.tier_name}
-                  </span>
-                  <span style={{ color: "var(--dim)" }}> · {tx.classification_reason}</span>
-                </td>
-                <td style={{ padding: "6px 8px", textAlign: "right", fontFamily: "var(--font-mono)", color: "var(--dim)" }}>
-                  {tx.vsize.toLocaleString()}
-                </td>
-                <td style={{ padding: "6px 8px", textAlign: "right", fontFamily: "var(--font-mono)", color: "var(--fg)" }}>
-                  {feeRateSatVb(tx).toFixed(2)}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </Card>
-  );
-}
-
 // ─── Advanced: heavy full explorer (electrs + mempool.space) ────────────────
 
 function AdvancedExplorer({ status }: { status?: MempoolStatus | null }) {
@@ -810,21 +757,10 @@ function AdvancedExplorer({ status }: { status?: MempoolStatus | null }) {
               open full explorer in a new tab ↗
             </a>
           </div>
-          <div
-            style={{
-              border: "1px solid var(--rule)",
-              borderRadius: "4px",
-              overflow: "hidden",
-              background: "var(--surface)",
-              height: "640px",
-            }}
-          >
-            <iframe
-              src={`http://localhost:${port}/`}
-              title="mempool.space full explorer"
-              style={{ width: "100%", height: "100%", border: 0, display: "block" }}
-            />
-          </div>
+          <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+            The full mempool.space + electrs stack is installed and running on this node. Open it
+            in a new tab above — it&apos;s not embedded here to keep the dashboard light.
+          </p>
         </div>
       ) : installedNotRunning ? (
         <div className="space-y-4">
