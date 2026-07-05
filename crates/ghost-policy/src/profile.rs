@@ -65,7 +65,7 @@ impl PolicyProfile {
     /// No OP_RETURN, inscriptions, or exotic data
     pub fn bitcoin_pure() -> Self {
         Self {
-            name: "bitcoin_pure".to_string(),
+            name: "strict".to_string(),
             description: "Financial transactions only (T0+T1), no data embedding".to_string(),
             allowed_tiers: vec![BudsTier::T0, BudsTier::T1],
             max_op_return_size: 0,
@@ -181,6 +181,7 @@ impl Default for PolicyProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfilePreset {
+    #[serde(rename = "strict", alias = "bitcoin_pure")]
     BitcoinPure,
     Permissive,
     FullOpen,
@@ -199,7 +200,7 @@ impl ProfilePreset {
 
     pub fn name(&self) -> &'static str {
         match self {
-            Self::BitcoinPure => "bitcoin_pure",
+            Self::BitcoinPure => "strict",
             Self::Permissive => "permissive",
             Self::FullOpen => "full_open",
             Self::Custom => "custom",

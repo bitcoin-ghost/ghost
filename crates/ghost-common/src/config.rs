@@ -1283,7 +1283,10 @@ impl Default for PolicyConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyProfile {
-    /// Only T0 + T1 transactions (financial-only)
+    /// Only T0 + T1 transactions (financial-only). Serialized as `strict`; the
+    /// legacy `bitcoin_pure` value is still accepted so existing pool.toml files
+    /// keep parsing. The internal `BitcoinPure` identifier is unchanged.
+    #[serde(rename = "strict", alias = "bitcoin_pure")]
     BitcoinPure,
     /// T0 + T1 + T2 (most common)
     Permissive,
