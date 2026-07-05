@@ -1313,6 +1313,19 @@ pub struct CustomPolicyConfig {
     pub allow_inscriptions: bool,
     /// Allow Runes
     pub allow_runes: bool,
+    /// Allow BRC-20 token transfers
+    #[serde(default)]
+    pub allow_brc20: bool,
+    /// Minimum fee rate (sat/vB, 0 = no minimum)
+    #[serde(default = "default_custom_min_fee_rate")]
+    pub min_fee_rate: f64,
+}
+
+/// Default minimum fee rate for a custom policy (sat/vB). Matches the
+/// `strict`/`permissive` preset default so an operator who only tweaks
+/// content toggles keeps a sane floor.
+fn default_custom_min_fee_rate() -> f64 {
+    1.0
 }
 
 impl Default for CustomPolicyConfig {
@@ -1325,6 +1338,8 @@ impl Default for CustomPolicyConfig {
             max_tx_size: MAX_TX_SIZE_BITCOIN_PURE,
             allow_inscriptions: false,
             allow_runes: false,
+            allow_brc20: false,
+            min_fee_rate: default_custom_min_fee_rate(),
         }
     }
 }

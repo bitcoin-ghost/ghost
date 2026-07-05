@@ -1950,6 +1950,22 @@ impl TemplateProcessor {
 
             // Check if tier is allowed by policy
             if self.policy.allows_tier(tier) {
+                // Full per-field policy enforcement. The tier gate above only
+                // checks the coarse BUDS class; this runs the finer profile
+                // knobs (allow_inscriptions/runes/brc20, max_op_return_size,
+                // max_witness_per_input, max_tx_outputs, max_tx_size) that
+                // ghost_policy::PolicyEngine enforces, so non-conforming txs are
+                // actually dropped from the block rather than silently mined.
+                if let Some(reason) = policy_field_violation(&self.policy, &btc_tx, &result) {
+                    removed_fees += tx.fee;
+                    debug!(
+                        txid = %tx.txid,
+                        reason = %reason,
+                        "Transaction filtered by policy field"
+                    );
+                    continue;
+                }
+
                 // Additional policy checks
                 let fee_rate = tx.fee as f64 / (tx.weight as f64 / 4.0);
                 if fee_rate >= self.config.min_fee_rate {
@@ -3151,6 +3167,97 @@ fn is_valid_script_bytes(script: &[u8]) -> bool {
     }
 }
 
+/// Enforce the finer per-field policy knobs against a candidate transaction.
+///
+/// Mirrors the field checks in `ghost_policy::PolicyEngine::evaluate`, minus the
+/// tier gate (handled by the caller via `PolicyProfile::allows_tier`) and the
+/// `min_fee_rate` floor (handled via `TemplateConfig::min_fee_rate`). Returns
+/// `Some(reason)` when the transaction violates a policy field and must be
+/// dropped from the block, or `None` when it conforms.
+///
+/// This is what makes `allow_inscriptions` / `allow_runes` / `allow_brc20`,
+/// `max_op_return_size`, `max_witness_per_input`, `max_tx_outputs` and
+/// `max_tx_size` actually bite at block-build time — before this was wired in,
+/// only the tier gate and `min_fee_rate` were enforced, leaving those fields
+/// cosmetic for block construction.
+fn policy_field_violation(
+    policy: &PolicyProfile,
+    btc_tx: &bitcoin::Transaction,
+    classification: &ghost_buds::ClassificationResult,
+) -> Option<String> {
+    // Transaction size (vbytes = weight / 4).
+    let tx_size = btc_tx.weight().to_wu() as usize / 4;
+    if tx_size > policy.max_tx_size {
+        return Some(format!(
+            "tx too large: {tx_size} > {} vB",
+            policy.max_tx_size
+        ));
+    }
+
+    // Output count.
+    if btc_tx.output.len() > policy.max_tx_outputs {
+        return Some(format!(
+            "too many outputs: {} > {}",
+            btc_tx.output.len(),
+            policy.max_tx_outputs
+        ));
+    }
+
+    // OP_RETURN payload size (strip the OP_RETURN opcode + push opcode ≈ 2 bytes,
+    // matching PolicyEngine's accounting).
+    for output in &btc_tx.output {
+        if output.script_pubkey.is_op_return() {
+            let op_return_size = output.script_pubkey.len().saturating_sub(2);
+            if op_return_size > policy.max_op_return_size {
+                return Some(format!(
+                    "op_return too large: {op_return_size} > {} bytes",
+                    policy.max_op_return_size
+                ));
+            }
+        }
+    }
+
+    // Per-input witness size.
+    for (i, input) in btc_tx.input.iter().enumerate() {
+        let witness_size: usize = input.witness.iter().map(|w| w.len()).sum();
+        if witness_size > policy.max_witness_per_input {
+            return Some(format!(
+                "witness too large on input {i}: {witness_size} > {} bytes",
+                policy.max_witness_per_input
+            ));
+        }
+    }
+
+    // Content-type restrictions, driven by the BUDS classifier's detected
+    // features.
+    if !policy.allow_inscriptions
+        && classification
+            .features
+            .iter()
+            .any(|f| matches!(f, ghost_buds::DetectedFeature::InscriptionEnvelope))
+    {
+        return Some("inscriptions not allowed by policy".to_string());
+    }
+    if !policy.allow_runes
+        && classification
+            .features
+            .iter()
+            .any(|f| matches!(f, ghost_buds::DetectedFeature::RunesRunestone))
+    {
+        return Some("runes not allowed by policy".to_string());
+    }
+    if !policy.allow_brc20
+        && classification
+            .features
+            .iter()
+            .any(|f| matches!(f, ghost_buds::DetectedFeature::Brc20Pattern))
+    {
+        return Some("brc20 not allowed by policy".to_string());
+    }
+
+    None
+}
+
 /// Filter statistics
 #[derive(Debug, Clone)]
 struct FilterStats {
@@ -4192,6 +4299,278 @@ mod tests {
             2,
             "both txs should survive with reaper disabled"
         );
+    }
+
+    // ===================================================================
+    // Per-field policy enforcement (wired into filter_transactions).
+    //
+    // These prove each finer PolicyProfile knob now actually drops the
+    // right tx at block-build time and lets conforming ones through.
+    // Each test starts from `full_open` (all tiers, generous limits, all
+    // content allowed) and lowers ONE field to isolate that knob. Reaper
+    // is disabled so the policy field check — not the reaper — is what
+    // drops the transaction.
+    // ===================================================================
+
+    /// Build a TemplateTransaction wrapper around a bitcoin::Transaction with a
+    /// fee/weight ratio comfortably above the default min_fee_rate (1.0).
+    fn template_tx(btc_tx: &bitcoin::Transaction) -> TemplateTransaction {
+        use bitcoin::consensus::encode::serialize as btc_serialize;
+        TemplateTransaction {
+            data: hex::encode(btc_serialize(btc_tx)),
+            txid: btc_tx.compute_txid().to_string(),
+            hash: "00".repeat(32),
+            depends: vec![],
+            fee: 100_000, // high fee so the fee-rate floor never drops these
+            weight: 400,
+            sigops: 1,
+        }
+    }
+
+    /// A simple P2WPKH transaction with `n` identical outputs and a unique
+    /// txid derived from `seed`.
+    fn tx_with_outputs(seed: u8, n: usize) -> bitcoin::Transaction {
+        use bitcoin::{
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, ScriptBuf,
+            Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        let mut witness = Witness::new();
+        witness.push([0x30; 72]);
+        witness.push([0x02; 33]);
+        let spk = ScriptBuf::from({
+            let mut s = vec![0x00, 0x14];
+            s.extend([seed; 20]);
+            s
+        });
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([seed; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: (0..n)
+                .map(|_| TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: spk.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn make_processor(policy: PolicyProfile) -> TemplateProcessor {
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        // Reaper disabled → only the policy fields can drop a tx.
+        TemplateProcessor::new(TemplateConfig::default(), rpc, policy, ReaperConfig::disabled())
+    }
+
+    #[test]
+    fn test_policy_max_tx_outputs_enforced() {
+        // 10-output tx: dropped when the limit is 5, kept when it is 20.
+        let tx = template_tx(&tx_with_outputs(0x10, 10));
+
+        let mut strict = PolicyProfile::full_open();
+        strict.max_tx_outputs = 5;
+        let (kept, _) = make_processor(strict).filter_transactions(&[tx.clone()]);
+        assert!(kept.is_empty(), "tx exceeding max_tx_outputs must be dropped");
+
+        let mut loose = PolicyProfile::full_open();
+        loose.max_tx_outputs = 20;
+        let (kept, _) = make_processor(loose).filter_transactions(&[tx]);
+        assert_eq!(kept.len(), 1, "conforming output count must be kept");
+    }
+
+    #[test]
+    fn test_policy_max_op_return_size_enforced() {
+        use bitcoin::{
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, ScriptBuf,
+            Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        // OP_RETURN carrying 100 bytes → payload size ~100.
+        let mut op_return = vec![0x6a, 0x4c, 100]; // OP_RETURN OP_PUSHDATA1 len=100
+        op_return.extend(std::iter::repeat_n(0xABu8, 100));
+        let mut witness = Witness::new();
+        witness.push([0x30; 72]);
+        witness.push([0x02; 33]);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0x20; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::from({
+                        let mut s = vec![0x00, 0x14];
+                        s.extend([0x20; 20]);
+                        s
+                    }),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from(op_return),
+                },
+            ],
+        };
+        let ttx = template_tx(&tx);
+
+        let mut strict = PolicyProfile::full_open();
+        strict.max_op_return_size = 40;
+        let (kept, _) = make_processor(strict).filter_transactions(&[ttx.clone()]);
+        assert!(kept.is_empty(), "oversized OP_RETURN must be dropped");
+
+        let mut loose = PolicyProfile::full_open();
+        loose.max_op_return_size = 200;
+        let (kept, _) = make_processor(loose).filter_transactions(&[ttx]);
+        assert_eq!(kept.len(), 1, "conforming OP_RETURN must be kept");
+    }
+
+    #[test]
+    fn test_policy_max_witness_per_input_enforced() {
+        use bitcoin::{
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, ScriptBuf,
+            Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        // A single ~2000-byte witness item.
+        let mut witness = Witness::new();
+        witness.push(vec![0x42u8; 2000]);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0x30; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from({
+                    let mut s = vec![0x00, 0x14];
+                    s.extend([0x30; 20]);
+                    s
+                }),
+            }],
+        };
+        let ttx = template_tx(&tx);
+
+        let mut strict = PolicyProfile::full_open();
+        strict.max_witness_per_input = 500;
+        let (kept, _) = make_processor(strict).filter_transactions(&[ttx.clone()]);
+        assert!(kept.is_empty(), "oversized witness must be dropped");
+
+        let mut loose = PolicyProfile::full_open();
+        loose.max_witness_per_input = 4000;
+        let (kept, _) = make_processor(loose).filter_transactions(&[ttx]);
+        assert_eq!(kept.len(), 1, "conforming witness must be kept");
+    }
+
+    #[test]
+    fn test_policy_max_tx_size_enforced() {
+        // Many outputs inflate the serialized size well past a tight limit,
+        // while keeping the output count under max_tx_outputs.
+        let tx = template_tx(&tx_with_outputs(0x40, 50));
+
+        let mut strict = PolicyProfile::full_open();
+        strict.max_tx_size = 500; // vbytes; a 50-output tx is larger
+        let (kept, _) = make_processor(strict).filter_transactions(&[tx.clone()]);
+        assert!(kept.is_empty(), "tx exceeding max_tx_size must be dropped");
+
+        let mut loose = PolicyProfile::full_open();
+        loose.max_tx_size = 100_000;
+        let (kept, _) = make_processor(loose).filter_transactions(&[tx]);
+        assert_eq!(kept.len(), 1, "conforming tx size must be kept");
+    }
+
+    #[test]
+    fn test_policy_allow_inscriptions_enforced() {
+        use bitcoin::{
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, ScriptBuf,
+            Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        // Inscription envelope (OP_FALSE OP_IF "ord" ... OP_ENDIF) in a tapscript.
+        let mut tapscript: Vec<u8> = Vec::new();
+        tapscript.push(0x00); // OP_FALSE
+        tapscript.push(0x63); // OP_IF
+        tapscript.push(0x03);
+        tapscript.extend(b"ord");
+        tapscript.push(0x51);
+        let ctype = b"text/plain";
+        tapscript.push(ctype.len() as u8);
+        tapscript.extend(ctype);
+        tapscript.push(0x00);
+        let body = b"inscription payload";
+        tapscript.push(body.len() as u8);
+        tapscript.extend(body);
+        tapscript.push(0x68); // OP_ENDIF
+        tapscript.push(0xac); // OP_CHECKSIG
+        let mut witness = Witness::new();
+        witness.push([0x30; 64]);
+        witness.push(&tapscript);
+        let mut control_block = vec![0xc0u8];
+        control_block.extend([0x11; 32]);
+        witness.push(&control_block);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0x50; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from({
+                    let mut s = vec![0x00, 0x14];
+                    s.extend([0x50; 20]);
+                    s
+                }),
+            }],
+        };
+        let ttx = template_tx(&tx);
+
+        // Sanity: the classifier must flag this as an inscription, else the test
+        // proves nothing.
+        let btc_tx: bitcoin::Transaction =
+            deserialize(&hex::decode(&ttx.data).unwrap()).unwrap();
+        let classification = BudsClassifier::new().classify(&btc_tx);
+        assert!(
+            classification
+                .features
+                .iter()
+                .any(|f| matches!(f, ghost_buds::DetectedFeature::InscriptionEnvelope)),
+            "test fixture must classify as an inscription"
+        );
+
+        // allow_inscriptions = false → dropped by policy (reaper disabled).
+        let mut strict = PolicyProfile::full_open();
+        strict.allow_inscriptions = false;
+        let (kept, _) = make_processor(strict).filter_transactions(&[ttx.clone()]);
+        assert!(kept.is_empty(), "inscription must be dropped when disallowed");
+
+        // allow_inscriptions = true → kept.
+        let loose = PolicyProfile::full_open(); // already allows inscriptions
+        let (kept, _) = make_processor(loose).filter_transactions(&[ttx]);
+        assert_eq!(kept.len(), 1, "inscription must be kept when allowed");
     }
 
     /// Test that ghost-reaper detects OP_DROP stuffing in witness scripts

@@ -2351,7 +2351,14 @@ async fn main() -> Result<()> {
         ghost_common::config::PolicyProfile::BitcoinPure => PolicyProfile::bitcoin_pure(),
         ghost_common::config::PolicyProfile::Permissive => PolicyProfile::permissive(),
         ghost_common::config::PolicyProfile::FullOpen => PolicyProfile::full_open(),
-        ghost_common::config::PolicyProfile::Custom => PolicyProfile::permissive(),
+        // Custom: build the enforced profile from the operator's `[policy].custom`
+        // fields so the finer knobs (tiers, content toggles, size limits, min fee)
+        // actually bite at block-build time. Falls back to the default custom
+        // block when none is persisted.
+        ghost_common::config::PolicyProfile::Custom => {
+            let custom = config.policy.custom.clone().unwrap_or_default();
+            policy_profile_from_custom(&custom)
+        }
     };
     info!(
         "Policy profile: {} (allows up to T{})",
@@ -2541,6 +2548,14 @@ async fn main() -> Result<()> {
     info!(tag = %coinbase_tag, "Coinbase tag: {}", coinbase_tag);
 
     // Initialize template processor with treasury and pool payout addresses from config
+    // The template's minimum fee-rate floor. Presets keep the historical
+    // TemplateConfig default (unchanged behaviour); the Custom profile lets the
+    // operator set their own floor via `[policy].custom.min_fee_rate`.
+    let template_min_fee_rate = match config.policy.profile {
+        ghost_common::config::PolicyProfile::Custom => policy.min_fee_rate,
+        _ => TemplateConfig::default().min_fee_rate,
+    };
+
     // Pool payout address defaults to treasury address if not explicitly configured separately
     let template_config = TemplateConfig {
         treasury_address: config.pool.treasury_address.clone(),
@@ -2549,6 +2564,7 @@ async fn main() -> Result<()> {
         mining_mode,
         solo_payout_address: config.network.solo_payout_address.clone(),
         coinbase_extra: coinbase_tag,
+        min_fee_rate: template_min_fee_rate,
         ..Default::default()
     };
     let template_processor = Arc::new(
@@ -8078,6 +8094,42 @@ fn expand_path(path: &std::path::Path) -> Result<PathBuf> {
 /// (`reject_opreturn`, `reject_runestone`) have no pool-side equivalent and are
 /// intentionally not mapped here — the Rust reaper bounds OP_RETURN via the
 /// `max_op_return_bytes` threshold and has no Runestone detector.
+/// Build the enforced `ghost_policy::PolicyProfile` from an operator's
+/// `[policy].custom` config block. This is the source of truth the template
+/// builder enforces per-field (tiers, content toggles, size limits) when the
+/// operator selects the `Custom` profile.
+fn policy_profile_from_custom(
+    custom: &ghost_common::config::CustomPolicyConfig,
+) -> PolicyProfile {
+    // Map the config-crate BudsTier enum onto the ghost_buds tier the policy
+    // engine/classifier use.
+    let allowed_tiers = custom
+        .allowed_tiers
+        .iter()
+        .map(|t| match t {
+            ghost_common::config::BudsTier::T0 => ghost_buds::BudsTier::T0,
+            ghost_common::config::BudsTier::T1 => ghost_buds::BudsTier::T1,
+            ghost_common::config::BudsTier::T2 => ghost_buds::BudsTier::T2,
+            ghost_common::config::BudsTier::T3 => ghost_buds::BudsTier::T3,
+        })
+        .collect();
+
+    PolicyProfile {
+        name: "custom".to_string(),
+        description: "Operator-defined custom policy".to_string(),
+        allowed_tiers,
+        max_op_return_size: custom.max_op_return_size,
+        max_witness_per_input: custom.max_witness_per_input,
+        max_tx_outputs: custom.max_tx_outputs,
+        max_tx_size: custom.max_tx_size,
+        allow_inscriptions: custom.allow_inscriptions,
+        allow_runes: custom.allow_runes,
+        allow_brc20: custom.allow_brc20,
+        min_fee_rate: custom.min_fee_rate,
+        t0_priority_boost: 1.0,
+    }
+}
+
 fn reaper_config_from_settings(s: &ReaperSettings) -> ReaperConfig {
     if !s.enabled {
         return ReaperConfig::disabled();
