@@ -286,6 +286,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/watchdog/status", get(api_watchdog_status_handler))
         .route("/api/v1/system/version", get(api_system_version_handler))
         .route("/api/v1/system/mempool", get(api_system_mempool_handler))
+        .route("/api/v1/system/self-check", get(api_self_check_handler))
         .route("/api/v1/reaper/status", get(api_reaper_status_handler))
         .route("/api/v1/payments", get(api_payments_handler))
         .route("/api/v1/backup/history", get(api_backup_history_handler))
@@ -7728,6 +7729,19 @@ async fn api_reaper_status_handler(
     Json(state.reaper_stats())
 }
 
+/// Return the capability self-check snapshot (per-capability
+/// claimed/passed/reason) computed by the background loop in ghost-pool. The
+/// dashboard reads this to warn an operator when they have CLAIMED a capability
+/// (e.g. `public_mining`) whose prerequisite is missing (e.g. no stratum
+/// listening on port 3333), so they don't silently fail to earn its shares.
+/// Read-only: hands back the last snapshot; no probing happens in the request
+/// path. Returns `null` on older deploys where the provider isn't wired.
+async fn api_self_check_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    Json(state.self_check())
+}
+
 /// Read-only decentralised-coordinator election view
 /// (`tasks/plan_decentralised_coordinators.md`). Returns
 /// `{enabled, epoch, seats, my_seat, elected:[hex node ids]}` when the operator
@@ -9024,5 +9038,88 @@ mod tests {
             .with_full_node_config(cfg, path),
         );
         assert_eq!(authority(override_state).await, "customAuthorityKey123");
+    }
+
+    /// The self-check endpoint must serialise a FAILING snapshot so the
+    /// dashboard can warn the operator (e.g. public_mining claimed but no
+    /// stratum listening). Wire a provider that returns a failing capability
+    /// and assert the endpoint reflects claimed/passed/reason verbatim.
+    #[tokio::test]
+    async fn test_self_check_endpoint_serialises_failure() {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_self_check(|| {
+                serde_json::json!({
+                    "public_mining": {
+                        "claimed": true,
+                        "passed": false,
+                        "reason": "SV1 stratum (port 3333) not listening — start sri-translator",
+                        "last_checked_unix": 1_700_000_000_i64,
+                    },
+                    "archive": { "claimed": false, "passed": false, "reason": null, "last_checked_unix": 1_700_000_000_i64 },
+                    "ghost_pay": { "claimed": false, "passed": false, "reason": null, "last_checked_unix": 1_700_000_000_i64 },
+                    "reaper": { "claimed": false, "passed": false, "reason": null, "last_checked_unix": 1_700_000_000_i64 },
+                })
+            }),
+        );
+        let app = super::create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/system/self-check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["public_mining"]["claimed"], true);
+        assert_eq!(json["public_mining"]["passed"], false);
+        assert!(json["public_mining"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("port 3333"));
+    }
+
+    /// Pre-bounce safety: when the provider isn't wired (older deploy), the
+    /// endpoint must still respond 200 with a JSON `null` body so the frontend
+    /// can treat "absent/ok" as "render nothing".
+    #[tokio::test]
+    async fn test_self_check_endpoint_null_when_unwired() {
+        let state = create_test_state_without_auth();
+        let app = super::create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/system/self-check")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.is_null());
     }
 }

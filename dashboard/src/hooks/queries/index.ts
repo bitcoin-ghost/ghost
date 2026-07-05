@@ -48,3 +48,6 @@ export * from './useShroudQueries';
 
 // Reaper queries
 export * from './useReaperQueries';
+
+// Capability self-check queries
+export * from './useSelfCheckQueries';

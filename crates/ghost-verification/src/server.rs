@@ -1263,6 +1263,13 @@ pub struct VerificationState {
     /// concrete `ReaperStats` type lives in `bins/ghost-pool` and we don't
     /// want a reverse dep from ghost-verification.
     get_reaper_stats: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
+    /// Capability self-check snapshot callback. Returns a JSON-serializable
+    /// snapshot of the current `SelfCheckState` (per-capability
+    /// claimed/passed/reason) so the dashboard can surface drift between a
+    /// claimed capability and its missing prerequisite. Pre-serialized to JSON
+    /// because the concrete `SelfCheckState` type lives in `bins/ghost-pool`
+    /// and we don't want a reverse dep from ghost-verification.
+    get_self_check: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Coordinator-election snapshot callback (pre-serialized JSON to avoid a
     /// reverse-dependency on the `wraith-protocol`/`ghost-pool` election types).
     /// Returns `{enabled, epoch, seats, my_seat, elected}` when the feature is
@@ -1484,6 +1491,7 @@ impl VerificationState {
             internal_auth: None,
             get_pool_peers: None,
             get_reaper_stats: None,
+            get_self_check: None,
             get_coordinator_status: None,
             get_mesh_active_miners: None,
             get_self_deduped_miners: None,
@@ -1981,6 +1989,28 @@ impl VerificationState {
         f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
     ) -> Self {
         self.get_reaper_stats = Some(Box::new(f));
+        self
+    }
+
+    /// Capability self-check snapshot for `/api/v1/system/self-check`, or
+    /// `null` when not wired (older deploy). Reports, for each capability the
+    /// node CLAIMS, whether its prerequisite probe currently passes and a
+    /// human-readable reason when it does not. Read-only: reads the snapshot
+    /// the background loop already computed — no probing in the request path.
+    pub fn self_check(&self) -> serde_json::Value {
+        self.get_self_check
+            .as_ref()
+            .map(|f| f())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Set the self-check callback (pre-serialized JSON to avoid a
+    /// reverse-dependency on ghost-pool's `SelfCheckState`).
+    pub fn with_self_check(
+        mut self,
+        f: impl Fn() -> serde_json::Value + Send + Sync + 'static,
+    ) -> Self {
+        self.get_self_check = Some(Box::new(f));
         self
     }
 
