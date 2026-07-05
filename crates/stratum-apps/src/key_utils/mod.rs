@@ -145,6 +145,22 @@ impl Secp256k1SecretKey {
     pub fn into_bytes(self) -> [u8; 32] {
         self.0.secret_bytes()
     }
+
+    /// Build a secret key from raw 32-byte key material (e.g. the first 32 bytes
+    /// of a node identity key file). Returns an error if the bytes are not a
+    /// valid secp256k1 scalar (all-zero or outside the curve order).
+    pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, Error> {
+        let secret = SecretKey::from_slice(bytes)?;
+        Ok(Secp256k1SecretKey(secret))
+    }
+
+    /// Generate a fresh secret key from the operating-system CSPRNG. Used by the
+    /// pool role to mint a per-node SV2 authority keypair at install time, so no
+    /// two nodes ship the same static Noise identity.
+    #[cfg(feature = "std")]
+    pub fn generate() -> Self {
+        Secp256k1SecretKey(SecretKey::new(&mut rand::thread_rng()))
+    }
 }
 
 impl From<Secp256k1SecretKey> for Secp256k1PublicKey {
@@ -261,5 +277,49 @@ mod test {
             .parse::<Secp256k1PublicKey>()
             .expect("Invalid test pubkey");
         assert_eq!(calculated_public_key.0, parsed_public_key.0);
+    }
+
+    #[test]
+    fn secret_from_bytes_matches_base58_parse() {
+        // The base58-encoded secret from the vector above, decoded to raw bytes,
+        // must yield an identical secret (and therefore public key) whether it is
+        // built from the string or from the raw 32 bytes. This locks the
+        // `from_bytes` path used to derive a pool authority key from a node key
+        // file to the exact same public-key encoding the config parser accepts.
+        let secret_key = "zmBEmPhqo3A92FkiLVvyCz6htc3e53ph3ZbD4ASqGaLjwnFLi";
+        let expected_public = "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan";
+
+        let parsed = secret_key
+            .parse::<Secp256k1SecretKey>()
+            .expect("Invalid test key");
+        let raw = parsed.into_bytes();
+        let from_raw = Secp256k1SecretKey::from_bytes(&raw).expect("valid scalar");
+
+        assert_eq!(from_raw.into_bytes(), raw);
+        assert_eq!(
+            Secp256k1PublicKey::from(from_raw).to_string(),
+            expected_public
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn generate_produces_roundtrippable_keypair() {
+        // A generated secret must serialise to base58 and parse back to the same
+        // scalar, and its derived public key must round-trip too — proving the
+        // pair written into pool-config.toml is valid input to the config parser.
+        let secret = Secp256k1SecretKey::generate();
+        let secret_str = secret.to_string();
+        let reparsed = secret_str
+            .parse::<Secp256k1SecretKey>()
+            .expect("generated secret must re-parse");
+        assert_eq!(reparsed.into_bytes(), secret.into_bytes());
+
+        let public = Secp256k1PublicKey::from(secret);
+        let public_str = public.to_string();
+        let reparsed_pub = public_str
+            .parse::<Secp256k1PublicKey>()
+            .expect("generated public must re-parse");
+        assert_eq!(reparsed_pub.0, public.0);
     }
 }
