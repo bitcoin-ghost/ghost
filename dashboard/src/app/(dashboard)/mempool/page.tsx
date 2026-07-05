@@ -179,10 +179,7 @@ export default function MempoolPage() {
         </Card>
       ) : (
         <>
-          <LiveStats mempool={mempool} />
-          <SectionErrorBoundary section="Reaper">
-            <ReaperStrip reaperStats={reaperStats} reaperEnabled={reaperEnabled} />
-          </SectionErrorBoundary>
+          <LiveStats mempool={mempool} reaperStats={reaperStats} reaperEnabled={reaperEnabled} />
           <SectionErrorBoundary section="Mempool composition">
             <Composition mempool={mempool} reaperEnabled={reaperEnabled} />
           </SectionErrorBoundary>
@@ -333,21 +330,52 @@ function NodeMempoolExplorer() {
 
 // ─── live RPC stats row ─────────────────────────────────────────────────────
 
-function LiveStats({ mempool }: { mempool?: BudsMempool }) {
+function LiveStats({
+  mempool,
+  reaperStats,
+  reaperEnabled,
+}: {
+  mempool?: BudsMempool;
+  reaperStats?: ReaperStats | null;
+  reaperEnabled: boolean;
+}) {
   const fillPct =
     mempool?.bytes && mempool?.max_mempool
       ? formatPercent(mempool.bytes, mempool.max_mempool)
       : "—";
   const minFee = btcPerKvbToSatVb(mempool?.min_fee);
 
+  // The "Reaped this block" tile only appears when this node runs the reaper
+  // (opt-in +2 capability). It reports the block currently being built — the
+  // most recent template snapshot — not cumulative history; lifetime totals
+  // live on the Reaper page.
+  const showReaped = reaperEnabled;
+  const hasBlock = !!reaperStats && reaperStats.last_block_unix != null;
+  // Five tiles need a wider track; four keep the original layout.
+  const gridCols = showReaped
+    ? "grid-cols-2 md:grid-cols-3 xl:grid-cols-5"
+    : "grid-cols-2 md:grid-cols-4";
+
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div className={`grid ${gridCols} gap-4`}>
       <StatCard
         label="Transactions"
         value={formatCount(mempool?.total)}
         sublabel="in your mempool now"
         tooltip="getmempoolinfo.size — count of transactions your node currently holds in its mempool."
       />
+      {showReaped && (
+        <StatCard
+          label="Reaped this block"
+          value={hasBlock ? reaperStats!.last_block_reaped.toLocaleString() : "—"}
+          sublabel={
+            hasBlock
+              ? `${formatBytes(reaperStats!.last_block_dead_bytes)} dead weight · ${formatRelative(reaperStats!.last_block_unix)}`
+              : "no block built yet"
+          }
+          tooltip="Transactions the pool template-builder reaper dropped from the block currently being built (dead code detected). A per-block snapshot, not cumulative — lifetime totals and per-vector detail are on the Reaper page."
+        />
+      )}
       <StatCard
         label="Mempool size"
         value={formatBytes(mempool?.bytes)}
@@ -370,7 +398,7 @@ function LiveStats({ mempool }: { mempool?: BudsMempool }) {
   );
 }
 
-// ─── Reaper strip — spam stripped from the block this node is building now ───
+// ─── reaper helpers (feed the "Reaped this block" stat tile) ─────────────────
 
 function formatRelative(unixSecs: number | null): string {
   if (!unixSecs) return "never";
@@ -379,80 +407,6 @@ function formatRelative(unixSecs: number | null): string {
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
   if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
   return `${Math.floor(secs / 86400)}d ago`;
-}
-
-/**
- * Slim reaper highlight. Renders ONLY when the pool template-builder reaper is
- * enabled, and reports ONLY the block this node is currently building — the most
- * recent template snapshot (`last_block_*`), not cumulative history. Lifetime
- * totals, per-vector counters and the most-caught pattern all live on the Reaper
- * page, so this stays a single at-a-glance line for the majority of operators
- * (reaper is opt-in) rather than a page-dominating panel.
- */
-function ReaperStrip({
-  reaperStats,
-  reaperEnabled,
-}: {
-  reaperStats?: ReaperStats | null;
-  reaperEnabled: boolean;
-}) {
-  if (!reaperEnabled) return null;
-
-  const hasBlock = !!reaperStats && reaperStats.last_block_unix != null;
-  const reaped = hasBlock ? reaperStats!.last_block_reaped : 0;
-  const deadBytes = hasBlock ? reaperStats!.last_block_dead_bytes : 0;
-
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: "12px",
-        flexWrap: "wrap",
-        padding: "10px 14px",
-        background: "var(--accent-weak)",
-        border: "1px solid var(--accent)",
-        borderRadius: "4px",
-        fontSize: "13px",
-        color: "var(--fg)",
-      }}
-    >
-      <span>
-        {!hasBlock ? (
-          <>
-            Reaper is <strong style={{ color: "var(--accent)" }}>enabled</strong> — no block template
-            built yet.
-          </>
-        ) : reaped > 0 ? (
-          <>
-            Reaper stripped{" "}
-            <strong style={{ color: "var(--accent)" }}>{reaped.toLocaleString()}</strong> spam{" "}
-            {reaped === 1 ? "tx" : "txs"} (<strong>{formatBytes(deadBytes)}</strong> dead weight) from the
-            block this node is currently building.
-          </>
-        ) : (
-          <>
-            Reaper found <strong style={{ color: "var(--accent)" }}>no dead weight</strong> to strip from
-            the block this node is currently building — nothing in it matched your active reject vectors.
-          </>
-        )}
-        {hasBlock && (
-          <span style={{ color: "var(--dim)" }}>
-            {" "}
-            · template updated {formatRelative(reaperStats!.last_block_unix)}
-          </span>
-        )}
-      </span>
-      <a
-        href="/reaper"
-        className="bare"
-        style={{ color: "var(--accent)", textDecoration: "underline", whiteSpace: "nowrap" }}
-      >
-        Reaper page →
-      </a>
-    </div>
-  );
 }
 
 // ─── mempool composition by BUDS class ──────────────────────────────────────
@@ -487,12 +441,13 @@ function Composition({
             <>
               {" "}
               About <strong style={{ color: "var(--fg)" }}>~{Math.round(abusiveShare * 100)}%</strong>{" "}
-              carry abusive patterns (T3) — runes, inscriptions and stuffing that your current reject
-              rules still admit, which is why the reaper leaves them alone.
+              carry abusive patterns (T3) — inscriptions, runes and oversized data. The reaper drops the
+              ones that hide dead code (inscription envelopes, stuffing, fake pubkeys); a runestone is
+              standard, provably-unspendable OP_RETURN data — not dead code — so the reaper leaves it.
               {reaperEnabled && (
                 <>
                   {" "}
-                  Widen your reject vectors on the{" "}
+                  Tune your reject vectors on the{" "}
                   <a
                     href="/reaper"
                     className="bare"
@@ -500,7 +455,7 @@ function Composition({
                   >
                     Reaper page
                   </a>{" "}
-                  to start stripping them from the blocks you build.
+                  to catch more dead-code variants.
                 </>
               )}
             </>
