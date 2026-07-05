@@ -39,6 +39,11 @@ pub struct NodeConfig {
     /// Requires ghost-core restart with -shroud=1 flag to take effect.
     #[serde(default)]
     pub shroud_enabled: bool,
+    /// Operator's display nickname for this node. Persisted so it survives
+    /// restarts (it used to live only in the in-memory dashboard config and was
+    /// lost on every restart). None = no nickname set (falls back to short id).
+    #[serde(default)]
+    pub nickname: Option<String>,
 }
 
 impl NodeConfig {
@@ -124,12 +129,14 @@ mod tests {
         let config = NodeConfig {
             ghost_mode: true,
             shroud_enabled: false,
+            nickname: Some("my-node".to_string()),
         };
         config.save(path).unwrap();
 
         let loaded = NodeConfig::load(path).unwrap();
         assert!(loaded.ghost_mode);
         assert!(!loaded.shroud_enabled);
+        assert_eq!(loaded.nickname.as_deref(), Some("my-node"));
     }
 
     #[test]

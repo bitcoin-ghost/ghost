@@ -3113,7 +3113,12 @@ async fn api_resources_handler(State(state): State<Arc<VerificationState>>) -> i
         "disk_total_gb": disk_total_gb,
         "uptime_seconds": health.uptime_secs,
         "uptime_secs": health.uptime_secs,
-        "connected_miners": health.miner_count,
+        // Deduplicated mesh-wide active-miner count (same source as
+        // /api/v1/network/pool), NOT the raw `miner_count` — the raw value is a
+        // load-balancer routing view that double-counts miners failing over
+        // between nodes, so the Watchdog was showing an inflated figure that
+        // could exceed the real distinct total. Falls back to raw if unavailable.
+        "connected_miners": state.mesh_active_miners().unwrap_or(health.miner_count),
         "estimated_capacity": 1000,
         "status": status,
         "last_redirect_count": 0,
@@ -7176,10 +7181,35 @@ async fn api_nickname_post_handler(
             .into_response();
     }
 
-    // Store in dashboard config
+    let value = if nickname.is_empty() {
+        None
+    } else {
+        Some(nickname.to_string())
+    };
+
+    // Store in the in-memory dashboard config (what the GET handler and the rest
+    // of the process read live).
     {
         let mut config = state.dashboard_config.write();
-        config.nickname = Some(nickname.to_string());
+        config.nickname = value.clone();
+    }
+
+    // Persist to the node config file so the nickname survives a restart. It
+    // previously lived only in the in-memory dashboard config and was lost on
+    // every restart.
+    {
+        let mut node_config = state.node_config.write();
+        node_config.nickname = value;
+        if let Some(ref path) = state.node_config_path {
+            if let Err(e) = node_config.save(path) {
+                error!(error = %e, "Failed to persist node nickname");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to persist nickname: {}", e)})),
+                )
+                    .into_response();
+            }
+        }
     }
 
     Json(serde_json::json!({

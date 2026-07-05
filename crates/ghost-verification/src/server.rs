@@ -1754,10 +1754,15 @@ impl VerificationState {
     /// Set the node config path and load config from disk
     pub fn with_node_config_path(mut self, path: PathBuf) -> Self {
         let config = NodeConfig::load_or_default(&path);
-        // Sync dashboard_config ghost_mode with loaded node_config
+        // Sync dashboard_config with the persisted node_config so restored
+        // values (ghost_mode, nickname) are reflected on the live config the
+        // dashboard reads.
         {
             let mut dashboard = self.dashboard_config.write();
             dashboard.ghost_mode = config.ghost_mode;
+            if config.nickname.is_some() {
+                dashboard.nickname = config.nickname.clone();
+            }
         }
         self.node_config = parking_lot::RwLock::new(config);
         self.node_config_path = Some(path);
