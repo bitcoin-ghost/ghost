@@ -472,20 +472,19 @@ function ReaperImpact({
             sublabel="block space returned to fee-paying txs"
             tooltip="Cumulative virtual bytes of dead weight the reaper stripped from your block templates (/api/v1/reaper/status → dead_bytes_total). That space is reclaimed for real, fee-paying transactions."
           />
-          {/*
-            BACKEND FOLLOW-UP: this tile is wired for a per-block reaped count.
-            template.rs builds `FilterStats.reaped` (bins/ghost-pool/src/template.rs,
-            the `reaped` field ~line 1994) on every template, but that per-block
-            figure is only logged — it is NOT exposed via any API. Surface it (e.g.
-            add `last_block_reaped` to /api/v1/reaper/status, or a per-template
-            endpoint) and swap the "—" below for that value. Until then we show no
-            fabricated number.
-          */}
           <StatCard
             label="Reaped this block"
-            value="—"
-            sublabel="per-block counter — pending node endpoint"
-            tooltip="The template builder already computes a per-block reaped count (template.rs FilterStats.reaped) but does not expose it via the API yet. This tile is wired and will populate once ghost-pool surfaces the per-template figure; until then it shows no fabricated number."
+            value={
+              reaperStats && reaperStats.last_block_unix != null
+                ? reaperStats.last_block_reaped.toLocaleString()
+                : "—"
+            }
+            sublabel={
+              reaperStats && reaperStats.last_block_unix != null
+                ? `${formatBytes(reaperStats.last_block_dead_bytes)} dead weight · ${formatRelative(reaperStats.last_block_unix)}`
+                : "no block built yet"
+            }
+            tooltip="Transactions the template-builder reaper stripped from the most-recently-built block template (/api/v1/reaper/status → last_block_reaped). A per-block snapshot, not cumulative."
           />
           <StatCard
             label="Most-caught pattern"
