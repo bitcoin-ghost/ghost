@@ -354,9 +354,6 @@ function NodeMempoolExplorer() {
 
   return (
     <Card>
-      <CardHeader
-        title="Your node's mempool"
-      />
       <div className="flex items-center gap-3" style={{ marginBottom: "12px" }}>
         <Badge variant="info">mempool.space · this node</Badge>
         {openLink}
