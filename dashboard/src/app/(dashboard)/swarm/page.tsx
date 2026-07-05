@@ -447,6 +447,11 @@ export default function SwarmPage() {
                       className={`w-2.5 h-2.5 rounded-full ${node.online ? "bg-green-500" : "bg-red-500"}`}
                     />
                     <span className="font-semibold text-gray-100">{node.name}</span>
+                    {node.is_self && (
+                      <Badge variant="info" className="text-xs">
+                        You
+                      </Badge>
+                    )}
                   </div>
                   <div className="flex items-center gap-1">
                     <Badge variant={node.online ? "success" : "error"} className="text-xs">
