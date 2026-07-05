@@ -13,9 +13,9 @@ import {
   Shield,
   Eye,
   Cloud,
-  Skull,
   Filter,
   Layers,
+  SlidersHorizontal,
   Globe,
   HeartPulse,
   ScrollText,
@@ -68,8 +68,8 @@ const GROUPS: NavGroup[] = [
     label: "filtering",
     items: [
       { href: "/filtering", label: "Overview", icon: <Filter {...ICON} /> },
-      { href: "/filtering/buds", label: "BUDS", icon: <Layers {...ICON} /> },
-      { href: "/reaper", label: "Reaper", icon: <Skull {...ICON} /> },
+      { href: "/filtering/basic", label: "Basic", icon: <Layers {...ICON} /> },
+      { href: "/filtering/advanced", label: "Advanced", icon: <SlidersHorizontal {...ICON} /> },
     ],
   },
   {

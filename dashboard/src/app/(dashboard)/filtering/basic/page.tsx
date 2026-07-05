@@ -1,14 +1,13 @@
 "use client";
 
 import { useState } from "react";
-import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { fetchApi } from "@/lib/api/client";
-import { useConfig, useFullConfig } from "@/hooks/queries/useConfigQueries";
+import { useFullConfig } from "@/hooks/queries/useConfigQueries";
 import { setPolicyProfile, type PolicyProfileType } from "@/lib/api/config";
 import { useToast } from "@/components/ui/Toast";
 
@@ -26,7 +25,6 @@ function normalizeProfile(profile?: string): PolicyProfileType | undefined {
   if (profile === "strict" || profile === "permissive" || profile === "full_open") return profile;
   return undefined;
 }
-
 
 interface TierMeta {
   key: "T0" | "T1" | "T2" | "T3";
@@ -78,15 +76,13 @@ interface BudsMempool {
   message?: string;
 }
 
-export default function BudsPage() {
-  const { data: config } = useConfig();
+export default function BasicFilteringPage() {
   const { data: mempool } = useQuery({
     queryKey: ["buds-mempool"],
     queryFn: () => fetchApi<BudsMempool>("/api/v1/buds/mempool"),
     refetchInterval: 15_000,
   });
 
-  const reaperEnabled = config?.reaper ?? false;
   const byTier = mempool?.by_tier ?? { T0: 0, T1: 0, T2: 0, T3: 0 };
   const sampled = mempool?.sample_size ?? TIERS.reduce((s, t) => s + (byTier[t.key] ?? 0), 0);
 
@@ -94,10 +90,33 @@ export default function BudsPage() {
     <div className="space-y-6">
       <PageHeader
         eyebrow="filtering"
-        title="BUDS."
-        subtitle="Every transaction your node sees is sorted into one of four classes — from ordinary payments to abusive data. That class decides how it's filtered."
+        title="Basic."
+        subtitle="Pick how much your node filters with one simple choice. Every transaction is sorted into a BUDS class (T0–T3), and your choice decides which classes get mined."
         subtitleFullWidth
       />
+
+      {/* BUDS explainer — lead with why BUDS = simple */}
+      <SectionErrorBoundary section="What is BUDS">
+        <Card>
+          <CardHeader title="Why one choice is enough" />
+          <p style={{ color: "var(--dim)", fontSize: "14px", lineHeight: "1.6" }}>
+            <strong style={{ color: "var(--fg)" }}>BUDS — Bitcoin Universal Data Specification.</strong>{" "}
+            We use BUDS to sort every transaction into a class (T0–T3), so filtering is one simple choice
+            instead of dozens of settings.
+          </p>
+        </Card>
+      </SectionErrorBoundary>
+
+      {/* The simple choice: the three tier presets */}
+      <SectionErrorBoundary section="Mining policy">
+        <Card>
+          <CardHeader
+            title="Mining policy"
+            subtitle="How strictly this node filters, by transaction class. Changing it restarts the node."
+          />
+          <PolicyProfileSelector />
+        </Card>
+      </SectionErrorBoundary>
 
       {/* The four classes, explained */}
       <SectionErrorBoundary section="Transaction classes">
@@ -173,32 +192,8 @@ export default function BudsPage() {
                     );
                   })}
                 </div>
-                <p style={{ color: "var(--fainter)", fontSize: "12px" }}>
-                  Based on a live sample of {sampled.toLocaleString()} transactions (the node classifies up to
-                  100 per poll to stay light). Proportions are representative, not exact totals.
-                </p>
               </>
             )}
-          </div>
-        </Card>
-      </SectionErrorBoundary>
-
-      {/* Filtering settings — current policy + where to change it */}
-      <SectionErrorBoundary section="Filtering settings">
-        <Card>
-          <CardHeader
-            title="Filtering settings"
-            subtitle="Basic — pick a tier preset below. Advanced — per-vector spam controls on the Reaper page (and custom policy, when enabled)."
-          />
-          <div className="space-y-3">
-            <PolicyProfileSelector />
-            <SettingRow
-              label="Reaper"
-              value={`${reaperEnabled ? "On" : "Off"} · Advanced`}
-              desc={reaperEnabled ? "Advanced: per-vector dead-code / spam filtering for your mempool and blocks." : "Advanced: per-vector dead-code / spam filtering (currently off)."}
-              href="/reaper"
-              cta="Reaper settings"
-            />
           </div>
         </Card>
       </SectionErrorBoundary>
@@ -233,15 +228,6 @@ function PolicyProfileSelector() {
 
   return (
     <div>
-      <div className="flex items-center gap-2" style={{ marginBottom: "2px" }}>
-        <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>Mining policy</span>
-        <span style={{ color: "var(--accent)", fontSize: "11px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-          Basic
-        </span>
-      </div>
-      <div style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "10px" }}>
-        The simple choice — how much your node filters, by transaction class. Changing it restarts the node.
-      </div>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {POLICY_PRESETS.map((p) => {
           const isCurrent = current === p.value;
@@ -294,47 +280,6 @@ function PolicyProfileSelector() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function SettingRow({
-  label,
-  value,
-  desc,
-  href,
-  cta,
-}: {
-  label: string;
-  value: string;
-  desc: string;
-  href: string;
-  cta: string;
-}) {
-  return (
-    <div
-      style={{
-        padding: "12px 14px",
-        border: "1px solid var(--rule)",
-        borderRadius: "6px",
-        background: "var(--bg)",
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        gap: "12px",
-        flexWrap: "wrap",
-      }}
-    >
-      <div>
-        <div className="flex items-center gap-2">
-          <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>{label}</span>
-          <span style={{ color: "var(--accent)", fontSize: "13px", fontWeight: 600 }}>{value}</span>
-        </div>
-        <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px" }}>{desc}</div>
-      </div>
-      <Link href={href} className="bare" style={{ color: "var(--accent)", textDecoration: "underline", fontSize: "13px", whiteSpace: "nowrap" }}>
-        {cta} →
-      </Link>
     </div>
   );
 }

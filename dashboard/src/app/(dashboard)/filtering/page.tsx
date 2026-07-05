@@ -1,210 +1,239 @@
 "use client";
 
 import Link from "next/link";
+import { useQuery } from "@tanstack/react-query";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatCard } from "@/components/ui/StatCard";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { useConfig } from "@/hooks/queries/useConfigQueries";
+import { fetchApi } from "@/lib/api/client";
+import { useConfig, useFullConfig } from "@/hooks/queries/useConfigQueries";
 import { useReaperStatus } from "@/hooks/queries";
+import { useAdvancedFilteringGate } from "@/hooks/useAdvancedFilteringGate";
+import type { FullNodeConfig } from "@/types/api";
 
-// Plain-English names for the tier policy the node mines under, so operators
-// never have to see the raw `permissive` / `bitcoin_pure` / `full_open` keys.
-function policyLabel(profile?: string): string {
+type TierKey = "T0" | "T1" | "T2" | "T3";
+
+interface BudsMempool {
+  by_tier?: { T0: number; T1: number; T2: number; T3: number };
+  sample_size?: number;
+  message?: string;
+}
+
+// Plain-English preset name for the stored [policy].profile, normalising the
+// legacy `bitcoin_pure` alias to Strict. Returns "Custom" for the custom policy.
+function modeLabel(profile?: string): string {
   switch (profile) {
     case "bitcoin_pure":
-      return "Bitcoin-only";
+    case "strict":
+      return "Strict";
     case "permissive":
       return "Standard";
     case "full_open":
       return "Everything";
+    case "custom":
+      return "Custom";
     default:
       return profile ? profile : "—";
   }
 }
 
+// Which BUDS tiers this node's policy drops (does not mine). Presets map to a
+// fixed set; a custom policy drops any tier whose allow flag is false.
+function droppedTiers(
+  profile: string | undefined,
+  custom?: FullPolicyCustom,
+): TierKey[] {
+  switch (profile) {
+    case "bitcoin_pure":
+    case "strict":
+      return ["T2", "T3"];
+    case "permissive":
+      return ["T3"];
+    case "full_open":
+      return [];
+    case "custom": {
+      if (!custom) return [];
+      const dropped: TierKey[] = [];
+      if (!custom.allow_t0) dropped.push("T0");
+      if (!custom.allow_t1) dropped.push("T1");
+      if (!custom.allow_t2) dropped.push("T2");
+      if (!custom.allow_t3) dropped.push("T3");
+      return dropped;
+    }
+    default:
+      return [];
+  }
+}
+
+type FullPolicyCustom = NonNullable<FullNodeConfig["policy"]>["custom"];
+
 function bytes(n?: number): string {
   if (n === undefined || n === null) return "—";
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 export default function FilteringOverviewPage() {
   const { data: config } = useConfig();
+  const { data: fullConfig } = useFullConfig();
   const { data: reaperStats } = useReaperStatus();
+  const { data: mempool } = useQuery({
+    queryKey: ["buds-mempool"],
+    queryFn: () => fetchApi<BudsMempool>("/api/v1/buds/mempool"),
+    refetchInterval: 15_000,
+  });
+
+  const [advancedEnabled] = useAdvancedFilteringGate();
 
   const reaperOn = config?.reaper ?? false;
-  const hasBlock = !!reaperStats && reaperStats.last_block_unix != null;
+  const profile = fullConfig?.policy?.profile;
+  const dropped = droppedTiers(profile, fullConfig?.policy?.custom);
+
+  // % filtered — the share of the CURRENT mempool sample that sits in the tiers
+  // this node's policy drops. Single-node indicator, not a cross-node comparison.
+  const byTier = mempool?.by_tier ?? { T0: 0, T1: 0, T2: 0, T3: 0 };
+  const sampled = mempool?.sample_size ?? (byTier.T0 + byTier.T1 + byTier.T2 + byTier.T3);
+  const droppedCount = dropped.reduce((s, t) => s + (byTier[t] ?? 0), 0);
+  const hasSample = !mempool?.message && sampled > 0;
+  const pctFiltered = hasSample ? (droppedCount / sampled) * 100 : null;
+  const droppedLabel = dropped.length ? dropped.join(" + ") : "none";
 
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="filtering"
         title="Filtering."
-        subtitle="What your node lets in, and what it mines. Every transaction is sorted into a class (BUDS) and passed through two filters — one for your mempool, one for the blocks you build."
+        subtitle="What your node lets in, and what it mines — at a glance. Set it up in Basic, fine-tune in Advanced."
         subtitleFullWidth
       />
 
-      {/* Status tiles */}
+      {/* Cumulative counters */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <StatCard
+          label="Total txs filtered"
+          value={reaperStats ? reaperStats.txs_reaped.toLocaleString() : "—"}
+          sublabel="cumulative, this run"
+          tooltip="Transactions the reaper has dropped from the blocks this node builds, since the last ghost-pool restart."
+        />
+        <StatCard
+          label="Dead weight cut"
+          value={reaperStats ? bytes(reaperStats.dead_bytes_total) : "—"}
+          sublabel="reclaimed for real txs"
+          tooltip="Total bytes of dead code stripped from block templates, returned to fee-paying transactions."
+        />
+        <StatCard
+          label="% of mempool filtered"
+          value={pctFiltered === null ? "—" : `${pctFiltered.toFixed(0)}%`}
+          sublabel={dropped.length ? `${droppedLabel} dropped` : "nothing dropped"}
+          tooltip="Share of your current mempool sample that sits in the tiers your policy drops. A single-node indicator, not a standard-vs-reaper comparison."
+        />
         <StatCard
           label="Reaper"
           value={reaperOn ? "On" : "Off"}
           sublabel={reaperOn ? "stripping junk" : "not filtering"}
           tooltip="Whether the reaper is enabled. When on, it removes dead-code transactions from your mempool and the blocks you build."
         />
-        <StatCard
-          label="Mining policy"
-          value={policyLabel(config?.template_profile)}
-          sublabel="classes you'll mine"
-          tooltip="The tier policy applied when building blocks. Standard mines T0–T2; Bitcoin-only mines T0–T1; Everything mines all classes including T3."
-        />
-        <StatCard
-          label="Reaped this block"
-          value={hasBlock ? reaperStats!.last_block_reaped.toLocaleString() : "—"}
-          sublabel={hasBlock ? "junk txs dropped" : "no block yet"}
-          tooltip="Transactions the reaper dropped from the block your node is currently building. Per-block, not cumulative."
-        />
-        <StatCard
-          label="Dead weight cut"
-          value={hasBlock ? bytes(reaperStats!.last_block_dead_bytes) : "—"}
-          sublabel="reclaimed for real txs"
-          tooltip="Bytes of dead code stripped from the current block, returned to fee-paying transactions."
-        />
       </div>
 
-      {/* Funnel explainer */}
-      <SectionErrorBoundary section="How filtering works">
+      {/* Status readout — which settings are active */}
+      <SectionErrorBoundary section="Active settings">
         <Card>
           <CardHeader
-            title="How filtering works"
-            subtitle="Transactions flow through two gates. Follow the funnel from top to bottom."
+            title="What's active"
+            subtitle="The filtering your node is running right now."
           />
-          <Funnel reaperOn={reaperOn} />
+          <div className="space-y-3">
+            <StatusRow
+              label="Mode"
+              value={modeLabel(profile)}
+              desc={
+                dropped.length
+                  ? `Drops ${droppedLabel} — mines everything else.`
+                  : profile === "full_open"
+                    ? "Mines every class, including heavy data (T3)."
+                    : "The tier policy this node mines under."
+              }
+            />
+            <StatusRow
+              label="Reaper"
+              value={reaperOn ? "On" : "Off"}
+              desc={
+                reaperOn
+                  ? "Stripping dead-code transactions from your mempool and blocks."
+                  : "Not removing dead-code transactions."
+              }
+            />
+            <StatusRow
+              label="Advanced controls"
+              value={advancedEnabled ? "Enabled" : "Disabled"}
+              desc={
+                advancedEnabled
+                  ? "Per-vector reaper + custom policy controls are unlocked in Advanced."
+                  : "Basic presets only. Unlock per-vector controls in Advanced."
+              }
+            />
+            {pctFiltered !== null && (
+              <div style={{ color: "var(--fainter)", fontSize: "12px", lineHeight: "1.5" }}>
+                {droppedCount.toLocaleString()} of {sampled.toLocaleString()} sampled mempool transactions
+                sit in the tiers this node drops. This is a live single-node indicator of your current
+                mempool sample — not a standard-vs-reaper-vs-Knots comparison.
+              </div>
+            )}
+          </div>
         </Card>
+      </SectionErrorBoundary>
+
+      {/* Where to go next */}
+      <SectionErrorBoundary section="Configure filtering">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <NavCard
+            href="/filtering/basic"
+            title="Basic"
+            desc="Pick how much your node filters with one simple choice — the three tier presets, plus a live view of your mempool by class."
+          />
+          <NavCard
+            href="/filtering/advanced"
+            title="Advanced"
+            desc="Hand-tune the reaper's per-vector spam controls and a full custom tier policy. For confident operators only."
+          />
+        </div>
       </SectionErrorBoundary>
     </div>
   );
 }
 
-// ─── the funnel: incoming → mempool gate → your mempool → block gate → block ──
-
-function Funnel({ reaperOn }: { reaperOn: boolean }) {
-  return (
-    <div className="space-y-2">
-      <FunnelNode label="Incoming transactions" desc="Everything the network sends your node." tone="neutral" />
-      <Arrow />
-      <FunnelGate
-        title="Gate 1 · What you keep"
-        desc="The mempool reaper decides what your node stores and relays. Junk (inscriptions, runestones, dust) can be turned away here."
-        control={{ label: "Reaper settings", href: "/reaper" }}
-        active={reaperOn}
-      />
-      <Arrow />
-      <FunnelNode
-        label="Your mempool"
-        desc="What's left is sorted into four BUDS classes — from ordinary payments (T0) to abusive data (T3)."
-        tone="accent"
-        control={{ label: "See the classes", href: "/filtering/buds" }}
-      />
-      <Arrow />
-      <FunnelGate
-        title="Gate 2 · What you mine"
-        desc="When building a block, the reaper strips dead code and your policy drops whole classes you've chosen not to mine (e.g. no T3)."
-        control={{ label: "Policy & classes", href: "/filtering/buds" }}
-        active={reaperOn}
-      />
-      <Arrow />
-      <FunnelNode label="The block you build" desc="Clean, fee-paying transactions — the block your node mines." tone="success" />
-    </div>
-  );
-}
-
-function FunnelNode({
-  label,
-  desc,
-  tone,
-  control,
-}: {
-  label: string;
-  desc: string;
-  tone: "neutral" | "accent" | "success";
-  control?: { label: string; href: string };
-}) {
-  const border =
-    tone === "success" ? "#3fb95055" : tone === "accent" ? "var(--accent)" : "var(--rule)";
-  const bg = tone === "neutral" ? "var(--bg)" : "var(--surface)";
+function StatusRow({ label, value, desc }: { label: string; value: string; desc: string }) {
   return (
     <div
       style={{
         padding: "12px 14px",
-        border: `1px solid ${border}`,
-        borderRadius: "6px",
-        background: bg,
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        gap: "12px",
-        flexWrap: "wrap",
-      }}
-    >
-      <div>
-        <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>{label}</div>
-        <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px" }}>{desc}</div>
-      </div>
-      {control && (
-        <Link
-          href={control.href}
-          className="bare"
-          style={{ color: "var(--accent)", textDecoration: "underline", fontSize: "13px", whiteSpace: "nowrap" }}
-        >
-          {control.label} →
-        </Link>
-      )}
-    </div>
-  );
-}
-
-function FunnelGate({
-  title,
-  desc,
-  control,
-  active,
-}: {
-  title: string;
-  desc: string;
-  control: { label: string; href: string };
-  active: boolean;
-}) {
-  return (
-    <div
-      style={{
-        padding: "12px 14px",
-        border: `1px dashed ${active ? "var(--accent)" : "var(--rule)"}`,
+        border: "1px solid var(--rule)",
         borderRadius: "6px",
         background: "var(--bg)",
       }}
     >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
-        <div style={{ color: active ? "var(--accent)" : "var(--dim)", fontSize: "13px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-          {title}
-        </div>
-        <Link
-          href={control.href}
-          className="bare"
-          style={{ color: "var(--fg)", textDecoration: "underline", fontSize: "13px", whiteSpace: "nowrap" }}
-        >
-          {control.label} →
-        </Link>
+      <div className="flex items-center gap-2">
+        <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>{label}</span>
+        <span style={{ color: "var(--accent)", fontSize: "13px", fontWeight: 600 }}>{value}</span>
       </div>
-      <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "4px" }}>{desc}</div>
+      <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px" }}>{desc}</div>
     </div>
   );
 }
 
-function Arrow() {
+function NavCard({ href, title, desc }: { href: string; title: string; desc: string }) {
   return (
-    <div style={{ textAlign: "center", color: "var(--fainter)", fontSize: "14px", lineHeight: "1" }}>↓</div>
+    <Link href={href} className="bare">
+      <Card>
+        <div className="flex items-center justify-between gap-3" style={{ marginBottom: "4px" }}>
+          <span style={{ color: "var(--fg)", fontSize: "15px", fontWeight: 600 }}>{title}</span>
+          <span style={{ color: "var(--accent)", fontSize: "13px", whiteSpace: "nowrap" }}>Open →</span>
+        </div>
+        <div style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6" }}>{desc}</div>
+      </Card>
+    </Link>
   );
 }
