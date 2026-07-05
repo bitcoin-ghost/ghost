@@ -48,6 +48,28 @@ export interface NodeStatus {
   template_profile?: TemplateProfile | string;
 }
 
+// Chain & sync status, sourced from ghostd `getblockchaininfo`
+// (/api/v1/node/blockchain). Numeric fields are null when the RPC is
+// unavailable (available === false), so the UI degrades to "—".
+export interface BlockchainStatus {
+  available: boolean;
+  network?: string | null;
+  chain?: string | null;
+  blocks?: number | null;
+  headers?: number | null;
+  best_block_hash?: string | null;
+  difficulty?: number | null;
+  size_on_disk?: number | null;
+  verification_progress?: number | null;
+  initial_block_download?: boolean | null;
+  pruned?: boolean | null;
+  hazed?: boolean | null;
+  median_time?: number | null;
+  tip_time?: number | null;
+  chainwork?: string | null;
+  warnings?: string[] | null;
+}
+
 export interface NodeConfig {
   ghost_mode?: boolean;
   archive_mode?: boolean;

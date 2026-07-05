@@ -4,6 +4,7 @@ import {
   LayoutDashboard,
   Pickaxe,
   Activity,
+  RefreshCw,
   ShieldCheck,
   Gauge,
   Network as NetworkIcon,
@@ -61,6 +62,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
       { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
+      { href: "/sync", label: "Sync", icon: <RefreshCw {...ICON} /> },
       { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
     ],
   },
