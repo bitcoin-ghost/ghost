@@ -182,6 +182,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // API v1 routes for dashboard compatibility
         .route("/api/v1/node/status", get(api_node_status_handler))
         .route("/api/v1/node/info", get(api_node_info_handler))
+        .route("/api/v1/node/blockchain", get(api_node_blockchain_handler))
         .route("/api/v1/node/shares", get(api_node_shares_handler))
         .route("/api/v1/mining/status", get(api_mining_status_handler))
         .route("/api/v1/mining/miners", get(api_miners_handler))
@@ -1531,6 +1532,84 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "mempool_profile": config.mempool_profile,
         "template_profile": config.template_profile
     }))
+}
+
+/// API v1 node blockchain handler — chain & sync status for the Sync page.
+///
+/// Every field is sourced directly from ghostd's `getblockchaininfo` RPC (the
+/// same call the haze/mining handlers already use). This is the only endpoint
+/// that surfaces the header-tip height, on-disk size, verification progress,
+/// best-block hash, tip time and the initial-block-download flag — the node
+/// `status`/`info` endpoints only carry the block height from the health cache.
+///
+/// When the RPC is unavailable or times out, the numeric fields degrade to
+/// `null` (and `available: false`) so the dashboard renders "—" rather than a
+/// misleading zero.
+async fn api_node_blockchain_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let network = state.network.as_str();
+
+    let info = match state.rpc {
+        Some(ref rpc) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rpc.get_blockchain_info(),
+            )
+            .await
+            {
+                Ok(Ok(info)) => Some(info),
+                Ok(Err(e)) => {
+                    warn!("Failed to get blockchain info from RPC: {}", e);
+                    None
+                }
+                Err(_) => {
+                    warn!("Blockchain info RPC timed out");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    match info {
+        Some(info) => Json(serde_json::json!({
+            "available": true,
+            "network": network,
+            "chain": info.chain,
+            "blocks": info.blocks,
+            "headers": info.headers,
+            "best_block_hash": info.bestblockhash,
+            "difficulty": info.difficulty,
+            "size_on_disk": info.size_on_disk,
+            "verification_progress": info.verificationprogress,
+            "initial_block_download": info.initialblockdownload,
+            "pruned": info.pruned,
+            "hazed": info.hazed,
+            "median_time": info.mediantime,
+            "tip_time": info.time,
+            "chainwork": info.chainwork,
+            "warnings": info.warnings,
+        })),
+        None => Json(serde_json::json!({
+            "available": false,
+            "network": network,
+            "chain": serde_json::Value::Null,
+            "blocks": serde_json::Value::Null,
+            "headers": serde_json::Value::Null,
+            "best_block_hash": serde_json::Value::Null,
+            "difficulty": serde_json::Value::Null,
+            "size_on_disk": serde_json::Value::Null,
+            "verification_progress": serde_json::Value::Null,
+            "initial_block_download": serde_json::Value::Null,
+            "pruned": serde_json::Value::Null,
+            "hazed": serde_json::Value::Null,
+            "median_time": serde_json::Value::Null,
+            "tip_time": serde_json::Value::Null,
+            "chainwork": serde_json::Value::Null,
+            "warnings": serde_json::Value::Null,
+        })),
+    }
 }
 
 /// API v1 mining status handler
