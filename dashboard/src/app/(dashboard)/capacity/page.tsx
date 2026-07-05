@@ -140,7 +140,11 @@ export default function CapacityPage() {
   }
 
   const me = data.this_node;
-  const myPct = utilPct(me);
+  // Use this node's DEDUPED count for its own figures — the raw miner_count is a
+  // double-counted load-balancer metric that can exceed the mesh total (nonsense
+  // for a single node). Keeps the tile consistent with the peer table below.
+  const myMiners = me.deduped_miner_count ?? me.miner_count;
+  const myPct = me.max_capacity ? Math.round((myMiners * 100) / me.max_capacity) : 0;
 
   // Post-redeploy nodes report a `deduped_miner_count` per node that sums to the
   // deduped mesh total. When present, the peer table shows those (labelled just
@@ -176,7 +180,7 @@ export default function CapacityPage() {
           </div>
 
           <div className="grid grid-cols-2 md:grid-cols-4 gap-6 mb-6">
-            <Stat label="connected miners" value={me.miner_count.toLocaleString()} />
+            <Stat label="connected miners" value={myMiners.toLocaleString()} />
             <Stat label="capacity ceiling" value={me.max_capacity.toLocaleString()} />
             <Stat label="utilisation" value={`${myPct}%`} accent={utilColor(myPct)} />
             <Stat
@@ -194,7 +198,7 @@ export default function CapacityPage() {
             />
           </div>
 
-          <UtilisationBar pct={myPct} label={`${me.miner_count} of ${me.max_capacity} (${myPct}%)`} />
+          <UtilisationBar pct={myPct} label={`${myMiners} of ${me.max_capacity} (${myPct}%)`} />
         </Card>
       </SectionErrorBoundary>
 
