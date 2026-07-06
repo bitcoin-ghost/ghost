@@ -353,6 +353,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             get(api_config_template_profile_handler),
         )
         .route("/api/v1/config/reaper", get(api_config_reaper_handler))
+        .route("/api/v1/config/daemon", get(api_config_daemon_handler))
         .route("/api/v1/config/alerts", get(api_config_alerts_handler))
         .route(
             "/api/v1/config/ghost_pay",
@@ -487,6 +488,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_reaper_post_handler),
         )
         .route("/api/v1/config/tor", post(api_config_tor_post_handler))
+        .route(
+            "/api/v1/config/daemon",
+            post(api_config_daemon_post_handler),
+        )
         .route(
             "/api/v1/config/alerts",
             post(api_config_alerts_post_handler),
@@ -5416,6 +5421,40 @@ async fn api_config_reaper_handler(
     }))
 }
 
+/// API v1 Config daemon handler — returns the ghostd launch / daemon settings
+/// from the full node config (pool.toml `[node_launch]`), plus the terminal
+/// result of the last ghostd apply so the dashboard can show whether the change
+/// was picked up. All of these are ghostd startup flags, so a change requires a
+/// ghostd restart (handled by the POST path).
+async fn api_config_daemon_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let launch = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().node_launch.clone())
+        .unwrap_or_default();
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Json(serde_json::json!({
+        "settings": {
+            "max_mempool_mb": launch.max_mempool_mb,
+            "mempool_expiry_hours": launch.mempool_expiry_hours,
+            "max_connections": launch.max_connections,
+            "max_upload_target_mb": launch.max_upload_target_mb,
+            "dbcache_mb": launch.dbcache_mb,
+            "block_filter_index": launch.block_filter_index,
+            "peer_block_filters": launch.peer_block_filters,
+            "onlynet": launch.onlynet,
+            "i2p_sam": launch.i2p_sam,
+            "i2p_accept_incoming": launch.i2p_accept_incoming,
+        },
+        // Terminal result of the last automatic ghostd apply.
+        "ghostd_apply": apply,
+        "message": "ghostd daemon launch settings (restart-required)",
+    }))
+}
+
 /// API v1 Config ghost pay handler
 async fn api_config_ghost_pay_handler(
     State(state): State<Arc<VerificationState>>,
@@ -5722,6 +5761,223 @@ async fn api_config_tor_post_handler(
         } else {
             "Tor mode disabled. ghostd is restarting on clearnet; the pool will bounce once it settles."
         },
+    }))
+    .into_response()
+}
+
+/// Request body for the ghostd daemon-settings POST endpoint. Every field is an
+/// `Option`; a missing field clears the corresponding ghostd flag (falls back to
+/// ghostd's own default). Mirrors the `[node_launch]` daemon fields — `tor_mode`
+/// keeps its own `/config/tor` endpoint and is preserved here untouched.
+#[derive(Debug, Default, Deserialize)]
+struct DaemonSettingsRequest {
+    #[serde(default)]
+    max_mempool_mb: Option<u32>,
+    #[serde(default)]
+    mempool_expiry_hours: Option<u32>,
+    #[serde(default)]
+    max_connections: Option<u32>,
+    #[serde(default)]
+    max_upload_target_mb: Option<String>,
+    #[serde(default)]
+    dbcache_mb: Option<u32>,
+    #[serde(default)]
+    block_filter_index: Option<bool>,
+    #[serde(default)]
+    peer_block_filters: Option<bool>,
+    #[serde(default)]
+    onlynet: Option<Vec<String>>,
+    #[serde(default)]
+    i2p_sam: Option<String>,
+    #[serde(default)]
+    i2p_accept_incoming: Option<bool>,
+}
+
+/// Networks ghostd's `-onlynet` accepts (matches `GetNetworkNames()`).
+const VALID_ONLYNET: &[&str] = &["ipv4", "ipv6", "onion", "i2p", "cjdns"];
+
+/// Validate a `-maxuploadtarget` value: a non-negative integer with an optional
+/// single base-unit suffix `[k|K|m|M|g|G|t|T]`. `0` (no limit) is allowed.
+fn valid_upload_target(v: &str) -> bool {
+    if v.is_empty() {
+        return false;
+    }
+    let (num, _unit) = match v.chars().last() {
+        Some(c) if "kKmMgGtT".contains(c) => (&v[..v.len() - 1], Some(c)),
+        _ => (v, None),
+    };
+    !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) && num.parse::<u64>().is_ok()
+}
+
+/// Validate the incoming daemon settings, returning a human-readable reason on
+/// the first failure. Ranges are deliberately generous but reject nonsense that
+/// would make ghostd refuse to start or cripple this mining node.
+fn validate_daemon_settings(req: &DaemonSettingsRequest) -> Result<(), String> {
+    // Mempool must stay live for block templates; ghostd's floor is small but a
+    // few MB is the practical minimum. Cap well above any realistic value.
+    if let Some(mb) = req.max_mempool_mb {
+        if !(5..=100_000).contains(&mb) {
+            return Err(format!("max_mempool_mb must be 5..=100000 MB (got {mb})"));
+        }
+    }
+    if let Some(h) = req.mempool_expiry_hours {
+        if !(1..=8_760).contains(&h) {
+            return Err(format!(
+                "mempool_expiry_hours must be 1..=8760 hours (got {h})"
+            ));
+        }
+    }
+    // maxconnections=0 would disable listening/dnsseed — unacceptable for a
+    // mining node — so require a sane floor.
+    if let Some(n) = req.max_connections {
+        if !(8..=10_000).contains(&n) {
+            return Err(format!("max_connections must be 8..=10000 (got {n})"));
+        }
+    }
+    if let Some(ref t) = req.max_upload_target_mb {
+        if !valid_upload_target(t) {
+            return Err(format!(
+                "max_upload_target_mb must be a number with optional unit [k|K|m|M|g|G|t|T] (got {t:?})"
+            ));
+        }
+    }
+    if let Some(mb) = req.dbcache_mb {
+        if !(4..=1_000_000).contains(&mb) {
+            return Err(format!("dbcache_mb must be 4..=1000000 MB (got {mb})"));
+        }
+    }
+    if let Some(ref nets) = req.onlynet {
+        for net in nets {
+            let n = net.trim().to_ascii_lowercase();
+            if !VALID_ONLYNET.contains(&n.as_str()) {
+                return Err(format!(
+                    "onlynet entry {net:?} invalid; allowed: {}",
+                    VALID_ONLYNET.join(", ")
+                ));
+            }
+        }
+    }
+    // ghostd refuses to start with -peerblockfilters unless the block-filter
+    // index is also enabled, so reject that combination up front.
+    if req.peer_block_filters == Some(true) && req.block_filter_index != Some(true) {
+        return Err(
+            "peer_block_filters (BIP157) requires block_filter_index to be enabled too".to_string(),
+        );
+    }
+    // I2P SAM proxy must be host:port with a numeric port.
+    if let Some(ref sam) = req.i2p_sam {
+        let ok = sam
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+        if !ok {
+            return Err(format!("i2p_sam must be host:port with a numeric port (got {sam:?})"));
+        }
+    }
+    if req.i2p_accept_incoming == Some(true) && req.i2p_sam.is_none() {
+        return Err("i2p_accept_incoming requires i2p_sam to be set".to_string());
+    }
+    Ok(())
+}
+
+/// API v1 Config daemon POST handler — sets ghostd launch flags (mempool,
+/// connectivity, performance, BIP157 indexes, onlynet, I2P).
+///
+/// ghostd reads all of these only at startup, so — exactly like `-tormode` and
+/// the `-ghostreaper` flags — this persists `[node_launch]` to pool.toml and
+/// then reuses `spawn_ghostd_reaper_apply`, which runs `ghost-setup apply-reaper`
+/// to regenerate the combined managed drop-in and RESTART ghostd, then bounces
+/// ghost-pool. The response returns promptly with the apply *initiated*; the
+/// terminal result lands on the `/config/daemon` GET endpoint's `ghostd_apply`.
+async fn api_config_daemon_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<DaemonSettingsRequest>,
+) -> impl IntoResponse {
+    // Validate before touching anything; reject nonsense with 400.
+    if let Err(reason) = validate_daemon_settings(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": reason,
+                "code": "INVALID_DAEMON_SETTINGS",
+            })),
+        )
+            .into_response();
+    }
+
+    // Require the full node config + a path to persist to; otherwise the change
+    // can't survive a restart, so fail-closed with SERVICE_UNAVAILABLE.
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    {
+        let mut cfg = full.write();
+        // tor_mode is owned by /config/tor — preserve it. Overwrite the daemon
+        // fields wholesale from the request (a missing field clears the flag,
+        // reverting to ghostd's default), normalising onlynet entries.
+        let launch = &mut cfg.node_launch;
+        launch.max_mempool_mb = payload.max_mempool_mb;
+        launch.mempool_expiry_hours = payload.mempool_expiry_hours;
+        launch.max_connections = payload.max_connections;
+        launch.max_upload_target_mb = payload.max_upload_target_mb.clone();
+        launch.dbcache_mb = payload.dbcache_mb;
+        launch.block_filter_index = payload.block_filter_index;
+        launch.peer_block_filters = payload.peer_block_filters;
+        launch.onlynet = payload
+            .onlynet
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| n.trim().to_ascii_lowercase())
+            .collect();
+        launch.i2p_sam = payload.i2p_sam.clone();
+        launch.i2p_accept_incoming = payload.i2p_accept_incoming;
+
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist daemon settings");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist daemon settings: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Apply the ghostd flags (restarts ghostd) then bounce the pool. Shares the
+    // reaper apply path because the drop-in carries all ghost-managed flags.
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
+
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Json(serde_json::json!({
+        "success": true,
+        "ghostd_apply": apply,
+        "restart_pending": true,
+        "message": "Daemon settings saved. ghostd is restarting to apply the new launch flags; the pool will bounce once it settles.",
     }))
     .into_response()
 }
@@ -8726,6 +8982,81 @@ mod tests {
                 "malformed new_hash {bad:?} must fall back to current"
             );
         }
+    }
+
+    #[test]
+    fn test_valid_upload_target() {
+        for ok in ["0", "500", "500M", "2G", "1t", "100k"] {
+            assert!(valid_upload_target(ok), "{ok:?} should be valid");
+        }
+        for bad in ["", "M", "5x", "-1", "1.5G", "5 M", "GG"] {
+            assert!(!valid_upload_target(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_validate_daemon_settings_accepts_sane_and_rejects_nonsense() {
+        // A fully-populated, sane request passes.
+        let good = DaemonSettingsRequest {
+            max_mempool_mb: Some(600),
+            mempool_expiry_hours: Some(72),
+            max_connections: Some(40),
+            max_upload_target_mb: Some("1G".to_string()),
+            dbcache_mb: Some(2048),
+            block_filter_index: Some(true),
+            peer_block_filters: Some(true),
+            onlynet: Some(vec!["onion".to_string(), "IPv4".to_string()]),
+            i2p_sam: Some("127.0.0.1:7656".to_string()),
+            i2p_accept_incoming: Some(true),
+        };
+        assert!(validate_daemon_settings(&good).is_ok());
+
+        // An all-None request (clear everything back to ghostd defaults) passes.
+        assert!(validate_daemon_settings(&DaemonSettingsRequest::default()).is_ok());
+
+        // Out-of-range scalars are rejected.
+        assert!(validate_daemon_settings(&DaemonSettingsRequest {
+            max_mempool_mb: Some(1),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(validate_daemon_settings(&DaemonSettingsRequest {
+            max_connections: Some(0),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(validate_daemon_settings(&DaemonSettingsRequest {
+            mempool_expiry_hours: Some(0),
+            ..Default::default()
+        })
+        .is_err());
+
+        // Unknown onlynet value rejected.
+        assert!(validate_daemon_settings(&DaemonSettingsRequest {
+            onlynet: Some(vec!["moonnet".to_string()]),
+            ..Default::default()
+        })
+        .is_err());
+
+        // BIP157: peerblockfilters without blockfilterindex is rejected.
+        assert!(validate_daemon_settings(&DaemonSettingsRequest {
+            peer_block_filters: Some(true),
+            block_filter_index: None,
+            ..Default::default()
+        })
+        .is_err());
+
+        // I2P: accept-incoming without a SAM proxy, and a malformed SAM address.
+        assert!(validate_daemon_settings(&DaemonSettingsRequest {
+            i2p_accept_incoming: Some(true),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(validate_daemon_settings(&DaemonSettingsRequest {
+            i2p_sam: Some("no-port".to_string()),
+            ..Default::default()
+        })
+        .is_err());
     }
 
     #[test]
