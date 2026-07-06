@@ -6962,6 +6962,7 @@ async fn main() -> Result<()> {
         let alerts_for_tip = Arc::clone(&alert_dispatcher);
         ghost_pool::alert_monitors::spawn_behind_tip_monitor(
             alerts_for_tip,
+            Arc::clone(&verification_state.chain_health),
             move || rm_for_tip.current_height(),
             move || {
                 // Highest L1 height reported by a fresh, connected mesh peer
@@ -8090,9 +8091,14 @@ async fn main() -> Result<()> {
         // operator-alert dispatcher so the existing reorg-detection point also
         // fires a `ReorgDetected` alert (gated on the operator's event flag).
         let block_events = zmq_subscriber.subscribe_block_events();
+        let rm_for_reorg = Arc::clone(&round_manager);
         let reorg_handler = ReorgHandler::new(Arc::clone(&db), ReorgConfig::default())
             .with_vote_handler(Arc::clone(&vote_handler))
-            .with_alert_dispatcher(Arc::clone(&alert_dispatcher));
+            .with_alert_dispatcher(Arc::clone(&alert_dispatcher))
+            // Record each detected reorg into the shared chain-health ring so the
+            // Sync page's Chain Health view can display it (not just alert).
+            .with_chain_health(Arc::clone(&verification_state.chain_health))
+            .with_height_getter(move || rm_for_reorg.current_height());
         reorg_handler.start(block_events);
 
         info!("ZMQ block watcher connected to {}", zmq_endpoint);

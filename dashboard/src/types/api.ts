@@ -331,6 +331,46 @@ export interface PoolSeriesResponse {
   samples: PoolSeriesSample[];
 }
 
+// Chain health (GET /api/v1/chain/health) — the current tip-lag status plus
+// recently recorded reorg events. Persisted server-side in a bounded ring, so
+// operators can SEE reorgs and tip-lag (both historically only fired alerts).
+
+/** Derived tip-lag status label. `at_tip` is the normal, healthy state. */
+export type TipStatusKind = "at_tip" | "behind" | "stale";
+
+export interface ChainTipStatus {
+  /** This node's current local L1 height. */
+  local_height: number;
+  /** Highest L1 height reported by a fresh connected mesh peer (0 = unknown). */
+  best_peer_height: number;
+  /** How many blocks behind the best peer (0 when caught up or peer unknown). */
+  behind_by: number;
+  /** Seconds since the local height last advanced (tip age). */
+  tip_age_secs: number;
+  /** Derived status label. */
+  status: TipStatusKind;
+}
+
+export interface ChainReorgEvent {
+  /** Unix timestamp (seconds) the reorg was recorded. */
+  unix_time: number;
+  /** Consecutive-disconnect depth when this block was orphaned. */
+  depth: number;
+  /** Hash of the disconnected (orphaned) block — the old tip. */
+  old_tip_hash: string;
+  /** Local height right after the disconnect, when a height source is wired. */
+  new_tip_height?: number;
+}
+
+export interface ChainHealthResponse {
+  /** Latest tip-status snapshot; null until the monitor has run once. */
+  tip: ChainTipStatus | null;
+  /** Recently recorded reorg events, newest first. */
+  reorgs: ChainReorgEvent[];
+  /** Reorgs recorded in the last 24h; 0 is the normal, healthy state. */
+  reorg_count_24h: number;
+}
+
 // Mesh-wide leaderboard (GET /api/v1/pool/mesh-leaderboard) — node-ranked
 // leaderboard + mesh-wide best-share records per window, aggregated with no new
 // gossip.

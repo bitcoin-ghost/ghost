@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getNodeInfo, getNodeStatus, getBlockchainStatus, getShares, getHealth, getNickname, setNickname } from '@/lib/api/node';
+import { getNodeInfo, getNodeStatus, getBlockchainStatus, getChainHealth, getShares, getHealth, getNickname, setNickname } from '@/lib/api/node';
 import { useNodeStore } from '@/stores';
 
 // Query keys for consistency
@@ -8,6 +8,7 @@ export const nodeKeys = {
   info: () => [...nodeKeys.all, 'info'] as const,
   status: () => [...nodeKeys.all, 'status'] as const,
   blockchain: () => [...nodeKeys.all, 'blockchain'] as const,
+  chainHealth: () => [...nodeKeys.all, 'chain-health'] as const,
   shares: () => [...nodeKeys.all, 'shares'] as const,
   health: () => [...nodeKeys.all, 'health'] as const,
   nickname: () => [...nodeKeys.all, 'nickname'] as const,
@@ -46,6 +47,14 @@ export function useBlockchainStatus(options?: { refetchInterval?: number }) {
     queryKey: nodeKeys.blockchain(),
     queryFn: getBlockchainStatus,
     refetchInterval: options?.refetchInterval ?? 10_000, // Poll every 10 seconds
+  });
+}
+
+export function useChainHealth(options?: { refetchInterval?: number }) {
+  return useQuery({
+    queryKey: nodeKeys.chainHealth(),
+    queryFn: getChainHealth,
+    refetchInterval: options?.refetchInterval ?? 30_000, // Poll every 30 seconds
   });
 }
 

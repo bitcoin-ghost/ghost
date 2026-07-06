@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use ghost_common::rpc::BitcoinRpc;
 use ghost_verification::alerts::{AlertDispatcher, AlertEvent};
+use ghost_verification::chain_health::{derive_tip_status, ChainHealth};
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
@@ -158,8 +159,14 @@ async fn read_versions(installed_fallback: &str) -> Option<(String, String)> {
 /// Spawn the behind-tip monitor. `local_height` reads this node's current L1
 /// height; `best_peer_height` reads the highest L1 height reported by a
 /// connected mesh peer (0 when none is known). Runs until `shutdown` fires.
+///
+/// On each tick it also records a derived tip-status snapshot into the shared
+/// [`ChainHealth`] holder (same inputs it evaluates for the alert), so the Sync
+/// page's Chain Health view can display the live tip-lag status — not just be
+/// paged when the node falls behind.
 pub fn spawn_behind_tip_monitor<L, P>(
     alerts: Arc<AlertDispatcher>,
+    chain_health: Arc<ChainHealth>,
     local_height: L,
     best_peer_height: P,
     mut shutdown: broadcast::Receiver<()>,
@@ -184,6 +191,16 @@ pub fn spawn_behind_tip_monitor<L, P>(
                     }
                     let best_peer = best_peer_height();
                     let tip_age = last_change.elapsed().as_secs();
+                    // Record the derived tip status for the Chain Health view,
+                    // using the same thresholds the alert below evaluates so the
+                    // displayed status and the fired alert always agree.
+                    chain_health.set_tip(derive_tip_status(
+                        local,
+                        best_peer,
+                        tip_age,
+                        BEHIND_TIP_LAG_BLOCKS,
+                        BEHIND_TIP_MAX_AGE_SECS,
+                    ));
                     let detail = evaluate_behind_tip(
                         local,
                         best_peer,
