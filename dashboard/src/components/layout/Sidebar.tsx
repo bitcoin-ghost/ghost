@@ -86,9 +86,9 @@ const GROUPS: NavGroup[] = [
     label: "ghost pool",
     items: [
       { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
-      { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
       { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
       { href: "/pool", label: "Node Pool", icon: <Boxes {...ICON} /> },
+      { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
     ],
   },
   {
