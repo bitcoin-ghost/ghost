@@ -35,12 +35,13 @@
 
 use ghost_common::config::AlertsConfig;
 use serde::Serialize;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// A watched node event. `label`/`title` produce operator-facing copy; the
 /// caller supplies a free-form `detail` string at the trigger site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AlertEvent {
     /// Node became unreachable / unhealthy.
     NodeOffline,
@@ -163,6 +164,129 @@ pub async fn dispatch_event(
     }
     let msg = AlertMessage::for_event(event, node_id, detail);
     Some(deliver(cfg, &msg).await)
+}
+
+/// Debouncing dispatcher that owns the self node id and a live view of the
+/// operator's `AlertsConfig`, so trigger sites can fire watched events without
+/// re-reading config or open-coding their own anti-spam. One shared instance
+/// (`Arc<AlertDispatcher>`) is cloned into every trigger site.
+///
+/// Three fire modes suit the shapes the trigger sites actually have:
+///
+/// * [`AlertDispatcher::fire_edge`] — edge-triggered: dispatches only when a
+///   condition (keyed by an arbitrary sub-key, e.g. a peer id or capability
+///   name) first becomes true, and re-arms when it clears. For level signals
+///   that persist across polling ticks (low disk, capability drift, a peer
+///   staying offline). Without this, a periodic check re-fires every tick.
+/// * [`AlertDispatcher::fire_rate_limited`] — dispatches at most once per
+///   `min_interval` per event. For repeating conditions with no natural
+///   "cleared" edge (a dropping peer count).
+/// * [`AlertDispatcher::fire`] — dispatches unconditionally. For naturally
+///   discrete one-shot events (block found, restart requested).
+///
+/// The config closure is evaluated on every dispatch so live edits to
+/// `[alerts]` (via the config API, which mutates `full_node_config`) take
+/// effect immediately — no stale startup snapshot.
+pub struct AlertDispatcher {
+    node_id: String,
+    config: Box<dyn Fn() -> AlertsConfig + Send + Sync>,
+    /// Currently-active edge conditions, keyed by `(event, sub-key)`.
+    edges: parking_lot::Mutex<HashSet<(AlertEvent, String)>>,
+    /// Last dispatch instant per event, for rate limiting.
+    rate: parking_lot::Mutex<HashMap<AlertEvent, Instant>>,
+}
+
+impl AlertDispatcher {
+    /// Build a dispatcher for this node. `config` is called on every dispatch
+    /// to read the current `[alerts]` config (wire it to the live
+    /// `full_node_config` so operator edits apply without a restart).
+    pub fn new(
+        node_id: String,
+        config: impl Fn() -> AlertsConfig + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            node_id,
+            config: Box::new(config),
+            edges: parking_lot::Mutex::new(HashSet::new()),
+            rate: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Update the edge state for `(event, key)` and report whether a dispatch
+    /// should happen now (i.e. the condition *just* became active). Pure — no
+    /// I/O — so the debounce is unit-testable on its own.
+    fn arm_edge(&self, event: AlertEvent, key: &str, active: bool) -> bool {
+        let mut edges = self.edges.lock();
+        if active {
+            // `insert` returns true only if it was not already present, i.e.
+            // this is the rising edge.
+            edges.insert((event, key.to_string()))
+        } else {
+            edges.remove(&(event, key.to_string()));
+            false
+        }
+    }
+
+    /// Update the rate-limit clock for `event`; report whether `min_interval`
+    /// has elapsed since the last dispatch. Pure — no I/O.
+    fn arm_rate(&self, event: AlertEvent, min_interval: Duration) -> bool {
+        let mut rate = self.rate.lock();
+        let now = Instant::now();
+        match rate.get(&event) {
+            Some(&last) if now.duration_since(last) < min_interval => false,
+            _ => {
+                rate.insert(event, now);
+                true
+            }
+        }
+    }
+
+    /// Edge-triggered dispatch. Fires once when `active` first becomes true for
+    /// `(event, key)`, and re-arms when `active` returns to false. Returns
+    /// whether an alert was actually delivered.
+    pub async fn fire_edge(
+        &self,
+        event: AlertEvent,
+        key: &str,
+        active: bool,
+        detail: &str,
+    ) -> bool {
+        if !self.arm_edge(event, key, active) {
+            return false;
+        }
+        dispatch_event(&(self.config)(), event, &self.node_id, detail)
+            .await
+            .is_some()
+    }
+
+    /// Rate-limited dispatch. Fires at most once per `min_interval` per event.
+    pub async fn fire_rate_limited(
+        &self,
+        event: AlertEvent,
+        min_interval: Duration,
+        detail: &str,
+    ) -> bool {
+        if !self.arm_rate(event, min_interval) {
+            return false;
+        }
+        dispatch_event(&(self.config)(), event, &self.node_id, detail)
+            .await
+            .is_some()
+    }
+
+    /// Unconditional dispatch for naturally-discrete events.
+    pub async fn fire(&self, event: AlertEvent, detail: &str) -> bool {
+        dispatch_event(&(self.config)(), event, &self.node_id, detail)
+            .await
+            .is_some()
+    }
+
+    /// Whether the edge condition for `(event, key)` is currently marked active.
+    /// Read-only introspection for diagnostics and for tests that assert a
+    /// trigger site reached `fire_edge`.
+    pub fn is_edge_active(&self, event: AlertEvent, key: &str) -> bool {
+        self.edges.lock().contains(&(event, key.to_string()))
+    }
 }
 
 async fn deliver_telegram(
@@ -333,5 +457,91 @@ mod tests {
         let m = AlertMessage::for_event(AlertEvent::LowDisk, "abcdef0123456789", "");
         assert!(m.title.contains("Low disk"));
         assert!(!m.body.is_empty());
+    }
+
+    /// A config that is on and enables one event, with all channels disabled —
+    /// so `dispatch_event` returns `Some` (it fired) but no network I/O happens
+    /// (every channel is skipped). Lets us assert the trigger→dispatch wiring
+    /// deterministically without HTTP.
+    fn enabled_for(pick: impl Fn(&mut AlertEvents)) -> impl Fn() -> AlertsConfig {
+        move || {
+            let mut c = base();
+            // Start from all-off so the test only exercises the event we pick.
+            let mut events = AlertEvents {
+                node_offline: false,
+                capability_drift: false,
+                low_disk: false,
+                restart_needed: false,
+                peer_count_drop: false,
+                block_found: false,
+            };
+            pick(&mut events);
+            c.events = events;
+            c
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_fires_once_then_suppresses_until_rearmed() {
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.low_disk = true));
+        // Rising edge -> dispatched.
+        assert!(d.fire_edge(AlertEvent::LowDisk, "/", true, "d").await);
+        // Still active -> suppressed (no spam).
+        assert!(!d.fire_edge(AlertEvent::LowDisk, "/", true, "d").await);
+        // Condition clears -> no dispatch, re-arms.
+        assert!(!d.fire_edge(AlertEvent::LowDisk, "/", false, "d").await);
+        // Rising edge again -> dispatched.
+        assert!(d.fire_edge(AlertEvent::LowDisk, "/", true, "d").await);
+    }
+
+    #[tokio::test]
+    async fn edge_keys_are_independent() {
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.node_offline = true));
+        // Two different peers offline -> two independent alerts.
+        assert!(d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d").await);
+        assert!(d.fire_edge(AlertEvent::NodeOffline, "peerB", true, "d").await);
+        // Re-reporting peerA -> suppressed.
+        assert!(!d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d").await);
+    }
+
+    #[tokio::test]
+    async fn edge_respects_master_and_event_flags() {
+        // Master off -> never dispatches even on a rising edge.
+        let d = AlertDispatcher::new("node".into(), || {
+            let mut c = base();
+            c.enabled = false;
+            c
+        });
+        assert!(!d.fire_edge(AlertEvent::LowDisk, "/", true, "d").await);
+
+        // Master on but this event disabled -> no dispatch.
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.block_found = true));
+        assert!(!d.fire_edge(AlertEvent::LowDisk, "/", true, "d").await);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_suppresses_within_window() {
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.peer_count_drop = true));
+        assert!(
+            d.fire_rate_limited(AlertEvent::PeerCountDrop, Duration::from_secs(60), "d")
+                .await
+        );
+        // Second call inside the window -> suppressed.
+        assert!(
+            !d.fire_rate_limited(AlertEvent::PeerCountDrop, Duration::from_secs(60), "d")
+                .await
+        );
+        // A zero window always allows.
+        assert!(
+            d.fire_rate_limited(AlertEvent::PeerCountDrop, Duration::from_secs(0), "d")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_unconditional_dispatches_each_call() {
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.block_found = true));
+        assert!(d.fire(AlertEvent::BlockFound, "block 1").await);
+        assert!(d.fire(AlertEvent::BlockFound, "block 2").await);
     }
 }

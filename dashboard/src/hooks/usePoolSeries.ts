@@ -1,26 +1,29 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { useMiningStatus, usePoolStatus, miningKeys, networkKeys } from '@/hooks/queries';
+import {
+  useMiningStatus,
+  usePoolStatus,
+  usePoolSeriesHistory,
+  miningKeys,
+  networkKeys,
+} from '@/hooks/queries';
 import type { MiningStatus, PoolStatus } from '@/types/api';
 
 /**
- * Session-scoped rolling time-series for the Node Pool page.
+ * Rolling time-series for the Node Pool page.
  *
- * The node API exposes only *current* pool values (hashrate, miner count,
- * share tallies) — there is no historical time-series endpoint. So the graphs
- * are driven from a client-side rolling buffer: every time the mining-status
- * query refetches (~5s) we append the latest reading. The buffer lives for the
- * session only (it resets on reload) and is labelled "live (session)" in the UI.
+ * Preferred source is the backend `GET /api/v1/pool/series` endpoint, a
+ * server-side ring sampled every 30s (survives reloads, covers up to 24h). When
+ * that ring is still empty (fresh node / just-restarted) the hook falls back to
+ * a client-side session buffer: every time the mining-status query refetches
+ * (~5s) we append the latest reading. Session accumulation is driven by
+ * subscribing to the react-query cache (an external system) — the idiomatic
+ * pattern for syncing external updates into state.
  *
- * Accumulation is driven by subscribing to the react-query cache (an external
- * system) and appending in the subscription callback — the idiomatic pattern
- * for syncing external updates into state.
- *
- * Backend follow-up: persisting these series server-side (e.g. 1-minute
- * roll-ups of pool hashrate / miner count / accept-rate) would let the charts
- * survive reloads and show longer windows than a single session.
+ * Share accept-rate has no backend series (the node exposes cumulative counters,
+ * not a rate history) so that chart is always session-derived.
  */
 
 export interface SeriesPoint {
@@ -35,22 +38,35 @@ export interface PoolSeries {
   nodeHashrate: SeriesPoint[];
   /** Connected miners across the mesh. */
   miners: SeriesPoint[];
-  /** Share accept-rate, 0–100. */
+  /** Share accept-rate, 0–100 (always session-derived). */
   acceptRate: SeriesPoint[];
-  /** Number of samples collected this session. */
+  /** Number of samples collected this session (session buffer). */
   sampleCount: number;
+  /** True when the hashrate/miner charts are backed by server-side history. */
+  serverBacked: boolean;
 }
 
 const MAX_POINTS = 240; // ~20 min at a 5s poll
+
+interface SessionSeries {
+  meshHashrate: SeriesPoint[];
+  nodeHashrate: SeriesPoint[];
+  miners: SeriesPoint[];
+  acceptRate: SeriesPoint[];
+  sampleCount: number;
+}
 
 export function usePoolSeries(): PoolSeries {
   // Keep the underlying queries active (and shared via the react-query cache)
   // so there is always fresh data to sample.
   useMiningStatus();
   usePoolStatus();
+  // Server-side history (1h window). Falls back silently to the session buffer
+  // when the endpoint is empty or unavailable on older nodes.
+  const { data: history } = usePoolSeriesHistory('1h');
 
   const queryClient = useQueryClient();
-  const [series, setSeries] = useState<PoolSeries>({
+  const [session, setSession] = useState<SessionSeries>({
     meshHashrate: [],
     nodeHashrate: [],
     miners: [],
@@ -91,7 +107,7 @@ export function usePoolSeries(): PoolSeries {
         return next.length > MAX_POINTS ? next.slice(next.length - MAX_POINTS) : next;
       };
 
-      setSeries((prev) => ({
+      setSession((prev) => ({
         meshHashrate: push(prev.meshHashrate, meshTh * 1e12),
         nodeHashrate: push(prev.nodeHashrate, nodeTh * 1e12),
         miners: push(prev.miners, miners),
@@ -106,5 +122,23 @@ export function usePoolSeries(): PoolSeries {
     return unsubscribe;
   }, [queryClient]);
 
-  return series;
+  // Merge: prefer the server ring for hashrate/miner charts once it has enough
+  // points to draw a meaningful line; otherwise use the session buffer. Chart
+  // values are H/s (TH/s * 1e12) to match the session buffer's units.
+  return useMemo<PoolSeries>(() => {
+    const samples = history?.samples ?? [];
+    const serverBacked = samples.length >= 2;
+    if (serverBacked) {
+      return {
+        meshHashrate: samples.map((s) => ({ t: s.t, v: s.mesh_hashrate_th * 1e12 })),
+        nodeHashrate: samples.map((s) => ({ t: s.t, v: s.local_hashrate_th * 1e12 })),
+        miners: samples.map((s) => ({ t: s.t, v: s.miners })),
+        // No backend accept-rate series — keep the session-derived one.
+        acceptRate: session.acceptRate,
+        sampleCount: session.sampleCount,
+        serverBacked: true,
+      };
+    }
+    return { ...session, serverBacked: false };
+  }, [history, session]);
 }

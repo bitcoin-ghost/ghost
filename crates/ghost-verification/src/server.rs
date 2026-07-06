@@ -1369,6 +1369,11 @@ pub struct VerificationState {
     stratum_verify_cache: parking_lot::Mutex<
         std::collections::HashMap<(StratumProtocol, u16), (Instant, StratumResponse)>,
     >,
+    /// Rolling in-memory time-series of pool-wide hashrate + connected miners,
+    /// fed by a periodic sampler task in `bins/ghost-pool` and exposed via
+    /// `GET /api/v1/pool/series`. Bounded ring; empty until the first sample
+    /// (the dashboard keeps its client-side session buffer as a fallback).
+    pub pool_series: crate::pool_series::PoolSeries,
 }
 
 /// TTL for cached stratum self-verification results. Verification cycles run
@@ -1521,6 +1526,8 @@ impl VerificationState {
             glyph_registered_relay_fn: None,
             l2_tree_state_fn: None,
             stratum_verify_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            // 24h of history at the sampler's 30s cadence (2880 samples).
+            pool_series: crate::pool_series::PoolSeries::new(2880),
         }
     }
 

@@ -17,12 +17,17 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use ghost_common::config::{MiningMode, NodeConfig};
+use ghost_verification::alerts::{AlertDispatcher, AlertEvent};
 
 /// Run all four checks every 30s. Cheap (sub-second total) and covers most
 /// operator drift scenarios without flooding logs.
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
 /// Minimum free disk space for a meaningful Archive claim (700 GB).
 const ARCHIVE_MIN_FREE_BYTES: u64 = 700 * 1024 * 1024 * 1024;
+/// Free-space floor for the general LowDisk operator alert on the data
+/// partition (independent of the Archive claim). A node needs headroom for the
+/// growing SQLite DB + WAL; dropping below this warrants operator attention.
+const LOW_DISK_MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CapabilityCheck {
@@ -70,8 +75,10 @@ impl SelfCheck {
 
     /// Run all probes once and update internal state. Logs at INFO when a
     /// capability transitions between passed/failed; doesn't spam on
-    /// stable state.
-    pub async fn run_once(&self, config: &NodeConfig) {
+    /// stable state. When `alerts` is provided, also fires edge-triggered
+    /// CapabilityDrift / LowDisk operator alerts (the dispatcher debounces, so
+    /// each is delivered once per transition, not every tick).
+    pub async fn run_once(&self, config: &NodeConfig, alerts: Option<&Arc<AlertDispatcher>>) {
         let public_mining = check_public_mining(config).await;
         let archive = check_archive(config);
         let ghost_pay = check_ghost_pay(config).await;
@@ -86,22 +93,86 @@ impl SelfCheck {
 
         let prev = self.snapshot();
         log_transitions(&prev, &next);
+
+        if let Some(alerts) = alerts {
+            fire_capability_drift_alerts(alerts, &next).await;
+            fire_low_disk_alert(alerts, config).await;
+        }
+
         *self.state.write() = next;
     }
 
     /// Spawn a background task that re-runs all probes every TICK_INTERVAL.
-    /// The handle is detached — caller doesn't await it.
-    pub fn spawn_loop(self, config: Arc<NodeConfig>) {
+    /// The handle is detached — caller doesn't await it. `alerts` (when set)
+    /// wires the loop into the operator alert pipeline.
+    pub fn spawn_loop(self, config: Arc<NodeConfig>, alerts: Option<Arc<AlertDispatcher>>) {
         tokio::spawn(async move {
             // Run once immediately so the dashboard has something to show.
-            self.run_once(&config).await;
+            self.run_once(&config, alerts.as_ref()).await;
             let mut interval = tokio::time::interval(TICK_INTERVAL);
             interval.tick().await; // consume the immediate tick
             loop {
                 interval.tick().await;
-                self.run_once(&config).await;
+                self.run_once(&config, alerts.as_ref()).await;
             }
         });
+    }
+}
+
+/// Fire a CapabilityDrift alert for every capability that is claimed in config
+/// but whose prerequisite probe is currently failing. Edge-triggered inside the
+/// dispatcher (keyed by capability name): one alert per pass→fail transition,
+/// re-armed when the prerequisite recovers.
+async fn fire_capability_drift_alerts(alerts: &Arc<AlertDispatcher>, next: &SelfCheckState) {
+    for (name, check) in [
+        ("public_mining", &next.public_mining),
+        ("archive", &next.archive),
+        ("ghost_pay", &next.ghost_pay),
+        ("reaper", &next.reaper),
+    ] {
+        let active = check.claimed && !check.passed;
+        let detail = format!(
+            "Capability '{name}' is claimed but its prerequisite check is failing: {}",
+            check.reason.as_deref().unwrap_or("unknown")
+        );
+        alerts
+            .fire_edge(AlertEvent::CapabilityDrift, name, active, &detail)
+            .await;
+    }
+}
+
+/// Fire a LowDisk alert when free space on the data partition drops below
+/// [`LOW_DISK_MIN_FREE_BYTES`]. Edge-triggered: one alert on crossing the
+/// threshold, re-armed when free space recovers. A stat failure is treated as
+/// "unknown" (no alert either way) to avoid false positives.
+async fn fire_low_disk_alert(alerts: &Arc<AlertDispatcher>, config: &NodeConfig) {
+    let probe_path = data_probe_path(config);
+    let Some(free) = free_bytes(&probe_path) else {
+        return;
+    };
+    let active = free < LOW_DISK_MIN_FREE_BYTES;
+    let detail = format!(
+        "Low disk space: only {} GiB free at {} (alert threshold {} GiB).",
+        free / (1024 * 1024 * 1024),
+        probe_path.display(),
+        LOW_DISK_MIN_FREE_BYTES / (1024 * 1024 * 1024)
+    );
+    alerts
+        .fire_edge(AlertEvent::LowDisk, "data_dir", active, &detail)
+        .await;
+}
+
+/// Resolve a stat-able path for the data partition: the configured `db_path`
+/// if it exists, else its parent (the DB may not be created yet), else `/`.
+fn data_probe_path(config: &NodeConfig) -> std::path::PathBuf {
+    let configured = config.storage.db_path.as_path();
+    if configured.exists() {
+        configured.to_path_buf()
+    } else {
+        configured
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
     }
 }
 
@@ -203,14 +274,7 @@ fn check_archive(config: &NodeConfig) -> CapabilityCheck {
     // wants something that exists. Fall back to its parent so we still report
     // disk-free of the partition that will hold the archive.
     let configured = config.storage.db_path.as_path();
-    let probe_path = if configured.exists() {
-        configured.to_path_buf()
-    } else {
-        configured
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("/"))
-    };
+    let probe_path = data_probe_path(config);
     let free = free_bytes(&probe_path);
     let passed = match free {
         Some(b) if b >= ARCHIVE_MIN_FREE_BYTES => true,
@@ -481,6 +545,44 @@ mod tests {
         if !r.passed {
             assert!(r.reason.as_ref().unwrap().contains("ghost-pay"));
         }
+    }
+
+    #[tokio::test]
+    async fn run_once_fires_capability_drift_for_failing_claim() {
+        use ghost_common::config::AlertsConfig;
+        // Enabled alert config, drift event on, channels default-disabled so no
+        // network I/O — we only assert the trigger reached the dispatcher.
+        let dispatcher = Arc::new(AlertDispatcher::new("node".into(), || {
+            let mut c = AlertsConfig::default();
+            c.enabled = true;
+            c.events.capability_drift = true;
+            c
+        }));
+        let mut cfg = NodeConfig::default();
+        // Claim public mining but omit the address/signing-key so the probe
+        // fails -> a genuine claimed-but-failing drift.
+        cfg.network.mining_mode = MiningMode::PublicPool;
+        cfg.network.public_address = None;
+        cfg.network.signing_key = None;
+
+        let sc = SelfCheck::new();
+        sc.run_once(&cfg, Some(&dispatcher)).await;
+
+        // The self-check loop reached fire_edge for the drifting capability.
+        assert!(dispatcher.is_edge_active(AlertEvent::CapabilityDrift, "public_mining"));
+        // A capability that is not claimed must NOT arm a drift edge.
+        assert!(!dispatcher.is_edge_active(AlertEvent::CapabilityDrift, "ghost_pay"));
+    }
+
+    #[tokio::test]
+    async fn run_once_without_dispatcher_is_a_noop_for_alerts() {
+        // Passing None must not panic and must still update the snapshot.
+        let cfg = NodeConfig::default();
+        let sc = SelfCheck::new();
+        sc.run_once(&cfg, None).await;
+        // State was written (last_checked_unix set on at least one probe).
+        let snap = sc.snapshot();
+        assert!(snap.reaper.last_checked_unix > 0);
     }
 
     #[tokio::test]
