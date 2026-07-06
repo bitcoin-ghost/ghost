@@ -1,24 +1,32 @@
 /**
  * Overlay: Mesh Constellation
  *
- * CONCEPT — the 8-node swarm rendered as a living star map: glowing orbs
- * (elders brighter / crowned, sized by hashrate, `is_self` at the centre in the
- * accent colour), connection lines from this node to its peers that softly
- * pulse as gossip flows, and particles drifting along those edges. A slow
- * rotation and breathing keep it alive on a dark rest screen.
+ * CONCEPT — the live mesh rendered as a slowly-turning galaxy. `is_self` is the
+ * luminous heart at the centre; every peer is a glowing body placed in a loose
+ * 3D shell around it (by geographic longitude/latitude when we can resolve it,
+ * an even golden-angle spread otherwise) and the whole cloud is projected to 2D
+ * with a gentle camera drift, so nearer nodes swell and brighten while far ones
+ * recede into fog. The mesh is (near) fully-connected, so we draw a LATTICE of
+ * faint light-threads between all the healthy nodes and stream packets of light
+ * along them — the gossip flow that gives the scene its life. Elders burn warm
+ * and wear a corona; a healthy peer glows cool green; a stale node cools to a
+ * dim red ember. Miners (`deduped_miner_count`) orbit their node as tiny sparks,
+ * nodes breathe, edges shimmer, and every so often a node emits a ping ripple.
+ * Behind it all drifts a parallax starfield and a faint nebula so even eight
+ * nodes read as a living galaxy rather than an empty ring.
  *
  * Data: `useMeshNodes` (`/api/v1/pool/mesh-nodes`) for the swarm, and the
- * offline geo lib (`useGeoDb` + `extractHost`/`resolve`) purely to ORDER peers
- * around the ring by longitude (west → left, east → right) so the layout reads
- * like a map. It degrades gracefully to a deterministic ordering when geo is
- * unavailable.
+ * offline geo lib (`useGeoDb` + `extractHost`) purely to PLACE peers by
+ * lon/lat. It degrades gracefully to a deterministic golden-angle sphere when
+ * geo is unavailable, and to loading / offline notices when there is no data.
  *
  * Contract:
  *  - Fills its container (the shell gives it 100dvh).
  *  - Honours `active`: the rAF loop and polling run ONLY while active===true and
  *    are cancelled on active===false and on unmount.
  *  - CSP-safe: canvas 2D only, no external assets, no new deps. Theme-aware via
- *    the design-token CSS vars read off the container.
+ *    the design-token CSS vars read off the container (deep-space on dark, and a
+ *    softer but faithful rendering on light).
  */
 'use client';
 
@@ -28,16 +36,40 @@ import { extractHost } from '@/lib/geo/geoip';
 import type { MeshNode } from '@/lib/api/meshNodes';
 import type { OverlayProps } from './types';
 
-/** A node plus the small amount of derived state the renderer needs. */
-interface PlacedNode {
+type RGB = { r: number; g: number; b: number };
+
+/** A node lifted into the 3D cloud plus the derived state the renderer needs. */
+interface Body {
   node: MeshNode;
-  /** Fixed angle (radians) on the ring; peers only. Self sits at the centre. */
-  angle: number;
-  /** 0..1 hashrate weight used for orb size. */
+  /** World-space position on the peer shell (self sits at the origin). */
+  wx: number;
+  wy: number;
+  wz: number;
+  /** 0..1 hashrate weight → orb size. */
   weight: number;
+  /** Stable per-node phase so pulses/orbits desync. */
+  phase: number;
+  isSelf: boolean;
 }
 
-type RGB = { r: number; g: number; b: number };
+interface Layout {
+  bodies: Body[];
+  /** Index pairs of healthy↔healthy nodes forming the gossip lattice. */
+  edges: Array<[number, number]>;
+}
+
+interface Star {
+  x: number; // 0..1 normalised
+  y: number; // 0..1 normalised
+  z: number; // 0..1 depth (1 = nearest layer → brighter, faster drift)
+  phase: number;
+  twinkle: number;
+}
+
+interface Ripple {
+  body: number; // index into bodies
+  t0: number; // spawn time (s)
+}
 
 const FALLBACK: Record<string, RGB> = {
   bg: { r: 15, g: 16, b: 18 },
@@ -47,6 +79,12 @@ const FALLBACK: Record<string, RGB> = {
   red: { r: 216, g: 116, b: 106 },
   dim: { r: 139, g: 138, b: 132 },
 };
+
+// A fixed cool tint for the far nebula/space wash; blended with the theme so it
+// never fights the palette.
+const COOL: RGB = { r: 70, g: 110, b: 190 };
+// A warm highlight elders are tinted toward.
+const WARM: RGB = { r: 255, g: 210, b: 140 };
 
 function parseHex(value: string): RGB | null {
   const m = value.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
@@ -64,7 +102,27 @@ function rgba({ r, g, b }: RGB, a: number): string {
   return `rgba(${r}, ${g}, ${b}, ${a})`;
 }
 
-/** Deterministic 0..1 from a string, so ordering is stable without geo. */
+function mix(a: RGB, b: RGB, t: number): RGB {
+  return {
+    r: Math.round(a.r + (b.r - a.r) * t),
+    g: Math.round(a.g + (b.g - a.g) * t),
+    b: Math.round(a.b + (b.b - a.b) * t),
+  };
+}
+
+function lighten(c: RGB, amount: number): RGB {
+  return {
+    r: Math.min(255, Math.round(c.r + (255 - c.r) * amount)),
+    g: Math.min(255, Math.round(c.g + (255 - c.g) * amount)),
+    b: Math.min(255, Math.round(c.b + (255 - c.b) * amount)),
+  };
+}
+
+function luminance(c: RGB): number {
+  return (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) / 255;
+}
+
+/** Deterministic 0..1 from a string, so placement/phase are stable per node. */
 function hash01(s: string): number {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
@@ -78,64 +136,101 @@ export function MeshConstellationOverlay({ active }: OverlayProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Poll briskly while on-screen and back off to a slow trickle when this
-  // overlay is off-screen, so it does not drive fast refetches in the carousel.
+  // Poll briskly while on-screen; back right off when the carousel moves on.
   const { data, isLoading, isError } = useMeshNodes({
     refetchInterval: active ? 15_000 : 60_000,
   });
-  // Geo DB is a one-shot static asset; used only to order peers by longitude.
+  // Geo DB is a one-shot static asset; used only to place peers by lon/lat.
   const { data: geoDb } = useGeoDb();
 
   const nodes = useMemo(() => data?.nodes ?? [], [data]);
 
-  // Precompute placement whenever the swarm or geo resolution changes. The rAF
-  // loop reads this via a ref so it never restarts on data updates.
-  const placed = useMemo(() => {
+  // Lay the swarm out into the 3D cloud whenever the nodes or geo resolution
+  // change. The rAF loop reads this via a ref so it never restarts on updates.
+  const layout = useMemo<Layout>(() => {
     const self = nodes.find((n) => n.is_self) ?? null;
     const peers = nodes.filter((n) => n !== self);
 
-    const maxHash = Math.max(1e-9, ...peers.map((p) => p.hashrate_th), self?.hashrate_th ?? 0);
+    const maxHash = Math.max(1e-9, ...nodes.map((n) => n.hashrate_th));
     const weightOf = (n: MeshNode) => Math.sqrt(Math.max(0, n.hashrate_th) / maxHash);
 
-    // Order peers by resolved longitude (west→east). Fall back to a stable
-    // per-node hash so the ring is still evenly, deterministically arranged.
-    const keyed = peers.map((n) => {
-      let key = hash01(n.node_id || n.address);
+    // Stable order so golden-angle indices don't jump between polls.
+    const ordered = [...peers].sort(
+      (a, b) => hash01(a.node_id || a.address) - hash01(b.node_id || b.address),
+    );
+    const n = Math.max(1, ordered.length);
+
+    const bodies: Body[] = [];
+    if (self) {
+      bodies.push({
+        node: self,
+        wx: 0,
+        wy: 0,
+        wz: 0,
+        weight: weightOf(self),
+        phase: 0,
+        isSelf: true,
+      });
+    }
+
+    ordered.forEach((node, i) => {
+      // Golden-angle point on a unit sphere — an even spread for every node.
+      const y = 1 - ((i + 0.5) / n) * 2; // 1 → -1
+      const rad = Math.sqrt(Math.max(0, 1 - y * y));
+      const theta = i * 2.399963229728653; // golden angle
+      let ux = Math.cos(theta) * rad;
+      let uy = y;
+      let uz = Math.sin(theta) * rad;
+
+      // Override the direction with true geography where we can resolve it, so
+      // the layout reads like a globe: lon → azimuth, lat → elevation.
       if (geoDb) {
         try {
-          const geo = geoDb.resolve(extractHost(n.address));
-          if (typeof geo.lon === 'number') key = (geo.lon + 180) / 360;
+          const geo = geoDb.resolve(extractHost(node.address));
+          if (geo.plottable && typeof geo.lat === 'number' && typeof geo.lon === 'number') {
+            const phi = (geo.lat * Math.PI) / 180;
+            const lam = (geo.lon * Math.PI) / 180;
+            ux = Math.cos(phi) * Math.sin(lam);
+            uy = Math.sin(phi);
+            uz = Math.cos(phi) * Math.cos(lam);
+          }
         } catch {
-          /* keep hash fallback */
+          /* keep the golden-angle fallback */
         }
       }
-      return { n, key };
+
+      // A little radial jitter gives the shell real depth instead of a hoop.
+      const rr = 0.8 + 0.32 * hash01((node.node_id || node.address) + 'r');
+      bodies.push({
+        node,
+        wx: ux * rr,
+        wy: uy * rr,
+        wz: uz * rr,
+        weight: weightOf(node),
+        phase: hash01((node.node_id || node.address) + 'p') * Math.PI * 2,
+        isSelf: false,
+      });
     });
-    keyed.sort((a, b) => a.key - b.key || hash01(a.n.node_id) - hash01(b.n.node_id));
 
-    const count = keyed.length || 1;
-    const peerNodes: PlacedNode[] = keyed.map(({ n }, i) => ({
-      node: n,
-      // -PI/2 puts the first node at the top; spread evenly around the circle.
-      angle: -Math.PI / 2 + (i / count) * Math.PI * 2,
-      weight: weightOf(n),
-    }));
+    // Full lattice between every pair of healthy nodes (near fully-connected).
+    const edges: Array<[number, number]> = [];
+    for (let i = 0; i < bodies.length; i++) {
+      if (!bodies[i].node.healthy) continue;
+      for (let j = i + 1; j < bodies.length; j++) {
+        if (!bodies[j].node.healthy) continue;
+        edges.push([i, j]);
+      }
+    }
 
-    const selfNode: PlacedNode | null = self
-      ? { node: self, angle: 0, weight: weightOf(self) }
-      : null;
-
-    return { selfNode, peers: peerNodes };
+    return { bodies, edges };
   }, [nodes, geoDb]);
 
-  // The rAF loop reads live data through refs so it never has to restart when
-  // the swarm/geo/loading state changes. Sync them outside render.
-  const placedRef = useRef(placed);
+  const layoutRef = useRef(layout);
   const stateRef = useRef({ isLoading, isError, count: nodes.length });
   useEffect(() => {
-    placedRef.current = placed;
+    layoutRef.current = layout;
     stateRef.current = { isLoading, isError, count: nodes.length };
-  }, [placed, isLoading, isError, nodes.length]);
+  }, [layout, isLoading, isError, nodes.length]);
 
   useEffect(() => {
     if (!active) return;
@@ -150,9 +245,8 @@ export function MeshConstellationOverlay({ active }: OverlayProps) {
     let height = 0;
     let dpr = 1;
 
-    // Theme colours, re-read cheaply (throttled) so a light/dark toggle while
-    // the overlay is up is picked up without per-frame layout thrash.
     let colours = FALLBACK;
+    let dark = true;
     let lastColourRead = -1;
     const readColours = () => {
       const cs = getComputedStyle(container);
@@ -166,6 +260,21 @@ export function MeshConstellationOverlay({ active }: OverlayProps) {
         red: pick('--red', 'red'),
         dim: pick('--dim', 'dim'),
       };
+      dark = luminance(colours.bg) < 0.4;
+    };
+
+    // Parallax starfield — regenerated to keep density roughly constant on
+    // resize. Three implicit depth layers via `z`.
+    let stars: Star[] = [];
+    const seedStars = () => {
+      const count = Math.round(Math.min(320, Math.max(120, (width * height) / 8500)));
+      stars = new Array(count).fill(0).map(() => ({
+        x: Math.random(),
+        y: Math.random(),
+        z: Math.random(),
+        phase: Math.random() * Math.PI * 2,
+        twinkle: 0.4 + Math.random() * 1.6,
+      }));
     };
 
     const resize = () => {
@@ -177,48 +286,141 @@ export function MeshConstellationOverlay({ active }: OverlayProps) {
       canvas.height = Math.round(height * dpr);
       canvas.style.width = `${width}px`;
       canvas.style.height = `${height}px`;
+      seedStars();
     };
     resize();
     const ro = new ResizeObserver(resize);
     ro.observe(container);
 
-    const drawOrb = (
-      x: number,
-      y: number,
-      radius: number,
-      colour: RGB,
-      intensity: number,
-      breath: number,
-    ) => {
-      const glow = radius * (3.4 + 0.7 * breath);
-      const g = ctx.createRadialGradient(x, y, 0, x, y, glow);
-      g.addColorStop(0, rgba(colour, 0.95 * intensity));
-      g.addColorStop(0.18, rgba(colour, 0.6 * intensity));
-      g.addColorStop(0.5, rgba(colour, 0.16 * intensity));
+    // Camera / projection constants (world units; peer shell radius ≈ 1).
+    const CAM_Z = 2.7;
+    const FOCAL = 2.7;
+
+    const ripples: Ripple[] = [];
+    let lastRipple = 0;
+
+    // Additive glow reads as luminous on the dark rest screen; on a light theme
+    // we fall back to plain compositing so nothing washes out.
+    const glowOn = () => {
+      ctx.globalCompositeOperation = dark ? 'lighter' : 'source-over';
+    };
+    const glowOff = () => {
+      ctx.globalCompositeOperation = 'source-over';
+    };
+
+    const drawSpace = (t: number) => {
+      // Deepened radial wash off the theme bg → a sense of depth behind it all.
+      const b = colours.bg;
+      const deep = dark
+        ? { r: Math.max(0, b.r - 4), g: Math.max(0, b.g - 4), b: Math.max(0, b.b - 3) }
+        : b;
+      const halo = { r: b.r + (dark ? 10 : 2), g: b.g + (dark ? 10 : 2), b: b.b + (dark ? 14 : 3) };
+      const bgGrad = ctx.createRadialGradient(
+        width * 0.5,
+        height * 0.46,
+        0,
+        width * 0.5,
+        height * 0.5,
+        Math.max(width, height) * 0.75,
+      );
+      bgGrad.addColorStop(0, rgba(halo, 1));
+      bgGrad.addColorStop(1, rgba(deep, 1));
+      ctx.fillStyle = bgGrad;
+      ctx.fillRect(0, 0, width, height);
+
+      // Faint drifting nebula — two large, very soft blobs (warm + cool).
+      glowOn();
+      const blobs: Array<{ cx: number; cy: number; col: RGB }> = [
+        {
+          cx: width * (0.32 + 0.03 * Math.sin(t * 0.05)),
+          cy: height * (0.38 + 0.02 * Math.cos(t * 0.04)),
+          col: mix(colours.accent, colours.bg, 0.35),
+        },
+        {
+          cx: width * (0.7 + 0.03 * Math.cos(t * 0.045)),
+          cy: height * (0.62 + 0.02 * Math.sin(t * 0.05)),
+          col: mix(COOL, colours.bg, 0.4),
+        },
+      ];
+      for (const nb of blobs) {
+        const rr = Math.max(width, height) * 0.55;
+        const g = ctx.createRadialGradient(nb.cx, nb.cy, 0, nb.cx, nb.cy, rr);
+        g.addColorStop(0, rgba(nb.col, dark ? 0.1 : 0.05));
+        g.addColorStop(1, rgba(nb.col, 0));
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, width, height);
+      }
+
+      // Parallax stars — deeper layers drift slower and glimmer fainter.
+      for (const s of stars) {
+        const drift = t * (0.004 + s.z * 0.01);
+        const sx = (((s.x + drift) % 1) + 1) % 1;
+        const px = sx * width;
+        const py = ((s.y + Math.sin(t * 0.02 + s.phase) * 0.004) % 1) * height;
+        const tw = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * s.twinkle + s.phase));
+        const a = (dark ? 0.5 : 0.28) * (0.25 + s.z) * tw;
+        const rad = (0.4 + s.z * 1.3) * (dark ? 1 : 0.9);
+        ctx.fillStyle = rgba(colours.fg, a);
+        ctx.beginPath();
+        ctx.arc(px, py, rad, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      glowOff();
+    };
+
+    // Layered radial-gradient bloom + hot core → a luminous body.
+    const drawOrb = (x: number, y: number, r: number, colour: RGB, intensity: number) => {
+      const glowR = r * 5.2;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, glowR);
+      g.addColorStop(0, rgba(colour, 0.9 * intensity));
+      g.addColorStop(0.12, rgba(colour, 0.55 * intensity));
+      g.addColorStop(0.32, rgba(colour, 0.2 * intensity));
       g.addColorStop(1, rgba(colour, 0));
       ctx.fillStyle = g;
       ctx.beginPath();
-      ctx.arc(x, y, glow, 0, Math.PI * 2);
+      ctx.arc(x, y, glowR, 0, Math.PI * 2);
       ctx.fill();
-      // Solid core.
-      ctx.fillStyle = rgba(
-        { r: Math.min(255, colour.r + 60), g: Math.min(255, colour.g + 60), b: Math.min(255, colour.b + 60) },
-        Math.min(1, 0.85 + 0.15 * intensity),
-      );
+      // Bright body + white-hot centre.
+      ctx.fillStyle = rgba(lighten(colour, 0.35), Math.min(1, 0.85 + 0.15 * intensity));
       ctx.beginPath();
-      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = rgba(lighten(colour, 0.85), 0.9 * intensity);
+      ctx.beginPath();
+      ctx.arc(x, y, r * 0.42, 0, Math.PI * 2);
       ctx.fill();
     };
 
-    const drawCrown = (x: number, y: number, radius: number, colour: RGB, breath: number) => {
-      ctx.strokeStyle = rgba(colour, 0.5 + 0.35 * breath);
-      ctx.lineWidth = Math.max(1, radius * 0.14);
+    // Elder corona — a soft ring plus slowly-turning rays (a crown).
+    const drawCorona = (
+      x: number,
+      y: number,
+      r: number,
+      colour: RGB,
+      t: number,
+      breath: number,
+    ) => {
+      ctx.strokeStyle = rgba(colour, 0.35 + 0.3 * breath);
+      ctx.lineWidth = Math.max(1, r * 0.12);
       ctx.beginPath();
-      ctx.arc(x, y, radius * 1.9, 0, Math.PI * 2);
+      ctx.arc(x, y, r * 1.9, 0, Math.PI * 2);
       ctx.stroke();
+      const rays = 8;
+      for (let k = 0; k < rays; k++) {
+        const a = t * 0.25 + (k / rays) * Math.PI * 2;
+        const r0 = r * 2.1;
+        const r1 = r * (2.7 + 0.4 * Math.sin(t * 1.5 + k));
+        ctx.strokeStyle = rgba(colour, 0.18 + 0.14 * breath);
+        ctx.lineWidth = Math.max(1, r * 0.09);
+        ctx.beginPath();
+        ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0);
+        ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1);
+        ctx.stroke();
+      }
     };
 
     const centreText = (text: string, sub: string) => {
+      glowOff();
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       const scale = Math.min(width, height);
@@ -230,44 +432,35 @@ export function MeshConstellationOverlay({ active }: OverlayProps) {
       ctx.fillText(sub, width / 2, height / 2 + scale * 0.03);
     };
 
-    const render = (now: number) => {
-      const t = now / 1000;
-      if (now - lastColourRead > 400) {
+    const render = (nowMs: number) => {
+      const t = nowMs / 1000;
+      if (nowMs - lastColourRead > 400) {
         readColours();
-        lastColourRead = now;
+        lastColourRead = nowMs;
       }
 
-      // Background — a soft radial vignette on the theme bg.
-      const bgGrad = ctx.createRadialGradient(
-        width / 2,
-        height / 2,
-        0,
-        width / 2,
-        height / 2,
-        Math.max(width, height) * 0.7,
-      );
-      const b = colours.bg;
-      bgGrad.addColorStop(0, rgba({ r: b.r + 6, g: b.g + 6, b: b.b + 8 }, 1));
-      bgGrad.addColorStop(1, rgba(b, 1));
-      ctx.fillStyle = bgGrad;
-      ctx.fillRect(0, 0, width, height);
+      drawSpace(t);
 
       ctx.save();
       ctx.scale(dpr, dpr);
 
-      const { selfNode, peers } = placedRef.current;
+      const { bodies, edges } = layoutRef.current;
       const { isLoading: loading, isError: err, count } = stateRef.current;
 
       if (err || (!loading && count === 0)) {
+        // A lone dim red ember at the heart while the mesh is dark.
+        glowOn();
+        drawOrb(width / 2, height / 2, 5, colours.red, 0.4 * (0.6 + 0.4 * Math.sin(t)));
+        glowOff();
         centreText('Mesh offline', 'no peers reachable');
         ctx.restore();
         raf = requestAnimationFrame(render);
         return;
       }
       if (loading && count === 0) {
-        // A lone breathing core while the first payload lands.
-        const breath = 0.5 + 0.5 * Math.sin(t * 0.9);
-        drawOrb(width / 2, height / 2, 6, colours.accent, 0.7, breath);
+        glowOn();
+        drawOrb(width / 2, height / 2, 6, colours.accent, 0.6 + 0.4 * Math.sin(t * 0.9));
+        glowOff();
         centreText('Mapping the mesh…', 'reading gossip');
         ctx.restore();
         raf = requestAnimationFrame(render);
@@ -277,89 +470,174 @@ export function MeshConstellationOverlay({ active }: OverlayProps) {
       const cx = width / 2;
       const cy = height / 2;
       const scale = Math.min(width, height);
-      const ringR = scale * 0.34;
-      const rotation = t * 0.03;
+      const viewScale = scale * 0.27;
+      const sizeScale = Math.min(2.3, Math.max(0.72, scale / 680));
+
+      // Slow camera drift: continuous yaw + a gently breathing tilt.
+      const yaw = t * 0.05;
+      const pitch = 0.34 + 0.05 * Math.sin(t * 0.07);
+      const cyaw = Math.cos(yaw);
+      const syaw = Math.sin(yaw);
+      const cpit = Math.cos(pitch);
+      const spit = Math.sin(pitch);
+
+      // Project every body once (painter order by depth).
+      const proj = bodies.map((body) => {
+        // Yaw about Y, then pitch about X.
+        const x1 = body.wx * cyaw + body.wz * syaw;
+        const z1 = -body.wx * syaw + body.wz * cyaw;
+        const y2 = body.wy * cpit - z1 * spit;
+        const z2 = body.wy * spit + z1 * cpit;
+        const depth = CAM_Z - z2;
+        const sc = FOCAL / depth;
+        const dz = Math.min(1, Math.max(0, (z2 + 1) / 2)); // 0 far … 1 near
+        return {
+          body,
+          x: cx + x1 * sc * viewScale,
+          y: cy - y2 * sc * viewScale,
+          sc,
+          dz,
+        };
+      });
+
       const breath = 0.5 + 0.5 * Math.sin(t * 0.6);
-      const sizeScale = Math.min(2.4, Math.max(0.7, scale / 680));
-      const orbR = (w: number) => (5 + 12 * w) * sizeScale;
 
-      // Position peers on the (slowly rotating) ring.
-      const peerPos = peers.map((p) => ({
-        p,
-        x: cx + Math.cos(p.angle + rotation) * ringR,
-        y: cy + Math.sin(p.angle + rotation) * ringR,
-      }));
+      // 1) Gossip lattice — faint light-threads with packets streaming along.
+      glowOn();
+      for (let e = 0; e < edges.length; e++) {
+        const [i, j] = edges[e];
+        const a = proj[i];
+        const bp = proj[j];
+        const nearness = (a.dz + bp.dz) / 2;
+        const shimmer = 0.5 + 0.5 * Math.sin(t * 0.9 + e * 1.3);
+        const threadA = (0.05 + 0.09 * nearness) * (0.6 + 0.4 * shimmer);
+        ctx.strokeStyle = rgba(colours.accent, threadA);
+        ctx.lineWidth = 0.6 + 0.7 * nearness;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(bp.x, bp.y);
+        ctx.stroke();
 
-      // 1) Edges from this node (centre) to each peer, drawn first so orbs sit
-      //    on top. Healthy edges pulse and carry gossip particles.
-      peerPos.forEach(({ p, x, y }, i) => {
-        const healthy = p.node.healthy && (selfNode ? selfNode.node.healthy : true);
-        const phase = i * 1.7;
-        if (healthy) {
-          const pulse = 0.12 + 0.16 * (0.5 + 0.5 * Math.sin(t * 1.6 + phase));
-          ctx.strokeStyle = rgba(colours.accent, pulse);
-          ctx.lineWidth = 1;
-          ctx.setLineDash([]);
+        // Packets of light — analytic positions, no per-frame allocation.
+        const dir = e % 2 === 0 ? 1 : -1;
+        const packets = 2;
+        for (let k = 0; k < packets; k++) {
+          let frac = (((t * 0.22 * dir + k / packets + e * 0.137) % 1) + 1) % 1;
+          if (dir < 0) frac = 1 - frac;
+          const px = a.x + (bp.x - a.x) * frac;
+          const py = a.y + (bp.y - a.y) * frac;
+          const fade = Math.sin(frac * Math.PI); // fade in/out at the ends
+          const pr = (1.2 + 1.1 * nearness) * sizeScale;
+          ctx.fillStyle = rgba(lighten(colours.accent, 0.4), 0.85 * fade * (0.5 + 0.5 * nearness));
           ctx.beginPath();
-          ctx.moveTo(cx, cy);
-          ctx.lineTo(x, y);
-          ctx.stroke();
+          ctx.arc(px, py, pr, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      glowOff();
 
-          // Particles drifting outward along the edge (gossip).
-          const particles = 3;
-          for (let k = 0; k < particles; k++) {
-            const frac = ((t * 0.28 + k / particles + i * 0.13) % 1 + 1) % 1;
-            const px = cx + (x - cx) * frac;
-            const py = cy + (y - cy) * frac;
-            const fade = Math.sin(frac * Math.PI); // fade in/out at the ends
-            ctx.fillStyle = rgba(colours.accent, 0.7 * fade);
+      // 2) Ping ripples — occasionally a node pulses a ring outward.
+      if (t - lastRipple > 2.1 && proj.length > 0) {
+        lastRipple = t;
+        const healthyIdx: number[] = [];
+        for (let idx = 0; idx < proj.length; idx++) {
+          if (proj[idx].body.node.healthy) healthyIdx.push(idx);
+        }
+        if (healthyIdx.length > 0) {
+          ripples.push({
+            body: healthyIdx[Math.floor(Math.random() * healthyIdx.length)],
+            t0: t,
+          });
+          if (ripples.length > 6) ripples.shift();
+        }
+      }
+      glowOn();
+      const RIPPLE_DUR = 2.4;
+      for (let i = ripples.length - 1; i >= 0; i--) {
+        const age = t - ripples[i].t0;
+        if (age > RIPPLE_DUR) {
+          ripples.splice(i, 1);
+          continue;
+        }
+        const p = proj[ripples[i].body];
+        if (!p) continue;
+        const k = age / RIPPLE_DUR;
+        const rr = (8 + k * 70) * sizeScale * (0.6 + 0.6 * p.dz);
+        const col = p.body.isSelf || p.body.node.elder ? colours.accent : colours.green;
+        ctx.strokeStyle = rgba(col, 0.4 * (1 - k) * p.dz);
+        ctx.lineWidth = 1.4 * sizeScale;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      glowOff();
+
+      // 3) Bodies, painted far → near so nearer nodes sit on top.
+      const order = proj.map((_, i) => i).sort((u, v) => proj[u].dz - proj[v].dz);
+      glowOn();
+      for (const idx of order) {
+        const p = proj[idx];
+        const b = p.body;
+        const online = b.node.healthy;
+        const elder = b.node.elder;
+
+        // Colour: self & elders warm accent, healthy peers cool green, stale red.
+        let colour: RGB;
+        let baseIntensity: number;
+        if (!online) {
+          colour = colours.red;
+          baseIntensity = 0.32;
+        } else if (b.isSelf) {
+          colour = colours.accent;
+          baseIntensity = 1;
+        } else if (elder) {
+          colour = mix(colours.accent, WARM, 0.25);
+          baseIntensity = 0.95;
+        } else {
+          colour = colours.green;
+          baseIntensity = 0.82;
+        }
+
+        const pulse = 0.86 + 0.14 * Math.sin(t * 1.1 + b.phase);
+        const depthFade = 0.5 + 0.5 * p.dz;
+        const intensity = baseIntensity * depthFade * pulse;
+
+        const selfBoost = b.isSelf ? 1.35 : 1;
+        const r = (3.5 + 11 * b.weight) * sizeScale * p.sc * selfBoost;
+
+        // Orbiting miner sparks — one per (capped) deduped miner.
+        if (online && b.node.deduped_miner_count > 0) {
+          const m = Math.min(6, Math.max(1, b.node.deduped_miner_count));
+          const orbitR = r * 2.3 + 6 * sizeScale;
+          for (let k = 0; k < m; k++) {
+            const a = t * (0.6 + 0.15 * (b.phase % 1)) + (k / m) * Math.PI * 2 + b.phase;
+            const sxk = p.x + Math.cos(a) * orbitR;
+            const syk = p.y + Math.sin(a) * orbitR * 0.9;
+            ctx.fillStyle = rgba(lighten(colour, 0.5), 0.55 * p.dz);
             ctx.beginPath();
-            ctx.arc(px, py, 1.6 * sizeScale, 0, Math.PI * 2);
+            ctx.arc(sxk, syk, 1.1 * sizeScale, 0, Math.PI * 2);
             ctx.fill();
           }
-        } else {
-          // Offline peer — faint, static, dashed red tether.
-          ctx.strokeStyle = rgba(colours.red, 0.14);
-          ctx.lineWidth = 1;
-          ctx.setLineDash([4, 6]);
-          ctx.beginPath();
-          ctx.moveTo(cx, cy);
-          ctx.lineTo(x, y);
-          ctx.stroke();
-          ctx.setLineDash([]);
         }
-      });
 
-      // 2) Peer orbs.
-      peerPos.forEach(({ p, x, y }) => {
-        const online = p.node.healthy;
-        const colour = !online ? colours.red : p.node.elder ? colours.accent : colours.green;
-        const intensity = online ? (p.node.elder ? 1 : 0.82) : 0.4;
-        const r = orbR(p.weight);
-        drawOrb(x, y, r, colour, intensity, breath);
-        if (p.node.elder && online) drawCrown(x, y, r, colours.accent, breath);
-      });
+        // Extra breathing halo for "you" so the heart reads instantly.
+        if (b.isSelf) {
+          const haloR = r * (4.6 + 0.8 * breath);
+          const halo = ctx.createRadialGradient(p.x, p.y, r, p.x, p.y, haloR);
+          halo.addColorStop(0, rgba(colour, 0.22 * depthFade));
+          halo.addColorStop(1, rgba(colour, 0));
+          ctx.fillStyle = halo;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, haloR, 0, Math.PI * 2);
+          ctx.fill();
+        }
 
-      // 3) This node at the centre, highlighted in the accent colour.
-      if (selfNode) {
-        const online = selfNode.node.healthy;
-        const r = orbR(Math.max(0.5, selfNode.weight)) * 1.15;
-        const colour = online ? colours.accent : colours.red;
-        // Extra pulsing halo so "you" reads instantly.
-        const haloR = r * (4.5 + 0.8 * breath);
-        const halo = ctx.createRadialGradient(cx, cy, r, cx, cy, haloR);
-        halo.addColorStop(0, rgba(colour, 0.22));
-        halo.addColorStop(1, rgba(colour, 0));
-        ctx.fillStyle = halo;
-        ctx.beginPath();
-        ctx.arc(cx, cy, haloR, 0, Math.PI * 2);
-        ctx.fill();
-        drawOrb(cx, cy, r, colour, 1, breath);
-        if (selfNode.node.elder) drawCrown(cx, cy, r, colours.accent, breath);
-      } else {
-        // No self in the payload — a faint focal core stands in as "the mesh".
-        drawOrb(cx, cy, 4 * sizeScale, colours.dim, 0.5, breath);
+        drawOrb(p.x, p.y, r, colour, intensity);
+        if (online && (elder || b.isSelf)) {
+          drawCorona(p.x, p.y, r, colour, t, breath * depthFade);
+        }
       }
+      glowOff();
 
       ctx.restore();
       raf = requestAnimationFrame(render);
