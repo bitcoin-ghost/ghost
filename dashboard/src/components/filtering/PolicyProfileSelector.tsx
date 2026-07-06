@@ -6,14 +6,55 @@ import { Button } from "@/components/ui/Button";
 import { useFullConfig } from "@/hooks/queries/useConfigQueries";
 import { setPolicyProfile, type PolicyProfileType } from "@/lib/api/config";
 import { useToast } from "@/components/ui/Toast";
+import { BUDS_TIER_COLORS, BUDS_TIER_KEYS, type BudsTierKey } from "@/lib/budsTiers";
 
 // The three real tier-policy presets (pool.toml [policy].profile), with
-// plain-English labels and descriptions true to what each actually mines.
-export const POLICY_PRESETS: { value: PolicyProfileType; label: string; desc: string }[] = [
-  { value: "strict", label: "Strict", desc: "Payments, multisig & timelocks only (T0+T1). Drops all data — no OP_RETURN, inscriptions or runes." },
-  { value: "permissive", label: "Standard", desc: "Adds small OP_RETURN / Lightning commitments (T0+T1+T2). Still drops inscriptions, runes & BRC-20 (T3)." },
-  { value: "full_open", label: "Everything", desc: "All valid transactions including inscriptions, runes & BRC-20 (T0–T3). Maximum fees, no tier filtering." },
+// plain-English labels, descriptions and the BUDS classes each actually mines.
+export const POLICY_PRESETS: {
+  value: PolicyProfileType;
+  label: string;
+  desc: string;
+  tiers: BudsTierKey[]; // BUDS classes this preset MINES (rest are dropped)
+}[] = [
+  { value: "strict", label: "Strict", tiers: ["T0", "T1"], desc: "Payments, multisig & timelocks only (T0+T1). Drops all data — no OP_RETURN, inscriptions or runes." },
+  { value: "permissive", label: "Standard", tiers: ["T0", "T1", "T2"], desc: "Adds small OP_RETURN / Lightning commitments (T0+T1+T2). Still drops inscriptions, runes & BRC-20 (T3)." },
+  { value: "full_open", label: "Everything", tiers: ["T0", "T1", "T2", "T3"], desc: "All valid transactions including inscriptions, runes & BRC-20 (T0–T3). Maximum fees, no tier filtering." },
 ];
+
+// A tight row of four BUDS-class pills. Mined classes are filled with the
+// class's BUDS colour; dropped classes are dimmed/outlined so the difference
+// is legible at a glance.
+function TierPills({ mined }: { mined: BudsTierKey[] }) {
+  return (
+    <div className="flex items-center" style={{ gap: "4px", marginBottom: "6px" }}>
+      {BUDS_TIER_KEYS.map((key) => {
+        const isMined = mined.includes(key);
+        const color = BUDS_TIER_COLORS[key];
+        return (
+          <span
+            key={key}
+            title={isMined ? `${key} mined` : `${key} dropped`}
+            style={{
+              fontFamily: "var(--font-mono, ui-monospace, monospace)",
+              fontSize: "11px",
+              fontWeight: 600,
+              lineHeight: 1,
+              letterSpacing: "0.02em",
+              padding: "3px 6px",
+              borderRadius: "4px",
+              border: `1px solid ${isMined ? color : "var(--rule)"}`,
+              background: isMined ? color : "transparent",
+              color: isMined ? "#0b0f14" : "var(--dim)",
+              opacity: isMined ? 1 : 0.55,
+            }}
+          >
+            {key}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
 
 // Normalise the stored profile (legacy `bitcoin_pure` == `strict`).
 export function normalizeProfile(profile?: string): PolicyProfileType | undefined {
@@ -77,6 +118,7 @@ export function PolicyProfileSelector() {
                   <span style={{ color: "var(--accent)", fontSize: "11px", fontWeight: 600 }}>· current</span>
                 )}
               </div>
+              <TierPills mined={p.tiers} />
               <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5" }}>{p.desc}</div>
             </button>
           );
