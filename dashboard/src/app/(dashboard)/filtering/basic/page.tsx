@@ -6,9 +6,10 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { fetchApi } from "@/lib/api/client";
 import { PolicyProfileSelector } from "@/components/filtering/PolicyProfileSelector";
+import { BUDS_TIER_COLORS, type BudsTierKey } from "@/lib/budsTiers";
 
 interface TierMeta {
-  key: "T0" | "T1" | "T2" | "T3";
+  key: BudsTierKey;
   name: string;
   short: string;
   color: string;
@@ -21,7 +22,7 @@ const TIERS: TierMeta[] = [
     key: "T0",
     name: "T0 · Financial",
     short: "Ordinary payments",
-    color: "#3fb950",
+    color: BUDS_TIER_COLORS.T0,
     blurb: "Plain money moving between people — the transactions Bitcoin exists for.",
     examples: "single-sig sends, change, consolidations",
   },
@@ -29,7 +30,7 @@ const TIERS: TierMeta[] = [
     key: "T1",
     name: "T1 · Extended",
     short: "Bigger financial",
-    color: "#58a6ff",
+    color: BUDS_TIER_COLORS.T1,
     blurb: "Still money, just more elaborate — multiple signers or time locks.",
     examples: "multisig, Lightning channels, timelocks",
   },
@@ -37,7 +38,7 @@ const TIERS: TierMeta[] = [
     key: "T2",
     name: "T2 · Data",
     short: "Small data carriers",
-    color: "#d29922",
+    color: BUDS_TIER_COLORS.T2,
     blurb: "Transactions that also carry a little standard data. Allowed, but not payments.",
     examples: "OP_RETURN ≤ 80 bytes, commitments",
   },
@@ -45,7 +46,7 @@ const TIERS: TierMeta[] = [
     key: "T3",
     name: "T3 · Abusive",
     short: "Heavy / abusive data",
-    color: "#f85149",
+    color: BUDS_TIER_COLORS.T3,
     blurb: "Transactions whose main purpose is stuffing data onto the chain.",
     examples: "inscriptions, runes, BRC-20, oversized data",
   },
