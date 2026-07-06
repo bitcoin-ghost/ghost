@@ -7491,84 +7491,22 @@ struct LogsQuery {
     level: Option<String>,
 }
 
-/// API v1 Logs handler — returns recent log entries from journalctl
+/// API v1 Logs handler — returns recent ghost-pool log entries from the
+/// in-process ring buffer (`crate::log_buffer`).
 ///
-/// Previously removed (HIGH-4) because it exposed journalctl output on a public endpoint.
-/// Now safely re-added behind HMAC authentication on the internal router.
+/// ghost-pool's `tracing` layer mirrors every emitted event into the buffer, so
+/// each entry carries the real structured message, target and level. This
+/// replaces the previous `journalctl`-backed implementation, which (a) exposed
+/// host journal output (HIGH-4) and (b) frequently returned empty `message`
+/// fields because journald stored the ANSI-coloured formatted line as a byte
+/// array that failed the JSON string decode (issue #246). The buffer is process-
+/// local so no host log daemon or elevated privileges are required.
 async fn api_logs_handler(
     State(_state): State<Arc<VerificationState>>,
     Query(params): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(100).min(1000);
-    let level_filter = params.level.as_deref().unwrap_or("info");
-
-    // Map dashboard level filter to journalctl priority
-    let priority = match level_filter {
-        "error" => "3",
-        "warn" => "4",
-        "info" => "6",
-        "debug" => "7",
-        "trace" => "7",
-        _ => "6",
-    };
-
-    // Read from journalctl for ghost-pool service
-    let output = tokio::process::Command::new("journalctl")
-        .args([
-            "-u",
-            "ghost-pool",
-            "--no-pager",
-            "-o",
-            "json",
-            "-n",
-            &limit.to_string(),
-            "-p",
-            priority,
-        ])
-        .output()
-        .await;
-
-    let entries = match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .lines()
-                .filter_map(|line| {
-                    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
-                    let timestamp = obj
-                        .get("__REALTIME_TIMESTAMP")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(|us| us / 1_000_000) // microseconds to seconds
-                        .unwrap_or(0);
-                    let priority_num = obj
-                        .get("PRIORITY")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u8>().ok())
-                        .unwrap_or(6);
-                    let level = match priority_num {
-                        0..=3 => "error",
-                        4 => "warn",
-                        5..=6 => "info",
-                        _ => "debug",
-                    };
-                    let message = obj.get("MESSAGE").and_then(|v| v.as_str()).unwrap_or("");
-                    let target = obj
-                        .get("SYSLOG_IDENTIFIER")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("ghost-pool");
-
-                    Some(serde_json::json!({
-                        "timestamp": timestamp,
-                        "level": level,
-                        "target": target,
-                        "message": message
-                    }))
-                })
-                .collect::<Vec<_>>()
-        }
-        _ => Vec::new(),
-    };
+    let entries = crate::log_buffer::recent(limit, params.level.as_deref());
 
     Json(serde_json::json!({
         "entries": entries

@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::prelude::*;
 
 use ghost_common::config::{MiningMode, NodeConfig, ReaperSettings};
 use ghost_common::identity::NodeIdentity;
@@ -2131,13 +2131,21 @@ async fn main() -> Result<()> {
     // Setup logging
     let level = parse_log_level(&args.log_level);
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
+    // Console layer (stdout → journald under systemd). ANSI is gated on an
+    // interactive terminal so journald stores clean UTF-8, not colour escapes.
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)
-        .with_line_number(false)
-        .finish();
+        .with_line_number(false);
+
+    // Ring-buffer layer feeds the dashboard `/logs` endpoint with ghost-pool's
+    // own structured log tail (real message + target + level per event).
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::from_level(level))
+        .with(fmt_layer)
+        .with(ghost_pool::log_ring::LogRingLayer);
 
     // HIGH-8: Use fallible initialization - if subscriber is already set, that's fine
     if tracing::subscriber::set_global_default(subscriber).is_err() {
