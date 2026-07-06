@@ -1131,6 +1131,14 @@ pub struct MeshNodeInfo {
     pub hashrate_th: f64,
     /// Miners currently connected to this node.
     pub miner_count: u32,
+    /// Peer's hardware-derived miner capacity ceiling (derived from
+    /// CPU/RAM/FD, capped by the operator's `network.max_miners` if set).
+    /// `0` means the peer has not gossiped it yet (rendered as "unknown" on
+    /// the Capacity page rather than a real ceiling). Surfaced here so the
+    /// Capacity table can show every mesh node — including community nodes
+    /// that don't advertise the `public_mining` capability the load-balancer
+    /// `pool-nodes` path filters on — against its utilisation ceiling.
+    pub max_capacity: u32,
     /// Deduplicated share of the mesh-wide active-miner total attributed to
     /// this node: each unique miner-id hash is owned by exactly one node, so
     /// summing this across the mesh-nodes list (self + peers) equals the
