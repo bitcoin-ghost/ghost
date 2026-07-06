@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMiningStatus, getMiners, getBestHash, getPublicMiningNodes, setPrivateMining, setPublicMining, setPayoutAddress } from '@/lib/api/mining';
+import { getMiningStatus, getMiners, getBestHash, getPublicMiningNodes, setPrivateMining, setPublicMining, setPayoutAddress, getPoolSeries, getPoolMeshLeaderboard } from '@/lib/api/mining';
 
 export const miningKeys = {
   all: ['mining'] as const,
@@ -7,7 +7,30 @@ export const miningKeys = {
   miners: () => [...miningKeys.all, 'miners'] as const,
   bestHash: () => [...miningKeys.all, 'best-hash'] as const,
   publicNodes: () => [...miningKeys.all, 'public-nodes'] as const,
+  poolSeries: (window: string) => [...miningKeys.all, 'pool-series', window] as const,
+  meshLeaderboard: () => [...miningKeys.all, 'mesh-leaderboard'] as const,
 };
+
+// Server-side pool time-series (hashrate + miners) for the Node Pool charts.
+export function usePoolSeriesHistory(
+  window: '1h' | '24h' = '1h',
+  options?: { refetchInterval?: number },
+) {
+  return useQuery({
+    queryKey: miningKeys.poolSeries(window),
+    queryFn: () => getPoolSeries(window),
+    refetchInterval: options?.refetchInterval ?? 30_000,
+  });
+}
+
+// Mesh-wide leaderboard (node-ranked + mesh best-share records).
+export function usePoolMeshLeaderboard(options?: { refetchInterval?: number }) {
+  return useQuery({
+    queryKey: miningKeys.meshLeaderboard(),
+    queryFn: getPoolMeshLeaderboard,
+    refetchInterval: options?.refetchInterval ?? 15_000,
+  });
+}
 
 export function useMiningStatus(options?: { refetchInterval?: number }) {
   return useQuery({

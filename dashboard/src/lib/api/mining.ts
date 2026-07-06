@@ -1,9 +1,30 @@
 // Mining API endpoints
 import { fetchApi } from './client';
-import type { MiningStatus, MinersResponse, BestHashResponse } from '@/types/api';
+import type {
+  MiningStatus,
+  MinersResponse,
+  BestHashResponse,
+  PoolSeriesResponse,
+  MeshLeaderboardResponse,
+} from '@/types/api';
 
 export async function getMiningStatus(): Promise<MiningStatus> {
   return fetchApi<MiningStatus>('/api/v1/mining/status');
+}
+
+// Rolling server-side time-series of pool hashrate + connected miners.
+// `window` is '1h' or '24h'. Empty samples until the node has been up long
+// enough to accumulate history (the pool page falls back to its session buffer).
+export async function getPoolSeries(
+  window: '1h' | '24h' = '1h',
+): Promise<PoolSeriesResponse> {
+  return fetchApi<PoolSeriesResponse>(`/api/v1/pool/series?window=${window}`);
+}
+
+// Mesh-wide leaderboard: nodes ranked by hashrate across the whole mesh, plus
+// mesh-wide best-share records per window.
+export async function getPoolMeshLeaderboard(): Promise<MeshLeaderboardResponse> {
+  return fetchApi<MeshLeaderboardResponse>('/api/v1/pool/mesh-leaderboard');
 }
 
 export async function getMiners(): Promise<MinersResponse> {

@@ -6836,6 +6836,38 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start pool time-series sampler task.
+    // Snapshots the mesh-wide pool hashrate + connected-miner count (the same
+    // accessors the /api/v1/mining/status handler reads) into the bounded
+    // in-memory ring on VerificationState every 30s, so /api/v1/pool/series can
+    // serve real server-side history instead of a client-side session buffer.
+    {
+        let state_for_series = Arc::clone(&verification_state);
+        let mut series_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let mesh_hashrate_th = state_for_series
+                            .mesh_total_hashrate()
+                            .or_else(|| state_for_series.local_hashrate())
+                            .unwrap_or(0.0);
+                        let sample = ghost_verification::pool_series::PoolSample {
+                            t: chrono::Utc::now().timestamp(),
+                            mesh_hashrate_th,
+                            local_hashrate_th: state_for_series.local_hashrate().unwrap_or(0.0),
+                            miners: state_for_series.mesh_active_miners().unwrap_or(0),
+                        };
+                        state_for_series.pool_series.push(sample);
+                    }
+                    _ = series_shutdown.recv() => break,
+                }
+            }
+        });
+        info!("Pool time-series sampler started (30s interval, 24h retention)");
+    }
+
     // Start self-uptime recording task
     // Records our own uptime so we can be qualified for payouts
     // This is necessary because verification results are stored by OTHER nodes about us,

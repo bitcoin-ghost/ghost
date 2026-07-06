@@ -310,6 +310,58 @@ export interface MinersResponse {
   total_shares_submitted?: number;
 }
 
+// Pool time-series (GET /api/v1/pool/series) — rolling server-side history of
+// pool hashrate + connected miners, sampled every 30s (24h retention).
+export interface PoolSeriesSample {
+  /** Unix timestamp (seconds). */
+  t: number;
+  /** Mesh-wide pool hashrate (TH/s). */
+  mesh_hashrate_th: number;
+  /** This node's own realized hashrate (TH/s). */
+  local_hashrate_th: number;
+  /** Mesh-wide deduplicated connected-miner count. */
+  miners: number;
+}
+
+export interface PoolSeriesResponse {
+  window: string;
+  window_secs: number;
+  sample_interval_secs: number;
+  count: number;
+  samples: PoolSeriesSample[];
+}
+
+// Mesh-wide leaderboard (GET /api/v1/pool/mesh-leaderboard) — node-ranked
+// leaderboard + mesh-wide best-share records per window, aggregated with no new
+// gossip.
+export interface MeshLeaderboardNode {
+  node_id: string;
+  name: string;
+  hashrate_th: number;
+  miner_count: number;
+  shares: number;
+  elder: boolean;
+  healthy: boolean;
+  is_self: boolean;
+}
+
+export interface MeshLeaderboardRecord {
+  window: string;
+  share_hash: string;
+  leading_zero_bits: number;
+  leading_hex_zeros: number;
+  miner_id_redacted: string;
+  timestamp: number;
+  difficulty: number;
+}
+
+export interface MeshLeaderboardResponse {
+  nodes: MeshLeaderboardNode[];
+  node_count: number;
+  records: MeshLeaderboardRecord[];
+  limit_note: string;
+}
+
 // Best Hash types
 export interface BestHashEntry {
   hash?: string | null;

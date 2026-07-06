@@ -17,9 +17,10 @@ import {
   useMiners,
   useRewardsCurrent,
   useNodePayoutHistory,
+  usePoolMeshLeaderboard,
 } from "@/hooks/queries";
 import { usePoolSeries } from "@/hooks/usePoolSeries";
-import type { BestHashEntry, MinerInfo, NodePayoutEntry } from "@/types/api";
+import type { BestHashEntry, MinerInfo, NodePayoutEntry, MeshLeaderboardNode } from "@/types/api";
 
 const TOOLTIPS = {
   pool_hashrate: "Combined hashrate of every node in the Ghost mesh pool, aggregated across the whole network.",
@@ -98,15 +99,19 @@ function BestShareCard({ title, entry }: { title: string; entry: BestHashEntry |
   );
 }
 
-// One chart panel: title + "live (session)" tag + the plot.
+// One chart panel: title + source tag + the plot. The tag shows whether the
+// series is backed by the server-side ring ("history") or the in-browser
+// session buffer ("live (session)").
 function ChartCard({
   title,
   subtitle,
   children,
+  serverBacked = false,
 }: {
   title: string;
   subtitle?: string;
   children: React.ReactNode;
+  serverBacked?: boolean;
 }) {
   return (
     <Card>
@@ -119,7 +124,7 @@ function ChartCard({
             <p style={{ color: "var(--dim)", fontSize: "12px", marginTop: "2px" }}>{subtitle}</p>
           )}
         </div>
-        <Badge variant="default">live (session)</Badge>
+        <Badge variant="default">{serverBacked ? "history" : "live (session)"}</Badge>
       </div>
       {children}
     </Card>
@@ -133,6 +138,7 @@ export default function NodePoolPage() {
   const { data: minersData } = useMiners();
   const { data: rewards } = useRewardsCurrent();
   const { data: payouts } = useNodePayoutHistory("7d");
+  const { data: meshLeaderboard } = usePoolMeshLeaderboard();
   const series = usePoolSeries();
 
   const meshTh = status?.hashrate_th ?? status?.total_hashrate ?? 0;
@@ -206,6 +212,63 @@ export default function NodePoolPage() {
     [],
   );
 
+  // Mesh-wide leaderboard: every node in the mesh ranked by hashrate. The
+  // backend returns nodes already ranked; render them as-is.
+  const meshNodes = meshLeaderboard?.nodes ?? [];
+  const meshRecords = meshLeaderboard?.records ?? [];
+
+  const meshNodeColumns = useMemo<ColumnDef<MeshLeaderboardNode>[]>(
+    () => [
+      {
+        id: "rank",
+        header: "#",
+        cell: ({ row }) => <span style={{ color: "var(--fainter)" }}>{row.index + 1}</span>,
+      },
+      {
+        id: "node",
+        header: "Node",
+        accessorFn: (n) => n.name || n.node_id.slice(0, 10),
+        cell: ({ row }) => (
+          <span className="truncate" style={{ fontFamily: "var(--font-mono)", fontSize: "12px" }}>
+            {row.original.name || row.original.node_id.slice(0, 10)}
+            {row.original.is_self && (
+              <Badge variant="default" className="ml-2">
+                this node
+              </Badge>
+            )}
+          </span>
+        ),
+      },
+      {
+        id: "hashrate",
+        header: "Hashrate",
+        accessorFn: (n) => n.hashrate_th ?? 0,
+        cell: ({ getValue }) => formatHashrate((getValue() as number) * 1e12),
+      },
+      {
+        id: "miners",
+        header: "Miners",
+        accessorFn: (n) => n.miner_count ?? 0,
+        cell: ({ getValue }) => (getValue() as number).toLocaleString(),
+      },
+      {
+        id: "shares",
+        header: "Shares",
+        accessorFn: (n) => n.shares ?? 0,
+        cell: ({ getValue }) => `${getValue() as number} / 15`,
+      },
+      {
+        id: "status",
+        header: "Status",
+        accessorFn: (n) => (n.healthy ? "online" : "offline"),
+        cell: ({ getValue }) => (
+          <Badge variant={getValue() === "online" ? "success" : "error"}>{String(getValue())}</Badge>
+        ),
+      },
+    ],
+    [],
+  );
+
   const payoutColumns = useMemo<ColumnDef<NodePayoutEntry>[]>(
     () => [
       {
@@ -253,16 +316,27 @@ export default function NodePoolPage() {
         subtitle="Live pool stats and graphs for this node and the Ghost mesh — hashrate, miners, shares, best shares, round progress and payouts."
       />
 
-      {/* Live-session note: the node only exposes current values, so the graphs
-          are built from a rolling in-browser buffer that resets on reload. */}
+      {/* Chart source note: the hashrate/miner charts use the node's server-side
+          time-series ring when it has data, falling back to an in-browser
+          session buffer on a freshly-started node. */}
       <div
         className="rounded-lg p-3 text-sm"
         style={{ background: "var(--accent-weak)", border: "1px solid var(--rule)", color: "var(--dim)" }}
       >
-        Graphs are drawn from a live in-browser buffer of the polled pool values
-        ({series.sampleCount} sample{series.sampleCount === 1 ? "" : "s"} this session) and reset on reload.
-        The node API exposes current values only — persisting server-side roll-ups would let these charts
-        survive reloads and cover longer windows.
+        {series.serverBacked ? (
+          <>
+            Hashrate and miner charts are drawn from the node&apos;s server-side history
+            (sampled every 30s, up to 24h) so they survive reloads. The share accept-rate chart
+            is a live in-browser buffer ({series.sampleCount} sample
+            {series.sampleCount === 1 ? "" : "s"} this session).
+          </>
+        ) : (
+          <>
+            Graphs are drawn from a live in-browser buffer of the polled pool values
+            ({series.sampleCount} sample{series.sampleCount === 1 ? "" : "s"} this session) and reset on reload.
+            The node&apos;s server-side history will back these charts once it has accumulated a few samples.
+          </>
+        )}
       </div>
 
       {/* Headline stats */}
@@ -314,25 +388,37 @@ export default function NodePoolPage() {
       {/* Hashrate + miners time-series */}
       <SectionErrorBoundary section="Pool Graphs">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <ChartCard title="Pool Hashrate" subtitle="Mesh-wide, aggregated across all nodes">
+          <ChartCard
+            title="Pool Hashrate"
+            subtitle="Mesh-wide, aggregated across all nodes"
+            serverBacked={series.serverBacked}
+          >
             <TimeSeriesChart
               data={series.meshHashrate}
-              ariaLabel="Pool hashrate over the session"
+              ariaLabel="Pool hashrate over time"
               formatValue={(v) => formatHashrate(v, 1)}
             />
           </ChartCard>
-          <ChartCard title="Connected Miners" subtitle="Active miners across the mesh pool">
+          <ChartCard
+            title="Connected Miners"
+            subtitle="Active miners across the mesh pool"
+            serverBacked={series.serverBacked}
+          >
             <TimeSeriesChart
               data={series.miners}
               color="var(--green)"
-              ariaLabel="Connected miners over the session"
+              ariaLabel="Connected miners over time"
               formatValue={(v) => Math.round(v).toString()}
             />
           </ChartCard>
-          <ChartCard title="This Node Hashrate" subtitle="Miners connected to this node only">
+          <ChartCard
+            title="This Node Hashrate"
+            subtitle="Miners connected to this node only"
+            serverBacked={series.serverBacked}
+          >
             <TimeSeriesChart
               data={series.nodeHashrate}
-              ariaLabel="This node hashrate over the session"
+              ariaLabel="This node hashrate over time"
               formatValue={(v) => formatHashrate(v, 1)}
             />
           </ChartCard>
@@ -445,12 +531,60 @@ export default function NodePoolPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* Leaderboard */}
-      <SectionErrorBoundary section="Miner Leaderboard">
+      {/* Mesh leaderboard: every node in the pool ranked by hashrate, plus the
+          mesh-wide best-share records per window. Aggregated by the backend
+          across the whole mesh (no client fan-out). */}
+      <SectionErrorBoundary section="Mesh Leaderboard">
         <Card>
           <CardHeader
-            title="Miner Leaderboard"
-            subtitle="Top miners connected to this node, ranked by hashrate"
+            title="Mesh Leaderboard"
+            subtitle="Every node in the Ghost pool, ranked by hashrate across the whole mesh"
+          />
+          <DataTable
+            columns={meshNodeColumns}
+            data={meshNodes}
+            showPagination={false}
+            emptyMessage="No mesh nodes reporting yet"
+            loadingRows={4}
+          />
+          {meshRecords.length > 0 && (
+            <div className="mt-5">
+              <div style={{ color: "var(--dim)", fontSize: "12px", marginBottom: "8px" }}>
+                Mesh best-share records
+              </div>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                {meshRecords.map((r) => (
+                  <div key={r.window}>
+                    <div style={{ color: "var(--dim)", fontSize: "11px", textTransform: "capitalize" }}>
+                      {r.window}
+                    </div>
+                    <div style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 600 }}>
+                      {formatDifficulty(r.difficulty)}
+                    </div>
+                    <div style={{ color: "var(--fainter)", fontSize: "11px" }}>
+                      {r.leading_zero_bits} zero bits · {r.miner_id_redacted || "—"}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {meshLeaderboard?.limit_note && (
+            <p style={{ color: "var(--fainter)", fontSize: "11px", marginTop: "12px" }}>
+              {meshLeaderboard.limit_note}
+            </p>
+          )}
+        </Card>
+      </SectionErrorBoundary>
+
+      {/* This node's miners: the per-miner detail this node can see locally.
+          A true mesh-wide per-miner leaderboard needs client fan-out to every
+          node (see the mesh leaderboard note above). */}
+      <SectionErrorBoundary section="This Node's Miners">
+        <Card>
+          <CardHeader
+            title="This Node's Miners"
+            subtitle="Miners connected to this node's stratum port, ranked by hashrate"
           />
           {minersRedacted ? (
             <div style={{ color: "var(--dim)", fontSize: "13px" }}>

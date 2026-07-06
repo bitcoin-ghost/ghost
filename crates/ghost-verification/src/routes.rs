@@ -232,6 +232,17 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // website render the node list from one node instead of a hard-coded
         // VM set, so new nodes appear automatically.
         .route("/api/v1/pool/mesh-nodes", get(api_pool_mesh_nodes_handler))
+        // Rolling server-side time-series of pool hashrate + connected miners,
+        // sampled every 30s (24h retention). `?window=1h|24h`. Lets the pool
+        // page chart real history instead of a client-side session buffer.
+        .route("/api/v1/pool/series", get(api_pool_series_handler))
+        // Mesh-wide leaderboard: node-ranked (self + peers by hashrate) plus the
+        // mesh-wide best-share records per window, aggregated from existing mesh
+        // data with no new gossip. Replaces the pool page's this-node-only list.
+        .route(
+            "/api/v1/pool/mesh-leaderboard",
+            get(api_pool_mesh_leaderboard_handler),
+        )
         // Read-only decentralised-coordinator election view. Returns
         // `{enabled:false}` unless the operator turns on
         // `[coordinator] wraith_election_enabled`.
@@ -1853,6 +1864,13 @@ struct PoolLeaderboardQuery {
     limit: Option<u32>,
 }
 
+/// Query parameters for the pool time-series endpoint.
+/// `window` is `1h | 24h` (defaults to `1h`, anything else is treated as `1h`).
+#[derive(Debug, Deserialize)]
+struct PoolSeriesQuery {
+    window: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct MinerHistoryQuery {
     miner_id: Option<String>,
@@ -2893,6 +2911,185 @@ async fn api_pool_records_handler(
             "difficulty": share_difficulty_from_hash_hex(&share_hash),
             "assigned_difficulty": winning_assigned_diff,
         }
+    }))
+}
+
+/// Rolling server-side time-series of pool hashrate + connected miners.
+///
+/// The sampler task in `bins/ghost-pool` snapshots the same mesh accessors the
+/// mining-status endpoint uses (`mesh_total_hashrate` / `local_hashrate` /
+/// `mesh_active_miners`) every 30s into a bounded in-memory ring. This endpoint
+/// returns the samples within the requested `window` (`1h` or `24h`, default
+/// `1h`), oldest first. Empty until the first sample lands after startup — the
+/// dashboard keeps its client-side session buffer as a fallback in that case.
+async fn api_pool_series_handler(
+    State(state): State<Arc<VerificationState>>,
+    Query(params): Query<PoolSeriesQuery>,
+) -> impl IntoResponse {
+    // Only 1h and 24h are offered; anything else falls back to 1h.
+    let (window_label, window_secs): (&str, i64) = match params.window.as_deref() {
+        Some("24h") => ("24h", 24 * 3600),
+        _ => ("1h", 3600),
+    };
+    let cutoff = chrono::Utc::now().timestamp() - window_secs;
+    let samples = state.pool_series.since(cutoff);
+    Json(serde_json::json!({
+        "window": window_label,
+        "window_secs": window_secs,
+        "sample_interval_secs": 30,
+        "count": samples.len(),
+        "samples": samples,
+    }))
+}
+
+/// Mesh-wide leaderboard for the pool page — aggregated across the whole mesh
+/// WITHOUT any new gossip, from data every node already holds:
+///
+/// * `nodes` — every mesh node (self + connected peers) ranked by realized
+///   hashrate. This is the mesh-wide replacement for the pool page's old
+///   this-node-only miner list.
+/// * `records` — the mesh-wide best (rarest) share per window (block/day/week/
+///   month), merging this node's local DB best with peers' gossiped
+///   `best_records` (already reduced to one winner per window), each attributed
+///   to its redacted miner id.
+///
+/// LIMIT: a true mesh-wide *per-miner top-N* leaderboard (every miner on every
+/// node ranked by hashrate or shares) is NOT computable from a single node
+/// without new gossip — peers gossip per-node aggregates and one best-share
+/// record per window, never their full per-miner tables. The public website
+/// builds that by fanning out to every node and merging client-side. `records`
+/// is the widest mesh-wide per-miner surface available server-side here.
+async fn api_pool_mesh_leaderboard_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let health = state.get_health().await;
+
+    // --- Node-ranked leaderboard: self + every connected peer ---
+    let self_name = {
+        let config = state.dashboard_config.read();
+        let addr = match config.stratum_host.clone() {
+            Some(host) if host.contains(':') => host,
+            Some(host) => format!("{host}:{}", config.http_port.unwrap_or(8080)),
+            None => String::new(),
+        };
+        config
+            .node_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| mesh_node_name(&addr, &health.node_id))
+    };
+    let self_caps = &health.capabilities;
+    let mut nodes = vec![serde_json::json!({
+        "node_id": health.node_id.clone(),
+        "name": self_name,
+        "hashrate_th": state.local_hashrate().unwrap_or(0.0),
+        "miner_count": health.miner_count,
+        "shares": mesh_capability_shares(
+            self_caps.archive_mode,
+            self_caps.ghost_pay,
+            self_caps.public_mining,
+            self_caps.reaper,
+            self_caps.elder_status,
+        ),
+        "elder": self_caps.elder_status,
+        "healthy": health.healthy,
+        "is_self": true,
+    })];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(health.node_id.clone());
+    for peer in state.mesh_nodes() {
+        if !seen.insert(peer.node_id.clone()) {
+            continue;
+        }
+        nodes.push(serde_json::json!({
+            "node_id": peer.node_id,
+            "name": mesh_node_name(&peer.address, &peer.node_id),
+            "hashrate_th": peer.hashrate_th,
+            "miner_count": peer.miner_count,
+            "shares": mesh_capability_shares(
+                peer.cap_archive,
+                peer.cap_ghost_pay,
+                peer.cap_public_mining,
+                peer.cap_reaper,
+                peer.cap_elder,
+            ),
+            "elder": peer.cap_elder,
+            "healthy": peer.healthy,
+            "is_self": false,
+        }));
+    }
+    // Rank by realized hashrate, highest first.
+    nodes.sort_by(|a, b| {
+        let ha = a.get("hashrate_th").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let hb = b.get("hashrate_th").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        hb.partial_cmp(&ha).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let node_count = nodes.len();
+
+    // --- Mesh-wide best-share records per window ---
+    // Merge this node's local DB best with the peers' gossiped winners (already
+    // one per window). Same rarity rule as /api/v1/pool/records: fixed-width
+    // zero-padded hex, so string `<` matches numeric order (smaller = rarer).
+    let now_s = chrono::Utc::now().timestamp();
+    let mesh_records = state.mesh_best_records();
+    let mut records = Vec::new();
+    for (window_name, window_secs) in [
+        ("block", 600i64),
+        ("day", 86_400),
+        ("week", 604_800),
+        ("month", 2_592_000),
+    ] {
+        let since_ts = now_s - window_secs;
+        let mut winning_hash: Option<String> = None;
+        let mut winning_redacted = String::new();
+        let mut winning_timestamp: i64 = 0;
+
+        if let Some(ref db) = state.database {
+            if let Ok(Some(best)) = db.get_best_share_since(since_ts) {
+                winning_hash = Some(best.share_hash.clone());
+                winning_redacted = redact_miner_id(&best.miner_id);
+                winning_timestamp = best.timestamp;
+            }
+        }
+        if let Some(ref recs) = mesh_records {
+            for rec in recs {
+                if rec.window != window_name || rec.share_hash.is_empty() {
+                    continue;
+                }
+                let beats = winning_hash
+                    .as_ref()
+                    .map(|w| rec.share_hash < *w)
+                    .unwrap_or(true);
+                if beats {
+                    winning_hash = Some(rec.share_hash.clone());
+                    winning_redacted = rec.miner_id_redacted.clone();
+                    winning_timestamp = rec.timestamp;
+                }
+            }
+        }
+
+        if let Some(share_hash) = winning_hash {
+            let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
+            records.push(serde_json::json!({
+                "window": window_name,
+                "share_hash": share_hash.clone(),
+                "leading_zero_bits": leading_hex_zeros * 4,
+                "leading_hex_zeros": leading_hex_zeros,
+                "miner_id_redacted": winning_redacted,
+                "timestamp": winning_timestamp,
+                "difficulty": share_difficulty_from_hash_hex(&share_hash),
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "nodes": nodes,
+        "node_count": node_count,
+        "records": records,
+        "limit_note": "Node-ranked leaderboard + mesh-wide best-share records \
+            per window, aggregated from existing mesh data (no new gossip). A \
+            per-miner top-N hashrate/shares leaderboard across the whole mesh \
+            requires client-side fan-out to every node.",
     }))
 }
 
