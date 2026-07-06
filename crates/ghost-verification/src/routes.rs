@@ -3353,6 +3353,35 @@ pub fn redact_miner_id(id: &str) -> String {
 }
 
 /// API v1 pool status handler
+/// Expected seconds for a pool to find a block, given the current network
+/// `difficulty` and the pool's aggregate hashrate `pool_hashrate_hps` (in
+/// hashes/second). Standard estimator: on average `difficulty * 2^32` hashes
+/// are needed to find a block, so the expected time is that divided by the
+/// pool's hash rate.
+///
+/// Returns `None` (rather than dividing by zero or emitting a nonsense value)
+/// when the hashrate is non-positive or either input is not a finite positive
+/// number. For a small pool the result is honestly very large — that is the
+/// real expectation, so it is emitted as-is. Computed in `f64` throughout to
+/// avoid the overflow that `difficulty * 2^32` would hit in integer math.
+fn estimated_time_to_block_secs(difficulty: f64, pool_hashrate_hps: f64) -> Option<f64> {
+    // 2^32 — the average number of hashes per unit of difficulty.
+    const HASHES_PER_DIFFICULTY: f64 = 4_294_967_296.0;
+    if !difficulty.is_finite()
+        || difficulty <= 0.0
+        || !pool_hashrate_hps.is_finite()
+        || pool_hashrate_hps <= 0.0
+    {
+        return None;
+    }
+    let secs = difficulty * HASHES_PER_DIFFICULTY / pool_hashrate_hps;
+    if secs.is_finite() {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
 async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
     let active_miners = state
@@ -3361,6 +3390,33 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         .and_then(|db| db.count_active_miners(300).ok())
         .unwrap_or(0);
     let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
+
+    // Seconds elapsed working the current template (round manager provides it;
+    // None on older deploys without the callback wired).
+    let current_round_duration_secs = state.round_elapsed_secs();
+
+    // Expected time for THIS pool to find a block at its current aggregate
+    // hashrate. Pool hashrate is the deduplicated mesh-wide figure (TH/s),
+    // falling back to this node's own realized rate; converted to hashes/sec
+    // for the estimator. Network difficulty comes straight from Ghost Core
+    // (getmininginfo) — the round manager's copy is a static default, so we
+    // read the live value here, mirroring the network-hashrate field on the
+    // mining-status endpoint. `null` when either input is unavailable.
+    let pool_hashrate_th = state.mesh_total_hashrate().or_else(|| state.local_hashrate());
+    let network_difficulty = if let Some(ref rpc) = state.rpc {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_mining_info())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|info| info.difficulty)
+    } else {
+        None
+    };
+    let estimated_time_to_block_secs = match (network_difficulty, pool_hashrate_th) {
+        (Some(diff), Some(th)) => estimated_time_to_block_secs(diff, th * 1e12),
+        _ => None,
+    };
+
     Json(serde_json::json!({
         "pool_name": "Ghost Pool",
         "version": health.version,
@@ -3373,6 +3429,8 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         "round_id": health.round_id,
         "uptime_secs": health.uptime_secs,
         "total_shares": health.capabilities.total_shares,
+        "current_round_duration_secs": current_round_duration_secs,
+        "estimated_time_to_block_secs": estimated_time_to_block_secs,
         "stratum_sv2_port": 4444,
         "stratum_sv1_port": 3333,
         "http_port": 8080
@@ -9180,6 +9238,43 @@ async fn api_system_mempool_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_estimated_time_to_block_secs_known_values() {
+        // A pool running at exactly difficulty * 2^32 hashes/sec finds a block
+        // in one second on average.
+        let difficulty = 1_000_000.0;
+        let hps = difficulty * 4_294_967_296.0;
+        let est = estimated_time_to_block_secs(difficulty, hps).unwrap();
+        assert!((est - 1.0).abs() < 1e-9, "expected 1s, got {est}");
+
+        // Concrete worked example: difficulty 1000, pool at 1 TH/s (1e12 h/s).
+        //   1000 * 2^32 / 1e12 = 4_294_967_296_000 / 1e12 = 4.294967296 s
+        let est = estimated_time_to_block_secs(1_000.0, 1e12).unwrap();
+        assert!((est - 4.294_967_296).abs() < 1e-9, "got {est}");
+
+        // Halving the hashrate doubles the expected time.
+        let slow = estimated_time_to_block_secs(1_000.0, 0.5e12).unwrap();
+        assert!((slow - 2.0 * est).abs() < 1e-6, "got {slow}");
+
+        // A small pool honestly yields a very large — but finite — estimate.
+        // difficulty 50e12 at 1 TH/s: 50e12 * 2^32 / 1e12 = 50 * 2^32 ≈ 2.147e11 s.
+        let big = estimated_time_to_block_secs(50_000_000_000_000.0, 1e12).unwrap();
+        assert!(big.is_finite() && big > 1e11, "got {big}");
+    }
+
+    #[test]
+    fn test_estimated_time_to_block_secs_guards() {
+        // Zero / negative / non-finite hashrate → None (no divide-by-zero).
+        assert!(estimated_time_to_block_secs(1_000_000.0, 0.0).is_none());
+        assert!(estimated_time_to_block_secs(1_000_000.0, -5.0).is_none());
+        assert!(estimated_time_to_block_secs(1_000_000.0, f64::NAN).is_none());
+        assert!(estimated_time_to_block_secs(1_000_000.0, f64::INFINITY).is_none());
+        // Non-positive / non-finite difficulty → None.
+        assert!(estimated_time_to_block_secs(0.0, 1e12).is_none());
+        assert!(estimated_time_to_block_secs(-1.0, 1e12).is_none());
+        assert!(estimated_time_to_block_secs(f64::NAN, 1e12).is_none());
+    }
 
     #[test]
     fn test_resolve_mpc_note_spend_path_serves_candidate_then_current() {

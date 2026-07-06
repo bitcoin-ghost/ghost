@@ -5865,6 +5865,7 @@ async fn main() -> Result<()> {
     let rm_for_height = Arc::clone(&round_manager);
     let rm_for_round = Arc::clone(&round_manager);
     let rm_for_miners = Arc::clone(&round_manager);
+    let rm_for_elapsed = Arc::clone(&round_manager);
     let mesh_for_verification = Arc::clone(&mesh);
 
     let mut verification_state = VerificationState::new(
@@ -6025,6 +6026,12 @@ async fn main() -> Result<()> {
             .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_route)
             .unwrap_or(0.0)
     });
+
+    // Seconds elapsed working the current template, surfaced as
+    // `current_round_duration_secs` on the pool-status endpoint so the
+    // dashboard's round-progress readout reflects real round timing.
+    verification_state = verification_state
+        .with_round_elapsed_secs(move || rm_for_elapsed.current_round_elapsed_secs());
 
     // Mesh-wide best records per window — every connected peer's gossiped best,
     // reduced to one winner per window. The records endpoint merges this with
