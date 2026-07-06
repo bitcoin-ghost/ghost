@@ -2995,7 +2995,9 @@ async fn api_pool_mesh_leaderboard_handler(
         "node_id": health.node_id.clone(),
         "name": self_name,
         "hashrate_th": state.local_hashrate().unwrap_or(0.0),
-        "miner_count": health.miner_count,
+        // Deduped real-miner count (matches Capacity/Swarm/overview), not the
+        // raw share-ledger miner_count which double-counts (issue #281).
+        "miner_count": state.self_deduped_miner_count(),
         "shares": mesh_capability_shares(
             self_caps.archive_mode,
             self_caps.ghost_pay,
@@ -3017,7 +3019,8 @@ async fn api_pool_mesh_leaderboard_handler(
             "node_id": peer.node_id,
             "name": mesh_node_name(&peer.address, &peer.node_id),
             "hashrate_th": peer.hashrate_th,
-            "miner_count": peer.miner_count,
+            // Deduped real-miner count, consistent with the self row (issue #281).
+            "miner_count": peer.deduped_miner_count,
             "shares": mesh_capability_shares(
                 peer.cap_archive,
                 peer.cap_ghost_pay,
