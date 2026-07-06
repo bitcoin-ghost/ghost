@@ -22,8 +22,9 @@ import type { MiningStatus, PoolStatus } from '@/types/api';
  * subscribing to the react-query cache (an external system) — the idiomatic
  * pattern for syncing external updates into state.
  *
- * Share accept-rate has no backend series (the node exposes cumulative counters,
- * not a rate history) so that chart is always session-derived.
+ * This node's own connected-miner count has no backend series (the `/pool/series`
+ * ring only carries the mesh-wide miner count) so that chart is always
+ * session-derived.
  */
 
 export interface SeriesPoint {
@@ -38,8 +39,8 @@ export interface PoolSeries {
   nodeHashrate: SeriesPoint[];
   /** Connected miners across the mesh. */
   miners: SeriesPoint[];
-  /** Share accept-rate, 0–100 (always session-derived). */
-  acceptRate: SeriesPoint[];
+  /** This node's own connected-miner count (always session-derived). */
+  nodeMiners: SeriesPoint[];
   /** Number of samples collected this session (session buffer). */
   sampleCount: number;
   /** True when the hashrate/miner charts are backed by server-side history. */
@@ -52,7 +53,7 @@ interface SessionSeries {
   meshHashrate: SeriesPoint[];
   nodeHashrate: SeriesPoint[];
   miners: SeriesPoint[];
-  acceptRate: SeriesPoint[];
+  nodeMiners: SeriesPoint[];
   sampleCount: number;
 }
 
@@ -70,7 +71,7 @@ export function usePoolSeries(): PoolSeries {
     meshHashrate: [],
     nodeHashrate: [],
     miners: [],
-    acceptRate: [],
+    nodeMiners: [],
     sampleCount: 0,
   });
 
@@ -98,9 +99,9 @@ export function usePoolSeries(): PoolSeries {
         status.connected_miners ??
         status.active_miners ??
         0;
-      const submitted = status.shares_submitted ?? 0;
-      const accepted = status.shares_accepted ?? 0;
-      const acceptRate = submitted > 0 ? (accepted / submitted) * 100 : 100;
+      // This node's OWN connected-miner count (not the mesh-wide figure) —
+      // mirrors the `miner_count` health field the "This Node" stat area uses.
+      const nodeMiners = status.miner_count ?? status.local_connected_miners ?? 0;
 
       const push = (arr: SeriesPoint[], v: number): SeriesPoint[] => {
         const next = [...arr, { t, v }];
@@ -111,7 +112,7 @@ export function usePoolSeries(): PoolSeries {
         meshHashrate: push(prev.meshHashrate, meshTh * 1e12),
         nodeHashrate: push(prev.nodeHashrate, nodeTh * 1e12),
         miners: push(prev.miners, miners),
-        acceptRate: push(prev.acceptRate, acceptRate),
+        nodeMiners: push(prev.nodeMiners, nodeMiners),
         sampleCount: prev.sampleCount + 1,
       }));
     };
@@ -133,8 +134,8 @@ export function usePoolSeries(): PoolSeries {
         meshHashrate: samples.map((s) => ({ t: s.t, v: s.mesh_hashrate_th * 1e12 })),
         nodeHashrate: samples.map((s) => ({ t: s.t, v: s.local_hashrate_th * 1e12 })),
         miners: samples.map((s) => ({ t: s.t, v: s.miners })),
-        // No backend accept-rate series — keep the session-derived one.
-        acceptRate: session.acceptRate,
+        // No backend this-node-miners series — keep the session-derived one.
+        nodeMiners: session.nodeMiners,
         sampleCount: session.sampleCount,
         serverBacked: true,
       };
