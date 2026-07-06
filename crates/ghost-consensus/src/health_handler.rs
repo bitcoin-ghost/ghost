@@ -872,6 +872,17 @@ impl HealthPingHandler {
         // Hardware-derived capacity used by the LB for utilisation routing.
         self.peers
             .update_max_capacity(&envelope.sender, ping.max_capacity);
+        // Swarm-page telemetry: L1 height, trailing-7-day uptime %, this peer's
+        // own peer count, and Ghost Pay L2 height. Older peers omit the Option
+        // fields (→ None) and report block_height 0, all handled inside the
+        // updater so the mesh stays backward-compatible.
+        self.peers.update_node_telemetry(
+            &envelope.sender,
+            ping.block_height,
+            ping.uptime_percent,
+            ping.peer_count,
+            ping.l2_height,
+        );
         // Best (rarest) share per records window — merged with the local DB
         // best so `/api/v1/pool/records` returns the mesh-wide rarest record.
         self.peers
