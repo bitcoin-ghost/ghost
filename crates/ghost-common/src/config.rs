@@ -121,6 +121,10 @@ pub struct NodeConfig {
     /// the node (`tasks/plan_decentralised_coordinators.md`, increment 4).
     #[serde(default)]
     pub coordinator: CoordinatorConfig,
+    /// Operator alerting configuration (email / push / Telegram). Off by
+    /// default; delivery is inert until an operator enables a channel.
+    #[serde(default)]
+    pub alerts: AlertsConfig,
 }
 
 /// Decentralised Wraith coordinator-election settings.
@@ -1628,6 +1632,135 @@ impl ReaperSettings {
             ),
             format!("-ghostreaper-mindropsize={}", self.min_drop_size),
         ]
+    }
+}
+
+/// Operator alerting configuration. Persisted to pool.toml `[alerts]`.
+///
+/// Delivers node-event notifications to one or more operator channels. Secure
+/// by default: `enabled = false` and every channel `enabled = false`, so no
+/// alert is ever sent until an operator opts in and supplies a destination.
+///
+/// Secrets (Telegram bot token) live in this struct exactly like the
+/// `[coordinator] bond_ledger_token` secret already does — persisted only to
+/// the root-owned pool.toml and never logged.
+///
+/// # TOML Example
+/// ```toml
+/// [alerts]
+/// enabled = true
+///
+/// [alerts.channels.telegram]
+/// enabled = true
+/// bot_token = "123456:ABC-DEF..."
+/// chat_id = "987654321"
+///
+/// [alerts.events]
+/// block_found = true
+/// node_offline = true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlertsConfig {
+    /// Master switch. When false, no alert is delivered on any channel,
+    /// regardless of the per-channel `enabled` flags.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Per-channel delivery configuration.
+    #[serde(default)]
+    pub channels: AlertChannels,
+    /// Which node events fire an alert.
+    #[serde(default)]
+    pub events: AlertEvents,
+}
+
+/// The set of delivery channels an operator can enable.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlertChannels {
+    #[serde(default)]
+    pub email: EmailChannel,
+    #[serde(default)]
+    pub push: PushChannel,
+    #[serde(default)]
+    pub telegram: TelegramChannel,
+}
+
+/// Email delivery via a configured HTTP webhook. The node POSTs
+/// `{ "to", "subject", "body" }` JSON to `webhook_url`; the operator points
+/// this at their own mail relay / transactional-email HTTP API (Mailgun,
+/// Postmark, a self-hosted SMTP-bridge, etc.). This keeps the node free of a
+/// heavyweight SMTP client while still delivering a real email end-to-end.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EmailChannel {
+    #[serde(default)]
+    pub enabled: bool,
+    /// HTTP(S) endpoint that accepts `{to, subject, body}` and sends the mail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    /// Destination email address placed in the `to` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_address: Option<String>,
+}
+
+/// Push delivery via a generic / ntfy-style HTTP webhook. The node POSTs
+/// `{ "title", "message" }` JSON to `webhook_url`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PushChannel {
+    #[serde(default)]
+    pub enabled: bool,
+    /// HTTP(S) endpoint that receives the push payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
+/// Telegram delivery via the Bot API `sendMessage` method.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelegramChannel {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bot token from @BotFather. SECRET — never logged; redacted on the read
+    /// API. Persisted only to the root-owned pool.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
+    /// Destination chat id (user, group, or channel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+}
+
+/// Which node events fire an alert. Every event defaults ON so that enabling
+/// the feature is useful out of the box; an operator narrows the set as they
+/// like. These names are the stable wire keys shared with the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertEvents {
+    /// Node became unreachable / unhealthy (health monitor).
+    #[serde(default = "default_true")]
+    pub node_offline: bool,
+    /// A verified capability regressed from qualified to drift/failing.
+    #[serde(default = "default_true")]
+    pub capability_drift: bool,
+    /// Free disk fell below the low-disk threshold.
+    #[serde(default = "default_true")]
+    pub low_disk: bool,
+    /// A configuration change or update needs a node restart to apply.
+    #[serde(default = "default_true")]
+    pub restart_needed: bool,
+    /// Connected peer count dropped (mesh partition / peers lost).
+    #[serde(default = "default_true")]
+    pub peer_count_drop: bool,
+    /// This node found a block.
+    #[serde(default = "default_true")]
+    pub block_found: bool,
+}
+
+impl Default for AlertEvents {
+    fn default() -> Self {
+        Self {
+            node_offline: true,
+            capability_drift: true,
+            low_disk: true,
+            restart_needed: true,
+            peer_count_drop: true,
+            block_found: true,
+        }
     }
 }
 
