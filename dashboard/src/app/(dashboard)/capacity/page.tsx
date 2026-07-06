@@ -1,18 +1,18 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { fetchApi } from "@/lib/api/client";
+import { useMeshNodes } from "@/hooks/queries";
+import type { MeshNode } from "@/lib/api/meshNodes";
 
 /**
  * Capacity & load-balancer view.
  *
  * Sourced from `/api/v1/pool/mesh-nodes` — the SAME live mesh-node list the
- * Swarm page and the deduped mesh-wide active-miner total (Watchdog's
+ * Swarm and Geo pages and the deduped mesh-wide active-miner total (Watchdog's
  * `mesh_active_miners`) are built from — so the table covers the WHOLE fleet,
  * not just the `public_mining` capacity reporters the load-balancer
  * `pool-nodes` path filtered to. Each node carries a `deduped_miner_count`
@@ -21,47 +21,6 @@ import { fetchApi } from "@/lib/api/client";
  * gossiped a capacity ceiling yet are shown with an "unknown" marker rather
  * than being dropped, keeping the visible node set == the deduped-total set.
  */
-
-interface MeshNodeCapabilities {
-  archive: boolean;
-  ghost_pay: boolean;
-  public_mining: boolean;
-  reaper: boolean;
-  elder: boolean;
-}
-
-interface MeshNode {
-  node_id: string;
-  address: string;
-  elder: boolean;
-  capabilities: MeshNodeCapabilities;
-  hashrate_th: number;
-  // Raw connection count — a load-balancer routing view that double-counts a
-  // miner failing over between nodes. Kept for reference; NOT summed.
-  miner_count: number;
-  // Deduplicated share of the mesh-wide active-miner total attributed to this
-  // node. Each unique miner is owned by exactly one node, so summing this
-  // across the list equals the deduped `mesh_active_miners` grand total the
-  // Watchdog reports.
-  deduped_miner_count: number;
-  // Hardware-derived capacity ceiling. 0 / absent = the node has not gossiped
-  // one yet (shown as "unknown", not a real ceiling).
-  max_capacity?: number;
-  healthy: boolean;
-  is_self: boolean;
-}
-
-interface MeshNodesResponse {
-  nodes: MeshNode[];
-  total: number;
-}
-
-async function fetchMeshNodes(): Promise<MeshNodesResponse> {
-  // Route through the proxy (fetchApi). `/api/v1/pool/mesh-nodes` is a public,
-  // no-auth endpoint that returns self + every connected peer, so the table
-  // reflects the whole mesh without a hard-coded node list.
-  return fetchApi<MeshNodesResponse>("/api/v1/pool/mesh-nodes");
-}
 
 // Utilisation from the DEDUPED miner count (the honest per-node figure) over
 // the node's capacity ceiling. Unknown capacity (0) yields 0% and renders "—".
@@ -120,11 +79,7 @@ function UtilisationBar({ pct, label }: { pct: number; label?: string }) {
 }
 
 export default function CapacityPage() {
-  const { data, isLoading, error } = useQuery<MeshNodesResponse>({
-    queryKey: ["mesh-nodes"],
-    queryFn: fetchMeshNodes,
-    refetchInterval: 30_000,
-  });
+  const { data, isLoading, error } = useMeshNodes();
 
   if (isLoading) {
     return (
