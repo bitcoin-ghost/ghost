@@ -6311,6 +6311,15 @@ async fn main() -> Result<()> {
         Ok(())
     });
 
+    // Shared slot for the operator-alert dispatcher. The block_found callback is
+    // registered here (before `verification_state` is wrapped in an `Arc`, which
+    // the dispatcher's live-config closure needs), so it can't capture the
+    // dispatcher directly. Instead it captures this slot, which is populated
+    // once the dispatcher is built (just after the `Arc::new` below). BlockFound
+    // is the one trigger site on a pre-Arc, synchronous callback path.
+    let alert_slot: Arc<std::sync::OnceLock<Arc<ghost_verification::alerts::AlertDispatcher>>> =
+        Arc::new(std::sync::OnceLock::new());
+
     // Configure block_found callback: triggers payout proposal BEFORE block submission.
     // This breaks the bootstrap deadlock where:
     //   1. submitblock requires an approved coinbase commitment
@@ -6326,6 +6335,7 @@ async fn main() -> Result<()> {
         let db_for_bf = Arc::clone(&db);
         let solo_payout_address_for_bf = config.network.solo_payout_address.clone();
         let metrics_for_bf = Arc::clone(&metrics);
+        let alert_slot_for_bf = Arc::clone(&alert_slot);
 
         verification_state = verification_state.with_block_found_callback(move |block_info| {
             let round_id = rm_for_bf.current_round_id();
@@ -6338,6 +6348,22 @@ async fn main() -> Result<()> {
                 solo_mode = is_solo_mode,
                 "Block-difficulty share found, creating pre-submission payout proposal..."
             );
+
+            // Fire the BlockFound operator alert (async, non-blocking — never
+            // holds up the payout-proposal hot path). Enable-flag + delivery are
+            // handled inside the dispatcher. Discrete event: no debounce needed.
+            if let Some(dispatcher) = alert_slot_for_bf.get() {
+                let dispatcher = Arc::clone(dispatcher);
+                let detail = format!(
+                    "Block-difficulty share found in round {round_id} (share {}, miner {}).",
+                    block_info.share_hash, block_info.miner_id
+                );
+                tokio::spawn(async move {
+                    dispatcher
+                        .fire(ghost_verification::alerts::AlertEvent::BlockFound, &detail)
+                        .await;
+                });
+            }
 
             // Use the share hash as block hash — the share met block difficulty,
             // so this IS the candidate block hash. Can't use [0u8;32] because
@@ -6705,6 +6731,26 @@ async fn main() -> Result<()> {
 
     let verification_state = Arc::new(verification_state);
 
+    // Build the operator-alert dispatcher now that the state is an `Arc`. Its
+    // config closure reads `full_node_config` on every dispatch, so live edits
+    // to `[alerts]` via the config API apply without a restart. All async
+    // trigger sites below clone this `Arc`; the block_found callback (registered
+    // pre-Arc) reads it via `alert_slot`, populated here.
+    let alert_dispatcher = {
+        let state_for_alerts = Arc::clone(&verification_state);
+        Arc::new(ghost_verification::alerts::AlertDispatcher::new(
+            verification_state.node_id.clone(),
+            move || {
+                state_for_alerts
+                    .full_node_config
+                    .as_ref()
+                    .map(|c| c.read().alerts.clone())
+                    .unwrap_or_default()
+            },
+        ))
+    };
+    let _ = alert_slot.set(Arc::clone(&alert_dispatcher));
+
     // Get restart signal for monitoring (config update API)
     let restart_signal = verification_state.restart_signal();
 
@@ -6712,12 +6758,23 @@ async fn main() -> Result<()> {
     // When config is updated via API, this triggers graceful shutdown
     let restart_signal_for_monitor = Arc::clone(&restart_signal);
     let shutdown_tx_for_restart = shutdown_tx.clone();
+    let alert_dispatcher_for_restart = Arc::clone(&alert_dispatcher);
+    let restart_node_id = verification_state.node_id.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
             if restart_signal_for_monitor.load(std::sync::atomic::Ordering::SeqCst) {
                 info!("Restart signal received (config update). Initiating graceful shutdown...");
+                // Fire the RestartNeeded alert BEFORE broadcasting shutdown so
+                // the HTTPS delivery isn't cut short by the graceful-exit path.
+                // Fires once (the loop breaks immediately after).
+                alert_dispatcher_for_restart
+                    .fire(
+                        ghost_verification::alerts::AlertEvent::RestartNeeded,
+                        &format!("Node {} is restarting to apply a configuration change.", &restart_node_id[..8.min(restart_node_id.len())]),
+                    )
+                    .await;
                 let _ = shutdown_tx_for_restart.send(());
                 break;
             }
@@ -6731,8 +6788,12 @@ async fn main() -> Result<()> {
     let mesh_for_ws = Arc::clone(&mesh);
     let start_time = std::time::Instant::now();
     let mut ws_shutdown = shutdown_tx.subscribe();
+    let alert_dispatcher_for_ws = Arc::clone(&alert_dispatcher);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Track the previous peer count so we can alert on a DROP (a decrease),
+        // not on every tick. `None` until the first observation.
+        let mut last_peer_count: Option<u32> = None;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -6740,14 +6801,35 @@ async fn main() -> Result<()> {
                         .round_stats(rm_for_ws.current_round_id())
                         .map(|s| s.miner_count as u32)
                         .unwrap_or(0);
+                    let peer_count = mesh_for_ws.peers().unique_peer_count() as u32;
                     let event = ghost_verification::WsEvent::HealthUpdate {
                         block_height: rm_for_ws.current_height(),
                         round_id: rm_for_ws.current_round_id() as u64,
                         miner_count,
-                        peer_count: mesh_for_ws.peers().unique_peer_count() as u32,
+                        peer_count,
                         uptime_secs: start_time.elapsed().as_secs(),
                     };
                     ws_state.broadcast(event);
+
+                    // PeerCountDrop alert: fire when the connected-peer count
+                    // decreases. Rate-limited (at most once per 5 min) so a
+                    // flapping mesh doesn't spam the operator; delivery + the
+                    // enable flag are handled inside the dispatcher.
+                    if let Some(prev) = last_peer_count {
+                        if peer_count < prev {
+                            let detail = format!(
+                                "Connected peer count dropped from {prev} to {peer_count}."
+                            );
+                            alert_dispatcher_for_ws
+                                .fire_rate_limited(
+                                    ghost_verification::alerts::AlertEvent::PeerCountDrop,
+                                    std::time::Duration::from_secs(300),
+                                    &detail,
+                                )
+                                .await;
+                        }
+                    }
+                    last_peer_count = Some(peer_count);
                 }
                 _ = ws_shutdown.recv() => break,
             }
@@ -6836,6 +6918,7 @@ async fn main() -> Result<()> {
         let vh_for_revoke = Arc::clone(&vote_handler);
         let hh_for_revoke = Arc::clone(&health_handler);
         let mesh_for_revoke = Arc::clone(&mesh);
+        let alert_dispatcher_for_revoke = Arc::clone(&alert_dispatcher);
         let mut revoke_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -6860,6 +6943,43 @@ async fn main() -> Result<()> {
 
                         // 2. Detect which are offline > 7 days
                         let offline = hh_for_revoke.detect_offline_elders(&elder_ids);
+
+                        // NodeOffline alerts: this is the node's only periodic
+                        // peer-liveness signal (self can't alert while it's the
+                        // one that's down). Edge-trigger per elder so an elder
+                        // that stays offline doesn't re-alert every hour, and
+                        // re-arm elders that are no longer offline so a later
+                        // outage alerts again. Keyed by the offline peer's id.
+                        {
+                            use std::collections::HashSet;
+                            let offline_ids: HashSet<[u8; 32]> =
+                                offline.iter().map(|(id, _)| *id).collect();
+                            for (elder_hex, _) in &elders {
+                                let is_offline = hex::decode(elder_hex)
+                                    .ok()
+                                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                                    .map(|id| offline_ids.contains(&id))
+                                    .unwrap_or(false);
+                                let days = offline
+                                    .iter()
+                                    .find(|(id, _)| hex::encode(id) == *elder_hex)
+                                    .map(|(_, d)| *d)
+                                    .unwrap_or(0);
+                                let detail = format!(
+                                    "Elder node {} has been offline for {} day(s).",
+                                    &elder_hex[..8.min(elder_hex.len())],
+                                    days
+                                );
+                                alert_dispatcher_for_revoke
+                                    .fire_edge(
+                                        ghost_verification::alerts::AlertEvent::NodeOffline,
+                                        elder_hex,
+                                        is_offline,
+                                        &detail,
+                                    )
+                                    .await;
+                            }
+                        }
 
                         // 3. For each offline elder, propose revocation vote
                         for (node_id, offline_days) in offline {
@@ -7228,7 +7348,12 @@ async fn main() -> Result<()> {
     // auto-demote claims; the verification mesh catches false claims at the
     // consensus layer. `self_check` was constructed earlier so the HTTP
     // handler shares this exact snapshot; here we start its probe loop.
-    self_check.clone().spawn_loop(Arc::new(config.clone()));
+    // Pass the alert dispatcher so the self-check loop fires CapabilityDrift
+    // (a claimed capability's prerequisite regressing pass→fail) and LowDisk
+    // (data partition crossing the low-free threshold) as edge-triggered alerts.
+    self_check
+        .clone()
+        .spawn_loop(Arc::new(config.clone()), Some(Arc::clone(&alert_dispatcher)));
     info!("Capability self-check loop started (30s interval)");
 
     // Subscribe to template events BEFORE starting the processor to avoid race condition
