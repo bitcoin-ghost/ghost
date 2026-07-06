@@ -44,9 +44,29 @@ export default function AdvancedFilteringPage() {
             <Card>
               <CardHeader
                 title="Custom mining policy"
-                subtitle="The full per-field counterpart to the Basic presets — every knob the block builder enforces."
+                subtitle="The full per-field counterpart to the Basic presets — every knob the block builder enforces. Includes the block fee floor (Min fee rate)."
               />
               <AdvancedPolicyPanel />
+            </Card>
+          </SectionErrorBoundary>
+
+          <SectionErrorBoundary section="Replace-by-fee">
+            <Card>
+              <CardHeader title="Replace-by-fee (RBF)" />
+              <div style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6" }}>
+                <p style={{ marginBottom: "8px" }}>
+                  Full replace-by-fee is <strong>always on</strong> at this node and cannot be disabled.
+                  ghostd hardcodes <code>fullrbf = true</code> — there is no <code>-mempoolfullrbf</code> or
+                  <code> -replacebyfee</code> launch flag to turn it off, so exposing a toggle here would be
+                  cosmetic. Any unconfirmed transaction may be replaced by a higher-fee spend of the same inputs,
+                  regardless of BIP-125 signalling.
+                </p>
+                <p>
+                  To bias which of a set of conflicting transactions actually lands in your blocks, use the fee
+                  floor and content limits in <strong>Custom mining policy</strong> above rather than a
+                  node-level RBF switch.
+                </p>
+              </div>
             </Card>
           </SectionErrorBoundary>
         </>
