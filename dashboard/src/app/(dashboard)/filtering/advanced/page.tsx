@@ -6,7 +6,6 @@ import { Toggle } from "@/components/ui/Toggle";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { ReaperControls } from "@/components/filtering/ReaperControls";
 import { AdvancedPolicyPanel } from "@/components/filtering/AdvancedPolicyPanel";
-import { FullRbfControl } from "@/components/filtering/FullRbfControl";
 import { useAdvancedFilteringGate } from "@/hooks/useAdvancedFilteringGate";
 
 export default function AdvancedFilteringPage() {
@@ -49,10 +48,6 @@ export default function AdvancedFilteringPage() {
               />
               <AdvancedPolicyPanel />
             </Card>
-          </SectionErrorBoundary>
-
-          <SectionErrorBoundary section="Replace-by-fee">
-            <FullRbfControl />
           </SectionErrorBoundary>
         </>
       )}
