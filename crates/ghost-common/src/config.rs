@@ -1781,6 +1781,15 @@ pub struct AlertEvents {
     /// This node found a block.
     #[serde(default = "default_true")]
     pub block_found: bool,
+    /// A Bitcoin chain reorg was detected (a block disconnected from the tip).
+    #[serde(default = "default_true")]
+    pub reorg_detected: bool,
+    /// The node is behind the network tip (stale tip / lagging local height).
+    #[serde(default = "default_true")]
+    pub behind_tip: bool,
+    /// A newer node release is available than the one installed.
+    #[serde(default = "default_true")]
+    pub update_available: bool,
 }
 
 impl Default for AlertEvents {
@@ -1792,6 +1801,9 @@ impl Default for AlertEvents {
             restart_needed: true,
             peer_count_drop: true,
             block_found: true,
+            reorg_detected: true,
+            behind_tip: true,
+            update_available: true,
         }
     }
 }
@@ -1900,6 +1912,47 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.network.sv2_port, SV2_STRATUM_PORT);
         assert_eq!(config.bitcoin.network, BitcoinNetwork::Signet);
+    }
+
+    #[test]
+    fn alert_events_default_all_on() {
+        let e = AlertEvents::default();
+        assert!(e.reorg_detected && e.behind_tip && e.update_available);
+    }
+
+    #[test]
+    fn alert_events_legacy_toml_still_parses_with_new_events_on() {
+        // A config written before the reorg/behind-tip/update events existed
+        // must still parse, and the three new events must default to ON via
+        // their `#[serde(default = "default_true")]` — so upgrading a node
+        // never silently disables the new alerts.
+        let legacy = r#"
+            node_offline = true
+            capability_drift = false
+            low_disk = true
+            restart_needed = true
+            peer_count_drop = true
+            block_found = true
+        "#;
+        let parsed: AlertEvents = toml::from_str(legacy).expect("legacy events parse");
+        assert!(!parsed.capability_drift, "explicit legacy value preserved");
+        assert!(
+            parsed.reorg_detected && parsed.behind_tip && parsed.update_available,
+            "new events default ON for old configs"
+        );
+    }
+
+    #[test]
+    fn alert_events_can_disable_new_events() {
+        let toml = r#"
+            reorg_detected = false
+            behind_tip = false
+            update_available = false
+        "#;
+        let parsed: AlertEvents = toml::from_str(toml).expect("parse");
+        assert!(!parsed.reorg_detected && !parsed.behind_tip && !parsed.update_available);
+        // Untouched events keep their default-ON.
+        assert!(parsed.node_offline && parsed.block_found);
     }
 
     #[test]
