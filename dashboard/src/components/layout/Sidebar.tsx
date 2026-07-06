@@ -7,6 +7,7 @@ import {
   RefreshCw,
   ShieldCheck,
   Gauge,
+  Boxes,
   Network as NetworkIcon,
   Crown,
   Lock,
@@ -79,6 +80,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
       { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
+      { href: "/pool", label: "Node Pool", icon: <Boxes {...ICON} /> },
     ],
   },
   {
