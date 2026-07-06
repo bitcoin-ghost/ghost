@@ -12,6 +12,8 @@ import type {
   SettlementStatus,
   GhostPayPayoutHistoryResponse,
   PayoutHistoryTimeFilter,
+  L2FeeDistributionContext,
+  L2TreeState,
 } from '@/types/api';
 
 // The Ghost ID (and other key material) is served by the ghost-pay backend,
@@ -172,6 +174,16 @@ export async function getSettlementStatus(): Promise<SettlementStatus> {
       avg_batch_size: 0,
     };
   }
+}
+
+// L2 fee-distribution context — treasury pool + Ghost Pay nodes sharing L2 fees.
+export async function getL2FeeDistributionContext(): Promise<L2FeeDistributionContext> {
+  return fetchApi<L2FeeDistributionContext>('/api/v1/l2/fee-distribution-context');
+}
+
+// L2 commitment-tree state (root, checkpoint, finalization counts).
+export async function getL2TreeState(): Promise<L2TreeState> {
+  return fetchApi<L2TreeState>('/api/v1/l2/tree-state');
 }
 
 // GhostPay Payout History (for Ghost-Pay page)
