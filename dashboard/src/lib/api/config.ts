@@ -37,6 +37,26 @@ export async function setGhostMode(enabled: boolean): Promise<NodeConfig> {
   });
 }
 
+// Result of toggling ghostd Tor mode. The apply happens off the request path
+// (ghostd restarts, then the pool bounces); poll the reaper GET's ghostd_apply
+// for the terminal state.
+export interface TorToggleResult {
+  success: boolean;
+  enabled: boolean;
+  ghostd_apply?: GhostdApplyStatus;
+  message: string;
+}
+
+// Toggle ghostd Tor mode (-tormode). Persists [node_launch].tor_mode to
+// pool.toml, regenerates ghostd's launch-flag drop-in and restarts ghostd, then
+// bounces ghost-pool. Requires a restart because -tormode is a startup flag.
+export async function setTor(enabled: boolean): Promise<TorToggleResult> {
+  return fetchApi<TorToggleResult>('/api/v1/config/tor', {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export async function setArchiveMode(enabled: boolean): Promise<NodeConfig> {
   return fetchApi<NodeConfig>('/api/v1/config/archive_mode', {
     method: 'POST',

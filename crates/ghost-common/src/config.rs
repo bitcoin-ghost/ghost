@@ -121,6 +121,38 @@ pub struct NodeConfig {
     /// the node (`tasks/plan_decentralised_coordinators.md`, increment 4).
     #[serde(default)]
     pub coordinator: CoordinatorConfig,
+    /// ghostd launch flags this node manages via the `ghost-setup apply-reaper`
+    /// systemd drop-in (e.g. Tor mode). Applied at ghostd startup, so changing
+    /// one requires a ghostd restart.
+    #[serde(default)]
+    pub node_launch: NodeLaunchConfig,
+}
+
+/// ghostd launch-time flags that the dashboard can toggle. These are baked into
+/// ghostd's systemd `ExecStart` via the same drop-in mechanism as the per-vector
+/// reaper flags (`ghost-setup apply-reaper`), because ghostd only reads them at
+/// startup — a running daemon can't switch them mid-flight.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeLaunchConfig {
+    /// Route all of ghostd's outbound P2P connections through Tor and publish an
+    /// onion service (`-tormode=1`). Off by default (clearnet). ghostd's
+    /// `-tormode` also soft-sets `-proxy`/`-listenonion` at startup, so only the
+    /// single flag is emitted. Requires a ghostd restart to take effect.
+    #[serde(default)]
+    pub tor_mode: bool,
+}
+
+impl NodeLaunchConfig {
+    /// The ghostd (Bitcoin Core) CLI flags that mirror these settings. Only
+    /// non-default values are emitted, so a node with everything off adds nothing
+    /// to ghostd's `ExecStart` and behaves exactly as before.
+    pub fn ghostd_flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if self.tor_mode {
+            flags.push("-tormode=1".to_string());
+        }
+        flags
+    }
 }
 
 /// Decentralised Wraith coordinator-election settings.

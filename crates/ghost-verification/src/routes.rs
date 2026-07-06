@@ -474,6 +474,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/config/reaper",
             post(api_config_reaper_post_handler),
         )
+        .route("/api/v1/config/tor", post(api_config_tor_post_handler))
         .route(
             "/api/v1/config/ghost_pay",
             post(api_config_ghost_pay_post_handler),
@@ -5381,6 +5382,80 @@ fn ghost_common_now(state: &str, message: impl Into<String>) -> crate::server::G
     crate::server::GhostdReaperApply::now(state, message)
 }
 
+/// API v1 Config tor POST handler — toggles ghostd Tor mode (`-tormode`).
+///
+/// ghostd only reads `-tormode` at startup, so it can't be flipped mid-flight.
+/// This persists `[node_launch] tor_mode` to pool.toml and then applies it via
+/// the same ghostd-flag drop-in path as the reaper: `spawn_ghostd_reaper_apply`
+/// runs `ghost-setup apply-reaper` (which now regenerates the combined
+/// reaper + launch-flag drop-in and restarts ghostd) and afterwards bounces
+/// ghost-pool. The response returns promptly with the apply *initiated*; the
+/// terminal result lands on the reaper GET endpoint's `ghostd_apply`.
+async fn api_config_tor_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<ToggleRequest>,
+) -> impl IntoResponse {
+    // Require the full node config + a path to persist to; otherwise the change
+    // can't survive a restart, so fail-closed with SERVICE_UNAVAILABLE.
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    {
+        let mut cfg = full.write();
+        cfg.node_launch.tor_mode = payload.enabled;
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist Tor mode");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist Tor mode: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Apply the ghostd flag (restarts ghostd) then bounce the pool. Shares the
+    // reaper apply path because the drop-in now carries all ghost-managed flags.
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
+
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Json(serde_json::json!({
+        "success": true,
+        "enabled": payload.enabled,
+        "ghostd_apply": apply,
+        "message": if payload.enabled {
+            "Tor mode enabled. ghostd is restarting with -tormode=1; the pool will bounce once it settles."
+        } else {
+            "Tor mode disabled. ghostd is restarting on clearnet; the pool will bounce once it settles."
+        },
+    }))
+    .into_response()
+}
+
 /// API v1 Config reaper POST handler — accepts the full per-vector reaper
 /// settings, persists them to the node config (pool.toml `[reaper]`), and then
 /// applies them to BOTH reapers automatically: the pool block-template reaper
@@ -7416,84 +7491,22 @@ struct LogsQuery {
     level: Option<String>,
 }
 
-/// API v1 Logs handler — returns recent log entries from journalctl
+/// API v1 Logs handler — returns recent ghost-pool log entries from the
+/// in-process ring buffer (`crate::log_buffer`).
 ///
-/// Previously removed (HIGH-4) because it exposed journalctl output on a public endpoint.
-/// Now safely re-added behind HMAC authentication on the internal router.
+/// ghost-pool's `tracing` layer mirrors every emitted event into the buffer, so
+/// each entry carries the real structured message, target and level. This
+/// replaces the previous `journalctl`-backed implementation, which (a) exposed
+/// host journal output (HIGH-4) and (b) frequently returned empty `message`
+/// fields because journald stored the ANSI-coloured formatted line as a byte
+/// array that failed the JSON string decode (issue #246). The buffer is process-
+/// local so no host log daemon or elevated privileges are required.
 async fn api_logs_handler(
     State(_state): State<Arc<VerificationState>>,
     Query(params): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(100).min(1000);
-    let level_filter = params.level.as_deref().unwrap_or("info");
-
-    // Map dashboard level filter to journalctl priority
-    let priority = match level_filter {
-        "error" => "3",
-        "warn" => "4",
-        "info" => "6",
-        "debug" => "7",
-        "trace" => "7",
-        _ => "6",
-    };
-
-    // Read from journalctl for ghost-pool service
-    let output = tokio::process::Command::new("journalctl")
-        .args([
-            "-u",
-            "ghost-pool",
-            "--no-pager",
-            "-o",
-            "json",
-            "-n",
-            &limit.to_string(),
-            "-p",
-            priority,
-        ])
-        .output()
-        .await;
-
-    let entries = match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout
-                .lines()
-                .filter_map(|line| {
-                    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
-                    let timestamp = obj
-                        .get("__REALTIME_TIMESTAMP")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(|us| us / 1_000_000) // microseconds to seconds
-                        .unwrap_or(0);
-                    let priority_num = obj
-                        .get("PRIORITY")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u8>().ok())
-                        .unwrap_or(6);
-                    let level = match priority_num {
-                        0..=3 => "error",
-                        4 => "warn",
-                        5..=6 => "info",
-                        _ => "debug",
-                    };
-                    let message = obj.get("MESSAGE").and_then(|v| v.as_str()).unwrap_or("");
-                    let target = obj
-                        .get("SYSLOG_IDENTIFIER")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("ghost-pool");
-
-                    Some(serde_json::json!({
-                        "timestamp": timestamp,
-                        "level": level,
-                        "target": target,
-                        "message": message
-                    }))
-                })
-                .collect::<Vec<_>>()
-        }
-        _ => Vec::new(),
-    };
+    let entries = crate::log_buffer::recent(limit, params.level.as_deref());
 
     Json(serde_json::json!({
         "entries": entries

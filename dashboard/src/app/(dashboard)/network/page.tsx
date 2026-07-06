@@ -1,24 +1,26 @@
 "use client";
 
+import { useState } from "react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { useNodeStatus } from "@/hooks/queries/useNodeQueries";
-import { useSetGhostMode } from "@/hooks/queries/useConfigQueries";
+import { useSetGhostMode, useSetTor } from "@/hooks/queries/useConfigQueries";
 import { useToast } from "@/components/ui/Toast";
 
 /**
- * /network — observability for this node's network exposure.
+ * /network — observability and control for this node's network exposure.
  *
- * Read-only mostly: Tor mode is set at ghostd startup via -tor flag and
- * can't be safely toggled mid-flight from a dashboard. The one interactive
- * control is Ghost Mode (suppresses outbound transaction relay).
+ * Tor mode is a ghostd startup flag (-tormode), so toggling it persists the
+ * setting and restarts ghostd (then bounces the pool) — hence the explicit
+ * "Apply & restart" confirm. Ghost Mode toggles live with no restart.
  *
- * For the *config* surface use /settings/privacy. This page is for
- * "what's actually happening right now".
+ * For the broader *config* surface use /settings/privacy. This page is for
+ * "what's actually happening right now" plus the exposure controls.
  */
 
 interface ToggleRowProps {
@@ -101,6 +103,7 @@ function ExposureRow({ label, description, enabled, onChange, disabled, readOnly
 export default function NetworkPage() {
   const { data: status, isLoading } = useNodeStatus();
   const setGhostMode = useSetGhostMode();
+  const setTor = useSetTor();
   const { success, error } = useToast();
 
   if (isLoading) {
@@ -127,7 +130,7 @@ export default function NetworkPage() {
       <PageHeader
         eyebrow="network"
         title="How this node is exposed."
-        subtitle="Live view of your node's outbound transport, onion address, and relay-suppression state. Set the underlying flags in /settings/privacy or the ghostd CLI."
+        subtitle="Live view of your node's outbound transport, onion address, and relay-suppression state — with controls for Tor mode and Ghost Mode."
         actions={
           <Badge variant={torActive ? "success" : "info"}>
             {exposure}
@@ -173,17 +176,29 @@ export default function NetworkPage() {
             Privacy modes
           </h3>
           <p style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "8px" }}>
-            Tor mode is set at startup via ghostd&apos;s <code>-tor</code> flag and surfaces here as read-only.
-            Ghost Mode is runtime-toggleable.
+            Tor mode is a ghostd startup flag (<code>-tormode</code>): toggling it restarts ghostd, so it asks
+            for confirmation. Ghost Mode is runtime-toggleable with no restart.
           </p>
 
           <div>
-            <ExposureRow
-              label="Tor mode"
-              description="When enabled, all P2P connections route through Tor and clearnet address gossip is suppressed. Set via ghostd's -tor and -onion flags before startup. Restart required to change."
+            <TorRow
               enabled={torActive}
-              readOnly
-              badge={torActive ? "+anonymity" : undefined}
+              pending={setTor.isPending}
+              onApply={async (next) => {
+                try {
+                  await setTor.mutateAsync(next);
+                  success(
+                    "Tor mode " + (next ? "enabling" : "disabling"),
+                    "ghostd is restarting" + (next ? " with -tormode=1" : " on clearnet") +
+                      "; live state updates once it settles."
+                  );
+                } catch (e) {
+                  error(
+                    "Failed to update Tor mode",
+                    e instanceof Error ? e.message : "Unknown error"
+                  );
+                }
+              }}
             />
             <ExposureRow
               label="Ghost Mode"
@@ -227,6 +242,101 @@ export default function NetworkPage() {
         </a>
         . For relay timing privacy see <a href="/shroud" className="bare" style={{ color: "var(--dim)", textDecoration: "underline", textDecorationColor: "var(--rule-strong)" }}>Shroud</a>.
       </p>
+    </div>
+  );
+}
+
+function TorRow({
+  enabled,
+  pending,
+  onApply,
+}: {
+  enabled: boolean;
+  pending: boolean;
+  onApply: (next: boolean) => void | Promise<void>;
+}) {
+  // `target` holds the pending confirmation value (true=enable, false=disable),
+  // or null when not confirming. `false` is meaningful, so guard on `!== null`.
+  const [target, setTarget] = useState<boolean | null>(null);
+
+  return (
+    <div style={{ padding: "16px 0", borderTop: "1px solid var(--rule)" }}>
+      <div className="flex items-start justify-between gap-6">
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="flex items-center gap-2 mb-1">
+            <span style={{ color: "var(--fg)", fontWeight: 500, fontSize: "15px" }}>Tor mode</span>
+            {enabled && <Badge variant="success">+anonymity</Badge>}
+          </div>
+          <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5", maxWidth: "60ch" }}>
+            When enabled, ghostd routes all outbound P2P through Tor (<code>-tormode=1</code>) and publishes an
+            onion service; clearnet address gossip is suppressed. This is a startup flag, so changing it
+            restarts ghostd and briefly bounces the pool.
+          </p>
+        </div>
+        <button
+          onClick={() => setTarget(!enabled)}
+          disabled={pending || target !== null}
+          className="flex-shrink-0"
+          style={{
+            width: "44px",
+            height: "24px",
+            borderRadius: "12px",
+            background: enabled ? "var(--accent)" : "var(--rule-strong)",
+            border: "none",
+            cursor: pending || target !== null ? "not-allowed" : "pointer",
+            opacity: pending || target !== null ? 0.6 : 1,
+            position: "relative",
+            transition: "background 120ms",
+          }}
+          aria-pressed={enabled}
+        >
+          <span
+            style={{
+              position: "absolute",
+              top: "3px",
+              left: enabled ? "23px" : "3px",
+              width: "18px",
+              height: "18px",
+              borderRadius: "50%",
+              background: "white",
+              transition: "left 120ms",
+            }}
+          />
+        </button>
+      </div>
+
+      {target !== null && (
+        <div
+          style={{
+            marginTop: "12px",
+            padding: "12px 14px",
+            border: "1px solid var(--accent)",
+            borderRadius: "6px",
+            background: "var(--accent-weak)",
+          }}
+        >
+          <div style={{ color: "var(--fg)", fontSize: "13px", marginBottom: "10px" }}>
+            {target ? "Enable" : "Disable"} <strong>Tor mode</strong>? This writes the config and{" "}
+            <strong>restarts ghostd</strong> (then bounces the pool) to apply.
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={pending}
+              onClick={async () => {
+                await onApply(target);
+                setTarget(null);
+              }}
+            >
+              {pending ? "Applying…" : "Apply & restart"}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setTarget(null)} disabled={pending}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

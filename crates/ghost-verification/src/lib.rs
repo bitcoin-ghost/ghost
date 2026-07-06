@@ -42,6 +42,7 @@ pub mod challenge;
 pub mod client;
 pub mod config;
 pub mod handlers;
+pub mod log_buffer;
 pub mod qualification;
 pub mod routes;
 pub mod server;
