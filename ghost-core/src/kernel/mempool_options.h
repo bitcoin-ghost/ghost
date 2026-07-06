@@ -26,6 +26,12 @@ static constexpr unsigned int DEFAULT_MEMPOOL_EXPIRY_HOURS{336};
 static constexpr bool DEFAULT_PERSIST_V1_DAT{false};
 /** Default for -acceptnonstdtxn */
 static constexpr bool DEFAULT_ACCEPT_NON_STD_TXN{false};
+/** Default for -mempoolfullrbf, whether the mempool accepts the replacement of
+ *  any conflicting transaction (full RBF) regardless of BIP125 opt-in
+ *  signalling. Ghost keeps full RBF on by default; an operator can opt out with
+ *  -mempoolfullrbf=0 to restrict replacement to transactions that signal BIP125
+ *  replaceability (first-seen-safe for non-signalling transactions). */
+static constexpr bool DEFAULT_MEMPOOL_FULL_RBF{true};
 
 namespace kernel {
 /**
@@ -54,6 +60,10 @@ struct MemPoolOptions {
     std::optional<unsigned> max_datacarrier_bytes{DEFAULT_ACCEPT_DATACARRIER ? std::optional{MAX_OP_RETURN_RELAY} : std::nullopt};
     bool permit_bare_multisig{DEFAULT_PERMIT_BAREMULTISIG};
     bool require_standard{true};
+    /** Whether to enable full RBF (accept replacement of any conflicting
+     *  mempool transaction). When false, only transactions signalling BIP125
+     *  opt-in replaceability may be replaced. Controlled by -mempoolfullrbf. */
+    bool full_rbf{DEFAULT_MEMPOOL_FULL_RBF};
     bool persist_v1_dat{DEFAULT_PERSIST_V1_DAT};
     /** Ghost Reaper dead-code mempool filter configuration */
     GhostReaperConfig ghost_reaper{};

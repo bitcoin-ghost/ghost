@@ -104,6 +104,10 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
 
     mempool_opts.persist_v1_dat = argsman.GetBoolArg("-persistmempoolv1", mempool_opts.persist_v1_dat);
 
+    // Full RBF is on by default; -mempoolfullrbf=0 lets an operator opt out and
+    // fall back to BIP125 opt-in replacement (see ReplacementChecks/PreChecks).
+    mempool_opts.full_rbf = argsman.GetBoolArg("-mempoolfullrbf", DEFAULT_MEMPOOL_FULL_RBF);
+
     // Ghost Reaper configuration.
     //
     // The master `-ghostreaper` flag sets the default value for every per-vector

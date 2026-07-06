@@ -717,6 +717,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     SetupChainParamsBaseOptions(argsman);
 
     argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (test networks only; default: %u)", DEFAULT_ACCEPT_NON_STD_TXN), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-mempoolfullrbf", strprintf("Accept transaction replace-by-fee without requiring replaceability signaling (full RBF; default: %u). Set to 0 to only replace transactions that signal BIP125 opt-in replaceability.", DEFAULT_MEMPOOL_FULL_RBF), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-ghostreaper", "Ghost Reaper dead-code filter master switch (default: enabled). Sets the default value for every per-vector toggle; individual -ghostreaper-reject* flags override per detector.", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-ghostreaper-rejectinscription", "Ghost Reaper: reject witness scripts containing OP_FALSE OP_IF ... OP_ENDIF inscription envelopes (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-ghostreaper-rejectdropstuffing", "Ghost Reaper: reject witness scripts with a large push followed by OP_DROP/OP_2DROP (default: follows -ghostreaper).", ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);

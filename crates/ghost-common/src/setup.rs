@@ -284,6 +284,7 @@ const MANAGED_GHOSTD_FLAG_PREFIXES: &[&str] = &[
     // Daemon / node launch settings (NodeLaunchConfig).
     "-maxmempool",
     "-mempoolexpiry",
+    "-mempoolfullrbf",
     "-maxconnections",
     "-maxuploadtarget",
     "-dbcache",
@@ -481,6 +482,7 @@ mod tests {
             tor_mode: true,
             max_mempool_mb: Some(600),
             mempool_expiry_hours: Some(48),
+            full_rbf: Some(false),
             max_connections: Some(50),
             max_upload_target_mb: Some("2G".to_string()),
             dbcache_mb: Some(2048),
@@ -505,6 +507,8 @@ mod tests {
         assert_eq!(dropin.matches("-dbcache=").count(), 1);
         assert!(dropin.contains("-dbcache=2048"));
         assert!(dropin.contains("-mempoolexpiry=48"));
+        assert_eq!(dropin.matches("-mempoolfullrbf=").count(), 1);
+        assert!(dropin.contains("-mempoolfullrbf=0"));
         assert!(dropin.contains("-maxconnections=50"));
         assert!(dropin.contains("-maxuploadtarget=2G"));
         assert!(dropin.contains("-blockfilterindex=1"));
