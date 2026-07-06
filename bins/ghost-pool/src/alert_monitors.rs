@@ -1,6 +1,6 @@
 //! Periodic operator-alert monitors.
 //!
-//! Two small background tasks that feed the existing operator-alert pipeline
+//! Small background tasks that feed the existing operator-alert pipeline
 //! (`ghost_verification::alerts`) for conditions that have no natural
 //! event-driven trigger site:
 //!
@@ -13,13 +13,22 @@
 //!   published. The installed/latest versions come from the same files the
 //!   dashboard auto-update view reads (`/etc/ghost/version` and the updater
 //!   status file). Rate-limited to at most once per day.
+//! * **Mempool-congestion** — ghostd's mempool `usage` is near its `maxmempool`
+//!   ceiling (from `getmempoolinfo`). Edge-triggered with hysteresis: fires when
+//!   usage crosses [`MEMPOOL_CONGESTION_HIGH_PCT`], re-arms once it falls back
+//!   below [`MEMPOOL_CONGESTION_REARM_PCT`].
+//! * **Fee-spike** — the next-block fee rate (from `estimatesmartfee`) crosses
+//!   [`FEE_SPIKE_ABS_SAT_VB`] or jumps to [`FEE_SPIKE_JUMP_FACTOR`]× a rolling
+//!   baseline. Rate-limited to [`FEE_SPIKE_ALERT_MIN_INTERVAL`] so sustained
+//!   high fees don't spam.
 //!
-//! Both dispatch off the hot path (their own spawned tasks) and both honour the
+//! All dispatch off the hot path (their own spawned tasks) and honour the
 //! operator's per-event enable flag + master switch inside the dispatcher.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ghost_common::rpc::BitcoinRpc;
 use ghost_verification::alerts::{AlertDispatcher, AlertEvent};
 use tokio::sync::broadcast;
 use tracing::{debug, info};
@@ -237,6 +246,268 @@ pub fn spawn_update_available_monitor(
     });
 }
 
+// ============================================================================
+// Mempool-congestion monitor
+// ============================================================================
+
+/// Usage (as a % of `maxmempool`) at which the mempool-congestion alert trips.
+pub const MEMPOOL_CONGESTION_HIGH_PCT: f64 = 90.0;
+
+/// Usage % the mempool must fall back below before the alert re-arms. The gap to
+/// [`MEMPOOL_CONGESTION_HIGH_PCT`] is hysteresis: it stops a mempool hovering
+/// right at the threshold from flapping the alert on every check.
+pub const MEMPOOL_CONGESTION_REARM_PCT: f64 = 80.0;
+
+/// Cadence of the mempool-congestion check.
+pub const MEMPOOL_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Mempool `usage` as a percentage of `maxmempool`. Returns 0 when `maxmempool`
+/// is 0 (unknown / not reported) so a missing bound never trips the alert. Pure.
+pub fn mempool_usage_pct(usage_bytes: u64, maxmempool_bytes: u64) -> f64 {
+    if maxmempool_bytes == 0 {
+        return 0.0;
+    }
+    (usage_bytes as f64 / maxmempool_bytes as f64) * 100.0
+}
+
+/// Decide whether the mempool is congested at or above `high_pct` of its
+/// capacity, returning an operator-facing detail string when it is. Pure — no
+/// I/O — so the threshold logic is unit-testable independent of the RPC read.
+/// `maxmempool_bytes == 0` (unknown) never trips.
+pub fn evaluate_mempool_congestion(
+    usage_bytes: u64,
+    maxmempool_bytes: u64,
+    high_pct: f64,
+) -> Option<String> {
+    if maxmempool_bytes == 0 {
+        return None;
+    }
+    let pct = mempool_usage_pct(usage_bytes, maxmempool_bytes);
+    if pct >= high_pct {
+        const MIB: f64 = 1024.0 * 1024.0;
+        return Some(format!(
+            "Mempool is {pct:.0}% full: {:.0} MiB of {:.0} MiB in use (usage vs maxmempool).",
+            usage_bytes as f64 / MIB,
+            maxmempool_bytes as f64 / MIB,
+        ));
+    }
+    None
+}
+
+/// Spawn the mempool-congestion monitor. Reads ghostd `getmempoolinfo` via the
+/// pool's shared RPC client and fires an edge-triggered [`AlertEvent::MempoolCongestion`]
+/// when `usage` crosses [`MEMPOOL_CONGESTION_HIGH_PCT`] of `maxmempool`, re-arming
+/// once it falls back below [`MEMPOOL_CONGESTION_REARM_PCT`] (hysteresis).
+/// Delivery + the enable flag are handled inside the dispatcher. Runs until
+/// `shutdown` fires.
+pub fn spawn_mempool_congestion_monitor(
+    alerts: Arc<AlertDispatcher>,
+    rpc: Arc<BitcoinRpc>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(MEMPOOL_CHECK_INTERVAL);
+        // Latched congestion state, for hysteresis across ticks.
+        let mut congested = false;
+        info!("Mempool-congestion monitor started");
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match rpc.get_mempool_info().await {
+                        Ok(info) => {
+                            let pct = mempool_usage_pct(info.usage, info.maxmempool);
+                            // Enter congested at HIGH; once congested, stay until
+                            // usage falls below REARM.
+                            let now_congested = if congested {
+                                info.maxmempool > 0 && pct >= MEMPOOL_CONGESTION_REARM_PCT
+                            } else {
+                                info.maxmempool > 0 && pct >= MEMPOOL_CONGESTION_HIGH_PCT
+                            };
+                            // Detail is only consumed on the rising edge; build it there.
+                            let detail = if now_congested && !congested {
+                                debug!(
+                                    pct,
+                                    usage = info.usage,
+                                    maxmempool = info.maxmempool,
+                                    "Mempool near capacity"
+                                );
+                                evaluate_mempool_congestion(
+                                    info.usage,
+                                    info.maxmempool,
+                                    MEMPOOL_CONGESTION_HIGH_PCT,
+                                )
+                                .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            congested = now_congested;
+                            alerts
+                                .fire_edge(
+                                    AlertEvent::MempoolCongestion,
+                                    "mempool",
+                                    now_congested,
+                                    &detail,
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "getmempoolinfo failed; skipping congestion check");
+                        }
+                    }
+                }
+                _ = shutdown.recv() => break,
+            }
+        }
+    });
+}
+
+// ============================================================================
+// Fee-spike monitor
+// ============================================================================
+
+/// Absolute next-block fee rate (sat/vB) at or above which a fee spike is
+/// reported regardless of the recent baseline — the fee environment is simply
+/// expensive.
+pub const FEE_SPIKE_ABS_SAT_VB: f64 = 100.0;
+
+/// A fee rate this many times the rolling baseline is a relative spike.
+pub const FEE_SPIKE_JUMP_FACTOR: f64 = 3.0;
+
+/// A relative (baseline-multiple) spike is only reported when the current rate
+/// is at least this high, so ordinary churn around a tiny baseline
+/// (e.g. 1 → 4 sat/vB) never pages the operator.
+pub const FEE_SPIKE_JUMP_FLOOR_SAT_VB: f64 = 20.0;
+
+/// EMA smoothing factor for the rolling fee baseline (weight of the newest
+/// sample). Small, so the baseline tracks the recent-normal slowly and a sudden
+/// jump still reads as a spike before it is absorbed.
+pub const FEE_SPIKE_BASELINE_ALPHA: f64 = 0.2;
+
+/// `estimatesmartfee` confirmation target used for the fee signal: the fee rate
+/// to get into the next block.
+pub const FEE_SPIKE_CONF_TARGET: u32 = 1;
+
+/// Cadence of the fee-spike check.
+pub const FEE_SPIKE_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Minimum interval between fee-spike alerts, so a sustained high-fee period
+/// pages once rather than every check.
+pub const FEE_SPIKE_ALERT_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Convert a Bitcoin Core fee rate (BTC per 1000 vBytes, as `estimatesmartfee`
+/// reports) to sat/vB. 1 BTC/kvB = 1e8 sat / 1000 vB = 1e5 sat/vB. Pure.
+pub fn feerate_btc_kvb_to_sat_vb(feerate_btc_kvb: f64) -> f64 {
+    feerate_btc_kvb * 100_000.0
+}
+
+/// Decide whether the fee environment has spiked, returning an operator-facing
+/// detail string when it has. Pure — no I/O or clock access — so the threshold
+/// logic is unit-testable like [`evaluate_behind_tip`].
+///
+/// * absolute: `current >= abs_threshold` → spike (fees are simply high).
+/// * relative: a known `baseline > 0`, `current >= jump_floor`, and
+///   `current >= baseline * jump_factor` → spike (a sharp jump vs recent normal).
+/// * `current <= 0` never trips (no usable signal).
+pub fn evaluate_fee_spike(
+    current_sat_vb: f64,
+    baseline_sat_vb: Option<f64>,
+    abs_threshold_sat_vb: f64,
+    jump_factor: f64,
+    jump_floor_sat_vb: f64,
+) -> Option<String> {
+    if current_sat_vb <= 0.0 {
+        return None;
+    }
+    if current_sat_vb >= abs_threshold_sat_vb {
+        return Some(format!(
+            "Next-block fee rate is {current_sat_vb:.1} sat/vB, at or above the \
+             {abs_threshold_sat_vb:.0} sat/vB alert threshold."
+        ));
+    }
+    if let Some(base) = baseline_sat_vb {
+        if base > 0.0
+            && current_sat_vb >= jump_floor_sat_vb
+            && current_sat_vb >= base * jump_factor
+        {
+            return Some(format!(
+                "Next-block fee rate jumped to {current_sat_vb:.1} sat/vB, {:.1}x the \
+                 recent baseline of {base:.1} sat/vB.",
+                current_sat_vb / base
+            ));
+        }
+    }
+    None
+}
+
+/// Update the rolling fee baseline (EMA) with a new sample. Pure. The first
+/// sample seeds the baseline; later samples blend in at [`FEE_SPIKE_BASELINE_ALPHA`].
+pub fn update_fee_baseline(baseline: Option<f64>, sample_sat_vb: f64) -> f64 {
+    match baseline {
+        Some(b) => b * (1.0 - FEE_SPIKE_BASELINE_ALPHA) + sample_sat_vb * FEE_SPIKE_BASELINE_ALPHA,
+        None => sample_sat_vb,
+    }
+}
+
+/// Spawn the fee-spike monitor. Reads ghostd `estimatesmartfee` (next-block
+/// target) via the pool's shared RPC client, maintains a rolling baseline, and
+/// fires a rate-limited [`AlertEvent::FeeSpike`] when the rate crosses
+/// [`FEE_SPIKE_ABS_SAT_VB`] or jumps to [`FEE_SPIKE_JUMP_FACTOR`]× the baseline.
+/// Delivery + the enable flag are handled inside the dispatcher. Runs until
+/// `shutdown` fires.
+pub fn spawn_fee_spike_monitor(
+    alerts: Arc<AlertDispatcher>,
+    rpc: Arc<BitcoinRpc>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(FEE_SPIKE_CHECK_INTERVAL);
+        let mut baseline: Option<f64> = None;
+        info!("Fee-spike monitor started");
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match rpc.estimate_smart_fee(FEE_SPIKE_CONF_TARGET).await {
+                        Ok(est) => {
+                            let Some(btc_kvb) = est.feerate else {
+                                debug!("estimatesmartfee returned no feerate; skipping fee-spike check");
+                                continue;
+                            };
+                            let sat_vb = feerate_btc_kvb_to_sat_vb(btc_kvb);
+                            if sat_vb <= 0.0 {
+                                continue;
+                            }
+                            if let Some(detail) = evaluate_fee_spike(
+                                sat_vb,
+                                baseline,
+                                FEE_SPIKE_ABS_SAT_VB,
+                                FEE_SPIKE_JUMP_FACTOR,
+                                FEE_SPIKE_JUMP_FLOOR_SAT_VB,
+                            ) {
+                                debug!(sat_vb, ?baseline, "Fee environment spiked");
+                                alerts
+                                    .fire_rate_limited(
+                                        AlertEvent::FeeSpike,
+                                        FEE_SPIKE_ALERT_MIN_INTERVAL,
+                                        &detail,
+                                    )
+                                    .await;
+                            }
+                            // Fold the sample into the rolling baseline AFTER
+                            // evaluating, so a spike is measured against the
+                            // pre-spike normal.
+                            baseline = Some(update_fee_baseline(baseline, sat_vb));
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "estimatesmartfee failed; skipping fee-spike check");
+                        }
+                    }
+                }
+                _ = shutdown.recv() => break,
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +590,143 @@ mod tests {
         assert!(version_is_newer("1.11", "1.10.20"));
         assert!(!version_is_newer("1.10", "1.10.0"));
         assert!(version_is_newer("1.10.1", "1.10"));
+    }
+
+    // ---- Mempool congestion ------------------------------------------------
+
+    #[test]
+    fn mempool_pct_is_zero_when_max_unknown() {
+        assert_eq!(mempool_usage_pct(100, 0), 0.0);
+        assert!((mempool_usage_pct(45, 100) - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn congestion_none_when_below_threshold() {
+        // 80% full, threshold 90% → not congested.
+        assert!(evaluate_mempool_congestion(80, 100, MEMPOOL_CONGESTION_HIGH_PCT).is_none());
+    }
+
+    #[test]
+    fn congestion_fires_at_or_above_threshold() {
+        // Exactly at the threshold trips (>=).
+        let d = evaluate_mempool_congestion(90, 100, MEMPOOL_CONGESTION_HIGH_PCT);
+        assert!(d.is_some());
+        assert!(d.unwrap().contains("90% full"));
+        // Well over the threshold trips too.
+        assert!(evaluate_mempool_congestion(99, 100, MEMPOOL_CONGESTION_HIGH_PCT).is_some());
+    }
+
+    #[test]
+    fn congestion_never_fires_when_max_unknown() {
+        // maxmempool == 0 (not reported) must never trip, even with huge usage.
+        assert!(evaluate_mempool_congestion(u64::MAX, 0, MEMPOOL_CONGESTION_HIGH_PCT).is_none());
+    }
+
+    #[test]
+    fn congestion_rearm_is_below_high() {
+        // Sanity: hysteresis band is non-empty and ordered.
+        assert!(MEMPOOL_CONGESTION_REARM_PCT < MEMPOOL_CONGESTION_HIGH_PCT);
+    }
+
+    // ---- Fee spike ---------------------------------------------------------
+
+    #[test]
+    fn feerate_conversion_btc_kvb_to_sat_vb() {
+        // Min-relay 0.00001 BTC/kvB == 1 sat/vB.
+        assert!((feerate_btc_kvb_to_sat_vb(0.00001) - 1.0).abs() < 1e-6);
+        // 0.001 BTC/kvB == 100 sat/vB.
+        assert!((feerate_btc_kvb_to_sat_vb(0.001) - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fee_spike_fires_on_absolute_threshold() {
+        // At/above the absolute threshold fires regardless of baseline.
+        let d = evaluate_fee_spike(
+            120.0,
+            Some(110.0),
+            FEE_SPIKE_ABS_SAT_VB,
+            FEE_SPIKE_JUMP_FACTOR,
+            FEE_SPIKE_JUMP_FLOOR_SAT_VB,
+        );
+        assert!(d.is_some());
+        assert!(d.unwrap().contains("120.0 sat/vB"));
+    }
+
+    #[test]
+    fn fee_spike_fires_on_relative_jump() {
+        // 30 sat/vB vs a 5 sat/vB baseline = 6x (>= 3x) and above the floor → spike.
+        let d = evaluate_fee_spike(
+            30.0,
+            Some(5.0),
+            FEE_SPIKE_ABS_SAT_VB,
+            FEE_SPIKE_JUMP_FACTOR,
+            FEE_SPIKE_JUMP_FLOOR_SAT_VB,
+        );
+        assert!(d.is_some());
+        assert!(d.unwrap().contains("baseline"));
+    }
+
+    #[test]
+    fn fee_spike_silent_below_jump_floor() {
+        // 5x jump but the current rate (10) is below the 20 sat/vB floor → silent,
+        // so ordinary churn around a tiny baseline never pages.
+        assert!(evaluate_fee_spike(
+            10.0,
+            Some(2.0),
+            FEE_SPIKE_ABS_SAT_VB,
+            FEE_SPIKE_JUMP_FACTOR,
+            FEE_SPIKE_JUMP_FLOOR_SAT_VB,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fee_spike_silent_when_no_baseline_and_below_abs() {
+        // First reading (no baseline) below the absolute threshold → no alert.
+        assert!(evaluate_fee_spike(
+            25.0,
+            None,
+            FEE_SPIKE_ABS_SAT_VB,
+            FEE_SPIKE_JUMP_FACTOR,
+            FEE_SPIKE_JUMP_FLOOR_SAT_VB,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fee_spike_silent_within_normal_variation() {
+        // 25 vs 20 baseline = 1.25x (< 3x) and below abs → not a spike.
+        assert!(evaluate_fee_spike(
+            25.0,
+            Some(20.0),
+            FEE_SPIKE_ABS_SAT_VB,
+            FEE_SPIKE_JUMP_FACTOR,
+            FEE_SPIKE_JUMP_FLOOR_SAT_VB,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fee_spike_ignores_nonpositive_rate() {
+        assert!(evaluate_fee_spike(
+            0.0,
+            Some(5.0),
+            FEE_SPIKE_ABS_SAT_VB,
+            FEE_SPIKE_JUMP_FACTOR,
+            FEE_SPIKE_JUMP_FLOOR_SAT_VB,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fee_baseline_seeds_then_smooths() {
+        // First sample seeds the baseline exactly.
+        let b0 = update_fee_baseline(None, 10.0);
+        assert!((b0 - 10.0).abs() < 1e-9);
+        // Next sample blends toward the new value but stays between old and new.
+        let b1 = update_fee_baseline(Some(10.0), 30.0);
+        assert!(b1 > 10.0 && b1 < 30.0);
+        // Explicit EMA value: 10*0.8 + 30*0.2 = 14.
+        assert!((b1 - 14.0).abs() < 1e-9);
     }
 }

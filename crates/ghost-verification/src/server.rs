@@ -1387,6 +1387,13 @@ pub struct VerificationState {
     /// `GET /api/v1/pool/series`. Bounded ring; empty until the first sample
     /// (the dashboard keeps its client-side session buffer as a fallback).
     pub pool_series: crate::pool_series::PoolSeries,
+    /// Operator-alert dispatcher, late-bound after startup. Populated by
+    /// `bins/ghost-pool` once the dispatcher is built (its live-config closure
+    /// needs this `Arc<VerificationState>`), so the internal failed-login
+    /// endpoint can dispatch a `FailedLogin` alert through the same debouncing
+    /// dispatcher every other trigger site uses. Empty on servers that never
+    /// wire it (e.g. minimal/test servers) — the endpoint then no-ops.
+    pub alert_dispatcher: std::sync::OnceLock<Arc<crate::alerts::AlertDispatcher>>,
 }
 
 /// TTL for cached stratum self-verification results. Verification cycles run
@@ -1541,7 +1548,15 @@ impl VerificationState {
             stratum_verify_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             // 24h of history at the sampler's 30s cadence (2880 samples).
             pool_series: crate::pool_series::PoolSeries::new(2880),
+            alert_dispatcher: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Late-bind the operator-alert dispatcher (see the field docs). Idempotent:
+    /// a second call is ignored. Takes `&self` because the state is shared behind
+    /// an `Arc` by the time the dispatcher exists.
+    pub fn set_alert_dispatcher(&self, dispatcher: Arc<crate::alerts::AlertDispatcher>) {
+        let _ = self.alert_dispatcher.set(dispatcher);
     }
 
     /// Set the L2 NoteSpend submission callback
