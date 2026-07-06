@@ -5,11 +5,13 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { useLogs } from "@/hooks/queries";
-import type { LogEntry } from "@/types/api";
+import { useLogs, useLogUnits } from "@/hooks/queries";
+import type { LogEntry, LogUnit } from "@/types/api";
 
 const LEVELS = ["all", "error", "warn", "info", "debug", "trace"] as const;
 type Level = (typeof LEVELS)[number];
+
+const DEFAULT_UNIT = "ghost-pool";
 
 const LEVEL_COLOR: Record<LogEntry["level"], string> = {
   error: "#f85149",
@@ -19,7 +21,19 @@ const LEVEL_COLOR: Record<LogEntry["level"], string> = {
   trace: "var(--fainter)",
 };
 
-// Ring-buffer timestamps are Unix seconds; guard for ms just in case.
+// Fallback selector entry so the page renders before /logs/units resolves.
+const FALLBACK_UNITS: LogUnit[] = [
+  {
+    key: DEFAULT_UNIT,
+    label: "Ghost Pool",
+    description: "Mining pool node (this process) — in-memory ring buffer",
+    source: "ring-buffer",
+    available: true,
+  },
+];
+
+// Ring-buffer timestamps are Unix seconds; journald entries are Unix ms. Guard
+// for both by treating anything below ~year-2001-in-ms as seconds.
 function formatTs(ts: number): string {
   const ms = ts < 1e12 ? ts * 1000 : ts;
   const d = new Date(ms);
@@ -29,13 +43,27 @@ function formatTs(ts: number): string {
 
 export default function LogsPage() {
   const [level, setLevel] = useState<Level>("all");
+  const [unit, setUnit] = useState<string>(DEFAULT_UNIT);
   const [limit] = useState(500);
+
+  const { data: unitsData } = useLogUnits();
+  const units = unitsData?.units?.length ? unitsData.units : FALLBACK_UNITS;
+
   const { data, isLoading, isError, error, refetch, isFetching } = useLogs({
     limit,
     level: level === "all" ? undefined : level,
+    unit,
   });
 
   const entries = data?.entries ?? [];
+  // Honest structured error surfaced by the backend (e.g. journald permission
+  // denied) — returned with HTTP 200 so the selector stays usable.
+  const structuredError = data?.error ?? null;
+
+  const activeUnit = units.find((u) => u.key === unit);
+  const subtitle = activeUnit
+    ? `Recent logs for ${activeUnit.label}. ${activeUnit.description}.`
+    : "Recent node logs. Select a binary to inspect its output.";
 
   const copyAll = () => {
     const text = entries
@@ -46,16 +74,40 @@ export default function LogsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader
-        eyebrow="system"
-        title="Logs."
-        subtitle="Recent ghost-pool logs from the node's in-memory ring buffer. This is ghost-pool's own output, not the full journald firehose of every binary."
-        subtitleFullWidth
-      />
+      <PageHeader eyebrow="system" title="Logs." subtitle={subtitle} subtitleFullWidth />
 
       <SectionErrorBoundary section="Logs">
         <Card>
-          {/* Controls */}
+          {/* Binary selector */}
+          <div className="flex items-center gap-2 flex-wrap" style={{ marginBottom: "12px" }}>
+            {units.map((u) => {
+              const active = unit === u.key;
+              const disabled = !u.available;
+              return (
+                <button
+                  key={u.key}
+                  onClick={() => !disabled && setUnit(u.key)}
+                  disabled={disabled}
+                  title={disabled ? `${u.label} is not present on this node` : u.description}
+                  style={{
+                    padding: "5px 12px",
+                    fontSize: "12px",
+                    borderRadius: "4px",
+                    border: `1px solid ${active ? "var(--accent)" : "var(--rule)"}`,
+                    background: active ? "var(--accent-weak)" : "transparent",
+                    color: disabled ? "var(--fainter)" : active ? "var(--fg)" : "var(--dim)",
+                    cursor: disabled ? "not-allowed" : "pointer",
+                    opacity: disabled ? 0.5 : 1,
+                    fontWeight: active ? 600 : 400,
+                  }}
+                >
+                  {u.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Level controls */}
           <div className="flex items-center justify-between gap-3 flex-wrap" style={{ marginBottom: "12px" }}>
             <div className="flex items-center gap-2 flex-wrap">
               {LEVELS.map((lv) => (
@@ -112,8 +164,10 @@ export default function LogsPage() {
               <div style={{ color: "#f85149" }}>
                 Couldn&apos;t load logs{error instanceof Error ? `: ${error.message}` : "."}
               </div>
+            ) : structuredError ? (
+              <div style={{ color: "#d29922" }}>{structuredError}</div>
             ) : entries.length === 0 ? (
-              <div style={{ color: "var(--dim)" }}>No log entries in the buffer for this level.</div>
+              <div style={{ color: "var(--dim)" }}>No log entries for this binary at this level.</div>
             ) : (
               entries.map((e, i) => (
                 <div key={i} style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", display: "flex", gap: "10px" }}>

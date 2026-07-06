@@ -538,6 +538,25 @@ export interface LogEntry {
 
 export interface LogsResponse {
   entries: LogEntry[];
+  // Present on multi-binary responses; absent on legacy ring-buffer-only shape.
+  unit?: string;
+  source?: "ring-buffer" | "journald";
+  // Honest structured error (e.g. journald permission denied); null on success.
+  error?: string | null;
+}
+
+// A selectable log source (binary) reported by /api/v1/logs/units.
+export interface LogUnit {
+  key: string;
+  label: string;
+  description: string;
+  source: "ring-buffer" | "journald";
+  available: boolean;
+}
+
+export interface LogUnitsResponse {
+  units: LogUnit[];
+  default: string;
 }
 
 // Wraith types

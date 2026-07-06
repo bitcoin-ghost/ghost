@@ -1086,6 +1086,19 @@ cat > /etc/systemd/system/ghost-pool.service.d/genesis-anchor.conf <<EOF
 Environment=ZK_GENESIS_PARAMS_HASH=${ZK_GENESIS_PARAMS_HASH}
 EOF
 
+# Journal access — the dashboard Logs console reads the OTHER node binaries'
+# logs (ghostd / ghost-pay / dashboard / SV2 stack) out of the systemd journal
+# via journalctl, which requires membership of the `systemd-journal` group.
+# Written as a sibling drop-in (merged with the base unit like genesis-anchor.conf
+# above) so it can ship to existing nodes without rewriting the whole unit; the
+# later `systemctl daemon-reload` picks it up and it takes effect on the next
+# ghost-pool restart. ghost-pool's own logs come from its in-process ring buffer
+# and need no privilege.
+cat > /etc/systemd/system/ghost-pool.service.d/journal-access.conf <<EOF
+[Service]
+SupplementaryGroups=systemd-journal
+EOF
+
 # ghost-pay L2 service (also serves the Wraith bond ledger on 8800). Only
 # installed when Ghost Pay is enabled. GHOST_PAY_BOND_LEDGER_TOKEN is the SAME
 # secret written into pool.toml's [coordinator] bond_ledger_token above, so the

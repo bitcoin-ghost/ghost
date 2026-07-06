@@ -43,6 +43,7 @@ pub mod challenge;
 pub mod client;
 pub mod config;
 pub mod handlers;
+pub mod journal;
 pub mod log_buffer;
 pub mod pool_series;
 pub mod qualification;
