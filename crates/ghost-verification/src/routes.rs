@@ -1489,11 +1489,27 @@ async fn api_node_shares_handler(State(state): State<Arc<VerificationState>>) ->
         total += 1;
     }
 
+    // Real trailing-7-day uptime for THIS node (the qualification gatekeeper
+    // metric), read from the self-recorded uptime samples via the same query
+    // the qualification layer uses. `uptime_qualified` reflects the true >=95%
+    // gate rather than an unconditional `true`. Falls back to null/false when
+    // no DB is attached (never a fabricated 99.9%).
+    let self_uptime_percent: Option<f64> = state.database.as_ref().and_then(|db| {
+        let since = chrono::Utc::now().timestamp()
+            - (ghost_common::constants::UPTIME_WINDOW_DAYS as i64 * 86_400);
+        db.get_uptime_percent(&state.node_id, since)
+            .ok()
+            .map(|ratio| ratio * 100.0)
+    });
+    let uptime_qualified = self_uptime_percent
+        .map(|p| p >= ghost_common::constants::UPTIME_GATEKEEPER_THRESHOLD)
+        .unwrap_or(false);
+
     Json(serde_json::json!({
         "total": total,
         "max_shares": 15,
-        "uptime_qualified": true,
-        "uptime_percent": 99.9,
+        "uptime_qualified": uptime_qualified,
+        "uptime_percent": self_uptime_percent,
         "archive_mode": config.archive_mode,
         "ghost_pay": config.ghost_pay,
         "public_mining": config.public_mining,
@@ -3434,10 +3450,25 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
 
     // The per-peer uptime %, peer count and L1/L2 heights are not gossiped, so
     // they render as "—" for mesh peers — but THIS node knows its own locally,
-    // so populate them here. (uptime_percent is the trailing-7-day qualification
-    // metric and isn't available on the health snapshot; left unset for now.)
+    // so populate them here.
     let self_l2_height =
         check_ghostpay_local(&state).and_then(|gp| (gp.sync_state != "disabled").then_some(gp.virtual_block));
+
+    // This node's own trailing-7-day uptime %, the qualification gatekeeper
+    // metric (>=95% before capabilities count). It's the exact figure the
+    // qualification layer reads (`get_uptime_percent`, GHOST-10 time-based
+    // denominator) over the self-recorded samples — the self-uptime task
+    // records under `identity.node_id_hex()`, which is `state.node_id` /
+    // `health.node_id`. Returned as a percentage (0-100) to match the
+    // peer-gossiped `uptime_percent` the frontend already renders. Left as
+    // `None` (frontend "—") only when there's no DB attached.
+    let self_uptime_percent = state.database.as_ref().and_then(|db| {
+        let since = chrono::Utc::now().timestamp()
+            - (ghost_common::constants::UPTIME_WINDOW_DAYS as i64 * 86_400);
+        db.get_uptime_percent(&health.node_id, since)
+            .ok()
+            .map(|ratio| ratio * 100.0)
+    });
 
     let self_node = serde_json::json!({
         "node_id": health.node_id.clone(),
@@ -3461,6 +3492,7 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         "peer_count": health.peer_count,
         "l1_height": health.block_height,
         "l2_height": self_l2_height,
+        "uptime_percent": self_uptime_percent,
     });
 
     let mut nodes = vec![self_node];
