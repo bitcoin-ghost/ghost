@@ -14,6 +14,9 @@ export interface AlertEvents {
   reorg_detected: boolean;
   behind_tip: boolean;
   update_available: boolean;
+  mempool_congestion: boolean;
+  fee_spike: boolean;
+  failed_login: boolean;
 }
 
 export interface EmailChannel {
@@ -93,6 +96,9 @@ export const ALERTS_DEFAULTS: AlertsConfig = {
     reorg_detected: true,
     behind_tip: true,
     update_available: true,
+    mempool_congestion: true,
+    fee_spike: true,
+    failed_login: true,
   },
 };
 

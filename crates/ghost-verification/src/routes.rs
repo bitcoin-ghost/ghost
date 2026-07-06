@@ -506,6 +506,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         .route("/api/v1/alerts/test", post(api_alerts_test_post_handler))
         .route(
+            "/api/v1/alerts/internal/failed-login",
+            post(api_alerts_failed_login_post_handler),
+        )
+        .route(
             "/api/v1/config/ghost_pay",
             post(api_config_ghost_pay_post_handler),
         )
@@ -6604,6 +6608,95 @@ async fn api_alerts_test_post_handler(
         "results": results,
         "message": message,
     }))
+}
+
+/// Pool-side rate limit for failed-login alerts. The dashboard already
+/// edge-triggers (it only signals when its failure counter first crosses the
+/// threshold within the window), so this is a defensive second layer against a
+/// burst of signals — at most one `FailedLogin` alert per this interval.
+const FAILED_LOGIN_ALERT_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// Body of the internal failed-login signal from the dashboard login route.
+/// Carries only the failed-attempt count (and the window it was measured over) —
+/// never the attempted password or any credential material.
+#[derive(Debug, Deserialize)]
+struct FailedLoginSignal {
+    /// Number of consecutive failed dashboard login attempts observed.
+    attempts: u32,
+    /// Window (seconds) over which the attempts were counted, for the message.
+    #[serde(default)]
+    window_secs: Option<u64>,
+}
+
+/// API v1 internal failed-login signal handler — dispatches a `FailedLogin`
+/// operator alert through the shared dispatcher.
+///
+/// This is a CROSS-LAYER bridge: dashboard password auth lives in the Next.js
+/// layer, which counts consecutive failed attempts in-process and, on crossing
+/// its threshold, calls this endpoint. The login route runs pre-session (there
+/// is no operator cookie yet), so it cannot use the authenticated dashboard
+/// proxy; instead it signs this call with the shared internal-auth secret
+/// (`INTERNAL_AUTH_KEY`, the same HMAC the proxy uses). We therefore VERIFY that
+/// HMAC here (`X-Ghost-Signature` + `X-Ghost-Timestamp` over the raw body) when
+/// internal auth is configured, so only a holder of the secret can raise this
+/// alert. The message includes the attempt count, never the attempted password.
+async fn api_alerts_failed_login_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    // Require a valid internal HMAC when configured (production). Verify over the
+    // exact raw bytes, matching the dashboard proxy's signing scheme.
+    if let Some(auth) = state.internal_auth.as_ref() {
+        if let Err((code, _)) = verify_internal_auth(auth, &headers, &body) {
+            return (
+                code,
+                Json(serde_json::json!({ "success": false, "message": "unauthorized" })),
+            )
+                .into_response();
+        }
+    }
+
+    let payload: FailedLoginSignal = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "success": false, "message": "invalid request body" })),
+            )
+                .into_response();
+        }
+    };
+
+    let detail = match payload.window_secs {
+        Some(w) if w >= 60 => format!(
+            "{} consecutive failed dashboard login attempts within {} minutes.",
+            payload.attempts,
+            w / 60
+        ),
+        _ => format!(
+            "{} consecutive failed dashboard login attempts.",
+            payload.attempts
+        ),
+    };
+
+    // Dispatch through the shared dispatcher: honours the master switch, the
+    // `failed_login` event flag, and applies a pool-side rate limit. No-op if
+    // the dispatcher was never wired (minimal/test servers).
+    let dispatched = if let Some(dispatcher) = state.alert_dispatcher.get() {
+        dispatcher
+            .fire_rate_limited(
+                crate::alerts::AlertEvent::FailedLogin,
+                FAILED_LOGIN_ALERT_MIN_INTERVAL,
+                &detail,
+            )
+            .await
+    } else {
+        false
+    };
+
+    Json(serde_json::json!({ "success": true, "dispatched": dispatched })).into_response()
 }
 
 /// API v1 Config ghost_pay POST handler

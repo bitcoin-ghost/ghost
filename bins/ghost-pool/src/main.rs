@@ -6862,6 +6862,11 @@ async fn main() -> Result<()> {
     };
     let _ = alert_slot.set(Arc::clone(&alert_dispatcher));
 
+    // Register the dispatcher on the verification state so the internal
+    // failed-login endpoint (signalled by the dashboard login route) can
+    // dispatch the `FailedLogin` alert through the same debouncing dispatcher.
+    verification_state.set_alert_dispatcher(Arc::clone(&alert_dispatcher));
+
     // Get restart signal for monitoring (config update API)
     let restart_signal = verification_state.restart_signal();
 
@@ -6980,6 +6985,24 @@ async fn main() -> Result<()> {
     ghost_pool::alert_monitors::spawn_update_available_monitor(
         Arc::clone(&alert_dispatcher),
         env!("CARGO_PKG_VERSION").to_string(),
+        shutdown_tx.subscribe(),
+    );
+
+    // Start the mempool-congestion monitor. Edge-triggered `MempoolCongestion`
+    // alert (with hysteresis) when ghostd's mempool `usage` nears `maxmempool`,
+    // read via the pool's shared RPC client (`getmempoolinfo`).
+    ghost_pool::alert_monitors::spawn_mempool_congestion_monitor(
+        Arc::clone(&alert_dispatcher),
+        Arc::clone(&rpc),
+        shutdown_tx.subscribe(),
+    );
+
+    // Start the fee-spike monitor. Rate-limited `FeeSpike` alert when the
+    // next-block fee rate (`estimatesmartfee`) crosses an absolute threshold or
+    // jumps sharply versus a rolling baseline, read via the same RPC client.
+    ghost_pool::alert_monitors::spawn_fee_spike_monitor(
+        Arc::clone(&alert_dispatcher),
+        Arc::clone(&rpc),
         shutdown_tx.subscribe(),
     );
 
