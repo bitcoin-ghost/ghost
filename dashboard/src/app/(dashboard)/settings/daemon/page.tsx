@@ -23,6 +23,9 @@ const ONLYNET_OPTIONS = ["ipv4", "ipv6", "onion", "i2p", "cjdns"] as const;
 interface FormState {
   maxMempoolMb: string;
   mempoolExpiryHours: string;
+  // ON = full RBF (ghostd default, any tx replaceable). OFF = opt out → only
+  // BIP125-signalling txs replaceable (first-seen-safe for the rest).
+  fullRbf: boolean;
   maxConnections: string;
   maxUploadTargetMb: string;
   dbcacheMb: string;
@@ -36,6 +39,7 @@ interface FormState {
 const EMPTY_FORM: FormState = {
   maxMempoolMb: "",
   mempoolExpiryHours: "",
+  fullRbf: true, // ghostd default is full RBF on
   maxConnections: "",
   maxUploadTargetMb: "",
   dbcacheMb: "",
@@ -52,6 +56,8 @@ function fromSettings(s: DaemonSettings | undefined): FormState {
   return {
     maxMempoolMb: num(s.max_mempool_mb),
     mempoolExpiryHours: num(s.mempool_expiry_hours),
+    // Full RBF is on unless the operator explicitly opted out (full_rbf===false).
+    fullRbf: s.full_rbf !== false,
     maxConnections: num(s.max_connections),
     maxUploadTargetMb: s.max_upload_target_mb ?? "",
     dbcacheMb: num(s.dbcache_mb),
@@ -79,6 +85,9 @@ function toSettings(f: FormState): DaemonSettings {
   return {
     max_mempool_mb: optNum(f.maxMempoolMb),
     mempool_expiry_hours: optNum(f.mempoolExpiryHours),
+    // ON → null (leave ghostd at its full-RBF default, emit no flag).
+    // OFF → false (opt out → -mempoolfullrbf=0).
+    full_rbf: f.fullRbf ? null : false,
     max_connections: optNum(f.maxConnections),
     max_upload_target_mb: optStr(f.maxUploadTargetMb),
     dbcache_mb: optNum(f.dbcacheMb),
@@ -265,6 +274,16 @@ export default function DaemonSettingsPage() {
                 type="number"
                 inputMode="numeric"
                 unit="hrs"
+              />
+              <ToggleFieldRow
+                label="Full RBF"
+                description={
+                  form.fullRbf
+                    ? "ON (default): every unconfirmed transaction is replaceable by a higher-fee conflict, regardless of BIP125 signalling."
+                    : "OFF: only transactions that signal BIP125 opt-in replaceability can be replaced. Non-signalling first-seen transactions are protected (-mempoolfullrbf=0)."
+                }
+                enabled={form.fullRbf}
+                onChange={(v) => patch({ fullRbf: v })}
               />
             </div>
           </Card>

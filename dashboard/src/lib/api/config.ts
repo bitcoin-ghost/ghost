@@ -64,6 +64,10 @@ export interface DaemonSettings {
   // Mempool
   max_mempool_mb?: number | null;       // -maxmempool (MB)
   mempool_expiry_hours?: number | null; // -mempoolexpiry (hours)
+  // Full RBF (-mempoolfullrbf). ghostd defaults to full RBF ON (any tx
+  // replaceable). false opts out → -mempoolfullrbf=0 (only BIP125-signalling
+  // txs replaceable). null/true preserve ghostd's default (emit nothing).
+  full_rbf?: boolean | null;
   // Connectivity
   max_connections?: number | null;      // -maxconnections
   max_upload_target_mb?: string | null; // -maxuploadtarget (number + optional unit k|K|m|M|g|G|t|T; 0 = no limit)

@@ -5440,6 +5440,7 @@ async fn api_config_daemon_handler(
         "settings": {
             "max_mempool_mb": launch.max_mempool_mb,
             "mempool_expiry_hours": launch.mempool_expiry_hours,
+            "full_rbf": launch.full_rbf,
             "max_connections": launch.max_connections,
             "max_upload_target_mb": launch.max_upload_target_mb,
             "dbcache_mb": launch.dbcache_mb,
@@ -5775,6 +5776,10 @@ struct DaemonSettingsRequest {
     max_mempool_mb: Option<u32>,
     #[serde(default)]
     mempool_expiry_hours: Option<u32>,
+    /// Full RBF opt-out. `Some(false)` opts out (emits `-mempoolfullrbf=0`);
+    /// `None`/`Some(true)` preserve ghostd's default (full RBF on).
+    #[serde(default)]
+    full_rbf: Option<bool>,
     #[serde(default)]
     max_connections: Option<u32>,
     #[serde(default)]
@@ -5938,6 +5943,7 @@ async fn api_config_daemon_post_handler(
         let launch = &mut cfg.node_launch;
         launch.max_mempool_mb = payload.max_mempool_mb;
         launch.mempool_expiry_hours = payload.mempool_expiry_hours;
+        launch.full_rbf = payload.full_rbf;
         launch.max_connections = payload.max_connections;
         launch.max_upload_target_mb = payload.max_upload_target_mb.clone();
         launch.dbcache_mb = payload.dbcache_mb;
@@ -9000,6 +9006,7 @@ mod tests {
         let good = DaemonSettingsRequest {
             max_mempool_mb: Some(600),
             mempool_expiry_hours: Some(72),
+            full_rbf: Some(false),
             max_connections: Some(40),
             max_upload_target_mb: Some("1G".to_string()),
             dbcache_mb: Some(2048),

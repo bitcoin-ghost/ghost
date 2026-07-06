@@ -154,6 +154,14 @@ pub struct NodeLaunchConfig {
     /// Unset → ghostd's default. Restart-required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mempool_expiry_hours: Option<u32>,
+    /// Full replace-by-fee (`-mempoolfullrbf`). ghostd defaults to full RBF ON
+    /// (any transaction replaceable). `Some(false)` opts the operator OUT,
+    /// emitting `-mempoolfullrbf=0` so only BIP125-signalling transactions are
+    /// replaceable (first-seen-safe for non-signalling txs). `None` or
+    /// `Some(true)` preserves ghostd's default (full RBF on) and emits nothing.
+    /// Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_rbf: Option<bool>,
 
     // --- Connectivity ----------------------------------------------------
     /// Maximum automatic peer connections (`-maxconnections`). Unset → ghostd's
@@ -219,6 +227,11 @@ impl NodeLaunchConfig {
         }
         if let Some(hours) = self.mempool_expiry_hours {
             flags.push(format!("-mempoolexpiry={hours}"));
+        }
+        // ghostd defaults to full RBF on, so only emit a flag when the operator
+        // opts out (Some(false)). None / Some(true) leave ghostd at its default.
+        if self.full_rbf == Some(false) {
+            flags.push("-mempoolfullrbf=0".to_string());
         }
         if let Some(n) = self.max_connections {
             flags.push(format!("-maxconnections={n}"));
@@ -2710,6 +2723,7 @@ mod tests {
             tor_mode: true,
             max_mempool_mb: Some(600),
             mempool_expiry_hours: Some(72),
+            full_rbf: Some(false),
             max_connections: Some(40),
             max_upload_target_mb: Some("500M".to_string()),
             dbcache_mb: Some(2048),
@@ -2723,6 +2737,7 @@ mod tests {
         assert!(flags.contains(&"-tormode=1".to_string()));
         assert!(flags.contains(&"-maxmempool=600".to_string()));
         assert!(flags.contains(&"-mempoolexpiry=72".to_string()));
+        assert!(flags.contains(&"-mempoolfullrbf=0".to_string()));
         assert!(flags.contains(&"-maxconnections=40".to_string()));
         assert!(flags.contains(&"-maxuploadtarget=500M".to_string()));
         assert!(flags.contains(&"-dbcache=2048".to_string()));
@@ -2744,6 +2759,28 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.ghostd_flags().is_empty());
+    }
+
+    #[test]
+    fn test_node_launch_full_rbf_only_emits_on_opt_out() {
+        // ghostd defaults to full RBF ON, so the flag is emitted ONLY when the
+        // operator opts out with Some(false). None and Some(true) preserve the
+        // default and must add nothing to ExecStart.
+        let none = NodeLaunchConfig::default();
+        assert_eq!(none.full_rbf, None);
+        assert!(!none.ghostd_flags().iter().any(|f| f.starts_with("-mempoolfullrbf")));
+
+        let on = NodeLaunchConfig {
+            full_rbf: Some(true),
+            ..Default::default()
+        };
+        assert!(!on.ghostd_flags().iter().any(|f| f.starts_with("-mempoolfullrbf")));
+
+        let off = NodeLaunchConfig {
+            full_rbf: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(off.ghostd_flags(), vec!["-mempoolfullrbf=0".to_string()]);
     }
 
     #[test]
