@@ -1,24 +1,42 @@
 /**
  * Overlay: Block Clock
  *
- * CONCEPT — a giant, ambient next-block countdown: estimated time to the next
- * block, round progress, current difficulty, and network hashrate. The
- * centrepiece is the clock itself; everything else is quiet supporting detail.
+ * CONCEPT — a giant, ambient next-block countdown. The centrepiece is the clock
+ * ring itself; everything else is quiet supporting detail.
  *
- * A large circular ring fills with the current round's progress (elapsed vs
- * the node's estimated time to the next block). At its centre a big, room-
- * legible counter ticks up the time since the last block. Block height,
- * network difficulty and network hashrate sit underneath as calm readouts.
- * When a new block lands (the height increments between polls) the whole clock
- * gives a satisfying golden pulse and the ring resets to the fresh round.
+ * The ring fills with the chain's progress toward the ~10-minute average block
+ * interval: elapsed time since the last L1 block versus that target. At its
+ * centre a big, room-legible counter ticks up the time since the last block.
+ * Block height, network difficulty and network hashrate sit underneath as calm
+ * readouts. When a new block lands (the height increments between polls) the
+ * whole clock gives a satisfying golden flash and the ring sweeps back to empty
+ * for the fresh block.
+ *
+ * DATA NOTES (why this file was rewritten):
+ *  - "Since last block" = `now - chain.tip_time`. `tip_time` is a unix SECONDS
+ *    timestamp of the current chain tip (verified against the node: it matches
+ *    the pool's `last_block_time`). This is the correct, honest L1 source — it
+ *    can legitimately read tens of minutes on a low-hashrate chain where blocks
+ *    are sparse, so a long value is "running long", NOT a bug.
+ *  - The ring is driven ENTIRELY from that L1 elapsed vs a 10-min target. The
+ *    old code filled it from `pool.estimated_time_to_block_secs` /
+ *    `current_round_duration_secs`, which the node never emits (they exist only
+ *    in the dashboard's TS types) — so the ring was permanently empty and the
+ *    face read "no block-time estimate yet". The ring is now never dead: it
+ *    shows real progress, a full breathing ring when a block runs long, and an
+ *    indeterminate breathing spinner while we have no tip yet.
  *
  * IMPLEMENTER NOTES:
  *  - Keep the `export function BlockClockOverlay({ active }: OverlayProps)`
  *    signature exactly. Replace only the body of this file.
- *  - Honour `active`: the 1s tick that drives the counter/ring and the pulse
- *    timeout run ONLY while `active === true`; both are torn down on inactive
- *    and on unmount. Polling backs right off while off-screen.
- *  - CSP-safe only: inline SVG, no external assets, no injected stylesheets.
+ *  - Honour `active`: the 1s tick that drives the counter/ring and the new-block
+ *    pulse run ONLY while `active === true`, and all ambient motion (CSS
+ *    keyframes scoped under `.bc-live`, SMIL sweep) is disabled when the overlay
+ *    is off-screen or the viewer prefers reduced motion. Polling backs right off
+ *    while parked.
+ *  - CSP-safe only: inline SVG + one inline <style> of keyframes (same pattern
+ *    the sibling NodeVitals overlay uses). No external assets, no injected
+ *    remote stylesheets, no new deps.
  */
 'use client';
 
@@ -32,6 +50,11 @@ import {
 } from '@/hooks/queries';
 
 const DASH = '—';
+
+// Bitcoin's long-run average inter-block time. The ring measures progress
+// toward this; past it, the block is simply "running long" (Poisson — ~37% of
+// blocks take longer than the mean), shown as a full, breathing ring.
+const TARGET_BLOCK_SECS = 600;
 
 function isNum(n: number | null | undefined): n is number {
   return typeof n === 'number' && Number.isFinite(n);
@@ -106,6 +129,25 @@ const TICKS = Array.from({ length: 60 }, (_, i) => {
   return { a, b, major };
 });
 
+// Indeterminate "waiting" arc: a short bright segment we spin.
+const SPIN_DASH = `${CIRC * 0.24} ${CIRC * 0.76}`;
+
+// Ambient keyframes. Scoped under `.bc-live` so ALL motion stops the instant the
+// overlay is parked or the viewer prefers reduced motion (the class is only
+// applied while animating).
+const keyframes = `
+.bc-live .bc-breathe { animation: bc-breathe 4.6s ease-in-out infinite; }
+.bc-live .bc-headglow { animation: bc-headglow 2.6s ease-in-out infinite; }
+.bc-live .bc-corepulse { animation: bc-breathe 5.4s ease-in-out infinite; }
+@keyframes bc-breathe { 0%, 100% { opacity: 0.28; } 50% { opacity: 0.62; } }
+@keyframes bc-headglow { 0%, 100% { opacity: 0.4; } 50% { opacity: 0.95; } }
+@media (prefers-reduced-motion: reduce) {
+  .bc-live .bc-breathe,
+  .bc-live .bc-headglow,
+  .bc-live .bc-corepulse { animation: none; }
+}
+`;
+
 // ─── overlay ─────────────────────────────────────────────────────────────────
 
 export function BlockClockOverlay({ active }: OverlayProps) {
@@ -115,7 +157,7 @@ export function BlockClockOverlay({ active }: OverlayProps) {
   const { data: chain, isLoading: chainLoading } = useBlockchainStatus({
     refetchInterval: poll,
   });
-  const { data: pool, dataUpdatedAt: poolAt } = usePoolStatus({ refetchInterval: poll });
+  const { data: pool } = usePoolStatus({ refetchInterval: poll });
   const { data: best } = useBestHash({ refetchInterval: poll });
   const { data: mining } = useMiningStatus({ refetchInterval: poll });
 
@@ -129,6 +171,17 @@ export function BlockClockOverlay({ active }: OverlayProps) {
   useEffect(() => {
     heightRef.current = heightNow;
   });
+
+  // Respect the viewer's motion preference; gates the ambient CSS + SMIL motion.
+  const [reduced, setReduced] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const sync = () => setReduced(mq.matches);
+    sync();
+    mq.addEventListener?.('change', sync);
+    return () => mq.removeEventListener?.('change', sync);
+  }, []);
 
   // Single 1s clock that drives every live figure AND spots new blocks. Runs
   // ONLY while active; setState happens only inside the timer callback, never
@@ -145,7 +198,7 @@ export function BlockClockOverlay({ active }: OverlayProps) {
       const prev = prevHeightRef.current;
       if (isNum(h)) {
         // Only celebrate a genuine forward step (never the first sighting).
-        if (prev !== null && h > prev) setFlashUntil(Date.now() + 1500);
+        if (prev !== null && h > prev) setFlashUntil(Date.now() + 1600);
         prevHeightRef.current = h;
       }
     };
@@ -154,27 +207,23 @@ export function BlockClockOverlay({ active }: OverlayProps) {
   }, [active]);
 
   const flash = active && now < flashUntil;
+  const animate = active && !reduced;
 
   // ── derived live values ────────────────────────────────────────────────────
 
-  // Time since the last block: ticks up from the chain tip timestamp.
-  const tipSecs = isNum(chain?.tip_time)
-    ? Math.max(0, now / 1000 - chain!.tip_time!)
-    : null;
+  // Time since the last block: ticks up from the chain tip timestamp (unix
+  // seconds). This is the honest L1 source — long values are real, not a bug.
+  const tipTime = isNum(chain?.tip_time) ? chain!.tip_time! : null;
+  const tipSecs = tipTime !== null ? Math.max(0, now / 1000 - tipTime) : null;
+  const hasTip = isNum(tipSecs);
 
-  // Ring fill = round progress (elapsed vs estimated time-to-block), advanced
-  // smoothly between polls off the query's own update time.
-  const roundBase = pool?.current_round_duration_secs ?? null;
-  const eta = pool?.estimated_time_to_block_secs ?? null;
-  const hasRound = isNum(roundBase) && isNum(eta) && eta > 0;
-  const sincePoll = poolAt ? Math.max(0, (now - poolAt) / 1000) : 0;
-  const liveElapsed = isNum(roundBase) ? roundBase + sincePoll : null;
-  const liveEta = isNum(eta) ? Math.max(1, eta - sincePoll) : null;
-  const remaining = isNum(eta) ? Math.max(0, eta - sincePoll) : null;
-  const progress =
-    hasRound && isNum(liveElapsed) && isNum(liveEta)
-      ? Math.min(0.9999, liveElapsed / (liveElapsed + liveEta))
-      : 0;
+  // Ring fill = progress toward the ~10-minute average, capped at 1. Past the
+  // average the block is "running long" and the ring stays full (breathing).
+  const rawProgress = hasTip ? tipSecs! / TARGET_BLOCK_SECS : 0;
+  const progress = hasTip ? Math.min(1, rawProgress) : 0;
+  const overdue = hasTip && rawProgress >= 1;
+  const remainingSecs = hasTip ? Math.max(0, TARGET_BLOCK_SECS - tipSecs!) : null;
+  const overSecs = hasTip ? Math.max(0, tipSecs! - TARGET_BLOCK_SECS) : null;
 
   const height = isNum(heightNow) ? heightNow : null;
   const difficulty =
@@ -182,7 +231,7 @@ export function BlockClockOverlay({ active }: OverlayProps) {
   const netHashrate = best?.network_hashrate ?? null;
   const roundId = pool?.round_id ?? best?.round_id ?? mining?.round_id ?? null;
 
-  const waiting = chainLoading && !isNum(tipSecs) && height === null;
+  const waiting = !hasTip && (chainLoading || height === null);
 
   // ── ring geometry ──────────────────────────────────────────────────────────
 
@@ -194,7 +243,9 @@ export function BlockClockOverlay({ active }: OverlayProps) {
 
   return (
     <div
-      className="relative flex h-full w-full flex-col items-center justify-center select-none"
+      className={`relative flex h-full w-full flex-col items-center justify-center select-none${
+        animate ? ' bc-live' : ''
+      }`}
       style={{
         background: 'var(--bg)',
         color: 'var(--fg)',
@@ -205,6 +256,8 @@ export function BlockClockOverlay({ active }: OverlayProps) {
         gap: 'clamp(24px, 4vh, 48px)',
       }}
     >
+      <style>{keyframes}</style>
+
       {/* Full-bleed golden flash on a new block. Quick rise, slow fall. */}
       <div
         aria-hidden
@@ -242,17 +295,33 @@ export function BlockClockOverlay({ active }: OverlayProps) {
           zIndex: 1,
         }}
       >
+        {/* Soft ambient halo behind the ring — always present, breathing so the
+            face never reads as dead even at low progress. */}
+        <div
+          className="bc-breathe"
+          aria-hidden
+          style={{
+            position: 'absolute',
+            inset: '4%',
+            borderRadius: '50%',
+            pointerEvents: 'none',
+            background:
+              'radial-gradient(circle, var(--accent-weak) 0%, transparent 68%)',
+            opacity: animate ? undefined : 0.4,
+          }}
+        />
+
         <svg
           viewBox={`0 0 ${VB} ${VB}`}
           width="100%"
           height="100%"
-          style={{ display: 'block', overflow: 'visible' }}
+          style={{ display: 'block', overflow: 'visible', position: 'relative' }}
           role="img"
-          aria-label="Round progress toward the next block"
+          aria-label="Progress toward the next block"
         >
           <defs>
             <linearGradient id="clk-arc" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stopColor={arcColor} stopOpacity="0.55" />
+              <stop offset="0%" stopColor={arcColor} stopOpacity="0.5" />
               <stop offset="100%" stopColor={arcColor} stopOpacity="1" />
             </linearGradient>
             <filter id="clk-glow" x="-40%" y="-40%" width="180%" height="180%">
@@ -262,6 +331,10 @@ export function BlockClockOverlay({ active }: OverlayProps) {
                 <feMergeNode in="SourceGraphic" />
               </feMerge>
             </filter>
+            <linearGradient id="clk-sweep" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={accent} stopOpacity="0.55" />
+              <stop offset="100%" stopColor={accent} stopOpacity="0" />
+            </linearGradient>
           </defs>
 
           {/* Clock tick marks */}
@@ -282,33 +355,105 @@ export function BlockClockOverlay({ active }: OverlayProps) {
           {/* Track */}
           <circle cx={C} cy={C} r={R} fill="none" stroke="var(--rule)" strokeWidth={10} />
 
-          {/* Progress arc — starts at 12 o'clock, sweeps clockwise */}
-          <g transform={`rotate(-90 ${C} ${C})`}>
-            <circle
-              cx={C}
-              cy={C}
-              r={R}
-              fill="none"
-              stroke="url(#clk-arc)"
-              strokeWidth={11}
-              strokeLinecap="round"
-              strokeDasharray={CIRC}
-              strokeDashoffset={dashOffset}
-              filter="url(#clk-glow)"
-              style={{ transition: 'stroke-dashoffset 950ms linear' }}
-            />
-          </g>
+          {/* Slow radar sweep hand — ambient "ticking" life, independent of
+              progress. SMIL rotation (CSP-safe, no CSS) and only mounted while
+              animating so it fully stops off-screen / under reduced motion. */}
+          {animate && (
+            <g opacity={0.5}>
+              <line
+                x1={C}
+                y1={C}
+                x2={C}
+                y2={C - R + 4}
+                stroke="url(#clk-sweep)"
+                strokeWidth={3}
+                strokeLinecap="round"
+              />
+              <animateTransform
+                attributeName="transform"
+                attributeType="XML"
+                type="rotate"
+                from={`0 ${C} ${C}`}
+                to={`360 ${C} ${C}`}
+                dur="18s"
+                repeatCount="indefinite"
+              />
+            </g>
+          )}
 
-          {/* Glowing head of the arc (the "hand") */}
-          {progress > 0.002 && (
-            <circle
-              cx={head.x}
-              cy={head.y}
-              r={flash ? 9 : 6.5}
-              fill={arcColor}
-              filter="url(#clk-glow)"
-              style={{ transition: 'r 300ms ease' }}
-            />
+          {hasTip ? (
+            <>
+              {/* Progress arc — starts at 12 o'clock, sweeps clockwise. Fills
+                  with an accent glow; sweeps back to empty on a new block. */}
+              <g transform={`rotate(-90 ${C} ${C})`}>
+                <circle
+                  cx={C}
+                  cy={C}
+                  r={R}
+                  fill="none"
+                  stroke="url(#clk-arc)"
+                  strokeWidth={11}
+                  strokeLinecap="round"
+                  strokeDasharray={CIRC}
+                  strokeDashoffset={dashOffset}
+                  filter="url(#clk-glow)"
+                  style={{ transition: 'stroke-dashoffset 950ms linear' }}
+                />
+              </g>
+
+              {/* Glowing leading edge of the arc (the "hand"). */}
+              {progress > 0.004 && (
+                <g>
+                  <circle
+                    className="bc-headglow"
+                    cx={head.x}
+                    cy={head.y}
+                    r={flash ? 15 : 12}
+                    fill={arcColor}
+                    filter="url(#clk-glow)"
+                    opacity={animate ? undefined : 0.6}
+                    style={{ transition: 'cx 950ms linear, cy 950ms linear' }}
+                  />
+                  <circle
+                    cx={head.x}
+                    cy={head.y}
+                    r={flash ? 8 : 6}
+                    fill={arcColor}
+                    filter="url(#clk-glow)"
+                    style={{ transition: 'cx 950ms linear, cy 950ms linear, r 300ms ease' }}
+                  />
+                </g>
+              )}
+            </>
+          ) : (
+            // No tip yet — an indeterminate, breathing spinner. Alive, never a
+            // dead grey circle.
+            <g transform={`rotate(-90 ${C} ${C})`}>
+              <circle
+                className="bc-breathe"
+                cx={C}
+                cy={C}
+                r={R}
+                fill="none"
+                stroke={accent}
+                strokeWidth={11}
+                strokeLinecap="round"
+                strokeDasharray={SPIN_DASH}
+                filter="url(#clk-glow)"
+                opacity={animate ? undefined : 0.5}
+              />
+              {animate && (
+                <animateTransform
+                  attributeName="transform"
+                  attributeType="XML"
+                  type="rotate"
+                  from={`-90 ${C} ${C}`}
+                  to={`270 ${C} ${C}`}
+                  dur="2.8s"
+                  repeatCount="indefinite"
+                />
+              )}
+            </g>
           )}
         </svg>
 
@@ -325,6 +470,21 @@ export function BlockClockOverlay({ active }: OverlayProps) {
             padding: '18%',
           }}
         >
+          {/* Soft core glow behind the number. */}
+          <div
+            className="bc-corepulse"
+            aria-hidden
+            style={{
+              position: 'absolute',
+              width: '62%',
+              aspectRatio: '1 / 1',
+              borderRadius: '50%',
+              pointerEvents: 'none',
+              background:
+                'radial-gradient(circle, var(--accent-weak) 0%, transparent 70%)',
+              opacity: animate ? undefined : 0.35,
+            }}
+          />
           <div
             style={{
               fontFamily: 'var(--font-mono)',
@@ -333,6 +493,7 @@ export function BlockClockOverlay({ active }: OverlayProps) {
               letterSpacing: '0.24em',
               color: 'var(--dim)',
               marginBottom: 'clamp(4px, 1vh, 10px)',
+              zIndex: 1,
             }}
           >
             since last block
@@ -346,6 +507,7 @@ export function BlockClockOverlay({ active }: OverlayProps) {
               fontSize: 'clamp(38px, 9vmin, 96px)',
               color: flash ? 'var(--green)' : 'var(--fg)',
               transition: 'color 600ms ease',
+              zIndex: 1,
             }}
           >
             {isNum(tipSecs) ? formatClock(tipSecs) : waiting ? '· · ·' : DASH}
@@ -356,18 +518,29 @@ export function BlockClockOverlay({ active }: OverlayProps) {
               fontFamily: 'var(--font-sans)',
               fontSize: 'clamp(11px, 1.3vw, 15px)',
               color: 'var(--dim)',
+              zIndex: 1,
+              maxWidth: '92%',
             }}
           >
-            {hasRound ? (
-              <>
-                <span style={{ color: 'var(--accent)', fontWeight: 600 }}>
-                  {Math.round(progress * 100)}%
-                </span>{' '}
-                of round · ~{formatShort(remaining)} to block
-              </>
+            {hasTip ? (
+              overdue ? (
+                <>
+                  <span style={{ color: 'var(--accent)', fontWeight: 600 }}>
+                    running long
+                  </span>{' '}
+                  · +{formatShort(overSecs)} over the ~10-min average
+                </>
+              ) : (
+                <>
+                  <span style={{ color: 'var(--accent)', fontWeight: 600 }}>
+                    {Math.round(progress * 100)}%
+                  </span>{' '}
+                  of the ~10-min average · ~{formatShort(remainingSecs)} to go
+                </>
+              )
             ) : (
               <span style={{ color: 'var(--fainter)' }}>
-                {waiting ? 'connecting to node…' : 'no block-time estimate yet'}
+                {waiting ? 'connecting to node…' : 'waiting for chain tip…'}
               </span>
             )}
           </div>
@@ -379,6 +552,7 @@ export function BlockClockOverlay({ active }: OverlayProps) {
                 fontSize: 'clamp(9px, 1vw, 11px)',
                 letterSpacing: '0.12em',
                 color: 'var(--fainter)',
+                zIndex: 1,
               }}
             >
               ROUND #{roundId}
