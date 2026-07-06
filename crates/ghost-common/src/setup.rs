@@ -271,23 +271,37 @@ pub fn apply_reaper(
     })
 }
 
+/// True when `tok` is a ghostd flag that this codebase manages via the drop-in,
+/// so it must be stripped from the inherited `ExecStart` before the current set
+/// is re-appended (keeps regeneration idempotent).
+fn is_managed_ghostd_flag(tok: &str) -> bool {
+    tok.starts_with("-ghostreaper") || tok.starts_with("-tormode")
+}
+
 /// Render a systemd drop-in for ghostd that applies the per-vector reaper
-/// settings to the node mempool reaper.
+/// settings AND the node launch flags (e.g. Tor mode) to the daemon.
 ///
 /// `exec_argv` is the daemon's resolved command line (e.g. the `argv[]` from
-/// `systemctl show ghostd -p ExecStart --value`). Any existing `-ghostreaper*`
-/// flags are stripped and the full set from `settings` is appended, wrapped in
-/// a drop-in that resets and replaces `ExecStart` (the systemd override idiom:
-/// an empty `ExecStart=` clears the inherited value before the new one is set).
-pub fn ghostd_reaper_dropin(exec_argv: &str, settings: &crate::config::ReaperSettings) -> String {
+/// `systemctl show ghostd -p ExecStart --value`). Any existing managed flags
+/// (`-ghostreaper*`, `-tormode`) are stripped and the current set is appended,
+/// wrapped in a drop-in that resets and replaces `ExecStart` (the systemd
+/// override idiom: an empty `ExecStart=` clears the inherited value before the
+/// new one is set). A single drop-in carries every ghost-managed flag so the
+/// separate toggles never fight over `ExecStart`.
+pub fn ghostd_managed_dropin(
+    exec_argv: &str,
+    reaper: &crate::config::ReaperSettings,
+    launch: &crate::config::NodeLaunchConfig,
+) -> String {
     let base: Vec<&str> = exec_argv
         .split_whitespace()
-        .filter(|tok| !tok.starts_with("-ghostreaper"))
+        .filter(|tok| !is_managed_ghostd_flag(tok))
         .collect();
-    let flags = settings.ghostd_flags();
+    let mut flags = reaper.ghostd_flags();
+    flags.extend(launch.ghostd_flags());
     format!(
-        "# Managed by `ghost-setup apply-reaper` — per-vector Ghost Reaper flags.\n\
-         # Do not edit by hand; regenerate from pool.toml [reaper].\n\
+        "# Managed by `ghost-setup apply-reaper` — Ghost Reaper + node launch flags.\n\
+         # Do not edit by hand; regenerate from pool.toml [reaper]/[node_launch].\n\
          [Service]\n\
          ExecStart=\n\
          ExecStart={} {}\n",
@@ -377,18 +391,19 @@ pub fn apply_mempool_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ReaperSettings;
+    use crate::config::{NodeLaunchConfig, ReaperSettings};
 
     #[test]
-    fn test_ghostd_reaper_dropin_strips_and_appends() {
+    fn test_ghostd_managed_dropin_strips_and_appends() {
         let exec = "/opt/ghost/bin/ghostd -signet -datadir=/var/lib/bitcoin -ghostreaper=enabled -port=38333";
         let s = ReaperSettings {
             reject_annex: false,
             ..Default::default()
         };
-        let dropin = ghostd_reaper_dropin(exec, &s);
+        let launch = NodeLaunchConfig::default();
+        let dropin = ghostd_managed_dropin(exec, &s, &launch);
 
-        // resets ExecStart then re-emits the base (minus any -ghostreaper*)
+        // resets ExecStart then re-emits the base (minus any managed flags)
         assert!(dropin.contains("[Service]\nExecStart=\nExecStart="));
         assert!(dropin.contains("/opt/ghost/bin/ghostd"));
         assert!(dropin.contains("-signet"));
@@ -400,5 +415,30 @@ mod tests {
         assert!(dropin.contains("-ghostreaper-rejectinscription=1"));
         assert!(dropin.contains("-ghostreaper-rejectdustflood=1"));
         assert!(dropin.contains("-ghostreaper-dustfloodthreshold=330"));
+        // Tor off by default → no -tormode flag emitted.
+        assert!(!dropin.contains("-tormode"));
+    }
+
+    #[test]
+    fn test_ghostd_managed_dropin_tor_toggle_is_idempotent() {
+        // Simulate a re-apply where the previous drop-in already added -tormode=1:
+        // it must be stripped and re-added exactly once when still enabled, and
+        // dropped entirely when disabled.
+        let exec = "/opt/ghost/bin/ghostd -signet -tormode=1 -ghostreaper=enabled";
+        let reaper = ReaperSettings::default();
+
+        let on = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &NodeLaunchConfig { tor_mode: true },
+        );
+        assert_eq!(on.matches("-tormode=1").count(), 1);
+
+        let off = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &NodeLaunchConfig { tor_mode: false },
+        );
+        assert!(!off.contains("-tormode"));
     }
 }

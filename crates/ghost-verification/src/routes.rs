@@ -474,6 +474,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/config/reaper",
             post(api_config_reaper_post_handler),
         )
+        .route("/api/v1/config/tor", post(api_config_tor_post_handler))
         .route(
             "/api/v1/config/ghost_pay",
             post(api_config_ghost_pay_post_handler),
@@ -5379,6 +5380,80 @@ fn spawn_ghostd_reaper_apply(state: Arc<VerificationState>) {
 /// type name everywhere.
 fn ghost_common_now(state: &str, message: impl Into<String>) -> crate::server::GhostdReaperApply {
     crate::server::GhostdReaperApply::now(state, message)
+}
+
+/// API v1 Config tor POST handler — toggles ghostd Tor mode (`-tormode`).
+///
+/// ghostd only reads `-tormode` at startup, so it can't be flipped mid-flight.
+/// This persists `[node_launch] tor_mode` to pool.toml and then applies it via
+/// the same ghostd-flag drop-in path as the reaper: `spawn_ghostd_reaper_apply`
+/// runs `ghost-setup apply-reaper` (which now regenerates the combined
+/// reaper + launch-flag drop-in and restarts ghostd) and afterwards bounces
+/// ghost-pool. The response returns promptly with the apply *initiated*; the
+/// terminal result lands on the reaper GET endpoint's `ghostd_apply`.
+async fn api_config_tor_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<ToggleRequest>,
+) -> impl IntoResponse {
+    // Require the full node config + a path to persist to; otherwise the change
+    // can't survive a restart, so fail-closed with SERVICE_UNAVAILABLE.
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    {
+        let mut cfg = full.write();
+        cfg.node_launch.tor_mode = payload.enabled;
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist Tor mode");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist Tor mode: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Apply the ghostd flag (restarts ghostd) then bounce the pool. Shares the
+    // reaper apply path because the drop-in now carries all ghost-managed flags.
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
+
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Json(serde_json::json!({
+        "success": true,
+        "enabled": payload.enabled,
+        "ghostd_apply": apply,
+        "message": if payload.enabled {
+            "Tor mode enabled. ghostd is restarting with -tormode=1; the pool will bounce once it settles."
+        } else {
+            "Tor mode disabled. ghostd is restarting on clearnet; the pool will bounce once it settles."
+        },
+    }))
+    .into_response()
 }
 
 /// API v1 Config reaper POST handler — accepts the full per-vector reaper
