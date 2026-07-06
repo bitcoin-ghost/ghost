@@ -11,6 +11,9 @@ export interface AlertEvents {
   restart_needed: boolean;
   peer_count_drop: boolean;
   block_found: boolean;
+  reorg_detected: boolean;
+  behind_tip: boolean;
+  update_available: boolean;
 }
 
 export interface EmailChannel {
@@ -87,6 +90,9 @@ export const ALERTS_DEFAULTS: AlertsConfig = {
     restart_needed: true,
     peer_count_drop: true,
     block_found: true,
+    reorg_detected: true,
+    behind_tip: true,
+    update_available: true,
   },
 };
 
