@@ -249,6 +249,18 @@ pub struct MeshNetwork {
     /// converge on the mesh-wide rarest record per window.
     best_records_fn:
         Option<Arc<dyn Fn() -> Vec<ghost_common::types::WindowBestRecord> + Send + Sync>>,
+    /// Application-provided callback returning this node's current L1 (Bitcoin)
+    /// block height, gossiped in health pings so peers can show it on the Swarm
+    /// page. `None` → the ping reports height 0 (rendered "—" upstream).
+    l1_height_fn: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    /// Application-provided callback returning this node's own trailing-7-day
+    /// uptime as a percentage (0-100), gossiped in health pings. Returns `None`
+    /// when there are no samples yet; absent provider → `None` in the ping.
+    uptime_percent_fn: Option<Arc<dyn Fn() -> Option<f64> + Send + Sync>>,
+    /// Application-provided callback returning this node's Ghost Pay L2
+    /// virtual-block height, gossiped in health pings. `None` when ghost-pay
+    /// isn't running / the tip is unknown; absent provider → `None` in the ping.
+    l2_height_fn: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
     /// Hardware-derived effective capacity advertised in health pings.
     /// `0` means we haven't computed it yet (mesh started before capacity
     /// init); peers treat it as unknown and skip utilisation routing for us.
@@ -1067,6 +1079,9 @@ impl MeshNetwork {
             active_miner_hashes_fn: None,
             local_hashrate_fn: None,
             best_records_fn: None,
+            l1_height_fn: None,
+            uptime_percent_fn: None,
+            l2_height_fn: None,
             max_capacity: AtomicU32::new(0),
             coordinator_sessions: AtomicU32::new(0),
         })
@@ -1171,6 +1186,29 @@ impl MeshNetwork {
         f: Arc<dyn Fn() -> Vec<ghost_common::types::WindowBestRecord> + Send + Sync>,
     ) {
         self.best_records_fn = Some(f);
+    }
+
+    /// Set a callback providing this node's current L1 (Bitcoin) block height,
+    /// gossiped in health pings for the Swarm page. Without this, pings report 0.
+    pub fn set_l1_height_provider(&mut self, f: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.l1_height_fn = Some(f);
+    }
+
+    /// Set a callback providing this node's own trailing-7-day uptime percentage
+    /// (0-100), gossiped in health pings so peers render it on the Swarm page.
+    /// Returns `None` when there are no samples yet.
+    pub fn set_uptime_percent_provider(
+        &mut self,
+        f: Arc<dyn Fn() -> Option<f64> + Send + Sync>,
+    ) {
+        self.uptime_percent_fn = Some(f);
+    }
+
+    /// Set a callback providing this node's Ghost Pay L2 virtual-block height,
+    /// gossiped in health pings. Returns `None` when ghost-pay isn't running or
+    /// the L2 tip isn't known yet.
+    pub fn set_l2_height_provider(&mut self, f: Arc<dyn Fn() -> Option<u64> + Send + Sync>) {
+        self.l2_height_fn = Some(f);
     }
 
     /// Collect the best (rarest) record per window across the mesh: every
@@ -2924,11 +2962,19 @@ impl MeshNetwork {
                 .as_ref()
                 .map(|f| f())
                 .unwrap_or_default();
+            // Swarm-page telemetry gossiped for peers to render. L1 height comes
+            // from a provider (fallback 0 = "unknown"); uptime % and L2 height
+            // are Option (None when unavailable); peer_count is this node's own
+            // deduplicated view, matching the self figure the swarm endpoint uses.
+            let block_height = self.l1_height_fn.as_ref().map(|f| f()).unwrap_or(0);
+            let uptime_percent = self.uptime_percent_fn.as_ref().and_then(|f| f());
+            let l2_height = self.l2_height_fn.as_ref().and_then(|f| f());
+            let peer_count = Some(self.peers.unique_peer_count() as u32);
             let ping = ghost_common::types::HealthPing {
                 node_id: self.identity.node_id(),
                 public_address: String::new(), // S-7: Don't broadcast IP in cleartext ZMQ
-                block_height: 0,               // Would track actual height
-                round_id: 0,                   // Would track current round
+                block_height,
+                round_id: 0, // Would track current round
                 capabilities: *self.capabilities.read(),
                 miner_count: self
                     .miner_count_fn
@@ -2945,6 +2991,9 @@ impl MeshNetwork {
                 // mutated at runtime), so reading from self.config is fine.
                 coordinator_endpoint: self.config.advertised_coordinator_endpoint.clone(),
                 coordinator_sessions: self.coordinator_sessions.load(Ordering::Relaxed),
+                uptime_percent,
+                peer_count,
+                l2_height,
             };
 
             match self.create_envelope(

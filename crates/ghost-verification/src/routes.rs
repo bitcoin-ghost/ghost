@@ -2548,6 +2548,12 @@ fn mesh_node_to_json(node: &MeshNodeInfo) -> serde_json::Value {
         // Peer's hardware-derived capacity ceiling (0 = not yet gossiped →
         // the Capacity page renders it as "unknown", not a real ceiling).
         "max_capacity": node.max_capacity,
+        // Swarm-page telemetry gossiped per peer. `None` serialises to JSON null,
+        // which the frontend renders as "—" (never a misleading 0).
+        "l1_height": node.l1_height,
+        "uptime_percent": node.uptime_percent,
+        "peer_count": node.peer_count,
+        "l2_height": node.l2_height,
         "healthy": node.healthy,
         "is_self": false,
     })
@@ -3645,11 +3651,25 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         self_caps.elder_status,
     );
 
-    // The per-peer uptime %, peer count and L1/L2 heights are not gossiped, so
-    // they render as "—" for mesh peers — but THIS node knows its own locally,
-    // so populate them here.
-    let self_l2_height =
-        check_ghostpay_local(&state).and_then(|gp| (gp.sync_state != "disabled").then_some(gp.virtual_block));
+    // THIS node's own L2 (Ghost Pay) virtual-block height. `check_ghostpay_local`
+    // reads the in-process handler, which production ghost-pool does NOT wire —
+    // ghost-pay runs as a separate service on :8800 — so it returns `None` and
+    // the self row's L2 showed "—". Mirror the ghostpay status endpoint: on that
+    // `None`, fall back to querying the local :8800 service. `Some(disabled)`
+    // (ghost-pay off) still resolves to `None` → "—", never a fabricated value.
+    let self_l2_height = match check_ghostpay_local(&state) {
+        Some(gp) if gp.sync_state == "disabled" => None,
+        Some(gp) => Some(gp.virtual_block),
+        None => match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::spawn(fetch_ghostpay_from_service()),
+        )
+        .await
+        {
+            Ok(Ok(Some(status))) => Some(status.virtual_block),
+            _ => None,
+        },
+    };
 
     // This node's own trailing-7-day uptime %, the qualification gatekeeper
     // metric (>=95% before capabilities count). It's the exact figure the
@@ -3734,6 +3754,13 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
             "public_mining": peer.cap_public_mining,
             "reaper": peer.cap_reaper,
             "elder": peer.cap_elder,
+            // Gossiped Swarm telemetry — `None` → JSON null → "—" on the page,
+            // so a peer running an older build (that doesn't gossip these) shows
+            // a dash rather than a fabricated 0 until the fleet is updated.
+            "uptime_percent": peer.uptime_percent,
+            "peer_count": peer.peer_count,
+            "l1_height": peer.l1_height,
+            "l2_height": peer.l2_height,
         }));
     }
 
@@ -9665,6 +9692,10 @@ mod tests {
             deduped_miner_count: 2,
             max_capacity: 500,
             healthy: true,
+            l1_height: Some(912_345),
+            uptime_percent: Some(99.7),
+            peer_count: Some(3),
+            l2_height: Some(4_567),
         };
 
         let v = mesh_node_to_json(&node);
@@ -9676,6 +9707,11 @@ mod tests {
         assert_eq!(v["deduped_miner_count"], 2);
         assert_eq!(v["max_capacity"], 500);
         assert_eq!(v["healthy"], true);
+        // Gossiped Swarm telemetry surfaces on the peer JSON.
+        assert_eq!(v["l1_height"], 912_345);
+        assert_eq!(v["uptime_percent"], 99.7);
+        assert_eq!(v["peer_count"], 3);
+        assert_eq!(v["l2_height"], 4_567);
         // Peers are never self.
         assert_eq!(v["is_self"], false);
         // Capabilities are nested exactly as the website expects.
@@ -9705,6 +9741,10 @@ mod tests {
             deduped_miner_count: 0,
             max_capacity: 0,
             healthy: false,
+            l1_height: None,
+            uptime_percent: None,
+            peer_count: None,
+            l2_height: None,
         };
 
         let v = mesh_node_to_json(&node);
@@ -9714,6 +9754,12 @@ mod tests {
         assert_eq!(v["deduped_miner_count"], 0);
         assert_eq!(v["max_capacity"], 0);
         assert_eq!(v["healthy"], false);
+        // Unreported telemetry serialises to JSON null → "—" on the page, never
+        // a fabricated 0.
+        assert!(v["l1_height"].is_null());
+        assert!(v["uptime_percent"].is_null());
+        assert!(v["peer_count"].is_null());
+        assert!(v["l2_height"].is_null());
         assert!(v["capabilities"].is_object());
     }
 

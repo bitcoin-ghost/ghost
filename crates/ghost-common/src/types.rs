@@ -475,6 +475,28 @@ pub struct HealthPing {
     /// `#[serde(default)]` for backward compatibility.
     #[serde(default)]
     pub coordinator_sessions: u32,
+    /// This node's own trailing-7-day uptime, as a PERCENTAGE (0-100) — the
+    /// qualification gatekeeper metric (>=95% before capabilities count).
+    /// Gossiped so the dashboard Swarm page can render each mesh peer's uptime
+    /// instead of a dash. `Option` (not a plain `f64` defaulting to 0.0) so an
+    /// older peer that omits it — or one with no uptime samples yet — is shown
+    /// as "—" rather than a misleading 0.0%. `#[serde(default)]` → `None` when
+    /// absent, keeping the wire change additive for a mixed-version fleet.
+    #[serde(default)]
+    pub uptime_percent: Option<f64>,
+    /// The number of mesh peers THIS node currently sees (its own deduplicated
+    /// peer count). Gossiped so the Swarm page can show each peer's connectivity.
+    /// `Option` so absence (older peer) renders as "—", never a misleading 0.
+    /// `#[serde(default)]` for backward compatibility.
+    #[serde(default)]
+    pub peer_count: Option<u32>,
+    /// This node's Ghost Pay L2 virtual-block height, when it runs ghost-pay.
+    /// Gossiped so the Swarm page can show each mesh peer's L2 tip. `None` for
+    /// nodes that don't run ghost-pay (or older peers that predate this field),
+    /// so the frontend renders "—" instead of a fabricated 0. `#[serde(default)]`
+    /// for backward compatibility.
+    #[serde(default)]
+    pub l2_height: Option<u64>,
 }
 
 /// One node's best (rarest) valid share in a public records window.
@@ -1078,7 +1100,42 @@ mod tests {
             }],
             coordinator_endpoint: None,
             coordinator_sessions: 0,
+            uptime_percent: Some(99.5),
+            peer_count: Some(3),
+            l2_height: Some(12_345),
         }
+    }
+
+    #[test]
+    fn health_ping_telemetry_roundtrip() {
+        // The new Swarm telemetry fields survive a round-trip.
+        let ping = sample_health_ping();
+        let back: HealthPing =
+            serde_json::from_str(&serde_json::to_string(&ping).unwrap()).unwrap();
+        assert_eq!(back.uptime_percent, Some(99.5));
+        assert_eq!(back.peer_count, Some(3));
+        assert_eq!(back.l2_height, Some(12_345));
+    }
+
+    #[test]
+    fn health_ping_deserializes_without_telemetry_fields() {
+        // Emulate an OLDER node's ping that predates the Swarm telemetry fields:
+        // serialize, strip each new field, and confirm every one defaults to
+        // `None` (rendered as "—", never a fabricated 0). Proves the wire change
+        // is additive so a mixed-version rolling deploy stays compatible.
+        let ping = sample_health_ping();
+        let mut v = serde_json::to_value(&ping).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        assert!(obj.remove("uptime_percent").is_some());
+        assert!(obj.remove("peer_count").is_some());
+        assert!(obj.remove("l2_height").is_some());
+        let back: HealthPing = serde_json::from_value(v).unwrap();
+        assert_eq!(back.uptime_percent, None);
+        assert_eq!(back.peer_count, None);
+        assert_eq!(back.l2_height, None);
+        // Unrelated fields are unaffected.
+        assert_eq!(back.miner_count, 2);
+        assert_eq!(back.active_miner_id_hashes.len(), 2);
     }
 
     #[test]

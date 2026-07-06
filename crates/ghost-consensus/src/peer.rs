@@ -204,6 +204,20 @@ impl PeerManager {
             if merged.coordinator_sessions == 0 {
                 merged.coordinator_sessions = existing.coordinator_sessions;
             }
+            // Preserve the health-ping telemetry a re-announce (Peer::new) carries
+            // at its defaults, so the Swarm figures don't blank out between pings.
+            if merged.block_height == 0 {
+                merged.block_height = existing.block_height;
+            }
+            if merged.uptime_percent.is_none() {
+                merged.uptime_percent = existing.uptime_percent;
+            }
+            if merged.peer_count.is_none() {
+                merged.peer_count = existing.peer_count;
+            }
+            if merged.l2_height.is_none() {
+                merged.l2_height = existing.l2_height;
+            }
             merged.first_seen = merged.first_seen.min(existing.first_seen);
             peers.insert(merged.node_id, merged);
             return;
@@ -347,6 +361,41 @@ impl PeerManager {
             // upsert/re-announce path preserves it instead, so a bare re-announce
             // can't reset it to 0 between pings.
             peer.coordinator_sessions = coordinator_sessions;
+        }
+    }
+
+    /// Update a peer's Swarm-page telemetry (L1 height, trailing-7-day uptime %,
+    /// its own peer count, and Ghost Pay L2 height) from its most recent health
+    /// ping. Each field is only overwritten when the ping carries a real value,
+    /// so a peer momentarily omitting one (older build / no L2) never blanks out
+    /// a figure the Swarm view already knows.
+    pub fn update_node_telemetry(
+        &self,
+        node_id: &NodeId,
+        block_height: u64,
+        uptime_percent: Option<f64>,
+        peer_count: Option<u32>,
+        l2_height: Option<u64>,
+    ) {
+        if let Some(peer) = self.peers.write().get_mut(node_id) {
+            // L1 height is a live gauge — take the latest reported value. `0`
+            // means the peer didn't report (older build), so don't clobber a
+            // known height with it.
+            if block_height != 0 {
+                peer.block_height = block_height;
+            }
+            // Uptime / peer-count / L2 are Option: only overwrite with a real
+            // value, never blank out a known figure with a peer's momentary
+            // omission (keeps the Swarm display stable between pings).
+            if uptime_percent.is_some() {
+                peer.uptime_percent = uptime_percent;
+            }
+            if peer_count.is_some() {
+                peer.peer_count = peer_count;
+            }
+            if l2_height.is_some() {
+                peer.l2_height = l2_height;
+            }
         }
     }
 
@@ -504,6 +553,20 @@ pub struct Peer {
     /// eligible set at the epoch boundary to size the seat count. 0 when idle or
     /// not a coordinator.
     pub coordinator_sessions: u32,
+    /// This peer's L1 (Bitcoin) block height, from its most recent health ping.
+    /// Surfaced on the Swarm page. `0` for older peers that hardcoded it (or
+    /// haven't reported yet) — treated as "unknown" and rendered "—" upstream.
+    pub block_height: u64,
+    /// This peer's own trailing-7-day uptime percentage (0-100), from its most
+    /// recent health ping. `None` for older peers that don't report it (or peers
+    /// with no samples yet) — rendered "—" on the Swarm page, never a fake 0.
+    pub uptime_percent: Option<f64>,
+    /// The number of mesh peers this peer itself reported seeing, from its most
+    /// recent health ping. `None` for older peers that don't report it.
+    pub peer_count: Option<u32>,
+    /// This peer's Ghost Pay L2 virtual-block height, from its most recent health
+    /// ping. `None` for peers that don't run ghost-pay (or older peers).
+    pub l2_height: Option<u64>,
 }
 
 impl Peer {
@@ -530,6 +593,10 @@ impl Peer {
             best_records: Vec::new(),
             coordinator_endpoint: None,
             coordinator_sessions: 0,
+            block_height: 0,
+            uptime_percent: None,
+            peer_count: None,
+            l2_height: None,
         }
     }
 

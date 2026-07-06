@@ -1147,6 +1147,19 @@ pub struct MeshNodeInfo {
     pub deduped_miner_count: u32,
     /// Whether the node is considered healthy/reachable on the mesh.
     pub healthy: bool,
+    /// This node's L1 (Bitcoin) block height, from its most recent health ping.
+    /// `None` when the peer hasn't reported it (older build) so the Swarm page
+    /// renders "—" instead of a misleading 0.
+    pub l1_height: Option<u64>,
+    /// This node's trailing-7-day uptime percentage (0-100), from its health
+    /// ping. `None` when not reported (older peer / no samples) → "—".
+    pub uptime_percent: Option<f64>,
+    /// The number of mesh peers this node itself reported seeing. `None` when
+    /// not reported (older peer) → "—".
+    pub peer_count: Option<u32>,
+    /// This node's Ghost Pay L2 virtual-block height. `None` when the node
+    /// doesn't run ghost-pay (or is an older peer) → "—".
+    pub l2_height: Option<u64>,
 }
 
 /// Outcome of the most recent automatic `ghost-setup apply-reaper` run.
