@@ -5,6 +5,7 @@ import {
   signSession,
   timingSafeEqualStr,
 } from "@/lib/jwt";
+import { BACKEND_URL, internalAuthHeaders } from "@/lib/internal-auth";
 
 // ---------------------------------------------------------------------------
 // Per-client login rate limiting (Finding 8)
@@ -71,6 +72,85 @@ function sweepExpired(now: number): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Failed-login alert signal (cross-layer: dashboard -> ghost-pool)
+// ---------------------------------------------------------------------------
+// Dashboard password auth lives here in the Next.js layer, not in ghost-pool.
+// To surface a brute-force attempt as an operator alert, we count CONSECUTIVE
+// failed password checks in-process and, when the streak first crosses
+// FAILED_LOGIN_ALERT_THRESHOLD within FAILED_LOGIN_WINDOW_MS, signal ghost-pool
+// to dispatch a `FailedLogin` alert. The signal carries ONLY the attempt count
+// (never the attempted password). We edge-trigger (the `alerted` flag) so a
+// single burst pages once; a successful login clears the streak.
+// ---------------------------------------------------------------------------
+
+const FAILED_LOGIN_ALERT_THRESHOLD = 5;
+const FAILED_LOGIN_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
+interface FailStreak {
+  count: number;
+  resetAt: number;
+  alerted: boolean;
+}
+
+const failedLogins = new Map<string, FailStreak>();
+
+/** Record one failed login; report the streak count and whether to alert now. */
+function recordFailedLogin(key: string): { count: number; shouldAlert: boolean } {
+  const now = Date.now();
+  const existing = failedLogins.get(key);
+
+  if (!existing || now >= existing.resetAt) {
+    failedLogins.set(key, { count: 1, resetAt: now + FAILED_LOGIN_WINDOW_MS, alerted: false });
+    return { count: 1, shouldAlert: false };
+  }
+
+  existing.count += 1;
+  if (existing.count >= FAILED_LOGIN_ALERT_THRESHOLD && !existing.alerted) {
+    existing.alerted = true; // edge: only the first crossing fires.
+    return { count: existing.count, shouldAlert: true };
+  }
+  return { count: existing.count, shouldAlert: false };
+}
+
+function clearFailedLogins(key: string): void {
+  failedLogins.delete(key);
+}
+
+/**
+ * Signal ghost-pool to dispatch a `FailedLogin` alert. Runs pre-session (no
+ * operator cookie exists on a failed login), so it cannot use the authenticated
+ * dashboard proxy; it signs the call directly with the shared internal-auth
+ * secret (the same HMAC the proxy uses). No-ops when INTERNAL_AUTH_KEY is
+ * unset. Never sends or logs the attempted password.
+ */
+async function signalFailedLoginBurst(attempts: number): Promise<void> {
+  const body = JSON.stringify({
+    attempts,
+    window_secs: Math.floor(FAILED_LOGIN_WINDOW_MS / 1000),
+  });
+  const authHeaders = internalAuthHeaders(body);
+  if (!("X-Ghost-Signature" in authHeaders)) {
+    // No signing key configured — we cannot authenticate the signal, so skip it
+    // rather than send an unauthenticated (and rejected) request.
+    return;
+  }
+  const url = new URL("/api/v1/alerts/internal/failed-login", BACKEND_URL);
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    await fetch(url.toString(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders },
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+  } catch {
+    // Best-effort: a failed-login alert must never break the login response.
+  }
+}
+
 export async function POST(request: NextRequest) {
   const key = clientKey(request);
   sweepExpired(Date.now());
@@ -91,6 +171,14 @@ export async function POST(request: NextRequest) {
   }
 
   if (!timingSafeEqualStr(password ?? "", dashboardPassword)) {
+    // Track the consecutive-failure streak and, on crossing the threshold,
+    // signal ghost-pool to raise a `FailedLogin` operator alert. Awaited (a
+    // fast loopback call, guarded by a timeout) so the signal completes before
+    // the response returns; it never carries or logs the attempted password.
+    const { count, shouldAlert } = recordFailedLogin(key);
+    if (shouldAlert) {
+      await signalFailedLoginBurst(count);
+    }
     return NextResponse.json({ error: "Invalid password" }, { status: 401 });
   }
 
@@ -100,8 +188,10 @@ export async function POST(request: NextRequest) {
   }
 
   // Successful auth — reset this client's attempt counter so a legitimate
-  // operator isn't throttled by their own earlier typos.
+  // operator isn't throttled by their own earlier typos, and clear the
+  // failed-login streak so an occasional typo never accumulates toward an alert.
   clearAttempts(key);
+  clearFailedLogins(key);
 
   const ttl = resolveTtlSecs();
   const token = await signSession("operator", secret, ttl);

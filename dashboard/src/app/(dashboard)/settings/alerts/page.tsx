@@ -32,6 +32,9 @@ const EVENT_META: { key: keyof AlertEvents; label: string; description: string }
   { key: "reorg_detected", label: "Chain reorg detected", description: "A Bitcoin block was disconnected from the tip (chain reorganisation)." },
   { key: "behind_tip", label: "Node behind tip", description: "The node fell behind the network — a stale tip or a lagging local height." },
   { key: "update_available", label: "Update available", description: "A newer node release is available than the one installed." },
+  { key: "mempool_congestion", label: "Mempool congestion", description: "The mempool is near its capacity (usage close to maxmempool)." },
+  { key: "fee_spike", label: "Fee spike", description: "The next-block fee rate crossed a high threshold or jumped sharply." },
+  { key: "failed_login", label: "Failed login attempts", description: "A burst of consecutive failed dashboard login attempts was detected." },
 ];
 
 export default function AlertsSettingsPage() {
