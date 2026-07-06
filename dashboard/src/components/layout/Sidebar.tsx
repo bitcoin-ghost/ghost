@@ -74,7 +74,7 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "filtering",
+    label: "tx filtering",
     items: [
       { href: "/filtering", label: "Overview", icon: <Filter {...ICON} /> },
       { href: "/filtering/basic", label: "Basic", icon: <Layers {...ICON} /> },
