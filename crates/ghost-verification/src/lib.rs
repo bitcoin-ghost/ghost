@@ -37,6 +37,7 @@
 //! - `GET /health` - Node health status
 //! - `GET /ws` - WebSocket for real-time updates
 
+pub mod alerts;
 pub mod auth;
 pub mod challenge;
 pub mod client;

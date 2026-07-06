@@ -342,6 +342,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             get(api_config_template_profile_handler),
         )
         .route("/api/v1/config/reaper", get(api_config_reaper_handler))
+        .route("/api/v1/config/alerts", get(api_config_alerts_handler))
         .route(
             "/api/v1/config/ghost_pay",
             get(api_config_ghost_pay_handler),
@@ -475,6 +476,11 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_reaper_post_handler),
         )
         .route("/api/v1/config/tor", post(api_config_tor_post_handler))
+        .route(
+            "/api/v1/config/alerts",
+            post(api_config_alerts_post_handler),
+        )
+        .route("/api/v1/alerts/test", post(api_alerts_test_post_handler))
         .route(
             "/api/v1/config/ghost_pay",
             post(api_config_ghost_pay_post_handler),
@@ -5833,6 +5839,141 @@ async fn api_config_reaper_post_handler(
         "ghostd_restart_required": false,
         "ghostd_apply": apply,
         "message": "Reaper settings saved. The pool template reaper applies on the imminent ghost-pool restart, and the ghostd mempool reaper is being applied automatically (ghostd will briefly restart).",
+    }))
+}
+
+// ============================================================================
+// Operator Alerts (email / push / Telegram) — issue #236
+// ============================================================================
+
+/// Serialize an [`AlertsConfig`] for the read/write API with the Telegram bot
+/// token REDACTED. The raw token is a secret (like `[coordinator]
+/// bond_ledger_token`) and must never leave the node; the dashboard only needs
+/// to know whether one is set. `telegram.bot_token` is dropped and a boolean
+/// `telegram.bot_token_set` is injected in its place.
+fn alerts_response_json(cfg: &ghost_common::config::AlertsConfig) -> serde_json::Value {
+    let mut v = serde_json::to_value(cfg).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(tg) = v
+        .get_mut("channels")
+        .and_then(|c| c.get_mut("telegram"))
+        .and_then(|t| t.as_object_mut())
+    {
+        let has_token = tg
+            .remove("bot_token")
+            .and_then(|t| t.as_str().map(|s| !s.is_empty()))
+            .unwrap_or(false);
+        tg.insert("bot_token_set".to_string(), serde_json::Value::Bool(has_token));
+    }
+    v
+}
+
+/// API v1 Config alerts GET handler — returns the operator alerting config from
+/// pool.toml `[alerts]`, with the Telegram bot token redacted.
+async fn api_config_alerts_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let alerts = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().alerts.clone())
+        .unwrap_or_default();
+    let mut body = alerts_response_json(&alerts);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "message".to_string(),
+            serde_json::Value::String("Operator alerting configuration".to_string()),
+        );
+    }
+    Json(body)
+}
+
+/// API v1 Config alerts POST handler — persists the operator alerting config to
+/// pool.toml `[alerts]`. The Telegram bot token is preserved when the client
+/// omits it (the GET redacts it, so a normal round-trip carries no token); a
+/// non-empty token replaces the stored one.
+async fn api_config_alerts_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<ghost_common::config::AlertsConfig>,
+) -> impl IntoResponse {
+    let mut persisted = false;
+    let mut saved = payload.clone();
+    if let Some(ref full) = state.full_node_config {
+        let mut cfg = full.write();
+        // Secret-preserve: an empty/absent incoming bot token keeps the stored
+        // one, so saving unrelated changes never wipes the credential.
+        if saved
+            .channels
+            .telegram
+            .bot_token
+            .as_deref()
+            .unwrap_or("")
+            .is_empty()
+        {
+            saved.channels.telegram.bot_token =
+                cfg.alerts.channels.telegram.bot_token.clone();
+        }
+        cfg.alerts = saved.clone();
+        if let Some(ref path) = state.full_node_config_path {
+            match cfg.save_atomic(path) {
+                Ok(()) => persisted = true,
+                // Do NOT log the config (it carries the bot token).
+                Err(e) => error!(error = %e, "Failed to persist alerts config"),
+            }
+        }
+    }
+    let mut body = alerts_response_json(&saved);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("success".to_string(), serde_json::Value::Bool(true));
+        obj.insert("persisted".to_string(), serde_json::Value::Bool(persisted));
+        obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(
+                if persisted {
+                    "Alert settings saved.".to_string()
+                } else {
+                    "Alert settings received but no node config path is configured — changes were not persisted.".to_string()
+                },
+            ),
+        );
+    }
+    Json(body)
+}
+
+/// API v1 Alerts test-send POST handler — delivers a real test alert to every
+/// enabled + configured channel, proving the delivery plumbing end to end. This
+/// bypasses the master `enabled` switch (the operator explicitly asked to test)
+/// but still only touches channels the operator has turned on and configured.
+async fn api_alerts_test_post_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let alerts = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().alerts.clone())
+        .unwrap_or_default();
+    let msg = crate::alerts::AlertMessage {
+        title: format!(
+            "[Ghost {}] Test alert",
+            &state.node_id[..state.node_id.len().min(12)]
+        ),
+        body: "This is a test alert from your Ghost node dashboard. If you received it, alert delivery is working.".to_string(),
+    };
+    let results = crate::alerts::deliver(&alerts, &msg).await;
+    let attempted = results.iter().filter(|r| r.attempted).count();
+    let succeeded = results.iter().filter(|r| r.attempted && r.success).count();
+    let message = if attempted == 0 {
+        "No channels are enabled and configured — enable a channel and enter its details, save, then send a test.".to_string()
+    } else if succeeded == attempted {
+        format!("Test alert delivered to {succeeded} channel(s).")
+    } else {
+        format!("Delivered to {succeeded} of {attempted} channel(s); see per-channel results.")
+    };
+    Json(serde_json::json!({
+        "success": attempted > 0 && succeeded == attempted,
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "results": results,
+        "message": message,
     }))
 }
 
