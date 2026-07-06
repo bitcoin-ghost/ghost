@@ -54,3 +54,6 @@ export * from './useReaperQueries';
 
 // Capability self-check queries
 export * from './useSelfCheckQueries';
+
+// Geo (offline GeoIP database) queries
+export * from './useGeoQueries';
