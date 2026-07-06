@@ -144,16 +144,105 @@ pub struct NodeLaunchConfig {
     /// single flag is emitted. Requires a ghostd restart to take effect.
     #[serde(default)]
     pub tor_mode: bool,
+
+    // --- Mempool ---------------------------------------------------------
+    /// Keep the transaction mempool below this many megabytes (`-maxmempool`).
+    /// Unset → ghostd's default. Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mempool_mb: Option<u32>,
+    /// Drop mempool transactions older than this many hours (`-mempoolexpiry`).
+    /// Unset → ghostd's default. Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mempool_expiry_hours: Option<u32>,
+
+    // --- Connectivity ----------------------------------------------------
+    /// Maximum automatic peer connections (`-maxconnections`). Unset → ghostd's
+    /// default. Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    /// Outbound-traffic ceiling per 24h (`-maxuploadtarget`). A unit-friendly
+    /// value: a bare number is megabytes, with optional suffix `[k|K|m|M|g|G|t|T]`
+    /// (lowercase = base-1000, uppercase = base-1024); `0` = no limit. Unset →
+    /// ghostd's default. Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_upload_target_mb: Option<String>,
+
+    // --- Performance -----------------------------------------------------
+    /// Database cache size in megabytes (`-dbcache`). Unset → ghostd's default.
+    /// Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbcache_mb: Option<u32>,
+
+    // --- Indexes / BIP157 ------------------------------------------------
+    /// Build the basic block-filter index (`-blockfilterindex=1`). Enabling
+    /// triggers a one-time index build over the chain. Unset/false → ghostd's
+    /// default (off). Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_filter_index: Option<bool>,
+    /// Serve BIP157 compact block filters to light clients (`-peerblockfilters=1`).
+    /// ghostd requires the block-filter index to also be enabled. Unset/false →
+    /// ghostd's default (off). Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_block_filters: Option<bool>,
+
+    // --- Privacy networking ---------------------------------------------
+    /// Restrict automatic outbound connections to these networks (`-onlynet`,
+    /// repeated once per entry). Valid values: `ipv4`, `ipv6`, `onion`, `i2p`,
+    /// `cjdns`. Empty → no restriction. Restart-required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub onlynet: Vec<String>,
+    /// I2P SAM proxy `host:port` for reaching I2P peers (`-i2psam`). Unset → I2P
+    /// disabled. Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i2p_sam: Option<String>,
+    /// Accept inbound I2P connections (`-i2pacceptincoming=1`). Only effective
+    /// when `i2p_sam` is set. Unset/false → ghostd's default. Restart-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i2p_accept_incoming: Option<bool>,
 }
 
 impl NodeLaunchConfig {
     /// The ghostd (Bitcoin Core) CLI flags that mirror these settings. Only
     /// non-default values are emitted, so a node with everything off adds nothing
     /// to ghostd's `ExecStart` and behaves exactly as before.
+    ///
+    /// Every flag here is read by ghostd only at startup, so changing any of
+    /// these requires a ghostd restart to take effect (see `ghostd_managed_dropin`
+    /// in `setup.rs`, which regenerates the drop-in idempotently).
     pub fn ghostd_flags(&self) -> Vec<String> {
         let mut flags = Vec::new();
         if self.tor_mode {
             flags.push("-tormode=1".to_string());
+        }
+        if let Some(mb) = self.max_mempool_mb {
+            flags.push(format!("-maxmempool={mb}"));
+        }
+        if let Some(hours) = self.mempool_expiry_hours {
+            flags.push(format!("-mempoolexpiry={hours}"));
+        }
+        if let Some(n) = self.max_connections {
+            flags.push(format!("-maxconnections={n}"));
+        }
+        if let Some(ref target) = self.max_upload_target_mb {
+            flags.push(format!("-maxuploadtarget={target}"));
+        }
+        if let Some(mb) = self.dbcache_mb {
+            flags.push(format!("-dbcache={mb}"));
+        }
+        if self.block_filter_index == Some(true) {
+            flags.push("-blockfilterindex=1".to_string());
+        }
+        if self.peer_block_filters == Some(true) {
+            flags.push("-peerblockfilters=1".to_string());
+        }
+        for net in &self.onlynet {
+            flags.push(format!("-onlynet={net}"));
+        }
+        if let Some(ref sam) = self.i2p_sam {
+            flags.push(format!("-i2psam={sam}"));
+        }
+        if self.i2p_accept_incoming == Some(true) {
+            flags.push("-i2pacceptincoming=1".to_string());
         }
         flags
     }
@@ -2552,5 +2641,83 @@ mod tests {
             result.is_ok(),
             "Signet should warn but allow world-readable config"
         );
+    }
+
+    // --- NodeLaunchConfig::ghostd_flags emission --------------------------
+
+    #[test]
+    fn test_node_launch_default_emits_nothing() {
+        // A node with everything off must add nothing to ghostd's ExecStart.
+        assert!(NodeLaunchConfig::default().ghostd_flags().is_empty());
+    }
+
+    #[test]
+    fn test_node_launch_each_field_maps_to_its_flag() {
+        let cfg = NodeLaunchConfig {
+            tor_mode: true,
+            max_mempool_mb: Some(600),
+            mempool_expiry_hours: Some(72),
+            max_connections: Some(40),
+            max_upload_target_mb: Some("500M".to_string()),
+            dbcache_mb: Some(2048),
+            block_filter_index: Some(true),
+            peer_block_filters: Some(true),
+            onlynet: vec!["onion".to_string(), "i2p".to_string()],
+            i2p_sam: Some("127.0.0.1:7656".to_string()),
+            i2p_accept_incoming: Some(true),
+        };
+        let flags = cfg.ghostd_flags();
+        assert!(flags.contains(&"-tormode=1".to_string()));
+        assert!(flags.contains(&"-maxmempool=600".to_string()));
+        assert!(flags.contains(&"-mempoolexpiry=72".to_string()));
+        assert!(flags.contains(&"-maxconnections=40".to_string()));
+        assert!(flags.contains(&"-maxuploadtarget=500M".to_string()));
+        assert!(flags.contains(&"-dbcache=2048".to_string()));
+        assert!(flags.contains(&"-blockfilterindex=1".to_string()));
+        assert!(flags.contains(&"-peerblockfilters=1".to_string()));
+        assert!(flags.contains(&"-onlynet=onion".to_string()));
+        assert!(flags.contains(&"-onlynet=i2p".to_string()));
+        assert!(flags.contains(&"-i2psam=127.0.0.1:7656".to_string()));
+        assert!(flags.contains(&"-i2pacceptincoming=1".to_string()));
+    }
+
+    #[test]
+    fn test_node_launch_none_and_false_fields_are_absent() {
+        // Some(false) bools and None scalars must not emit a flag.
+        let cfg = NodeLaunchConfig {
+            block_filter_index: Some(false),
+            peer_block_filters: Some(false),
+            i2p_accept_incoming: Some(false),
+            ..Default::default()
+        };
+        assert!(cfg.ghostd_flags().is_empty());
+    }
+
+    #[test]
+    fn test_node_launch_serde_back_compat_missing_fields() {
+        // An old pool.toml that predates the daemon fields (only tor_mode, or
+        // even an empty table) must still parse, with the new fields defaulting.
+        let old: NodeLaunchConfig = toml::from_str("tor_mode = true").unwrap();
+        assert!(old.tor_mode);
+        assert_eq!(old.max_mempool_mb, None);
+        assert!(old.onlynet.is_empty());
+        assert_eq!(old.i2p_accept_incoming, None);
+        assert_eq!(old.ghostd_flags(), vec!["-tormode=1".to_string()]);
+
+        let empty: NodeLaunchConfig = toml::from_str("").unwrap();
+        assert!(empty.ghostd_flags().is_empty());
+    }
+
+    #[test]
+    fn test_node_launch_round_trips_through_toml() {
+        let cfg = NodeLaunchConfig {
+            max_mempool_mb: Some(300),
+            onlynet: vec!["ipv4".to_string()],
+            block_filter_index: Some(true),
+            ..Default::default()
+        };
+        let s = toml::to_string(&cfg).unwrap();
+        let back: NodeLaunchConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.ghostd_flags(), cfg.ghostd_flags());
     }
 }

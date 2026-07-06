@@ -271,11 +271,36 @@ pub fn apply_reaper(
     })
 }
 
+/// Every ghostd flag prefix this codebase owns via the drop-in. A token matching
+/// any of these is stripped from the inherited `ExecStart` before the current set
+/// is re-appended, which is what keeps regeneration idempotent: re-applying with
+/// the same config yields the same `ExecStart`, and toggling a setting off drops
+/// its flag entirely rather than leaving a stale copy behind. All are emitted by
+/// `ReaperSettings::ghostd_flags` / `NodeLaunchConfig::ghostd_flags`.
+const MANAGED_GHOSTD_FLAG_PREFIXES: &[&str] = &[
+    // Reaper (per-vector) + Tor.
+    "-ghostreaper",
+    "-tormode",
+    // Daemon / node launch settings (NodeLaunchConfig).
+    "-maxmempool",
+    "-mempoolexpiry",
+    "-maxconnections",
+    "-maxuploadtarget",
+    "-dbcache",
+    "-blockfilterindex",
+    "-peerblockfilters",
+    "-onlynet",
+    "-i2psam",
+    "-i2pacceptincoming",
+];
+
 /// True when `tok` is a ghostd flag that this codebase manages via the drop-in,
 /// so it must be stripped from the inherited `ExecStart` before the current set
 /// is re-appended (keeps regeneration idempotent).
 fn is_managed_ghostd_flag(tok: &str) -> bool {
-    tok.starts_with("-ghostreaper") || tok.starts_with("-tormode")
+    MANAGED_GHOSTD_FLAG_PREFIXES
+        .iter()
+        .any(|p| tok.starts_with(p))
 }
 
 /// Render a systemd drop-in for ghostd that applies the per-vector reaper
@@ -283,7 +308,8 @@ fn is_managed_ghostd_flag(tok: &str) -> bool {
 ///
 /// `exec_argv` is the daemon's resolved command line (e.g. the `argv[]` from
 /// `systemctl show ghostd -p ExecStart --value`). Any existing managed flags
-/// (`-ghostreaper*`, `-tormode`) are stripped and the current set is appended,
+/// (`-ghostreaper*`, `-tormode`, and the daemon flags in
+/// `MANAGED_GHOSTD_FLAG_PREFIXES`) are stripped and the current set is appended,
 /// wrapped in a drop-in that resets and replaces `ExecStart` (the systemd
 /// override idiom: an empty `ExecStart=` clears the inherited value before the
 /// new one is set). A single drop-in carries every ghost-managed flag so the
@@ -430,15 +456,83 @@ mod tests {
         let on = ghostd_managed_dropin(
             exec,
             &reaper,
-            &NodeLaunchConfig { tor_mode: true },
+            &NodeLaunchConfig { tor_mode: true, ..Default::default() },
         );
         assert_eq!(on.matches("-tormode=1").count(), 1);
 
         let off = ghostd_managed_dropin(
             exec,
             &reaper,
-            &NodeLaunchConfig { tor_mode: false },
+            &NodeLaunchConfig { tor_mode: false, ..Default::default() },
         );
         assert!(!off.contains("-tormode"));
+    }
+
+    #[test]
+    fn test_ghostd_managed_dropin_daemon_flags_coexist_and_idempotent() {
+        // A prior drop-in already carried Tor + reaper + a stale daemon flag set;
+        // re-applying with a new daemon config must strip the stale copies and
+        // emit each managed flag exactly once, alongside the reaper + tor flags.
+        let exec = "/opt/ghost/bin/ghostd -signet -datadir=/var/lib/bitcoin \
+                    -tormode=1 -ghostreaper=enabled -maxmempool=100 -dbcache=300 \
+                    -onlynet=ipv4 -port=38333";
+        let reaper = ReaperSettings::default();
+        let launch = NodeLaunchConfig {
+            tor_mode: true,
+            max_mempool_mb: Some(600),
+            mempool_expiry_hours: Some(48),
+            max_connections: Some(50),
+            max_upload_target_mb: Some("2G".to_string()),
+            dbcache_mb: Some(2048),
+            block_filter_index: Some(true),
+            peer_block_filters: Some(true),
+            onlynet: vec!["onion".to_string(), "i2p".to_string()],
+            i2p_sam: Some("127.0.0.1:7656".to_string()),
+            i2p_accept_incoming: Some(true),
+        };
+
+        let dropin = ghostd_managed_dropin(exec, &reaper, &launch);
+
+        // Base non-managed args survive.
+        assert!(dropin.contains("/opt/ghost/bin/ghostd"));
+        assert!(dropin.contains("-signet"));
+        assert!(dropin.contains("-datadir=/var/lib/bitcoin"));
+        assert!(dropin.contains("-port=38333"));
+
+        // Each managed daemon flag appears exactly once (stale values stripped).
+        assert_eq!(dropin.matches("-maxmempool=").count(), 1);
+        assert!(dropin.contains("-maxmempool=600"));
+        assert_eq!(dropin.matches("-dbcache=").count(), 1);
+        assert!(dropin.contains("-dbcache=2048"));
+        assert!(dropin.contains("-mempoolexpiry=48"));
+        assert!(dropin.contains("-maxconnections=50"));
+        assert!(dropin.contains("-maxuploadtarget=2G"));
+        assert!(dropin.contains("-blockfilterindex=1"));
+        assert!(dropin.contains("-peerblockfilters=1"));
+        assert!(dropin.contains("-i2psam=127.0.0.1:7656"));
+        assert!(dropin.contains("-i2pacceptincoming=1"));
+
+        // onlynet re-emitted per network, and the stale ipv4 is gone.
+        assert!(dropin.contains("-onlynet=onion"));
+        assert!(dropin.contains("-onlynet=i2p"));
+        assert!(!dropin.contains("-onlynet=ipv4"));
+        assert_eq!(dropin.matches("-onlynet=").count(), 2);
+
+        // Coexists with Tor + reaper, each once.
+        assert_eq!(dropin.matches("-tormode=1").count(), 1);
+        assert_eq!(dropin.matches("-ghostreaper=").count(), 1);
+
+        // Idempotence: feeding the generated ExecStart back in yields the same
+        // managed flag set.
+        let regen_exec = dropin
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("ExecStart=/"))
+            .unwrap()
+            .trim_start_matches("ExecStart=");
+        let dropin2 = ghostd_managed_dropin(regen_exec, &reaper, &launch);
+        assert_eq!(dropin2.matches("-maxmempool=").count(), 1);
+        assert_eq!(dropin2.matches("-onlynet=").count(), 2);
+        assert_eq!(dropin2.matches("-tormode=1").count(), 1);
     }
 }
