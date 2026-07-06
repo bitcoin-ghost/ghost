@@ -57,6 +57,53 @@ export async function setTor(enabled: boolean): Promise<TorToggleResult> {
   });
 }
 
+// ghostd daemon / node launch settings (pool.toml [node_launch]). Every field
+// maps to a ghostd startup flag, so a change requires a ghostd restart. A field
+// left undefined/null clears the flag (reverts to ghostd's own default).
+export interface DaemonSettings {
+  // Mempool
+  max_mempool_mb?: number | null;       // -maxmempool (MB)
+  mempool_expiry_hours?: number | null; // -mempoolexpiry (hours)
+  // Connectivity
+  max_connections?: number | null;      // -maxconnections
+  max_upload_target_mb?: string | null; // -maxuploadtarget (number + optional unit k|K|m|M|g|G|t|T; 0 = no limit)
+  // Performance
+  dbcache_mb?: number | null;           // -dbcache (MB)
+  // Indexes / BIP157
+  block_filter_index?: boolean | null;  // -blockfilterindex=1 (triggers an index build)
+  peer_block_filters?: boolean | null;  // -peerblockfilters=1 (requires block_filter_index)
+  // Privacy networking
+  onlynet?: string[];                    // -onlynet (repeated): ipv4|ipv6|onion|i2p|cjdns
+  i2p_sam?: string | null;               // -i2psam host:port
+  i2p_accept_incoming?: boolean | null;  // -i2pacceptincoming=1 (needs i2p_sam)
+}
+
+export interface DaemonConfigResponse {
+  settings: DaemonSettings;
+  ghostd_apply?: GhostdApplyStatus;
+  message: string;
+}
+
+export interface DaemonUpdateResponse {
+  success: boolean;
+  restart_pending?: boolean;
+  ghostd_apply?: GhostdApplyStatus;
+  message: string;
+}
+
+export async function getDaemonSettings(): Promise<DaemonConfigResponse> {
+  return fetchApi<DaemonConfigResponse>('/api/v1/config/daemon');
+}
+
+// Persist [node_launch] daemon settings and apply them: ghostd's launch-flag
+// drop-in is regenerated and ghostd is RESTARTED, then ghost-pool bounces.
+export async function setDaemonSettings(settings: DaemonSettings): Promise<DaemonUpdateResponse> {
+  return fetchApi<DaemonUpdateResponse>('/api/v1/config/daemon', {
+    method: 'POST',
+    body: JSON.stringify(settings),
+  });
+}
+
 export async function setArchiveMode(enabled: boolean): Promise<NodeConfig> {
   return fetchApi<NodeConfig>('/api/v1/config/archive_mode', {
     method: 'POST',

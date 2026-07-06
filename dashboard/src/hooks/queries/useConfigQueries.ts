@@ -8,6 +8,9 @@ import {
   setReaper,
   getReaper,
   type ReaperSettings,
+  getDaemonSettings,
+  setDaemonSettings,
+  type DaemonSettings,
   setMempoolProfile,
   setTemplateProfile,
   getMempoolProfiles,
@@ -110,6 +113,28 @@ export function useSetReaper() {
     mutationFn: (input: ReaperSettings | boolean) => setReaper(input),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
+    },
+  });
+}
+
+export function useDaemonSettings() {
+  return useQuery({
+    queryKey: [...configKeys.all, 'daemon'] as const,
+    queryFn: getDaemonSettings,
+    staleTime: 30_000,
+  });
+}
+
+export function useSetDaemonSettings() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (settings: DaemonSettings) => setDaemonSettings(settings),
+    onSuccess: () => {
+      // Config changed; the live daemon state flips once ghostd finishes
+      // restarting — refresh both the config views and node status.
+      queryClient.invalidateQueries({ queryKey: configKeys.all });
+      queryClient.invalidateQueries({ queryKey: nodeKeys.status() });
     },
   });
 }
@@ -359,4 +384,4 @@ export function useSetPublicMiningConfig() {
 }
 
 // Re-export types for convenience
-export type { CustomMempoolProfile, CustomTemplateProfile };
+export type { CustomMempoolProfile, CustomTemplateProfile, DaemonSettings };
