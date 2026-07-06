@@ -32,7 +32,14 @@ export async function getNodePayoutHistory(
 ): Promise<NodePayoutEntry[]> {
   const params = new URLSearchParams({ time_filter: timeFilter });
   if (payoutType) params.set('payout_type', payoutType);
-  return fetchApi<NodePayoutEntry[]>(`/api/v1/rewards/node-history?${params.toString()}`);
+  // The /api/v1/rewards/node-history endpoint wraps the entries in
+  // `{ history, total }` (same payload as getNodeBalances) — it does NOT return
+  // a bare array. Unwrap here so every caller receives the array it is typed to
+  // get. Stay tolerant of a bare-array response in case the endpoint changes.
+  const res = await fetchApi<NodePayoutEntry[] | { history?: NodePayoutEntry[] }>(
+    `/api/v1/rewards/node-history?${params.toString()}`,
+  );
+  return Array.isArray(res) ? res : res?.history ?? [];
 }
 
 // Node Balance Accounts — all nodes with their reward balances

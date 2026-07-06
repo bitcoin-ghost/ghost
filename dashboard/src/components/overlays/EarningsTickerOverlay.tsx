@@ -392,14 +392,16 @@ export function EarningsTickerOverlay({ active }: OverlayProps) {
   const pendingTarget = rewards?.pending_rewards_sats ?? 0;
   const earnedTarget = rewards?.total_earned_sats ?? 0;
 
-  const payouts = useMemo(
-    () =>
-      (payoutData ?? [])
-        .slice()
-        .sort((a, b) => payoutTime(b) - payoutTime(a))
-        .slice(0, 14),
-    [payoutData],
-  );
+  const payouts = useMemo(() => {
+    // Defensive: only ever operate on an array. The node-history endpoint has
+    // been seen to hand back a `{ history, total }` wrapper rather than a bare
+    // array; guarding here keeps a shape surprise from blanking the overlay.
+    const list = Array.isArray(payoutData) ? payoutData : [];
+    return list
+      .slice()
+      .sort((a, b) => payoutTime(b) - payoutTime(a))
+      .slice(0, 14);
+  }, [payoutData]);
 
   const pending = useCountUp(pendingTarget, active);
   const earned = useCountUp(earnedTarget, active);
