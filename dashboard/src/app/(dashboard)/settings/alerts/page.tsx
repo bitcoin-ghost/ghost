@@ -29,6 +29,9 @@ const EVENT_META: { key: keyof AlertEvents; label: string; description: string }
   { key: "restart_needed", label: "Restart needed", description: "A change or update needs a node restart to apply." },
   { key: "peer_count_drop", label: "Peer count drop", description: "Connected mesh peers were lost (possible partition)." },
   { key: "block_found", label: "Block found", description: "This node found a block." },
+  { key: "reorg_detected", label: "Chain reorg detected", description: "A Bitcoin block was disconnected from the tip (chain reorganisation)." },
+  { key: "behind_tip", label: "Node behind tip", description: "The node fell behind the network — a stale tip or a lagging local height." },
+  { key: "update_available", label: "Update available", description: "A newer node release is available than the one installed." },
 ];
 
 export default function AlertsSettingsPage() {

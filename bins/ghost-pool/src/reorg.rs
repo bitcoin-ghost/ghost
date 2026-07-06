@@ -46,6 +46,13 @@ use ghost_common::zmq::BlockEvent;
 use ghost_consensus::vote_handler::VoteHandler;
 use ghost_storage::models::PayoutStatus;
 use ghost_storage::Database;
+use ghost_verification::alerts::{AlertDispatcher, AlertEvent};
+use std::time::Duration;
+
+/// Debounce window for reorg alerts. A single reorg emits one `Disconnected`
+/// event per orphaned block, so without this a depth-N reorg would fire N
+/// alerts in a burst. One alert per window is enough to page the operator.
+const REORG_ALERT_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Safely truncate a hash string for logging (returns up to 16 chars or full string if shorter)
 fn truncate_hash(hash: &str) -> &str {
@@ -109,6 +116,10 @@ impl ReorgConfig {
 pub struct ReorgHandler {
     db: Arc<Database>,
     vote_handler: Option<Arc<VoteHandler>>,
+    /// Operator-alert dispatcher. When set, a `ReorgDetected` alert fires (once
+    /// per debounce window, and only if the operator has the event enabled) at
+    /// the existing reorg-detection point.
+    alerts: Option<Arc<AlertDispatcher>>,
     config: ReorgConfig,
     /// Counter for consecutive reorgs (deep reorg detection)
     consecutive_reorgs: AtomicU32,
@@ -133,6 +144,7 @@ impl ReorgHandler {
         Self {
             db,
             vote_handler: None,
+            alerts: None,
             consecutive_reorgs: AtomicU32::new(0),
             stats: ReorgStatsInner {
                 total_reorgs: AtomicU64::new(0),
@@ -149,6 +161,12 @@ impl ReorgHandler {
     /// Set the vote handler for cancelling pending proposals
     pub fn with_vote_handler(mut self, vh: Arc<VoteHandler>) -> Self {
         self.vote_handler = Some(vh);
+        self
+    }
+
+    /// Wire the operator-alert dispatcher so reorgs page the operator.
+    pub fn with_alert_dispatcher(mut self, alerts: Arc<AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
         self
     }
 
@@ -281,6 +299,26 @@ impl ReorgHandler {
             reorg_depth,
             "REORG DETECTED: Block disconnected from main chain"
         );
+
+        // Fire the operator alert at the detection point. Rate-limited so a
+        // multi-block reorg (one Disconnected event per orphaned block) pages
+        // once, not once per block; the dispatcher also gates on the master
+        // switch and the `reorg_detected` event flag. `old_tip` is the
+        // disconnected block hash; depth is the consecutive-disconnect count.
+        // The new tip is not carried on the ZMQ sequence event, so it is
+        // omitted from the message.
+        if let Some(alerts) = &self.alerts {
+            let detail = format!(
+                "Bitcoin chain reorg detected: block {hash_display} disconnected from the tip (depth {reorg_depth})."
+            );
+            alerts
+                .fire_rate_limited(
+                    AlertEvent::ReorgDetected,
+                    REORG_ALERT_MIN_INTERVAL,
+                    &detail,
+                )
+                .await;
+        }
 
         // 1. Mark affected rounds as orphaned
         match self.db.mark_rounds_orphaned_by_hash(block_hash) {

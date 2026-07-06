@@ -6947,6 +6947,42 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start the behind-tip monitor. Edge-triggered `BehindTip` alert when this
+    // node's local height lags the best connected peer, or the tip stalls while
+    // a peer is ahead. Uses the same height/peer plumbing the /health + swarm
+    // views read; delivery + the enable flag are handled inside the dispatcher.
+    {
+        let rm_for_tip = Arc::clone(&round_manager);
+        let mesh_for_tip = Arc::clone(&mesh);
+        let alerts_for_tip = Arc::clone(&alert_dispatcher);
+        ghost_pool::alert_monitors::spawn_behind_tip_monitor(
+            alerts_for_tip,
+            move || rm_for_tip.current_height(),
+            move || {
+                // Highest L1 height reported by a fresh, connected mesh peer
+                // (0 when none is known → the monitor stays silent).
+                mesh_for_tip
+                    .peers()
+                    .get_connected_peers(120)
+                    .iter()
+                    .map(|p| p.block_height)
+                    .max()
+                    .unwrap_or(0)
+            },
+            shutdown_tx.subscribe(),
+        );
+    }
+
+    // Start the update-available monitor. Rate-limited `UpdateAvailable` alert
+    // (at most once/day) when the updater's published latest version is newer
+    // than the installed one — same version files the dashboard auto-update
+    // view reads.
+    ghost_pool::alert_monitors::spawn_update_available_monitor(
+        Arc::clone(&alert_dispatcher),
+        env!("CARGO_PKG_VERSION").to_string(),
+        shutdown_tx.subscribe(),
+    );
+
     // Start pool time-series sampler task.
     // Snapshots the mesh-wide pool hashrate + connected-miner count (the same
     // accessors the /api/v1/mining/status handler reads) into the bounded
@@ -7903,10 +7939,13 @@ async fn main() -> Result<()> {
             }
         });
 
-        // Start reorg handler (subscribes to block disconnect events)
+        // Start reorg handler (subscribes to block disconnect events). Wire the
+        // operator-alert dispatcher so the existing reorg-detection point also
+        // fires a `ReorgDetected` alert (gated on the operator's event flag).
         let block_events = zmq_subscriber.subscribe_block_events();
         let reorg_handler = ReorgHandler::new(Arc::clone(&db), ReorgConfig::default())
-            .with_vote_handler(Arc::clone(&vote_handler));
+            .with_vote_handler(Arc::clone(&vote_handler))
+            .with_alert_dispatcher(Arc::clone(&alert_dispatcher));
         reorg_handler.start(block_events);
 
         info!("ZMQ block watcher connected to {}", zmq_endpoint);

@@ -55,6 +55,12 @@ pub enum AlertEvent {
     PeerCountDrop,
     /// This node found a block.
     BlockFound,
+    /// A Bitcoin chain reorg was detected (a block disconnected from the tip).
+    ReorgDetected,
+    /// The node is behind the network tip (stale tip / lagging local height).
+    BehindTip,
+    /// A newer node release is available than the one installed.
+    UpdateAvailable,
 }
 
 impl AlertEvent {
@@ -68,6 +74,9 @@ impl AlertEvent {
             AlertEvent::RestartNeeded => e.restart_needed,
             AlertEvent::PeerCountDrop => e.peer_count_drop,
             AlertEvent::BlockFound => e.block_found,
+            AlertEvent::ReorgDetected => e.reorg_detected,
+            AlertEvent::BehindTip => e.behind_tip,
+            AlertEvent::UpdateAvailable => e.update_available,
         }
     }
 
@@ -80,6 +89,9 @@ impl AlertEvent {
             AlertEvent::RestartNeeded => "Restart needed",
             AlertEvent::PeerCountDrop => "Peer count dropped",
             AlertEvent::BlockFound => "Block found",
+            AlertEvent::ReorgDetected => "Chain reorg detected",
+            AlertEvent::BehindTip => "Node behind tip",
+            AlertEvent::UpdateAvailable => "Update available",
         }
     }
 }
@@ -474,6 +486,9 @@ mod tests {
                 restart_needed: false,
                 peer_count_drop: false,
                 block_found: false,
+                reorg_detected: false,
+                behind_tip: false,
+                update_available: false,
             };
             pick(&mut events);
             c.events = events;

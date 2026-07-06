@@ -39,6 +39,9 @@
 //! - [`treasury`] - Treasury state and fee distribution tracking
 //! - [`validation`] - Input validation for miner credentials and shares
 
+/// Periodic operator-alert monitors (behind-tip / update-available).
+pub mod alert_monitors;
+
 /// Coinbase transaction verification against payout commitments.
 pub mod coinbase_verifier;
 
