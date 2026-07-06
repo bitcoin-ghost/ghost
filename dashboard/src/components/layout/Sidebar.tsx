@@ -24,6 +24,7 @@ import {
   Users,
   CreditCard,
   Banknote,
+  Smartphone,
   HardDrive,
   Cpu,
   Settings,
@@ -92,6 +93,7 @@ const GROUPS: NavGroup[] = [
     label: "ghost pay",
     items: [
       { href: "/ghost-pay", label: "Ghost Pay Network", icon: <Crown {...ICON} /> },
+      { href: "/connect", label: "Connect Wallet", icon: <Smartphone {...ICON} /> },
       { href: "/locks", label: "Locks", icon: <Lock {...ICON} /> },
       { href: "/wraith", label: "Wraith", icon: <Shield {...ICON} /> },
     ],
