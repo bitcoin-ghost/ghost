@@ -28,6 +28,9 @@ export * from './useLogsQuery';
 // Backup queries
 export * from './useBackupQueries';
 
+// Scheduled-backup config queries
+export * from './useBackupScheduleQueries';
+
 // Watchdog queries
 export * from './useWatchdogQueries';
 

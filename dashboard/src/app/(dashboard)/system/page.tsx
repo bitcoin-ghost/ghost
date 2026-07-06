@@ -36,6 +36,7 @@ import {
 import { getBackupDownloadUrl } from "@/lib/api/backup";
 import { useToast } from "@/components/ui/Toast";
 import { AutoUpdateSection } from "@/components/settings/AutoUpdateSection";
+import { ScheduledBackupsCard } from "@/components/settings/ScheduledBackupsCard";
 import type { UpdateStatus } from "@/lib/api/system";
 import type { PruneProfile } from "@/types/api";
 import type { VerifyBackupResponse } from "@/types/api";
@@ -992,6 +993,13 @@ export default function SystemPage() {
             </div>
           </div>
         </Card>
+      </SectionErrorBoundary>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* Scheduled Backups                                                  */}
+      {/* ----------------------------------------------------------------- */}
+      <SectionErrorBoundary section="Scheduled Backups">
+        <ScheduledBackupsCard />
       </SectionErrorBoundary>
 
       {/* ================================================================= */}
