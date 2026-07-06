@@ -9,33 +9,24 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { WorldMap, type MapPoint } from "@/components/geo/WorldMap";
-import { usePeers, useGeoDb } from "@/hooks/queries";
-import { flagEmoji, type GeoResult } from "@/lib/geo/geoip";
-import type { PeerInfo } from "@/types/api";
+import { useMeshNodes, useGeoDb } from "@/hooks/queries";
+import { extractHost, flagEmoji, type GeoResult } from "@/lib/geo/geoip";
+import type { MeshNode } from "@/lib/api/meshNodes";
 
 const TOOLTIPS = {
-  peers: "Mesh peers this node currently knows, from the network peers endpoint.",
-  plotted: "Peers whose IP resolved to a country and are drawn on the map.",
-  countries: "Distinct countries your plotted peers resolve to.",
-  online: "Peers seen within the mesh freshness window (synced).",
+  nodes: "Mesh nodes this node knows — self plus every connected peer, from the mesh-nodes endpoint.",
+  plotted: "Nodes whose IP resolved to a country and are drawn on the map.",
+  countries: "Distinct countries your plotted nodes resolve to.",
+  online: "Nodes reporting healthy in the current mesh view.",
 };
 
 interface Row {
   key: string;
-  peer: PeerInfo;
+  node: MeshNode;
   host: string;
   online: boolean;
   isSelf: boolean;
   geo: GeoResult;
-}
-
-function hostOf(address: string | undefined): string {
-  if (!address) return "";
-  const trimmed = address.trim();
-  const bracket = trimmed.match(/^\[([^\]]+)\](?::\d+)?$/);
-  if (bracket) return bracket[1];
-  if ((trimmed.match(/:/g) || []).length === 1) return trimmed.split(":")[0];
-  return trimmed;
 }
 
 function toPoint(r: Row): MapPoint | null {
@@ -46,7 +37,7 @@ function toPoint(r: Row): MapPoint | null {
     lon: r.geo.lon,
     code: r.geo.code ?? "",
     name: r.geo.name ?? "",
-    label: `${r.host || "peer"} — ${r.geo.name ?? "peer"}`,
+    label: `${r.host || "node"} — ${r.geo.name ?? "node"}`,
     online: r.online,
     isSelf: r.isSelf,
     num: r.geo.num,
@@ -54,28 +45,28 @@ function toPoint(r: Row): MapPoint | null {
 }
 
 export default function GeoPage() {
-  const { data: peersData, isLoading: peersLoading } = usePeers();
+  const { data: meshData, isLoading: nodesLoading } = useMeshNodes();
   const { data: geoDb, isLoading: geoLoading, isError: geoError } = useGeoDb();
   const [hoveredId, setHoveredId] = useState<string | null>(null);
 
   const rows: Row[] = useMemo(() => {
-    const peers = peersData?.peers ?? [];
-    return peers.map((peer, i): Row => {
-      const key = peer.node_id || peer.address || `peer-${i}`;
-      const host = hostOf(peer.address);
+    const nodes = meshData?.nodes ?? [];
+    return nodes.map((node, i): Row => {
+      const key = node.node_id || node.address || `node-${i}`;
+      const host = extractHost(node.address);
       const geo: GeoResult = geoDb
-        ? geoDb.resolve(peer.address)
+        ? geoDb.resolve(node.address)
         : { kind: "unknown", label: geoLoading ? "Resolving…" : "Unresolved", plottable: false };
       return {
         key,
-        peer,
+        node,
         host,
-        online: Boolean(peer.synced),
-        isSelf: Boolean(peer.is_self),
+        online: Boolean(node.healthy),
+        isSelf: Boolean(node.is_self),
         geo,
       };
     });
-  }, [peersData, geoDb, geoLoading]);
+  }, [meshData, geoDb, geoLoading]);
 
   const points = useMemo(
     () => rows.map(toPoint).filter((p): p is MapPoint => p !== null),
@@ -102,22 +93,22 @@ export default function GeoPage() {
       .sort((a, b) => b.count - a.count);
   }, [rows]);
 
-  const loading = peersLoading || geoLoading;
+  const loading = nodesLoading || geoLoading;
 
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="geo"
-        title="Peer map."
-        subtitle="Geographic spread of the mesh peers this node knows, resolved offline from peer IP addresses to country level."
+        title="Node map."
+        subtitle="Geographic spread of the mesh nodes this node knows, resolved offline from node IP addresses to country level."
       />
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard label="Peers" value={rows.length} tooltip={TOOLTIPS.peers} loading={peersLoading} />
+        <StatCard label="Nodes" value={rows.length} tooltip={TOOLTIPS.nodes} loading={nodesLoading} />
         <StatCard label="Plotted" value={points.length} tooltip={TOOLTIPS.plotted} loading={loading} />
         <StatCard label="Countries" value={countryCount} tooltip={TOOLTIPS.countries} loading={loading} />
-        <StatCard label="Online" value={`${onlineCount} / ${rows.length}`} tooltip={TOOLTIPS.online} loading={peersLoading} />
+        <StatCard label="Online" value={`${onlineCount} / ${rows.length}`} tooltip={TOOLTIPS.online} loading={nodesLoading} />
       </div>
 
       {/* Region chips */}
@@ -155,15 +146,15 @@ export default function GeoPage() {
         <Info size={16} strokeWidth={1.75} style={{ color: "var(--accent)", flexShrink: 0, marginTop: "1px" }} />
         <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: 1.5 }}>
           Locations are <strong style={{ color: "var(--fg)" }}>country-level</strong>, resolved entirely
-          offline. The dashboard&apos;s CSP forbids external map tiles and geolocation lookups, so each peer IP
+          offline. The dashboard&apos;s CSP forbids external map tiles and geolocation lookups, so each node IP
           is matched against a small bundled IP&#8209;to&#8209;country table (DB&#8209;IP Lite, CC&#8209;BY 4.0)
           and drawn at that country&apos;s centroid on a bundled Natural&nbsp;Earth vector map. Private,
-          loopback, carrier&#8209;NAT and reserved addresses are listed but not plotted. Per&#8209;peer ASN and
-          direction would need those fields added to the peers endpoint.
+          loopback, carrier&#8209;NAT and reserved addresses are listed but not plotted. This node is drawn in
+          the accent colour; peers are green when healthy and red when stale.
           {geoError && (
             <>
               {" "}
-              <strong style={{ color: "var(--red)" }}>The GeoIP dataset failed to load</strong>, so peers are
+              <strong style={{ color: "var(--red)" }}>The GeoIP dataset failed to load</strong>, so nodes are
               listed without country placement.
             </>
           )}
@@ -171,15 +162,15 @@ export default function GeoPage() {
       </div>
 
       {/* Map */}
-      <SectionErrorBoundary section="Peer Map">
+      <SectionErrorBoundary section="Node Map">
         <Card>
-          <CardHeader title="World map" subtitle={`${points.length} of ${rows.length} peers plotted`} />
+          <CardHeader title="World map" subtitle={`${points.length} of ${rows.length} nodes plotted`} />
           <WorldMap points={points} self={self} hoveredId={hoveredId} onHover={setHoveredId} />
           {/* Legend */}
           <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4" style={{ fontSize: "12px", color: "var(--dim)" }}>
             <span className="inline-flex items-center gap-2">
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--green)", display: "inline-block" }} />
-              Online peer
+              Online node
             </span>
             <span className="inline-flex items-center gap-2">
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--red)", display: "inline-block" }} />
@@ -193,13 +184,13 @@ export default function GeoPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* Peer list */}
-      <SectionErrorBoundary section="Peer List">
+      {/* Node list */}
+      <SectionErrorBoundary section="Node List">
         <Card>
-          <CardHeader title="Peers" subtitle={`${rows.length} known`} />
+          <CardHeader title="Nodes" subtitle={`${rows.length} known`} />
           {rows.length === 0 ? (
             <p style={{ color: "var(--dim)", fontSize: "14px", padding: "8px 0" }}>
-              {peersLoading ? "Loading peers…" : "No peers connected. Your node will discover peers automatically."}
+              {nodesLoading ? "Loading nodes…" : "No mesh nodes connected. Your node will discover peers automatically."}
             </p>
           ) : (
             <div style={{ overflowX: "auto" }}>
@@ -208,7 +199,7 @@ export default function GeoPage() {
                   <tr style={{ textAlign: "left", color: "var(--dim)" }}>
                     <th style={{ padding: "8px 10px", fontWeight: 500 }}>Address</th>
                     <th style={{ padding: "8px 10px", fontWeight: 500 }}>Country</th>
-                    <th style={{ padding: "8px 10px", fontWeight: 500 }}>Latency</th>
+                    <th style={{ padding: "8px 10px", fontWeight: 500 }}>Role</th>
                     <th style={{ padding: "8px 10px", fontWeight: 500 }}>Status</th>
                   </tr>
                 </thead>
@@ -216,7 +207,6 @@ export default function GeoPage() {
                   {rows.map((r) => {
                     const active = hoveredId === r.key;
                     const flag = r.geo.code ? flagEmoji(r.geo.code) : "";
-                    const latency = r.peer.latency_ms;
                     return (
                       <tr
                         key={r.key}
@@ -243,8 +233,12 @@ export default function GeoPage() {
                             <span style={{ marginLeft: 8, color: "var(--fainter)", fontSize: "11px" }}>not plotted</span>
                           )}
                         </td>
-                        <td style={{ padding: "8px 10px", color: "var(--dim)", fontVariantNumeric: "tabular-nums" }}>
-                          {latency != null ? `${Math.round(latency)} ms` : "—"}
+                        <td style={{ padding: "8px 10px", color: "var(--dim)" }}>
+                          {r.node.elder ? (
+                            <span style={{ color: "var(--accent)" }}>Elder</span>
+                          ) : (
+                            "Node"
+                          )}
                         </td>
                         <td style={{ padding: "8px 10px" }}>
                           <StatusDot
