@@ -61,6 +61,13 @@ pub enum AlertEvent {
     BehindTip,
     /// A newer node release is available than the one installed.
     UpdateAvailable,
+    /// The mempool is near its capacity (usage close to `maxmempool`).
+    MempoolCongestion,
+    /// The fee environment spiked (fee rate crossed a threshold or jumped
+    /// sharply versus the recent baseline).
+    FeeSpike,
+    /// A burst of consecutive failed dashboard login attempts was detected.
+    FailedLogin,
 }
 
 impl AlertEvent {
@@ -77,6 +84,9 @@ impl AlertEvent {
             AlertEvent::ReorgDetected => e.reorg_detected,
             AlertEvent::BehindTip => e.behind_tip,
             AlertEvent::UpdateAvailable => e.update_available,
+            AlertEvent::MempoolCongestion => e.mempool_congestion,
+            AlertEvent::FeeSpike => e.fee_spike,
+            AlertEvent::FailedLogin => e.failed_login,
         }
     }
 
@@ -92,6 +102,9 @@ impl AlertEvent {
             AlertEvent::ReorgDetected => "Chain reorg detected",
             AlertEvent::BehindTip => "Node behind tip",
             AlertEvent::UpdateAvailable => "Update available",
+            AlertEvent::MempoolCongestion => "Mempool congestion",
+            AlertEvent::FeeSpike => "Fee spike",
+            AlertEvent::FailedLogin => "Failed login attempts",
         }
     }
 }
@@ -489,6 +502,9 @@ mod tests {
                 reorg_detected: false,
                 behind_tip: false,
                 update_available: false,
+                mempool_congestion: false,
+                fee_spike: false,
+                failed_login: false,
             };
             pick(&mut events);
             c.events = events;
@@ -558,5 +574,56 @@ mod tests {
         let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.block_found = true));
         assert!(d.fire(AlertEvent::BlockFound, "block 1").await);
         assert!(d.fire(AlertEvent::BlockFound, "block 2").await);
+    }
+
+    #[tokio::test]
+    async fn mempool_congestion_respects_enable_flag() {
+        // Enabled → edge dispatches on the rising edge.
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.mempool_congestion = true));
+        assert!(
+            d.fire_edge(AlertEvent::MempoolCongestion, "mempool", true, "90% full")
+                .await
+        );
+        // A different event enabled, congestion disabled → no dispatch.
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.fee_spike = true));
+        assert!(
+            !d.fire_edge(AlertEvent::MempoolCongestion, "mempool", true, "90% full")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_spike_respects_enable_flag() {
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.fee_spike = true));
+        assert!(
+            d.fire_rate_limited(AlertEvent::FeeSpike, Duration::from_secs(60), "120 sat/vB")
+                .await
+        );
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.block_found = true));
+        assert!(
+            !d.fire_rate_limited(AlertEvent::FeeSpike, Duration::from_secs(60), "120 sat/vB")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_login_respects_enable_flag() {
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.failed_login = true));
+        assert!(
+            d.fire_rate_limited(AlertEvent::FailedLogin, Duration::from_secs(60), "5 attempts")
+                .await
+        );
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.node_offline = true));
+        assert!(
+            !d.fire_rate_limited(AlertEvent::FailedLogin, Duration::from_secs(60), "5 attempts")
+                .await
+        );
+    }
+
+    #[test]
+    fn new_event_titles_are_set() {
+        assert_eq!(AlertEvent::MempoolCongestion.title(), "Mempool congestion");
+        assert_eq!(AlertEvent::FeeSpike.title(), "Fee spike");
+        assert_eq!(AlertEvent::FailedLogin.title(), "Failed login attempts");
     }
 }

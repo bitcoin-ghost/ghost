@@ -1879,6 +1879,16 @@ pub struct AlertEvents {
     /// A newer node release is available than the one installed.
     #[serde(default = "default_true")]
     pub update_available: bool,
+    /// The mempool is near its capacity (usage close to `maxmempool`).
+    #[serde(default = "default_true")]
+    pub mempool_congestion: bool,
+    /// The fee environment spiked (fee rate crossed a threshold or jumped
+    /// sharply versus the recent baseline).
+    #[serde(default = "default_true")]
+    pub fee_spike: bool,
+    /// A burst of consecutive failed dashboard login attempts was detected.
+    #[serde(default = "default_true")]
+    pub failed_login: bool,
 }
 
 impl Default for AlertEvents {
@@ -1893,6 +1903,9 @@ impl Default for AlertEvents {
             reorg_detected: true,
             behind_tip: true,
             update_available: true,
+            mempool_congestion: true,
+            fee_spike: true,
+            failed_login: true,
         }
     }
 }
@@ -2007,14 +2020,16 @@ mod tests {
     fn alert_events_default_all_on() {
         let e = AlertEvents::default();
         assert!(e.reorg_detected && e.behind_tip && e.update_available);
+        assert!(e.mempool_congestion && e.fee_spike && e.failed_login);
     }
 
     #[test]
     fn alert_events_legacy_toml_still_parses_with_new_events_on() {
-        // A config written before the reorg/behind-tip/update events existed
-        // must still parse, and the three new events must default to ON via
-        // their `#[serde(default = "default_true")]` — so upgrading a node
-        // never silently disables the new alerts.
+        // A config written before the reorg/behind-tip/update and the
+        // congestion/fee-spike/failed-login events existed must still parse, and
+        // every newer event must default to ON via its
+        // `#[serde(default = "default_true")]` — so upgrading a node never
+        // silently disables the new alerts.
         let legacy = r#"
             node_offline = true
             capability_drift = false
@@ -2027,7 +2042,11 @@ mod tests {
         assert!(!parsed.capability_drift, "explicit legacy value preserved");
         assert!(
             parsed.reorg_detected && parsed.behind_tip && parsed.update_available,
-            "new events default ON for old configs"
+            "reorg/behind-tip/update events default ON for old configs"
+        );
+        assert!(
+            parsed.mempool_congestion && parsed.fee_spike && parsed.failed_login,
+            "congestion/fee-spike/failed-login events default ON for old configs"
         );
     }
 
@@ -2037,9 +2056,13 @@ mod tests {
             reorg_detected = false
             behind_tip = false
             update_available = false
+            mempool_congestion = false
+            fee_spike = false
+            failed_login = false
         "#;
         let parsed: AlertEvents = toml::from_str(toml).expect("parse");
         assert!(!parsed.reorg_detected && !parsed.behind_tip && !parsed.update_available);
+        assert!(!parsed.mempool_congestion && !parsed.fee_spike && !parsed.failed_login);
         // Untouched events keep their default-ON.
         assert!(parsed.node_offline && parsed.block_found);
     }
