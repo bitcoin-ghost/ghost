@@ -2511,6 +2511,9 @@ fn mesh_node_to_json(node: &MeshNodeInfo) -> serde_json::Value {
         "hashrate_th": node.hashrate_th,
         "miner_count": node.miner_count,
         "deduped_miner_count": node.deduped_miner_count,
+        // Peer's hardware-derived capacity ceiling (0 = not yet gossiped →
+        // the Capacity page renders it as "unknown", not a real ceiling).
+        "max_capacity": node.max_capacity,
         "healthy": node.healthy,
         "is_self": false,
     })
@@ -2568,6 +2571,10 @@ async fn api_pool_mesh_nodes_handler(
         // Deduped share attributed to this node (see `deduped_miner_counts`);
         // self + peers sum to the deduped mesh-wide active-miner total.
         "deduped_miner_count": state.self_deduped_miner_count(),
+        // This node's own hardware-derived capacity ceiling, so the Capacity
+        // page can render self's utilisation from the same field it uses for
+        // every peer.
+        "max_capacity": state.max_capacity(),
         // Self is serving this request, so it is healthy by definition.
         "healthy": true,
         "is_self": true,
@@ -9427,6 +9434,7 @@ mod tests {
             hashrate_th: 12.5,
             miner_count: 3,
             deduped_miner_count: 2,
+            max_capacity: 500,
             healthy: true,
         };
 
@@ -9437,6 +9445,7 @@ mod tests {
         assert_eq!(v["hashrate_th"], 12.5);
         assert_eq!(v["miner_count"], 3);
         assert_eq!(v["deduped_miner_count"], 2);
+        assert_eq!(v["max_capacity"], 500);
         assert_eq!(v["healthy"], true);
         // Peers are never self.
         assert_eq!(v["is_self"], false);
@@ -9465,6 +9474,7 @@ mod tests {
             hashrate_th: 0.0,
             miner_count: 0,
             deduped_miner_count: 0,
+            max_capacity: 0,
             healthy: false,
         };
 
@@ -9473,6 +9483,7 @@ mod tests {
         assert_eq!(v["hashrate_th"], 0.0);
         assert_eq!(v["miner_count"], 0);
         assert_eq!(v["deduped_miner_count"], 0);
+        assert_eq!(v["max_capacity"], 0);
         assert_eq!(v["healthy"], false);
         assert!(v["capabilities"].is_object());
     }

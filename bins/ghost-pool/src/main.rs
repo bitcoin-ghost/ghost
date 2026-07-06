@@ -5860,6 +5860,10 @@ async fn main() -> Result<()> {
                 hashrate_th: p.local_hashrate_th,
                 miner_count: p.miner_count,
                 deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
+                // Peer's gossiped hardware capacity ceiling (0 until reported),
+                // so the Capacity page can show utilisation for every mesh node
+                // — not just the public-mining peers the pool-nodes path lists.
+                max_capacity: p.max_capacity,
                 // get_connected_peers already filtered to Connected + fresh.
                 healthy: true,
             })

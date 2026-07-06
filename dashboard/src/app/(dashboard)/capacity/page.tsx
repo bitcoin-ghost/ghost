@@ -11,40 +11,68 @@ import { fetchApi } from "@/lib/api/client";
 /**
  * Capacity & load-balancer view.
  *
- * Pulls `/api/internal/pool-nodes` (the same endpoint the colocated
- * translator polls every 30 s) and renders this node's utilisation against
- * its hardware-derived `max_capacity`, plus every peer's utilisation so the
- * operator can see whether the mesh is balanced or skewed.
+ * Sourced from `/api/v1/pool/mesh-nodes` — the SAME live mesh-node list the
+ * Swarm page and the deduped mesh-wide active-miner total (Watchdog's
+ * `mesh_active_miners`) are built from — so the table covers the WHOLE fleet,
+ * not just the `public_mining` capacity reporters the load-balancer
+ * `pool-nodes` path filtered to. Each node carries a `deduped_miner_count`
+ * (every unique miner is owned by exactly one node, so these sum to the deduped
+ * mesh total) and its hardware-derived `max_capacity`. Nodes that haven't
+ * gossiped a capacity ceiling yet are shown with an "unknown" marker rather
+ * than being dropped, keeping the visible node set == the deduped-total set.
  */
 
-interface PoolNode {
+interface MeshNodeCapabilities {
+  archive: boolean;
+  ghost_pay: boolean;
+  public_mining: boolean;
+  reaper: boolean;
+  elder: boolean;
+}
+
+interface MeshNode {
+  node_id: string;
+  address: string;
+  elder: boolean;
+  capabilities: MeshNodeCapabilities;
+  hashrate_th: number;
+  // Raw connection count — a load-balancer routing view that double-counts a
+  // miner failing over between nodes. Kept for reference; NOT summed.
   miner_count: number;
-  max_capacity: number;
-  public_address?: string;
-  public_mining?: boolean;
-  last_seen?: number;
   // Deduplicated share of the mesh-wide active-miner total attributed to this
-  // node. Unlike the raw `miner_count` (kept for the load-balancer utilisation
-  // view), these DO sum to the deduped `mesh_active_miners` total because each
-  // unique miner is owned by exactly one node. Absent on pre-redeploy nodes.
-  deduped_miner_count?: number;
+  // node. Each unique miner is owned by exactly one node, so summing this
+  // across the list equals the deduped `mesh_active_miners` grand total the
+  // Watchdog reports.
+  deduped_miner_count: number;
+  // Hardware-derived capacity ceiling. 0 / absent = the node has not gossiped
+  // one yet (shown as "unknown", not a real ceiling).
+  max_capacity?: number;
+  healthy: boolean;
+  is_self: boolean;
 }
 
-interface PoolNodesResponse {
-  this_node: PoolNode;
-  peers: PoolNode[];
+interface MeshNodesResponse {
+  nodes: MeshNode[];
+  total: number;
 }
 
-async function fetchPoolNodes(): Promise<PoolNodesResponse> {
-  // Route through the proxy (fetchApi) so the HMAC-signed internal request
-  // reaches ghost-pool; a bare fetch hits the Next server and always 404s,
-  // which previously left this page rendering only an error card.
-  return fetchApi<PoolNodesResponse>("/api/internal/pool-nodes");
+async function fetchMeshNodes(): Promise<MeshNodesResponse> {
+  // Route through the proxy (fetchApi). `/api/v1/pool/mesh-nodes` is a public,
+  // no-auth endpoint that returns self + every connected peer, so the table
+  // reflects the whole mesh without a hard-coded node list.
+  return fetchApi<MeshNodesResponse>("/api/v1/pool/mesh-nodes");
 }
 
-function utilPct(n: PoolNode): number {
-  if (!n.max_capacity || n.max_capacity === 0) return 0;
-  return Math.round((n.miner_count * 100) / n.max_capacity);
+// Utilisation from the DEDUPED miner count (the honest per-node figure) over
+// the node's capacity ceiling. Unknown capacity (0) yields 0% and renders "—".
+function utilPct(n: MeshNode): number {
+  const cap = n.max_capacity ?? 0;
+  if (!cap) return 0;
+  return Math.round((n.deduped_miner_count * 100) / cap);
+}
+
+function hasCapacity(n: MeshNode): boolean {
+  return (n.max_capacity ?? 0) > 0;
 }
 
 function utilColor(pct: number): string {
@@ -92,12 +120,11 @@ function UtilisationBar({ pct, label }: { pct: number; label?: string }) {
 }
 
 export default function CapacityPage() {
-  const { data, isLoading, error } = useQuery<PoolNodesResponse>({
-    queryKey: ["pool-nodes"],
-    queryFn: fetchPoolNodes,
+  const { data, isLoading, error } = useQuery<MeshNodesResponse>({
+    queryKey: ["mesh-nodes"],
+    queryFn: fetchMeshNodes,
     refetchInterval: 30_000,
   });
-
 
   if (isLoading) {
     return (
@@ -122,7 +149,7 @@ export default function CapacityPage() {
         />
         <Card>
           <p style={{ color: "var(--dim)" }}>
-            Could not reach <code>/api/internal/pool-nodes</code>.{" "}
+            Could not reach <code>/api/v1/pool/mesh-nodes</code>.{" "}
             {error instanceof Error ? error.message : "Unknown error"}
           </p>
         </Card>
@@ -130,18 +157,29 @@ export default function CapacityPage() {
     );
   }
 
-  const me = data.this_node;
-  // Use this node's DEDUPED count for its own figures — the raw miner_count is a
-  // double-counted load-balancer metric that can exceed the mesh total (nonsense
-  // for a single node). Keeps the tile consistent with the peer table below.
-  const myMiners = me.deduped_miner_count ?? me.miner_count;
-  const myPct = me.max_capacity ? Math.round((myMiners * 100) / me.max_capacity) : 0;
+  const nodes = data.nodes ?? [];
+  const me = nodes.find((n) => n.is_self);
+  const myMiners = me?.deduped_miner_count ?? 0;
+  const myCapacity = me?.max_capacity ?? 0;
+  const myPct = myCapacity ? Math.round((myMiners * 100) / myCapacity) : 0;
 
-  // Post-redeploy nodes report a `deduped_miner_count` per node that sums to the
-  // deduped mesh total. When present, the peer table shows those (labelled just
-  // "Miners") and drops the "don't sum" caveat. Pre-redeploy nodes omit it, so
-  // we fall back to the raw routed `miner_count` and keep the caveat.
-  const dedupAvailable = me.deduped_miner_count !== undefined;
+  // Distinct active miners across the mesh = sum of every node's deduped share.
+  // Because each unique miner is owned by exactly one node, this equals the
+  // deduped `mesh_active_miners` grand total the Watchdog reports — and, being
+  // computed from the SAME rows shown below, it is guaranteed to equal the
+  // visible sum. No more header/table mismatch.
+  const distinctMiners = nodes.reduce((sum, n) => sum + (n.deduped_miner_count ?? 0), 0);
+  const capacityUnknown = nodes.filter((n) => !hasCapacity(n)).length;
+
+  // Sort the table: self first, then by ascending utilisation (nodes with a
+  // known capacity ranked by load; unknown-capacity nodes sink to the bottom).
+  const sorted = nodes.slice().sort((a, b) => {
+    if (a.is_self !== b.is_self) return a.is_self ? -1 : 1;
+    const aKnown = hasCapacity(a);
+    const bKnown = hasCapacity(b);
+    if (aKnown !== bKnown) return aKnown ? -1 : 1;
+    return utilPct(a) - utilPct(b);
+  });
 
   return (
     <div className="space-y-6">
@@ -173,12 +211,14 @@ export default function CapacityPage() {
 
           <div className="grid grid-cols-2 md:grid-cols-4 gap-6 mb-6">
             <Stat label="connected miners" value={myMiners.toLocaleString()} />
-            <Stat label="capacity ceiling" value={me.max_capacity.toLocaleString()} />
-            <Stat label="utilisation" value={`${myPct}%`} accent={utilColor(myPct)} />
+            <Stat label="capacity ceiling" value={myCapacity ? myCapacity.toLocaleString() : "—"} />
+            <Stat label="utilisation" value={myCapacity ? `${myPct}%` : "—"} accent={utilColor(myPct)} />
             <Stat
               label="state"
               value={
-                myPct >= 95
+                !myCapacity
+                  ? "unknown"
+                  : myPct >= 95
                   ? "critical"
                   : myPct >= 90
                   ? "reject new"
@@ -190,7 +230,10 @@ export default function CapacityPage() {
             />
           </div>
 
-          <UtilisationBar pct={myPct} label={`${myMiners} of ${me.max_capacity} (${myPct}%)`} />
+          <UtilisationBar
+            pct={myPct}
+            label={myCapacity ? `${myMiners} of ${myCapacity} (${myPct}%)` : `${myMiners} miners · capacity unknown`}
+          />
         </Card>
       </SectionErrorBoundary>
 
@@ -198,9 +241,22 @@ export default function CapacityPage() {
       <SectionErrorBoundary section="Peers">
         <Card>
           <div style={{ marginBottom: "16px" }}>
-            <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500 }}>
+            <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
               Peer mesh
             </h3>
+            <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+              {nodes.length} {nodes.length === 1 ? "node" : "nodes"} across the mesh ·{" "}
+              <strong style={{ color: "var(--fg)" }}>{distinctMiners}</strong> distinct active{" "}
+              {distinctMiners === 1 ? "miner" : "miners"} (deduplicated). Each miner is owned by
+              exactly one node, so the per-node counts below sum to this total.
+              {capacityUnknown > 0 && (
+                <>
+                  {" "}
+                  {capacityUnknown} {capacityUnknown === 1 ? "node has" : "nodes have"} not gossiped a
+                  capacity ceiling yet (shown as <code>—</code>).
+                </>
+              )}
+            </p>
           </div>
 
           <div style={{ overflowX: "auto" }}>
@@ -208,28 +264,16 @@ export default function CapacityPage() {
               <thead>
                 <tr style={{ borderBottom: "1px solid var(--rule)" }}>
                   <th style={thStyle}>Node</th>
-                  <th style={thStyle}>{dedupAvailable ? "Miners" : "Miners (routed)"}</th>
+                  <th style={thStyle}>Miners</th>
                   <th style={thStyle}>Capacity</th>
                   <th style={thStyle}>Utilisation</th>
                   <th style={{ ...thStyle, width: "30%" }}>&nbsp;</th>
                 </tr>
               </thead>
               <tbody>
-                {/* This node is part of the deduplicated total, so it belongs in
-                    the breakdown — otherwise the visible per-node counts under-
-                    report the mesh (they'd sum to the peers' share only). */}
-                <MeshRow node={me} isSelf dedupAvailable={dedupAvailable} />
-                {data.peers
-                  .slice()
-                  .sort((a, b) => utilPct(a) - utilPct(b))
-                  .map((p, idx) => (
-                    <MeshRow
-                      key={p.public_address ?? idx}
-                      node={p}
-                      isSelf={false}
-                      dedupAvailable={dedupAvailable}
-                    />
-                  ))}
+                {sorted.map((node, idx) => (
+                  <MeshRow key={node.node_id || node.address || idx} node={node} />
+                ))}
               </tbody>
             </table>
           </div>
@@ -246,21 +290,13 @@ export default function CapacityPage() {
   );
 }
 
-function MeshRow({
-  node,
-  isSelf,
-  dedupAvailable,
-}: {
-  node: PoolNode;
-  isSelf: boolean;
-  dedupAvailable: boolean;
-}) {
+function MeshRow({ node }: { node: MeshNode }) {
+  const known = hasCapacity(node);
   const pct = utilPct(node);
-  // this_node carries no public_address; label it explicitly.
-  const label = isSelf ? "this node" : node.public_address?.split(":")[0] ?? "?";
-  // Deduped view = unique miners owned by this node; routed view = raw
-  // connection count (may overlap across nodes).
-  const miners = dedupAvailable ? node.deduped_miner_count ?? 0 : node.miner_count;
+  const isSelf = node.is_self;
+  // this_node carries no public_address in some deploys; label it explicitly.
+  const label = isSelf ? "this node" : node.address?.split(":")[0] || "?";
+  const capacity = node.max_capacity ?? 0;
   return (
     <tr
       style={{
@@ -275,21 +311,26 @@ function MeshRow({
             you
           </Badge>
         )}
-        {node.public_mining === false && (
+        {!node.capabilities?.public_mining && (
           <Badge variant="warning" className="ml-2">
             non-public
           </Badge>
         )}
+        {!known && (
+          <Badge variant="warning" className="ml-2">
+            capacity unknown
+          </Badge>
+        )}
       </td>
-      <td style={{ ...tdStyle, fontFamily: "var(--font-mono)" }}>{miners}</td>
+      <td style={{ ...tdStyle, fontFamily: "var(--font-mono)" }}>{node.deduped_miner_count ?? 0}</td>
       <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", color: "var(--dim)" }}>
-        {node.max_capacity || "—"}
+        {known ? capacity : "—"}
       </td>
       <td style={{ ...tdStyle, fontFamily: "var(--font-mono)", color: utilColor(pct) }}>
-        {node.max_capacity ? `${pct}%` : "—"}
+        {known ? `${pct}%` : "—"}
       </td>
       <td style={tdStyle}>
-        <UtilisationBar pct={node.max_capacity ? pct : 0} />
+        <UtilisationBar pct={known ? pct : 0} />
       </td>
     </tr>
   );
