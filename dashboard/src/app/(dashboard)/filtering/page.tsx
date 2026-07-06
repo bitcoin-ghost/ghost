@@ -38,6 +38,31 @@ function modeLabel(profile?: string): string {
   }
 }
 
+// Headline "what your node does" summary for the mode card: a short value plus a
+// one-line plain-English description of what it means for the blocks you build.
+// The description is driven by the tiers actually dropped, so a Custom policy
+// reads correctly too.
+function modeSummary(
+  profile: string | undefined,
+  dropped: TierKey[],
+): { value: string; sublabel: string } {
+  switch (profile) {
+    case "full_open":
+      return { value: "Everything", sublabel: "Mining every kind of transaction" };
+    case "permissive":
+      return { value: "Standard", sublabel: "Dropping heavy data (T3)" };
+    case "bitcoin_pure":
+    case "strict":
+      return { value: "Payments only", sublabel: "All data transactions dropped" };
+    case "custom":
+      return dropped.length
+        ? { value: "Custom", sublabel: `Dropping ${dropped.join(" + ")}` }
+        : { value: "Custom", sublabel: "Mining every tier" };
+    default:
+      return { value: modeLabel(profile), sublabel: "The tier policy this node mines under" };
+  }
+}
+
 // Which BUDS tiers this node's policy drops (does not mine). Presets map to a
 // fixed set; a custom policy drops any tier whose allow flag is false.
 function droppedTiers(
@@ -91,15 +116,31 @@ export default function FilteringOverviewPage() {
   const reaperOn = config?.reaper ?? false;
   const profile = fullConfig?.policy?.profile;
   const dropped = droppedTiers(profile, fullConfig?.policy?.custom);
+  const mode = modeSummary(profile, dropped);
 
-  // % filtered — the share of the CURRENT mempool sample that sits in the tiers
-  // this node's policy drops. Single-node indicator, not a cross-node comparison.
+  // Live mempool composition from the sampled tier histogram. T0/T1 are ordinary
+  // payments; T2/T3 carry data (OP_RETURN, inscriptions, runes). These are the
+  // real, per-request counts — not a since-restart artefact.
   const byTier = mempool?.by_tier ?? { T0: 0, T1: 0, T2: 0, T3: 0 };
   const sampled = mempool?.sample_size ?? (byTier.T0 + byTier.T1 + byTier.T2 + byTier.T3);
-  const droppedCount = dropped.reduce((s, t) => s + (byTier[t] ?? 0), 0);
   const hasSample = !mempool?.message && sampled > 0;
-  const pctFiltered = hasSample ? (droppedCount / sampled) * 100 : null;
+  const paymentsCount = byTier.T0 + byTier.T1;
+  const dataCount = byTier.T2 + byTier.T3;
+  const paymentsPct = hasSample ? Math.round((paymentsCount / sampled) * 100) : null;
+  const dataPct = hasSample ? Math.round((dataCount / sampled) * 100) : null;
+
+  // What THIS node would drop: the share of the current sample sitting in the
+  // tiers its policy drops. 0% on Everything mode — that's correct, not broken.
+  const droppedCount = dropped.reduce((s, t) => s + (byTier[t] ?? 0), 0);
+  const pctFiltered = hasSample ? Math.round((droppedCount / sampled) * 100) : null;
   const droppedLabel = dropped.length ? dropped.join(" + ") : "none";
+
+  // Per-block reaper impact — the junk stripped from the block this node most
+  // recently built. Uses the per-template snapshot (last_block_*), NOT the
+  // cumulative since-restart counters, so it stays honest and current.
+  const blockBuilt = reaperStats?.last_block_unix != null;
+  const lastBlockDeadBytes = reaperStats?.last_block_dead_bytes ?? 0;
+  const lastBlockReaped = reaperStats?.last_block_reaped ?? 0;
 
   return (
     <div className="space-y-6">
@@ -110,31 +151,56 @@ export default function FilteringOverviewPage() {
         subtitleFullWidth
       />
 
-      {/* Cumulative counters */}
+      {/* Live, comparative snapshot — what your node does, what's in the
+          mempool right now, and what your policy actually removes. */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard
-          label="Total txs filtered"
-          value={reaperStats ? reaperStats.txs_reaped.toLocaleString() : "—"}
-          sublabel="cumulative, this run"
-          tooltip="Transactions the reaper has dropped from the blocks this node builds, since the last ghost-pool restart."
+          label="Mode"
+          value={fullConfig ? mode.value : "—"}
+          sublabel={fullConfig ? mode.sublabel : undefined}
+          tooltip="What your node mines, in plain English. This is the tier policy — which kinds of transaction end up in the blocks you build."
         />
         <StatCard
-          label="Dead weight cut"
-          value={reaperStats ? bytes(reaperStats.dead_bytes_total) : "—"}
-          sublabel="reclaimed for real txs"
-          tooltip="Total bytes of dead code stripped from block templates, returned to fee-paying transactions."
+          label="Mempool right now"
+          value={paymentsPct === null ? "—" : `${paymentsPct}% payments`}
+          sublabel={
+            dataPct === null
+              ? "waiting for a sample"
+              : `${dataPct}% carry data · of ${sampled} sampled`
+          }
+          tooltip="Live make-up of the current mempool from a sample of up to 100 transactions. Payments are simple sends and financial scripts (T0/T1); data-carrying are OP_RETURN, inscriptions and runes (T2/T3)."
         />
         <StatCard
-          label="% of mempool filtered"
-          value={pctFiltered === null ? "—" : `${pctFiltered.toFixed(0)}%`}
-          sublabel={dropped.length ? `${droppedLabel} dropped` : "nothing dropped"}
-          tooltip="Share of your current mempool sample that sits in the tiers your policy drops. A single-node indicator, not a standard-vs-reaper comparison."
+          label="What you'd drop"
+          value={pctFiltered === null ? "—" : `${pctFiltered}%`}
+          sublabel={
+            dropped.length
+              ? `${droppedCount} of ${sampled} in ${droppedLabel}`
+              : "You mine every tier"
+          }
+          tooltip="Share of that same live sample sitting in the tiers your policy drops. 0% means your node currently mines everything in the mempool — that's expected on Everything mode, not a fault."
         />
         <StatCard
-          label="Reaper"
-          value={reaperOn ? "On" : "Off"}
-          sublabel={reaperOn ? "stripping junk" : "not filtering"}
-          tooltip="Whether the reaper is enabled. When on, it removes dead-code transactions from your mempool and the blocks you build."
+          label="Kept out of your blocks"
+          value={
+            !reaperOn
+              ? "Reaper off"
+              : !blockBuilt
+                ? "—"
+                : lastBlockReaped === 0
+                  ? "0"
+                  : bytes(lastBlockDeadBytes)
+          }
+          sublabel={
+            !reaperOn
+              ? "Not stripping junk"
+              : !blockBuilt
+                ? "No block built yet"
+                : lastBlockReaped === 0
+                  ? "Nothing to strip last block"
+                  : `${lastBlockReaped} junk tx from your last block`
+          }
+          tooltip="Dead-code and malformed data the reaper stripped from the last block template this node built. This is per-block, not a running total — it reflects your most recent block only."
         />
       </div>
 
@@ -161,9 +227,13 @@ export default function FilteringOverviewPage() {
               label="Reaper"
               value={reaperOn ? "On" : "Off"}
               desc={
-                reaperOn
-                  ? "Stripping dead-code transactions from your mempool and blocks."
-                  : "Not removing dead-code transactions."
+                !reaperOn
+                  ? "Not removing dead-code transactions."
+                  : !blockBuilt
+                    ? "Stripping dead-code junk — no block built yet this run."
+                    : lastBlockReaped === 0
+                      ? "On. Nothing to strip from your last block."
+                      : `Stripped ${lastBlockReaped} junk tx (${bytes(lastBlockDeadBytes)}) from your last block.`
               }
             />
             <StatusRow
@@ -177,9 +247,11 @@ export default function FilteringOverviewPage() {
             />
             {pctFiltered !== null && (
               <div style={{ color: "var(--fainter)", fontSize: "12px", lineHeight: "1.5" }}>
-                {droppedCount.toLocaleString()} of {sampled.toLocaleString()} sampled mempool transactions
-                sit in the tiers this node drops. This is a live single-node indicator of your current
-                mempool sample — not a standard-vs-reaper-vs-Knots comparison.
+                {dropped.length
+                  ? `${droppedCount.toLocaleString()} of ${sampled.toLocaleString()} sampled mempool transactions sit in the tiers this node drops (${droppedLabel}).`
+                  : `All ${sampled.toLocaleString()} sampled mempool transactions fall in tiers this node mines — nothing is dropped by tier policy.`}{" "}
+                A live single-node reading of your current mempool sample — not a standard-vs-reaper-vs-Knots comparison.
+                {reaperOn && " The reaper runs independently, stripping dead-code junk regardless of tier."}
               </div>
             )}
           </div>
