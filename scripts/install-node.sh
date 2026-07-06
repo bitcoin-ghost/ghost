@@ -559,7 +559,16 @@ cd /
 # ─────────────────────────── 4. fresh secrets ────────────────────────────────
 log "Generating fresh node secrets"
 RPCPW="$(openssl rand -hex 32)"
-APISECRET="$(openssl rand -hex 32)"
+# internal_api_secret: the shared HMAC secret between ghost-pool and the node
+# dashboard. Generate ONCE and REUSE any existing value on re-runs, so an
+# upgrade/re-provision never rotates it out from under the dashboard (a rotated
+# secret 401s every internal dashboard request). Mirrors the BOND_LEDGER_TOKEN
+# share-once pattern below. Change B (after pool.toml is written) mirrors this
+# same value into the dashboard's INTERNAL_AUTH_KEY so the two can never drift.
+if [[ -f /etc/ghost/pool.toml ]] && grep -qE '^internal_api_secret[[:space:]]*=' /etc/ghost/pool.toml; then
+  APISECRET="$(sed -nE 's/^internal_api_secret[[:space:]]*=[[:space:]]*"([0-9a-fA-F]{64})".*/\1/p' /etc/ghost/pool.toml | head -1)"
+fi
+[[ -n "${APISECRET:-}" ]] || APISECRET="$(openssl rand -hex 32)"
 SIGNKEY="$(openssl rand -hex 32)"
 PUBIP="$(curl -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 # Private-mining password. The private modes (private_pool, private_solo) require
@@ -746,6 +755,25 @@ max_connections = 10
 enabled = ${REAPER}
 mode = "strict"
 EOF
+
+# Change B: mirror internal_api_secret into the dashboard's INTERNAL_AUTH_KEY so
+# the dashboard always signs internal requests with the SAME secret ghost-pool
+# validates against. Written as a root-only systemd drop-in in a file SEPARATE
+# from the dashboard's DASHBOARD_PASSWORD override, so rewriting the auth key
+# never clobbers the password (or vice-versa). The dashboard may be installed
+# out-of-band; systemd applies the drop-in as soon as ghost-dashboard.service
+# exists. Because $APISECRET is pinned to pool.toml's existing value (Change A),
+# a re-run refreshes this file to the SAME value — the two can never drift.
+install -d -m 0750 /etc/systemd/system/ghost-dashboard.service.d
+cat > /etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf <<EOF
+[Service]
+Environment=INTERNAL_AUTH_KEY=${APISECRET}
+EOF
+chmod 0600 /etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf
+systemctl daemon-reload 2>/dev/null || true
+# If the dashboard is already running, restart it to pick up the aligned key
+# (safe: the dashboard is non-consensus). No-op when the unit isn't installed.
+systemctl is-active --quiet ghost-dashboard 2>/dev/null && systemctl restart ghost-dashboard || true
 
 # Wraith mixing coordinator. Keys are the `[coordinator]` (CoordinatorConfig)
 # fields read by ghost-pool: `coordinator_role_enabled` actually RUNS the
