@@ -2,6 +2,7 @@
 
 import {
   LayoutDashboard,
+  Monitor,
   Pickaxe,
   Activity,
   RefreshCw,
@@ -64,6 +65,7 @@ const GROUPS: NavGroup[] = [
     label: "overview",
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
+      { href: "/overlays", label: "Overlays", icon: <Monitor {...ICON} /> },
       { href: "/sync", label: "Sync", icon: <RefreshCw {...ICON} /> },
       { href: "/geo", label: "Geo", icon: <MapPin {...ICON} /> },
     ],
