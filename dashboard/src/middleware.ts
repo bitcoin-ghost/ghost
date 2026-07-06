@@ -100,5 +100,9 @@ function redirectToLogin(request: NextRequest, pathname: string): NextResponse {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  // `geo/geoip.bin` is a large static binary served from /public; exclude it so
+  // the middleware never runs for it and it is delivered directly (same treatment
+  // as `_next/static`). This is the asset only — the `/geo` PAGE is still matched
+  // and stays behind the JWT session gate.
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|geo/geoip\\.bin).*)"],
 };
