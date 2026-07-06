@@ -76,32 +76,14 @@ export default function BasicFilteringPage() {
         subtitleFullWidth
       />
 
-      {/* BUDS explainer — lead with why BUDS = simple */}
-      <SectionErrorBoundary section="What is BUDS">
+      {/* The four classes, explained — lead with what BUDS is */}
+      <SectionErrorBoundary section="Transaction classes">
         <Card>
-          <CardHeader title="Why one choice is enough" />
-          <p style={{ color: "var(--dim)", fontSize: "14px", lineHeight: "1.6" }}>
+          <p style={{ color: "var(--dim)", fontSize: "14px", lineHeight: "1.6", marginBottom: "16px" }}>
             <strong style={{ color: "var(--fg)" }}>BUDS — Bitcoin Universal Data Specification.</strong>{" "}
             We use BUDS to sort every transaction into a class (T0–T3), so filtering is one simple choice
             instead of dozens of settings.
           </p>
-        </Card>
-      </SectionErrorBoundary>
-
-      {/* The simple choice: the three tier presets */}
-      <SectionErrorBoundary section="Mining policy">
-        <Card>
-          <CardHeader
-            title="Mining policy"
-            subtitle="How strictly this node filters, by transaction class. Changing it restarts the node."
-          />
-          <PolicyProfileSelector />
-        </Card>
-      </SectionErrorBoundary>
-
-      {/* The four classes, explained */}
-      <SectionErrorBoundary section="Transaction classes">
-        <Card>
           <CardHeader
             title="The four classes"
             subtitle="What each BUDS class means, in plain terms."
@@ -130,6 +112,17 @@ export default function BasicFilteringPage() {
               </div>
             ))}
           </div>
+        </Card>
+      </SectionErrorBoundary>
+
+      {/* The simple choice: the three tier presets — now below the classes */}
+      <SectionErrorBoundary section="Mining policy">
+        <Card>
+          <CardHeader
+            title="Mining policy"
+            subtitle="How strictly this node filters, by transaction class. Changing it restarts the node."
+          />
+          <PolicyProfileSelector />
         </Card>
       </SectionErrorBoundary>
 
