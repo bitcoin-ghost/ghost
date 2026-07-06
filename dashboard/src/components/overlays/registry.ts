@@ -4,7 +4,6 @@ import { NodeVitalsOverlay } from './NodeVitalsOverlay';
 import { MempoolRiverOverlay } from './MempoolRiverOverlay';
 import { BlockClockOverlay } from './BlockClockOverlay';
 import { EarningsTickerOverlay } from './EarningsTickerOverlay';
-import { ChainHealthPulseOverlay } from './ChainHealthPulseOverlay';
 
 /**
  * The ordered set of rest-screen overlays shown by /overlays.
@@ -20,5 +19,4 @@ export const OVERLAYS: OverlayDef[] = [
   { id: 'mempool-river', title: 'Mempool River', Component: MempoolRiverOverlay },
   { id: 'block-clock', title: 'Block Clock', Component: BlockClockOverlay },
   { id: 'earnings-ticker', title: 'Earnings Ticker', Component: EarningsTickerOverlay },
-  { id: 'chain-health-pulse', title: 'Chain Health Pulse', Component: ChainHealthPulseOverlay },
 ];
