@@ -13,6 +13,7 @@ import {
   Lock,
   Shield,
   Eye,
+  Ghost,
   Cloud,
   Filter,
   Layers,
@@ -104,6 +105,13 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
       { href: "/shroud", label: "Shroud", icon: <Eye {...ICON} /> },
+      { href: "/ghost-mode", label: "Ghost Mode", icon: <Ghost {...ICON} /> },
+    ],
+  },
+  {
+    label: "node storage",
+    items: [
+      { href: "/storage", label: "Storage", icon: <HardDrive {...ICON} /> },
       { href: "/haze", label: "Haze", icon: <Cloud {...ICON} /> },
     ],
   },
@@ -121,7 +129,6 @@ const GROUPS: NavGroup[] = [
       { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
       { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
       { href: "/peers", label: "Peers", icon: <NetworkIcon {...ICON} /> },
-      { href: "/storage", label: "Storage", icon: <HardDrive {...ICON} /> },
       { href: "/watchdog", label: "Watchdog", icon: <HeartPulse {...ICON} /> },
       { href: "/logs", label: "Logs", icon: <ScrollText {...ICON} /> },
       { href: "/settings", label: "Settings", icon: <Settings {...ICON} /> },
