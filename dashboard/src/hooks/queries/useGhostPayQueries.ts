@@ -7,6 +7,8 @@ import {
   getPayments,
   getSettlement,
   getSettlementStatus,
+  getL2FeeDistributionContext,
+  getL2TreeState,
   getGhostPayPayoutHistory,
   joinWraithSession,
   requestLockSettlement,
@@ -24,6 +26,8 @@ export const ghostPayKeys = {
     [...ghostPayKeys.all, 'payments', params] as const,
   settlement: () => [...ghostPayKeys.all, 'settlement'] as const,
   settlementStatus: () => [...ghostPayKeys.all, 'settlement-status'] as const,
+  feeContext: () => [...ghostPayKeys.all, 'fee-context'] as const,
+  treeState: () => [...ghostPayKeys.all, 'tree-state'] as const,
   payoutHistory: (timeFilter: PayoutHistoryTimeFilter) =>
     [...ghostPayKeys.all, 'payout-history', timeFilter] as const,
 };
@@ -122,6 +126,22 @@ export function useSettlementStatus(options?: { refetchInterval?: number }) {
     queryKey: ghostPayKeys.settlementStatus(),
     queryFn: getSettlementStatus,
     refetchInterval: options?.refetchInterval ?? 10_000,
+  });
+}
+
+export function useL2FeeDistributionContext(options?: { refetchInterval?: number }) {
+  return useQuery({
+    queryKey: ghostPayKeys.feeContext(),
+    queryFn: getL2FeeDistributionContext,
+    refetchInterval: options?.refetchInterval ?? 30_000,
+  });
+}
+
+export function useL2TreeState(options?: { refetchInterval?: number }) {
+  return useQuery({
+    queryKey: ghostPayKeys.treeState(),
+    queryFn: getL2TreeState,
+    refetchInterval: options?.refetchInterval ?? 15_000,
   });
 }
 

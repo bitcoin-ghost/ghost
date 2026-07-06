@@ -145,8 +145,14 @@ export interface FullNodeConfig {
   [key: string]: unknown;
 }
 
-// L2 Pruning config (from ghost-pay-node)
+// L2 Pruning config (from /api/v1/ghost-pay/pruning). The backend returns the
+// profile-derived enable flag + sat threshold; the *_pruned counters are only
+// populated once a prune has run.
 export interface L2PruningConfig {
+  enabled?: boolean;
+  profile?: string;
+  threshold_sats?: number;
+  last_prune?: number | null;
   retention_days?: number;
   auto_prune?: boolean;
   prune_interval_hours?: number;
@@ -155,6 +161,35 @@ export interface L2PruningConfig {
   attestations_pruned?: number;
   locks_pruned?: number;
   [key: string]: unknown;
+}
+
+// L2 fee-distribution context (from /api/v1/l2/fee-distribution-context) — the
+// treasury pool plus the set of Ghost Pay-capable nodes that share L2 fees.
+export interface L2FeeDistributionNode {
+  node_id: string;
+  address: string;
+  shares: number;
+}
+
+export interface L2FeeDistributionContext {
+  treasury_balance_sats?: number;
+  threshold_reached_at?: number | null;
+  ghost_pay_nodes?: L2FeeDistributionNode[];
+  error?: string;
+}
+
+// L2 commitment-tree state (from /api/v1/l2/tree-state).
+export interface L2TreeState {
+  epoch?: number;
+  tree_root?: string;
+  checkpoint_height?: number;
+  checkpoint_root?: string;
+  checkpoint_tx_count?: number;
+  note_count?: number;
+  recent_finalizations?: number;
+  active_finalizations?: number;
+  roots_match?: boolean;
+  error?: string;
 }
 
 export interface SharesInfo {
