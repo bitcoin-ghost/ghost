@@ -543,8 +543,9 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/backup/delete/:filename",
             delete(api_backup_delete_handler),
         )
-        // Dashboard: Logs endpoint (ring buffer)
+        // Dashboard: Logs endpoint (ring buffer + allowlisted journald units)
         .route("/api/v1/logs", get(api_logs_handler))
+        .route("/api/v1/logs/units", get(api_logs_units_handler))
         // Dashboard: Nickname management
         .route("/api/v1/node/nickname", post(api_nickname_post_handler))
         // Dashboard: Swarm node management CRUD
@@ -7866,28 +7867,99 @@ async fn api_node_restart_handler(
 struct LogsQuery {
     limit: Option<usize>,
     level: Option<String>,
+    /// Logical binary key (see `crate::journal::ALLOWLIST`). Absent → ghost-pool
+    /// ring buffer (unchanged default behaviour).
+    unit: Option<String>,
 }
 
-/// API v1 Logs handler — returns recent ghost-pool log entries from the
-/// in-process ring buffer (`crate::log_buffer`).
+/// API v1 Logs handler — returns recent log entries for the selected binary.
 ///
-/// ghost-pool's `tracing` layer mirrors every emitted event into the buffer, so
-/// each entry carries the real structured message, target and level. This
-/// replaces the previous `journalctl`-backed implementation, which (a) exposed
-/// host journal output (HIGH-4) and (b) frequently returned empty `message`
-/// fields because journald stored the ANSI-coloured formatted line as a byte
-/// array that failed the JSON string decode (issue #246). The buffer is process-
-/// local so no host log daemon or elevated privileges are required.
+/// `unit=ghost-pool` (the default) short-circuits to ghost-pool's in-process
+/// ring buffer (`crate::log_buffer`): its `tracing` layer mirrors every emitted
+/// event into the buffer so each entry carries the real structured message,
+/// target and level, with no host log daemon or elevated privileges required.
+///
+/// Any other allowlisted binary (ghostd / ghost-pay / dashboard / SV2 stack) is
+/// read from the systemd journal via `crate::journal`. The client sends only a
+/// LOGICAL key, which is resolved through a strict compile-time allowlist to a
+/// hard-coded unit string; `journalctl` is then exec'd with an explicit argv, so
+/// there is no shell and no way to interpolate a client string into the command.
+/// An unknown key is rejected with 400 before anything is executed. journald
+/// failures (missing binary, permission denied, empty) return an honest
+/// structured `error`/empty state — never fabricated log lines.
 async fn api_logs_handler(
     State(_state): State<Arc<VerificationState>>,
     Query(params): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(100).min(1000);
-    let entries = crate::log_buffer::recent(limit, params.level.as_deref());
+    let level = params.level.as_deref();
+    let key = params
+        .unit
+        .as_deref()
+        .unwrap_or(crate::journal::DEFAULT_UNIT);
 
-    Json(serde_json::json!({
-        "entries": entries
-    }))
+    // STRICT allowlist: an unknown key is rejected here, before any exec.
+    let Some(unit) = crate::journal::resolve_unit(key) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "entries": [],
+                "unit": key,
+                "error": format!("Unknown log unit '{key}'"),
+            })),
+        )
+            .into_response();
+    };
+
+    // ghost-pool → in-process ring buffer (unchanged behaviour).
+    if unit.ring_buffer {
+        let entries = crate::log_buffer::recent(limit, level);
+        return Json(serde_json::json!({
+            "entries": entries,
+            "unit": unit.key,
+            "source": "ring-buffer",
+            "error": serde_json::Value::Null,
+        }))
+        .into_response();
+    }
+
+    // All other allowlisted binaries → journald, via an argv exec.
+    match crate::journal::read_journal(unit.unit, limit, level).await {
+        Ok(entries) => Json(serde_json::json!({
+            "entries": entries,
+            "unit": unit.key,
+            "source": "journald",
+            "error": serde_json::Value::Null,
+        }))
+        .into_response(),
+        Err(e) => Json(serde_json::json!({
+            "entries": [],
+            "unit": unit.key,
+            "source": "journald",
+            "error": e.message(),
+        }))
+        .into_response(),
+    }
+}
+
+/// API v1 Logs Units handler — lists the binaries whose logs this node can
+/// serve, so the dashboard builds its selector from what is actually allowlisted
+/// AND present on this host. ghost-pool is always available (ring buffer); other
+/// units report `available` from their systemd `LoadState`.
+async fn api_logs_units_handler(
+    State(_state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let mut units = Vec::with_capacity(crate::journal::ALLOWLIST.len());
+    for u in crate::journal::ALLOWLIST {
+        units.push(serde_json::json!({
+            "key": u.key,
+            "label": u.label,
+            "description": u.description,
+            "source": if u.ring_buffer { "ring-buffer" } else { "journald" },
+            "available": crate::journal::unit_is_present(u).await,
+        }));
+    }
+    Json(serde_json::json!({ "units": units, "default": crate::journal::DEFAULT_UNIT }))
 }
 
 /// Nickname POST body
