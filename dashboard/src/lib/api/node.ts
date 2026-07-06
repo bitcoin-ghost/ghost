@@ -1,9 +1,16 @@
 // Node API endpoints
 import { fetchApi } from './client';
-import type { NodeInfo, NodeStatus, SharesInfo, HealthStatus, BlockchainStatus } from '@/types/api';
+import type { NodeInfo, NodeStatus, SharesInfo, HealthStatus, BlockchainStatus, ChainHealthResponse } from '@/types/api';
 
 export async function getNodeInfo(): Promise<NodeInfo> {
   return fetchApi<NodeInfo>('/api/v1/node/info');
+}
+
+// Chain health: current tip-lag status + recently recorded reorg events.
+// Persisted server-side (bounded ring), so the Sync page can SEE reorgs and
+// tip-lag rather than these only firing operator alerts.
+export async function getChainHealth(): Promise<ChainHealthResponse> {
+  return fetchApi<ChainHealthResponse>('/api/v1/chain/health');
 }
 
 export async function getNodeStatus(): Promise<NodeStatus> {

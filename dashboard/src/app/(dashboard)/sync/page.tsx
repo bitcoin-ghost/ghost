@@ -10,6 +10,9 @@ import {
   Clock,
   CheckCircle2,
   Loader2,
+  GitBranch,
+  ShieldCheck,
+  AlertTriangle,
 } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
@@ -18,8 +21,13 @@ import { StatCard } from "@/components/ui/StatCard";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { useBlockchainStatus } from "@/hooks/queries";
-import type { BlockchainStatus } from "@/types/api";
+import { useBlockchainStatus, useChainHealth } from "@/hooks/queries";
+import type {
+  BlockchainStatus,
+  ChainHealthResponse,
+  ChainTipStatus,
+  ChainReorgEvent,
+} from "@/types/api";
 
 // ─── formatting helpers ──────────────────────────────────────────────────────
 
@@ -113,6 +121,7 @@ function deriveView(data: BlockchainStatus | undefined): SyncView {
 
 export default function SyncPage() {
   const { data, isLoading, isError, error } = useBlockchainStatus({ refetchInterval: 10_000 });
+  const chainHealth = useChainHealth({ refetchInterval: 30_000 });
 
   // Single ticking clock so relative times stay live between polls.
   const [now, setNow] = useState<number>(() => Date.now());
@@ -288,7 +297,193 @@ export default function SyncPage() {
           )}
         </Card>
       </SectionErrorBoundary>
+
+      {/* Chain health: reorgs + tip-lag */}
+      <SectionErrorBoundary section="Chain health">
+        <ChainHealthSection
+          data={chainHealth.data}
+          isLoading={chainHealth.isLoading}
+          isError={chainHealth.isError}
+          now={now}
+        />
+      </SectionErrorBoundary>
     </div>
+  );
+}
+
+// ─── chain health ────────────────────────────────────────────────────────────
+
+// Human-readable tip status, keyed off the derived `status` label from the API.
+function tipStatusLabel(tip: ChainTipStatus): string {
+  switch (tip.status) {
+    case "at_tip":
+      return "At tip";
+    case "behind":
+      return `Behind by ${formatCount(tip.behind_by)} block${tip.behind_by === 1 ? "" : "s"}`;
+    case "stale": {
+      const mins = Math.floor(tip.tip_age_secs / 60);
+      return `Stale — no block in ${formatCount(mins)} min`;
+    }
+    default:
+      return DASH;
+  }
+}
+
+function TipStatusBadge({ tip }: { tip: ChainTipStatus | null }) {
+  if (!tip) return <Badge variant="default">Awaiting first check</Badge>;
+  if (tip.status === "at_tip") {
+    return (
+      <Badge variant="success">
+        <ShieldCheck size={13} strokeWidth={2} className="mr-1" />
+        {tipStatusLabel(tip)}
+      </Badge>
+    );
+  }
+  if (tip.status === "behind") {
+    return (
+      <Badge variant="warning">
+        <AlertTriangle size={13} strokeWidth={2} className="mr-1" />
+        {tipStatusLabel(tip)}
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="error">
+      <AlertTriangle size={13} strokeWidth={2} className="mr-1" />
+      {tipStatusLabel(tip)}
+    </Badge>
+  );
+}
+
+// One-line summary of the most recent reorg: time · depth · old→new tip.
+function reorgSummary(ev: ChainReorgEvent, now: number): string {
+  const when = formatRelative(ev.unix_time, now);
+  const oldTip = truncateHash(ev.old_tip_hash);
+  const newTip = isNum(ev.new_tip_height) ? `height ${formatCount(ev.new_tip_height)}` : "new tip";
+  return `${when} · depth ${formatCount(ev.depth)} · ${oldTip} → ${newTip}`;
+}
+
+function ChainHealthSection({
+  data,
+  isLoading,
+  isError,
+  now,
+}: {
+  data: ChainHealthResponse | undefined;
+  isLoading: boolean;
+  isError: boolean;
+  now: number;
+}) {
+  const tip = data?.tip ?? null;
+  const reorgs = data?.reorgs ?? [];
+  const count24h = data?.reorg_count_24h ?? 0;
+  const lastReorg = reorgs[0];
+  const stable = count24h === 0;
+
+  return (
+    <Card>
+      <CardHeader
+        title="Chain health"
+        subtitle="Tip-lag against the network and any recent chain reorganisations this node has seen."
+        action={<TipStatusBadge tip={tip} />}
+      />
+
+      {isError ? (
+        <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+          Chain-health data is unavailable right now.
+        </p>
+      ) : isLoading ? (
+        <div className="space-y-3">
+          <div className="h-4 w-2/3 rounded" style={{ background: "var(--rule)" }} />
+          <div className="h-4 w-1/2 rounded" style={{ background: "var(--rule)" }} />
+        </div>
+      ) : (
+        <div className="space-y-5">
+          {/* Tip detail */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <Field
+              label="Tip status"
+              value={tip ? tipStatusLabel(tip) : "Awaiting first check"}
+            />
+            <Field
+              label="Local height"
+              value={tip && isNum(tip.local_height) ? formatCount(tip.local_height) : DASH}
+              sub={
+                tip && tip.best_peer_height > 0
+                  ? `best peer ${formatCount(tip.best_peer_height)}`
+                  : "no peer height reported"
+              }
+            />
+            <Field
+              label="Tip age"
+              value={
+                tip && isNum(tip.tip_age_secs)
+                  ? `${formatCount(Math.floor(tip.tip_age_secs / 60))}m ${tip.tip_age_secs % 60}s`
+                  : DASH
+              }
+              sub="since local height last advanced"
+            />
+          </div>
+
+          {/* Reorg summary */}
+          <div
+            className="rounded-lg p-4"
+            style={{
+              background: stable ? "var(--card-2, var(--rule))" : undefined,
+              border: "1px solid var(--rule)",
+            }}
+          >
+            <div className="flex items-center gap-2" style={{ marginBottom: "6px" }}>
+              <GitBranch size={15} strokeWidth={1.75} style={{ color: "var(--dim)" }} />
+              <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500 }}>
+                Reorgs (last 24h)
+              </span>
+              <Badge variant={stable ? "success" : "warning"}>{formatCount(count24h)}</Badge>
+            </div>
+            {stable ? (
+              <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+                None in the last 24 hours — a stable, single chain is the normal, healthy state.
+              </p>
+            ) : (
+              <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+                {formatCount(count24h)} chain reorganisation{count24h === 1 ? "" : "s"} recorded in
+                the last 24 hours.
+              </p>
+            )}
+          </div>
+
+          {/* Last reorg */}
+          <Field
+            label="Last reorg"
+            value={lastReorg ? reorgSummary(lastReorg, now) : "None recently"}
+            sub={lastReorg ? formatAbsolute(lastReorg.unix_time) : undefined}
+          />
+
+          {/* Recent reorgs list */}
+          {reorgs.length > 0 && (
+            <div>
+              <div
+                style={{ color: "var(--dim)", fontSize: "12px", marginBottom: "6px" }}
+              >
+                Recent reorgs
+              </div>
+              <ul className="space-y-1.5">
+                {reorgs.map((ev, i) => (
+                  <li
+                    key={`${ev.unix_time}-${ev.old_tip_hash}-${i}`}
+                    className="flex items-center gap-2 font-mono"
+                    style={{ color: "var(--fg)", fontSize: "13px" }}
+                  >
+                    <GitBranch size={13} strokeWidth={1.75} style={{ color: "var(--fainter)" }} />
+                    <span>{reorgSummary(ev, now)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }
 
