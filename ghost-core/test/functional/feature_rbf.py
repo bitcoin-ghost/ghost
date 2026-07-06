@@ -79,6 +79,9 @@ class ReplaceByFeeTest(BitcoinTestFramework):
         self.log.info("Running test incremental relay feerates...")
         self.test_incremental_relay_feerates()
 
+        self.log.info("Running test opt-out of full replace by fee...")
+        self.test_no_fullrbf()
+
         self.log.info("Passed")
 
     def make_utxo(self, node, amount, *, confirmed=True, scriptPubKey=None):
@@ -650,6 +653,60 @@ class ReplaceByFeeTest(BitcoinTestFramework):
         # Optout_tx is not anymore in the mempool.
         assert optout_tx['txid'] not in self.nodes[0].getrawmempool()
         assert conflicting_tx['txid'] in self.nodes[0].getrawmempool()
+
+    def test_no_fullrbf(self):
+        # With -mempoolfullrbf=0 the operator opts out of full RBF: only
+        # transactions that signal BIP125 opt-in replaceability may be replaced.
+        self.restart_node(0, extra_args=[
+            "-mempoolfullrbf=0",
+            "-limitancestorcount=50",
+            "-limitancestorsize=101",
+            "-limitdescendantcount=200",
+            "-limitdescendantsize=101",
+        ])
+        assert_equal(False, self.nodes[0].getmempoolinfo()["fullrbf"])
+
+        # A transaction that does NOT signal BIP125 (opt-out) is protected from
+        # replacement even by a higher-fee conflict.
+        optout_utxo = self.make_utxo(self.nodes[0], int(2 * COIN))
+        optout_tx = self.wallet.send_self_transfer(
+            from_node=self.nodes[0],
+            utxo_to_spend=optout_utxo,
+            sequence=MAX_BIP125_RBF_SEQUENCE + 1,
+            fee_rate=Decimal('0.01'),
+        )
+        assert_equal(False, self.nodes[0].getmempoolentry(optout_tx['txid'])['bip125-replaceable'])
+
+        optout_conflict = self.wallet.create_self_transfer(
+            utxo_to_spend=optout_utxo,
+            fee_rate=Decimal('0.02'),
+        )
+        # The replacement must be rejected because full RBF is off and the
+        # conflicting mempool tx did not signal opt-in.
+        assert_raises_rpc_error(-26, "txn-mempool-conflict",
+                                self.nodes[0].sendrawtransaction, optout_conflict['hex'], 0)
+        # The original opt-out tx survives; the replacement did not enter.
+        assert optout_tx['txid'] in self.nodes[0].getrawmempool()
+        assert optout_conflict['txid'] not in self.nodes[0].getrawmempool()
+
+        # A transaction that DOES signal BIP125 opt-in remains replaceable even
+        # with full RBF disabled — this is the opt-in path that must still work.
+        optin_utxo = self.make_utxo(self.nodes[0], int(2 * COIN))
+        optin_tx = self.wallet.send_self_transfer(
+            from_node=self.nodes[0],
+            utxo_to_spend=optin_utxo,
+            sequence=MAX_BIP125_RBF_SEQUENCE,
+            fee_rate=Decimal('0.01'),
+        )
+        assert_equal(True, self.nodes[0].getmempoolentry(optin_tx['txid'])['bip125-replaceable'])
+
+        optin_conflict = self.wallet.create_self_transfer(
+            utxo_to_spend=optin_utxo,
+            fee_rate=Decimal('0.02'),
+        )
+        self.nodes[0].sendrawtransaction(optin_conflict['hex'], 0)
+        assert optin_tx['txid'] not in self.nodes[0].getrawmempool()
+        assert optin_conflict['txid'] in self.nodes[0].getrawmempool()
 
 if __name__ == '__main__':
     ReplaceByFeeTest(__file__).main()

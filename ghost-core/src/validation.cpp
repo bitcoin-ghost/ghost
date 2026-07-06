@@ -843,6 +843,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 // Transaction conflicts with a mempool tx, but we're not allowing replacements in this context.
                 return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "bip125-replacement-disallowed");
             }
+            if (!m_pool.m_opts.full_rbf && !SignalsOptInRBF(*ptxConflicting)) {
+                // Full RBF is disabled (-mempoolfullrbf=0) and the conflicting
+                // mempool transaction did not signal BIP125 opt-in
+                // replaceability, so it is protected from replacement.
+                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "txn-mempool-conflict");
+            }
             ws.m_conflicts.insert(ptxConflicting->GetHash());
         }
     }
