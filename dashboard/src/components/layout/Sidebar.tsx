@@ -8,7 +8,6 @@ import {
   ShieldCheck,
   Gauge,
   Network as NetworkIcon,
-  Coins,
   Crown,
   Lock,
   Shield,
@@ -80,12 +79,6 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
       { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
-    ],
-  },
-  {
-    label: "operate",
-    items: [
-      { href: "/rewards", label: "Rewards", icon: <Coins {...ICON} /> },
     ],
   },
   {
