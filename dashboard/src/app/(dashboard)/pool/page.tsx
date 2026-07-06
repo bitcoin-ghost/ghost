@@ -316,29 +316,6 @@ export default function NodePoolPage() {
         subtitle="Live pool stats and graphs for this node and the Ghost mesh — hashrate, miners, shares, best shares, round progress and payouts."
       />
 
-      {/* Chart source note: the hashrate/miner charts use the node's server-side
-          time-series ring when it has data, falling back to an in-browser
-          session buffer on a freshly-started node. */}
-      <div
-        className="rounded-lg p-3 text-sm"
-        style={{ background: "var(--accent-weak)", border: "1px solid var(--rule)", color: "var(--dim)" }}
-      >
-        {series.serverBacked ? (
-          <>
-            Hashrate and miner charts are drawn from the node&apos;s server-side history
-            (sampled every 30s, up to 24h) so they survive reloads. The share accept-rate chart
-            is a live in-browser buffer ({series.sampleCount} sample
-            {series.sampleCount === 1 ? "" : "s"} this session).
-          </>
-        ) : (
-          <>
-            Graphs are drawn from a live in-browser buffer of the polled pool values
-            ({series.sampleCount} sample{series.sampleCount === 1 ? "" : "s"} this session) and reset on reload.
-            The node&apos;s server-side history will back these charts once it has accumulated a few samples.
-          </>
-        )}
-      </div>
-
       {/* Headline stats */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <StatCard
@@ -400,14 +377,14 @@ export default function NodePoolPage() {
             />
           </ChartCard>
           <ChartCard
-            title="Connected Miners"
+            title="Pool Connected Miners"
             subtitle="Active miners across the mesh pool"
             serverBacked={series.serverBacked}
           >
             <TimeSeriesChart
               data={series.miners}
               color="var(--green)"
-              ariaLabel="Connected miners over time"
+              ariaLabel="Pool connected miners over time"
               formatValue={(v) => Math.round(v).toString()}
             />
           </ChartCard>
@@ -422,12 +399,12 @@ export default function NodePoolPage() {
               formatValue={(v) => formatHashrate(v, 1)}
             />
           </ChartCard>
-          <ChartCard title="Share Accept Rate" subtitle="Accepted shares as a percentage of submitted">
+          <ChartCard title="This Node Connected Miners" subtitle="Miners connected to this node only">
             <TimeSeriesChart
-              data={series.acceptRate}
+              data={series.nodeMiners}
               color="var(--green)"
-              ariaLabel="Share accept rate over the session"
-              formatValue={(v) => `${v.toFixed(1)}%`}
+              ariaLabel="This node connected miners over time"
+              formatValue={(v) => Math.round(v).toString()}
             />
           </ChartCard>
         </div>
@@ -623,6 +600,30 @@ export default function NodePoolPage() {
           />
         </Card>
       </SectionErrorBoundary>
+
+      {/* Chart source note: the mesh hashrate/miner charts use the node's
+          server-side time-series ring when it has data, falling back to an
+          in-browser session buffer on a freshly-started node. The this-node
+          connected-miners chart is always a session buffer. */}
+      <div
+        className="rounded-lg p-3 text-sm"
+        style={{ background: "var(--accent-weak)", border: "1px solid var(--rule)", color: "var(--dim)" }}
+      >
+        {series.serverBacked ? (
+          <>
+            Mesh hashrate and miner charts are drawn from the node&apos;s server-side history
+            (sampled every 30s, up to 24h) so they survive reloads. The this-node connected-miners
+            chart is a live in-browser buffer ({series.sampleCount} sample
+            {series.sampleCount === 1 ? "" : "s"} this session).
+          </>
+        ) : (
+          <>
+            Graphs are drawn from a live in-browser buffer of the polled pool values
+            ({series.sampleCount} sample{series.sampleCount === 1 ? "" : "s"} this session) and reset on reload.
+            The node&apos;s server-side history will back the mesh charts once it has accumulated a few samples.
+          </>
+        )}
+      </div>
     </div>
   );
 }
