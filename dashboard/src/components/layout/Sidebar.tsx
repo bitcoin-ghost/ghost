@@ -63,13 +63,18 @@ const GROUPS: NavGroup[] = [
     label: "overview",
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
-      { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
       { href: "/sync", label: "Sync", icon: <RefreshCw {...ICON} /> },
       { href: "/geo", label: "Geo", icon: <MapPin {...ICON} /> },
     ],
   },
   {
-    label: "filtering",
+    label: "identity",
+    items: [
+      { href: "/elders", label: "Elders & MPC", icon: <Users {...ICON} /> },
+    ],
+  },
+  {
+    label: "tx filtering",
     items: [
       { href: "/filtering", label: "Overview", icon: <Filter {...ICON} /> },
       { href: "/filtering/basic", label: "Basic", icon: <Layers {...ICON} /> },
@@ -80,6 +85,7 @@ const GROUPS: NavGroup[] = [
     label: "ghost pool",
     items: [
       { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
+      { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
       { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
       { href: "/pool", label: "Node Pool", icon: <Boxes {...ICON} /> },
     ],
@@ -102,13 +108,7 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "identity",
-    items: [
-      { href: "/elders", label: "Elders & MPC", icon: <Users {...ICON} /> },
-    ],
-  },
-  {
-    label: "treasury",
+    label: "financial",
     items: [
       { href: "/payouts", label: "Payouts", icon: <Banknote {...ICON} /> },
       { href: "/treasury", label: "Treasury", icon: <CreditCard {...ICON} /> },
