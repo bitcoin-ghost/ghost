@@ -7401,6 +7401,130 @@ async fn main() -> Result<()> {
     });
     info!("Database backup task started (daily)");
 
+    // Automatic scheduled encrypted-backup task. Secure-by-default: it idles and
+    // writes nothing until an operator enables `[backup]` in pool.toml (or via
+    // the dashboard). When enabled it reuses the SAME `Database::backup`
+    // (VACUUM INTO) routine the manual backup uses — so the artifact inherits
+    // the database's SQLCipher encryption — writing a timestamped file into the
+    // configured target dir, pruning to `retention`, and recording last-run
+    // status for the dashboard. The live schedule is re-read from the shared
+    // full_node_config each tick, so enable/interval/retention/target_dir edits
+    // take effect without a node restart.
+    {
+        let db_for_sched = Arc::clone(&db);
+        let state_for_sched = Arc::clone(&verification_state);
+        let mut sched_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            // Coarse poll cadence: the loop wakes on this fixed interval and only
+            // runs a backup once the configured period has elapsed. 60s keeps the
+            // task off any hot path while still honouring hourly custom periods.
+            const CHECK_SECS: u64 = 60;
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(CHECK_SECS));
+            // Let the node finish starting before the first check/run.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Snapshot the live schedule (may have changed via the API).
+                        let schedule = match state_for_sched.full_node_config.as_ref() {
+                            Some(cfg) => cfg.read().backup.clone(),
+                            None => continue,
+                        };
+                        if !schedule.enabled {
+                            continue;
+                        }
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let last_run = state_for_sched.backup_status.read().last_run_unix;
+                        if !ghost_common::config::backup_is_due(
+                            last_run,
+                            now_unix,
+                            schedule.interval.period_secs(),
+                        ) {
+                            continue;
+                        }
+
+                        let target_dir = std::path::PathBuf::from(&schedule.target_dir);
+                        let filename =
+                            ghost_common::config::BackupSchedule::artifact_filename(now_unix);
+                        let backup_path = target_dir.join(&filename);
+                        let retention = schedule.effective_retention();
+
+                        // Blocking DB + filesystem work off the async worker.
+                        let db_run = Arc::clone(&db_for_sched);
+                        let dir_run = target_dir.clone();
+                        let path_run = backup_path.clone();
+                        let result = tokio::task::spawn_blocking(
+                            move || -> Result<(), String> {
+                                std::fs::create_dir_all(&dir_run)
+                                    .map_err(|e| format!("create target dir: {e}"))?;
+                                db_run.backup(&path_run).map_err(|e| e.to_string())?;
+                                // Prune old artifacts down to the retention window.
+                                let mut names: Vec<String> = Vec::new();
+                                if let Ok(entries) = std::fs::read_dir(&dir_run) {
+                                    for entry in entries.flatten() {
+                                        if let Some(name) = entry.file_name().to_str() {
+                                            if name.starts_with("ghost-backup-")
+                                                && name.ends_with(".db")
+                                            {
+                                                names.push(name.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                for stale in ghost_common::config::backups_to_prune(
+                                    names, retention,
+                                ) {
+                                    let _ = std::fs::remove_file(dir_run.join(stale));
+                                }
+                                Ok(())
+                            },
+                        )
+                        .await;
+
+                        let finished_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(now_unix);
+                        let mut status = state_for_sched.backup_status.write();
+                        status.last_run_unix = Some(finished_unix);
+                        match result {
+                            Ok(Ok(())) => {
+                                status.last_success = Some(true);
+                                status.last_path =
+                                    Some(backup_path.to_string_lossy().to_string());
+                                status.last_error = None;
+                                tracing::info!(
+                                    path = ?backup_path,
+                                    "Scheduled encrypted backup complete"
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                status.last_success = Some(false);
+                                status.last_error = Some(e.clone());
+                                tracing::warn!(error = %e, "Scheduled backup failed");
+                            }
+                            Err(e) => {
+                                let msg = format!("backup task join error: {e}");
+                                status.last_success = Some(false);
+                                status.last_error = Some(msg.clone());
+                                tracing::warn!(error = %msg, "Scheduled backup task failed");
+                            }
+                        }
+                    }
+                    _ = sched_shutdown.recv() => {
+                        tracing::info!("Scheduled backup task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+        info!("Scheduled encrypted-backup task started (idle until enabled)");
+    }
+
     // Clone ws_state for event handlers before moving verification_state
     let _verification_state_for_ws = Arc::clone(&verification_state);
 

@@ -130,6 +130,11 @@ pub struct NodeConfig {
     /// default; delivery is inert until an operator enables a channel.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Automatic scheduled encrypted-backup configuration. Off by default
+    /// (secure-by-default); the scheduler idles and writes nothing until an
+    /// operator enables it.
+    #[serde(default)]
+    pub backup: BackupSchedule,
 }
 
 /// ghostd launch-time flags that the dashboard can toggle. These are baked into
@@ -1897,6 +1902,202 @@ impl Default for AlertEvents {
     }
 }
 
+// ============================================================================
+// Scheduled encrypted backups
+// ============================================================================
+
+/// How often the scheduled-backup task runs.
+///
+/// Serialises to a single compact string so it round-trips cleanly through both
+/// pool.toml (`interval = "daily"`) and the dashboard JSON API: `Daily`→`"daily"`,
+/// `Weekly`→`"weekly"`, and a custom period →`"<n>h"` (e.g. `"6h"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupInterval {
+    /// Every 24 hours.
+    Daily,
+    /// Every 7 days.
+    Weekly,
+    /// Every N hours (clamped to a 1-hour floor).
+    Hours(u32),
+}
+
+impl Default for BackupInterval {
+    fn default() -> Self {
+        BackupInterval::Daily
+    }
+}
+
+impl BackupInterval {
+    /// The period between runs, in whole hours (never zero).
+    pub fn period_hours(self) -> u32 {
+        match self {
+            BackupInterval::Daily => 24,
+            BackupInterval::Weekly => 24 * 7,
+            BackupInterval::Hours(h) => h.max(1),
+        }
+    }
+
+    /// The period between runs, in seconds (never zero).
+    pub fn period_secs(self) -> u64 {
+        self.period_hours() as u64 * 3600
+    }
+
+    /// Canonical string form used on the wire and on disk.
+    pub fn as_wire(self) -> String {
+        match self {
+            BackupInterval::Daily => "daily".to_string(),
+            BackupInterval::Weekly => "weekly".to_string(),
+            BackupInterval::Hours(h) => format!("{}h", h.max(1)),
+        }
+    }
+
+    /// Parse the canonical string form. Accepts `daily`/`weekly` (also `day`/
+    /// `week`), or an hours value written as `24` or `24h`. The 24- and 168-hour
+    /// values normalise back to `Daily`/`Weekly` so a round-trip is stable.
+    pub fn parse_wire(s: &str) -> Result<Self, String> {
+        let t = s.trim().to_lowercase();
+        match t.as_str() {
+            "daily" | "day" => Ok(BackupInterval::Daily),
+            "weekly" | "week" => Ok(BackupInterval::Weekly),
+            other => {
+                let digits = other.strip_suffix('h').unwrap_or(other);
+                match digits.parse::<u32>() {
+                    Ok(24) => Ok(BackupInterval::Daily),
+                    Ok(168) => Ok(BackupInterval::Weekly),
+                    Ok(h) => Ok(BackupInterval::Hours(h.max(1))),
+                    Err(_) => Err(format!("invalid backup interval: {s:?}")),
+                }
+            }
+        }
+    }
+}
+
+impl Serialize for BackupInterval {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for BackupInterval {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        BackupInterval::parse_wire(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+fn default_backup_retention() -> u32 {
+    7
+}
+
+fn default_backup_target_dir() -> String {
+    "/home/ghost/.ghost/backups".to_string()
+}
+
+/// Automatic scheduled encrypted-backup configuration.
+///
+/// Secure-by-default: `enabled` is `false`, so the scheduler task idles and
+/// writes nothing until an operator turns it on. When enabled, the task runs
+/// the same `Database::backup` (VACUUM INTO) routine the manual backup uses —
+/// so the artifact inherits the database's SQLCipher encryption — writing a
+/// timestamped file into `target_dir` every `interval`, then pruning to the
+/// most recent `retention` files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupSchedule {
+    /// Master switch. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often a backup runs.
+    #[serde(default)]
+    pub interval: BackupInterval,
+    /// Keep only the most recent N artifacts in `target_dir`; older ones are
+    /// pruned after each successful run. Effective value has a floor of 1.
+    #[serde(default = "default_backup_retention")]
+    pub retention: u32,
+    /// Absolute directory the timestamped encrypted artifacts are written to.
+    #[serde(default = "default_backup_target_dir")]
+    pub target_dir: String,
+}
+
+impl Default for BackupSchedule {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: BackupInterval::Daily,
+            retention: default_backup_retention(),
+            target_dir: default_backup_target_dir(),
+        }
+    }
+}
+
+impl BackupSchedule {
+    /// Retention clamped to a floor of 1 (never keep zero backups).
+    pub fn effective_retention(&self) -> u32 {
+        self.retention.max(1)
+    }
+
+    /// Timestamped artifact filename for a backup taken at `unix_secs` (UTC).
+    ///
+    /// Format `ghost-backup-YYYYMMDD-HHMMSS.db`, which is lexicographically
+    /// sortable — a plain string sort is chronological, which the prune logic
+    /// relies on. The `.db` extension matches what the backup-history endpoint
+    /// lists, so scheduled artifacts show up alongside manual ones.
+    pub fn artifact_filename(unix_secs: u64) -> String {
+        use chrono::{TimeZone, Utc};
+        let stamp = Utc
+            .timestamp_opt(unix_secs as i64, 0)
+            .single()
+            .map(|dt| dt.format("%Y%m%d-%H%M%S").to_string())
+            .unwrap_or_else(|| format!("{unix_secs:012}"));
+        format!("ghost-backup-{stamp}.db")
+    }
+}
+
+/// Whether a scheduled backup is due. Pure + testable.
+///
+/// Due when the task has never run this process (`last_run_unix` is `None`) or
+/// at least `period_secs` have elapsed since the last completed attempt.
+pub fn backup_is_due(last_run_unix: Option<u64>, now_unix: u64, period_secs: u64) -> bool {
+    match last_run_unix {
+        None => true,
+        Some(last) => now_unix.saturating_sub(last) >= period_secs,
+    }
+}
+
+/// Given the backup filenames currently in the target directory, return the
+/// ones to delete so only the most recent `retention` remain. Pure + testable.
+///
+/// Filenames are compared lexicographically, which is chronological for the
+/// `ghost-backup-YYYYMMDD-HHMMSS.db` naming produced by [`BackupSchedule::artifact_filename`].
+pub fn backups_to_prune(mut filenames: Vec<String>, retention: u32) -> Vec<String> {
+    let keep = retention.max(1) as usize;
+    // Newest first, then drop everything past the keep window.
+    filenames.sort();
+    filenames.reverse();
+    filenames.into_iter().skip(keep).collect()
+}
+
+/// Runtime status of the scheduled-backup task, surfaced to the dashboard.
+///
+/// Held in memory only (not persisted); it resets on node restart, which is
+/// why `last_run_unix` starting at `None` triggers a first run shortly after
+/// startup when the schedule is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackupRunStatus {
+    /// Unix seconds of the last completed attempt (success or failure).
+    /// `None` = the task has not run since startup.
+    #[serde(default)]
+    pub last_run_unix: Option<u64>,
+    /// Whether the most recent attempt succeeded.
+    #[serde(default)]
+    pub last_success: Option<bool>,
+    /// Absolute path of the most recently written artifact (on success).
+    #[serde(default)]
+    pub last_path: Option<String>,
+    /// Error detail from the most recent failed attempt.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 /// Pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
@@ -1995,6 +2196,135 @@ impl Default for PoolConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Scheduled backups
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn backup_schedule_defaults_secure_by_default() {
+        let s = BackupSchedule::default();
+        assert!(!s.enabled, "scheduled backups must be OFF by default");
+        assert_eq!(s.interval, BackupInterval::Daily);
+        assert_eq!(s.retention, 7);
+        assert_eq!(s.target_dir, "/home/ghost/.ghost/backups");
+    }
+
+    #[test]
+    fn backup_schedule_serde_back_compat_missing_section() {
+        // A pool.toml written before this feature has no [backup] table at all;
+        // #[serde(default)] on the field must fill in the safe default.
+        #[derive(serde::Deserialize)]
+        struct Slice {
+            #[serde(default)]
+            backup: BackupSchedule,
+        }
+        let slice: Slice = toml::from_str("").expect("empty toml deserialises");
+        assert!(!slice.backup.enabled);
+        assert_eq!(slice.backup.interval, BackupInterval::Daily);
+        assert_eq!(slice.backup.retention, 7);
+    }
+
+    #[test]
+    fn backup_schedule_partial_fields_fill_defaults() {
+        // Only `enabled` provided; the rest fall back to defaults.
+        let s: BackupSchedule = toml::from_str("enabled = true\n").unwrap();
+        assert!(s.enabled);
+        assert_eq!(s.interval, BackupInterval::Daily);
+        assert_eq!(s.retention, 7);
+    }
+
+    #[test]
+    fn backup_interval_round_trips_toml_and_json() {
+        for iv in [
+            BackupInterval::Daily,
+            BackupInterval::Weekly,
+            BackupInterval::Hours(6),
+        ] {
+            let s = BackupSchedule {
+                enabled: true,
+                interval: iv,
+                retention: 3,
+                target_dir: "/var/lib/ghost/backups".to_string(),
+            };
+            let toml_s = toml::to_string(&s).unwrap();
+            let back: BackupSchedule = toml::from_str(&toml_s).unwrap();
+            assert_eq!(back.interval, iv, "toml round-trip: {toml_s}");
+            let json = serde_json::to_string(&s).unwrap();
+            let back_j: BackupSchedule = serde_json::from_str(&json).unwrap();
+            assert_eq!(back_j.interval, iv, "json round-trip: {json}");
+        }
+    }
+
+    #[test]
+    fn backup_interval_wire_forms() {
+        assert_eq!(BackupInterval::Daily.as_wire(), "daily");
+        assert_eq!(BackupInterval::Weekly.as_wire(), "weekly");
+        assert_eq!(BackupInterval::Hours(6).as_wire(), "6h");
+        // Aliases + hour equivalents normalise back.
+        assert_eq!(BackupInterval::parse_wire("daily").unwrap(), BackupInterval::Daily);
+        assert_eq!(BackupInterval::parse_wire("WEEK").unwrap(), BackupInterval::Weekly);
+        assert_eq!(BackupInterval::parse_wire("24h").unwrap(), BackupInterval::Daily);
+        assert_eq!(BackupInterval::parse_wire("168").unwrap(), BackupInterval::Weekly);
+        assert_eq!(BackupInterval::parse_wire("12h").unwrap(), BackupInterval::Hours(12));
+        assert!(BackupInterval::parse_wire("nonsense").is_err());
+    }
+
+    #[test]
+    fn backup_interval_period_secs() {
+        assert_eq!(BackupInterval::Daily.period_secs(), 86_400);
+        assert_eq!(BackupInterval::Weekly.period_secs(), 604_800);
+        assert_eq!(BackupInterval::Hours(6).period_secs(), 21_600);
+        // Zero hours is clamped to a one-hour floor (never a zero period).
+        assert_eq!(BackupInterval::Hours(0).period_secs(), 3_600);
+    }
+
+    #[test]
+    fn backup_is_due_next_run_computation() {
+        let period = BackupInterval::Daily.period_secs(); // 86_400
+        // Never run this process → due immediately.
+        assert!(backup_is_due(None, 1_000_000, period));
+        // Exactly a full period elapsed → due.
+        assert!(backup_is_due(Some(1_000_000), 1_000_000 + period, period));
+        // Just short of a period → not due.
+        assert!(!backup_is_due(Some(1_000_000), 1_000_000 + period - 1, period));
+        // Clock skew backwards → not due (saturating subtraction).
+        assert!(!backup_is_due(Some(2_000_000), 1_000_000, period));
+    }
+
+    #[test]
+    fn backups_to_prune_keeps_last_n() {
+        let files = vec![
+            "ghost-backup-20260101-000000.db".to_string(),
+            "ghost-backup-20260102-000000.db".to_string(),
+            "ghost-backup-20260103-000000.db".to_string(),
+            "ghost-backup-20260104-000000.db".to_string(),
+            "ghost-backup-20260105-000000.db".to_string(),
+        ];
+        let prune = backups_to_prune(files.clone(), 3);
+        // The two oldest are pruned; the three newest are kept.
+        assert_eq!(
+            prune,
+            vec![
+                "ghost-backup-20260102-000000.db".to_string(),
+                "ghost-backup-20260101-000000.db".to_string(),
+            ]
+        );
+        // Retention >= count keeps everything.
+        assert!(backups_to_prune(files.clone(), 5).is_empty());
+        assert!(backups_to_prune(files.clone(), 99).is_empty());
+        // Retention floored at 1 (never prune the whole set to zero).
+        assert_eq!(backups_to_prune(files, 0).len(), 4);
+    }
+
+    #[test]
+    fn backup_artifact_filename_is_sortable_and_dotted() {
+        let a = BackupSchedule::artifact_filename(1_700_000_000);
+        let b = BackupSchedule::artifact_filename(1_700_086_400);
+        assert!(a.starts_with("ghost-backup-"));
+        assert!(a.ends_with(".db"));
+        assert!(a < b, "later timestamp must sort after earlier: {a} vs {b}");
+    }
 
     #[test]
     fn test_default_config() {
