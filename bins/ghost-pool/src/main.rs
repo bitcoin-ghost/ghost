@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::prelude::*;
 
 use ghost_common::config::{MiningMode, NodeConfig, ReaperSettings};
 use ghost_common::identity::NodeIdentity;
@@ -2131,13 +2131,21 @@ async fn main() -> Result<()> {
     // Setup logging
     let level = parse_log_level(&args.log_level);
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
+    // Console layer (stdout → journald under systemd). ANSI is gated on an
+    // interactive terminal so journald stores clean UTF-8, not colour escapes.
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)
-        .with_line_number(false)
-        .finish();
+        .with_line_number(false);
+
+    // Ring-buffer layer feeds the dashboard `/logs` endpoint with ghost-pool's
+    // own structured log tail (real message + target + level per event).
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::from_level(level))
+        .with(fmt_layer)
+        .with(ghost_pool::log_ring::LogRingLayer);
 
     // HIGH-8: Use fallible initialization - if subscriber is already set, that's fine
     if tracing::subscriber::set_global_default(subscriber).is_err() {
@@ -2351,7 +2359,14 @@ async fn main() -> Result<()> {
         ghost_common::config::PolicyProfile::BitcoinPure => PolicyProfile::bitcoin_pure(),
         ghost_common::config::PolicyProfile::Permissive => PolicyProfile::permissive(),
         ghost_common::config::PolicyProfile::FullOpen => PolicyProfile::full_open(),
-        ghost_common::config::PolicyProfile::Custom => PolicyProfile::permissive(),
+        // Custom: build the enforced profile from the operator's `[policy].custom`
+        // fields so the finer knobs (tiers, content toggles, size limits, min fee)
+        // actually bite at block-build time. Falls back to the default custom
+        // block when none is persisted.
+        ghost_common::config::PolicyProfile::Custom => {
+            let custom = config.policy.custom.clone().unwrap_or_default();
+            policy_profile_from_custom(&custom)
+        }
     };
     info!(
         "Policy profile: {} (allows up to T{})",
@@ -2541,6 +2556,22 @@ async fn main() -> Result<()> {
     info!(tag = %coinbase_tag, "Coinbase tag: {}", coinbase_tag);
 
     // Initialize template processor with treasury and pool payout addresses from config
+    // Per-field policy enforcement (max outputs / size / OP_RETURN / witness /
+    // content) is the "Advanced" Custom profile only. The three "Basic" presets
+    // stay tier-gate-only, so their baked-in field limits are NOT enforced at
+    // block-build time — preserving the historical preset behaviour.
+    let enforce_custom_policy_fields =
+        matches!(config.policy.profile, ghost_common::config::PolicyProfile::Custom);
+
+    // The template's minimum fee-rate floor. Presets keep the historical
+    // TemplateConfig default (unchanged behaviour); the Custom profile lets the
+    // operator set their own floor via `[policy].custom.min_fee_rate`.
+    let template_min_fee_rate = if enforce_custom_policy_fields {
+        policy.min_fee_rate
+    } else {
+        TemplateConfig::default().min_fee_rate
+    };
+
     // Pool payout address defaults to treasury address if not explicitly configured separately
     let template_config = TemplateConfig {
         treasury_address: config.pool.treasury_address.clone(),
@@ -2549,6 +2580,8 @@ async fn main() -> Result<()> {
         mining_mode,
         solo_payout_address: config.network.solo_payout_address.clone(),
         coinbase_extra: coinbase_tag,
+        min_fee_rate: template_min_fee_rate,
+        enforce_custom_policy_fields,
         ..Default::default()
     };
     let template_processor = Arc::new(
@@ -5827,6 +5860,10 @@ async fn main() -> Result<()> {
                 hashrate_th: p.local_hashrate_th,
                 miner_count: p.miner_count,
                 deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
+                // Peer's gossiped hardware capacity ceiling (0 until reported),
+                // so the Capacity page can show utilisation for every mesh node
+                // — not just the public-mining peers the pool-nodes path lists.
+                max_capacity: p.max_capacity,
                 // get_connected_peers already filtered to Connected + fresh.
                 healthy: true,
             })
@@ -8078,6 +8115,42 @@ fn expand_path(path: &std::path::Path) -> Result<PathBuf> {
 /// (`reject_opreturn`, `reject_runestone`) have no pool-side equivalent and are
 /// intentionally not mapped here — the Rust reaper bounds OP_RETURN via the
 /// `max_op_return_bytes` threshold and has no Runestone detector.
+/// Build the enforced `ghost_policy::PolicyProfile` from an operator's
+/// `[policy].custom` config block. This is the source of truth the template
+/// builder enforces per-field (tiers, content toggles, size limits) when the
+/// operator selects the `Custom` profile.
+fn policy_profile_from_custom(
+    custom: &ghost_common::config::CustomPolicyConfig,
+) -> PolicyProfile {
+    // Map the config-crate BudsTier enum onto the ghost_buds tier the policy
+    // engine/classifier use.
+    let allowed_tiers = custom
+        .allowed_tiers
+        .iter()
+        .map(|t| match t {
+            ghost_common::config::BudsTier::T0 => ghost_buds::BudsTier::T0,
+            ghost_common::config::BudsTier::T1 => ghost_buds::BudsTier::T1,
+            ghost_common::config::BudsTier::T2 => ghost_buds::BudsTier::T2,
+            ghost_common::config::BudsTier::T3 => ghost_buds::BudsTier::T3,
+        })
+        .collect();
+
+    PolicyProfile {
+        name: "custom".to_string(),
+        description: "Operator-defined custom policy".to_string(),
+        allowed_tiers,
+        max_op_return_size: custom.max_op_return_size,
+        max_witness_per_input: custom.max_witness_per_input,
+        max_tx_outputs: custom.max_tx_outputs,
+        max_tx_size: custom.max_tx_size,
+        allow_inscriptions: custom.allow_inscriptions,
+        allow_runes: custom.allow_runes,
+        allow_brc20: custom.allow_brc20,
+        min_fee_rate: custom.min_fee_rate,
+        t0_priority_boost: 1.0,
+    }
+}
+
 fn reaper_config_from_settings(s: &ReaperSettings) -> ReaperConfig {
     if !s.enabled {
         return ReaperConfig::disabled();

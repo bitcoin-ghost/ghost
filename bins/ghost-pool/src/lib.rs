@@ -42,6 +42,10 @@
 /// Coinbase transaction verification against payout commitments.
 pub mod coinbase_verifier;
 
+/// `tracing` layer that feeds ghost-pool's log tail into the dashboard `/logs`
+/// ring buffer.
+pub mod log_ring;
+
 /// Payout proposal creation and consensus coordination.
 pub mod payout;
 

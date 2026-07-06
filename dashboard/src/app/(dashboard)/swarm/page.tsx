@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Dialog } from "@/components/ui/Dialog";
 import { SkeletonTable } from "@/components/ui/Skeleton";
+import { Tooltip } from "@/components/ui/Tooltip";
 import { truncateId } from "@/components/ui/DataTable";
 import {
   useSwarm,
@@ -41,6 +42,51 @@ function formatHashrate(th: number): string {
   }
   return `${th.toFixed(0)} TH/s`;
 }
+
+// Small inline help affordance placed next to a label; the surrounding element
+// is wrapped in a <Tooltip> that carries the explanatory copy.
+function InfoIcon() {
+  return (
+    <svg className="w-3 h-3 text-gray-600 inline-block ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 16v-4M12 8h.01" />
+    </svg>
+  );
+}
+
+// One short, plain-language line per element. "—" copy ties to the em-dash
+// placeholder above (issue #219): a value a mesh peer simply does not gossip.
+const TOOLTIPS = {
+  // Summary tiles
+  nodes: "Total nodes tracked in this swarm.",
+  online: "Nodes currently reporting healthy.",
+  combinedHashrate: "Combined hashrate summed across the mesh.",
+  combinedShares: "Qualified capability shares summed across the swarm (max = 15 × node count).",
+  // This Node card
+  nodeId: "This node's mesh identity — paste it into another node to add this one.",
+  connectionAddress: "The endpoint other nodes add to reach this node.",
+  // Per-node fields
+  uptime: "Trailing-7-day uptime %. Capabilities only count at ≥95%. — means this peer did not gossip it.",
+  peers: "Mesh peers this node is connected to. — means not gossiped.",
+  l1Height: "Bitcoin (L1) chain height. — means not gossiped.",
+  l2Height: "Ghost-Pay (L2) chain height. — means not gossiped.",
+  shares: "Qualified capability shares, out of a maximum of 15.",
+  capabilities: "Capabilities in the 5-4-3-2-1 model. Green = qualified; red = claimed but not yet verified.",
+  // Status badges
+  statusOnline: "Whether this node is reachable and reporting healthy.",
+  mesh: "Auto-discovered gossip peer — can't be polled or removed from here.",
+  stale: "The last manual refresh of this node failed.",
+  you: "This is the node you're viewing the dashboard on.",
+  // Actions
+  viewToggle: "Switch between list and grid layouts.",
+  refreshAll: "Re-poll manual nodes and sync the mesh.",
+  updateAll: "Push a version update across the whole swarm.",
+  addNode: "Track a remote node by its address.",
+  edit: "Rename this node (and edit its address if remote).",
+  restart: "Restart this node's services.",
+  refresh: "Re-poll this node now.",
+  remove: "Stop tracking this remote node.",
+};
 
 // Em-dash placeholder for values a mesh peer does not gossip (uptime %, mesh
 // peer count, L1/L2 heights, balance). These are genuinely unknown from here,
@@ -319,46 +365,54 @@ export default function SwarmPage() {
         subtitle="Multi-node fleet management"
         actions={
           <>
-            <div className="flex rounded-lg border border-gray-700 overflow-hidden">
-              <button
-                onClick={() => setViewMode("list")}
-                className={`px-3 py-1.5 text-sm ${
-                  viewMode === "list"
-                    ? "bg-gray-700 text-white"
-                    : "bg-gray-800 text-gray-400 hover:text-white"
-                }`}
+            <Tooltip content={TOOLTIPS.viewToggle}>
+              <div className="flex rounded-lg border border-gray-700 overflow-hidden">
+                <button
+                  onClick={() => setViewMode("list")}
+                  className={`px-3 py-1.5 text-sm ${
+                    viewMode === "list"
+                      ? "bg-gray-700 text-white"
+                      : "bg-gray-800 text-gray-400 hover:text-white"
+                  }`}
+                >
+                  List
+                </button>
+                <button
+                  onClick={() => setViewMode("grid")}
+                  className={`px-3 py-1.5 text-sm ${
+                    viewMode === "grid"
+                      ? "bg-gray-700 text-white"
+                      : "bg-gray-800 text-gray-400 hover:text-white"
+                  }`}
+                >
+                  Grid
+                </button>
+              </div>
+            </Tooltip>
+            <Tooltip content={TOOLTIPS.refreshAll}>
+              <Button
+                variant="secondary"
+                onClick={() => handleRefreshAll()}
+                loading={isRefreshing}
+                disabled={nodes.filter(n => n.address !== "localhost").length === 0}
               >
-                List
-              </button>
-              <button
-                onClick={() => setViewMode("grid")}
-                className={`px-3 py-1.5 text-sm ${
-                  viewMode === "grid"
-                    ? "bg-gray-700 text-white"
-                    : "bg-gray-800 text-gray-400 hover:text-white"
-                }`}
+                Refresh All
+              </Button>
+            </Tooltip>
+            <Tooltip content={TOOLTIPS.updateAll}>
+              <Button
+                variant="warning"
+                onClick={() => setUpdateDialogOpen(true)}
+                disabled={nodes.length === 0}
               >
-                Grid
-              </button>
-            </div>
-            <Button
-              variant="secondary"
-              onClick={() => handleRefreshAll()}
-              loading={isRefreshing}
-              disabled={nodes.filter(n => n.address !== "localhost").length === 0}
-            >
-              Refresh All
-            </Button>
-            <Button
-              variant="warning"
-              onClick={() => setUpdateDialogOpen(true)}
-              disabled={nodes.length === 0}
-            >
-              Update All
-            </Button>
-            <Button variant="primary" onClick={() => setAddDialogOpen(true)}>
-              + Add Node
-            </Button>
+                Update All
+              </Button>
+            </Tooltip>
+            <Tooltip content={TOOLTIPS.addNode}>
+              <Button variant="primary" onClick={() => setAddDialogOpen(true)}>
+                + Add Node
+              </Button>
+            </Tooltip>
           </>
         }
       />
@@ -369,21 +423,25 @@ export default function SwarmPage() {
           <StatCard
             label="Nodes"
             value={stats?.total_nodes ?? 0}
+            tooltip={TOOLTIPS.nodes}
             loading={swarmLoading}
           />
           <StatCard
             label="Online"
             value={stats?.online_nodes ?? 0}
+            tooltip={TOOLTIPS.online}
             loading={swarmLoading}
           />
           <StatCard
             label="Combined Hashrate"
             value={formatHashrate(stats?.combined_hashrate_th ?? 0)}
+            tooltip={TOOLTIPS.combinedHashrate}
             loading={swarmLoading}
           />
           <StatCard
             label="Combined Shares"
             value={`${stats?.combined_shares ?? 0} / ${stats?.max_combined_shares ?? 0}`}
+            tooltip={TOOLTIPS.combinedShares}
             loading={swarmLoading}
           />
         </div>
@@ -399,13 +457,17 @@ export default function SwarmPage() {
             />
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-3 bg-gray-800/50 rounded-lg">
-                <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Node ID</div>
+                <Tooltip content={TOOLTIPS.nodeId}>
+                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block">Node ID <InfoIcon /></div>
+                </Tooltip>
                 <div className="font-mono text-sm text-gray-100 break-all select-all">
                   {nodeInfo.node_id}
                 </div>
               </div>
               <div className="p-3 bg-gray-800/50 rounded-lg">
-                <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">Connection Address</div>
+                <Tooltip content={TOOLTIPS.connectionAddress}>
+                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block">Connection Address <InfoIcon /></div>
+                </Tooltip>
                 <div className="font-mono text-sm text-gray-100 mb-2 select-all">
                   {swarmData?.self?.address
                     ? `http://${swarmData.self.address}`
@@ -447,20 +509,33 @@ export default function SwarmPage() {
                       className={`w-2.5 h-2.5 rounded-full ${node.online ? "bg-green-500" : "bg-red-500"}`}
                     />
                     <span className="font-semibold text-gray-100">{node.name}</span>
+                    {node.is_self && (
+                      <Tooltip content={TOOLTIPS.you}>
+                        <Badge variant="info" className="text-xs">
+                          You
+                        </Badge>
+                      </Tooltip>
+                    )}
                   </div>
                   <div className="flex items-center gap-1">
-                    <Badge variant={node.online ? "success" : "error"} className="text-xs">
-                      {node.online ? "Online" : "Offline"}
-                    </Badge>
-                    {isMeshNode(node) && (
-                      <Badge variant="info" className="text-xs">
-                        Mesh
+                    <Tooltip content={TOOLTIPS.statusOnline}>
+                      <Badge variant={node.online ? "success" : "error"} className="text-xs">
+                        {node.online ? "Online" : "Offline"}
                       </Badge>
+                    </Tooltip>
+                    {isMeshNode(node) && (
+                      <Tooltip content={TOOLTIPS.mesh}>
+                        <Badge variant="info" className="text-xs">
+                          Mesh
+                        </Badge>
+                      </Tooltip>
                     )}
                     {staleNodeIds.has(node.node_id) && (
-                      <Badge variant="warning" className="text-xs">
-                        Stale
-                      </Badge>
+                      <Tooltip content={TOOLTIPS.stale}>
+                        <Badge variant="warning" className="text-xs">
+                          Stale
+                        </Badge>
+                      </Tooltip>
                     )}
                     {node.watchdog_health && (
                       <Badge
@@ -476,45 +551,61 @@ export default function SwarmPage() {
                 <div className="text-xs text-gray-400 mb-3 font-mono truncate">{node.address}</div>
 
                 <div className="grid grid-cols-2 gap-2 text-xs mb-3">
-                  <div>
-                    <span className="text-gray-500">L1:</span>{" "}
-                    <span className="text-gray-300">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
-                  </div>
-                  <div>
-                    <span className="text-gray-500">L2:</span>{" "}
-                    <span className="text-gray-300">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
-                  </div>
-                  <div>
-                    <span className="text-gray-500">Peers:</span>{" "}
-                    <span className="text-gray-300">{orDash(node.peer_count, (v) => String(v))}</span>
-                  </div>
-                  <div>
-                    <span className="text-gray-500">Shares:</span>{" "}
-                    <span className="text-gray-300">{node.shares ?? 0}/{node.max_shares ?? 15}</span>
-                  </div>
+                  <Tooltip content={TOOLTIPS.l1Height}>
+                    <div>
+                      <span className="text-gray-500">L1: <InfoIcon /></span>{" "}
+                      <span className="text-gray-300">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
+                    </div>
+                  </Tooltip>
+                  <Tooltip content={TOOLTIPS.l2Height}>
+                    <div>
+                      <span className="text-gray-500">L2: <InfoIcon /></span>{" "}
+                      <span className="text-gray-300">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
+                    </div>
+                  </Tooltip>
+                  <Tooltip content={TOOLTIPS.peers}>
+                    <div>
+                      <span className="text-gray-500">Peers: <InfoIcon /></span>{" "}
+                      <span className="text-gray-300">{orDash(node.peer_count, (v) => String(v))}</span>
+                    </div>
+                  </Tooltip>
+                  <Tooltip content={TOOLTIPS.shares}>
+                    <div>
+                      <span className="text-gray-500">Shares: <InfoIcon /></span>{" "}
+                      <span className="text-gray-300">{node.shares ?? 0}/{node.max_shares ?? 15}</span>
+                    </div>
+                  </Tooltip>
                 </div>
 
-                <div className="flex flex-wrap gap-1 mb-3">
-                  <Badge variant={node.archive_mode ? "success" : "error"} className="text-xs px-1.5 py-0">+5</Badge>
-                  <Badge variant={node.ghost_pay ? "success" : "error"} className="text-xs px-1.5 py-0">+4</Badge>
-                  <Badge variant={node.public_mining ? "success" : "error"} className="text-xs px-1.5 py-0">+3</Badge>
-                  <Badge variant={node.reaper ? "success" : "error"} className="text-xs px-1.5 py-0">+2</Badge>
-                  <Badge variant={node.elder ? "success" : "error"} className="text-xs px-1.5 py-0">+1</Badge>
-                </div>
+                <Tooltip content={TOOLTIPS.capabilities}>
+                  <div className="flex flex-wrap gap-1 mb-3">
+                    <Badge variant={node.archive_mode ? "success" : "error"} className="text-xs px-1.5 py-0">+5</Badge>
+                    <Badge variant={node.ghost_pay ? "success" : "error"} className="text-xs px-1.5 py-0">+4</Badge>
+                    <Badge variant={node.public_mining ? "success" : "error"} className="text-xs px-1.5 py-0">+3</Badge>
+                    <Badge variant={node.reaper ? "success" : "error"} className="text-xs px-1.5 py-0">+2</Badge>
+                    <Badge variant={node.elder ? "success" : "error"} className="text-xs px-1.5 py-0">+1</Badge>
+                  </div>
+                </Tooltip>
 
                 <div className="flex gap-1 pt-2 border-t border-gray-800">
-                  <Button variant="ghost" size="sm" onClick={() => handleEditClick(node)} className="text-xs px-2">
-                    Edit
-                  </Button>
-                  {node.address !== "localhost" && !isMeshNode(node) && (
-                    <Button variant="ghost" size="sm" onClick={() => handleRefreshNode(node)} className="text-xs px-2">
-                      Refresh
+                  <Tooltip content={TOOLTIPS.edit}>
+                    <Button variant="ghost" size="sm" onClick={() => handleEditClick(node)} className="text-xs px-2">
+                      Edit
                     </Button>
+                  </Tooltip>
+                  {node.address !== "localhost" && !isMeshNode(node) && (
+                    <Tooltip content={TOOLTIPS.refresh}>
+                      <Button variant="ghost" size="sm" onClick={() => handleRefreshNode(node)} className="text-xs px-2">
+                        Refresh
+                      </Button>
+                    </Tooltip>
                   )}
                   {node.address !== "localhost" && !isMeshNode(node) && (
-                    <Button variant="danger" size="sm" onClick={() => handleRemoveNode(node)} className="text-xs px-2">
-                      Remove
-                    </Button>
+                    <Tooltip content={TOOLTIPS.remove}>
+                      <Button variant="danger" size="sm" onClick={() => handleRemoveNode(node)} className="text-xs px-2">
+                        Remove
+                      </Button>
+                    </Tooltip>
                   )}
                 </div>
               </Card>
@@ -536,14 +627,20 @@ export default function SwarmPage() {
                         <span className="text-gray-500 font-mono text-sm">
                           ({truncateId(node.node_id, 6)})
                         </span>
-                        <Badge variant={node.online ? "success" : "error"}>
-                          {node.online ? "Online" : "Offline"}
-                        </Badge>
+                        <Tooltip content={TOOLTIPS.statusOnline}>
+                          <Badge variant={node.online ? "success" : "error"}>
+                            {node.online ? "Online" : "Offline"}
+                          </Badge>
+                        </Tooltip>
                         {isMeshNode(node) && (
-                          <Badge variant="info">Mesh</Badge>
+                          <Tooltip content={TOOLTIPS.mesh}>
+                            <Badge variant="info">Mesh</Badge>
+                          </Tooltip>
                         )}
                         {staleNodeIds.has(node.node_id) && (
-                          <Badge variant="warning">Stale</Badge>
+                          <Tooltip content={TOOLTIPS.stale}>
+                            <Badge variant="warning">Stale</Badge>
+                          </Tooltip>
                         )}
                         {node.watchdog_health && (
                           <Badge
@@ -560,88 +657,108 @@ export default function SwarmPage() {
                     <div className="text-lg font-bold text-gray-100">
                       {orDash(node.balance_btc, (v) => `${formatBtc(v)} BTC`)}
                     </div>
-                    <div className="text-sm text-gray-400">
-                      {node.shares ?? 0}/{node.max_shares ?? 15} shares
-                    </div>
+                    <Tooltip content={TOOLTIPS.shares}>
+                      <div className="text-sm text-gray-400 inline-block">
+                        {node.shares ?? 0}/{node.max_shares ?? 15} shares <InfoIcon />
+                      </div>
+                    </Tooltip>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 text-sm">
-                  <div>
-                    <span className="text-gray-500">Uptime</span>
-                    <div
-                      className={`font-medium ${
-                        node.uptime_percent === undefined || node.uptime_percent === null
-                          ? "text-gray-400"
-                          : node.uptime_percent >= 95
-                            ? "text-green-400"
-                            : node.uptime_percent >= 90
-                              ? "text-yellow-400"
-                              : "text-red-400"
-                      }`}
-                    >
-                      {orDash(node.uptime_percent, formatUptime)}
+                  <Tooltip content={TOOLTIPS.uptime}>
+                    <div>
+                      <span className="text-gray-500">Uptime <InfoIcon /></span>
+                      <div
+                        className={`font-medium ${
+                          node.uptime_percent === undefined || node.uptime_percent === null
+                            ? "text-gray-400"
+                            : node.uptime_percent >= 95
+                              ? "text-green-400"
+                              : node.uptime_percent >= 90
+                                ? "text-yellow-400"
+                                : "text-red-400"
+                        }`}
+                      >
+                        {orDash(node.uptime_percent, formatUptime)}
+                      </div>
                     </div>
-                  </div>
-                  <div>
-                    <span className="text-gray-500">Peers</span>
-                    <div className="text-gray-100">{orDash(node.peer_count, (v) => String(v))}</div>
-                  </div>
-                  <div>
-                    <span className="text-gray-500">L1 Height</span>
-                    <div className="text-gray-100 font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
-                  </div>
-                  <div>
-                    <span className="text-gray-500">L2 Height</span>
-                    <div className="text-gray-100 font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
-                  </div>
+                  </Tooltip>
+                  <Tooltip content={TOOLTIPS.peers}>
+                    <div>
+                      <span className="text-gray-500">Peers <InfoIcon /></span>
+                      <div className="text-gray-100">{orDash(node.peer_count, (v) => String(v))}</div>
+                    </div>
+                  </Tooltip>
+                  <Tooltip content={TOOLTIPS.l1Height}>
+                    <div>
+                      <span className="text-gray-500">L1 Height <InfoIcon /></span>
+                      <div className="text-gray-100 font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
+                    </div>
+                  </Tooltip>
+                  <Tooltip content={TOOLTIPS.l2Height}>
+                    <div>
+                      <span className="text-gray-500">L2 Height <InfoIcon /></span>
+                      <div className="text-gray-100 font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
+                    </div>
+                  </Tooltip>
                 </div>
 
-                <div className="flex flex-wrap gap-2 mt-4">
-                  <Badge variant={node.archive_mode ? "success" : "error"}>Archive +5</Badge>
-                  <Badge variant={node.ghost_pay ? "success" : "error"}>Ghost Pay +4</Badge>
-                  <Badge variant={node.public_mining ? "success" : "error"}>Public Mining +3</Badge>
-                  <Badge variant={node.reaper ? "success" : "error"}>Reaper +2</Badge>
-                  <Badge variant={node.elder ? "success" : "error"}>
-                    Elder{node.elder && node.elder_slot != null ? ` #${node.elder_slot}` : ""} +1
-                  </Badge>
-                </div>
+                <Tooltip content={TOOLTIPS.capabilities}>
+                  <div className="flex flex-wrap gap-2 mt-4">
+                    <Badge variant={node.archive_mode ? "success" : "error"}>Archive +5</Badge>
+                    <Badge variant={node.ghost_pay ? "success" : "error"}>Ghost Pay +4</Badge>
+                    <Badge variant={node.public_mining ? "success" : "error"}>Public Mining +3</Badge>
+                    <Badge variant={node.reaper ? "success" : "error"}>Reaper +2</Badge>
+                    <Badge variant={node.elder ? "success" : "error"}>
+                      Elder{node.elder && node.elder_slot != null ? ` #${node.elder_slot}` : ""} +1
+                    </Badge>
+                  </div>
+                </Tooltip>
 
                 <div className="flex gap-2 mt-4 pt-4 border-t border-gray-800">
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => handleEditClick(node)}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    variant="warning"
-                    size="sm"
-                    onClick={() => handleRestartNode(node)}
-                    loading={restartingNode === node.node_id}
-                  >
-                    Restart
-                  </Button>
-                  {node.address !== "localhost" && !isMeshNode(node) && (
+                  <Tooltip content={TOOLTIPS.edit}>
                     <Button
-                      variant="ghost"
+                      variant="secondary"
                       size="sm"
-                      onClick={() => handleRefreshNode(node)}
-                      loading={refreshNode.isPending}
+                      onClick={() => handleEditClick(node)}
                     >
-                      Refresh
+                      Edit
                     </Button>
+                  </Tooltip>
+                  <Tooltip content={TOOLTIPS.restart}>
+                    <Button
+                      variant="warning"
+                      size="sm"
+                      onClick={() => handleRestartNode(node)}
+                      loading={restartingNode === node.node_id}
+                    >
+                      Restart
+                    </Button>
+                  </Tooltip>
+                  {node.address !== "localhost" && !isMeshNode(node) && (
+                    <Tooltip content={TOOLTIPS.refresh}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRefreshNode(node)}
+                        loading={refreshNode.isPending}
+                      >
+                        Refresh
+                      </Button>
+                    </Tooltip>
                   )}
                   {node.address !== "localhost" && !isMeshNode(node) && (
-                    <Button
-                      variant="danger"
-                      size="sm"
-                      onClick={() => handleRemoveNode(node)}
-                      loading={removeNode.isPending}
-                    >
-                      Remove
-                    </Button>
+                    <Tooltip content={TOOLTIPS.remove}>
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        onClick={() => handleRemoveNode(node)}
+                        loading={removeNode.isPending}
+                      >
+                        Remove
+                      </Button>
+                    </Tooltip>
                   )}
                 </div>
               </Card>

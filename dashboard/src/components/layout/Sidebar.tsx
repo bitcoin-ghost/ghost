@@ -4,26 +4,29 @@ import {
   LayoutDashboard,
   Pickaxe,
   Activity,
+  RefreshCw,
   ShieldCheck,
   Gauge,
+  Boxes,
   Network as NetworkIcon,
-  Coins,
   Crown,
   Lock,
   Shield,
   Eye,
   Cloud,
-  EyeOff,
-  Skull,
+  Filter,
+  Layers,
+  SlidersHorizontal,
   Globe,
+  MapPin,
   HeartPulse,
   ScrollText,
   Users,
   CreditCard,
   Banknote,
+  Smartphone,
   HardDrive,
   Cpu,
-  Palette,
   Settings,
   ChevronLeft,
   X,
@@ -51,9 +54,9 @@ const ICON = { size: 16, strokeWidth: 1.75 } as const;
 
 /**
  * Single source of nav truth — sidebar is the only navigation.
- * 7 groups, ~25 items, no nested dropdowns. Each group is rendered with
- * the website's `.section-label` rhythm: 11px IBM Plex Mono uppercase
- * tracked-out in `var(--accent)` orange.
+ * No nested dropdowns. Each group is rendered with the website's
+ * `.section-label` rhythm: 11px IBM Plex Mono uppercase tracked-out
+ * in `var(--accent)` orange.
  */
 const GROUPS: NavGroup[] = [
   {
@@ -61,7 +64,16 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
       { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },
-      { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
+      { href: "/sync", label: "Sync", icon: <RefreshCw {...ICON} /> },
+      { href: "/geo", label: "Geo", icon: <MapPin {...ICON} /> },
+    ],
+  },
+  {
+    label: "filtering",
+    items: [
+      { href: "/filtering", label: "Overview", icon: <Filter {...ICON} /> },
+      { href: "/filtering/basic", label: "Basic", icon: <Layers {...ICON} /> },
+      { href: "/filtering/advanced", label: "Advanced", icon: <SlidersHorizontal {...ICON} /> },
     ],
   },
   {
@@ -69,19 +81,14 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
       { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
-    ],
-  },
-  {
-    label: "operate",
-    items: [
-      { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
-      { href: "/rewards", label: "Rewards", icon: <Coins {...ICON} /> },
+      { href: "/pool", label: "Node Pool", icon: <Boxes {...ICON} /> },
     ],
   },
   {
     label: "ghost pay",
     items: [
-      { href: "/ghost-pay", label: "Overview", icon: <Crown {...ICON} /> },
+      { href: "/ghost-pay", label: "Ghost Pay Network", icon: <Crown {...ICON} /> },
+      { href: "/connect", label: "Connect Wallet", icon: <Smartphone {...ICON} /> },
       { href: "/locks", label: "Locks", icon: <Lock {...ICON} /> },
       { href: "/wraith", label: "Wraith", icon: <Shield {...ICON} /> },
     ],
@@ -92,14 +99,12 @@ const GROUPS: NavGroup[] = [
       { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
       { href: "/shroud", label: "Shroud", icon: <Eye {...ICON} /> },
       { href: "/haze", label: "Haze", icon: <Cloud {...ICON} /> },
-      { href: "/reaper", label: "Reaper", icon: <Skull {...ICON} /> },
     ],
   },
   {
     label: "identity",
     items: [
       { href: "/elders", label: "Elders & MPC", icon: <Users {...ICON} /> },
-      { href: "/glyph", label: "Glyph", icon: <Palette {...ICON} /> },
     ],
   },
   {
@@ -113,6 +118,8 @@ const GROUPS: NavGroup[] = [
     label: "system",
     items: [
       { href: "/system", label: "System", icon: <Cpu {...ICON} /> },
+      { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
+      { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
       { href: "/peers", label: "Peers", icon: <NetworkIcon {...ICON} /> },
       { href: "/storage", label: "Storage", icon: <HardDrive {...ICON} /> },
       { href: "/watchdog", label: "Watchdog", icon: <HeartPulse {...ICON} /> },

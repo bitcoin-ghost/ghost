@@ -25,7 +25,7 @@ export function useKeyboardShortcuts() {
     { key: "l", ctrl: true, action: () => router.push("/locks"), description: "Go to Locks" },
     { key: "p", ctrl: true, action: () => router.push("/payments"), description: "Go to Payments" },
     { key: "s", ctrl: true, action: () => router.push("/settlement"), description: "Go to Settlement" },
-    { key: "r", ctrl: true, action: () => router.push("/rewards"), description: "Go to Rewards" },
+    { key: "r", ctrl: true, action: () => router.push("/payouts"), description: "Go to Payouts" },
     { key: "g", ctrl: true, action: () => router.push("/config"), description: "Go to Configuration" },
     { key: "?", ctrl: false, shift: true, action: () => setShowHelp(true), description: "Show shortcuts" },
     { key: "Escape", ctrl: false, action: () => setShowHelp(false), description: "Close dialog" },

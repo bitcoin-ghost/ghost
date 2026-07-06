@@ -10,6 +10,9 @@ export * from './useMiningQueries';
 // Config queries
 export * from './useConfigQueries';
 
+// Alerts queries
+export * from './useAlertsQueries';
+
 // Ghost Pay queries
 export * from './useGhostPayQueries';
 
@@ -51,3 +54,6 @@ export * from './useReaperQueries';
 
 // Capability self-check queries
 export * from './useSelfCheckQueries';
+
+// Geo (offline GeoIP database) queries
+export * from './useGeoQueries';

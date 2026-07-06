@@ -1,6 +1,6 @@
 // Node API endpoints
 import { fetchApi } from './client';
-import type { NodeInfo, NodeStatus, SharesInfo, HealthStatus } from '@/types/api';
+import type { NodeInfo, NodeStatus, SharesInfo, HealthStatus, BlockchainStatus } from '@/types/api';
 
 export async function getNodeInfo(): Promise<NodeInfo> {
   return fetchApi<NodeInfo>('/api/v1/node/info');
@@ -8,6 +8,11 @@ export async function getNodeInfo(): Promise<NodeInfo> {
 
 export async function getNodeStatus(): Promise<NodeStatus> {
   return fetchApi<NodeStatus>('/api/v1/node/status');
+}
+
+// Chain & sync status from ghostd `getblockchaininfo`.
+export async function getBlockchainStatus(): Promise<BlockchainStatus> {
+  return fetchApi<BlockchainStatus>('/api/v1/node/blockchain');
 }
 
 export async function getShares(): Promise<SharesInfo> {

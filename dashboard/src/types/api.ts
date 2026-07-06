@@ -48,6 +48,28 @@ export interface NodeStatus {
   template_profile?: TemplateProfile | string;
 }
 
+// Chain & sync status, sourced from ghostd `getblockchaininfo`
+// (/api/v1/node/blockchain). Numeric fields are null when the RPC is
+// unavailable (available === false), so the UI degrades to "—".
+export interface BlockchainStatus {
+  available: boolean;
+  network?: string | null;
+  chain?: string | null;
+  blocks?: number | null;
+  headers?: number | null;
+  best_block_hash?: string | null;
+  difficulty?: number | null;
+  size_on_disk?: number | null;
+  verification_progress?: number | null;
+  initial_block_download?: boolean | null;
+  pruned?: boolean | null;
+  hazed?: boolean | null;
+  median_time?: number | null;
+  tip_time?: number | null;
+  chainwork?: string | null;
+  warnings?: string[] | null;
+}
+
 export interface NodeConfig {
   ghost_mode?: boolean;
   archive_mode?: boolean;
@@ -85,6 +107,26 @@ export interface FullNodeConfig {
     vardiff_enabled: boolean;
   };
   pruning?: PruningConfig;
+  // The real tier policy from pool.toml [policy]. `profile` is the lever that
+  // decides which BUDS tiers get mined (strict / permissive / full_open / custom).
+  // `custom` carries the resolved per-field values for the advanced panel.
+  policy?: {
+    profile?: string;
+    custom?: {
+      allow_t0: boolean;
+      allow_t1: boolean;
+      allow_t2: boolean;
+      allow_t3: boolean;
+      allow_inscriptions: boolean;
+      allow_runes: boolean;
+      allow_brc20: boolean;
+      max_op_return_size: number;
+      max_witness_per_input: number;
+      max_tx_outputs: number;
+      max_tx_size: number;
+      min_fee_rate: number;
+    };
+  };
   payout?: {
     address: string | null;
     ghostpay_address: string | null;

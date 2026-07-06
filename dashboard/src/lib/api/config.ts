@@ -37,6 +37,26 @@ export async function setGhostMode(enabled: boolean): Promise<NodeConfig> {
   });
 }
 
+// Result of toggling ghostd Tor mode. The apply happens off the request path
+// (ghostd restarts, then the pool bounces); poll the reaper GET's ghostd_apply
+// for the terminal state.
+export interface TorToggleResult {
+  success: boolean;
+  enabled: boolean;
+  ghostd_apply?: GhostdApplyStatus;
+  message: string;
+}
+
+// Toggle ghostd Tor mode (-tormode). Persists [node_launch].tor_mode to
+// pool.toml, regenerates ghostd's launch-flag drop-in and restarts ghostd, then
+// bounces ghost-pool. Requires a restart because -tormode is a startup flag.
+export async function setTor(enabled: boolean): Promise<TorToggleResult> {
+  return fetchApi<TorToggleResult>('/api/v1/config/tor', {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export async function setArchiveMode(enabled: boolean): Promise<NodeConfig> {
   return fetchApi<NodeConfig>('/api/v1/config/archive_mode', {
     method: 'POST',
@@ -154,6 +174,77 @@ export async function setTemplateProfile(profile: TemplateProfile): Promise<Node
   return fetchApi<NodeConfig>('/api/v1/config/template_profile', {
     method: 'POST',
     body: JSON.stringify({ profile }),
+  });
+}
+
+// The REAL tier policy (pool.toml [policy].profile). Unlike mempool/template
+// profile, this actually governs which BUDS tiers get mined. Writing it persists
+// to pool.toml and triggers a graceful restart to apply.
+export type PolicyProfileType = 'strict' | 'permissive' | 'full_open';
+
+export interface PolicyProfileResult {
+  success: boolean;
+  profile: PolicyProfileType;
+  restart_pending: boolean;
+}
+
+export async function setPolicyProfile(profile: PolicyProfileType): Promise<PolicyProfileResult> {
+  return fetchApi<PolicyProfileResult>('/api/v1/config/policy_profile', {
+    method: 'POST',
+    body: JSON.stringify({ profile }),
+  });
+}
+
+// The full custom tier policy (pool.toml [policy].custom). Writing it sets
+// [policy].profile = custom, persists every field, and triggers a graceful
+// restart to apply. This is the advanced counterpart to the three presets: it
+// exposes every per-field knob the block builder now enforces.
+export interface PolicyCustomConfig {
+  // Per-tier inclusion (T0 financial .. T3 heavy data).
+  allow_t0: boolean;
+  allow_t1: boolean;
+  allow_t2: boolean;
+  allow_t3: boolean;
+  // Content-type toggles.
+  allow_inscriptions: boolean;
+  allow_runes: boolean;
+  allow_brc20: boolean;
+  // Size limits.
+  max_op_return_size: number;   // bytes; 0 = no OP_RETURN allowed
+  max_witness_per_input: number; // bytes per input
+  max_tx_outputs: number;        // outputs per tx
+  max_tx_size: number;           // vbytes per tx
+  // Fee floor.
+  min_fee_rate: number;          // sat/vB; 0 = no minimum
+}
+
+export interface PolicyCustomResult {
+  success: boolean;
+  profile: 'custom';
+  restart_pending: boolean;
+}
+
+// Sensible starting values for a fresh custom policy (mirrors the backend
+// CustomPolicyConfig defaults: T0+T1+T2, no data, small-OP_RETURN limits).
+export const POLICY_CUSTOM_DEFAULTS: PolicyCustomConfig = {
+  allow_t0: true,
+  allow_t1: true,
+  allow_t2: true,
+  allow_t3: false,
+  allow_inscriptions: false,
+  allow_runes: false,
+  allow_brc20: false,
+  max_op_return_size: 80,
+  max_witness_per_input: 400,
+  max_tx_outputs: 100,
+  max_tx_size: 100_000,
+  min_fee_rate: 1.0,
+};
+
+export async function setPolicyCustom(config: PolicyCustomConfig): Promise<PolicyCustomResult> {
+  return fetchApi<PolicyCustomResult>('/api/v1/config/policy_custom', {
+    method: 'POST',
+    body: JSON.stringify(config),
   });
 }
 

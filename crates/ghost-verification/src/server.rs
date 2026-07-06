@@ -1131,6 +1131,14 @@ pub struct MeshNodeInfo {
     pub hashrate_th: f64,
     /// Miners currently connected to this node.
     pub miner_count: u32,
+    /// Peer's hardware-derived miner capacity ceiling (derived from
+    /// CPU/RAM/FD, capped by the operator's `network.max_miners` if set).
+    /// `0` means the peer has not gossiped it yet (rendered as "unknown" on
+    /// the Capacity page rather than a real ceiling). Surfaced here so the
+    /// Capacity table can show every mesh node — including community nodes
+    /// that don't advertise the `public_mining` capability the load-balancer
+    /// `pool-nodes` path filters on — against its utilisation ceiling.
+    pub max_capacity: u32,
     /// Deduplicated share of the mesh-wide active-miner total attributed to
     /// this node: each unique miner-id hash is owned by exactly one node, so
     /// summing this across the mesh-nodes list (self + peers) equals the
@@ -1754,10 +1762,15 @@ impl VerificationState {
     /// Set the node config path and load config from disk
     pub fn with_node_config_path(mut self, path: PathBuf) -> Self {
         let config = NodeConfig::load_or_default(&path);
-        // Sync dashboard_config ghost_mode with loaded node_config
+        // Sync dashboard_config with the persisted node_config so restored
+        // values (ghost_mode, nickname) are reflected on the live config the
+        // dashboard reads.
         {
             let mut dashboard = self.dashboard_config.write();
             dashboard.ghost_mode = config.ghost_mode;
+            if config.nickname.is_some() {
+                dashboard.nickname = config.nickname.clone();
+            }
         }
         self.node_config = parking_lot::RwLock::new(config);
         self.node_config_path = Some(path);

@@ -3,6 +3,7 @@ import {
   getConfig,
   getFullConfig,
   setGhostMode,
+  setTor,
   setArchiveMode,
   setReaper,
   getReaper,
@@ -33,6 +34,7 @@ import {
   type CustomTemplateProfile,
 } from '@/lib/api/config';
 import type { MempoolProfile, TemplateProfile, PruneProfile } from '@/types/api';
+import { nodeKeys } from './useNodeQueries';
 
 export const configKeys = {
   all: ['config'] as const,
@@ -65,6 +67,20 @@ export function useSetGhostMode() {
     mutationFn: (enabled: boolean) => setGhostMode(enabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
+    },
+  });
+}
+
+export function useSetTor() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (enabled: boolean) => setTor(enabled),
+    onSuccess: () => {
+      // Config changed and the live Tor state (node status) will flip once
+      // ghostd finishes restarting — refresh both.
+      queryClient.invalidateQueries({ queryKey: configKeys.all });
+      queryClient.invalidateQueries({ queryKey: nodeKeys.status() });
     },
   });
 }

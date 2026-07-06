@@ -109,22 +109,35 @@ const contributorColumns: ColumnDef<MpcContributor>[] = [
   {
     accessorKey: "created_at",
     header: "Contributed",
-    cell: ({ row }) => {
-      const date = new Date(row.original.created_at);
-      return (
-        <span className="text-gray-400 text-sm">
-          {date.toLocaleDateString(undefined, {
-            year: "numeric",
-            month: "short",
-            day: "numeric",
-          })}
-        </span>
-      );
-    },
+    cell: ({ row }) => (
+      <span className="text-gray-400 text-sm">{formatContributed(row.original.created_at)}</span>
+    ),
   },
 ];
 
 // --- Helpers ---
+
+// The backend stores `created_at` as Unix SECONDS (i64 as_secs). Feeding that
+// straight to `new Date()` (which expects milliseconds) landed every elder on
+// "21 Jan 1970". Coerce to a real timestamp — treat a numeric value below 1e12
+// as seconds — and render a full date + time of when the node registered.
+function formatContributed(value: string | number): string {
+  const n = typeof value === "number" ? value : Number(value);
+  let date: Date;
+  if (Number.isFinite(n) && n > 0) {
+    date = new Date(n < 1e12 ? n * 1000 : n); // seconds → ms, or already ms
+  } else {
+    date = new Date(value); // fall back to an ISO/date string
+  }
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
 function getCeremonyPhase(mpc: MpcStatus | undefined): {
   label: string;
@@ -180,6 +193,7 @@ export default function EldersPage() {
         eyebrow="elders & mpc"
         title="Quorum members and ceremony."
         subtitle="MPC ceremony status, elder registry, and zero-knowledge proof parameters"
+        subtitleFullWidth
         actions={
           isElder && elderSlot != null ? (
             <Badge variant="success">Elder #{elderSlot}</Badge>
