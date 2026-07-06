@@ -1341,6 +1341,11 @@ pub struct VerificationState {
     /// endpoint so the dashboard can report whether the ghostd mempool reaper
     /// picked up the last change (the apply runs off the request path).
     pub ghostd_reaper_apply: Arc<parking_lot::RwLock<GhostdReaperApply>>,
+    /// Last-run status of the scheduled encrypted-backup task (in bins/ghost-pool).
+    /// Updated by that task after each run and read by the backup-schedule GET
+    /// endpoint so the dashboard can show the last time/result/path. In-memory
+    /// only — resets on restart. Shared by cloning the `Arc` into the task.
+    pub backup_status: Arc<parking_lot::RwLock<ghost_common::config::BackupRunStatus>>,
     /// L-28: Debug endpoints enabled flag - IMMUTABLE after server start
     ///
     /// This is set from DashboardConfig during construction and can be modified
@@ -1529,6 +1534,9 @@ impl VerificationState {
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
             ghostd_reaper_apply: Arc::new(parking_lot::RwLock::new(GhostdReaperApply::default())),
+            backup_status: Arc::new(parking_lot::RwLock::new(
+                ghost_common::config::BackupRunStatus::default(),
+            )),
             // L-28: Debug endpoints flag frozen from DashboardConfig
             debug_endpoints_frozen: AtomicBool::new(debug_enabled),
             max_capacity: AtomicU32::new(0),

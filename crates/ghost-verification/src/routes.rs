@@ -356,6 +356,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/config/daemon", get(api_config_daemon_handler))
         .route("/api/v1/config/alerts", get(api_config_alerts_handler))
         .route(
+            "/api/v1/config/backup_schedule",
+            get(api_config_backup_schedule_handler),
+        )
+        .route(
             "/api/v1/config/ghost_pay",
             get(api_config_ghost_pay_handler),
         )
@@ -495,6 +499,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/config/alerts",
             post(api_config_alerts_post_handler),
+        )
+        .route(
+            "/api/v1/config/backup_schedule",
+            post(api_config_backup_schedule_post_handler),
         )
         .route("/api/v1/alerts/test", post(api_alerts_test_post_handler))
         .route(
@@ -6460,6 +6468,104 @@ async fn api_config_alerts_post_handler(
         );
     }
     Json(body)
+}
+
+/// Build the shared JSON body for the backup-schedule get/set endpoints:
+/// the persisted schedule plus the in-memory last-run status.
+fn backup_schedule_response_json(
+    schedule: &ghost_common::config::BackupSchedule,
+    status: &ghost_common::config::BackupRunStatus,
+) -> serde_json::Value {
+    serde_json::json!({
+        // `interval` serialises to its wire string ("daily" / "weekly" / "6h").
+        "enabled": schedule.enabled,
+        "interval": schedule.interval,
+        "retention": schedule.retention,
+        "target_dir": schedule.target_dir,
+        "status": status,
+    })
+}
+
+/// API v1 Config backup-schedule GET handler — returns the automatic scheduled
+/// encrypted-backup configuration plus the in-memory last-run status (time /
+/// result / path) so the dashboard can render the "Scheduled backups" card.
+async fn api_config_backup_schedule_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let schedule = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().backup.clone())
+        .unwrap_or_default();
+    let status = state.backup_status.read().clone();
+    let mut body = backup_schedule_response_json(&schedule, &status);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(
+                "Automatic scheduled encrypted-backup configuration".to_string(),
+            ),
+        );
+    }
+    Json(body)
+}
+
+/// API v1 Config backup-schedule POST handler — persists the scheduled-backup
+/// config to pool.toml `[backup]`. Retention is floored at 1 and `target_dir`
+/// must be an absolute path (mirrors the M-15 backup-history guard), so an
+/// enabled schedule can never be pointed at a relative directory.
+async fn api_config_backup_schedule_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<ghost_common::config::BackupSchedule>,
+) -> impl IntoResponse {
+    let mut saved = payload;
+    // Never keep zero backups; clamp before persisting so what's stored matches
+    // what the scheduler enforces.
+    saved.retention = saved.retention.max(1);
+
+    // Reject a relative target dir up front (the scheduler and history endpoint
+    // both require an absolute path).
+    if !std::path::Path::new(&saved.target_dir).is_absolute() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "target_dir must be an absolute path",
+                "code": "INVALID_TARGET_DIR",
+            })),
+        )
+            .into_response();
+    }
+
+    let mut persisted = false;
+    if let Some(ref full) = state.full_node_config {
+        let mut cfg = full.write();
+        cfg.backup = saved.clone();
+        if let Some(ref path) = state.full_node_config_path {
+            match cfg.save_atomic(path) {
+                Ok(()) => persisted = true,
+                Err(e) => error!(error = %e, "Failed to persist backup schedule config"),
+            }
+        }
+    }
+
+    let status = state.backup_status.read().clone();
+    let mut body = backup_schedule_response_json(&saved, &status);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("success".to_string(), serde_json::Value::Bool(true));
+        obj.insert("persisted".to_string(), serde_json::Value::Bool(persisted));
+        obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(
+                if persisted {
+                    "Backup schedule saved.".to_string()
+                } else {
+                    "Backup schedule received but no node config path is configured — changes were not persisted.".to_string()
+                },
+            ),
+        );
+    }
+    Json(body).into_response()
 }
 
 /// API v1 Alerts test-send POST handler — delivers a real test alert to every
