@@ -19,14 +19,25 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [prevOpen, setPrevOpen] = useState(false);
+
+  // Reset the transient UI state the moment the dialog opens, during render
+  // (guarded on the open transition so it can't loop) rather than in the effect.
+  // This is React's recommended alternative to a setState-in-effect for derived
+  // resets; the effect below is left to do only the async fetch.
+  if (isOpen !== prevOpen) {
+    setPrevOpen(isOpen);
+    if (isOpen) {
+      setIsLoading(true);
+      setError(null);
+      setCopied(false);
+    }
+  }
 
   useEffect(() => {
     if (!isOpen) return;
 
     let cancelled = false;
-    setIsLoading(true);
-    setError(null);
-    setCopied(false);
 
     getGhostId()
       .then((result) => {
