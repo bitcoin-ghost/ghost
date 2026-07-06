@@ -76,11 +76,11 @@ class ReplaceByFeeTest(BitcoinTestFramework):
         self.log.info("Running test full replace by fee...")
         self.test_fullrbf()
 
-        self.log.info("Running test incremental relay feerates...")
-        self.test_incremental_relay_feerates()
-
         self.log.info("Running test opt-out of full replace by fee...")
         self.test_no_fullrbf()
+
+        self.log.info("Running test incremental relay feerates...")
+        self.test_incremental_relay_feerates()
 
         self.log.info("Passed")
 
@@ -664,6 +664,9 @@ class ReplaceByFeeTest(BitcoinTestFramework):
             "-limitdescendantcount=200",
             "-limitdescendantsize=101",
         ])
+        # Restarting drops node 0's P2P connection; reconnect so make_utxo's
+        # block generation can sync across the two nodes.
+        self.connect_nodes(0, 1)
         assert_equal(False, self.nodes[0].getmempoolinfo()["fullrbf"])
 
         # A transaction that does NOT signal BIP125 (opt-out) is protected from
