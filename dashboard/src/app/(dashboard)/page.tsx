@@ -44,7 +44,7 @@ const SHARE_TIERS = [
 
 function InfoIcon() {
   return (
-    <svg className="w-3 h-3 text-gray-600 inline-block ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <svg className="w-3 h-3 text-gray-600 inline-block mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <circle cx="12" cy="12" r="10" />
       <path d="M12 16v-4M12 8h.01" />
     </svg>
@@ -79,7 +79,7 @@ function L1Card() {
       <div className="grid grid-cols-2 gap-3">
         <Tooltip content={TOOLTIPS.block_height}>
           <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Block Height <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Block Height</div>
             <div className="text-lg font-mono font-semibold text-gray-100">
               {isLoading ? "..." : isSyncing
                 ? <span>{syncHeight.toLocaleString()} <span className="text-xs text-orange-400">/ {blockHeight.toLocaleString()}</span></span>
@@ -95,7 +95,7 @@ function L1Card() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.l1_peers}>
           <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Mesh Peers <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Mesh Peers</div>
             <div className="text-lg font-mono font-semibold text-gray-100">
               {isLoading ? "..." : `${status?.peer_count ?? 0} connected`}
             </div>
@@ -103,7 +103,7 @@ function L1Card() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.network_hashrate}>
           <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Network Hashrate <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Network Hashrate</div>
             <div className="text-lg font-mono font-semibold text-gray-100">
               {bestHashLoading ? "..." : bestHash?.network_hashrate ? formatHashrate(bestHash.network_hashrate) : "--"}
             </div>
@@ -111,7 +111,7 @@ function L1Card() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.pool_hashrate}>
           <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Ghost Pool Hashrate <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Pool Hashrate</div>
             <div className="text-lg font-mono font-semibold text-gray-100">
               {isLoading ? "..." : mining ? formatHashrate((mining.hashrate_th ?? 0) * 1e12) : "0 H/s"}
             </div>
@@ -119,7 +119,7 @@ function L1Card() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.l1_hashrate}>
           <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Your Hashrate <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Your Hashrate</div>
             <div className="text-lg font-mono font-semibold text-gray-100">
               {isLoading ? "..." : mining ? formatHashrate((mining.local_hashrate_th ?? 0) * 1e12) : "0 H/s"}
             </div>
@@ -171,7 +171,7 @@ function L2Card() {
       <div className="grid grid-cols-2 gap-3">
         <Tooltip content={TOOLTIPS.l2_height}>
           <div className="p-3 bg-purple-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">L2 Height <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> L2 Height</div>
             <div className="text-lg font-mono font-semibold text-gray-100">
               {isLoading ? "..." : isSyncing ? <span className="text-purple-400">Syncing...</span> : height}
             </div>
@@ -184,7 +184,7 @@ function L2Card() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.l2_peers}>
           <div className="p-3 bg-purple-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">L2 Peers <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> L2 Peers</div>
             <div className="text-lg font-mono font-semibold text-gray-100">
               {isLoading ? "..." : `${gp?.peer_count ?? 0} connected`}
             </div>
@@ -192,7 +192,7 @@ function L2Card() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.l2_wraith}>
           <div className="p-3 bg-purple-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Wraith <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Wraith</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={wraithActive ? "online" : "offline"}
@@ -361,7 +361,7 @@ function PrivacySection() {
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <Tooltip content={TOOLTIPS.ghost_mode}>
           <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Ghost Mode <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Mode</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={ghostModeActive ? "online" : "offline"}
@@ -373,7 +373,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_tor}>
           <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Tor Mode <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Tor Mode</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={torActive ? "online" : "offline"}
@@ -385,7 +385,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_haze}>
           <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Ghost Haze <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Haze</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={hazeActive ? "online" : "offline"}
@@ -397,7 +397,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_shroud}>
           <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Ghost Shroud <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Shroud</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={shroudActive ? "online" : "offline"}
@@ -409,7 +409,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_wraith}>
           <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1">Wraith <InfoIcon /></div>
+            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Wraith</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={wraithActive ? "online" : "offline"}

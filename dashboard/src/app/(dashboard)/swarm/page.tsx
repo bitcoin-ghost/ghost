@@ -47,7 +47,7 @@ function formatHashrate(th: number): string {
 // is wrapped in a <Tooltip> that carries the explanatory copy.
 function InfoIcon() {
   return (
-    <svg className="w-3 h-3 text-gray-600 inline-block ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <svg className="w-3 h-3 text-gray-600 inline-block mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <circle cx="12" cy="12" r="10" />
       <path d="M12 16v-4M12 8h.01" />
     </svg>
@@ -458,7 +458,7 @@ export default function SwarmPage() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-3 bg-gray-800/50 rounded-lg">
                 <Tooltip content={TOOLTIPS.nodeId}>
-                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block">Node ID <InfoIcon /></div>
+                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Node ID</div>
                 </Tooltip>
                 <div className="font-mono text-sm text-gray-100 break-all select-all">
                   {nodeInfo.node_id}
@@ -466,7 +466,7 @@ export default function SwarmPage() {
               </div>
               <div className="p-3 bg-gray-800/50 rounded-lg">
                 <Tooltip content={TOOLTIPS.connectionAddress}>
-                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block">Connection Address <InfoIcon /></div>
+                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Connection Address</div>
                 </Tooltip>
                 <div className="font-mono text-sm text-gray-100 mb-2 select-all">
                   {swarmData?.self?.address
@@ -553,25 +553,25 @@ export default function SwarmPage() {
                 <div className="grid grid-cols-2 gap-2 text-xs mb-3">
                   <Tooltip content={TOOLTIPS.l1Height}>
                     <div>
-                      <span className="text-gray-500">L1: <InfoIcon /></span>{" "}
+                      <span className="text-gray-500"><InfoIcon /> L1:</span>{" "}
                       <span className="text-gray-300">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.l2Height}>
                     <div>
-                      <span className="text-gray-500">L2: <InfoIcon /></span>{" "}
+                      <span className="text-gray-500"><InfoIcon /> L2:</span>{" "}
                       <span className="text-gray-300">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.peers}>
                     <div>
-                      <span className="text-gray-500">Peers: <InfoIcon /></span>{" "}
+                      <span className="text-gray-500"><InfoIcon /> Peers:</span>{" "}
                       <span className="text-gray-300">{orDash(node.peer_count, (v) => String(v))}</span>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.shares}>
                     <div>
-                      <span className="text-gray-500">Shares: <InfoIcon /></span>{" "}
+                      <span className="text-gray-500"><InfoIcon /> Shares:</span>{" "}
                       <span className="text-gray-300">{node.shares ?? 0}/{node.max_shares ?? 15}</span>
                     </div>
                   </Tooltip>
@@ -659,7 +659,7 @@ export default function SwarmPage() {
                     </div>
                     <Tooltip content={TOOLTIPS.shares}>
                       <div className="text-sm text-gray-400 inline-block">
-                        {node.shares ?? 0}/{node.max_shares ?? 15} shares <InfoIcon />
+                        <InfoIcon /> {node.shares ?? 0}/{node.max_shares ?? 15} shares
                       </div>
                     </Tooltip>
                   </div>
@@ -668,7 +668,7 @@ export default function SwarmPage() {
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 text-sm">
                   <Tooltip content={TOOLTIPS.uptime}>
                     <div>
-                      <span className="text-gray-500">Uptime <InfoIcon /></span>
+                      <span className="text-gray-500"><InfoIcon /> Uptime</span>
                       <div
                         className={`font-medium ${
                           node.uptime_percent === undefined || node.uptime_percent === null
@@ -686,19 +686,19 @@ export default function SwarmPage() {
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.peers}>
                     <div>
-                      <span className="text-gray-500">Peers <InfoIcon /></span>
+                      <span className="text-gray-500"><InfoIcon /> Peers</span>
                       <div className="text-gray-100">{orDash(node.peer_count, (v) => String(v))}</div>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.l1Height}>
                     <div>
-                      <span className="text-gray-500">L1 Height <InfoIcon /></span>
+                      <span className="text-gray-500"><InfoIcon /> L1 Height</span>
                       <div className="text-gray-100 font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.l2Height}>
                     <div>
-                      <span className="text-gray-500">L2 Height <InfoIcon /></span>
+                      <span className="text-gray-500"><InfoIcon /> L2 Height</span>
                       <div className="text-gray-100 font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
                     </div>
                   </Tooltip>
