@@ -133,7 +133,30 @@ export default function GeoPage() {
         </div>
       )}
 
-      {/* Resolution note */}
+      {/* Map */}
+      <SectionErrorBoundary section="Node Map">
+        <Card>
+          <CardHeader title="World map" subtitle={`${points.length} of ${rows.length} nodes plotted`} />
+          <WorldMap points={points} self={self} hoveredId={hoveredId} onHover={setHoveredId} />
+          {/* Legend */}
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4" style={{ fontSize: "12px", color: "var(--dim)" }}>
+            <span className="inline-flex items-center gap-2">
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--green)", display: "inline-block" }} />
+              Online node
+            </span>
+            <span className="inline-flex items-center gap-2">
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--red)", display: "inline-block" }} />
+              Offline / stale
+            </span>
+            <span className="inline-flex items-center gap-2">
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--accent)", display: "inline-block" }} />
+              This node
+            </span>
+          </div>
+        </Card>
+      </SectionErrorBoundary>
+
+      {/* Resolution note (below the map) */}
       <div
         className="flex items-start gap-3"
         style={{
@@ -160,29 +183,6 @@ export default function GeoPage() {
           )}
         </p>
       </div>
-
-      {/* Map */}
-      <SectionErrorBoundary section="Node Map">
-        <Card>
-          <CardHeader title="World map" subtitle={`${points.length} of ${rows.length} nodes plotted`} />
-          <WorldMap points={points} self={self} hoveredId={hoveredId} onHover={setHoveredId} />
-          {/* Legend */}
-          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4" style={{ fontSize: "12px", color: "var(--dim)" }}>
-            <span className="inline-flex items-center gap-2">
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--green)", display: "inline-block" }} />
-              Online node
-            </span>
-            <span className="inline-flex items-center gap-2">
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--red)", display: "inline-block" }} />
-              Offline / stale
-            </span>
-            <span className="inline-flex items-center gap-2">
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--accent)", display: "inline-block" }} />
-              This node
-            </span>
-          </div>
-        </Card>
-      </SectionErrorBoundary>
 
       {/* Node list */}
       <SectionErrorBoundary section="Node List">
