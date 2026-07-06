@@ -1392,6 +1392,12 @@ pub struct VerificationState {
     /// `GET /api/v1/pool/series`. Bounded ring; empty until the first sample
     /// (the dashboard keeps its client-side session buffer as a fallback).
     pub pool_series: crate::pool_series::PoolSeries,
+    /// Chain-health state: a bounded ring of recent reorg events plus the
+    /// latest tip-lag snapshot. Written by the reorg handler + behind-tip
+    /// monitor in `bins/ghost-pool` (both hold a clone of this `Arc`) and read
+    /// by the `GET /api/v1/chain/health` route, so operators can SEE reorgs and
+    /// tip-lag instead of only being paged. In-memory; resets on restart.
+    pub chain_health: Arc<crate::chain_health::ChainHealth>,
     /// Operator-alert dispatcher, late-bound after startup. Populated by
     /// `bins/ghost-pool` once the dispatcher is built (its live-config closure
     /// needs this `Arc<VerificationState>`), so the internal failed-login
@@ -1556,6 +1562,7 @@ impl VerificationState {
             stratum_verify_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             // 24h of history at the sampler's 30s cadence (2880 samples).
             pool_series: crate::pool_series::PoolSeries::new(2880),
+            chain_health: Arc::new(crate::chain_health::ChainHealth::default()),
             alert_dispatcher: std::sync::OnceLock::new(),
         }
     }

@@ -236,6 +236,11 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // sampled every 30s (24h retention). `?window=1h|24h`. Lets the pool
         // page chart real history instead of a client-side session buffer.
         .route("/api/v1/pool/series", get(api_pool_series_handler))
+        // Chain-health view: current tip-lag status + recently recorded reorgs
+        // (persisted in a bounded in-memory ring). Backs the Sync page's
+        // "Chain Health" section so reorgs and tip-lag are visible, not just
+        // paged as alerts.
+        .route("/api/v1/chain/health", get(api_chain_health_handler))
         // Mesh-wide leaderboard: node-ranked (self + peers by hashrate) plus the
         // mesh-wide best-share records per window, aggregated from existing mesh
         // data with no new gossip. Replaces the pool page's this-node-only list.
@@ -2963,6 +2968,32 @@ async fn api_pool_series_handler(
         "sample_interval_secs": 30,
         "count": samples.len(),
         "samples": samples,
+    }))
+}
+
+/// Chain-health view: the current tip-lag status plus the recently recorded
+/// reorg events. Backs the Sync page's "Chain Health" section so operators can
+/// SEE reorgs and tip-lag — signals that historically only fired an alert and
+/// were never persisted.
+///
+/// * `tip` — the latest snapshot from the behind-tip monitor: local height,
+///   best connected-peer height, how far behind, tip age, and a derived
+///   `status` (`at_tip` / `behind` / `stale`). `null` until the monitor has run
+///   at least once after startup.
+/// * `reorgs` — the retained recent reorg events, newest first (bounded ring).
+/// * `reorg_count_24h` — how many reorgs were recorded in the last 24 hours;
+///   `0` is the normal, healthy state.
+///
+/// Read-only, same public surface as the other `/api/v1/...` read endpoints.
+async fn api_chain_health_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let ch = &state.chain_health;
+    let cutoff_24h = chrono::Utc::now().timestamp() - 24 * 3600;
+    Json(serde_json::json!({
+        "tip": ch.tip(),
+        "reorgs": ch.recent_reorgs(),
+        "reorg_count_24h": ch.reorg_count_since(cutoff_24h),
     }))
 }
 

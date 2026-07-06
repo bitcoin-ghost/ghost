@@ -47,7 +47,12 @@ use ghost_consensus::vote_handler::VoteHandler;
 use ghost_storage::models::PayoutStatus;
 use ghost_storage::Database;
 use ghost_verification::alerts::{AlertDispatcher, AlertEvent};
+use ghost_verification::chain_health::ChainHealth;
 use std::time::Duration;
+
+/// Callback returning the node's current local L1 height, used to record the
+/// post-disconnect tip height alongside a reorg event.
+type HeightGetter = Box<dyn Fn() -> u64 + Send + Sync>;
 
 /// Debounce window for reorg alerts. A single reorg emits one `Disconnected`
 /// event per orphaned block, so without this a depth-N reorg would fire N
@@ -120,6 +125,13 @@ pub struct ReorgHandler {
     /// per debounce window, and only if the operator has the event enabled) at
     /// the existing reorg-detection point.
     alerts: Option<Arc<AlertDispatcher>>,
+    /// Shared chain-health state. When set, every detected reorg is recorded
+    /// into its bounded ring (in addition to firing the alert) so the Sync
+    /// page's Chain Health view can display it. Read-through the API.
+    chain_health: Option<Arc<ChainHealth>>,
+    /// Optional local-height source, so a recorded reorg carries the node's
+    /// height right after the disconnect (the ZMQ event itself has no new tip).
+    get_height: Option<HeightGetter>,
     config: ReorgConfig,
     /// Counter for consecutive reorgs (deep reorg detection)
     consecutive_reorgs: AtomicU32,
@@ -145,6 +157,8 @@ impl ReorgHandler {
             db,
             vote_handler: None,
             alerts: None,
+            chain_health: None,
+            get_height: None,
             consecutive_reorgs: AtomicU32::new(0),
             stats: ReorgStatsInner {
                 total_reorgs: AtomicU64::new(0),
@@ -167,6 +181,23 @@ impl ReorgHandler {
     /// Wire the operator-alert dispatcher so reorgs page the operator.
     pub fn with_alert_dispatcher(mut self, alerts: Arc<AlertDispatcher>) -> Self {
         self.alerts = Some(alerts);
+        self
+    }
+
+    /// Wire the shared chain-health state so each detected reorg is recorded
+    /// into its bounded ring for the Sync page's Chain Health view.
+    pub fn with_chain_health(mut self, chain_health: Arc<ChainHealth>) -> Self {
+        self.chain_health = Some(chain_health);
+        self
+    }
+
+    /// Wire a local-height source so a recorded reorg carries the node's height
+    /// right after the disconnect.
+    pub fn with_height_getter<F>(mut self, get_height: F) -> Self
+    where
+        F: Fn() -> u64 + Send + Sync + 'static,
+    {
+        self.get_height = Some(Box::new(get_height));
         self
     }
 
@@ -318,6 +349,22 @@ impl ReorgHandler {
                     &detail,
                 )
                 .await;
+        }
+
+        // Persist the reorg into the shared chain-health ring so the Sync page
+        // can display it (the alert above only pages the operator). Records
+        // what the ZMQ sequence event carries — the disconnected (old-tip) hash
+        // and the consecutive-disconnect depth — plus the node's local height
+        // right after the disconnect when a height source is wired. The new tip
+        // hash is not on the event, so it is not fabricated.
+        if let Some(chain_health) = &self.chain_health {
+            let new_tip_height = self.get_height.as_ref().map(|f| f());
+            chain_health.record_reorg(
+                chrono::Utc::now().timestamp(),
+                reorg_depth,
+                block_hash,
+                new_tip_height,
+            );
         }
 
         // 1. Mark affected rounds as orphaned
