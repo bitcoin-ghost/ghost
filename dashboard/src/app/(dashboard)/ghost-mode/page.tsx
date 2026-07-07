@@ -270,6 +270,38 @@ export default function GhostModePage() {
         </div>
       </Card>
 
+      {/* Rewards / capability shares */}
+      <Card>
+        <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+          Does this affect my capability shares?
+        </h3>
+        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginBottom: "12px" }}>
+          <strong style={{ color: "var(--fg)" }}>No.</strong> Every capability is verified by an HTTP
+          challenge–response to your node&apos;s API — Archive by historical-block retrieval, Ghost Pay by
+          L2-block lookup, Reaper by policy classification — plus a Stratum port check for Public Mining.
+          None of that rides the P2P transaction-relay path Ghost Mode suppresses, so you keep all of your
+          5-4-3-2-1 shares while running silent. Ghost Mode composes cleanly with an archive / verification
+          node behind Tor: a private, silent node that still earns its full share of the reward pool.
+        </p>
+        <div
+          style={{
+            padding: "12px 14px",
+            background: "var(--bg)",
+            border: "1px solid var(--rule)",
+            borderRadius: "6px",
+          }}
+        >
+          <p style={{ color: "var(--fainter)", fontSize: "13px", lineHeight: "1.6" }}>
+            <span style={{ color: "var(--yellow)", fontWeight: 500 }}>Mining caveat:</span> Ghost Mode
+            rejects transactions from peers, so your mempool never fills with anyone else&apos;s fee-paying
+            transactions. Blocks your node builds are therefore near-empty — coinbase subsidy only, no
+            transaction fees. The Public Mining <strong style={{ color: "var(--fg)" }}>+3</strong> share
+            still verifies (the Stratum port stays open), but any block your miners find earns no fees.
+            Ghost Mode suits archive / verification nodes; if you mine for fee revenue, leave it off.
+          </p>
+        </div>
+      </Card>
+
       {/* Threat model */}
       <Card>
         <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
