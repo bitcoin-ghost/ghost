@@ -15,8 +15,9 @@ import {
   useSetArchiveMode,
   useSetReaper,
   useSetGhostPay,
-  useActivateMempoolProfile,
+  useSetPolicyProfile,
 } from '@/hooks/queries';
+import { toPolicyProfile } from '@/lib/api/config';
 
 interface InitialSetupData {
   nickname: string;
@@ -66,9 +67,9 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
   const setArchiveMode = useSetArchiveMode();
   const setReaper = useSetReaper();
   const setGhostPay = useSetGhostPay();
-  // The cosmetic `mempool_profile` field is written via the profile-activate
-  // route; POST /config/mempool_profile is GET-only on the node and 405s.
-  const activateMempoolProfile = useActivateMempoolProfile();
+  // The mempool step drives the REAL tier-policy lever (`/config/policy_profile`),
+  // which persists to pool.toml and applies on the next graceful restart.
+  const setPolicyProfile = useSetPolicyProfile();
   const toast = useToast();
 
   const steps = useMemo<WizardStep<InitialSetupData>[]>(() => [
@@ -131,7 +132,7 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
         await setArchiveMode.mutateAsync(data.archive_mode);
         await setReaper.mutateAsync(data.reaper);
         await setGhostPay.mutateAsync(data.ghost_pay);
-        await activateMempoolProfile.mutateAsync(data.mempool_profile);
+        await setPolicyProfile.mutateAsync(toPolicyProfile(data.mempool_profile));
         toast.success(
           'Setup Complete',
           'Your node has been configured and is ready to operate.'
@@ -142,7 +143,7 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
   ], [
     setNickname, setPublicMiningConfig, setPayoutAddress,
     setGhostMode, setArchiveMode, setReaper, setGhostPay,
-    activateMempoolProfile, toast, onClose,
+    setPolicyProfile, toast, onClose,
   ]);
 
   const wizard = useWizard<InitialSetupData>({

@@ -45,8 +45,6 @@ export interface NodeStatus {
   private_mining?: boolean;
   reaper?: boolean;
   ghost_pay?: boolean;
-  mempool_profile?: MempoolProfile | string;
-  template_profile?: TemplateProfile | string;
 }
 
 // Chain & sync status, sourced from ghostd `getblockchaininfo`
@@ -78,17 +76,18 @@ export interface NodeConfig {
   reaper?: boolean;
   public_mining?: boolean;
   ghost_pay?: boolean;
-  mempool_profile?: MempoolProfile | string;
-  template_profile?: TemplateProfile | string;
 }
 
-// Pruning configuration
-export type PruneProfile = "default" | "strict" | "clean" | "structured" | "archive";
-
+// Pruning configuration — the VW/OW/AW three-window model. Pruning is
+// block-storage only and is deliberately NOT tied to BUDS tx-filtering.
 export interface PruningConfig {
+  // Validator Window: the mandatory Bitcoin Core prune floor (read-only).
   vw_blocks?: number;
+  // Operator Window: the one editable depth knob = storage.prune_height
+  // (blocks to keep, 0 = keep everything short of the Archive Window).
   ow_blocks?: number;
-  prune_profile?: PruneProfile | string;
+  // Archive Window: storage.archive_mode (when true, pruning is disabled).
+  archive_mode?: boolean;
 }
 
 export interface FullNodeConfig {
@@ -98,8 +97,6 @@ export interface FullNodeConfig {
     ghost_mode_local_egress?: boolean;
     archive_mode: boolean;
     public_mining: boolean;
-    mempool_profile: string;
-    template_profile: string;
   };
   mining?: {
     private_mining: boolean;
@@ -143,8 +140,6 @@ export interface FullNodeConfig {
   public_mining?: boolean;
   reaper?: boolean;
   ghost_pay?: boolean;
-  mempool_profile?: string;
-  template_profile?: string;
   elder?: boolean;
   [key: string]: unknown;
 }
@@ -237,23 +232,6 @@ export interface HealthStatus {
   version?: string;
   capabilities?: HealthCapabilities;
 }
-
-export type MempoolProfile =
-  | "standard"
-  | "strict"
-  | "clean"
-  | "structured"
-  | "app_friendly"
-  | "ghost";
-
-export type TemplateProfile =
-  | "standard"
-  | "max_fee"
-  | "strict"
-  | "clean_block"
-  | "structured"
-  | "app_friendly"
-  | "ghost_block";
 
 // WebSocket event types
 export type NodeEvent =

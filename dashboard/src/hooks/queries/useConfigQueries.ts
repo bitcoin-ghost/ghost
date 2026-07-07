@@ -12,17 +12,8 @@ import {
   getDaemonSettings,
   setDaemonSettings,
   type DaemonSettings,
-  setMempoolProfile,
-  setTemplateProfile,
-  getMempoolProfiles,
-  saveMempoolProfile,
-  deleteMempoolProfile,
-  activateMempoolProfile,
-  getTemplateProfiles,
-  saveTemplateProfile,
-  deleteTemplateProfile,
-  activateTemplateProfile,
-  setPruneProfile,
+  setPolicyProfile,
+  type PolicyProfileType,
   setOperatorWindow,
   getL2PruningStatus,
   setGhostPayPayoutAddress,
@@ -34,18 +25,13 @@ import {
   setMiningPayoutAddress,
   setPoolName,
   setPublicMiningConfig,
-  type CustomMempoolProfile,
-  type CustomTemplateProfile,
 } from '@/lib/api/config';
-import type { MempoolProfile, TemplateProfile, PruneProfile } from '@/types/api';
 import { nodeKeys } from './useNodeQueries';
 
 export const configKeys = {
   all: ['config'] as const,
   basic: () => [...configKeys.all, 'basic'] as const,
   full: () => [...configKeys.all, 'full'] as const,
-  mempoolProfiles: () => [...configKeys.all, 'mempool-profiles'] as const,
-  templateProfiles: () => [...configKeys.all, 'template-profiles'] as const,
 };
 
 export function useConfig() {
@@ -160,106 +146,15 @@ export function useSetDaemonSettings() {
   });
 }
 
-export function useSetMempoolProfile() {
+// The REAL tier-policy lever (pool.toml [policy].profile), persisted to disk and
+// applied via a graceful restart. This is what the mempool/block-template
+// filtering actually keys off — the old cosmetic mempool/template "profiles"
+// were removed. Used by the setup/onboarding wizards.
+export function useSetPolicyProfile() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (profile: MempoolProfile) => setMempoolProfile(profile),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-    },
-  });
-}
-
-export function useSetTemplateProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (profile: TemplateProfile) => setTemplateProfile(profile),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-    },
-  });
-}
-
-// Custom Mempool Profiles
-export function useMempoolProfiles() {
-  return useQuery({
-    queryKey: configKeys.mempoolProfiles(),
-    queryFn: getMempoolProfiles,
-    staleTime: 60_000,
-  });
-}
-
-export function useSaveMempoolProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (profile: CustomMempoolProfile) => saveMempoolProfile(profile),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.mempoolProfiles() });
-    },
-  });
-}
-
-export function useDeleteMempoolProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (name: string) => deleteMempoolProfile(name),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.mempoolProfiles() });
-    },
-  });
-}
-
-export function useActivateMempoolProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (name: string) => activateMempoolProfile(name),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-    },
-  });
-}
-
-// Custom Template Profiles
-export function useTemplateProfiles() {
-  return useQuery({
-    queryKey: configKeys.templateProfiles(),
-    queryFn: getTemplateProfiles,
-    staleTime: 60_000,
-  });
-}
-
-export function useSaveTemplateProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (profile: CustomTemplateProfile) => saveTemplateProfile(profile),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.templateProfiles() });
-    },
-  });
-}
-
-export function useDeleteTemplateProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (name: string) => deleteTemplateProfile(name),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.templateProfiles() });
-    },
-  });
-}
-
-export function useActivateTemplateProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (name: string) => activateTemplateProfile(name),
+    mutationFn: (profile: PolicyProfileType) => setPolicyProfile(profile),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
     },
@@ -277,17 +172,6 @@ export function useL2PruningStatus() {
     queryKey: pruningKeys.l2(),
     queryFn: getL2PruningStatus,
     staleTime: 60_000,
-  });
-}
-
-export function useSetPruneProfile() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (profile: PruneProfile) => setPruneProfile(profile),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: configKeys.all });
-    },
   });
 }
 
@@ -405,4 +289,4 @@ export function useSetPublicMiningConfig() {
 }
 
 // Re-export types for convenience
-export type { CustomMempoolProfile, CustomTemplateProfile, DaemonSettings };
+export type { DaemonSettings };

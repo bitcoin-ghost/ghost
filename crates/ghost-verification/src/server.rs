@@ -974,9 +974,6 @@ pub struct DashboardConfig {
     pub reaper: bool,
     pub elder: bool,
     pub elder_slot: Option<u32>,
-    pub mempool_profile: String,
-    pub template_profile: String,
-    pub prune_profile: String,
     /// Maximum miners this node will accept
     pub max_miners: u32,
     /// Node display name for node finder
@@ -999,20 +996,12 @@ pub struct DashboardConfig {
     // Dashboard-managed fields
     /// Node display nickname
     pub nickname: Option<String>,
-    /// Custom mempool profiles (name -> settings)
-    pub custom_mempool_profiles: std::collections::HashMap<String, serde_json::Value>,
-    /// Custom template profiles (name -> settings)
-    pub custom_template_profiles: std::collections::HashMap<String, serde_json::Value>,
-    /// GhostPay payout address
-    pub ghostpay_payout_address: Option<String>,
     /// Private mining enabled
     pub private_mining: Option<bool>,
     /// Payout address for mining rewards
     pub payout_address: Option<String>,
     /// Custom pool name for coinbase tag (formatted as "- G H O S T - {pool_name}")
     pub pool_name: Option<String>,
-    /// Operator pruning window (blocks)
-    pub operator_window: Option<u64>,
     /// Tor mode active (ghostd -tormode)
     pub tor_mode: bool,
     /// Onion address (if tor mode active)
@@ -1038,9 +1027,6 @@ impl Default for DashboardConfig {
             reaper: true,        // enabled by default
             elder: false,        // set per-node
             elder_slot: None,
-            mempool_profile: "permissive".to_string(),
-            template_profile: "default".to_string(),
-            prune_profile: "none".to_string(),
             max_miners: 1000,
             node_name: None,
             region: None,
@@ -1059,13 +1045,9 @@ impl Default for DashboardConfig {
             backup_dir: "/home/ghost/.ghost/backups".to_string(),
             // Dashboard-managed fields
             nickname: None,
-            custom_mempool_profiles: std::collections::HashMap::new(),
-            custom_template_profiles: std::collections::HashMap::new(),
-            ghostpay_payout_address: None,
             private_mining: None,
             payout_address: None,
             pool_name: None,
-            operator_window: None,
             tor_mode: false,
             onion_address: None,
         }

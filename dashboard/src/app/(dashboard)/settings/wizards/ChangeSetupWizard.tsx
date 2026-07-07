@@ -17,8 +17,9 @@ import {
   useSetArchiveMode,
   useSetReaper,
   useSetGhostPay,
-  useActivateMempoolProfile,
+  useSetPolicyProfile,
 } from '@/hooks/queries';
+import { toPolicyProfile } from '@/lib/api/config';
 
 interface ChangeSetupData {
   nickname: string;
@@ -68,9 +69,9 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
   const setArchiveMode = useSetArchiveMode();
   const setReaper = useSetReaper();
   const setGhostPay = useSetGhostPay();
-  // Cosmetic mempool_profile mirror is written via the profile-activate route;
-  // POST /config/mempool_profile is GET-only on the node and 405s.
-  const activateMempoolProfile = useActivateMempoolProfile();
+  // The mempool step drives the REAL tier-policy lever (`/config/policy_profile`),
+  // which persists to pool.toml and applies on the next graceful restart.
+  const setPolicyProfile = useSetPolicyProfile();
   const toast = useToast();
 
   // Track original values to detect changes
@@ -98,7 +99,9 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
       archive_mode: fullConfig.archive_mode ?? fullConfig.node?.archive_mode ?? false,
       reaper: fullConfig.reaper ?? false,
       ghost_pay: fullConfig.ghost_pay ?? false,
-      mempool_profile: (fullConfig.mempool_profile ?? fullConfig.node?.mempool_profile ?? 'standard') as string,
+      // Derive the coarse wizard choice from the REAL tier policy (only "strict"
+      // has a distinct wizard option; everything else shows as "standard").
+      mempool_profile: fullConfig.policy?.profile === 'strict' ? 'strict' : 'standard',
     };
   }, [fullConfig]);
 
@@ -192,7 +195,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
           changeCount++;
         }
         if (data.mempool_profile !== original.mempool_profile) {
-          await activateMempoolProfile.mutateAsync(data.mempool_profile);
+          await setPolicyProfile.mutateAsync(toPolicyProfile(data.mempool_profile));
           changeCount++;
         }
 
@@ -210,7 +213,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
   ], [
     configLoading, setNickname, setPublicMiningConfig, setPayoutAddress,
     setGhostMode, setArchiveMode, setReaper, setGhostPay,
-    activateMempoolProfile, toast, onClose,
+    setPolicyProfile, toast, onClose,
   ]);
 
   const wizard = useWizard<ChangeSetupData>({

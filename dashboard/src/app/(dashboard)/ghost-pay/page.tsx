@@ -167,7 +167,7 @@ export default function GhostPayPage() {
   // Config.
   const ghostPayOn = !!fullConfig?.ghost_pay;
   const pruneEnabled = !!pruning?.enabled;
-  const pruneProfile = String(pruning?.profile ?? fullConfig?.prune_profile ?? "none");
+  const pruneProfile = String(pruning?.profile ?? "none");
   const pruneThreshold = Number(pruning?.threshold_sats ?? 0);
 
   return (
