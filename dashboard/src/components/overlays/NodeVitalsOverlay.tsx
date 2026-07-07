@@ -627,8 +627,6 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
             boxShadow: `0 0 12px 2px rgba(${ACCENT_RGB}, ${v.isSyncing ? 0.6 : 0})`,
           }}
         />
-        <span>Node Vitals</span>
-        <span style={{ color: 'var(--fainter)' }}>·</span>
         <span style={{ color: v.isSyncing ? 'var(--accent)' : 'var(--dim)' }}>
           {!hasStatus ? 'Acquiring signal' : v.isSyncing ? 'Syncing' : 'Synced'}
         </span>
