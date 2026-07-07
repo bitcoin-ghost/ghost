@@ -9,12 +9,12 @@ interface ProgressBarProps {
 }
 
 const colorClasses = {
-  orange: 'bg-orange-500',
-  green: 'bg-green-500',
+  orange: 'bg-[var(--accent)]',
+  green: 'bg-[var(--green)]',
   blue: 'bg-blue-500',
-  red: 'bg-red-500',
-  yellow: 'bg-yellow-500',
-  gray: 'bg-gray-500',
+  red: 'bg-[var(--red)]',
+  yellow: 'bg-[var(--accent)]',
+  gray: 'bg-[var(--fainter)]',
 };
 
 const sizeClasses = {
@@ -38,11 +38,11 @@ export function ProgressBar({
     <div className={className}>
       {(label || sublabel) && (
         <div className="flex justify-between items-center mb-1.5">
-          {label && <span className="text-sm text-gray-400">{label}</span>}
-          {sublabel && <span className="text-sm text-gray-300 font-mono">{sublabel}</span>}
+          {label && <span className="text-sm text-[color:var(--dim)]">{label}</span>}
+          {sublabel && <span className="text-sm text-[color:var(--dim)] font-mono">{sublabel}</span>}
         </div>
       )}
-      <div className={`bg-gray-800 rounded-full overflow-hidden ${sizeClasses[size]}`}>
+      <div className={`bg-[var(--surface)] rounded-full overflow-hidden ${sizeClasses[size]}`}>
         <div
           className={`${colorClasses[color]} rounded-full transition-all duration-500 h-full`}
           style={{ width: `${percent}%` }}

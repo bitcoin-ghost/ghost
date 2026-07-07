@@ -34,12 +34,12 @@ export function CopyButton({ text, label, className = '' }: CopyButtonProps) {
   return (
     <button
       onClick={handleCopy}
-      className={`inline-flex items-center gap-1.5 text-sm text-gray-400 hover:text-gray-200 transition-colors ${className}`}
+      className={`inline-flex items-center gap-1.5 text-sm text-[color:var(--dim)] hover:text-[color:var(--fg)] transition-colors ${className}`}
       title={copied ? 'Copied!' : 'Click to copy'}
     >
       {label && <span className="font-mono truncate">{label}</span>}
       <svg
-        className={`w-3.5 h-3.5 flex-shrink-0 ${copied ? 'text-green-400' : ''}`}
+        className={`w-3.5 h-3.5 flex-shrink-0 ${copied ? 'text-[color:var(--green)]' : ''}`}
         fill="none"
         viewBox="0 0 24 24"
         stroke="currentColor"

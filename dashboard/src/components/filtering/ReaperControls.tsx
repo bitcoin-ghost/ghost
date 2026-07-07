@@ -299,7 +299,7 @@ export function ReaperControls() {
         </div>
 
         {errorMsg && (
-          <p style={{ color: "var(--danger, #f87171)", fontSize: "13px" }}>{errorMsg}</p>
+          <p style={{ color: "var(--red)", fontSize: "13px" }}>{errorMsg}</p>
         )}
 
         <div

@@ -12,14 +12,14 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 const variantClasses: Record<ButtonVariant, string> = {
-  default: 'bg-gray-700 text-gray-100 hover:bg-gray-600 border-gray-600',
-  primary: 'bg-orange-600 text-white hover:bg-orange-500 border-orange-500',
-  secondary: 'bg-orange-600 text-white hover:bg-orange-500 border-orange-500',
-  outline: 'bg-transparent text-gray-300 hover:bg-gray-800 border-gray-600',
-  ghost: 'bg-transparent text-gray-300 hover:bg-gray-800 border-transparent',
-  danger: 'bg-red-600 text-white hover:bg-red-500 border-red-500',
-  success: 'bg-green-600 text-white hover:bg-green-500 border-green-500',
-  warning: 'bg-yellow-600 text-white hover:bg-yellow-500 border-yellow-500',
+  default: 'bg-[var(--rule-strong)] text-[color:var(--fg)] hover:bg-[var(--rule-strong)] border-[color:var(--rule-strong)]',
+  primary: 'bg-[var(--accent)] text-[color:var(--fg)] hover:bg-[var(--accent)] border-[color:var(--accent)]',
+  secondary: 'bg-[var(--accent)] text-[color:var(--fg)] hover:bg-[var(--accent)] border-[color:var(--accent)]',
+  outline: 'bg-transparent text-[color:var(--dim)] hover:bg-[var(--surface)] border-[color:var(--rule-strong)]',
+  ghost: 'bg-transparent text-[color:var(--dim)] hover:bg-[var(--surface)] border-transparent',
+  danger: 'bg-[var(--red)] text-[color:var(--fg)] hover:bg-[var(--red)] border-[color:var(--red)]',
+  success: 'bg-[var(--green)] text-[color:var(--fg)] hover:bg-[var(--green)] border-[color:var(--green)]',
+  warning: 'bg-[var(--accent)] text-[color:var(--fg)] hover:bg-[var(--accent)] border-[color:var(--accent)]',
 };
 
 const sizeClasses: Record<ButtonSize, string> = {
@@ -38,7 +38,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
         disabled={isDisabled}
         className={`
           inline-flex items-center justify-center font-medium rounded-lg border transition-colors
-          focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-orange-500
+          focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-[color:var(--surface)] focus:ring-orange-500
           disabled:opacity-50 disabled:cursor-not-allowed
           ${variantClasses[variant]}
           ${sizeClasses[size]}

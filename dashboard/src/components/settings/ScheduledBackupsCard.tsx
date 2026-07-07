@@ -105,10 +105,10 @@ export function ScheduledBackupsCard() {
 
       <div className="space-y-6">
         {/* Enable */}
-        <div className="flex items-center justify-between p-4 bg-gray-800/50 rounded-lg">
+        <div className="flex items-center justify-between p-4 bg-[var(--surface)]/50 rounded-lg">
           <div>
-            <div className="text-gray-100 font-medium">Enable scheduled backups</div>
-            <p className="text-sm text-gray-400">
+            <div className="text-[color:var(--fg)] font-medium">Enable scheduled backups</div>
+            <p className="text-sm text-[color:var(--dim)]">
               Off by default. When on, the node writes an encrypted backup to the target
               directory on each interval and prunes old copies automatically.
             </p>
@@ -122,18 +122,18 @@ export function ScheduledBackupsCard() {
         {/* Settings */}
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1">
-            <label className="block text-sm font-medium text-gray-300">Interval</label>
+            <label className="block text-sm font-medium text-[color:var(--dim)]">Interval</label>
             <select
               value={intervalKind}
               onChange={(e) => setIntervalKind(e.target.value as IntervalKind)}
               disabled={!enabled}
-              className="w-full px-3 py-2 text-sm bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full px-3 py-2 text-sm bg-[var(--surface)] border border-[color:var(--rule-strong)] rounded-lg text-[color:var(--fg)] focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <option value="daily">Daily (every 24h)</option>
               <option value="weekly">Weekly (every 7 days)</option>
               <option value="custom">Custom (hours)</option>
             </select>
-            <p className="text-xs text-gray-500">How often a backup is created.</p>
+            <p className="text-xs text-[color:var(--fainter)]">How often a backup is created.</p>
           </div>
 
           {intervalKind === "custom" && (
@@ -169,20 +169,20 @@ export function ScheduledBackupsCard() {
         </div>
 
         {/* Last run status */}
-        <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
+        <div className="p-4 bg-[var(--surface)]/50 rounded-lg border border-[color:var(--rule-strong)]">
           <div className="flex items-center justify-between mb-2">
-            <h4 className="text-sm font-medium text-gray-300">Last run</h4>
+            <h4 className="text-sm font-medium text-[color:var(--dim)]">Last run</h4>
             {status?.last_success === true && <Badge variant="success">Success</Badge>}
             {status?.last_success === false && <Badge variant="error">Failed</Badge>}
             {status?.last_run_unix == null && <Badge variant="default">Never run</Badge>}
           </div>
-          <div className="text-sm text-gray-400 space-y-1">
+          <div className="text-sm text-[color:var(--dim)] space-y-1">
             <div>Time: {formatUnix(status?.last_run_unix)}</div>
             {status?.last_path && (
               <div className="break-all">Path: {status.last_path}</div>
             )}
             {status?.last_error && (
-              <div className="text-red-400 break-all">Error: {status.last_error}</div>
+              <div className="text-[color:var(--red)] break-all">Error: {status.last_error}</div>
             )}
           </div>
         </div>
@@ -196,7 +196,7 @@ export function ScheduledBackupsCard() {
           >
             Save schedule
           </Button>
-          <span className="text-xs text-gray-500">
+          <span className="text-xs text-[color:var(--fainter)]">
             Backups inherit the database encryption; store the target directory securely.
           </span>
         </div>

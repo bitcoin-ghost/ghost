@@ -97,14 +97,14 @@ export function StoragePruningCard() {
       />
       <div className="space-y-6">
         {/* Archive Mode Toggle */}
-        <div className="p-4 bg-gray-800/50 rounded-lg">
+        <div className="p-4 bg-[var(--surface)]/50 rounded-lg">
           <div className="flex items-center justify-between">
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-gray-100 font-medium">Archive Mode</span>
+                <span className="text-[color:var(--fg)] font-medium">Archive Mode</span>
                 {archiveMode && <Badge variant="success">+5 Shares</Badge>}
               </div>
-              <p className="text-sm text-gray-400 mt-1">
+              <p className="text-sm text-[color:var(--dim)] mt-1">
                 Store complete blockchain history. Disables all pruning and earns bonus shares.
               </p>
             </div>
@@ -121,43 +121,43 @@ export function StoragePruningCard() {
         {/* Window Visualization */}
         <div className="grid grid-cols-3 gap-4">
           {/* Validator Window */}
-          <div className="p-4 bg-orange-900/20 border border-orange-800 rounded-lg">
-            <div className="text-orange-400 font-medium mb-2">Validator Window (VW)</div>
-            <div className="text-2xl font-bold text-gray-100">288 blocks</div>
-            <div className="text-sm text-gray-400 mt-1">~2 days</div>
-            <div className="mt-3 text-xs text-orange-300">
+          <div className="p-4 bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] border border-[color:var(--accent)] rounded-lg">
+            <div className="text-[color:var(--accent)] font-medium mb-2">Validator Window (VW)</div>
+            <div className="text-2xl font-bold text-[color:var(--fg)]">288 blocks</div>
+            <div className="text-sm text-[color:var(--dim)] mt-1">~2 days</div>
+            <div className="mt-3 text-xs text-[color:var(--accent)]">
               Fixed - Bitcoin Core minimum for reorg safety
             </div>
           </div>
 
           {/* Operator Window */}
-          <div className={`p-4 rounded-lg border ${archiveMode ? "bg-gray-800/30 border-gray-700" : "bg-orange-900/20 border-orange-800"}`}>
-            <div className={`font-medium mb-2 ${archiveMode ? "text-gray-500" : "text-orange-400"}`}>
+          <div className={`p-4 rounded-lg border ${archiveMode ? "bg-[var(--surface)]/30 border-[color:var(--rule-strong)]" : "bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] border-[color:var(--accent)]"}`}>
+            <div className={`font-medium mb-2 ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--accent)]"}`}>
               Operator Window (OW)
             </div>
-            <div className={`text-2xl font-bold ${archiveMode ? "text-gray-500" : "text-gray-100"}`}>
+            <div className={`text-2xl font-bold ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--fg)]"}`}>
               {fullConfig?.pruning?.ow_blocks ?? 2016} blocks
             </div>
-            <div className="text-sm text-gray-400 mt-1">
+            <div className="text-sm text-[color:var(--dim)] mt-1">
               ~{formatDuration(fullConfig?.pruning?.ow_blocks ?? 2016)}
             </div>
-            <div className={`mt-3 text-xs ${archiveMode ? "text-gray-500" : "text-orange-300"}`}>
+            <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--accent)]"}`}>
               {archiveMode ? "Disabled (Archive Mode)" : "BUDS-based pruning applied here"}
             </div>
           </div>
 
           {/* Archive Window */}
-          <div className={`p-4 rounded-lg border ${archiveMode ? "bg-green-900/20 border-green-800" : "bg-gray-800/30 border-gray-700"}`}>
-            <div className={`font-medium mb-2 ${archiveMode ? "text-green-400" : "text-gray-500"}`}>
+          <div className={`p-4 rounded-lg border ${archiveMode ? "bg-[color-mix(in_srgb,var(--green)_16%,transparent)] border-[color:var(--green)]" : "bg-[var(--surface)]/30 border-[color:var(--rule-strong)]"}`}>
+            <div className={`font-medium mb-2 ${archiveMode ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}`}>
               Archive Window (AW)
             </div>
-            <div className={`text-2xl font-bold ${archiveMode ? "text-gray-100" : "text-gray-500"}`}>
+            <div className={`text-2xl font-bold ${archiveMode ? "text-[color:var(--fg)]" : "text-[color:var(--fainter)]"}`}>
               {archiveMode ? "Infinite" : "Pruned"}
             </div>
-            <div className="text-sm text-gray-400 mt-1">
+            <div className="text-sm text-[color:var(--dim)] mt-1">
               {archiveMode ? "All history retained" : "Data beyond OW is deleted"}
             </div>
-            <div className={`mt-3 text-xs ${archiveMode ? "text-green-300" : "text-gray-500"}`}>
+            <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}`}>
               {archiveMode ? "Full chain storage enabled" : "Enable Archive Mode for +5 shares"}
             </div>
           </div>
@@ -166,7 +166,7 @@ export function StoragePruningCard() {
         {/* Operator Window Selection (only if not archive mode) */}
         {!archiveMode && (
           <div className="space-y-3">
-            <label className="text-sm font-medium text-gray-300">Operator Window Size</label>
+            <label className="text-sm font-medium text-[color:var(--dim)]">Operator Window Size</label>
             <div className="grid grid-cols-3 gap-3">
               {OW_PRESETS.map((preset) => (
                 <button
@@ -175,13 +175,13 @@ export function StoragePruningCard() {
                   disabled={setOperatorWindow.isPending}
                   className={`p-3 rounded-lg border transition-colors text-left ${
                     fullConfig?.pruning?.ow_blocks === preset.blocks
-                      ? "bg-orange-900/30 border-orange-600 text-orange-300"
-                      : "bg-gray-800/50 border-gray-700 text-gray-300 hover:border-gray-500"
+                      ? "bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] border-[color:var(--accent)] text-[color:var(--accent)]"
+                      : "bg-[var(--surface)]/50 border-[color:var(--rule-strong)] text-[color:var(--dim)] hover:border-[color:var(--rule-strong)]"
                   }`}
                 >
                   <div className="font-medium">{preset.label}</div>
-                  <div className="text-xs text-gray-500 mt-1">{preset.blocks} blocks</div>
-                  <div className="text-xs text-gray-400 mt-1">{preset.description}</div>
+                  <div className="text-xs text-[color:var(--fainter)] mt-1">{preset.blocks} blocks</div>
+                  <div className="text-xs text-[color:var(--dim)] mt-1">{preset.description}</div>
                 </button>
               ))}
             </div>
@@ -191,8 +191,8 @@ export function StoragePruningCard() {
         {/* Prune Profile Selection (only if not archive mode) */}
         {!archiveMode && (
           <div className="space-y-3">
-            <label className="text-sm font-medium text-gray-300">BUDS Prune Profile</label>
-            <p className="text-xs text-gray-500">
+            <label className="text-sm font-medium text-[color:var(--dim)]">BUDS Prune Profile</label>
+            <p className="text-xs text-[color:var(--fainter)]">
               Controls which BUDS tiers are retained in the Operator Window
             </p>
             <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
@@ -203,13 +203,13 @@ export function StoragePruningCard() {
                   disabled={setPruneProfile.isPending}
                   className={`p-3 rounded-lg border transition-colors text-left ${
                     fullConfig?.pruning?.prune_profile === profile.value
-                      ? "bg-orange-900/30 border-orange-600 text-orange-300"
-                      : "bg-gray-800/50 border-gray-700 text-gray-300 hover:border-gray-500"
+                      ? "bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] border-[color:var(--accent)] text-[color:var(--accent)]"
+                      : "bg-[var(--surface)]/50 border-[color:var(--rule-strong)] text-[color:var(--dim)] hover:border-[color:var(--rule-strong)]"
                   }`}
                 >
                   <div className="font-medium capitalize">{profile.label}</div>
-                  <div className="text-xs text-green-400 mt-1">Keep: {profile.keep}</div>
-                  <div className="text-xs text-red-400">Prune: {profile.prune}</div>
+                  <div className="text-xs text-[color:var(--green)] mt-1">Keep: {profile.keep}</div>
+                  <div className="text-xs text-[color:var(--red)]">Prune: {profile.prune}</div>
                 </button>
               ))}
             </div>

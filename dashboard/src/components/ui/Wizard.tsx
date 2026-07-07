@@ -24,15 +24,15 @@ export function StepIndicator({ steps, currentStep }: StepIndicatorProps) {
               {/* Dot */}
               <div className="relative flex items-center justify-center">
                 {isActive && (
-                  <span className="absolute inline-flex h-8 w-8 rounded-full bg-orange-500/20 animate-ping" />
+                  <span className="absolute inline-flex h-8 w-8 rounded-full bg-[var(--accent)]/20 animate-ping" />
                 )}
                 <div
                   className={`
                     relative z-10 flex items-center justify-center w-8 h-8 rounded-full text-sm font-semibold
                     transition-colors duration-200
-                    ${isCompleted ? 'bg-orange-600 text-white' : ''}
-                    ${isActive ? 'border-2 border-orange-500 text-orange-400 bg-gray-900' : ''}
-                    ${isPending ? 'bg-gray-700 text-gray-400' : ''}
+                    ${isCompleted ? 'bg-[var(--accent)] text-[color:var(--fg)]' : ''}
+                    ${isActive ? 'border-2 border-[color:var(--accent)] text-[color:var(--accent)] bg-[var(--surface)]' : ''}
+                    ${isPending ? 'bg-[var(--rule-strong)] text-[color:var(--dim)]' : ''}
                   `}
                 >
                   {isCompleted ? (
@@ -48,9 +48,9 @@ export function StepIndicator({ steps, currentStep }: StepIndicatorProps) {
               <span
                 className={`
                   hidden md:block mt-2 text-xs text-center truncate max-w-[80px]
-                  ${isCompleted ? 'text-orange-300' : ''}
-                  ${isActive ? 'text-orange-400 font-medium' : ''}
-                  ${isPending ? 'text-gray-500' : ''}
+                  ${isCompleted ? 'text-[color:var(--accent)]' : ''}
+                  ${isActive ? 'text-[color:var(--accent)] font-medium' : ''}
+                  ${isPending ? 'text-[color:var(--fainter)]' : ''}
                 `}
               >
                 {step.title}
@@ -63,7 +63,7 @@ export function StepIndicator({ steps, currentStep }: StepIndicatorProps) {
                 <div
                   className={`
                     h-0.5 w-full transition-colors duration-200
-                    ${index < currentStep ? 'bg-orange-600' : 'bg-gray-700'}
+                    ${index < currentStep ? 'bg-[var(--accent)]' : 'bg-[var(--rule-strong)]'}
                   `}
                 />
               </div>
@@ -128,7 +128,7 @@ export function WizardDialog<TData>({
 
       {/* Error Banner */}
       {wizard.error && (
-        <div className="mb-4 px-4 py-3 rounded-lg bg-red-900/50 border border-red-700 text-red-200 text-sm">
+        <div className="mb-4 px-4 py-3 rounded-lg bg-[color-mix(in_srgb,var(--red)_20%,var(--surface))] border border-[color-mix(in_srgb,var(--red)_40%,transparent)] text-[color:var(--red)] text-sm">
           {wizard.error}
         </div>
       )}

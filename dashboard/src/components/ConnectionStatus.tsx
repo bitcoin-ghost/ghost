@@ -7,19 +7,19 @@ export function ConnectionStatus() {
 
   const statusConfig = {
     connected: {
-      color: "bg-green-500",
+      color: "bg-[var(--green)]",
       label: "Live",
     },
     connecting: {
-      color: "bg-yellow-500",
+      color: "bg-[var(--accent)]",
       label: "Connecting",
     },
     disconnected: {
-      color: "bg-gray-500",
+      color: "bg-[var(--fainter)]",
       label: "Offline",
     },
     error: {
-      color: "bg-red-500",
+      color: "bg-[var(--red)]",
       label: "Error",
     },
   };
@@ -30,11 +30,11 @@ export function ConnectionStatus() {
     <div className="flex items-center gap-2">
       <span className="relative flex h-2 w-2">
         {isConnected && (
-          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--green)] opacity-75"></span>
         )}
         <span className={`relative inline-flex rounded-full h-2 w-2 ${config.color}`}></span>
       </span>
-      <span className="text-xs text-gray-500 hidden sm:inline">{config.label}</span>
+      <span className="text-xs text-[color:var(--fainter)] hidden sm:inline">{config.label}</span>
     </div>
   );
 }

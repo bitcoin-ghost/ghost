@@ -33,8 +33,8 @@ export function ConfigCard() {
       <Card>
         <CardHeader title="Configuration" />
         <div className="animate-pulse space-y-4">
-          <div className="h-6 bg-gray-800 rounded w-full"></div>
-          <div className="h-6 bg-gray-800 rounded w-full"></div>
+          <div className="h-6 bg-[var(--surface)] rounded w-full"></div>
+          <div className="h-6 bg-[var(--surface)] rounded w-full"></div>
         </div>
       </Card>
     );
@@ -44,7 +44,7 @@ export function ConfigCard() {
     return (
       <Card>
         <CardHeader title="Configuration" />
-        <p className="text-gray-400">
+        <p className="text-[color:var(--dim)]">
           {error ? `Error: ${error.message}` : "Unable to load configuration"}
         </p>
       </Card>
@@ -58,8 +58,8 @@ export function ConfigCard() {
       <div className="space-y-6">
         <div className="flex items-center justify-between">
           <div>
-            <div className="text-gray-100 font-medium">Ghost Mode</div>
-            <div className="text-sm text-gray-400">
+            <div className="text-[color:var(--fg)] font-medium">Ghost Mode</div>
+            <div className="text-sm text-[color:var(--dim)]">
               Private blocks-only peer mode
             </div>
           </div>
@@ -73,8 +73,8 @@ export function ConfigCard() {
 
         <div className="flex items-center justify-between">
           <div>
-            <div className="text-gray-100 font-medium">Archive Mode</div>
-            <div className="text-sm text-gray-400">
+            <div className="text-[color:var(--fg)] font-medium">Archive Mode</div>
+            <div className="text-sm text-[color:var(--dim)]">
               Full chain storage, no pruning
             </div>
           </div>
@@ -86,16 +86,16 @@ export function ConfigCard() {
           />
         </div>
 
-        <div className="pt-4 border-t border-gray-800">
+        <div className="pt-4 border-t border-[color:var(--rule)]">
           <div className="flex justify-between mb-2">
-            <span className="text-gray-400">Mempool Profile</span>
-            <span className="text-gray-100 capitalize">
+            <span className="text-[color:var(--dim)]">Mempool Profile</span>
+            <span className="text-[color:var(--fg)] capitalize">
               {(config.mempool_profile ?? "standard").replace("_", " ")}
             </span>
           </div>
           <div className="flex justify-between">
-            <span className="text-gray-400">Template Profile</span>
-            <span className="text-gray-100 capitalize">
+            <span className="text-[color:var(--dim)]">Template Profile</span>
+            <span className="text-[color:var(--fg)] capitalize">
               {(config.template_profile ?? "standard").replace("_", " ")}
             </span>
           </div>

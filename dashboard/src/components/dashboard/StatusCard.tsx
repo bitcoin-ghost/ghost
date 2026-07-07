@@ -24,8 +24,8 @@ export function StatusCard() {
       <Card>
         <CardHeader title="Node Status" />
         <div className="animate-pulse space-y-3">
-          <div className="h-4 bg-gray-800 rounded w-3/4"></div>
-          <div className="h-4 bg-gray-800 rounded w-1/2"></div>
+          <div className="h-4 bg-[var(--surface)] rounded w-3/4"></div>
+          <div className="h-4 bg-[var(--surface)] rounded w-1/2"></div>
         </div>
       </Card>
     );
@@ -35,7 +35,7 @@ export function StatusCard() {
     return (
       <Card>
         <CardHeader title="Node Status" />
-        <p className="text-gray-400">
+        <p className="text-[color:var(--dim)]">
           {error ? `Error: ${error.message}` : "Unable to load status"}
         </p>
       </Card>
@@ -44,9 +44,9 @@ export function StatusCard() {
 
   const getColorClasses = (active: boolean) => {
     if (active) {
-      return { dot: "bg-green-500", badge: "success" as const };
+      return { dot: "bg-[var(--green)]", badge: "success" as const };
     }
-    return { dot: "bg-red-500", badge: "error" as const };
+    return { dot: "bg-[var(--red)]", badge: "error" as const };
   };
 
   return (
@@ -62,32 +62,32 @@ export function StatusCard() {
 
       <div className="space-y-4">
         <div className="flex justify-between items-center">
-          <span className="text-gray-400">Block Height</span>
-          <span className="font-mono text-gray-100">
+          <span className="text-[color:var(--dim)]">Block Height</span>
+          <span className="font-mono text-[color:var(--fg)]">
             {(status.sync_height ?? status.block_height ?? 0).toLocaleString()}
           </span>
         </div>
 
         <div className="flex justify-between items-center">
-          <span className="text-gray-400">Peers</span>
-          <span className="font-mono text-gray-100">{status.peer_count ?? 0}</span>
+          <span className="text-[color:var(--dim)]">Peers</span>
+          <span className="font-mono text-[color:var(--fg)]">{status.peer_count ?? 0}</span>
         </div>
 
         <div className="flex justify-between items-center">
-          <span className="text-gray-400">Mempool Profile</span>
-          <span className="font-mono text-gray-100 text-sm capitalize">
+          <span className="text-[color:var(--dim)]">Mempool Profile</span>
+          <span className="font-mono text-[color:var(--fg)] text-sm capitalize">
             {(status.mempool_profile ?? "standard").replace("_", " ")}
           </span>
         </div>
 
         <div className="flex justify-between items-center">
-          <span className="text-gray-400">Template Profile</span>
-          <span className="font-mono text-gray-100 text-sm capitalize">
+          <span className="text-[color:var(--dim)]">Template Profile</span>
+          <span className="font-mono text-[color:var(--fg)] text-sm capitalize">
             {(status.template_profile ?? "standard").replace("_", " ")}
           </span>
         </div>
 
-        <div className="pt-4 border-t border-gray-800 space-y-2">
+        <div className="pt-4 border-t border-[color:var(--rule)] space-y-2">
           {MODE_CONFIG_PRIMARY.map((mode) => {
             const isActive = status[mode.key as keyof typeof status] as boolean;
             const colors = getColorClasses(isActive);
@@ -95,7 +95,7 @@ export function StatusCard() {
             return (
               <div key={mode.key} className="flex items-center gap-2">
                 <span className={`w-2 h-2 rounded-full ${colors.dot}`} />
-                <span className="text-sm text-gray-300 flex-1">{mode.name}</span>
+                <span className="text-sm text-[color:var(--dim)] flex-1">{mode.name}</span>
                 <Badge variant={colors.badge}>
                   {isActive ? "Active" : "Off"}
                 </Badge>
@@ -104,7 +104,7 @@ export function StatusCard() {
           })}
         </div>
 
-        <div className="pt-3 border-t border-gray-800/50 space-y-2">
+        <div className="pt-3 border-t border-[color:var(--rule)]/50 space-y-2">
           {MODE_CONFIG_SECONDARY.map((mode) => {
             const isActive = status[mode.key as keyof typeof status] as boolean;
             const colors = getColorClasses(isActive);
@@ -112,7 +112,7 @@ export function StatusCard() {
             return (
               <div key={mode.key} className="flex items-center gap-2">
                 <span className={`w-2 h-2 rounded-full ${colors.dot}`} />
-                <span className="text-sm text-gray-300 flex-1">{mode.name}</span>
+                <span className="text-sm text-[color:var(--dim)] flex-1">{mode.name}</span>
                 <Badge variant={colors.badge}>
                   {isActive ? "Active" : "Off"}
                 </Badge>

@@ -13,7 +13,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
     return (
       <div className="space-y-1">
         {label && (
-          <label className="block text-sm font-medium text-gray-300">
+          <label className="block text-sm font-medium text-[color:var(--dim)]">
             {label}
           </label>
         )}
@@ -21,20 +21,20 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
           ref={ref}
           className={`
             w-full px-3 py-2 text-sm
-            bg-gray-800 border rounded-lg
-            text-gray-100 placeholder-gray-500
+            bg-[var(--surface)] border rounded-lg
+            text-[color:var(--fg)] placeholder-[color:var(--fainter)]
             focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent
             disabled:opacity-50 disabled:cursor-not-allowed
-            ${error ? 'border-red-500' : 'border-gray-700'}
+            ${error ? 'border-[color:var(--red)]' : 'border-[color:var(--rule-strong)]'}
             ${className}
           `.trim()}
           {...props}
         />
         {error && (
-          <p className="text-xs text-red-400">{error}</p>
+          <p className="text-xs text-[color:var(--red)]">{error}</p>
         )}
         {helperText && !error && (
-          <p className="text-xs text-gray-500">{helperText}</p>
+          <p className="text-xs text-[color:var(--fainter)]">{helperText}</p>
         )}
       </div>
     );
@@ -54,7 +54,7 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
     return (
       <div className="space-y-1">
         {label && (
-          <label className="block text-sm font-medium text-gray-300">
+          <label className="block text-sm font-medium text-[color:var(--dim)]">
             {label}
           </label>
         )}
@@ -62,21 +62,21 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
           ref={ref}
           className={`
             w-full px-3 py-2 text-sm
-            bg-gray-800 border rounded-lg
-            text-gray-100 placeholder-gray-500
+            bg-[var(--surface)] border rounded-lg
+            text-[color:var(--fg)] placeholder-[color:var(--fainter)]
             focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent
             disabled:opacity-50 disabled:cursor-not-allowed
             resize-none
-            ${error ? 'border-red-500' : 'border-gray-700'}
+            ${error ? 'border-[color:var(--red)]' : 'border-[color:var(--rule-strong)]'}
             ${className}
           `.trim()}
           {...props}
         />
         {error && (
-          <p className="text-xs text-red-400">{error}</p>
+          <p className="text-xs text-[color:var(--red)]">{error}</p>
         )}
         {helperText && !error && (
-          <p className="text-xs text-gray-500">{helperText}</p>
+          <p className="text-xs text-[color:var(--fainter)]">{helperText}</p>
         )}
       </div>
     );
@@ -97,7 +97,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
     return (
       <div className="space-y-1">
         {label && (
-          <label className="block text-sm font-medium text-gray-300">
+          <label className="block text-sm font-medium text-[color:var(--dim)]">
             {label}
           </label>
         )}
@@ -105,11 +105,11 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
           ref={ref}
           className={`
             w-full px-3 py-2 text-sm
-            bg-gray-800 border rounded-lg
-            text-gray-100
+            bg-[var(--surface)] border rounded-lg
+            text-[color:var(--fg)]
             focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent
             disabled:opacity-50 disabled:cursor-not-allowed
-            ${error ? 'border-red-500' : 'border-gray-700'}
+            ${error ? 'border-[color:var(--red)]' : 'border-[color:var(--rule-strong)]'}
             ${className}
           `.trim()}
           {...(props as React.SelectHTMLAttributes<HTMLSelectElement>)}
@@ -121,10 +121,10 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
           ))}
         </select>
         {error && (
-          <p className="text-xs text-red-400">{error}</p>
+          <p className="text-xs text-[color:var(--red)]">{error}</p>
         )}
         {helperText && !error && (
-          <p className="text-xs text-gray-500">{helperText}</p>
+          <p className="text-xs text-[color:var(--fainter)]">{helperText}</p>
         )}
       </div>
     );
