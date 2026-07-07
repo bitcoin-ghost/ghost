@@ -5,8 +5,6 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Dialog } from "@/components/ui/Dialog";
-import { Input } from "@/components/ui/Input";
-import { Toggle } from "@/components/ui/Toggle";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
@@ -188,21 +186,12 @@ export default function SystemPage() {
   const deleteBackupMutation = useDeleteBackup();
 
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
-  const [exportPassword, setExportPassword] = useState("");
-  const [exportConfirmPassword, setExportConfirmPassword] = useState("");
-  const [exportOptions, setExportOptions] = useState({
-    include_identity: true,
-    include_wallet_keys: true,
-    include_config: true,
-    include_ghost_pay_db: true,
-    include_block_history: true,
-    include_logs: false,
-  });
 
   const [importDialogOpen, setImportDialogOpen] = useState(false);
-  const [importPassword, setImportPassword] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [verifyResult, setVerifyResult] = useState<VerifyBackupResponse | null>(null);
+  // Set after a successful import: the artifact is staged and a restart applies it.
+  const [restartRequired, setRestartRequired] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const backupHistory = historyData?.backups ?? [];
@@ -335,20 +324,10 @@ export default function SystemPage() {
   };
 
   const handleExport = async () => {
-    if (exportPassword !== exportConfirmPassword) {
-      toastError("Password Mismatch", "Passwords do not match");
-      return;
-    }
-    if (exportPassword.length < 8) {
-      toastError("Weak Password", "Password must be at least 8 characters");
-      return;
-    }
-
     try {
-      const result = await createBackup.mutateAsync({
-        options: exportOptions,
-        password: exportPassword,
-      });
+      // The node produces a full encrypted snapshot server-side, then we stream
+      // the bytes down through the proxy.
+      const result = await createBackup.mutateAsync();
 
       const link = document.createElement("a");
       link.href = getBackupDownloadUrl(result.filename);
@@ -359,8 +338,6 @@ export default function SystemPage() {
 
       success("Backup Created", `Backup saved as ${result.filename}`);
       setExportDialogOpen(false);
-      setExportPassword("");
-      setExportConfirmPassword("");
     } catch (err) {
       toastError("Export Failed", err instanceof Error ? err.message : "Unknown error");
     }
@@ -374,19 +351,16 @@ export default function SystemPage() {
   };
 
   const handleVerify = async () => {
-    if (!selectedFile || !importPassword) return;
+    if (!selectedFile) return;
 
     try {
-      const result = await verifyBackup.mutateAsync({
-        file: selectedFile,
-        password: importPassword,
-      });
+      const result = await verifyBackup.mutateAsync({ file: selectedFile });
       setVerifyResult(result);
 
       if (result.valid) {
-        success("Backup Verified", "Backup file is valid and can be imported");
+        success("Backup Verified", "Backup file passed the integrity and schema checks");
       } else {
-        warning("Verification Failed", result.error ?? "Backup file is invalid or password is incorrect");
+        warning("Verification Failed", result.error ?? "Backup file is invalid or corrupt");
       }
     } catch (err) {
       toastError("Verification Failed", err instanceof Error ? err.message : "Unknown error");
@@ -394,19 +368,16 @@ export default function SystemPage() {
   };
 
   const handleImport = async () => {
-    if (!selectedFile || !importPassword || !verifyResult?.valid) return;
+    if (!selectedFile || !verifyResult?.valid) return;
 
     try {
-      await importBackup.mutateAsync({
-        file: selectedFile,
-        password: importPassword,
-      });
-
-      success("Import Complete", "Backup restored successfully. The node will restart.");
-      setImportDialogOpen(false);
-      setSelectedFile(null);
-      setImportPassword("");
-      setVerifyResult(null);
+      const result = await importBackup.mutateAsync({ file: selectedFile });
+      setRestartRequired(Boolean(result.restart_required));
+      success(
+        "Restore Staged",
+        result.message ??
+          "Backup verified and staged. Restart ghost-pool to apply the restore.",
+      );
     } catch (err) {
       toastError("Import Failed", err instanceof Error ? err.message : "Unknown error");
     }
@@ -901,7 +872,9 @@ export default function SystemPage() {
               <div className="p-4 bg-gray-800/50 rounded-lg">
                 <div className="text-gray-100 font-medium mb-1">Export Backup</div>
                 <p className="text-gray-400 text-sm mb-3">
-                  Create an encrypted backup of your node configuration, locks, wallet data, and history.
+                  Create a full snapshot of this node&apos;s pool database (miners, shares,
+                  rounds, payouts) and download it. The artifact is encrypted with this
+                  node&apos;s own key.
                 </p>
                 <Button variant="primary" onClick={() => setExportDialogOpen(true)}>
                   Create Backup
@@ -911,7 +884,9 @@ export default function SystemPage() {
               <div className="p-4 bg-gray-800/50 rounded-lg">
                 <div className="text-gray-100 font-medium mb-1">Import Backup</div>
                 <p className="text-gray-400 text-sm mb-3">
-                  Restore from an encrypted backup file. This will replace current data with the backup contents.
+                  Restore from a backup file. The artifact is verified, then staged and applied
+                  atomically on the next ghost-pool restart (your current database is copied to a
+                  safety backup first).
                 </p>
                 <Button variant="secondary" onClick={() => setImportDialogOpen(true)}>
                   Restore Backup
@@ -954,9 +929,7 @@ export default function SystemPage() {
                           </div>
                         </div>
                         <div className="flex items-center gap-2">
-                          <Badge variant={backup.type === "full" ? "success" : "info"}>
-                            {backup.type === "full" ? "Full" : "Partial"}
-                          </Badge>
+                          <Badge variant="success">Full</Badge>
                           <Button
                             variant="ghost"
                             size="sm"
@@ -986,7 +959,7 @@ export default function SystemPage() {
               <ul className="text-sm text-orange-300/80 space-y-1 list-disc list-inside">
                 <li>Create regular backups before making configuration changes</li>
                 <li>Store backup files in a secure location separate from your node</li>
-                <li>Use a strong, unique password and store it safely</li>
+                <li>The artifact is encrypted with this node&apos;s key — restore it on this node</li>
                 <li>Test your backups periodically by verifying them</li>
                 <li>Keep multiple backup copies in different locations</li>
               </ul>
@@ -1086,101 +1059,23 @@ export default function SystemPage() {
         title="Create Backup"
       >
         <div className="space-y-4">
-          <div>
-            <h4 className="text-sm font-medium text-gray-300 mb-3">Include in Backup</h4>
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-gray-100">Node Identity</div>
-                  <div className="text-xs text-gray-400">Node ID and keys</div>
-                </div>
-                <Toggle
-                  enabled={exportOptions.include_identity}
-                  onChange={(v) => setExportOptions({ ...exportOptions, include_identity: v })}
-                  label="Include identity"
-                />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-gray-100">Wallet Keys</div>
-                  <div className="text-xs text-gray-400">Private keys and wallet data</div>
-                </div>
-                <Toggle
-                  enabled={exportOptions.include_wallet_keys}
-                  onChange={(v) => setExportOptions({ ...exportOptions, include_wallet_keys: v })}
-                  label="Include wallet"
-                />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-gray-100">Configuration</div>
-                  <div className="text-xs text-gray-400">Node settings and preferences</div>
-                </div>
-                <Toggle
-                  enabled={exportOptions.include_config}
-                  onChange={(v) => setExportOptions({ ...exportOptions, include_config: v })}
-                  label="Include config"
-                />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-gray-100">Ghost Pay Database</div>
-                  <div className="text-xs text-gray-400">L2 locks and payment data</div>
-                </div>
-                <Toggle
-                  enabled={exportOptions.include_ghost_pay_db}
-                  onChange={(v) => setExportOptions({ ...exportOptions, include_ghost_pay_db: v })}
-                  label="Include ghost pay"
-                />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-gray-100">Block History</div>
-                  <div className="text-xs text-gray-400">Historical block data</div>
-                </div>
-                <Toggle
-                  enabled={exportOptions.include_block_history}
-                  onChange={(v) => setExportOptions({ ...exportOptions, include_block_history: v })}
-                  label="Include history"
-                />
-              </div>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-gray-100">Logs</div>
-                  <div className="text-xs text-gray-400">Node log files</div>
-                </div>
-                <Toggle
-                  enabled={exportOptions.include_logs}
-                  onChange={(v) => setExportOptions({ ...exportOptions, include_logs: v })}
-                  label="Include logs"
-                />
-              </div>
-            </div>
-          </div>
+          <p className="text-sm text-gray-300">
+            This creates a consistent, compact snapshot of this node&apos;s pool database
+            (<span className="font-mono text-gray-200">VACUUM INTO</span>) — miners, shares,
+            rounds and payout records — and downloads it as a timestamped
+            <span className="font-mono text-gray-200"> .db</span> file.
+          </p>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Encryption Password</label>
-            <Input
-              type="password"
-              value={exportPassword}
-              onChange={(e) => setExportPassword(e.target.value)}
-              placeholder="Enter a strong password"
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Confirm Password</label>
-            <Input
-              type="password"
-              value={exportConfirmPassword}
-              onChange={(e) => setExportConfirmPassword(e.target.value)}
-              placeholder="Confirm password"
-            />
+          <div className="p-3 bg-gray-800/50 border border-gray-700 rounded space-y-1">
+            <p className="text-sm text-gray-300">
+              The artifact is encrypted with this node&apos;s own key: payout addresses stay
+              field-encrypted, so no separate backup password is needed.
+            </p>
           </div>
 
           <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded">
             <p className="text-yellow-400 text-sm">
-              Store your password securely. You will need it to restore from this backup.
+              Because it is bound to this node&apos;s key, restore this backup on this same node.
             </p>
           </div>
 
@@ -1193,11 +1088,6 @@ export default function SystemPage() {
               className="flex-1"
               onClick={handleExport}
               loading={createBackup.isPending}
-              disabled={
-                !exportPassword ||
-                exportPassword !== exportConfirmPassword ||
-                exportPassword.length < 8
-              }
             >
               Create Backup
             </Button>
@@ -1211,8 +1101,8 @@ export default function SystemPage() {
         onClose={() => {
           setImportDialogOpen(false);
           setSelectedFile(null);
-          setImportPassword("");
           setVerifyResult(null);
+          setRestartRequired(false);
         }}
         title="Restore Backup"
       >
@@ -1222,7 +1112,7 @@ export default function SystemPage() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".ghost,.backup"
+              accept=".db,.backup"
               onChange={handleFileSelect}
               className="hidden"
             />
@@ -1235,24 +1125,20 @@ export default function SystemPage() {
                 {selectedFile ? selectedFile.name : "Select File"}
               </Button>
               {selectedFile && (
-                <Button variant="ghost" onClick={() => setSelectedFile(null)}>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setSelectedFile(null);
+                    setVerifyResult(null);
+                  }}
+                >
                   Clear
                 </Button>
               )}
             </div>
           </div>
 
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Backup Password</label>
-            <Input
-              type="password"
-              value={importPassword}
-              onChange={(e) => setImportPassword(e.target.value)}
-              placeholder="Enter backup password"
-            />
-          </div>
-
-          {!verifyResult && selectedFile && importPassword && (
+          {!restartRequired && !verifyResult && selectedFile && (
             <Button
               variant="secondary"
               onClick={handleVerify}
@@ -1263,7 +1149,7 @@ export default function SystemPage() {
             </Button>
           )}
 
-          {verifyResult && (
+          {!restartRequired && verifyResult && (
             <div
               className={`p-4 rounded-lg border ${
                 verifyResult.valid
@@ -1276,29 +1162,45 @@ export default function SystemPage() {
                   {verifyResult.valid ? "Valid" : "Invalid"}
                 </Badge>
                 <span className={verifyResult.valid ? "text-green-400" : "text-red-400"}>
-                  {verifyResult.valid ? "Backup verified" : verifyResult.error}
+                  {verifyResult.valid ? "Passed integrity + schema checks" : verifyResult.error}
                 </span>
               </div>
               {verifyResult.valid && verifyResult.info && (
                 <div className="text-sm text-gray-400 space-y-1">
-                  <p>Created: {formatTimestampDate(verifyResult.info.created_at ?? 0)}</p>
-                  <p>Node ID: {(verifyResult.info.node_id ?? "").slice(0, 12)}...</p>
-                  <p>Locks: {verifyResult.info.locks_count ?? 0}</p>
+                  <p>Integrity: {verifyResult.info.integrity_ok ? "ok" : "failed"}</p>
+                  <p>Schema version: {verifyResult.info.schema_version ?? "?"}</p>
+                  <p>Tables: {verifyResult.info.table_count ?? 0}</p>
+                  <p>Miners: {verifyResult.info.miner_count ?? 0}</p>
+                  <p>Size: {formatBytes(verifyResult.info.size_bytes ?? 0)}</p>
                   <div className="flex gap-2 mt-2">
-                    {verifyResult.info.config_included && <Badge variant="info">Config</Badge>}
-                    {(verifyResult.info.locks_count ?? 0) > 0 && <Badge variant="info">Locks</Badge>}
-                    {verifyResult.info.ghost_pay_blocks && <Badge variant="info">Ghost Pay</Badge>}
+                    {verifyResult.info.encrypted && <Badge variant="info">Encrypted</Badge>}
                   </div>
                 </div>
               )}
             </div>
           )}
 
-          {verifyResult?.valid && (
+          {!restartRequired && verifyResult?.valid && (
             <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded">
               <p className="text-yellow-400 text-sm">
-                Warning: Importing a backup will replace your current node data. This action cannot
-                be undone.
+                Restoring stages this artifact and applies it on the next ghost-pool restart.
+                Your current database is copied to a timestamped safety backup first, then
+                replaced. Restart the node to complete the restore.
+              </p>
+            </div>
+          )}
+
+          {restartRequired && (
+            <div className="p-4 rounded-lg border bg-blue-900/20 border-blue-800 space-y-2">
+              <div className="flex items-center gap-2">
+                <Badge variant="info">Restart required</Badge>
+                <span className="text-blue-300">Restore staged</span>
+              </div>
+              <p className="text-sm text-gray-400">
+                The backup was verified and staged. Restart ghost-pool (System &gt; Restart, or
+                the node&apos;s service manager) to apply it. The current database is copied to a
+                <span className="font-mono"> .pre-restore-*.db </span> safety backup automatically
+                before the swap.
               </p>
             </div>
           )}
@@ -1310,21 +1212,23 @@ export default function SystemPage() {
               onClick={() => {
                 setImportDialogOpen(false);
                 setSelectedFile(null);
-                setImportPassword("");
                 setVerifyResult(null);
+                setRestartRequired(false);
               }}
             >
-              Cancel
+              {restartRequired ? "Close" : "Cancel"}
             </Button>
-            <Button
-              variant="danger"
-              className="flex-1"
-              onClick={handleImport}
-              loading={importBackup.isPending}
-              disabled={!verifyResult?.valid}
-            >
-              Restore Backup
-            </Button>
+            {!restartRequired && (
+              <Button
+                variant="danger"
+                className="flex-1"
+                onClick={handleImport}
+                loading={importBackup.isPending}
+                disabled={!verifyResult?.valid}
+              >
+                Restore Backup
+              </Button>
+            )}
           </div>
         </div>
       </Dialog>

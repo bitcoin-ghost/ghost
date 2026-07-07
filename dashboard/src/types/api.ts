@@ -944,24 +944,17 @@ export interface SwarmResponse {
 }
 
 // Backup/Migration types
-export interface BackupOptions {
-  include_identity?: boolean;
-  include_wallet_keys?: boolean;
-  include_config?: boolean;
-  include_ghost_pay_db?: boolean;
-  include_block_history?: boolean;
-  include_logs?: boolean;
-}
 
+// Real verification detail returned by the node's /api/v1/backup/verify. These
+// come straight from opening the artifact read-only and running an integrity +
+// Ghost-schema check — no fabricated fields.
 export interface BackupInfo {
-  node_id?: string;
-  elder_status?: boolean;
-  elder_slot?: number | null;
-  config_included?: boolean;
-  ghost_pay_blocks?: number | null;
-  locks_count?: number;
-  locks_balance_btc?: number;
-  created_at?: number;
+  integrity_ok?: boolean;
+  encrypted?: boolean;
+  schema_version?: number;
+  table_count?: number;
+  miner_count?: number;
+  missing_tables?: string[];
   size_bytes?: number;
   checksum_valid?: boolean;
 }
@@ -978,13 +971,23 @@ export interface BackupResponse {
   success: boolean;
   filename: string;
   size_bytes?: number;
+  created_at?: number;
   download_url?: string;
+  message?: string;
 }
 
 export interface VerifyBackupResponse {
   valid?: boolean;
   info?: BackupInfo | null;
   error?: string | null;
+}
+
+export interface ImportBackupResponse {
+  success: boolean;
+  restart_required?: boolean;
+  staged_path?: string;
+  message?: string;
+  error?: string;
 }
 
 export interface BackupHistoryResponse {

@@ -1,25 +1,29 @@
 // Backup/Migration API endpoints
 import { fetchApi, fetchWithTimeout, getApiBase } from './client';
-import type { BackupOptions, BackupResponse, BackupHistoryResponse, VerifyBackupResponse } from '@/types/api';
+import type { BackupResponse, BackupHistoryResponse, VerifyBackupResponse, ImportBackupResponse } from '@/types/api';
 
-export async function createBackup(options: BackupOptions, password: string): Promise<BackupResponse> {
+// The artifact is a full snapshot of the pool database, produced server-side by
+// VACUUM INTO and encrypted with the NODE's own key (payout addresses stay
+// field-encrypted; a SQLCipher DB copies under the same key). There is no
+// per-request password to supply — the node key is used automatically.
+export async function createBackup(): Promise<BackupResponse> {
   return fetchApi<BackupResponse>('/api/v1/backup/export', {
     method: 'POST',
-    body: JSON.stringify({ options, password }),
+    body: JSON.stringify({}),
   });
 }
 
-export async function verifyBackup(file: File, password: string): Promise<VerifyBackupResponse> {
-  // Read file and convert to base64
+export async function verifyBackup(file: File): Promise<VerifyBackupResponse> {
+  // Read file and convert to base64 (text-safe transport through the proxy).
   const fileContent = await fileToBase64(file);
 
   return fetchApi<VerifyBackupResponse>('/api/v1/backup/verify', {
     method: 'POST',
-    body: JSON.stringify({ file_content: fileContent, password }),
+    body: JSON.stringify({ file_content: fileContent }),
   });
 }
 
-export async function importBackup(file: File, password: string): Promise<void> {
+export async function importBackup(file: File): Promise<ImportBackupResponse> {
   // Read file and convert to base64
   const fileContent = await fileToBase64(file);
 
@@ -27,18 +31,19 @@ export async function importBackup(file: File, password: string): Promise<void> 
     `${getApiBase()}/api/proxy/api/v1/backup/import`,
     {
       method: 'POST',
-      body: JSON.stringify({ file_content: fileContent, password }),
+      body: JSON.stringify({ file_content: fileContent }),
       headers: {
         'Content-Type': 'application/json',
       },
     },
-    60000 // 60 second timeout for import
+    120000 // 2 minute timeout: import verifies the artifact server-side
   );
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(error.error || `API error: ${response.status}`);
+  const data = (await response.json().catch(() => ({}))) as ImportBackupResponse;
+  if (!response.ok || data.success === false) {
+    throw new Error(data.error || `API error: ${response.status}`);
   }
+  return data;
 }
 
 // Helper to convert File to base64
@@ -67,5 +72,7 @@ export async function deleteBackup(filename: string): Promise<{ success: boolean
 }
 
 export function getBackupDownloadUrl(filename: string): string {
-  return `${getApiBase()}/api/v1/backup/download/${encodeURIComponent(filename)}`;
+  // Route through the HMAC-signing proxy; the proxy streams binary payloads
+  // (see api/proxy/[...path]) so the download arrives byte-for-byte.
+  return `${getApiBase()}/api/proxy/api/v1/backup/download/${encodeURIComponent(filename)}`;
 }
