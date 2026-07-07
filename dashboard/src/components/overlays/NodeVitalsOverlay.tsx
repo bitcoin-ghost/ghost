@@ -117,10 +117,15 @@ function shift(c: RGB, d: number): RGB {
   };
 }
 
+// Difficulty formatting — metric prefixes (…M/G/T/P/E), matching the pool
+// page's formatDifficulty so a best share reads the same everywhere (e.g.
+// 4.26e9 → "4.26G", not "4.26B").
 function fmtCompact(n: number): string {
   if (!isFinite(n) || n <= 0) return '—';
+  if (n >= 1e18) return `${(n / 1e18).toFixed(2)}E`;
+  if (n >= 1e15) return `${(n / 1e15).toFixed(2)}P`;
   if (n >= 1e12) return `${(n / 1e12).toFixed(2)}T`;
-  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}G`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(2)}K`;
   return Math.round(n).toLocaleString();
