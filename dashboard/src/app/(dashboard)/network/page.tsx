@@ -25,7 +25,7 @@ import { useToast } from "@/components/ui/Toast";
 
 
 export default function NetworkPage() {
-  const { data: status, isLoading } = useNodeStatus();
+  const { data: status, isLoading, error: statusError } = useNodeStatus();
   const setTor = useSetTor();
   const { success, error } = useToast();
 
@@ -38,6 +38,26 @@ export default function NetworkPage() {
           subtitle="Live view of your node's outbound transport, onion address, and relay-suppression state."
         />
         <SkeletonCard />
+      </div>
+    );
+  }
+
+  // Surface a fetch failure instead of rendering a healthy-looking clearnet
+  // page (peers 0, no onion) that is indistinguishable from a real state.
+  if (statusError || !status) {
+    return (
+      <div className="space-y-6">
+        <PageHeader
+          eyebrow="network"
+          title="How this node is exposed."
+          subtitle="Live view of your node's outbound transport, onion address, and relay-suppression state."
+        />
+        <Card>
+          <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+            Could not reach the node status endpoint.{" "}
+            {statusError instanceof Error ? statusError.message : "Ensure Ghost Core is running."}
+          </p>
+        </Card>
       </div>
     );
   }

@@ -12,6 +12,7 @@
  */
 
 import { NodeVitalsOverlay } from '@/components/overlays/NodeVitalsOverlay';
+import { SectionErrorBoundary } from '@/components/ui/SectionErrorBoundary';
 
 export default function HomePage() {
   return (
@@ -19,9 +20,14 @@ export default function HomePage() {
       className="relative overflow-hidden -mt-14 -mx-4 -mb-4 md:-m-6 h-[100dvh]"
       style={{ background: 'var(--bg)' }}
     >
-      <div className="absolute inset-0">
-        <NodeVitalsOverlay active />
-      </div>
+      {/* A partial/degraded data response (e.g. a resources payload missing
+          fields) must never white-screen the whole Home route — contain any
+          render error to this section with a graceful fallback. */}
+      <SectionErrorBoundary section="Node Vitals">
+        <div className="absolute inset-0">
+          <NodeVitalsOverlay active />
+        </div>
+      </SectionErrorBoundary>
     </div>
   );
 }

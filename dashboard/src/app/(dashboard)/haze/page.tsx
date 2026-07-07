@@ -21,7 +21,9 @@ const TOOLTIPS = {
 
 // --- Helpers ---
 
-function formatStorageGB(bytes: number): string {
+function formatStorageGB(bytes: number | undefined | null): string {
+  // A missing/non-numeric size must render "--", never "NaN GB".
+  if (bytes == null || !Number.isFinite(bytes)) return "--";
   const gb = bytes / (1024 * 1024 * 1024);
   if (gb >= 1000) return `${(gb / 1024).toFixed(2)} TB`;
   if (gb >= 1) return `${gb.toFixed(2)} GB`;
@@ -101,7 +103,7 @@ export default function HazePage() {
         />
         <StatCard
           label="Blocks"
-          value={haze ? haze.blocks.toLocaleString() : "--"}
+          value={haze ? (haze.blocks ?? 0).toLocaleString() : "--"}
           sublabel={haze?.chain ?? undefined}
           tooltip={TOOLTIPS.blocks}
           loading={isLoading}
@@ -233,7 +235,7 @@ export default function HazePage() {
               </StatusRow>
               <StatusRow label="Blocks Processed">
                 <span className="font-mono text-sm text-[color:var(--fg)]">
-                  {haze?.blocks.toLocaleString() ?? 0}
+                  {(haze?.blocks ?? 0).toLocaleString()}
                 </span>
               </StatusRow>
               <StatusRow label="Storage on Disk">

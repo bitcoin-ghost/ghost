@@ -27,7 +27,9 @@ import type { MeshNode } from "@/lib/api/meshNodes";
 function utilPct(n: MeshNode): number {
   const cap = n.max_capacity ?? 0;
   if (!cap) return 0;
-  return Math.round((n.deduped_miner_count * 100) / cap);
+  // Guard the miner count too — an undefined `deduped_miner_count` yields NaN%,
+  // which also destabilises the sort comparator below.
+  return Math.round(((n.deduped_miner_count ?? 0) * 100) / cap);
 }
 
 function hasCapacity(n: MeshNode): boolean {

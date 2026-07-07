@@ -54,8 +54,11 @@ export interface GeoResult {
 const UNKNOWN_CC = 0xff;
 const GEOIP_URL = "/geo/geoip.bin";
 
-/** Strip a trailing `:port` and surrounding brackets to get the bare host. */
-export function extractHost(addressOrIp: string): string {
+/** Strip a trailing `:port` and surrounding brackets to get the bare host.
+ *  Returns "" for a missing/blank address (callers use it in top-level render
+ *  paths, so `.trim()` of undefined must never throw). */
+export function extractHost(addressOrIp: string | null | undefined): string {
+  if (!addressOrIp) return "";
   const host = addressOrIp.trim();
   const bracket = host.match(/^\[([^\]]+)\](?::\d+)?$/);
   if (bracket) return bracket[1];
