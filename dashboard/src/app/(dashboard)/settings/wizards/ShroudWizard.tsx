@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Toggle } from '@/components/ui/Toggle';
@@ -58,6 +59,22 @@ export default function ShroudWizard({ isOpen, onClose }: ShroudWizardProps) {
       enabled: shroudStatus?.enabled ?? false,
     },
   });
+
+  // Re-seed the editable toggle from live shroud status each time the dialog
+  // opens (the initial mount captured the `false` fallback before the status
+  // query resolved), so an untouched Finish writes back the live value rather
+  // than silently disabling Shroud.
+  const hydratedRef = useRef(false);
+  useEffect(() => {
+    if (!isOpen) {
+      hydratedRef.current = false;
+      return;
+    }
+    if (shroudStatus && !hydratedRef.current) {
+      hydratedRef.current = true;
+      wizard.reset({ enabled: shroudStatus.enabled ?? false });
+    }
+  }, [isOpen, shroudStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <WizardDialog

@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Input } from '@/components/ui/Input';
@@ -130,6 +131,28 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
       pool_name: '',
     },
   });
+
+  // The wizard captures its initial mining mode at mount, before the node/mining
+  // status queries resolve — so without this it defaults to `private_solo` and
+  // an untouched Finish would switch a public pool back to private solo. Re-seed
+  // the live mode each time the dialog opens. (payout_address / pool_name are
+  // write-only inputs the status endpoints don't return, so they start empty.)
+  const hydratedRef = useRef(false);
+  useEffect(() => {
+    if (!isOpen) {
+      hydratedRef.current = false;
+      return;
+    }
+    if ((miningStatus || nodeStatus) && !hydratedRef.current) {
+      hydratedRef.current = true;
+      wizard.reset({
+        mining_mode: currentMode,
+        public_mining: nodeStatus?.public_mining ?? false,
+        payout_address: '',
+        pool_name: '',
+      });
+    }
+  }, [isOpen, miningStatus, nodeStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <WizardDialog

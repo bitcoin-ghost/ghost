@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Badge } from '@/components/ui/Badge';
@@ -69,6 +70,22 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
       mode: currentMode as HazeMode,
     },
   });
+
+  // Re-seed the selected mode from live haze status each time the dialog opens
+  // (the initial mount captured the `standard` fallback before the status query
+  // resolved), so an untouched Finish keeps the current mode instead of forcing
+  // the node back to Standard.
+  const hydratedRef = useRef(false);
+  useEffect(() => {
+    if (!isOpen) {
+      hydratedRef.current = false;
+      return;
+    }
+    if (hazeStatus && !hydratedRef.current) {
+      hydratedRef.current = true;
+      wizard.reset({ mode: (hazeStatus.mode ?? 'standard') as HazeMode });
+    }
+  }, [isOpen, hazeStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <WizardDialog

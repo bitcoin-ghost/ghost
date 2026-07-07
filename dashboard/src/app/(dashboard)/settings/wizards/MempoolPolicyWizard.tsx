@@ -8,13 +8,11 @@ import { Toggle } from '@/components/ui/Toggle';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
 import {
-  useSetMempoolProfile,
-  useSetTemplateProfile,
   useSaveMempoolProfile,
   useActivateMempoolProfile,
+  useActivateTemplateProfile,
 } from '@/hooks/queries';
 import { DEFAULT_MEMPOOL_PROFILE } from '../MempoolProfileDialog';
-import type { MempoolProfile, TemplateProfile } from '@/types/api';
 import type { CustomMempoolProfile } from '@/lib/api/config';
 
 interface MempoolPolicyData {
@@ -72,10 +70,12 @@ const TEMPLATE_PROFILES = [
 ];
 
 export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWizardProps) {
-  const setMempoolProfile = useSetMempoolProfile();
-  const setTemplateProfile = useSetTemplateProfile();
+  // The mempool/template profile fields are the node's cosmetic dashboard
+  // mirror, written via the profile-activate routes. The old POST
+  // /config/{mempool,template}_profile endpoints are GET-only and 405.
   const saveMempoolProfile = useSaveMempoolProfile();
   const activateMempoolProfile = useActivateMempoolProfile();
+  const activateTemplateProfile = useActivateTemplateProfile();
   const toast = useToast();
 
   const steps = useMemo<WizardStep<MempoolPolicyData>[]>(() => {
@@ -144,9 +144,9 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
             await saveMempoolProfile.mutateAsync(customProfile);
             await activateMempoolProfile.mutateAsync(customProfile.name);
           } else {
-            await setMempoolProfile.mutateAsync(data.mempool_profile as MempoolProfile);
+            await activateMempoolProfile.mutateAsync(data.mempool_profile);
           }
-          await setTemplateProfile.mutateAsync(data.template_profile as TemplateProfile);
+          await activateTemplateProfile.mutateAsync(data.template_profile);
           toast.success(
             'Mempool Policy Updated',
             data.mempool_profile === 'custom'
@@ -158,7 +158,7 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
       },
     ];
     return allSteps;
-  }, [setMempoolProfile, setTemplateProfile, saveMempoolProfile, activateMempoolProfile, toast, onClose]);
+  }, [saveMempoolProfile, activateMempoolProfile, activateTemplateProfile, toast, onClose]);
 
   const wizard = useWizard<MempoolPolicyData>({
     steps,
