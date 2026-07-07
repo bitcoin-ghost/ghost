@@ -47,7 +47,7 @@ function formatHashrate(th: number): string {
 // is wrapped in a <Tooltip> that carries the explanatory copy.
 function InfoIcon() {
   return (
-    <svg className="w-3 h-3 text-[color:var(--fainter)] inline-block mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <svg className="w-3 h-3 text-[color:var(--fainter)] inline-block align-middle mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <circle cx="12" cy="12" r="10" />
       <path d="M12 16v-4M12 8h.01" />
     </svg>
@@ -458,7 +458,7 @@ export default function SwarmPage() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-3 bg-[var(--surface)] rounded-lg">
                 <Tooltip content={TOOLTIPS.nodeId}>
-                  <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Node ID</div>
+                  <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide mb-1 flex items-center gap-1"><InfoIcon /> Node ID</div>
                 </Tooltip>
                 <div className="font-mono text-sm text-[color:var(--fg)] break-all select-all">
                   {nodeInfo.node_id}
@@ -466,7 +466,7 @@ export default function SwarmPage() {
               </div>
               <div className="p-3 bg-[var(--surface)] rounded-lg">
                 <Tooltip content={TOOLTIPS.connectionAddress}>
-                  <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Connection Address</div>
+                  <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide mb-1 flex items-center gap-1"><InfoIcon /> Connection Address</div>
                 </Tooltip>
                 <div className="font-mono text-sm text-[color:var(--fg)] mb-2 select-all">
                   {swarmData?.self?.address
