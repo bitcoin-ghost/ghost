@@ -625,7 +625,6 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
             borderRadius: 9999,
             background: v.isSyncing ? 'var(--accent)' : 'var(--green)',
             boxShadow: `0 0 12px 2px rgba(${ACCENT_RGB}, ${v.isSyncing ? 0.6 : 0})`,
-            animation: active ? 'nv-blink 2.4s ease-in-out infinite' : undefined,
           }}
         />
         <span>Node Vitals</span>
@@ -1095,8 +1094,6 @@ function WatchdogLeds({ leds, active }: { leds: Led[]; active: boolean }) {
               background: TONE_COLOR[led.tone],
               boxShadow: `0 0 8px 1px ${TONE_COLOR[led.tone]}`,
               opacity: 0.9,
-              animation:
-                active && led.tone === 'ok' ? 'nv-blink 3s ease-in-out infinite' : undefined,
             }}
           />
           <span
