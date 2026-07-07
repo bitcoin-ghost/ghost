@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { NodeEvent } from "@/types/api";
-import { getWsUrl, isSessionExpired, redirectToLogin } from "@/lib/api/ws";
+import { getWsUrl, confirmSessionExpired, redirectToLogin } from "@/lib/api/ws";
 
 type ConnectionState = "connecting" | "connected" | "disconnected" | "error";
 
@@ -104,8 +104,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (!wasOpen) {
           // Handshake never completed. Could be a dead session (relay 401) or a
           // transient backend outage — ask the auth layer which it is before
-          // deciding to reconnect, so an expired session doesn't hot-loop.
-          isSessionExpired().then((expired) => {
+          // deciding to reconnect, so an expired session doesn't hot-loop. Only
+          // a CONFIRMED-stable 401 ejects to /login; a single transient blip on
+          // this always-on socket must not bounce a logged-in operator.
+          confirmSessionExpired().then((expired) => {
             if (!mountedRef.current) return;
             if (expired) {
               authDeadRef.current = true;

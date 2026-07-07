@@ -43,6 +43,23 @@ export async function isSessionExpired(): Promise<boolean> {
   }
 }
 
+/**
+ * Confirm the session is REALLY dead before ejecting the operator to /login.
+ *
+ * A single probe is not sufficient grounds to bounce. The Home screen mounts an
+ * always-on socket that reconnects continuously, so a lone close-before-open —
+ * a reconnect racing a cookie rotation, a momentary relay/backend blip — must
+ * NOT log a working operator out. We only treat the session as expired when the
+ * probe returns a definite 401 AND a second probe, a short beat later, still
+ * does. A genuinely expired or cleared cookie returns 401 persistently, so real
+ * logouts still redirect (about a second later); a transient reconnect does not.
+ */
+export async function confirmSessionExpired(): Promise<boolean> {
+  if (!(await isSessionExpired())) return false;
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  return isSessionExpired();
+}
+
 /** Redirect to the login page once, preserving the current path for return. */
 export function redirectToLogin(): void {
   if (redirecting || typeof window === "undefined") return;
