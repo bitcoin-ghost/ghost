@@ -281,10 +281,10 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
             <div className="space-y-4">
               {configLoading ? (
                 <div className="space-y-3">
-                  <div className="p-4 rounded-lg bg-gray-800/50">
+                  <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                     <div className="flex items-center gap-3 mb-3">
-                      <div className="w-5 h-5 rounded-full border-2 border-gray-600 border-t-orange-500 animate-spin" />
-                      <span className="text-gray-100 font-medium">Loading current configuration...</span>
+                      <div className="w-5 h-5 rounded-full border-2 border-[var(--rule-strong)] border-t-orange-500 animate-spin" />
+                      <span className="text-[color:var(--fg)] font-medium">Loading current configuration...</span>
                     </div>
                     <div className="space-y-2">
                       <Skeleton className="h-4 w-full" />
@@ -292,48 +292,48 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                       <Skeleton className="h-4 w-1/2" />
                     </div>
                   </div>
-                  <div className="p-4 rounded-lg bg-gray-800/50">
+                  <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                     <Skeleton className="h-4 w-2/3 mb-2" />
                     <Skeleton className="h-4 w-full" />
                   </div>
                 </div>
               ) : (
                 <div className="space-y-4">
-                  <div className="p-4 rounded-lg bg-green-900/20 border border-green-800">
+                  <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
                     <div className="flex items-center gap-3">
-                      <svg className="w-5 h-5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <svg className="w-5 h-5 text-[color:var(--green)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                       </svg>
-                      <span className="text-green-300 font-medium">Configuration loaded</span>
+                      <span className="text-[color:var(--green)] font-medium">Configuration loaded</span>
                     </div>
                   </div>
-                  <div className="p-4 rounded-lg bg-gray-800/50">
-                    <h4 className="text-gray-100 font-medium mb-3">Current Settings</h4>
+                  <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                    <h4 className="text-[color:var(--fg)] font-medium mb-3">Current Settings</h4>
                     <div className="space-y-2 text-sm">
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-400">Nickname</span>
-                        <span className="text-gray-100">{currentConfig.nickname || '--'}</span>
+                        <span className="text-[color:var(--dim)]">Nickname</span>
+                        <span className="text-[color:var(--fg)]">{currentConfig.nickname || '--'}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-400">Ghost Mode</span>
+                        <span className="text-[color:var(--dim)]">Ghost Mode</span>
                         <Badge variant={currentConfig.ghost_mode ? 'success' : 'default'}>
                           {currentConfig.ghost_mode ? 'On' : 'Off'}
                         </Badge>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-400">Public Mining</span>
+                        <span className="text-[color:var(--dim)]">Public Mining</span>
                         <Badge variant={currentConfig.public_mining ? 'success' : 'default'}>
                           {currentConfig.public_mining ? 'On' : 'Off'}
                         </Badge>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-400">Mempool Profile</span>
+                        <span className="text-[color:var(--dim)]">Mempool Profile</span>
                         <Badge variant="warning">{currentConfig.mempool_profile}</Badge>
                       </div>
                     </div>
                   </div>
-                  <div className="p-4 rounded-lg bg-gray-800/50">
-                    <p className="text-sm text-gray-400">
+                  <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                    <p className="text-sm text-[color:var(--dim)]">
                       Review your current settings above. Click Next to step through each section
                       and make changes. Only modified values will be submitted.
                     </p>
@@ -346,7 +346,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
           {/* Step 1: Identity */}
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Node Nickname"
                   type="text"
@@ -359,7 +359,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                 {hasChanged('nickname') && (
                   <div className="mt-2 flex items-center gap-2">
                     <Badge variant="warning">Changed</Badge>
-                    <span className="text-xs text-gray-400">
+                    <span className="text-xs text-[color:var(--dim)]">
                       from &quot;{original?.nickname || '--'}&quot;
                     </span>
                   </div>
@@ -371,11 +371,11 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
           {/* Step 2: Mining */}
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Public Mining</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Public Mining</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Open your Stratum port to external miners. Earns +3 shares.
                     </p>
                   </div>
@@ -391,7 +391,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                   </div>
                 )}
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Mining Payout Address"
                   type="text"
@@ -403,7 +403,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                 {hasChanged('payout_address') && (
                   <div className="mt-2 flex items-center gap-2">
                     <Badge variant="warning">Changed</Badge>
-                    <span className="text-xs text-gray-400 truncate max-w-[150px]">
+                    <span className="text-xs text-[color:var(--dim)] truncate max-w-[150px]">
                       from &quot;{original?.payout_address || '--'}&quot;
                     </span>
                   </div>
@@ -416,11 +416,11 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
           {wizard.currentStep === 3 && (
             <div className="space-y-3">
               {NODE_MODES.map((mode) => (
-                <div key={mode.key} className="p-4 rounded-lg bg-gray-800/50">
+                <div key={mode.key} className="p-4 rounded-lg bg-[var(--surface)]/50">
                   <div className="flex items-center justify-between">
                     <div className="flex-1 mr-4">
                       <div className="flex items-center gap-2">
-                        <span className="text-gray-100 font-medium">{mode.label}</span>
+                        <span className="text-[color:var(--fg)] font-medium">{mode.label}</span>
                         {mode.shares && (
                           <Badge variant="info">{mode.shares}</Badge>
                         )}
@@ -428,7 +428,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                           <Badge variant="warning">Changed</Badge>
                         )}
                       </div>
-                      <p className="text-sm text-gray-400 mt-1">{mode.description}</p>
+                      <p className="text-sm text-[color:var(--dim)] mt-1">{mode.description}</p>
                     </div>
                     <Toggle
                       enabled={data[mode.key]}
@@ -452,13 +452,13 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                   className={`
                     w-full text-left p-4 rounded-lg border transition-colors
                     ${data.mempool_profile === profile.id
-                      ? 'bg-orange-900/30 border-orange-600'
-                      : 'bg-gray-800/50 border-gray-700 hover:border-gray-600'}
+                      ? 'bg-[var(--accent)]/30 border-[var(--accent)]'
+                      : 'bg-[var(--surface)]/50 border-[var(--rule-strong)] hover:border-[var(--rule-strong)]'}
                   `}
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <span className="text-gray-100 font-medium">{profile.label}</span>
+                      <span className="text-[color:var(--fg)] font-medium">{profile.label}</span>
                       {data.mempool_profile === profile.id && hasChanged('mempool_profile') && (
                         <Badge variant="warning">Changed</Badge>
                       )}
@@ -467,7 +467,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
                       <Badge variant="warning">Selected</Badge>
                     )}
                   </div>
-                  <p className="text-sm text-gray-400 mt-1">{profile.description}</p>
+                  <p className="text-sm text-[color:var(--dim)] mt-1">{profile.description}</p>
                 </button>
               ))}
             </div>
@@ -505,8 +505,8 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
 
                 if (changes.length === 0) {
                   return (
-                    <div className="p-4 rounded-lg bg-gray-800/50">
-                      <p className="text-gray-400 text-sm">
+                    <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                      <p className="text-[color:var(--dim)] text-sm">
                         No changes detected. All settings match the current configuration.
                       </p>
                     </div>
@@ -515,25 +515,25 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
 
                 return (
                   <>
-                    <div className="p-4 rounded-lg bg-gray-800/50">
-                      <h4 className="text-gray-100 font-medium mb-3">
+                    <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                      <h4 className="text-[color:var(--fg)] font-medium mb-3">
                         Changes to Apply ({changes.length})
                       </h4>
                       <div className="space-y-3">
                         {changes.map((change) => (
                           <div key={change.label} className="flex items-center justify-between">
-                            <span className="text-gray-400">{change.label}</span>
+                            <span className="text-[color:var(--dim)]">{change.label}</span>
                             <div className="flex items-center gap-2 text-sm">
-                              <span className="text-gray-500 truncate max-w-[100px]">{change.from}</span>
-                              <span className="text-gray-600">-&gt;</span>
-                              <span className="text-orange-300 font-medium truncate max-w-[100px]">{change.to}</span>
+                              <span className="text-[color:var(--fainter)] truncate max-w-[100px]">{change.from}</span>
+                              <span className="text-[color:var(--fainter)]">-&gt;</span>
+                              <span className="text-[color:var(--accent)] font-medium truncate max-w-[100px]">{change.to}</span>
                             </div>
                           </div>
                         ))}
                       </div>
                     </div>
-                    <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                      <p className="text-sm text-orange-300">
+                    <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                      <p className="text-sm text-[color:var(--accent)]">
                         Click Finish to apply {changes.length} change{changes.length > 1 ? 's' : ''}.
                         Only modified settings will be updated.
                       </p>

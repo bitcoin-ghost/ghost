@@ -216,41 +216,41 @@ export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps)
               {checks.map((check) => (
                 <div
                   key={check.label}
-                  className="p-4 rounded-lg bg-gray-800/50 flex items-center justify-between"
+                  className="p-4 rounded-lg bg-[var(--surface)]/50 flex items-center justify-between"
                 >
                   <div className="flex items-center gap-3">
                     {check.status === 'pending' && (
-                      <div className="w-5 h-5 rounded-full border-2 border-gray-600 border-t-orange-500 animate-spin" />
+                      <div className="w-5 h-5 rounded-full border-2 border-[var(--rule-strong)] border-t-orange-500 animate-spin" />
                     )}
                     {check.status === 'ok' && (
-                      <svg className="w-5 h-5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <svg className="w-5 h-5 text-[color:var(--green)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                       </svg>
                     )}
                     {check.status === 'error' && (
-                      <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <svg className="w-5 h-5 text-[color:var(--red)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                       </svg>
                     )}
-                    <span className="text-gray-100 font-medium">{check.label}</span>
+                    <span className="text-[color:var(--fg)] font-medium">{check.label}</span>
                   </div>
                   {check.message && (
-                    <span className={`text-sm ${check.status === 'ok' ? 'text-green-400' : check.status === 'error' ? 'text-red-400' : 'text-gray-400'}`}>
+                    <span className={`text-sm ${check.status === 'ok' ? 'text-[color:var(--green)]' : check.status === 'error' ? 'text-[color:var(--red)]' : 'text-[color:var(--dim)]'}`}>
                       {check.message}
                     </span>
                   )}
                 </div>
               ))}
               {checksComplete && !allChecksOk && (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     Some pre-flight checks failed. You can still proceed, but the action may not succeed.
                   </p>
                 </div>
               )}
               {checksComplete && allChecksOk && (
-                <div className="p-4 rounded-lg bg-green-900/20 border border-green-800">
-                  <p className="text-sm text-green-300">
+                <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
+                  <p className="text-sm text-[color:var(--green)]">
                     All pre-flight checks passed. Your node is ready.
                   </p>
                 </div>
@@ -269,22 +269,22 @@ export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps)
                   className={`
                     w-full text-left p-4 rounded-lg border transition-colors
                     ${data.action === action.id
-                      ? 'bg-orange-900/30 border-orange-600'
-                      : 'bg-gray-800/50 border-gray-700 hover:border-gray-600'}
+                      ? 'bg-[var(--accent)]/30 border-[var(--accent)]'
+                      : 'bg-[var(--surface)]/50 border-[var(--rule-strong)] hover:border-[var(--rule-strong)]'}
                   `}
                 >
                   <div className="flex items-center gap-3">
-                    <svg className="w-5 h-5 text-gray-300 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <svg className="w-5 h-5 text-[color:var(--dim)] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={action.icon} />
                     </svg>
                     <div className="flex-1">
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-100 font-medium">{action.label}</span>
+                        <span className="text-[color:var(--fg)] font-medium">{action.label}</span>
                         {data.action === action.id && (
                           <Badge variant="warning">Selected</Badge>
                         )}
                       </div>
-                      <p className="text-sm text-gray-400 mt-1">{action.description}</p>
+                      <p className="text-sm text-[color:var(--dim)] mt-1">{action.description}</p>
                     </div>
                   </div>
                 </button>
@@ -295,17 +295,17 @@ export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps)
           {/* Step 2: Confirm */}
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Action Summary</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Action Summary</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Action</span>
+                    <span className="text-[color:var(--dim)]">Action</span>
                     <Badge variant={data.action === 'stop' ? 'error' : 'warning'}>
                       {data.action.charAt(0).toUpperCase() + data.action.slice(1)}
                     </Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Pre-flight Status</span>
+                    <span className="text-[color:var(--dim)]">Pre-flight Status</span>
                     <Badge variant={data.health_ok ? 'success' : 'error'}>
                       {data.health_ok ? 'All Passed' : 'Issues Detected'}
                     </Badge>
@@ -313,24 +313,24 @@ export default function BuildRunWizard({ isOpen, onClose }: BuildRunWizardProps)
                 </div>
               </div>
               {data.action === 'stop' && (
-                <div className="p-4 rounded-lg bg-red-900/20 border border-red-800">
-                  <p className="text-sm text-red-300">
+                <div className="p-4 rounded-lg bg-[var(--red)]/20 border border-[var(--red)]">
+                  <p className="text-sm text-[color:var(--red)]">
                     Stopping the node will disconnect all miners and peers. The node will not participate
                     in consensus or earn rewards while stopped.
                   </p>
                 </div>
               )}
               {data.action === 'restart' && (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     Restarting the node will cause a brief interruption. Miners will automatically
                     reconnect after the restart completes.
                   </p>
                 </div>
               )}
               {data.action === 'start' && (
-                <div className="p-4 rounded-lg bg-green-900/20 border border-green-800">
-                  <p className="text-sm text-green-300">
+                <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
+                  <p className="text-sm text-[color:var(--green)]">
                     The node will start and begin syncing with the network. It may take a moment to
                     fully connect to peers.
                   </p>

@@ -29,9 +29,9 @@ export default function FilteringSettingsPage() {
             subtitle="How strictly this node filters, by transaction class (BUDS T0–T3). Changing it restarts the node."
           />
           <PolicyProfileSelector />
-          <p className="text-xs text-gray-500 mt-3">
+          <p className="text-xs text-[color:var(--fainter)] mt-3">
             Prefer the guided view? The same choice, with a live mempool-by-class breakdown, is on{" "}
-            <Link href="/filtering/basic" className="text-orange-400 hover:text-orange-300 underline">
+            <Link href="/filtering/basic" className="text-[color:var(--accent)] hover:text-[color:var(--accent)] underline">
               Filtering › Basic
             </Link>
             .

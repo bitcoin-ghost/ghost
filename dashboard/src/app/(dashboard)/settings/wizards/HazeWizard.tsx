@@ -83,11 +83,11 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
           {/* Step 1: Current Status */}
           {wizard.currentStep === 0 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Current Haze Status</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Current Haze Status</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Storage Mode</span>
+                    <span className="text-[color:var(--dim)]">Storage Mode</span>
                     <Badge
                       variant={
                         currentMode === 'hazed'
@@ -103,21 +103,21 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
                   {hazeStatus && (
                     <>
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-400">Blocks Stored</span>
-                        <span className="text-gray-100">
+                        <span className="text-[color:var(--dim)]">Blocks Stored</span>
+                        <span className="text-[color:var(--fg)]">
                           {hazeStatus.blocks?.toLocaleString() ?? 'N/A'}
                         </span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-400">Size on Disk</span>
-                        <span className="text-gray-100">
+                        <span className="text-[color:var(--dim)]">Size on Disk</span>
+                        <span className="text-[color:var(--fg)]">
                           {hazeStatus.size_on_disk
                             ? `${(hazeStatus.size_on_disk / (1024 * 1024 * 1024)).toFixed(2)} GB`
                             : 'N/A'}
                         </span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-gray-400">Archive Mode</span>
+                        <span className="text-[color:var(--dim)]">Archive Mode</span>
                         <Badge variant={hazeStatus.archive_mode ? 'success' : 'default'}>
                           {hazeStatus.archive_mode ? 'Active' : 'Inactive'}
                         </Badge>
@@ -126,8 +126,8 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
                   )}
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <p className="text-sm text-gray-400">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <p className="text-sm text-[color:var(--dim)]">
                   Ghost Haze controls how your node stores block data. Hazed mode strips
                   non-financial witness data from blocks, reducing storage requirements while
                   maintaining full transaction verification capability.
@@ -151,28 +151,28 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
                       w-full text-left p-4 rounded-lg border-2 transition-colors
                       ${
                         isSelected
-                          ? 'border-orange-500 bg-orange-900/20'
-                          : 'border-gray-700 bg-gray-800/50 hover:border-gray-600'
+                          ? 'border-[var(--accent)] bg-[var(--accent)]/20'
+                          : 'border-[var(--rule-strong)] bg-[var(--surface)]/50 hover:border-[var(--rule-strong)]'
                       }
                     `}
                   >
                     <div className="flex items-center justify-between mb-1">
-                      <span className="text-gray-100 font-medium">{modeLabels[mode]}</span>
+                      <span className="text-[color:var(--fg)] font-medium">{modeLabels[mode]}</span>
                       <div className="flex items-center gap-2">
                         {isCurrent && (
                           <Badge variant="info">Current</Badge>
                         )}
                         {isSelected && (
-                          <div className="w-4 h-4 rounded-full bg-orange-500 flex items-center justify-center">
+                          <div className="w-4 h-4 rounded-full bg-[var(--accent)] flex items-center justify-center">
                             <div className="w-2 h-2 rounded-full bg-white" />
                           </div>
                         )}
                         {!isSelected && (
-                          <div className="w-4 h-4 rounded-full border-2 border-gray-600" />
+                          <div className="w-4 h-4 rounded-full border-2 border-[var(--rule-strong)]" />
                         )}
                       </div>
                     </div>
-                    <p className="text-sm text-gray-400">{modeDescriptions[mode]}</p>
+                    <p className="text-sm text-[color:var(--dim)]">{modeDescriptions[mode]}</p>
                   </button>
                 );
               })}
@@ -182,10 +182,10 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
           {/* Step 3: Confirm */}
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Change Summary</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Change Summary</h4>
                 <div className="flex items-center justify-between">
-                  <span className="text-gray-400">Storage Mode</span>
+                  <span className="text-[color:var(--dim)]">Storage Mode</span>
                   <div className="flex items-center gap-2">
                     <Badge
                       variant={
@@ -198,7 +198,7 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
                     >
                       {modeLabels[currentMode as HazeMode] ?? 'Unknown'}
                     </Badge>
-                    <span className="text-gray-500">-&gt;</span>
+                    <span className="text-[color:var(--fainter)]">-&gt;</span>
                     <Badge
                       variant={
                         data.mode === 'hazed'
@@ -214,22 +214,22 @@ export default function HazeWizard({ isOpen, onClose }: HazeWizardProps) {
                 </div>
               </div>
               {data.mode !== currentMode ? (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     Click Finish to change the storage mode. This may require Ghost Core to
                     reprocess blocks depending on the mode transition.
                   </p>
                 </div>
               ) : (
-                <div className="p-4 rounded-lg bg-gray-800/50">
-                  <p className="text-sm text-gray-400">
+                <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                  <p className="text-sm text-[color:var(--dim)]">
                     No changes detected. The selected mode matches the current configuration.
                   </p>
                 </div>
               )}
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-2">Mode Details</h4>
-                <p className="text-sm text-gray-400">{modeDescriptions[data.mode]}</p>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-2">Mode Details</h4>
+                <p className="text-sm text-[color:var(--dim)]">{modeDescriptions[data.mode]}</p>
               </div>
             </div>
           )}

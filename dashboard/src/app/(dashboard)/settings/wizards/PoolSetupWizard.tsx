@@ -155,21 +155,21 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                     })}
                     className={`w-full p-4 rounded-lg border text-left transition-all ${
                       isActive
-                        ? 'bg-orange-900/20 border-orange-600 ring-1 ring-orange-600/50'
-                        : 'bg-gray-800/30 border-gray-700 hover:border-gray-600'
+                        ? 'bg-[var(--accent)]/20 border-[var(--accent)] ring-1 ring-[var(--accent)]/50'
+                        : 'bg-[var(--surface)]/30 border-[var(--rule-strong)] hover:border-[var(--rule-strong)]'
                     }`}
                   >
                     <div className="flex items-center gap-2 mb-1">
                       <div className={`w-3 h-3 rounded-full border-2 flex items-center justify-center ${
-                        isActive ? 'border-orange-500' : 'border-gray-600'
+                        isActive ? 'border-[var(--accent)]' : 'border-[var(--rule-strong)]'
                       }`}>
-                        {isActive && <div className="w-1.5 h-1.5 rounded-full bg-orange-500" />}
+                        {isActive && <div className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />}
                       </div>
-                      <span className={`font-medium ${isActive ? 'text-orange-400' : 'text-gray-300'}`}>{label}</span>
+                      <span className={`font-medium ${isActive ? 'text-[color:var(--accent)]' : 'text-[color:var(--dim)]'}`}>{label}</span>
                       {isActive && <Badge variant="success">Selected</Badge>}
                       {key === 'pool' && <Badge variant="info">+3 Shares</Badge>}
                     </div>
-                    <div className="text-xs text-gray-500 ml-5">{desc}</div>
+                    <div className="text-xs text-[color:var(--fainter)] ml-5">{desc}</div>
                   </button>
                 );
               })}
@@ -179,22 +179,22 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
           {/* Step 2: Payout Address */}
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Mining Payout Address"
                   value={data.payout_address}
                   onChange={(e) => setData({ payout_address: e.target.value })}
                   placeholder="bc1q... / tb1q... / bcrt1q..."
                 />
-                <p className="text-sm text-gray-400 mt-1">
+                <p className="text-sm text-[color:var(--dim)] mt-1">
                   Enter a bech32 Bitcoin address to receive mining payouts. Must start with
                   bc1 (mainnet), tb1 (testnet/signet), or bcrt1 (regtest).
                 </p>
               </div>
               {data.payout_address.trim() && (
-                <div className="p-4 rounded-lg bg-gray-800/50">
+                <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Address Valid</span>
+                    <span className="text-[color:var(--dim)]">Address Valid</span>
                     {isValidBech32Address(data.payout_address) ? (
                       <Badge variant="success">Valid</Badge>
                     ) : (
@@ -203,8 +203,8 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                   </div>
                   {isValidBech32Address(data.payout_address) && (
                     <div className="mt-2">
-                      <span className="text-gray-400 text-sm">Network: </span>
-                      <span className="text-orange-300 text-sm">
+                      <span className="text-[color:var(--dim)] text-sm">Network: </span>
+                      <span className="text-[color:var(--accent)] text-sm">
                         {data.payout_address.trim().toLowerCase().startsWith('bc1')
                           ? 'Mainnet'
                           : data.payout_address.trim().toLowerCase().startsWith('bcrt1')
@@ -216,8 +216,8 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                 </div>
               )}
               {data.mining_mode !== 'private_solo' && !data.payout_address.trim() && (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     A payout address is required for pool modes (the node receives its own share of pool rewards here).
                   </p>
                 </div>
@@ -228,7 +228,7 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
           {/* Step 3: Pool Info */}
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Pool Name (optional)"
                   value={data.pool_name}
@@ -240,50 +240,50 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                   }}
                   placeholder="e.g. SatoshiPool"
                 />
-                <p className="text-sm text-gray-400 mt-1">
+                <p className="text-sm text-[color:var(--dim)] mt-1">
                   Custom name shown in block coinbase. ASCII only, max 30 characters.
                 </p>
                 {data.pool_name.trim() && (
-                  <div className="mt-2 p-2 rounded bg-gray-900 font-mono text-sm text-orange-300">
+                  <div className="mt-2 p-2 rounded bg-[var(--surface)] font-mono text-sm text-[color:var(--accent)]">
                     - G H O S T - {data.pool_name.trim()}
                   </div>
                 )}
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Pool Configuration</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Pool Configuration</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Stratum Port</span>
-                    <span className="text-gray-100 font-mono">3333</span>
+                    <span className="text-[color:var(--dim)]">Stratum Port</span>
+                    <span className="text-[color:var(--fg)] font-mono">3333</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Protocol</span>
-                    <span className="text-gray-100">Stratum V1</span>
+                    <span className="text-[color:var(--dim)]">Protocol</span>
+                    <span className="text-[color:var(--fg)]">Stratum V1</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Variable Difficulty</span>
+                    <span className="text-[color:var(--dim)]">Variable Difficulty</span>
                     <Badge variant="success">Active</Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Target Rate</span>
-                    <span className="text-gray-100">4 shares/minute</span>
+                    <span className="text-[color:var(--dim)]">Target Rate</span>
+                    <span className="text-[color:var(--fg)]">4 shares/minute</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Share Cap</span>
-                    <span className="text-gray-100">10% per miner</span>
+                    <span className="text-[color:var(--dim)]">Share Cap</span>
+                    <span className="text-[color:var(--fg)]">10% per miner</span>
                   </div>
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-2">Miner Connection Format</h4>
-                <p className="text-sm text-gray-400 mb-2">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-2">Miner Connection Format</h4>
+                <p className="text-sm text-[color:var(--dim)] mb-2">
                   Miners connect with the following worker name format:
                 </p>
-                <div className="p-3 rounded bg-gray-900 font-mono text-sm text-orange-300">
+                <div className="p-3 rounded bg-[var(--surface)] font-mono text-sm text-[color:var(--accent)]">
                   stratum+tcp://your-node-ip:3333
                 </div>
-                <p className="text-sm text-gray-400 mt-2">
-                  Worker name: <span className="text-orange-300 font-mono">bitcoin_address.worker_id</span>
+                <p className="text-sm text-[color:var(--dim)] mt-2">
+                  Worker name: <span className="text-[color:var(--accent)] font-mono">bitcoin_address.worker_id</span>
                 </p>
               </div>
             </div>
@@ -292,16 +292,16 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
           {/* Step 4: Confirm */}
           {wizard.currentStep === 3 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Configuration Summary</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Configuration Summary</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Mining Mode</span>
+                    <span className="text-[color:var(--dim)]">Mining Mode</span>
                     <div className="flex items-center gap-2">
                       <Badge variant="default">
                         {MODES.find(m => m.key === currentMode)?.label ?? currentMode}
                       </Badge>
-                      <span className="text-gray-500">-&gt;</span>
+                      <span className="text-[color:var(--fainter)]">-&gt;</span>
                       <Badge variant="success">
                         {MODES.find(m => m.key === data.mining_mode)?.label ?? data.mining_mode}
                       </Badge>
@@ -309,8 +309,8 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                   </div>
                   {data.payout_address.trim() && (
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Payout Address</span>
-                      <span className="text-gray-100 font-mono text-sm">
+                      <span className="text-[color:var(--dim)]">Payout Address</span>
+                      <span className="text-[color:var(--fg)] font-mono text-sm">
                         {data.payout_address.trim().slice(0, 12)}...
                         {data.payout_address.trim().slice(-8)}
                       </span>
@@ -318,16 +318,16 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
                   )}
                   {data.pool_name.trim() && (
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Pool Name</span>
-                      <span className="text-orange-300 font-mono text-sm">
+                      <span className="text-[color:var(--dim)]">Pool Name</span>
+                      <span className="text-[color:var(--accent)] font-mono text-sm">
                         - G H O S T - {data.pool_name.trim()}
                       </span>
                     </div>
                   )}
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                <p className="text-sm text-orange-300">
+              <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                <p className="text-sm text-[color:var(--accent)]">
                   Click Finish to apply mining settings. Changes will take effect immediately.
                   {data.mining_mode !== 'private_solo'
                     ? ' Miners will be able to connect to your node on port 3333.'

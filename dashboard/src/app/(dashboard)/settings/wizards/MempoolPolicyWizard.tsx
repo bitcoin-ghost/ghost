@@ -225,17 +225,17 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   className={`
                     w-full text-left p-4 rounded-lg border transition-colors
                     ${data.mempool_profile === profile.id
-                      ? 'bg-orange-900/30 border-orange-600'
-                      : 'bg-gray-800/50 border-gray-700 hover:border-gray-600'}
+                      ? 'bg-[var(--accent)]/30 border-[var(--accent)]'
+                      : 'bg-[var(--surface)]/50 border-[var(--rule-strong)] hover:border-[var(--rule-strong)]'}
                   `}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-100 font-medium">{profile.label}</span>
+                    <span className="text-[color:var(--fg)] font-medium">{profile.label}</span>
                     {data.mempool_profile === profile.id && (
                       <Badge variant="warning">Selected</Badge>
                     )}
                   </div>
-                  <p className="text-sm text-gray-400 mt-1">{profile.description}</p>
+                  <p className="text-sm text-[color:var(--dim)] mt-1">{profile.description}</p>
                 </button>
               ))}
             </div>
@@ -244,7 +244,7 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
           {/* Step 1: Core Settings (custom only) */}
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Profile Name"
                   type="text"
@@ -253,7 +253,7 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   helperText="A label for this custom profile; it is saved and activated on your node"
                 />
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Minimum Relay TX Fee (sat/vB)"
                   type="number"
@@ -264,7 +264,7 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   helperText="Transactions below this fee rate will not be relayed or accepted into the mempool"
                 />
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Max Mempool Size (MB)"
                   type="number"
@@ -275,7 +275,7 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   helperText="Maximum size of the in-memory transaction pool. Lower values evict low-fee transactions sooner."
                 />
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Mempool Expiry (hours)"
                   type="number"
@@ -292,11 +292,11 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
           {/* Step 2: Filtering (custom only) */}
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Filter Inscriptions</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Filter Inscriptions</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Reject Ordinal inscription transactions from the mempool
                     </p>
                   </div>
@@ -307,11 +307,11 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   />
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Filter BRC-20</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Filter BRC-20</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Reject BRC-20 token transfer transactions
                     </p>
                   </div>
@@ -322,11 +322,11 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   />
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Filter Runes</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Filter Runes</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Reject Rune protocol transactions from the mempool
                     </p>
                   </div>
@@ -337,11 +337,11 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   />
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Allow OP_RETURN (Datacarrier)</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Allow OP_RETURN (Datacarrier)</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Accept transactions with OP_RETURN data outputs
                     </p>
                   </div>
@@ -366,17 +366,17 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   className={`
                     w-full text-left p-4 rounded-lg border transition-colors
                     ${data.template_profile === profile.id
-                      ? 'bg-orange-900/30 border-orange-600'
-                      : 'bg-gray-800/50 border-gray-700 hover:border-gray-600'}
+                      ? 'bg-[var(--accent)]/30 border-[var(--accent)]'
+                      : 'bg-[var(--surface)]/50 border-[var(--rule-strong)] hover:border-[var(--rule-strong)]'}
                   `}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-100 font-medium">{profile.label}</span>
+                    <span className="text-[color:var(--fg)] font-medium">{profile.label}</span>
                     {data.template_profile === profile.id && (
                       <Badge variant="warning">Selected</Badge>
                     )}
                   </div>
-                  <p className="text-sm text-gray-400 mt-1">{profile.description}</p>
+                  <p className="text-sm text-[color:var(--dim)] mt-1">{profile.description}</p>
                 </button>
               ))}
             </div>
@@ -385,66 +385,66 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
           {/* Step 4: Confirm Summary */}
           {wizard.currentStep === 4 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Configuration Summary</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Configuration Summary</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Mempool Profile</span>
+                    <span className="text-[color:var(--dim)]">Mempool Profile</span>
                     <Badge variant="warning">{data.mempool_profile}</Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Template Profile</span>
+                    <span className="text-[color:var(--dim)]">Template Profile</span>
                     <Badge variant="warning">{data.template_profile}</Badge>
                   </div>
                 </div>
               </div>
               {isCustom && (
-                <div className="p-4 rounded-lg bg-gray-800/50">
-                  <h4 className="text-gray-100 font-medium mb-3">Custom Settings</h4>
+                <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                  <h4 className="text-[color:var(--fg)] font-medium mb-3">Custom Settings</h4>
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Profile Name</span>
-                      <span className="text-gray-100">{data.profile_name}</span>
+                      <span className="text-[color:var(--dim)]">Profile Name</span>
+                      <span className="text-[color:var(--fg)]">{data.profile_name}</span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Min Relay Fee</span>
-                      <span className="text-gray-100">{data.min_relay_tx_fee} sat/vB</span>
+                      <span className="text-[color:var(--dim)]">Min Relay Fee</span>
+                      <span className="text-[color:var(--fg)]">{data.min_relay_tx_fee} sat/vB</span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Max Mempool Size</span>
-                      <span className="text-gray-100">{data.max_mempool_size} MB</span>
+                      <span className="text-[color:var(--dim)]">Max Mempool Size</span>
+                      <span className="text-[color:var(--fg)]">{data.max_mempool_size} MB</span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Mempool Expiry</span>
-                      <span className="text-gray-100">{data.mempool_expiry} hours</span>
+                      <span className="text-[color:var(--dim)]">Mempool Expiry</span>
+                      <span className="text-[color:var(--fg)]">{data.mempool_expiry} hours</span>
                     </div>
                   </div>
                 </div>
               )}
               {isCustom && (
-                <div className="p-4 rounded-lg bg-gray-800/50">
-                  <h4 className="text-gray-100 font-medium mb-3">Filtering</h4>
+                <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                  <h4 className="text-[color:var(--fg)] font-medium mb-3">Filtering</h4>
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Filter Inscriptions</span>
+                      <span className="text-[color:var(--dim)]">Filter Inscriptions</span>
                       <Badge variant={data.filter_inscriptions ? 'error' : 'success'}>
                         {data.filter_inscriptions ? 'Blocked' : 'Allowed'}
                       </Badge>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Filter BRC-20</span>
+                      <span className="text-[color:var(--dim)]">Filter BRC-20</span>
                       <Badge variant={data.filter_brc20 ? 'error' : 'success'}>
                         {data.filter_brc20 ? 'Blocked' : 'Allowed'}
                       </Badge>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Filter Runes</span>
+                      <span className="text-[color:var(--dim)]">Filter Runes</span>
                       <Badge variant={data.filter_runes ? 'error' : 'success'}>
                         {data.filter_runes ? 'Blocked' : 'Allowed'}
                       </Badge>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">OP_RETURN Data</span>
+                      <span className="text-[color:var(--dim)]">OP_RETURN Data</span>
                       <Badge variant={data.datacarrier ? 'success' : 'error'}>
                         {data.datacarrier ? 'Allowed' : 'Blocked'}
                       </Badge>
@@ -452,8 +452,8 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
                   </div>
                 </div>
               )}
-              <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                <p className="text-sm text-orange-300">
+              <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                <p className="text-sm text-[color:var(--accent)]">
                   Click Finish to apply these changes. Your node mempool and template configuration will be updated immediately.
                 </p>
               </div>

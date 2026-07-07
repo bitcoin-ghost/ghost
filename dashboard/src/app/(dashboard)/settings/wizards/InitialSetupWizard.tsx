@@ -199,15 +199,15 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
           {/* Step 0: Welcome */}
           {wizard.currentStep === 0 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-2">Welcome to Ghost Pool</h4>
-                <p className="text-sm text-gray-400">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-2">Welcome to Ghost Pool</h4>
+                <p className="text-sm text-[color:var(--dim)]">
                   This wizard will guide you through the initial configuration of your Ghost node.
                   All capabilities are enabled by default for maximum privacy and shares (15/15).
                   You can disable anything you don&apos;t need.
                 </p>
-                <div className="mt-3 text-sm text-gray-500">
-                  <p className="font-medium text-gray-400 mb-1">Share breakdown:</p>
+                <div className="mt-3 text-sm text-[color:var(--fainter)]">
+                  <p className="font-medium text-[color:var(--dim)] mb-1">Share breakdown:</p>
                   <ul className="space-y-1 ml-2">
                     <li>Archive Mode: +5 shares</li>
                     <li>Ghost Pay: +4 shares</li>
@@ -217,29 +217,29 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   </ul>
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-2">What we will set up</h4>
-                <ul className="space-y-2 text-sm text-gray-400">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-2">What we will set up</h4>
+                <ul className="space-y-2 text-sm text-[color:var(--dim)]">
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">1.</span>
+                    <span className="text-[color:var(--accent)]">1.</span>
                     Node identity and nickname
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">2.</span>
+                    <span className="text-[color:var(--accent)]">2.</span>
                     Mining configuration and payout address
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">3.</span>
+                    <span className="text-[color:var(--accent)]">3.</span>
                     Node capabilities (Ghost Mode, Archive, Pure, Pay)
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">4.</span>
+                    <span className="text-[color:var(--accent)]">4.</span>
                     Mempool transaction policy
                   </li>
                 </ul>
               </div>
-              <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                <p className="text-sm text-orange-300">
+              <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                <p className="text-sm text-[color:var(--accent)]">
                   All settings can be changed later from the Settings page. Click Next to begin.
                 </p>
               </div>
@@ -249,7 +249,7 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
           {/* Step 1: Identity */}
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Node Nickname"
                   type="text"
@@ -260,8 +260,8 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   maxLength={32}
                 />
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <p className="text-sm text-gray-400">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <p className="text-sm text-[color:var(--dim)]">
                   Your node will also have a cryptographic node ID derived from its keys. The nickname
                   is an optional friendly label shown in the dashboard and to network peers.
                 </p>
@@ -272,11 +272,11 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
           {/* Step 2: Mining */}
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Public Mining</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Public Mining</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Open your Stratum port to external miners. Earns +3 shares in the node reward pool.
                     </p>
                   </div>
@@ -287,7 +287,7 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   />
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
                   label="Mining Payout Address"
                   type="text"
@@ -298,8 +298,8 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                 />
               </div>
               {data.public_mining && !data.payout_address && (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     A payout address is required for public mining. Miners connecting to your pool
                     will contribute shares to this address.
                   </p>
@@ -312,16 +312,16 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
           {wizard.currentStep === 3 && (
             <div className="space-y-3">
               {NODE_MODES.map((mode) => (
-                <div key={mode.key} className="p-4 rounded-lg bg-gray-800/50">
+                <div key={mode.key} className="p-4 rounded-lg bg-[var(--surface)]/50">
                   <div className="flex items-center justify-between">
                     <div className="flex-1 mr-4">
                       <div className="flex items-center gap-2">
-                        <span className="text-gray-100 font-medium">{mode.label}</span>
+                        <span className="text-[color:var(--fg)] font-medium">{mode.label}</span>
                         {mode.shares && (
                           <Badge variant="info">{mode.shares}</Badge>
                         )}
                       </div>
-                      <p className="text-sm text-gray-400 mt-1">{mode.description}</p>
+                      <p className="text-sm text-[color:var(--dim)] mt-1">{mode.description}</p>
                     </div>
                     <Toggle
                       enabled={data[mode.key]}
@@ -331,8 +331,8 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   </div>
                 </div>
               ))}
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <p className="text-sm text-gray-400">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <p className="text-sm text-[color:var(--dim)]">
                   Capabilities are verified by the network through challenge-response checks.
                   Earning share bonuses requires passing verification with 95% accuracy over 7 days.
                 </p>
@@ -351,17 +351,17 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
                   className={`
                     w-full text-left p-4 rounded-lg border transition-colors
                     ${data.mempool_profile === profile.id
-                      ? 'bg-orange-900/30 border-orange-600'
-                      : 'bg-gray-800/50 border-gray-700 hover:border-gray-600'}
+                      ? 'bg-[var(--accent)]/30 border-[var(--accent)]'
+                      : 'bg-[var(--surface)]/50 border-[var(--rule-strong)] hover:border-[var(--rule-strong)]'}
                   `}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-100 font-medium">{profile.label}</span>
+                    <span className="text-[color:var(--fg)] font-medium">{profile.label}</span>
                     {data.mempool_profile === profile.id && (
                       <Badge variant="warning">Selected</Badge>
                     )}
                   </div>
-                  <p className="text-sm text-gray-400 mt-1">{profile.description}</p>
+                  <p className="text-sm text-[color:var(--dim)] mt-1">{profile.description}</p>
                 </button>
               ))}
             </div>
@@ -370,66 +370,66 @@ export default function InitialSetupWizard({ isOpen, onClose }: InitialSetupWiza
           {/* Step 5: Confirm */}
           {wizard.currentStep === 5 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Setup Summary</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Setup Summary</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Nickname</span>
-                    <span className="text-gray-100 font-medium">{data.nickname || '--'}</span>
+                    <span className="text-[color:var(--dim)]">Nickname</span>
+                    <span className="text-[color:var(--fg)] font-medium">{data.nickname || '--'}</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Public Mining</span>
+                    <span className="text-[color:var(--dim)]">Public Mining</span>
                     <Badge variant={data.public_mining ? 'success' : 'default'}>
                       {data.public_mining ? 'Enabled' : 'Disabled'}
                     </Badge>
                   </div>
                   {data.payout_address && (
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-400">Payout Address</span>
-                      <span className="text-gray-100 text-sm font-mono truncate max-w-[200px]">
+                      <span className="text-[color:var(--dim)]">Payout Address</span>
+                      <span className="text-[color:var(--fg)] text-sm font-mono truncate max-w-[200px]">
                         {data.payout_address}
                       </span>
                     </div>
                   )}
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Node Capabilities</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Node Capabilities</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Ghost Mode</span>
+                    <span className="text-[color:var(--dim)]">Ghost Mode</span>
                     <Badge variant={data.ghost_mode ? 'success' : 'default'}>
                       {data.ghost_mode ? 'Enabled' : 'Disabled'}
                     </Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Archive Mode (+5)</span>
+                    <span className="text-[color:var(--dim)]">Archive Mode (+5)</span>
                     <Badge variant={data.archive_mode ? 'success' : 'default'}>
                       {data.archive_mode ? 'Enabled' : 'Disabled'}
                     </Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Reaper (+2)</span>
+                    <span className="text-[color:var(--dim)]">Reaper (+2)</span>
                     <Badge variant={data.reaper ? 'success' : 'default'}>
                       {data.reaper ? 'Enabled' : 'Disabled'}
                     </Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Ghost Pay (+4)</span>
+                    <span className="text-[color:var(--dim)]">Ghost Pay (+4)</span>
                     <Badge variant={data.ghost_pay ? 'success' : 'default'}>
                       {data.ghost_pay ? 'Enabled' : 'Disabled'}
                     </Badge>
                   </div>
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
-                  <span className="text-gray-400">Mempool Profile</span>
+                  <span className="text-[color:var(--dim)]">Mempool Profile</span>
                   <Badge variant="warning">{data.mempool_profile}</Badge>
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                <p className="text-sm text-orange-300">
+              <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                <p className="text-sm text-[color:var(--accent)]">
                   Click Finish to apply all settings. Your node will be configured and start
                   operating with the selected parameters.
                 </p>

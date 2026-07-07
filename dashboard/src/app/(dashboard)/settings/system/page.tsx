@@ -21,17 +21,17 @@ export default function SystemSettingsPage() {
             title="Software Updates"
             subtitle="Keep this node current automatically, or drive updates by hand from System."
           />
-          <div className="p-4 bg-gray-800/50 rounded-lg">
+          <div className="p-4 bg-[var(--surface)]/50 rounded-lg">
             <AutoUpdateSection />
           </div>
         </Card>
       </SectionErrorBoundary>
 
       <Card>
-        <p className="text-sm text-gray-400">
+        <p className="text-sm text-[color:var(--dim)]">
           Check for and install updates manually, roll back to a previous version, or manage encrypted
           backups on{" "}
-          <Link href="/system" className="text-orange-400 hover:text-orange-300 underline">
+          <Link href="/system" className="text-[color:var(--accent)] hover:text-[color:var(--accent)] underline">
             System
           </Link>
           .

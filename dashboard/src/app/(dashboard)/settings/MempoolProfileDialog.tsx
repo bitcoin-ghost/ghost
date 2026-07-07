@@ -75,18 +75,18 @@ export function MempoolProfileDialog({
     >
       <div className="space-y-4 max-h-[70vh] overflow-y-auto">
         {/* Advanced User Warning */}
-        <div className="p-4 bg-orange-900/20 border border-orange-700 rounded-lg">
+        <div className="p-4 bg-[var(--accent)]/20 border border-[var(--accent)] rounded-lg">
           <div className="flex items-start gap-3">
-            <span className="text-orange-400 text-xl">&#9888;</span>
+            <span className="text-[color:var(--accent)] text-xl">&#9888;</span>
             <div>
-              <h4 className="text-orange-300 font-medium">Advanced Configuration</h4>
-              <p className="text-orange-300/80 text-sm mt-1">
+              <h4 className="text-[color:var(--accent)] font-medium">Advanced Configuration</h4>
+              <p className="text-[color:var(--accent)]/80 text-sm mt-1">
                 Custom mempool profiles are intended for advanced users. Incorrect settings may
                 cause your node to reject valid transactions or accept unwanted ones.
               </p>
-              <p className="text-orange-300/80 text-sm mt-2">
+              <p className="text-[color:var(--accent)]/80 text-sm mt-2">
                 If you&apos;re unsure, use one of the preset profiles instead. For guidance, refer to
-                the <a href="/docs/mempool-profiles" className="text-orange-200 underline hover:text-orange-100">Mempool Profile Guide</a>.
+                the <a href="/docs/mempool-profiles" className="text-[color:var(--accent)] underline hover:text-[color:var(--accent)]">Mempool Profile Guide</a>.
               </p>
             </div>
           </div>
@@ -94,7 +94,7 @@ export function MempoolProfileDialog({
 
         {/* Profile Name */}
         <div>
-          <label className="block text-sm text-gray-400 mb-1">Profile Name</label>
+          <label className="block text-sm text-[color:var(--dim)] mb-1">Profile Name</label>
           <Input
             value={profile.name}
             onChange={(e) => update({ name: e.target.value })}
@@ -104,7 +104,7 @@ export function MempoolProfileDialog({
 
         {/* Core Mempool Settings */}
         <div>
-          <h4 className="text-sm font-medium text-gray-300 mb-3">Core Mempool Settings</h4>
+          <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3">Core Mempool Settings</h4>
           <div className="space-y-2">
             <NumberInput
               label="Min Relay Fee"
@@ -142,7 +142,7 @@ export function MempoolProfileDialog({
 
         {/* Transaction Acceptance */}
         <div>
-          <h4 className="text-sm font-medium text-gray-300 mb-3">Transaction Acceptance</h4>
+          <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3">Transaction Acceptance</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Permit Bare Multisig"
@@ -177,7 +177,7 @@ export function MempoolProfileDialog({
 
         {/* RBF Settings */}
         <div>
-          <h4 className="text-sm font-medium text-gray-300 mb-3">Replace-By-Fee (RBF)</h4>
+          <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3">Replace-By-Fee (RBF)</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Full RBF"
@@ -198,7 +198,7 @@ export function MempoolProfileDialog({
 
         {/* Ghost Extensions - Spam/Dust Protection */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Spam & Dust Protection</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Spam & Dust Protection</h4>
           <div className="space-y-2">
             <NumberInput
               label="Dust Limit"
@@ -228,7 +228,7 @@ export function MempoolProfileDialog({
 
         {/* Ghost Extensions - Output Preferences */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Output Type Preferences</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Output Type Preferences</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Prefer Native SegWit"
@@ -247,7 +247,7 @@ export function MempoolProfileDialog({
 
         {/* Ghost Extensions - Inscription Filtering */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Inscription Filtering</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Inscription Filtering</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Filter Ordinal Inscriptions"
@@ -272,7 +272,7 @@ export function MempoolProfileDialog({
 
         {/* Ghost Extensions - Lightning & Privacy */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Lightning & Privacy</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Lightning & Privacy</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Prioritize Lightning Opens"
@@ -307,7 +307,7 @@ export function MempoolProfileDialog({
 
         {/* Ghost Extensions - Chain Limits */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Chain Limits (CPFP)</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Chain Limits (CPFP)</h4>
           <div className="space-y-2">
             <NumberInput
               label="Max Ancestor Count"
@@ -339,7 +339,7 @@ export function MempoolProfileDialog({
         {/* BUDS Tiers */}
         <div>
           <div className="flex items-center gap-2 mb-3">
-            <h4 className="text-sm font-medium text-gray-300">BUDS Transaction Tiers</h4>
+            <h4 className="text-sm font-medium text-[color:var(--dim)]">BUDS Transaction Tiers</h4>
             {!budsEnabled && (
               <Badge variant="warning">Requires Ghost Pay</Badge>
             )}
@@ -387,7 +387,7 @@ export function MempoolProfileDialog({
         </div>
 
         {/* Actions */}
-        <div className="flex gap-3 pt-4 border-t border-gray-800">
+        <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
           <Button
             variant="ghost"
             className="flex-1"

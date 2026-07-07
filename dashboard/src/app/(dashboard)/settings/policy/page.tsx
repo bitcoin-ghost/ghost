@@ -75,14 +75,14 @@ function ProfileGrid({
           key={profile.name}
           className={`p-3 rounded-lg border transition-colors text-left ${
             activeProfile === profile.name
-              ? "bg-orange-900/30 border-orange-600 text-orange-300"
-              : "bg-gray-800/50 border-gray-700 text-gray-300 hover:border-gray-500"
+              ? "bg-[var(--accent)]/30 border-[var(--accent)] text-[color:var(--accent)]"
+              : "bg-[var(--surface)]/50 border-[var(--rule-strong)] text-[color:var(--dim)] hover:border-[var(--rule-strong)]"
           }`}
           onClick={() => onActivate(profile.name)}
           disabled={disabled || (profile.name === ghostModeRequired && !ghostModeActive)}
         >
           <div className="font-medium capitalize">{profile.name.replace(/_/g, " ")}</div>
-          <div className="text-xs text-gray-500 mt-1">{profile.desc}</div>
+          <div className="text-xs text-[color:var(--fainter)] mt-1">{profile.desc}</div>
         </button>
       ))}
     </div>
@@ -107,15 +107,15 @@ function CustomProfileList<T extends { name: string }>({
   if (profiles.length === 0) return null;
   return (
     <div className={`space-y-2 ${disabled ? "opacity-50 pointer-events-none" : ""}`}>
-      <h4 className="text-sm font-medium text-gray-300">Custom Profiles</h4>
+      <h4 className="text-sm font-medium text-[color:var(--dim)]">Custom Profiles</h4>
       {profiles.map((profile) => (
         <div
           key={profile.name}
-          className="p-3 bg-gray-800/50 rounded-lg flex justify-between items-center"
+          className="p-3 bg-[var(--surface)]/50 rounded-lg flex justify-between items-center"
         >
           <div>
-            <div className="text-gray-100">{profile.name}</div>
-            <div className="text-xs text-gray-500">{renderDetails(profile)}</div>
+            <div className="text-[color:var(--fg)]">{profile.name}</div>
+            <div className="text-xs text-[color:var(--fainter)]">{renderDetails(profile)}</div>
           </div>
           <div className="flex gap-2">
             <Button size="sm" variant="secondary" onClick={() => onEdit(profile)} disabled={disabled}>Edit</Button>
@@ -131,7 +131,7 @@ function CustomProfileList<T extends { name: string }>({
 function AdvancedToggle({ open, onToggle, count }: { open: boolean; onToggle: () => void; count: number }) {
   return (
     <button
-      className="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+      className="flex items-center gap-2 text-sm text-[color:var(--dim)] hover:text-[color:var(--fg)] transition-colors"
       onClick={onToggle}
     >
       <svg
@@ -142,7 +142,7 @@ function AdvancedToggle({ open, onToggle, count }: { open: boolean; onToggle: ()
       </svg>
       {open ? "Hide Advanced" : "Show Advanced"}
       {count > 0 && !open && (
-        <span className="text-xs text-gray-600">({count} custom)</span>
+        <span className="text-xs text-[color:var(--fainter)]">({count} custom)</span>
       )}
     </button>
   );
@@ -258,10 +258,10 @@ export default function PolicySettingsPage() {
       <Card>
         <CardHeader title="Mempool Policy" subtitle="Configure which transactions to accept in your mempool" />
         <div className="space-y-4">
-          <div className="p-3 bg-gray-800/50 rounded-lg flex justify-between items-center">
+          <div className="p-3 bg-[var(--surface)]/50 rounded-lg flex justify-between items-center">
             <div>
-              <div className="text-gray-100">Current Profile</div>
-              <div className="text-sm text-gray-400">{config?.mempool_profile ?? "standard"}</div>
+              <div className="text-[color:var(--fg)]">Current Profile</div>
+              <div className="text-sm text-[color:var(--dim)]">{config?.mempool_profile ?? "standard"}</div>
             </div>
             <Badge variant="info">{config?.mempool_profile ?? "standard"}</Badge>
           </div>
@@ -305,10 +305,10 @@ export default function PolicySettingsPage() {
       <Card>
         <CardHeader title="Block Template Policy" subtitle="Configure which transactions to include when mining blocks" />
         <div className="space-y-4">
-          <div className="p-3 bg-gray-800/50 rounded-lg flex justify-between items-center">
+          <div className="p-3 bg-[var(--surface)]/50 rounded-lg flex justify-between items-center">
             <div>
-              <div className="text-gray-100">Current Profile</div>
-              <div className="text-sm text-gray-400">{config?.template_profile ?? "standard"}</div>
+              <div className="text-[color:var(--fg)]">Current Profile</div>
+              <div className="text-sm text-[color:var(--dim)]">{config?.template_profile ?? "standard"}</div>
             </div>
             <Badge variant="info">{config?.template_profile ?? "standard"}</Badge>
           </div>

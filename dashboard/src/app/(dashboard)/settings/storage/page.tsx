@@ -19,13 +19,13 @@ export default function StorageSettingsPage() {
       </SectionErrorBoundary>
 
       <Card>
-        <p className="text-sm text-gray-400">
+        <p className="text-sm text-[color:var(--dim)]">
           Looking for L2 (Ghost Pay) pruning status and the full storage breakdown? See{" "}
-          <Link href="/storage" className="text-orange-400 hover:text-orange-300 underline">
+          <Link href="/storage" className="text-[color:var(--accent)] hover:text-[color:var(--accent)] underline">
             Storage
           </Link>
           . Backups and software updates live under{" "}
-          <Link href="/system" className="text-orange-400 hover:text-orange-300 underline">
+          <Link href="/system" className="text-[color:var(--accent)] hover:text-[color:var(--accent)] underline">
             System
           </Link>
           .

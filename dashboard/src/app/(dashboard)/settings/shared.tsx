@@ -37,13 +37,13 @@ export function ToggleRow({
   badge?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+    <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
       <div className="flex-1">
         <div className="flex items-center gap-2">
-          <span className="text-gray-100 font-medium">{label}</span>
+          <span className="text-[color:var(--fg)] font-medium">{label}</span>
           {badge}
         </div>
-        <div className="text-sm text-gray-400">{description}</div>
+        <div className="text-sm text-[color:var(--dim)]">{description}</div>
       </div>
       <Toggle enabled={enabled} onChange={onChange} label={label} disabled={disabled} />
     </div>
@@ -52,13 +52,13 @@ export function ToggleRow({
 
 export function StatusRow({ label, description, badge }: { label: string; description: string; badge: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+    <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
       <div className="flex-1">
         <div className="flex items-center gap-2">
-          <span className="text-gray-100 font-medium">{label}</span>
+          <span className="text-[color:var(--fg)] font-medium">{label}</span>
           {badge}
         </div>
-        <div className="text-sm text-gray-400">{description}</div>
+        <div className="text-sm text-[color:var(--dim)]">{description}</div>
       </div>
     </div>
   );
@@ -82,8 +82,8 @@ export function NumberInput({
   unit?: string;
 }) {
   return (
-    <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
-      <span className="text-gray-100">{label}</span>
+    <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
+      <span className="text-[color:var(--fg)]">{label}</span>
       <div className="flex items-center gap-2">
         <Input
           type="number"
@@ -94,7 +94,7 @@ export function NumberInput({
           step={step}
           className="w-24 text-right"
         />
-        {unit && <span className="text-gray-400 text-sm w-12">{unit}</span>}
+        {unit && <span className="text-[color:var(--dim)] text-sm w-12">{unit}</span>}
       </div>
     </div>
   );
