@@ -1319,6 +1319,12 @@ pub struct VerificationState {
     /// exact term it contributes to `get_mesh_total_hashrate`. Surfaced as
     /// `local_hashrate_th` so the per-node and mesh figures reconcile.
     get_local_hashrate: Option<Box<dyn Fn() -> f64 + Send + Sync>>,
+    /// Seconds elapsed in the current mining round (time working the current
+    /// template), from the round manager's `current_round_elapsed_secs`.
+    /// Surfaced as `current_round_duration_secs` on the pool-status endpoint so
+    /// the dashboard's round-progress readout can show how long the pool has
+    /// been on the current template. None on deploys without the provider wired.
+    get_round_elapsed_secs: Option<Box<dyn Fn() -> u64 + Send + Sync>>,
     /// Mesh-wide best (rarest) records per window: the connected peers'
     /// gossiped `best_records`, already reduced to one winner per window.
     /// The records endpoint merges this with the local DB best so it returns
@@ -1541,6 +1547,7 @@ impl VerificationState {
             get_self_deduped_miners: None,
             get_mesh_total_hashrate: None,
             get_local_hashrate: None,
+            get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
             // VF-C2: Default to requiring internal auth for security
@@ -2149,6 +2156,18 @@ impl VerificationState {
     /// the mesh total — or None if no callback has been wired up.
     pub fn local_hashrate(&self) -> Option<f64> {
         self.get_local_hashrate.as_ref().map(|f| f())
+    }
+
+    /// Set the current-round-elapsed-seconds callback (from the round manager).
+    pub fn with_round_elapsed_secs(mut self, f: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.get_round_elapsed_secs = Some(Box::new(f));
+        self
+    }
+
+    /// Returns seconds elapsed in the current mining round, or None if no
+    /// callback has been wired up (older deploys without the provider).
+    pub fn round_elapsed_secs(&self) -> Option<u64> {
+        self.get_round_elapsed_secs.as_ref().map(|f| f())
     }
 
     /// Set the mesh-wide best-records-per-window callback.

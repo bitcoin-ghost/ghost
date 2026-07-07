@@ -270,6 +270,12 @@ pub struct RoundManager {
     current_round: RwLock<RoundId>,
     /// Current block height
     current_height: RwLock<u64>,
+    /// Wall-clock start of the current round (reset on every `start_round`,
+    /// i.e. each new-work / template event). Monotonic `Instant` so the
+    /// reported elapsed time is immune to system clock adjustments. Read by
+    /// `current_round_elapsed_secs` to surface `current_round_duration_secs`
+    /// on the pool-status endpoint.
+    current_round_start: RwLock<std::time::Instant>,
     /// Active rounds (current and recent)
     rounds: RwLock<HashMap<RoundId, RoundShares>>,
     /// Difficulty calculator
@@ -318,6 +324,14 @@ pub struct RoundManager {
     metrics: Option<Arc<ghost_common::metrics::Metrics>>,
 }
 
+/// Seconds elapsed between two monotonic instants, saturating to 0 if `now`
+/// precedes `start` (guards against any ordering surprise; `Instant` is
+/// monotonic so this normally cannot happen). Pure helper so the round-duration
+/// derivation is unit-testable without wall-clock sleeps.
+fn elapsed_secs_between(start: std::time::Instant, now: std::time::Instant) -> u64 {
+    now.saturating_duration_since(start).as_secs()
+}
+
 impl RoundManager {
     /// Create a new round manager
     pub fn new(our_node_id: NodeId, config: RoundConfig) -> Self {
@@ -330,6 +344,7 @@ impl RoundManager {
             config,
             current_round: RwLock::new(0),
             current_height: RwLock::new(0),
+            current_round_start: RwLock::new(std::time::Instant::now()),
             rounds: RwLock::new(HashMap::new()),
             difficulty: RwLock::new(difficulty),
             nodes: RwLock::new(HashMap::new()),
@@ -366,6 +381,9 @@ impl RoundManager {
         };
 
         *self.current_height.write() = block_height;
+        // Reset the round timer so `current_round_duration_secs` measures time
+        // spent working THIS template, not the pool's total uptime.
+        *self.current_round_start.write() = std::time::Instant::now();
 
         // Create new round shares tracker
         let mut rounds = self.rounds.write();
@@ -928,6 +946,14 @@ impl RoundManager {
         *self.current_height.read()
     }
 
+    /// Seconds elapsed in the current round — i.e. how long the pool has been
+    /// working the current template, measured from the most recent
+    /// `start_round`. Surfaced as `current_round_duration_secs` on the
+    /// pool-status endpoint.
+    pub fn current_round_elapsed_secs(&self) -> u64 {
+        elapsed_secs_between(*self.current_round_start.read(), std::time::Instant::now())
+    }
+
     /// Get round statistics
     pub fn round_stats(&self, round_id: RoundId) -> Option<RoundStats> {
         let rounds = self.rounds.read();
@@ -1339,6 +1365,33 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.round_id, 1);
         assert!(!result.is_block);
+    }
+
+    #[test]
+    fn test_round_duration_derivation() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        // 125 seconds later → 125s elapsed.
+        let now = start + Duration::from_secs(125);
+        assert_eq!(elapsed_secs_between(start, now), 125);
+        // Sub-second remainder truncates down to whole seconds.
+        let now = start + Duration::from_millis(4_900);
+        assert_eq!(elapsed_secs_between(start, now), 4);
+        // `now` before `start` (should never happen with a monotonic clock, but
+        // must never underflow/panic) → saturates to 0.
+        assert_eq!(elapsed_secs_between(start + Duration::from_secs(10), start), 0);
+    }
+
+    #[test]
+    fn test_current_round_elapsed_resets_on_start_round() {
+        let node_id = [1u8; 32];
+        let manager = RoundManager::new(node_id, RoundConfig::default());
+        manager.start_round(100);
+        // Immediately after start_round the round has just begun.
+        assert!(
+            manager.current_round_elapsed_secs() < 2,
+            "elapsed should be ~0 right after start_round"
+        );
     }
 
     #[test]
