@@ -345,7 +345,7 @@ function PrivacySection() {
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <Tooltip content={TOOLTIPS.ghost_mode}>
           <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Ghost Mode</div>
+            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-start gap-1 min-h-[2.25rem] leading-tight"><InfoIcon /> Ghost Mode</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={ghostModeActive ? "online" : "offline"}
@@ -357,7 +357,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_tor}>
           <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Tor Mode</div>
+            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-start gap-1 min-h-[2.25rem] leading-tight"><InfoIcon /> Tor Mode</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={torActive ? "online" : "offline"}
@@ -369,7 +369,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_haze}>
           <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Ghost Haze</div>
+            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-start gap-1 min-h-[2.25rem] leading-tight"><InfoIcon /> Ghost Haze</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={hazeActive ? "online" : "offline"}
@@ -381,7 +381,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_shroud}>
           <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Ghost Shroud</div>
+            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-start gap-1 min-h-[2.25rem] leading-tight"><InfoIcon /> Ghost Shroud</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={shroudActive ? "online" : "offline"}
@@ -393,7 +393,7 @@ function PrivacySection() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_wraith}>
           <div className="p-3 bg-[var(--surface)] rounded-lg">
-            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Wraith</div>
+            <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-start gap-1 min-h-[2.25rem] leading-tight"><InfoIcon /> Wraith</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={wraithActive ? "online" : "offline"}
