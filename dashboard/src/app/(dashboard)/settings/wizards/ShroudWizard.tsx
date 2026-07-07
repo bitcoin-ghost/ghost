@@ -117,8 +117,8 @@ export default function ShroudWizard({ isOpen, onClose }: ShroudWizardProps) {
                   />
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-blue-900/20 border border-blue-800">
-                <p className="text-sm text-blue-300">
+              <div className="p-4 rounded-lg bg-[color-mix(in_srgb,var(--blue)_14%,transparent)] border border-[color-mix(in_srgb,var(--blue)_35%,transparent)]">
+                <p className="text-sm text-[color:var(--blue)]">
                   Ghost-core must be restarted for this change to take effect.
                   The node will start with the -shroud=1 flag when enabled.
                 </p>

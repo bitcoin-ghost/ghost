@@ -11,7 +11,7 @@ interface ProgressBarProps {
 const colorClasses = {
   orange: 'bg-[var(--accent)]',
   green: 'bg-[var(--green)]',
-  blue: 'bg-blue-500',
+  blue: 'bg-[var(--blue)]',
   red: 'bg-[var(--red)]',
   yellow: 'bg-[var(--accent)]',
   gray: 'bg-[var(--fainter)]',

@@ -13,13 +13,13 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 const variantClasses: Record<ButtonVariant, string> = {
   default: 'bg-[var(--rule-strong)] text-[color:var(--fg)] hover:bg-[var(--rule-strong)] border-[color:var(--rule-strong)]',
-  primary: 'bg-[var(--accent)] text-[color:var(--fg)] hover:bg-[var(--accent)] border-[color:var(--accent)]',
-  secondary: 'bg-[var(--accent)] text-[color:var(--fg)] hover:bg-[var(--accent)] border-[color:var(--accent)]',
+  primary: 'bg-[var(--accent)] text-white hover:bg-[var(--accent)] border-[color:var(--accent)]',
+  secondary: 'bg-[var(--accent)] text-white hover:bg-[var(--accent)] border-[color:var(--accent)]',
   outline: 'bg-transparent text-[color:var(--dim)] hover:bg-[var(--surface)] border-[color:var(--rule-strong)]',
   ghost: 'bg-transparent text-[color:var(--dim)] hover:bg-[var(--surface)] border-transparent',
-  danger: 'bg-[var(--red)] text-[color:var(--fg)] hover:bg-[var(--red)] border-[color:var(--red)]',
-  success: 'bg-[var(--green)] text-[color:var(--fg)] hover:bg-[var(--green)] border-[color:var(--green)]',
-  warning: 'bg-[var(--accent)] text-[color:var(--fg)] hover:bg-[var(--accent)] border-[color:var(--accent)]',
+  danger: 'bg-[var(--red)] text-white hover:bg-[var(--red)] border-[color:var(--red)]',
+  success: 'bg-[var(--green)] text-white hover:bg-[var(--green)] border-[color:var(--green)]',
+  warning: 'bg-[var(--accent)] text-white hover:bg-[var(--accent)] border-[color:var(--accent)]',
 };
 
 const sizeClasses: Record<ButtonSize, string> = {

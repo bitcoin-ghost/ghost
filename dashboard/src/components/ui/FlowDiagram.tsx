@@ -6,7 +6,7 @@ interface FlowDiagramStep {
 
 const ACCENT_COLORS: Record<string, { bg: string; border: string; text: string }> = {
   orange: { bg: "bg-[color-mix(in_srgb,var(--accent)_10%,transparent)]", border: "border-[color-mix(in_srgb,var(--accent)_30%,transparent)]", text: "text-[color:var(--accent)]" },
-  blue:   { bg: "bg-blue-900/10",   border: "border-blue-600/30",   text: "text-blue-400" },
+  blue:   { bg: "bg-[color-mix(in_srgb,var(--blue)_10%,transparent)]",   border: "border-[color-mix(in_srgb,var(--blue)_30%,transparent)]",   text: "text-[color:var(--blue)]" },
   red:    { bg: "bg-[color-mix(in_srgb,var(--red)_10%,transparent)]",    border: "border-[color-mix(in_srgb,var(--red)_30%,transparent)]",    text: "text-[color:var(--red)]" },
   green:  { bg: "bg-[color-mix(in_srgb,var(--green)_10%,transparent)]",  border: "border-[color-mix(in_srgb,var(--green)_30%,transparent)]",  text: "text-[color:var(--green)]" },
   purple: { bg: "bg-purple-900/10", border: "border-purple-600/30", text: "text-purple-400" },

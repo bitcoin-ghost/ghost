@@ -1191,10 +1191,10 @@ export default function SystemPage() {
           )}
 
           {restartRequired && (
-            <div className="p-4 rounded-lg border bg-blue-900/20 border-blue-800 space-y-2">
+            <div className="p-4 rounded-lg border bg-[color-mix(in_srgb,var(--blue)_14%,transparent)] border-[color-mix(in_srgb,var(--blue)_35%,transparent)] space-y-2">
               <div className="flex items-center gap-2">
                 <Badge variant="info">Restart required</Badge>
-                <span className="text-blue-300">Restore staged</span>
+                <span className="text-[color:var(--blue)]">Restore staged</span>
               </div>
               <p className="text-sm text-[color:var(--dim)]">
                 The backup was verified and staged. Restart ghost-pool (System &gt; Restart, or

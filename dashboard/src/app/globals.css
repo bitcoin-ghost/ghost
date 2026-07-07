@@ -19,6 +19,8 @@
   --accent-weak:   rgba(247, 147, 26, 0.12);
   --green:         #3f8f5b;
   --red:           #c0584c;
+  --blue:          #2f6ea8;
+  --yellow:        #9a7715;
 
   /* Aliases used by existing dashboard components (keep working) */
   --background: var(--bg);
@@ -39,6 +41,8 @@
   --accent-weak:   rgba(247, 147, 26, 0.14);
   --green:         #5cc77e;
   --red:           #d8746a;
+  --blue:          #6ba3d6;
+  --yellow:        #d9b35c;
 }
 
 /* Default to dark when the user hasn't set a preference and the OS is dark.

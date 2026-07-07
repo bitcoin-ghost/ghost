@@ -345,8 +345,8 @@ export function MempoolProfileDialog({
             )}
           </div>
           {!budsEnabled && (
-            <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded-lg mb-3">
-              <p className="text-yellow-400 text-sm">
+            <div className="p-3 bg-[color-mix(in_srgb,var(--yellow)_14%,transparent)] border border-[color-mix(in_srgb,var(--yellow)_35%,transparent)] rounded-lg mb-3">
+              <p className="text-[color:var(--yellow)] text-sm">
                 Enable Ghost Pay to use BUDS transaction tiers. T1-T3 tiers provide enhanced
                 transaction capabilities.
               </p>
