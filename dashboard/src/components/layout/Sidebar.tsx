@@ -2,7 +2,7 @@
 
 import {
   LayoutDashboard,
-  Monitor,
+  House,
   Pickaxe,
   Activity,
   RefreshCw,
@@ -62,10 +62,15 @@ const ICON = { size: 16, strokeWidth: 1.75 } as const;
  */
 const GROUPS: NavGroup[] = [
   {
+    label: "home",
+    items: [
+      { href: "/home", label: "Home", icon: <House {...ICON} /> },
+    ],
+  },
+  {
     label: "overview",
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
-      { href: "/overlays", label: "Overlays", icon: <Monitor {...ICON} /> },
       { href: "/sync", label: "Sync", icon: <RefreshCw {...ICON} /> },
       { href: "/geo", label: "Geo", icon: <MapPin {...ICON} /> },
     ],

@@ -3,8 +3,10 @@
  *
  * CONCEPT — a calm mission-control board for this node: block height ticking
  * up, a heartbeat pulse on each new block, current hashrate, the 5-4-3-2-1
- * capability ring, peer count, uptime, and a sync progress bar. Big, legible,
- * ambient — designed to be glanced at from across a room.
+ * capability ring, peer count, uptime, and a sync progress bar. It also carries
+ * a compact row of watchdog service LEDs (one dot per monitored service) and
+ * CPU / memory / disk resource gauges, so the Home screen is a full glance-able
+ * health board. Big, legible, ambient — designed to be read from across a room.
  *
  * The scene is given DEPTH so the medallion never floats in a black void: a
  * full-bleed background canvas paints a soft radial vignette focused on the
@@ -26,11 +28,23 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import type { OverlayProps } from './types';
 import { useNodeStatus, useShares } from '@/hooks/queries/useNodeQueries';
 import { useMiningStatus, useBestHash } from '@/hooks/queries/useMiningQueries';
+import { useWatchdogStatus } from '@/hooks/queries/useWatchdogQueries';
+import { useResourceStatus } from '@/hooks/queries/useResourceQueries';
 import { formatHashrate, formatDuration } from '@/components/ui/DataTable';
-import type { SharesInfo } from '@/types/api';
+import type { SharesInfo, WatchdogStatus } from '@/types/api';
+
+/**
+ * The scene honours `active`: it runs its rAF animation loop and lets its data
+ * hooks poll ONLY while `active === true`. The Home page mounts it permanently
+ * with `active` fixed on (there is no carousel), so the loop always runs — the
+ * prop is retained so the animation contract stays explicit and the scene could
+ * be paused again if it were ever placed off-screen.
+ */
+interface OverlayProps {
+  active: boolean;
+}
 
 // Bitcoin orange — identical in both themes (--accent), so the canvas can use
 // it directly without reading it back out of the DOM every frame.
@@ -131,11 +145,80 @@ function fmtCompact(n: number): string {
   return Math.round(n).toLocaleString();
 }
 
+// ── Watchdog LEDs ──────────────────────────────────────────────────────────
+// Each monitored service is reduced to a coloured dot: green = healthy/running,
+// red = down/errored, amber = degraded/unknown/stopped. The real per-service
+// statuses come from the watchdog endpoint — nothing here is fabricated.
+type Tone = 'ok' | 'down' | 'warn';
+interface Led {
+  name: string;
+  label: string;
+  tone: Tone;
+  title: string;
+}
+
+const TONE_COLOR: Record<Tone, string> = {
+  ok: 'var(--green)',
+  down: 'var(--red)',
+  warn: 'var(--accent)', // amber/orange — degraded or unknown
+};
+
+function ledTone(status: string): Tone {
+  switch (status) {
+    case 'ok':
+    case 'running':
+    case 'syncing':
+    case 'healthy':
+      return 'ok';
+    case 'error':
+    case 'unhealthy':
+      return 'down';
+    default:
+      // stopped, not_enabled, unknown, degraded, …
+      return 'warn';
+  }
+}
+
+// Trim the noisy prefixes/suffixes so labels stay legible in the compact row
+// (e.g. "ghost-pool" → "pool", "sri-translator" → "translator").
+function shortName(name: string): string {
+  const trimmed = name
+    .replace(/^ghost[-_]?/i, '')
+    .replace(/^sri[-_]?/i, '')
+    .replace(/[-_]?(service|node)$/i, '');
+  return trimmed.length > 0 ? trimmed : name;
+}
+
+// Prefer the granular per-component health list; fall back to the higher-level
+// services list if components are absent.
+function deriveLeds(status: WatchdogStatus | undefined): Led[] {
+  if (!status) return [];
+  const src =
+    status.components && status.components.length > 0
+      ? status.components.map((c) => ({ name: c.name, status: String(c.status) }))
+      : (status.services ?? []).map((s) => ({ name: s.name, status: String(s.status) }));
+  return src.map((s) => ({
+    name: s.name,
+    label: shortName(s.name),
+    tone: ledTone(s.status),
+    title: `${s.name}: ${s.status}`,
+  }));
+}
+
+// Resource usage → tone, mirroring the Watchdog page's threshold colouring.
+function usageTone(value: number, warn: number, crit: number): Tone {
+  if (value >= crit) return 'down';
+  if (value >= warn) return 'warn';
+  return 'ok';
+}
+
 export function NodeVitalsOverlay({ active }: OverlayProps) {
   const { data: status, isLoading: statusLoading } = useNodeStatus();
   const { data: mining } = useMiningStatus();
   const { data: shares } = useShares();
   const { data: bestHash } = useBestHash();
+  const { data: watchdog } = useWatchdogStatus();
+  const { data: resources } = useResourceStatus();
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -174,6 +257,49 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
   const totalShares = shares?.total ?? 0;
   const maxShares = shares?.max_shares ?? 15;
   const hasStatus = !!status;
+
+  // ── Watchdog service LEDs (real per-service health, or empty until it loads).
+  const leds = deriveLeds(watchdog);
+
+  // ── CPU / Memory / Disk gauges — real values, gracefully absent otherwise.
+  const gauges: { key: string; label: string; pct: number | null; tone: Tone; detail: string }[] =
+    resources
+      ? [
+          {
+            key: 'cpu',
+            label: 'CPU',
+            pct: resources.cpu_percent,
+            tone: usageTone(
+              resources.cpu_percent,
+              resources.warning_threshold_cpu,
+              resources.critical_threshold_cpu,
+            ),
+            detail: `${resources.cpu_percent.toFixed(0)}%`,
+          },
+          {
+            key: 'mem',
+            label: 'MEM',
+            pct: resources.memory_percent,
+            tone: usageTone(
+              resources.memory_percent,
+              resources.warning_threshold_memory,
+              resources.critical_threshold_memory,
+            ),
+            detail: `${(resources.memory_used_mb / 1024).toFixed(1)}/${(resources.memory_total_mb / 1024).toFixed(0)} GB`,
+          },
+          {
+            key: 'disk',
+            label: 'DISK',
+            pct: resources.disk_percent,
+            tone: usageTone(resources.disk_percent, 75, 90),
+            detail: `${resources.disk_used_gb.toFixed(0)}/${resources.disk_total_gb.toFixed(0)} GB`,
+          },
+        ]
+      : [
+          { key: 'cpu', label: 'CPU', pct: null, tone: 'ok', detail: '—' },
+          { key: 'mem', label: 'MEM', pct: null, tone: 'ok', detail: '—' },
+          { key: 'disk', label: 'DISK', pct: null, tone: 'ok', detail: '—' },
+        ];
 
   // ── Heartbeat detection: a rising synced height registers a STRONG beat. ──
   useEffect(() => {
@@ -430,7 +556,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
     <div
       ref={rootRef}
       className="relative flex h-full w-full flex-col items-center justify-center select-none overflow-hidden"
-      style={{ background: 'var(--bg)', color: 'var(--fg)', gap: 'clamp(10px, 2.2vh, 30px)' }}
+      style={{ background: 'var(--bg)', color: 'var(--fg)', gap: 'clamp(6px, 1.5vh, 20px)' }}
     >
       <style>{keyframes}</style>
 
@@ -470,11 +596,14 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
         </span>
       </div>
 
+      {/* Watchdog service LEDs — one dot per monitored service. */}
+      <WatchdogLeds leds={leds} active={active} />
+
       {/* Medallion: capability ring wrapping the big ticking block height. */}
       <div
         ref={wrapRef}
         className="relative flex items-center justify-center"
-        style={{ width: 'min(52vh, 80vw, 440px)', aspectRatio: '1 / 1' }}
+        style={{ width: 'min(42vh, 72vw, 384px)', aspectRatio: '1 / 1' }}
       >
         {/* Canvas heartbeat layer (behind the SVG ring). */}
         <canvas
@@ -706,6 +835,22 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
         <Stat label="Best Share" value={fmtCompact(v.bestDifficulty)} accent />
       </div>
 
+      {/* Host resources — CPU / Memory / Disk mini radial gauges. */}
+      <div
+        className="relative flex items-stretch justify-center"
+        style={{ gap: 'clamp(10px, 1.6vw, 22px)' }}
+      >
+        {gauges.map((g) => (
+          <ResourceGauge
+            key={g.key}
+            label={g.label}
+            pct={g.pct}
+            tone={g.tone}
+            detail={g.detail}
+          />
+        ))}
+      </div>
+
       {/* Sync progress bar. */}
       <div className="relative" style={{ width: 'min(620px, 82vw)' }}>
         <div
@@ -841,6 +986,141 @@ function Stat({
           {sub}
         </div>
       )}
+    </div>
+  );
+}
+
+// A compact row of watchdog service LEDs: one dot + tiny label per monitored
+// service. Healthy dots share a gentle unison blink so the row reads as alive.
+function WatchdogLeds({ leds, active }: { leds: Led[]; active: boolean }) {
+  if (leds.length === 0) {
+    return (
+      <div
+        className="relative"
+        style={{
+          fontFamily: 'var(--font-mono)',
+          fontSize: '9px',
+          textTransform: 'uppercase',
+          letterSpacing: '0.2em',
+          color: 'var(--fainter)',
+        }}
+      >
+        watchdog · acquiring service health
+      </div>
+    );
+  }
+  return (
+    <div
+      className="relative flex flex-wrap items-center justify-center"
+      style={{ gap: 'clamp(8px, 1.2vw, 16px)', maxWidth: '92vw' }}
+    >
+      {leds.map((led) => (
+        <div key={led.name} className="flex items-center" style={{ gap: 6 }} title={led.title}>
+          <span
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: 9999,
+              background: TONE_COLOR[led.tone],
+              boxShadow: `0 0 8px 1px ${TONE_COLOR[led.tone]}`,
+              opacity: 0.9,
+              animation:
+                active && led.tone === 'ok' ? 'nv-blink 3s ease-in-out infinite' : undefined,
+            }}
+          />
+          <span
+            style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: '9.5px',
+              textTransform: 'uppercase',
+              letterSpacing: '0.14em',
+              color: led.tone === 'down' ? 'var(--red)' : 'var(--dim)',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {led.label}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// A small radial gauge for a host-resource percentage (CPU / Memory / Disk).
+// Renders '—' with a dim track when the value is unavailable.
+function ResourceGauge({
+  label,
+  pct,
+  tone,
+  detail,
+}: {
+  label: string;
+  pct: number | null;
+  tone: Tone;
+  detail: string;
+}) {
+  const has = pct !== null;
+  const clamped = has ? Math.max(0, Math.min(100, pct)) : 0;
+  const color = TONE_COLOR[tone];
+  return (
+    <div className="relative flex flex-col items-center" style={{ gap: 4 }}>
+      <div style={{ position: 'relative', width: 'clamp(50px, 6.6vh, 66px)', aspectRatio: '1 / 1' }}>
+        <svg viewBox="0 0 64 64" style={{ width: '100%', height: '100%' }} aria-hidden>
+          <circle cx={32} cy={32} r={24} fill="none" stroke="var(--rule)" strokeWidth={5} />
+          {has && (
+            <circle
+              cx={32}
+              cy={32}
+              r={24}
+              fill="none"
+              stroke={color}
+              strokeWidth={5}
+              strokeLinecap="round"
+              pathLength={100}
+              strokeDasharray={`${clamped} ${100 - clamped}`}
+              transform="rotate(-90 32 32)"
+              style={{
+                filter: `drop-shadow(0 0 4px ${color})`,
+                transition: 'stroke-dasharray 0.6s ease, stroke 0.4s ease',
+              }}
+            />
+          )}
+        </svg>
+        <div
+          className="absolute inset-0 flex items-center justify-center"
+          style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 'clamp(11px, 1.7vh, 15px)',
+            fontWeight: 300,
+            fontVariantNumeric: 'tabular-nums',
+            color: has ? 'var(--fg)' : 'var(--fainter)',
+          }}
+        >
+          {has ? `${Math.round(clamped)}%` : '—'}
+        </div>
+      </div>
+      <div
+        style={{
+          fontFamily: 'var(--font-mono)',
+          fontSize: '9.5px',
+          textTransform: 'uppercase',
+          letterSpacing: '0.18em',
+          color: 'var(--dim)',
+        }}
+      >
+        {label}
+      </div>
+      <div
+        style={{
+          fontFamily: 'var(--font-mono)',
+          fontSize: '8.5px',
+          letterSpacing: '0.06em',
+          color: 'var(--fainter)',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {detail}
+      </div>
     </div>
   );
 }
