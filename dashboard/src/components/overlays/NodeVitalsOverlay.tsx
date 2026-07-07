@@ -72,7 +72,35 @@ const RING_STROKE = 13;
 const SEG_SLOT = 100 / CAPS.length; // pathLength=100 → 20 units per capability
 const SEG_GAP = 3; // units of gap between arcs
 const SEG_VISIBLE = SEG_SLOT - SEG_GAP;
-const LABEL_R = RING_R + 30;
+// Labels curve along invisible arcs concentric with the ring. The name rides an
+// outer arc, the "+bonus" an inner arc; both radii are chosen so that even where
+// a bottom-half label's glyphs extend inward (toward the ring), they still clear
+// the ring's outer edge (RING_R + RING_STROKE/2 = 156.5) with comfortable margin.
+const LABEL_NAME_R = RING_R + 34; // 184
+const LABEL_BONUS_R = RING_R + 18; // 168
+
+// Build an SVG arc `d` for a label baseline: a minor arc (≤180°) of radius `r`
+// centred on the ring angle `thetaDeg` (clockwise from 12 o'clock), spanning
+// `span` degrees. On the TOP half the arc runs clockwise (sweep=1) so text reads
+// upright with glyphs pointing outward; on the BOTTOM half it runs
+// counter-clockwise (sweep=0) so text stays upright (never mirrored) with glyphs
+// pointing gently inward. textPath + startOffset 50% + text-anchor middle then
+// centres each label exactly on its capability's 72° segment midpoint.
+function labelArc(thetaDeg: number, r: number, bottom: boolean, span = 120): string {
+  const pt = (a: number): [number, number] => {
+    const phi = ((a - 90) * Math.PI) / 180; // 12 o'clock = 0°, clockwise positive
+    return [CENTER + r * Math.cos(phi), CENTER + r * Math.sin(phi)];
+  };
+  const half = span / 2;
+  if (bottom) {
+    const [x1, y1] = pt(thetaDeg + half);
+    const [x2, y2] = pt(thetaDeg - half);
+    return `M ${x1} ${y1} A ${r} ${r} 0 0 0 ${x2} ${y2}`; // CCW → upright at bottom
+  }
+  const [x1, y1] = pt(thetaDeg - half);
+  const [x2, y2] = pt(thetaDeg + half);
+  return `M ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2} ${y2}`; // CW → upright at top
+}
 
 interface Vitals {
   height: number; // node's synced height (the big ticking number)
@@ -687,25 +715,32 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
           </g>
         </svg>
 
-        {/* Capability labels around the ring. */}
+        {/* Capability labels — curved along arcs just outside the ring so the
+            text follows the ring's curvature and never overlaps the arcs. */}
         <svg
           viewBox="0 0 400 400"
           className="absolute inset-0"
           style={{ width: '100%', height: '100%', overflow: 'visible' }}
           aria-hidden
         >
-          {CAPS.map((cap, i) => {
-            const frac = (i * SEG_SLOT + SEG_VISIBLE / 2) / 100;
-            const ang = (-90 + frac * 360) * (Math.PI / 180);
-            const x = CENTER + LABEL_R * Math.cos(ang);
-            const y = CENTER + LABEL_R * Math.sin(ang);
+          <defs>
+            {CAPS.map((cap, i) => {
+              const theta = ((i * SEG_SLOT + SEG_VISIBLE / 2) / 100) * 360; // clockwise from top
+              const bottom = theta > 90 && theta < 270; // lower half → keep upright
+              return (
+                <g key={cap.key}>
+                  <path id={`nv-lbl-${cap.key}`} d={labelArc(theta, LABEL_NAME_R, bottom)} fill="none" />
+                  <path id={`nv-bns-${cap.key}`} d={labelArc(theta, LABEL_BONUS_R, bottom)} fill="none" />
+                </g>
+              );
+            })}
+          </defs>
+          {CAPS.map((cap) => {
             const qualified = !!shares?.[cap.key] && uptimeQualified;
             return (
-              <g key={cap.key} transform={`translate(${x} ${y})`}>
+              <g key={cap.key}>
                 <text
-                  textAnchor="middle"
                   dominantBaseline="middle"
-                  y={-6}
                   style={{
                     fontFamily: 'var(--font-mono)',
                     fontSize: 12,
@@ -713,12 +748,12 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
                     fill: qualified ? 'var(--fg)' : 'var(--fainter)',
                   }}
                 >
-                  {cap.label}
+                  <textPath href={`#nv-lbl-${cap.key}`} startOffset="50%" textAnchor="middle">
+                    {cap.label}
+                  </textPath>
                 </text>
                 <text
-                  textAnchor="middle"
                   dominantBaseline="middle"
-                  y={9}
                   style={{
                     fontFamily: 'var(--font-mono)',
                     fontSize: 11,
@@ -726,7 +761,9 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
                     fill: qualified ? `rgb(${ACCENT_RGB})` : 'var(--fainter)',
                   }}
                 >
-                  +{cap.bonus}
+                  <textPath href={`#nv-bns-${cap.key}`} startOffset="50%" textAnchor="middle">
+                    +{cap.bonus}
+                  </textPath>
                 </text>
               </g>
             );
