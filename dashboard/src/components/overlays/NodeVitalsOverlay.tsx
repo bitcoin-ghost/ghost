@@ -889,7 +889,6 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
       >
         <Stat
           label="Hashrate"
-          sub="this node"
           value={
             v.nodeHashrateHs > 0
               ? formatHashrate(v.nodeHashrateHs)
