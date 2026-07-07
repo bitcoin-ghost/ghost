@@ -6,7 +6,6 @@ import {
   getBackupHistory,
   deleteBackup,
 } from '@/lib/api/backup';
-import type { BackupOptions } from '@/types/api';
 
 export const backupKeys = {
   all: ['backup'] as const,
@@ -25,8 +24,7 @@ export function useCreateBackup() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ options, password }: { options: BackupOptions; password: string }) =>
-      createBackup(options, password),
+    mutationFn: () => createBackup(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: backupKeys.history() });
     },
@@ -35,8 +33,7 @@ export function useCreateBackup() {
 
 export function useVerifyBackup() {
   return useMutation({
-    mutationFn: ({ file, password }: { file: File; password: string }) =>
-      verifyBackup(file, password),
+    mutationFn: ({ file }: { file: File }) => verifyBackup(file),
   });
 }
 
@@ -44,8 +41,7 @@ export function useImportBackup() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ file, password }: { file: File; password: string }) =>
-      importBackup(file, password),
+    mutationFn: ({ file }: { file: File }) => importBackup(file),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: backupKeys.all });
     },

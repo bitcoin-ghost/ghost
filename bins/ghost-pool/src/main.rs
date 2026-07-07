@@ -2380,6 +2380,21 @@ async fn main() -> Result<()> {
 
     // Initialize database
     let db_path = data_dir.join("ghost.db");
+
+    // Apply a pending restore staged by the dashboard Backup & Restore import,
+    // if any. This MUST run before the DB is opened so the swap happens while the
+    // file is closed (never corrupting a running DB). It first copies the current
+    // DB to a timestamped `.pre-restore-*.db` safety backup. A failure here is
+    // non-fatal — the existing DB is left intact and we start from it.
+    match ghost_storage::database::apply_pending_restore(&db_path) {
+        Ok(true) => info!("Applied pending database restore from dashboard import"),
+        Ok(false) => {}
+        Err(e) => error!(
+            error = %e,
+            "Pending database restore failed; starting with the existing database"
+        ),
+    }
+
     let db = Arc::new(Database::open(&db_path)?);
     info!("Database opened: {}", db_path.display());
 

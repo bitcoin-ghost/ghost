@@ -42,12 +42,31 @@ async function proxyRequest(request: NextRequest, params: Promise<{ path: string
       body,
     });
 
+    const contentType = response.headers.get("Content-Type") || "application/json";
+
+    // Binary payloads (e.g. a backup download) must NOT be round-tripped through
+    // `.text()` — that would decode the bytes as UTF-8 and corrupt the file.
+    // Pass them through as an ArrayBuffer, preserving the attachment headers.
+    const isBinary = !contentType.includes("json") && !contentType.startsWith("text/");
+    if (isBinary) {
+      const buffer = await response.arrayBuffer();
+      const outHeaders: Record<string, string> = { "Content-Type": contentType };
+      const disposition = response.headers.get("Content-Disposition");
+      if (disposition) outHeaders["Content-Disposition"] = disposition;
+      const length = response.headers.get("Content-Length");
+      if (length) outHeaders["Content-Length"] = length;
+      return new NextResponse(buffer, {
+        status: response.status,
+        headers: outHeaders,
+      });
+    }
+
     const responseData = await response.text();
 
     return new NextResponse(responseData, {
       status: response.status,
       headers: {
-        "Content-Type": response.headers.get("Content-Type") || "application/json",
+        "Content-Type": contentType,
       },
     });
   } catch (error) {
