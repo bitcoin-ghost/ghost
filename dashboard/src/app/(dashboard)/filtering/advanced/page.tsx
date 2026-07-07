@@ -1,7 +1,7 @@
 "use client";
 
 import { PageHeader } from "@/components/ui/PageHeader";
-import { Card, CardHeader } from "@/components/ui/Card";
+import { Card } from "@/components/ui/Card";
 import { Toggle } from "@/components/ui/Toggle";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { ReaperControls } from "@/components/filtering/ReaperControls";
@@ -42,10 +42,6 @@ export default function AdvancedFilteringPage() {
 
           <SectionErrorBoundary section="Custom policy">
             <Card>
-              <CardHeader
-                title="Custom mining policy"
-                subtitle="The full per-field counterpart to the Basic presets — every knob the block builder enforces. Includes the block fee floor (Min fee rate)."
-              />
               <AdvancedPolicyPanel />
             </Card>
           </SectionErrorBoundary>

@@ -61,10 +61,6 @@ export default function FilteringSettingsPage() {
 
           <SectionErrorBoundary section="Custom policy">
             <Card>
-              <CardHeader
-                title="Custom mining policy"
-                subtitle="The full per-field counterpart to the presets above — every knob the block builder enforces, including the block fee floor (Min fee rate)."
-              />
               <AdvancedPolicyPanel />
             </Card>
           </SectionErrorBoundary>

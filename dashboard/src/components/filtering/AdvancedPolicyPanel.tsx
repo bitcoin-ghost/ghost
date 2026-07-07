@@ -184,7 +184,7 @@ export function AdvancedPolicyPanel() {
 function PanelSection({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div style={{ marginBottom: "14px" }}>
-      <div style={{ color: "var(--fg)", fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>{title}</div>
+      <div style={{ color: "var(--accent)", fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>{title}</div>
       <div className="space-y-2">{children}</div>
     </div>
   );
