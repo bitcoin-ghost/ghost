@@ -47,9 +47,9 @@ const STEPS = [
 
 function StatItem({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
-      <span className="text-sm text-gray-400">{label}</span>
-      <span className="text-sm text-gray-100 font-medium">{value}</span>
+    <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
+      <span className="text-sm text-[color:var(--dim)]">{label}</span>
+      <span className="text-sm text-[color:var(--fg)] font-medium">{value}</span>
     </div>
   );
 }
@@ -324,13 +324,13 @@ export default function OnboardingPage() {
               )}
 
               <div
-                className={`p-3 bg-gray-800/50 rounded-lg flex justify-between items-center ${
+                className={`p-3 bg-[var(--surface)]/50 rounded-lg flex justify-between items-center ${
                   reaperEnabled ? "opacity-50" : ""
                 }`}
               >
                 <div>
-                  <div className="text-gray-100">Current Profile</div>
-                  <div className="text-sm text-gray-400">{activeMempoolProfile}</div>
+                  <div className="text-[color:var(--fg)]">Current Profile</div>
+                  <div className="text-sm text-[color:var(--dim)]">{activeMempoolProfile}</div>
                 </div>
                 <Badge variant="info">{activeMempoolProfile}</Badge>
               </div>
@@ -347,12 +347,12 @@ export default function OnboardingPage() {
                     disabled={reaperEnabled || activateMempoolProfile.isPending}
                     className={`p-3 rounded-lg border transition-colors text-left ${
                       activeMempoolProfile === p.name
-                        ? "bg-orange-900/30 border-orange-600 text-orange-300"
-                        : "bg-gray-800/50 border-gray-700 text-gray-300 hover:border-gray-500"
+                        ? "bg-[var(--accent)]/30 border-[var(--accent)] text-[color:var(--accent)]"
+                        : "bg-[var(--surface)]/50 border-[var(--rule-strong)] text-[color:var(--dim)] hover:border-[var(--rule-strong)]"
                     }`}
                   >
                     <div className="font-medium capitalize">{p.name.replace(/_/g, " ")}</div>
-                    <div className="text-xs text-gray-500 mt-1">{p.desc}</div>
+                    <div className="text-xs text-[color:var(--fainter)] mt-1">{p.desc}</div>
                   </button>
                 ))}
               </div>

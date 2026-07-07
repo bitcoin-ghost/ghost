@@ -61,7 +61,7 @@ export function PayoutSection() {
       <div className="space-y-4">
         {/* Mining Payout Address */}
         <div>
-          <label className="block text-sm text-gray-400 mb-1">Mining Payout Address</label>
+          <label className="block text-sm text-[color:var(--dim)] mb-1">Mining Payout Address</label>
           <div className="flex gap-3">
             <Input
               value={miningPayoutAddress}
@@ -77,14 +77,14 @@ export function PayoutSection() {
               Save
             </Button>
           </div>
-          <p className="text-xs text-gray-500 mt-1">
+          <p className="text-xs text-[color:var(--fainter)] mt-1">
             Mining block rewards and coinbase fees will be sent to this address
           </p>
         </div>
 
         {/* GhostPay Payout Address */}
         <div>
-          <label className="block text-sm text-gray-400 mb-1">GhostPay Fee Address</label>
+          <label className="block text-sm text-[color:var(--dim)] mb-1">GhostPay Fee Address</label>
           <div className="flex gap-3">
             <Input
               value={ghostPayPayoutAddress}
@@ -100,7 +100,7 @@ export function PayoutSection() {
               Save
             </Button>
           </div>
-          <p className="text-xs text-gray-500 mt-1">
+          <p className="text-xs text-[color:var(--fainter)] mt-1">
             GhostPay L2 transaction fee distributions will be sent to this address.
             Requires Ghost Pay to be enabled.
           </p>

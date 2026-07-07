@@ -66,35 +66,35 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
         <div className="space-y-6">
           {wizard.currentStep === 0 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
-                  <span className="text-gray-100 font-medium">Current Status</span>
+                  <span className="text-[color:var(--fg)] font-medium">Current Status</span>
                   <Badge variant={config?.ghost_mode ? 'success' : 'default'}>
                     {config?.ghost_mode ? 'Active' : 'Inactive'}
                   </Badge>
                 </div>
-                <p className="text-sm text-gray-400 mt-1">
+                <p className="text-sm text-[color:var(--dim)] mt-1">
                   Ghost Mode enables Ghost protocol features including L2 participation,
                   privacy tools, and node reward eligibility.
                 </p>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-2">What Ghost Mode does</h4>
-                <ul className="space-y-2 text-sm text-gray-400">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-2">What Ghost Mode does</h4>
+                <ul className="space-y-2 text-sm text-[color:var(--dim)]">
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
+                    <span className="text-[color:var(--accent)]">--</span>
                     Signals your node as a Ghost protocol participant
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
+                    <span className="text-[color:var(--accent)]">--</span>
                     Enables node capability verification eligibility
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
+                    <span className="text-[color:var(--accent)]">--</span>
                     Individual capabilities (Ghost Pay, Archive, etc.) are configured separately
                   </li>
                   <li className="flex items-center gap-2">
-                    <span className="text-orange-300">--</span>
+                    <span className="text-[color:var(--accent)]">--</span>
                     Does not grant shares on its own — shares come from verified capabilities
                   </li>
                 </ul>
@@ -104,11 +104,11 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
 
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Ghost Mode</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Ghost Mode</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Enable Ghost protocol features and L2 participation
                     </p>
                   </div>
@@ -120,15 +120,15 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
                 </div>
               </div>
               {data.enabled && (
-                <div className="p-4 rounded-lg bg-green-900/20 border border-green-800">
-                  <p className="text-sm text-green-300">
+                <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
+                  <p className="text-sm text-[color:var(--green)]">
                     Your node will join the Ghost network and become eligible for node rewards.
                   </p>
                 </div>
               )}
               {!data.enabled && (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     Disabling Ghost Mode will disconnect your node from the Ghost network.
                     You will no longer earn node rewards or participate in L2 services.
                   </p>
@@ -139,15 +139,15 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
 
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Change Summary</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Change Summary</h4>
                 <div className="flex items-center justify-between">
-                  <span className="text-gray-400">Ghost Mode</span>
+                  <span className="text-[color:var(--dim)]">Ghost Mode</span>
                   <div className="flex items-center gap-2">
                     <Badge variant={config?.ghost_mode ? 'success' : 'default'}>
                       {config?.ghost_mode ? 'Active' : 'Inactive'}
                     </Badge>
-                    <span className="text-gray-500">-&gt;</span>
+                    <span className="text-[color:var(--fainter)]">-&gt;</span>
                     <Badge variant={data.enabled ? 'success' : 'default'}>
                       {data.enabled ? 'Active' : 'Inactive'}
                     </Badge>
@@ -155,14 +155,14 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
                 </div>
               </div>
               {data.enabled !== (config?.ghost_mode ?? false) ? (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     Click Finish to apply this change. Your node configuration will be updated immediately.
                   </p>
                 </div>
               ) : (
-                <div className="p-4 rounded-lg bg-gray-800/50">
-                  <p className="text-sm text-gray-400">
+                <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                  <p className="text-sm text-[color:var(--dim)]">
                     No changes detected. The setting matches the current configuration.
                   </p>
                 </div>

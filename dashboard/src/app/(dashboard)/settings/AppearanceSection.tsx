@@ -13,7 +13,7 @@ export function AppearanceSection() {
     <SettingsSection title="Appearance" subtitle="Customize the dashboard theme">
       <div className="space-y-4">
         <div>
-          <label className="block text-sm text-gray-400 mb-3">Accent Color</label>
+          <label className="block text-sm text-[color:var(--dim)] mb-3">Accent Color</label>
           <div className="grid grid-cols-4 sm:grid-cols-8 gap-3">
             {(Object.entries(ACCENT_COLORS) as [AccentColorKey, typeof ACCENT_COLORS[AccentColorKey]][]).map(
               ([key, color]) => (
@@ -23,7 +23,7 @@ export function AppearanceSection() {
                   className={`
                     relative h-10 w-10 rounded-lg transition-all duration-200
                     ${accentColor === key
-                      ? 'ring-2 ring-white ring-offset-2 ring-offset-gray-900 scale-110'
+                      ? 'ring-2 ring-[var(--fg)] ring-offset-2 ring-offset-[var(--bg)] scale-110'
                       : 'hover:scale-105'
                     }
                   `}
@@ -41,7 +41,7 @@ export function AppearanceSection() {
               )
             )}
           </div>
-          <p className="text-xs text-gray-500 mt-3">
+          <p className="text-xs text-[color:var(--fainter)] mt-3">
             Current: <span style={{ color: ACCENT_COLORS[accentColor].hex }}>{ACCENT_COLORS[accentColor].name}</span>
           </p>
         </div>

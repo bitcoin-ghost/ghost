@@ -119,7 +119,7 @@ export default function AlertsSettingsPage() {
   };
 
   if (isLoading) {
-    return <div className="text-gray-400 text-sm">Loading alert settings…</div>;
+    return <div className="text-[color:var(--dim)] text-sm">Loading alert settings…</div>;
   }
 
   return (
@@ -142,12 +142,12 @@ export default function AlertsSettingsPage() {
         <CardHeader title="Channels" subtitle="Enable one or more delivery channels and enter their details." />
         <div className="space-y-4">
           {/* Email */}
-          <div className="p-4 bg-gray-800/50 rounded-lg space-y-3">
+          <div className="p-4 bg-[var(--surface)]/50 rounded-lg space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-gray-100 font-medium">Email</div>
-                <div className="text-sm text-gray-400">
-                  POSTs <code className="text-orange-400">{"{to, subject, body}"}</code> to your mail-relay webhook.
+                <div className="text-[color:var(--fg)] font-medium">Email</div>
+                <div className="text-sm text-[color:var(--dim)]">
+                  POSTs <code className="text-[color:var(--accent)]">{"{to, subject, body}"}</code> to your mail-relay webhook.
                 </div>
               </div>
               <Toggle
@@ -181,12 +181,12 @@ export default function AlertsSettingsPage() {
           </div>
 
           {/* Push */}
-          <div className="p-4 bg-gray-800/50 rounded-lg space-y-3">
+          <div className="p-4 bg-[var(--surface)]/50 rounded-lg space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-gray-100 font-medium">Push</div>
-                <div className="text-sm text-gray-400">
-                  POSTs <code className="text-orange-400">{"{title, message}"}</code> to an ntfy-style webhook.
+                <div className="text-[color:var(--fg)] font-medium">Push</div>
+                <div className="text-sm text-[color:var(--dim)]">
+                  POSTs <code className="text-[color:var(--accent)]">{"{title, message}"}</code> to an ntfy-style webhook.
                 </div>
               </div>
               <Toggle
@@ -210,11 +210,11 @@ export default function AlertsSettingsPage() {
           </div>
 
           {/* Telegram */}
-          <div className="p-4 bg-gray-800/50 rounded-lg space-y-3">
+          <div className="p-4 bg-[var(--surface)]/50 rounded-lg space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-gray-100 font-medium">Telegram</div>
-                <div className="text-sm text-gray-400">Delivers via the Telegram Bot API.</div>
+                <div className="text-[color:var(--fg)] font-medium">Telegram</div>
+                <div className="text-sm text-[color:var(--dim)]">Delivers via the Telegram Bot API.</div>
               </div>
               <Toggle
                 label="Enable Telegram"
@@ -271,7 +271,7 @@ export default function AlertsSettingsPage() {
         <Button variant="outline" onClick={handleTest} loading={sendTest.isPending}>
           Send test alert
         </Button>
-        <span className="text-xs text-gray-500">
+        <span className="text-xs text-[color:var(--fainter)]">
           Test delivers to every enabled + configured channel. Save first so a newly entered token is applied.
         </span>
       </div>
@@ -282,10 +282,10 @@ export default function AlertsSettingsPage() {
           <CardHeader title="Test result" subtitle={testResult.message} />
           <div className="space-y-2">
             {testResult.results.map((r) => (
-              <div key={r.channel} className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
-                <span className="text-gray-100 capitalize">{r.channel}</span>
+              <div key={r.channel} className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
+                <span className="text-[color:var(--fg)] capitalize">{r.channel}</span>
                 <div className="flex items-center gap-3">
-                  <span className="text-xs text-gray-400">{r.detail}</span>
+                  <span className="text-xs text-[color:var(--dim)]">{r.detail}</span>
                   <Badge variant={!r.attempted ? "default" : r.success ? "success" : "error"}>
                     {!r.attempted ? "Skipped" : r.success ? "Delivered" : "Failed"}
                   </Badge>

@@ -59,9 +59,9 @@ export default function PrivacySettingsPage() {
 
   return (
     <>
-      <Card className="border-red-600/30">
+      <Card className="border-[var(--red)]/30">
         <CardHeader
-          title={<span className="text-red-400">Privacy &amp; Anonymity</span>}
+          title={<span className="text-[color:var(--red)]">Privacy &amp; Anonymity</span>}
           subtitle="Control your node's privacy features"
         />
         <div className="space-y-4">
@@ -80,26 +80,26 @@ export default function PrivacySettingsPage() {
             }
           />
 
-          <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+          <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
             <div className="flex-1">
               <div className="flex items-center gap-2">
-                <span className="text-gray-100 font-medium">Tor Mode</span>
+                <span className="text-[color:var(--fg)] font-medium">Tor Mode</span>
                 {status?.tor_mode ? (
                   <Badge variant="success">Active</Badge>
                 ) : (
                   <Badge variant="default">Disabled</Badge>
                 )}
               </div>
-              <div className="text-sm text-gray-400">
+              <div className="text-sm text-[color:var(--dim)]">
                 Routes all P2P connections through the Tor network, hiding your node&apos;s IP address
               </div>
               {status?.tor_mode && status?.onion_address && (
                 <div className="mt-2 flex items-center gap-2">
-                  <code className="text-xs text-orange-400 bg-gray-900/50 px-2 py-1 rounded font-mono">
+                  <code className="text-xs text-[color:var(--accent)] bg-[var(--surface)]/50 px-2 py-1 rounded font-mono">
                     {status.onion_address}
                   </code>
                   <button
-                    className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
+                    className="text-xs text-[color:var(--fainter)] hover:text-[color:var(--dim)] transition-colors"
                     onClick={() => {
                       navigator.clipboard.writeText(status.onion_address!);
                     }}
@@ -109,7 +109,7 @@ export default function PrivacySettingsPage() {
                 </div>
               )}
               {!status?.tor_mode && (
-                <div className="text-xs text-gray-600 mt-1">
+                <div className="text-xs text-[color:var(--fainter)] mt-1">
                   Configure via Ghost Core startup flags (-proxy, -torcontrol). Set at startup, read-only here.
                 </div>
               )}
@@ -117,10 +117,10 @@ export default function PrivacySettingsPage() {
           </div>
 
           {/* Ghost Shroud — configurable via the same wizard as Settings › Wizards */}
-          <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+          <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
             <div className="flex-1">
               <div className="flex items-center gap-2">
-                <span className="text-gray-100 font-medium">Ghost Shroud</span>
+                <span className="text-[color:var(--fg)] font-medium">Ghost Shroud</span>
                 {shroudStatus ? (
                   <Badge variant={shroudStatus.enabled ? "success" : "default"}>
                     {shroudStatus.enabled ? "Active" : "Disabled"}
@@ -129,7 +129,7 @@ export default function PrivacySettingsPage() {
                   <Badge variant="default">Unknown</Badge>
                 )}
               </div>
-              <div className="text-sm text-gray-400">
+              <div className="text-sm text-[color:var(--dim)]">
                 Random delays before relaying transactions — protects against timing analysis
               </div>
             </div>
@@ -139,10 +139,10 @@ export default function PrivacySettingsPage() {
           </div>
 
           {/* Ghost Haze — configurable via the same wizard as Settings › Wizards */}
-          <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+          <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
             <div className="flex-1">
               <div className="flex items-center gap-2">
-                <span className="text-gray-100 font-medium">Ghost Haze</span>
+                <span className="text-[color:var(--fg)] font-medium">Ghost Haze</span>
                 {hazeStatus ? (
                   <Badge variant={hazeMode === "hazed" ? "success" : hazeMode === "full_archive" ? "info" : "default"}>
                     {hazeModeLabel}
@@ -151,7 +151,7 @@ export default function PrivacySettingsPage() {
                   <Badge variant="default">Unknown</Badge>
                 )}
               </div>
-              <div className="text-sm text-gray-400">
+              <div className="text-sm text-[color:var(--dim)]">
                 Strips privacy-sensitive data (signatures, witness data, inscriptions) from stored blocks
               </div>
             </div>
@@ -171,13 +171,13 @@ export default function PrivacySettingsPage() {
               badge={wraithEnabled ? <Badge variant="success">Active</Badge> : <Badge variant="default">Available</Badge>}
             />
           ) : (
-            <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+            <div className="flex items-center justify-between p-3 bg-[var(--surface)]/50 rounded-lg">
               <div className="flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="text-gray-100 font-medium">Wraith Protocol</span>
+                  <span className="text-[color:var(--fg)] font-medium">Wraith Protocol</span>
                   <Badge variant="warning">Not Running</Badge>
                 </div>
-                <div className="text-sm text-gray-400">
+                <div className="text-sm text-[color:var(--dim)]">
                   CoinJoin mixing on the L2 network — breaks transaction linkability. Requires an active
                   ghost-pay-node.
                 </div>

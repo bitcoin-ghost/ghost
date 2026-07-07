@@ -72,25 +72,25 @@ export default function ShroudWizard({ isOpen, onClose }: ShroudWizardProps) {
           {/* Step 1: Current Status */}
           {wizard.currentStep === 0 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Current Shroud Status</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Current Shroud Status</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Shroud Enabled</span>
+                    <span className="text-[color:var(--dim)]">Shroud Enabled</span>
                     <Badge variant={shroudStatus?.enabled ? 'success' : 'default'}>
                       {shroudStatus?.enabled ? 'Active' : 'Inactive'}
                     </Badge>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Ghost Core Connected</span>
+                    <span className="text-[color:var(--dim)]">Ghost Core Connected</span>
                     <Badge variant={shroudStatus?.ghost_core_connected ? 'success' : 'warning'}>
                       {shroudStatus?.ghost_core_connected ? 'Connected' : 'Not Connected'}
                     </Badge>
                   </div>
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <p className="text-sm text-gray-400">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <p className="text-sm text-[color:var(--dim)]">
                   Ghost Shroud adds a random 0-5 second delay before relaying transactions
                   to peers, making it harder for network observers to determine the origin
                   of a transaction. This setting requires a ghost-core restart to take effect.
@@ -102,11 +102,11 @@ export default function ShroudWizard({ isOpen, onClose }: ShroudWizardProps) {
           {/* Step 2: Configure */}
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50 space-y-4">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50 space-y-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <span className="text-gray-100 font-medium">Enable Shroud</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Enable Shroud</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Add random 0-5 second delays to transaction relay for privacy
                     </p>
                   </div>
@@ -129,16 +129,16 @@ export default function ShroudWizard({ isOpen, onClose }: ShroudWizardProps) {
           {/* Step 3: Confirm */}
           {wizard.currentStep === 2 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
-                <h4 className="text-gray-100 font-medium mb-3">Change Summary</h4>
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
+                <h4 className="text-[color:var(--fg)] font-medium mb-3">Change Summary</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-400">Shroud</span>
+                    <span className="text-[color:var(--dim)]">Shroud</span>
                     <div className="flex items-center gap-2">
                       <Badge variant={shroudStatus?.enabled ? 'success' : 'default'}>
                         {shroudStatus?.enabled ? 'Active' : 'Inactive'}
                       </Badge>
-                      <span className="text-gray-500">-&gt;</span>
+                      <span className="text-[color:var(--fainter)]">-&gt;</span>
                       <Badge variant={data.enabled ? 'success' : 'default'}>
                         {data.enabled ? 'Active' : 'Inactive'}
                       </Badge>
@@ -147,15 +147,15 @@ export default function ShroudWizard({ isOpen, onClose }: ShroudWizardProps) {
                 </div>
               </div>
               {data.enabled ? (
-                <div className="p-4 rounded-lg bg-green-900/20 border border-green-800">
-                  <p className="text-sm text-green-300">
+                <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
+                  <p className="text-sm text-[color:var(--green)]">
                     Shroud will add random 0-5 second delays before relaying transactions.
                     A ghost-core restart is required to activate this change.
                   </p>
                 </div>
               ) : (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">
                     Shroud will be disabled. Transactions will be relayed immediately to
                     peers without privacy delays. A ghost-core restart is required.
                   </p>

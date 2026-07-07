@@ -74,18 +74,18 @@ export function TemplateProfileDialog({
     >
       <div className="space-y-4 max-h-[70vh] overflow-y-auto">
         {/* Advanced User Warning */}
-        <div className="p-4 bg-orange-900/20 border border-orange-700 rounded-lg">
+        <div className="p-4 bg-[var(--accent)]/20 border border-[var(--accent)] rounded-lg">
           <div className="flex items-start gap-3">
-            <span className="text-orange-400 text-xl">&#9888;</span>
+            <span className="text-[color:var(--accent)] text-xl">&#9888;</span>
             <div>
-              <h4 className="text-orange-300 font-medium">Advanced Configuration</h4>
-              <p className="text-orange-300/80 text-sm mt-1">
+              <h4 className="text-[color:var(--accent)] font-medium">Advanced Configuration</h4>
+              <p className="text-[color:var(--accent)]/80 text-sm mt-1">
                 Custom block templates are intended for advanced users. Incorrect settings may
                 affect your mining efficiency or block validity.
               </p>
-              <p className="text-orange-300/80 text-sm mt-2">
+              <p className="text-[color:var(--accent)]/80 text-sm mt-2">
                 If you&apos;re unsure, use one of the preset profiles instead. For guidance, refer to
-                the <a href="/docs/template-profiles" className="text-orange-200 underline hover:text-orange-100">Block Template Guide</a>.
+                the <a href="/docs/template-profiles" className="text-[color:var(--accent)] underline hover:text-[color:var(--accent)]">Block Template Guide</a>.
               </p>
             </div>
           </div>
@@ -93,7 +93,7 @@ export function TemplateProfileDialog({
 
         {/* Profile Name */}
         <div>
-          <label className="block text-sm text-gray-400 mb-1">Profile Name</label>
+          <label className="block text-sm text-[color:var(--dim)] mb-1">Profile Name</label>
           <Input
             value={profile.name}
             onChange={(e) => update({ name: e.target.value })}
@@ -103,7 +103,7 @@ export function TemplateProfileDialog({
 
         {/* Core Template Settings */}
         <div>
-          <h4 className="text-sm font-medium text-gray-300 mb-3">Core Template Settings</h4>
+          <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3">Core Template Settings</h4>
           <div className="space-y-2">
             <NumberInput
               label="Block Max Weight"
@@ -127,7 +127,7 @@ export function TemplateProfileDialog({
 
         {/* Priority Settings */}
         <div>
-          <h4 className="text-sm font-medium text-gray-300 mb-3">Priority Settings</h4>
+          <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3">Priority Settings</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Prioritise by Fee"
@@ -146,7 +146,7 @@ export function TemplateProfileDialog({
 
         {/* Ghost Extensions - Block Composition */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Block Composition</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Block Composition</h4>
           <div className="space-y-2">
             <NumberInput
               label="Reserve Weight for Lightning"
@@ -175,7 +175,7 @@ export function TemplateProfileDialog({
 
         {/* Ghost Extensions - Inscription Filtering */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Inscription Filtering</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Inscription Filtering</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Filter Ordinal Inscriptions"
@@ -208,7 +208,7 @@ export function TemplateProfileDialog({
 
         {/* Ghost Extensions - Transaction Preferences */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Transaction Preferences</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Transaction Preferences</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Boost Consolidations"
@@ -227,7 +227,7 @@ export function TemplateProfileDialog({
 
         {/* Ghost Extensions - Package Relay */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Package Relay (CPFP)</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Package Relay (CPFP)</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Enable Package Relay"
@@ -250,7 +250,7 @@ export function TemplateProfileDialog({
 
         {/* Ghost Extensions - MEV Protection */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">MEV Protection</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">MEV Protection</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Randomize Transaction Order"
@@ -273,7 +273,7 @@ export function TemplateProfileDialog({
 
         {/* Ghost Extensions - Economic Preferences */}
         <div>
-          <h4 className="text-sm font-medium text-orange-300 mb-3">Economic Preferences</h4>
+          <h4 className="text-sm font-medium text-[color:var(--accent)] mb-3">Economic Preferences</h4>
           <div className="space-y-2">
             <ToggleRow
               label="Include Free Relay"
@@ -297,7 +297,7 @@ export function TemplateProfileDialog({
         {/* BUDS Tiers */}
         <div>
           <div className="flex items-center gap-2 mb-3">
-            <h4 className="text-sm font-medium text-gray-300">BUDS Transaction Tiers</h4>
+            <h4 className="text-sm font-medium text-[color:var(--dim)]">BUDS Transaction Tiers</h4>
             {!budsEnabled && <Badge variant="warning">Requires Ghost Pay</Badge>}
           </div>
           {!budsEnabled && (
@@ -342,7 +342,7 @@ export function TemplateProfileDialog({
         </div>
 
         {/* Actions */}
-        <div className="flex gap-3 pt-4 border-t border-gray-800">
+        <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
           <Button
             variant="ghost"
             className="flex-1"

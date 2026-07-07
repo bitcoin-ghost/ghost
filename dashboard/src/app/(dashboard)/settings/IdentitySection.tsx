@@ -36,7 +36,7 @@ export function IdentitySection() {
     <SettingsSection title="Node Identity" subtitle="Configure your node identification">
       <div className="space-y-4">
         <div>
-          <label className="block text-sm text-gray-400 mb-1">Node Nickname</label>
+          <label className="block text-sm text-[color:var(--dim)] mb-1">Node Nickname</label>
           <div className="flex gap-3">
             <Input
               value={nickname}
@@ -52,29 +52,29 @@ export function IdentitySection() {
               Save
             </Button>
           </div>
-          <p className="text-xs text-gray-500 mt-1">
+          <p className="text-xs text-[color:var(--fainter)] mt-1">
             Useful for identifying nodes in multi-node setups
           </p>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="p-3 bg-gray-800/50 rounded-lg">
-            <div className="text-sm text-gray-400 mb-1">Node ID</div>
-            <code className="text-gray-100 text-sm break-all">
+          <div className="p-3 bg-[var(--surface)]/50 rounded-lg">
+            <div className="text-sm text-[color:var(--dim)] mb-1">Node ID</div>
+            <code className="text-[color:var(--fg)] text-sm break-all">
               {nodeInfo?.node_id ?? "Loading..."}
             </code>
           </div>
-          <div className="p-3 bg-gray-800/50 rounded-lg">
-            <div className="text-sm text-gray-400 mb-1">Ghost ID (Short)</div>
-            <code className="text-orange-400 text-sm">
+          <div className="p-3 bg-[var(--surface)]/50 rounded-lg">
+            <div className="text-sm text-[color:var(--dim)] mb-1">Ghost ID (Short)</div>
+            <code className="text-[color:var(--accent)] text-sm">
               {nodeInfo?.node_id_short ?? "Loading..."}
             </code>
           </div>
         </div>
 
-        <div className="p-3 bg-gray-800/50 rounded-lg">
+        <div className="p-3 bg-[var(--surface)]/50 rounded-lg">
           <div className="flex justify-between items-center">
-            <div className="text-sm text-gray-400">Version</div>
+            <div className="text-sm text-[color:var(--dim)]">Version</div>
             <Badge variant="info">{nodeInfo?.version ?? "Unknown"}</Badge>
           </div>
         </div>

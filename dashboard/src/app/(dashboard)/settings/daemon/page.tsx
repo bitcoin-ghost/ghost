@@ -120,10 +120,10 @@ function FieldRow({
   inputMode?: "numeric" | "text";
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 p-3 bg-gray-800/50 rounded-lg">
+    <div className="flex items-center justify-between gap-4 p-3 bg-[var(--surface)]/50 rounded-lg">
       <div className="flex-1 min-w-0">
-        <div className="text-gray-100 font-medium">{label}</div>
-        <div className="text-sm text-gray-400">{description}</div>
+        <div className="text-[color:var(--fg)] font-medium">{label}</div>
+        <div className="text-sm text-[color:var(--dim)]">{description}</div>
       </div>
       <div className="flex items-center gap-2 shrink-0">
         <Input
@@ -134,7 +134,7 @@ function FieldRow({
           placeholder={placeholder ?? "default"}
           className="w-28 text-right"
         />
-        {unit && <span className="text-gray-400 text-sm w-10">{unit}</span>}
+        {unit && <span className="text-[color:var(--dim)] text-sm w-10">{unit}</span>}
       </div>
     </div>
   );
@@ -156,13 +156,13 @@ function ToggleFieldRow({
   badge?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 p-3 bg-gray-800/50 rounded-lg">
+    <div className="flex items-center justify-between gap-4 p-3 bg-[var(--surface)]/50 rounded-lg">
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-gray-100 font-medium">{label}</span>
+          <span className="text-[color:var(--fg)] font-medium">{label}</span>
           {badge}
         </div>
-        <div className="text-sm text-gray-400">{description}</div>
+        <div className="text-sm text-[color:var(--dim)]">{description}</div>
       </div>
       <Toggle enabled={enabled} onChange={onChange} label={label} disabled={disabled} />
     </div>
@@ -224,7 +224,7 @@ export default function DaemonSettingsPage() {
           title="Daemon / Node"
           subtitle="ghostd launch flags for this node. Every setting here is read only at startup, so applying any change restarts ghostd (and briefly bounces the pool)."
         />
-        <div className="flex items-center gap-2 text-sm text-gray-400">
+        <div className="flex items-center gap-2 text-sm text-[color:var(--dim)]">
           <span>Last apply:</span>
           {applyState ? (
             <Badge
@@ -243,13 +243,13 @@ export default function DaemonSettingsPage() {
           ) : (
             <Badge variant="default">idle</Badge>
           )}
-          {applyMessage && <span className="text-gray-500 truncate">{applyMessage}</span>}
+          {applyMessage && <span className="text-[color:var(--fainter)] truncate">{applyMessage}</span>}
         </div>
       </Card>
 
       {isLoading ? (
         <Card>
-          <p className="text-gray-400 text-sm">Loading daemon settings…</p>
+          <p className="text-[color:var(--dim)] text-sm">Loading daemon settings…</p>
         </Card>
       ) : (
         <SectionErrorBoundary section="Daemon settings">
@@ -344,7 +344,7 @@ export default function DaemonSettingsPage() {
                 disabled={!form.blockFilterIndex}
               />
               {bip157Invalid && (
-                <p className="text-xs text-red-400 px-1">
+                <p className="text-xs text-[color:var(--red)] px-1">
                   Peer block filters need the block filter index enabled too.
                 </p>
               )}
@@ -355,9 +355,9 @@ export default function DaemonSettingsPage() {
           <Card>
             <CardHeader title="Privacy networking" subtitle="Restrict outbound networks and reach I2P peers (-onlynet / -i2psam)." />
             <div className="space-y-3">
-              <div className="p-3 bg-gray-800/50 rounded-lg">
-                <div className="text-gray-100 font-medium">Only connect via networks</div>
-                <div className="text-sm text-gray-400 mb-3">
+              <div className="p-3 bg-[var(--surface)]/50 rounded-lg">
+                <div className="text-[color:var(--fg)] font-medium">Only connect via networks</div>
+                <div className="text-sm text-[color:var(--dim)] mb-3">
                   Restrict automatic outbound connections to the selected networks. None selected = no restriction.
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -370,8 +370,8 @@ export default function DaemonSettingsPage() {
                         onClick={() => toggleNet(net)}
                         className={`px-3 py-1 rounded-lg text-sm border transition-colors ${
                           on
-                            ? "bg-orange-600 text-white border-orange-500"
-                            : "bg-transparent text-gray-300 border-gray-600 hover:bg-gray-800"
+                            ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                            : "bg-transparent text-[color:var(--dim)] border-[var(--rule-strong)] hover:bg-[var(--surface)]"
                         }`}
                       >
                         {net}
@@ -395,7 +395,7 @@ export default function DaemonSettingsPage() {
                 disabled={form.i2pSam.trim() === ""}
               />
               {i2pIncomingInvalid && (
-                <p className="text-xs text-red-400 px-1">
+                <p className="text-xs text-[color:var(--red)] px-1">
                   Accepting inbound I2P needs an I2P SAM proxy address.
                 </p>
               )}
@@ -405,7 +405,7 @@ export default function DaemonSettingsPage() {
           {/* Apply */}
           <Card>
             <div className="flex items-center justify-between gap-4">
-              <div className="text-sm text-gray-400">
+              <div className="text-sm text-[color:var(--dim)]">
                 Applying these changes restarts ghostd and briefly bounces ghost-pool.
               </div>
               <Button

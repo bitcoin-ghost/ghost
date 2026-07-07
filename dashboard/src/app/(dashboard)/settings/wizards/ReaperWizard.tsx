@@ -81,16 +81,16 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
     data: ReaperSettings,
     setData: (patch: Partial<ReaperSettings>) => void
   ) => (
-    <div className="p-4 rounded-lg bg-gray-800/50 space-y-4">
+    <div className="p-4 rounded-lg bg-[var(--surface)]/50 space-y-4">
       <div>
-        <h4 className="text-gray-100 font-medium">{title}</h4>
-        <p className="text-xs text-gray-500 mt-0.5">{note}</p>
+        <h4 className="text-[color:var(--fg)] font-medium">{title}</h4>
+        <p className="text-xs text-[color:var(--fainter)] mt-0.5">{note}</p>
       </div>
       {vectors.map((v) => (
         <div key={v.key} className="flex items-center justify-between">
           <div className="pr-4">
-            <span className="text-gray-100">{v.label}</span>
-            <p className="text-sm text-gray-400 mt-1">{v.desc}</p>
+            <span className="text-[color:var(--fg)]">{v.label}</span>
+            <p className="text-sm text-[color:var(--dim)] mt-1">{v.desc}</p>
           </div>
           <Toggle
             enabled={Boolean(data[v.key])}
@@ -110,11 +110,11 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
           {/* Step 1: Enable */}
           {wizard.currentStep === 0 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
                   <div className="pr-4">
-                    <span className="text-gray-100 font-medium">Reaper Mode</span>
-                    <p className="text-sm text-gray-400 mt-1">
+                    <span className="text-[color:var(--fg)] font-medium">Reaper Mode</span>
+                    <p className="text-sm text-[color:var(--dim)] mt-1">
                       Master switch. When off, every detector is disabled on both the pool template
                       reaper and the node mempool reaper. When on, the per-detector choices below apply.
                     </p>
@@ -123,10 +123,10 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
                 </div>
               </div>
               {data.enabled && (
-                <div className="p-4 rounded-lg bg-green-900/20 border border-green-800">
+                <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
                   <div className="flex items-center gap-2">
                     <Badge variant="success">+2 Shares</Badge>
-                    <span className="text-sm text-green-300">Enables Reaper capability verification for node rewards</span>
+                    <span className="text-sm text-[color:var(--green)]">Enables Reaper capability verification for node rewards</span>
                   </div>
                 </div>
               )}
@@ -137,8 +137,8 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
           {wizard.currentStep === 1 && (
             <div className="space-y-4">
               {!data.enabled && (
-                <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                  <p className="text-sm text-orange-300">Reaper is disabled — these choices take effect once you enable it.</p>
+                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                  <p className="text-sm text-[color:var(--accent)]">Reaper is disabled — these choices take effect once you enable it.</p>
                 </div>
               )}
               {renderGroup('Shared detectors', 'Apply to both the pool (block templates) and the node (mempool relay).', SHARED, data, setData)}
@@ -149,8 +149,8 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
 
           {/* Step 3: Thresholds */}
           {wizard.currentStep === 2 && (
-            <div className="p-4 rounded-lg bg-gray-800/50 space-y-4">
-              <h4 className="text-gray-100 font-medium">Thresholds</h4>
+            <div className="p-4 rounded-lg bg-[var(--surface)]/50 space-y-4">
+              <h4 className="text-[color:var(--fg)] font-medium">Thresholds</h4>
               <Input label="Max OP_RETURN bytes (shared)" type="number" value={data.max_op_return_bytes}
                 onChange={(e) => setData({ max_op_return_bytes: Number(e.target.value) })} disabled={!data.enabled} />
               <Input label="Min drop-stuffing push size (shared)" type="number" value={data.min_drop_size}
@@ -167,15 +167,15 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
           {/* Step 4: Confirm */}
           {wizard.currentStep === 3 && (
             <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-gray-800/50">
+              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <div className="flex items-center justify-between">
-                  <span className="text-gray-400">Reaper Mode</span>
+                  <span className="text-[color:var(--dim)]">Reaper Mode</span>
                   <Badge variant={data.enabled ? 'success' : 'default'}>{data.enabled ? 'Enabled' : 'Disabled'}</Badge>
                 </div>
-                <div className="border-t border-gray-700 mt-3 pt-3 grid grid-cols-2 gap-2 text-sm">
+                <div className="border-t border-[var(--rule-strong)] mt-3 pt-3 grid grid-cols-2 gap-2 text-sm">
                   {[...SHARED, ...NODE_ONLY, ...POOL_ONLY].map((v) => (
                     <div key={v.key} className="flex items-center justify-between">
-                      <span className="text-gray-400">{v.label}</span>
+                      <span className="text-[color:var(--dim)]">{v.label}</span>
                       <Badge variant={data.enabled && Boolean(data[v.key]) ? 'error' : 'default'}>
                         {data.enabled && Boolean(data[v.key]) ? 'Reject' : 'Allow'}
                       </Badge>
@@ -183,8 +183,8 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
                   ))}
                 </div>
               </div>
-              <div className="p-4 rounded-lg bg-orange-900/20 border border-orange-800">
-                <p className="text-sm text-orange-300">
+              <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
+                <p className="text-sm text-[color:var(--accent)]">
                   Click Finish to save. Both reapers apply automatically: the pool reaper on the next
                   ghost-pool restart, and the ghostd mempool reaper is regenerated for you (ghostd briefly
                   restarts). No manual <code>ghost-setup apply-reaper</code> step is needed.
