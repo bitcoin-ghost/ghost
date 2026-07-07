@@ -34,17 +34,19 @@ export function GhostBrand({
       style={{ color: "var(--fg)" }}
     >
       <Ghost size={iconSize} strokeWidth={1.75} style={{ color: "var(--accent)" }} aria-hidden="true" />
-      <span
-        style={{
-          fontFamily: "var(--font-sans)",
-          fontWeight: 400,
-          fontSize,
-          letterSpacing: "0.3em",
-          textTransform: "lowercase",
-        }}
-      >
-        {label}
-      </span>
+      {label && (
+        <span
+          style={{
+            fontFamily: "var(--font-sans)",
+            fontWeight: 400,
+            fontSize,
+            letterSpacing: "0.3em",
+            textTransform: "lowercase",
+          }}
+        >
+          {label}
+        </span>
+      )}
     </span>
   );
 
