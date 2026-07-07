@@ -22,6 +22,10 @@ export function PayoutSection() {
   const [miningPayoutAddress, setMiningPayoutAddress] = useState("");
   const [ghostPayPayoutAddress, setGhostPayPayoutAddress] = useState("");
 
+  // Running-state from the explicit `sync_state` flag, not `l2_height` (0 is a
+  // valid running height and would falsely trip the "not running" warning).
+  const ghostPayRunning = ghostPayStatus?.sync_state === "synced";
+
   useEffect(() => {
     if (fullConfig?.payout?.address && !miningPayoutAddress) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -104,7 +108,7 @@ export function PayoutSection() {
             GhostPay L2 transaction fee distributions will be sent to this address.
             Requires Ghost Pay to be enabled.
           </p>
-          {!ghostPayStatus?.l2_height && (
+          {!ghostPayRunning && (
             <p className="text-xs text-[color:var(--yellow)] mt-1">
               Ghost Pay is not running - fee distributions require an active ghost-pay-node
             </p>

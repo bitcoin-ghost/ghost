@@ -143,34 +143,31 @@ export async function getWraithStats(): Promise<WraithStats> {
   }
 }
 
-// Settlement Status (node-level settlement service status)
+// Settlement Status (node-level settlement service status).
+//
+// The live `/settlement/status` endpoint returns a FLAT shape:
+//   { status, pending_settlements, pending_count, batches_24h,
+//     last_settlement, total_settled_sats }
+// There is no nested `stats` object or `batches` array, so we read the real
+// flat fields directly. The previous nested-shape mapping silently produced
+// all-zeros against the real backend (Settlement Quick-Stats always showed 0).
 export async function getSettlementStatus(): Promise<SettlementStatus> {
   try {
     const settlement = await fetchApi<SettlementResponse>('/api/v1/settlement/status');
     return {
-      l1_available: settlement.stats?.l1_connected ?? false,
-      l1_height: settlement.stats?.l1_height ?? 0,
-      active_count: settlement.stats?.active_batches ?? 0,
-      pending_count: settlement.stats?.pending_batches ?? 0,
-      batches_24h: settlement.stats?.confirmed_24h ?? 0,
-      total_settled_24h: settlement.stats?.total_settled_24h ?? 0,
-      current_epoch: settlement.stats?.current_epoch ?? 0,
-      avg_batch_size: (settlement.batches?.length ?? 0) > 0
-        ? settlement.batches!.reduce((sum, b) => sum + b.participant_count, 0) / settlement.batches!.length
-        : 0,
+      status: settlement.status ?? 'idle',
+      pending_count: settlement.pending_count ?? settlement.pending_settlements ?? 0,
+      batches_24h: settlement.batches_24h ?? 0,
+      total_settled_sats: settlement.total_settled_sats ?? 0,
     };
   } catch (e) {
     // See getWraithStats — log instead of silently returning all-zeros.
     console.error("getSettlementStatus: failed to fetch settlement status", e);
     return {
-      l1_available: false,
-      l1_height: 0,
-      active_count: 0,
+      status: 'idle',
       pending_count: 0,
       batches_24h: 0,
-      total_settled_24h: 0,
-      current_epoch: 0,
-      avg_batch_size: 0,
+      total_settled_sats: 0,
     };
   }
 }

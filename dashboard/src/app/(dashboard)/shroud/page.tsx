@@ -21,7 +21,7 @@ const TOOLTIPS = {
 };
 
 export default function ShroudPage() {
-  const { data: status, isLoading } = useShroudStatus({ refetchInterval: 10_000 });
+  const { data: status, isLoading, error } = useShroudStatus({ refetchInterval: 10_000 });
 
   const showSkeleton = isLoading && !status;
 
@@ -57,13 +57,13 @@ export default function ShroudPage() {
         />
         <StatCard
           label="Max Delay"
-          value={status ? `${status.max_delay_ms} ms` : "--"}
+          value={status?.max_delay_ms != null ? `${status.max_delay_ms} ms` : "--"}
           tooltip={TOOLTIPS.max_delay}
           loading={showSkeleton}
         />
         <StatCard
           label="Avg Delay"
-          value={status ? `${status.avg_delay_ms} ms` : "--"}
+          value={status?.avg_delay_ms != null ? `${status.avg_delay_ms} ms` : "--"}
           tooltip={TOOLTIPS.avg_delay}
           loading={showSkeleton}
         />
@@ -105,6 +105,15 @@ export default function ShroudPage() {
       <SectionErrorBoundary section="Shroud Status">
         {showSkeleton ? (
           <SkeletonCard />
+        ) : error ? (
+          <Card>
+            <CardHeader title="Status" />
+            <div className="p-4 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
+              <p className="text-[color:var(--red)] text-sm">
+                Unable to fetch Ghost Shroud status. Ensure Ghost Core is running and the Shroud module is enabled.
+              </p>
+            </div>
+          </Card>
         ) : status ? (
           <Card>
             <CardHeader
@@ -128,12 +137,12 @@ export default function ShroudPage() {
               </StatusRow>
               <StatusRow label="Max Delay" tooltip={TOOLTIPS.max_delay}>
                 <span className="text-[color:var(--fg)] font-mono text-sm">
-                  {status.max_delay_ms.toLocaleString()} ms
+                  {(status.max_delay_ms ?? 0).toLocaleString()} ms
                 </span>
               </StatusRow>
               <StatusRow label="Avg Delay" tooltip={TOOLTIPS.avg_delay}>
                 <span className="text-[color:var(--blue)] font-mono text-sm">
-                  {status.avg_delay_ms.toLocaleString()} ms
+                  {(status.avg_delay_ms ?? 0).toLocaleString()} ms
                 </span>
               </StatusRow>
             </div>

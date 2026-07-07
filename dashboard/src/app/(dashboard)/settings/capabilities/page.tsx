@@ -34,6 +34,11 @@ export default function CapabilitiesSettingsPage() {
   const publicMiningActive = status?.public_mining ?? false;
   const publicMiningBlocked = ghostModeActive && !publicMiningActive;
 
+  // Ghost Pay running-state comes from the explicit `sync_state` flag, NOT
+  // `l2_height` — an L2 height of 0 is a perfectly valid running state (fresh
+  // node), so its truthiness would mislabel a running node as "Not Running".
+  const ghostPayRunning = ghostPayStatus?.sync_state === "synced";
+
   const handlePublicMiningToggle = async (enabled: boolean) => {
     try {
       await setPublicMining.mutateAsync(enabled);
@@ -86,9 +91,9 @@ export default function CapabilitiesSettingsPage() {
 
       <StatusRow
         label="Ghost Pay"
-        description={`L2 payment network participation — requires ghost-pay-node${ghostPayStatus?.l2_height ? ` (L2 height: ${ghostPayStatus.l2_height})` : ''}`}
+        description={`L2 payment network participation — requires ghost-pay-node${ghostPayRunning ? ` (L2 height: ${ghostPayStatus?.l2_height ?? 0})` : ''}`}
         badge={
-          ghostPayStatus?.l2_height ? (
+          ghostPayRunning ? (
             <Badge variant="success">+4 Shares</Badge>
           ) : (
             <Badge variant="warning">Not Running</Badge>

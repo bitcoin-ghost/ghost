@@ -45,7 +45,9 @@ export default function StoragePage() {
 
   const isLoading = configLoading;
   const archiveMode = status?.archive_mode ?? false;
-  const ghostPayRunning = !!ghostPayStatus?.l2_height;
+  // Running-state from the explicit `sync_state` flag, not `l2_height` (0 is a
+  // valid running height and would wrongly show "Ghost Pay Not Running").
+  const ghostPayRunning = ghostPayStatus?.sync_state === "synced";
 
   return (
     <div className="space-y-6">
@@ -89,7 +91,7 @@ export default function StoragePage() {
                     <div className="p-4 bg-[var(--surface)] rounded-lg">
                       <div className="text-sm text-[color:var(--dim)]">Retention Period</div>
                       <div className="text-xl font-bold text-[color:var(--fg)] mt-1">
-                        {l2Pruning.retention_days} days
+                        {l2Pruning.retention_days ?? 90} days
                       </div>
                     </div>
                     <div className="p-4 bg-[var(--surface)] rounded-lg">
@@ -98,7 +100,7 @@ export default function StoragePage() {
                         <Badge variant="success">Always On</Badge>
                       </div>
                       <div className="text-xs text-[color:var(--fainter)] mt-1">
-                        Every {l2Pruning.prune_interval_hours}h
+                        Every {l2Pruning.prune_interval_hours ?? 24}h
                       </div>
                     </div>
                     <div className="p-4 bg-[var(--surface)] rounded-lg">
@@ -113,9 +115,9 @@ export default function StoragePage() {
                     <div className="p-4 bg-[var(--surface)] rounded-lg">
                       <div className="text-sm text-[color:var(--dim)]">Last Run Stats</div>
                       <div className="text-sm text-[color:var(--dim)] mt-2 space-y-1">
-                        <div>Payments: {l2Pruning.payments_pruned}</div>
-                        <div>Attestations: {l2Pruning.attestations_pruned}</div>
-                        <div>Locks: {l2Pruning.locks_pruned}</div>
+                        <div>Payments: {l2Pruning.payments_pruned ?? 0}</div>
+                        <div>Attestations: {l2Pruning.attestations_pruned ?? 0}</div>
+                        <div>Locks: {l2Pruning.locks_pruned ?? 0}</div>
                       </div>
                     </div>
                   </div>
@@ -127,15 +129,15 @@ export default function StoragePage() {
                       <ul className="text-sm text-[color:var(--red)] space-y-2">
                         <li className="flex items-start gap-2">
                           <span className="text-[color:var(--red)] mt-0.5">•</span>
-                          <span>Payments (with ZK proofs) older than {l2Pruning.retention_days} days</span>
+                          <span>Payments (with ZK proofs) older than {l2Pruning.retention_days ?? 90} days</span>
                         </li>
                         <li className="flex items-start gap-2">
                           <span className="text-[color:var(--red)] mt-0.5">•</span>
-                          <span>Attestations older than {l2Pruning.retention_days} days</span>
+                          <span>Attestations older than {l2Pruning.retention_days ?? 90} days</span>
                         </li>
                         <li className="flex items-start gap-2">
                           <span className="text-[color:var(--red)] mt-0.5">•</span>
-                          <span>Closed locks (reconciled or jumped) older than {l2Pruning.retention_days} days</span>
+                          <span>Closed locks (reconciled or jumped) older than {l2Pruning.retention_days ?? 90} days</span>
                         </li>
                       </ul>
                     </div>

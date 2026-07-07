@@ -278,7 +278,15 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
     height: syncHeight,
     target: blockHeight,
     isSyncing,
-    syncPct: isSyncing ? Math.min(100, (syncHeight / blockHeight) * 100) : status?.is_synced ? 100 : 0,
+    // When not actively syncing, a node reporting a height is treated as synced
+    // (100%) unless it explicitly reports is_synced=false. This keeps the bar in
+    // agreement with the "Synced · 100%" label and the eyebrow, which both read
+    // an omitted is_synced as synced (previously syncPct fell to 0 here).
+    syncPct: isSyncing
+      ? Math.min(100, (syncHeight / blockHeight) * 100)
+      : status?.is_synced === false
+        ? 0
+        : 100,
     peers: status?.peer_count ?? 0,
     miners: mining?.local_connected_miners ?? mining?.connected_miners ?? 0,
     // This node's own hashrate — the combined hashrate of miners connected to
@@ -301,39 +309,65 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
   const leds = deriveLeds(watchdog);
 
   // ── CPU / Memory / Disk gauges — real values, gracefully absent otherwise.
+  // Individual numeric fields are guarded (not just the `resources` object): a
+  // partial resources response with a missing cpu_percent / memory_used_mb /
+  // disk_used_gb must render '—'/0, never crash on `.toFixed` of undefined.
   const gauges: { key: string; label: string; pct: number | null; tone: Tone; detail: string }[] =
     resources
-      ? [
-          {
-            key: 'cpu',
-            label: 'CPU',
-            pct: resources.cpu_percent,
-            tone: usageTone(
-              resources.cpu_percent,
-              resources.warning_threshold_cpu,
-              resources.critical_threshold_cpu,
-            ),
-            detail: `${resources.cpu_percent.toFixed(0)}%`,
-          },
-          {
-            key: 'mem',
-            label: 'MEM',
-            pct: resources.memory_percent,
-            tone: usageTone(
-              resources.memory_percent,
-              resources.warning_threshold_memory,
-              resources.critical_threshold_memory,
-            ),
-            detail: `${(resources.memory_used_mb / 1024).toFixed(1)}/${(resources.memory_total_mb / 1024).toFixed(0)} GB`,
-          },
-          {
-            key: 'disk',
-            label: 'DISK',
-            pct: resources.disk_percent,
-            tone: usageTone(resources.disk_percent, 75, 90),
-            detail: `${resources.disk_used_gb.toFixed(0)}/${resources.disk_total_gb.toFixed(0)} GB`,
-          },
-        ]
+      ? (() => {
+          const num = (x: number | undefined | null): number | null =>
+            typeof x === 'number' && Number.isFinite(x) ? x : null;
+          const cpu = num(resources.cpu_percent);
+          const mem = num(resources.memory_percent);
+          const disk = num(resources.disk_percent);
+          const memUsed = num(resources.memory_used_mb);
+          const memTotal = num(resources.memory_total_mb);
+          const diskUsed = num(resources.disk_used_gb);
+          const diskTotal = num(resources.disk_total_gb);
+          return [
+            {
+              key: 'cpu',
+              label: 'CPU',
+              pct: cpu,
+              tone:
+                cpu === null
+                  ? ('ok' as Tone)
+                  : usageTone(
+                      cpu,
+                      resources.warning_threshold_cpu ?? 70,
+                      resources.critical_threshold_cpu ?? 90,
+                    ),
+              detail: cpu === null ? '—' : `${cpu.toFixed(0)}%`,
+            },
+            {
+              key: 'mem',
+              label: 'MEM',
+              pct: mem,
+              tone:
+                mem === null
+                  ? ('ok' as Tone)
+                  : usageTone(
+                      mem,
+                      resources.warning_threshold_memory ?? 70,
+                      resources.critical_threshold_memory ?? 90,
+                    ),
+              detail:
+                memUsed !== null && memTotal !== null
+                  ? `${(memUsed / 1024).toFixed(1)}/${(memTotal / 1024).toFixed(0)} GB`
+                  : '—',
+            },
+            {
+              key: 'disk',
+              label: 'DISK',
+              pct: disk,
+              tone: disk === null ? ('ok' as Tone) : usageTone(disk, 75, 90),
+              detail:
+                diskUsed !== null && diskTotal !== null
+                  ? `${diskUsed.toFixed(0)}/${diskTotal.toFixed(0)} GB`
+                  : '—',
+            },
+          ];
+        })()
       : [
           { key: 'cpu', label: 'CPU', pct: null, tone: 'ok', detail: '—' },
           { key: 'mem', label: 'MEM', pct: null, tone: 'ok', detail: '—' },

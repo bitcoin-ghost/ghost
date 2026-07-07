@@ -770,57 +770,22 @@ export interface PaymentsResponse {
 export type SettlementClass = "Express" | "Standard" | "Economy" | string;
 export type BatchStatus = "Forming" | "CollectingSignatures" | "Ready" | "Broadcast" | "Confirmed" | "Failed" | string;
 
-export interface SettlementBatch {
-  batch_id: string;
-  settlement_class: string;
-  epoch_id: number;
-  status: string;
-  participant_count: number;
-  signatures_collected: number;
-  your_lock_id?: string | null;
-  your_signature_submitted?: boolean;
-  txid?: string | null;
-  confirmations?: number;
-  created_at?: number;
-  total_amount_sats?: number;
-  l1_txid?: string | null;
-  finalized_at?: number | null;
-}
-
-export interface SettlementStats {
-  pending_batches?: number;
-  active_batches?: number;
-  confirmed_24h?: number;
-  total_settled_24h?: number;
-  your_settlements?: number;
-  current_epoch?: number;
-  l1_connected?: boolean;
-  l1_height?: number;
-}
-
+// Live `/settlement/status` response — a flat object (no nested `stats`/`batches`).
 export interface SettlementResponse {
-  // Backend fields
   status?: string;
   pending_settlements?: number;
   pending_count?: number;
   batches_24h?: number;
   last_settlement?: Record<string, unknown> | null;
   total_settled_sats?: number;
-  // Dashboard aliases
-  batches?: SettlementBatch[];
-  stats?: SettlementStats;
 }
 
-// Node-level settlement service status
+// Node-level settlement service status, derived from the flat SettlementResponse.
 export interface SettlementStatus {
-  l1_available?: boolean;
-  l1_height?: number;
-  active_count?: number;
+  status?: string;
   pending_count?: number;
   batches_24h?: number;
-  total_settled_24h?: number;
-  current_epoch?: number;
-  avg_batch_size?: number;
+  total_settled_sats?: number;
 }
 
 // Jump Queue types
