@@ -17,7 +17,7 @@ interface StatCardProps {
 export function StatCard({ label, value, tooltip, icon, sublabel, loading, className = '' }: StatCardProps) {
   if (loading) {
     return (
-      <div className={`bg-gray-900 border border-gray-800 rounded-lg p-4 h-[104px] ${className}`}>
+      <div className={`bg-[var(--surface)] border border-[color:var(--rule)] rounded-lg p-4 h-[104px] ${className}`}>
         <Skeleton className="h-4 w-20 mb-3" />
         <Skeleton className="h-7 w-24 mb-1" />
         <Skeleton className="h-3 w-16" />
@@ -26,20 +26,20 @@ export function StatCard({ label, value, tooltip, icon, sublabel, loading, class
   }
 
   const content = (
-    <div className={`bg-gray-900 border border-gray-800 rounded-lg p-4 h-[104px] flex flex-col justify-between ${className}`}>
-      <div className="flex items-center gap-2 text-sm text-gray-400">
+    <div className={`bg-[var(--surface)] border border-[color:var(--rule)] rounded-lg p-4 h-[104px] flex flex-col justify-between ${className}`}>
+      <div className="flex items-center gap-2 text-sm text-[color:var(--dim)]">
         {icon && <span className="w-4 h-4 flex-shrink-0">{icon}</span>}
         <span className="truncate">{label}</span>
         {tooltip && (
-          <svg className="w-3 h-3 text-gray-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <svg className="w-3 h-3 text-[color:var(--fainter)] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <circle cx="12" cy="12" r="10" />
             <path d="M12 16v-4M12 8h.01" />
           </svg>
         )}
       </div>
       <div>
-        <div className="text-2xl font-bold text-gray-100 truncate">{value}</div>
-        {sublabel && <div className="text-xs text-gray-500 truncate">{sublabel}</div>}
+        <div className="text-2xl font-bold text-[color:var(--fg)] truncate">{value}</div>
+        {sublabel && <div className="text-xs text-[color:var(--fainter)] truncate">{sublabel}</div>}
       </div>
     </div>
   );

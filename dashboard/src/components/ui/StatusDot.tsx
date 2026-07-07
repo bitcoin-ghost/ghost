@@ -7,10 +7,10 @@ interface StatusDotProps {
 }
 
 const colorClasses = {
-  online: 'bg-green-400',
-  warning: 'bg-yellow-400',
-  offline: 'bg-red-400',
-  unknown: 'bg-gray-500',
+  online: 'bg-[var(--green)]',
+  warning: 'bg-[var(--accent)]',
+  offline: 'bg-[var(--red)]',
+  unknown: 'bg-[var(--fainter)]',
 };
 
 const sizeClasses = {
@@ -28,7 +28,7 @@ export function StatusDot({ status, pulse, size = 'md', label, className = '' }:
           <span className={`absolute inset-0 rounded-full ${colorClasses[status]} animate-ping opacity-75`} />
         )}
       </span>
-      {label && <span className="text-sm text-gray-400">{label}</span>}
+      {label && <span className="text-sm text-[color:var(--dim)]">{label}</span>}
     </span>
   );
 }

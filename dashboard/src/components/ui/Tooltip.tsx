@@ -20,10 +20,10 @@ const GAP = 8;
 const ARROW = 4;
 
 const arrowClasses: Record<Side, string> = {
-  top: 'border-t-gray-700 border-x-transparent border-b-transparent',
-  bottom: 'border-b-gray-700 border-x-transparent border-t-transparent',
-  left: 'border-l-gray-700 border-y-transparent border-r-transparent',
-  right: 'border-r-gray-700 border-y-transparent border-l-transparent',
+  top: 'border-t-[color:var(--rule-strong)] border-x-transparent border-b-transparent',
+  bottom: 'border-b-[color:var(--rule-strong)] border-x-transparent border-t-transparent',
+  left: 'border-l-[color:var(--rule-strong)] border-y-transparent border-r-transparent',
+  right: 'border-r-[color:var(--rule-strong)] border-y-transparent border-l-transparent',
 };
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -138,7 +138,7 @@ export function Tooltip({ content, children, position = 'top' }: TooltipProps) {
             style={{ left: 0, top: 0, opacity: 0 }}
             className="fixed z-[9999] pointer-events-none transition-opacity duration-150"
           >
-            <div className="relative bg-gray-800 border border-gray-700 text-gray-200 text-xs rounded-lg px-3 py-2 w-72 max-w-[calc(100vw-1rem)] shadow-lg whitespace-normal">
+            <div className="relative bg-[var(--surface)] border border-[color:var(--rule-strong)] text-[color:var(--fg)] text-xs rounded-lg px-3 py-2 w-72 max-w-[calc(100vw-1rem)] shadow-lg whitespace-normal">
               {content}
               <div ref={arrowRef} className={`absolute w-0 h-0 border-4 ${arrowClasses[position]}`} />
             </div>

@@ -33,7 +33,7 @@ export function Card({ children, className = '', collapsible, defaultCollapsed =
   const body = childArray.slice(1);
 
   return (
-    <div className={`bg-gray-900 border border-gray-800 rounded-lg p-6 ${className}`}>
+    <div className={`bg-[var(--surface)] border border-[color:var(--rule)] rounded-lg p-6 ${className}`}>
       <div
         className="cursor-pointer select-none"
         onClick={() => setCollapsed(!collapsed)}
@@ -41,7 +41,7 @@ export function Card({ children, className = '', collapsible, defaultCollapsed =
         <div className="flex items-center justify-between">
           <div className="flex-1">{header}</div>
           <svg
-            className={`w-5 h-5 text-gray-400 transition-transform flex-shrink-0 ml-2 ${collapsed ? '' : 'rotate-180'}`}
+            className={`w-5 h-5 text-[color:var(--dim)] transition-transform flex-shrink-0 ml-2 ${collapsed ? '' : 'rotate-180'}`}
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"

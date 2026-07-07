@@ -22,7 +22,7 @@ export function TimeFilter({
   className = '',
 }: TimeFilterProps) {
   return (
-    <div className={`inline-flex bg-gray-800 rounded-lg p-0.5 ${className}`}>
+    <div className={`inline-flex bg-[var(--surface)] rounded-lg p-0.5 ${className}`}>
       {options.map((opt) => (
         <button
           key={opt}
@@ -30,8 +30,8 @@ export function TimeFilter({
           className={`
             px-3 py-1 text-sm rounded-md transition-colors
             ${value === opt
-              ? 'bg-gray-700 text-gray-100 font-medium'
-              : 'text-gray-400 hover:text-gray-200'
+              ? 'bg-[var(--rule-strong)] text-[color:var(--fg)] font-medium'
+              : 'text-[color:var(--dim)] hover:text-[color:var(--fg)]'
             }
           `}
         >

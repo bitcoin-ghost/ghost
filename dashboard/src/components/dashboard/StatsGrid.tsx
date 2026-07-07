@@ -12,20 +12,20 @@ interface StatBoxProps {
 function StatBox({ label, value, sublabel, loading }: StatBoxProps) {
   if (loading) {
     return (
-      <div className="bg-gray-800/50 rounded-lg p-4 text-center">
+      <div className="bg-[var(--surface)]/50 rounded-lg p-4 text-center">
         <div className="animate-pulse">
-          <div className="h-8 bg-gray-700 rounded w-16 mx-auto mb-2"></div>
-          <div className="h-4 bg-gray-700 rounded w-20 mx-auto"></div>
+          <div className="h-8 bg-[var(--rule-strong)] rounded w-16 mx-auto mb-2"></div>
+          <div className="h-4 bg-[var(--rule-strong)] rounded w-20 mx-auto"></div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="bg-gray-800/50 rounded-lg p-4 text-center">
-      <div className="text-2xl font-bold text-gray-100">{value}</div>
-      <div className="text-sm text-gray-400">{label}</div>
-      {sublabel && <div className="text-xs text-gray-500 mt-1">{sublabel}</div>}
+    <div className="bg-[var(--surface)]/50 rounded-lg p-4 text-center">
+      <div className="text-2xl font-bold text-[color:var(--fg)]">{value}</div>
+      <div className="text-sm text-[color:var(--dim)]">{label}</div>
+      {sublabel && <div className="text-xs text-[color:var(--fainter)] mt-1">{sublabel}</div>}
     </div>
   );
 }

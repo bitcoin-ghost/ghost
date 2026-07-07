@@ -34,8 +34,8 @@ export function SidebarGroup({ icon, label, items, collapsed = false }: SidebarG
           className={`
             flex items-center justify-center w-full px-3 py-2 rounded-lg transition-colors
             ${isAnyActive
-              ? 'bg-orange-500/20 text-orange-400'
-              : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+              ? 'bg-[var(--accent)]/20 text-[color:var(--accent)]'
+              : 'text-[color:var(--dim)] hover:text-[color:var(--fg)] hover:bg-[var(--surface)]/50'
             }
           `}
         >
@@ -44,8 +44,8 @@ export function SidebarGroup({ icon, label, items, collapsed = false }: SidebarG
 
         {/* Flyout menu on hover */}
         <div className="absolute left-full top-0 ml-2 hidden group-hover:block z-50">
-          <div className="bg-gray-900 border border-gray-700 rounded-lg shadow-xl py-1 min-w-40">
-            <div className="px-3 py-2 text-xs font-semibold text-gray-500 uppercase">
+          <div className="bg-[var(--surface)] border border-[color:var(--rule-strong)] rounded-lg shadow-xl py-1 min-w-40">
+            <div className="px-3 py-2 text-xs font-semibold text-[color:var(--fainter)] uppercase">
               {label}
             </div>
             {items.map((item) => (
@@ -55,8 +55,8 @@ export function SidebarGroup({ icon, label, items, collapsed = false }: SidebarG
                 className={`
                   block px-3 py-2 text-sm transition-colors
                   ${isPathActive(pathname, item.href)
-                    ? 'text-orange-400 bg-orange-500/10'
-                    : 'text-gray-300 hover:text-gray-100 hover:bg-gray-800'
+                    ? 'text-[color:var(--accent)] bg-[var(--accent)]/10'
+                    : 'text-[color:var(--dim)] hover:text-[color:var(--fg)] hover:bg-[var(--surface)]'
                   }
                 `}
               >
@@ -76,8 +76,8 @@ export function SidebarGroup({ icon, label, items, collapsed = false }: SidebarG
         className={`
           flex items-center justify-between w-full px-3 py-2 rounded-lg transition-colors
           ${isAnyActive
-            ? 'bg-orange-500/20 text-orange-400'
-            : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+            ? 'bg-[var(--accent)]/20 text-[color:var(--accent)]'
+            : 'text-[color:var(--dim)] hover:text-[color:var(--fg)] hover:bg-[var(--surface)]/50'
           }
         `}
       >
@@ -96,7 +96,7 @@ export function SidebarGroup({ icon, label, items, collapsed = false }: SidebarG
       </button>
 
       {isOpen && (
-        <div className="mt-1 ml-4 pl-4 border-l border-gray-800 space-y-1">
+        <div className="mt-1 ml-4 pl-4 border-l border-[color:var(--rule)] space-y-1">
           {items.map((item) => (
             <Link
               key={item.href}
@@ -104,8 +104,8 @@ export function SidebarGroup({ icon, label, items, collapsed = false }: SidebarG
               className={`
                 block px-3 py-2 text-sm rounded-lg transition-colors
                 ${isPathActive(pathname, item.href)
-                  ? 'text-orange-400 bg-orange-500/10'
-                  : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+                  ? 'text-[color:var(--accent)] bg-[var(--accent)]/10'
+                  : 'text-[color:var(--dim)] hover:text-[color:var(--fg)] hover:bg-[var(--surface)]/50'
                 }
               `}
             >

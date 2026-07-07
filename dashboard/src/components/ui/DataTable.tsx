@@ -66,7 +66,7 @@ export function DataTable<TData, TValue>({
       <div className="space-y-4">
         {searchColumn && (
           <div className="max-w-sm">
-            <div className="h-10 bg-gray-800 rounded-lg animate-pulse" />
+            <div className="h-10 bg-[var(--surface)] rounded-lg animate-pulse" />
           </div>
         )}
         <SkeletonTable rows={loadingRows} cols={columns.length} />
@@ -88,18 +88,18 @@ export function DataTable<TData, TValue>({
       )}
 
       {/* Table */}
-      <div className="rounded-lg border border-gray-800 overflow-hidden">
+      <div className="rounded-lg border border-[color:var(--rule)] overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full">
-            <thead className="bg-gray-800/50">
+            <thead className="bg-[var(--surface)]/50">
               {table.getHeaderGroups().map((headerGroup) => (
                 <tr key={headerGroup.id}>
                   {headerGroup.headers.map((header) => (
                     <th
                       key={header.id}
                       className={`
-                        px-4 py-3 text-left text-sm font-medium text-gray-400
-                        ${header.column.getCanSort() ? 'cursor-pointer hover:text-gray-200 select-none' : ''}
+                        px-4 py-3 text-left text-sm font-medium text-[color:var(--dim)]
+                        ${header.column.getCanSort() ? 'cursor-pointer hover:text-[color:var(--fg)] select-none' : ''}
                       `}
                       onClick={header.column.getToggleSortingHandler()}
                     >
@@ -108,7 +108,7 @@ export function DataTable<TData, TValue>({
                           ? null
                           : flexRender(header.column.columnDef.header, header.getContext())}
                         {header.column.getIsSorted() && (
-                          <span className="text-orange-400">
+                          <span className="text-[color:var(--accent)]">
                             {header.column.getIsSorted() === 'asc' ? '\u2191' : '\u2193'}
                           </span>
                         )}
@@ -118,7 +118,7 @@ export function DataTable<TData, TValue>({
                 </tr>
               ))}
             </thead>
-            <tbody className="divide-y divide-gray-800">
+            <tbody className="divide-y divide-[color:var(--rule)]">
               {table.getRowModel().rows.length === 0 ? (
                 <tr>
                   <td colSpan={columns.length}>
@@ -133,10 +133,10 @@ export function DataTable<TData, TValue>({
                 table.getRowModel().rows.map((row) => (
                   <tr
                     key={row.id}
-                    className="hover:bg-gray-800/30 transition-colors"
+                    className="hover:bg-[var(--surface)]/30 transition-colors"
                   >
                     {row.getVisibleCells().map((cell) => (
-                      <td key={cell.id} className="px-4 py-3 text-sm text-gray-100">
+                      <td key={cell.id} className="px-4 py-3 text-sm text-[color:var(--fg)]">
                         {flexRender(cell.column.columnDef.cell, cell.getContext())}
                       </td>
                     ))}
@@ -151,7 +151,7 @@ export function DataTable<TData, TValue>({
       {/* Pagination */}
       {showPagination && table.getPageCount() > 1 && (
         <div className="flex items-center justify-between">
-          <span className="text-sm text-gray-400">
+          <span className="text-sm text-[color:var(--dim)]">
             Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
             {' \u00b7 '}
             {table.getFilteredRowModel().rows.length} total rows

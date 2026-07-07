@@ -17,8 +17,8 @@ export function Toggle({ enabled, onChange, label, disabled = false }: TogglePro
       disabled={disabled}
       className={`
         relative inline-flex h-6 w-11 min-w-[2.75rem] shrink-0 items-center rounded-full
-        transition-colors focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 focus:ring-offset-gray-900
-        ${enabled ? "bg-orange-600" : "bg-gray-700"}
+        transition-colors focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 focus:ring-offset-[color:var(--surface)]
+        ${enabled ? "bg-[var(--accent)]" : "bg-[var(--rule-strong)]"}
         ${disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}
       `}
     >

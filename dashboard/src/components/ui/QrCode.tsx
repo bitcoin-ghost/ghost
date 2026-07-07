@@ -37,7 +37,7 @@ export function QrCode({ value, size = 160, ecc = "MEDIUM", margin = 4, classNam
   if (!path) {
     return (
       <div
-        className={`flex items-center justify-center text-xs text-gray-500 ${className}`}
+        className={`flex items-center justify-center text-xs text-[color:var(--fainter)] ${className}`}
         style={{ width: size, height: size, background: "#fff", borderRadius: 6 }}
       >
         —

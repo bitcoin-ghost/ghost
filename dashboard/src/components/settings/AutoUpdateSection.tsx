@@ -50,19 +50,19 @@ export function AutoUpdateSection() {
     <div className="flex items-center justify-between">
       <div className="pr-4">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-gray-300">Automatic updates</span>
+          <span className="text-sm font-medium text-[color:var(--dim)]">Automatic updates</span>
           <Badge variant={autoUpdateEnabled ? "success" : "default"}>
             {autoUpdateEnabled ? "On" : "Off"}
           </Badge>
         </div>
-        <p className="text-xs text-gray-500 mt-0.5">
+        <p className="text-xs text-[color:var(--fainter)] mt-0.5">
           When on, newer <strong>signed</strong> releases are applied automatically —
           the GPG signature and ghostd checksum are verified before any binary is
           swapped, and the node rolls back on a failed health check. Checked every 6h.
           Off by default.
         </p>
         {autoUpdate?.last_status?.result && (
-          <p className="text-xs text-gray-500 mt-1">
+          <p className="text-xs text-[color:var(--fainter)] mt-1">
             Last check: {autoUpdate.last_status.result}
             {autoUpdate.last_status.last_run
               ? ` · ${formatDate(autoUpdate.last_status.last_run)}`

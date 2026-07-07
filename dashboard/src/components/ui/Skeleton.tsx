@@ -7,7 +7,7 @@ interface SkeletonProps {
 export function Skeleton({ className = '' }: SkeletonProps) {
   return (
     <div
-      className={`animate-pulse bg-gray-800 rounded ${className}`}
+      className={`animate-pulse bg-[var(--surface)] rounded ${className}`}
     />
   );
 }
@@ -28,7 +28,7 @@ export function SkeletonText({ lines = 1, className = '' }: { lines?: number; cl
 
 export function SkeletonCard({ className = '' }: { className?: string }) {
   return (
-    <div className={`p-4 border border-gray-800 rounded-lg ${className}`}>
+    <div className={`p-4 border border-[color:var(--rule)] rounded-lg ${className}`}>
       <Skeleton className="h-6 w-1/3 mb-4" />
       <SkeletonText lines={3} />
     </div>
@@ -39,7 +39,7 @@ export function SkeletonTable({ rows = 5, cols = 4, className = '' }: { rows?: n
   return (
     <div className={`space-y-2 ${className}`}>
       {/* Header */}
-      <div className="flex gap-4 pb-2 border-b border-gray-800">
+      <div className="flex gap-4 pb-2 border-b border-[color:var(--rule)]">
         {Array.from({ length: cols }).map((_, i) => (
           <Skeleton key={i} className="h-4 flex-1" />
         ))}
@@ -60,7 +60,7 @@ export function SkeletonStats({ count = 4, className = '' }: { count?: number; c
   return (
     <div className={`grid grid-cols-2 md:grid-cols-4 gap-4 ${className}`}>
       {Array.from({ length: count }).map((_, i) => (
-        <div key={i} className="p-4 border border-gray-800 rounded-lg">
+        <div key={i} className="p-4 border border-[color:var(--rule)] rounded-lg">
           <Skeleton className="h-4 w-1/2 mb-2" />
           <Skeleton className="h-8 w-3/4" />
         </div>

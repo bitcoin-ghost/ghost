@@ -46,8 +46,8 @@ function TimeFilterToggle({
         onClick={() => onChange("24h")}
         className={`px-2 py-1 text-xs rounded transition-colors ${
           value === "24h"
-            ? "bg-orange-600 text-white"
-            : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+            ? "bg-[var(--accent)] text-[color:var(--fg)]"
+            : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
         }`}
       >
         24h
@@ -56,8 +56,8 @@ function TimeFilterToggle({
         onClick={() => onChange("7d")}
         className={`px-2 py-1 text-xs rounded transition-colors ${
           value === "7d"
-            ? "bg-orange-600 text-white"
-            : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+            ? "bg-[var(--accent)] text-[color:var(--fg)]"
+            : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
         }`}
       >
         7d
@@ -132,7 +132,7 @@ export function NetworkPayoutHistoryCard({
       accessorKey: "timestamp",
       header: "Time",
       cell: ({ row }) => (
-        <span className="text-gray-400 text-sm">
+        <span className="text-[color:var(--dim)] text-sm">
           {formatTimestamp(row.original.timestamp ?? 0)}
         </span>
       ),
@@ -145,7 +145,7 @@ export function NetworkPayoutHistoryCard({
           href={makeBlockLink(row.original.block_height ?? 0)}
           target="_blank"
           rel="noopener noreferrer"
-          className="font-mono text-orange-400 hover:text-orange-300 hover:underline"
+          className="font-mono text-[color:var(--accent)] hover:text-[color:var(--accent)] hover:underline"
         >
           #{row.original.block_height ?? 0}
         </a>
@@ -160,7 +160,7 @@ export function NetworkPayoutHistoryCard({
       accessorKey: "amount_satoshis",
       header: "Amount",
       cell: ({ row }) => (
-        <span className="font-mono text-gray-100">
+        <span className="font-mono text-[color:var(--fg)]">
           {formatSats(row.original.amount_satoshis ?? 0)}
         </span>
       ),
@@ -169,7 +169,7 @@ export function NetworkPayoutHistoryCard({
       accessorKey: "recipient_node_id",
       header: "Recipient",
       cell: ({ row }) => (
-        <span className="font-mono text-gray-400 text-sm">
+        <span className="font-mono text-[color:var(--dim)] text-sm">
           {row.original.recipient_node_id
             ? row.original.recipient_node_id.slice(0, 8)
             : row.original.recipient_address
@@ -189,18 +189,18 @@ export function NetworkPayoutHistoryCard({
       />
 
       {/* Summary row */}
-      <div className="grid grid-cols-3 gap-4 mb-4 p-3 bg-gray-900 rounded">
+      <div className="grid grid-cols-3 gap-4 mb-4 p-3 bg-[var(--surface)] rounded">
         <div className="text-center">
-          <div className="text-yellow-400 font-mono">{formatSats(summary.total_treasury_satoshis)}</div>
-          <div className="text-xs text-gray-500">Treasury</div>
+          <div className="text-[color:var(--accent)] font-mono">{formatSats(summary.total_treasury_satoshis)}</div>
+          <div className="text-xs text-[color:var(--fainter)]">Treasury</div>
         </div>
         <div className="text-center">
-          <div className="text-green-400 font-mono">{formatSats(summary.total_node_rewards_satoshis)}</div>
-          <div className="text-xs text-gray-500">Node Rewards</div>
+          <div className="text-[color:var(--green)] font-mono">{formatSats(summary.total_node_rewards_satoshis)}</div>
+          <div className="text-xs text-[color:var(--fainter)]">Node Rewards</div>
         </div>
         <div className="text-center">
-          <div className="text-gray-300 font-mono">{formatSats(summary.total_miner_rewards_satoshis)}</div>
-          <div className="text-xs text-gray-500">Miner Rewards</div>
+          <div className="text-[color:var(--dim)] font-mono">{formatSats(summary.total_miner_rewards_satoshis)}</div>
+          <div className="text-xs text-[color:var(--fainter)]">Miner Rewards</div>
         </div>
       </div>
 
@@ -241,7 +241,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "timestamp",
       header: "Time",
       cell: ({ row }) => (
-        <span className="text-gray-400 text-sm">
+        <span className="text-[color:var(--dim)] text-sm">
           {formatTimestamp(row.original.timestamp ?? 0)}
         </span>
       ),
@@ -254,7 +254,7 @@ export function GhostPayPayoutHistoryCard({
           href={makeBlockLink(row.original.block_height ?? 0)}
           target="_blank"
           rel="noopener noreferrer"
-          className="font-mono text-orange-400 hover:text-orange-300 hover:underline"
+          className="font-mono text-[color:var(--accent)] hover:text-[color:var(--accent)] hover:underline"
         >
           #{row.original.block_height ?? 0}
         </a>
@@ -264,7 +264,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "batch_id",
       header: "Batch ID",
       cell: ({ row }) => (
-        <span className="font-mono text-gray-400 text-sm">
+        <span className="font-mono text-[color:var(--dim)] text-sm">
           {(row.original.batch_id ?? "").slice(0, 12)}...
         </span>
       ),
@@ -273,7 +273,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "fee_satoshis",
       header: "Fee",
       cell: ({ row }) => (
-        <span className="font-mono text-green-400">
+        <span className="font-mono text-[color:var(--green)]">
           {formatSats(row.original.fee_satoshis ?? 0)}
         </span>
       ),
@@ -282,7 +282,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "recipient_node_id",
       header: "Node",
       cell: ({ row }) => (
-        <span className="font-mono text-gray-400 text-sm">
+        <span className="font-mono text-[color:var(--dim)] text-sm">
           {row.original.recipient_node_id?.slice(0, 8) ?? "—"}
         </span>
       ),
@@ -294,7 +294,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "timestamp",
       header: "Time",
       cell: ({ row }) => (
-        <span className="text-gray-400 text-sm">
+        <span className="text-[color:var(--dim)] text-sm">
           {formatTimestamp(row.original.timestamp ?? 0)}
         </span>
       ),
@@ -307,7 +307,7 @@ export function GhostPayPayoutHistoryCard({
           href={makeBlockLink(row.original.block_height ?? 0)}
           target="_blank"
           rel="noopener noreferrer"
-          className="font-mono text-orange-400 hover:text-orange-300 hover:underline"
+          className="font-mono text-[color:var(--accent)] hover:text-[color:var(--accent)] hover:underline"
         >
           #{row.original.block_height ?? 0}
         </a>
@@ -317,7 +317,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "session_id",
       header: "Session ID",
       cell: ({ row }) => (
-        <span className="font-mono text-gray-400 text-sm">
+        <span className="font-mono text-[color:var(--dim)] text-sm">
           {(row.original.session_id ?? "").slice(0, 12)}...
         </span>
       ),
@@ -326,7 +326,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "fee_satoshis",
       header: "Fee",
       cell: ({ row }) => (
-        <span className="font-mono text-yellow-400">
+        <span className="font-mono text-[color:var(--accent)]">
           {formatSats(row.original.fee_satoshis ?? 0)}
         </span>
       ),
@@ -335,7 +335,7 @@ export function GhostPayPayoutHistoryCard({
       accessorKey: "recipient_node_id",
       header: "Node",
       cell: ({ row }) => (
-        <span className="font-mono text-gray-400 text-sm">
+        <span className="font-mono text-[color:var(--dim)] text-sm">
           {row.original.recipient_node_id?.slice(0, 8) ?? "—"}
         </span>
       ),
@@ -351,14 +351,14 @@ export function GhostPayPayoutHistoryCard({
       />
 
       {/* Summary row */}
-      <div className="grid grid-cols-2 gap-4 mb-4 p-3 bg-gray-900 rounded">
+      <div className="grid grid-cols-2 gap-4 mb-4 p-3 bg-[var(--surface)] rounded">
         <div className="text-center">
-          <div className="text-green-400 font-mono">{formatSats(summary.total_ghostpay_fees_satoshis)}</div>
-          <div className="text-xs text-gray-500">GhostPay Fees ({summary.ghostpay_sessions_count})</div>
+          <div className="text-[color:var(--green)] font-mono">{formatSats(summary.total_ghostpay_fees_satoshis)}</div>
+          <div className="text-xs text-[color:var(--fainter)]">GhostPay Fees ({summary.ghostpay_sessions_count})</div>
         </div>
         <div className="text-center">
-          <div className="text-yellow-400 font-mono">{formatSats(summary.total_wraith_fees_satoshis)}</div>
-          <div className="text-xs text-gray-500">Wraith Fees ({summary.wraith_sessions_count})</div>
+          <div className="text-[color:var(--accent)] font-mono">{formatSats(summary.total_wraith_fees_satoshis)}</div>
+          <div className="text-xs text-[color:var(--fainter)]">Wraith Fees ({summary.wraith_sessions_count})</div>
         </div>
       </div>
 
@@ -368,8 +368,8 @@ export function GhostPayPayoutHistoryCard({
           onClick={() => setActiveTab("ghostpay")}
           className={`px-3 py-1.5 text-sm rounded transition-colors ${
             activeTab === "ghostpay"
-              ? "bg-orange-600 text-white"
-              : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+              ? "bg-[var(--accent)] text-[color:var(--fg)]"
+              : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
           }`}
         >
           L2→L1 Reconciliation ({ghostpayFees.length})
@@ -378,8 +378,8 @@ export function GhostPayPayoutHistoryCard({
           onClick={() => setActiveTab("wraith")}
           className={`px-3 py-1.5 text-sm rounded transition-colors ${
             activeTab === "wraith"
-              ? "bg-yellow-600 text-white"
-              : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+              ? "bg-[var(--accent)] text-[color:var(--fg)]"
+              : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
           }`}
         >
           Wraith Sessions ({wraithFees.length})
@@ -430,7 +430,7 @@ export function NodePayoutHistoryCard({
       accessorKey: "timestamp",
       header: "Time",
       cell: ({ row }) => (
-        <span className="text-gray-400 text-sm">
+        <span className="text-[color:var(--dim)] text-sm">
           {formatTimestamp(row.original.timestamp ?? 0)}
         </span>
       ),
@@ -443,7 +443,7 @@ export function NodePayoutHistoryCard({
           href={makeBlockLink(row.original.block_height ?? 0)}
           target="_blank"
           rel="noopener noreferrer"
-          className="font-mono text-orange-400 hover:text-orange-300 hover:underline"
+          className="font-mono text-[color:var(--accent)] hover:text-[color:var(--accent)] hover:underline"
         >
           #{row.original.block_height ?? 0}
         </a>
@@ -458,7 +458,7 @@ export function NodePayoutHistoryCard({
       accessorKey: "amount_satoshis",
       header: "Amount",
       cell: ({ row }) => (
-        <span className="font-mono text-green-400">
+        <span className="font-mono text-[color:var(--green)]">
           {formatSats(row.original.amount_satoshis ?? 0)}
         </span>
       ),
@@ -467,7 +467,7 @@ export function NodePayoutHistoryCard({
       accessorKey: "share_percentage",
       header: "Share %",
       cell: ({ row }) => (
-        <span className="font-mono text-gray-400">
+        <span className="font-mono text-[color:var(--dim)]">
           {row.original.share_percentage
             ? `${(row.original.share_percentage * 100).toFixed(2)}%`
             : "—"}
@@ -491,8 +491,8 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange(undefined)}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               !payoutTypeFilter
-                ? "bg-orange-600 text-white"
-                : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >
             All
@@ -501,8 +501,8 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange("node_reward")}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               payoutTypeFilter === "node_reward"
-                ? "bg-orange-600 text-white"
-                : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >
             Node Rewards
@@ -511,8 +511,8 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange("ghostpay_fee")}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               payoutTypeFilter === "ghostpay_fee"
-                ? "bg-orange-600 text-white"
-                : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >
             GhostPay Fees
@@ -521,8 +521,8 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange("wraith_fee")}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               payoutTypeFilter === "wraith_fee"
-                ? "bg-yellow-600 text-white"
-                : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >
             Wraith Fees

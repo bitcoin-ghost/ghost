@@ -20,8 +20,8 @@ export function DecentralisationCard() {
       <Card className="col-span-full">
         <CardHeader title="Decentralisation Status" />
         <div className="animate-pulse space-y-4">
-          <div className="h-6 bg-gray-800 rounded w-full"></div>
-          <div className="h-20 bg-gray-800 rounded w-full"></div>
+          <div className="h-6 bg-[var(--surface)] rounded w-full"></div>
+          <div className="h-20 bg-[var(--surface)] rounded w-full"></div>
         </div>
       </Card>
     );
@@ -31,7 +31,7 @@ export function DecentralisationCard() {
     return (
       <Card className="col-span-full">
         <CardHeader title="Decentralisation Status" />
-        <p className="text-gray-400">
+        <p className="text-[color:var(--dim)]">
           {error ? `Error: ${error.message}` : "Unable to load treasury status"}
         </p>
       </Card>
@@ -46,10 +46,10 @@ export function DecentralisationCard() {
   }[phase] ?? "UNKNOWN";
 
   const phaseColor = {
-    bootstrap: "text-yellow-400",
-    decay: "text-orange-400",
-    ossified: "text-green-400",
-  }[phase] ?? "text-gray-400";
+    bootstrap: "text-[color:var(--accent)]",
+    decay: "text-[color:var(--accent)]",
+    ossified: "text-[color:var(--green)]",
+  }[phase] ?? "text-[color:var(--dim)]";
 
   return (
     <Card className="col-span-full">
@@ -59,15 +59,15 @@ export function DecentralisationCard() {
         {/* Treasury Progress Bar */}
         <div>
           <div className="flex justify-between text-sm mb-2">
-            <span className="text-gray-400">Treasury Progress</span>
-            <span className="text-gray-100">
+            <span className="text-[color:var(--dim)]">Treasury Progress</span>
+            <span className="text-[color:var(--fg)]">
               {(treasury.accumulated_btc ?? 0).toFixed(2)} / {(treasury.target_btc ?? 21).toFixed(1)} BTC
-              <span className="text-gray-500 ml-2">
+              <span className="text-[color:var(--fainter)] ml-2">
                 ({(treasury.progress_percent ?? 0).toFixed(1)}%)
               </span>
             </span>
           </div>
-          <div className="h-4 bg-gray-800 rounded-full overflow-hidden">
+          <div className="h-4 bg-[var(--surface)] rounded-full overflow-hidden">
             <div
               className="h-full bg-gradient-to-r from-orange-600 to-orange-400 transition-all duration-500"
               style={{ width: `${Math.min(treasury.progress_percent ?? 0, 100)}%` }}
@@ -76,28 +76,28 @@ export function DecentralisationCard() {
         </div>
 
         {/* Phase Info */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-4 bg-gray-800/50 rounded-lg">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 p-4 bg-[var(--surface)]/50 rounded-lg">
           <div>
-            <div className="text-xs text-gray-500 uppercase tracking-wide">Phase</div>
-            <div className={`text-lg font-semibold ${phaseColor ?? 'text-gray-400'}`}>{phaseLabel ?? 'Unknown'}</div>
+            <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide">Phase</div>
+            <div className={`text-lg font-semibold ${phaseColor ?? 'text-[color:var(--dim)]'}`}>{phaseLabel ?? 'Unknown'}</div>
           </div>
           <div>
-            <div className="text-xs text-gray-500 uppercase tracking-wide">Decay Year</div>
-            <div className="text-lg font-semibold text-gray-100">
+            <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide">Decay Year</div>
+            <div className="text-lg font-semibold text-[color:var(--fg)]">
               {treasury.decay_started && treasury.decay_year !== null
                 ? `Year ${treasury.decay_year}`
                 : "Not started"}
             </div>
           </div>
           <div>
-            <div className="text-xs text-gray-500 uppercase tracking-wide">Treasury</div>
-            <div className="text-lg font-semibold text-gray-100">
+            <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide">Treasury</div>
+            <div className="text-lg font-semibold text-[color:var(--fg)]">
               {(treasury.treasury_percent ?? 50).toFixed(2)}% of subsidy
             </div>
           </div>
           <div>
-            <div className="text-xs text-gray-500 uppercase tracking-wide">Node Pool</div>
-            <div className="text-lg font-semibold text-gray-100">
+            <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide">Node Pool</div>
+            <div className="text-lg font-semibold text-[color:var(--fg)]">
               {(treasury.node_pool_percent ?? 50).toFixed(2)}% of subsidy
             </div>
           </div>
@@ -105,7 +105,7 @@ export function DecentralisationCard() {
 
         {/* Ossification Timeline */}
         <div>
-          <div className="text-sm text-gray-400 mb-3">Ossification Timeline</div>
+          <div className="text-sm text-[color:var(--dim)] mb-3">Ossification Timeline</div>
           <div className="flex items-center justify-between">
             {DECAY_SCHEDULE.map((step) => {
               const decayYear = treasury.decay_year ?? 0;
@@ -113,19 +113,19 @@ export function DecentralisationCard() {
               const isPast = treasury.decay_started && treasury.decay_year != null && step.year < decayYear;
               const isOssified = treasury.phase === "ossified";
 
-              let dotColor = "bg-gray-600";
-              if (isOssified && step.year === 5) dotColor = "bg-green-500";
-              else if (isCurrentYear) dotColor = "bg-orange-500 animate-pulse";
-              else if (isPast) dotColor = "bg-orange-400";
-              else if (!treasury.decay_started && step.year === 0) dotColor = "bg-yellow-500";
+              let dotColor = "bg-[var(--rule-strong)]";
+              if (isOssified && step.year === 5) dotColor = "bg-[var(--green)]";
+              else if (isCurrentYear) dotColor = "bg-[var(--accent)] animate-pulse";
+              else if (isPast) dotColor = "bg-[var(--accent)]";
+              else if (!treasury.decay_started && step.year === 0) dotColor = "bg-[var(--accent)]";
 
               return (
                 <div key={step.year} className="flex flex-col items-center flex-1">
                   <div className={`w-3 h-3 rounded-full ${dotColor}`} />
-                  <div className="text-xs text-gray-500 mt-1">
+                  <div className="text-xs text-[color:var(--fainter)] mt-1">
                     {step.year === 0 ? "21 BTC" : `Yr ${step.year}`}
                   </div>
-                  <div className="text-xs text-gray-600 mt-0.5">
+                  <div className="text-xs text-[color:var(--fainter)] mt-0.5">
                     {step.treasury}%
                   </div>
                 </div>
@@ -133,8 +133,8 @@ export function DecentralisationCard() {
             })}
           </div>
           <div className="flex justify-between mt-2">
-            <span className="text-xs text-gray-500">Bootstrap</span>
-            <span className="text-xs text-gray-500">Fully Ossified</span>
+            <span className="text-xs text-[color:var(--fainter)]">Bootstrap</span>
+            <span className="text-xs text-[color:var(--fainter)]">Fully Ossified</span>
           </div>
         </div>
       </div>

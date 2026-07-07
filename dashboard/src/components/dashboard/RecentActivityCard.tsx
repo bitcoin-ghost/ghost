@@ -47,13 +47,13 @@ export function RecentActivityCard() {
   const getLogColor = (level: string) => {
     switch (level) {
       case "error":
-        return "text-red-400";
+        return "text-[color:var(--red)]";
       case "warn":
-        return "text-yellow-400";
+        return "text-[color:var(--accent)]";
       case "info":
-        return "text-orange-400";
+        return "text-[color:var(--accent)]";
       default:
-        return "text-gray-400";
+        return "text-[color:var(--dim)]";
     }
   };
 
@@ -63,7 +63,7 @@ export function RecentActivityCard() {
         <CardHeader title="Recent Activity" />
         <div className="animate-pulse space-y-2">
           {[...Array(5)].map((_, i) => (
-            <div key={i} className="h-4 bg-gray-800 rounded w-full"></div>
+            <div key={i} className="h-4 bg-[var(--surface)] rounded w-full"></div>
           ))}
         </div>
       </Card>
@@ -75,7 +75,7 @@ export function RecentActivityCard() {
       <CardHeader
         title="Recent Activity"
         action={
-          <a href="/logs" className="text-sm text-gray-400 hover:text-gray-200">
+          <a href="/logs" className="text-sm text-[color:var(--dim)] hover:text-[color:var(--fg)]">
             View All
           </a>
         }
@@ -83,20 +83,20 @@ export function RecentActivityCard() {
 
       <div className="space-y-2 max-h-64 overflow-y-auto">
         {logs.length === 0 ? (
-          <p className="text-gray-500 text-sm">No recent activity</p>
+          <p className="text-[color:var(--fainter)] text-sm">No recent activity</p>
         ) : (
           logs.map((log, idx) => (
             <div
               key={idx}
-              className="flex items-start gap-3 text-sm py-1 border-b border-gray-800/50 last:border-0"
+              className="flex items-start gap-3 text-sm py-1 border-b border-[color:var(--rule)]/50 last:border-0"
             >
-              <span className="text-gray-500 font-mono text-xs whitespace-nowrap">
+              <span className="text-[color:var(--fainter)] font-mono text-xs whitespace-nowrap">
                 {formatTime(log.timestamp)}
               </span>
               <span className={getLogColor(log.level)}>
                 {getLogIcon(log.level, log.message)}
               </span>
-              <span className="text-gray-300 truncate">{log.message}</span>
+              <span className="text-[color:var(--dim)] truncate">{log.message}</span>
             </div>
           ))
         )}

@@ -47,7 +47,7 @@ export function Dialog({ isOpen, onClose, title, description, children, footer, 
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
       <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+        className="absolute inset-0 bg-[var(--bg)]/60 backdrop-blur-sm"
         onClick={onClose}
       />
 
@@ -55,21 +55,21 @@ export function Dialog({ isOpen, onClose, title, description, children, footer, 
       <div
         className={`
           relative z-10 w-full ${sizeClasses[size]} mx-4
-          bg-gray-900 border border-gray-700 rounded-xl shadow-2xl
+          bg-[var(--surface)] border border-[color:var(--rule-strong)] rounded-xl shadow-2xl
           animate-in fade-in zoom-in-95 duration-200
         `}
       >
         {/* Header */}
-        <div className="flex items-start justify-between p-4 border-b border-gray-800">
+        <div className="flex items-start justify-between p-4 border-b border-[color:var(--rule)]">
           <div>
-            <h2 className="text-lg font-semibold text-gray-100">{title}</h2>
+            <h2 className="text-lg font-semibold text-[color:var(--fg)]">{title}</h2>
             {description && (
-              <p className="mt-1 text-sm text-gray-400">{description}</p>
+              <p className="mt-1 text-sm text-[color:var(--dim)]">{description}</p>
             )}
           </div>
           <button
             onClick={onClose}
-            className="p-1 text-gray-400 hover:text-gray-200 rounded-lg hover:bg-gray-800 transition-colors"
+            className="p-1 text-[color:var(--dim)] hover:text-[color:var(--fg)] rounded-lg hover:bg-[var(--surface)] transition-colors"
           >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -84,7 +84,7 @@ export function Dialog({ isOpen, onClose, title, description, children, footer, 
 
         {/* Footer */}
         {footer && (
-          <div className="flex items-center justify-end gap-3 p-4 border-t border-gray-800">
+          <div className="flex items-center justify-end gap-3 p-4 border-t border-[color:var(--rule)]">
             {footer}
           </div>
         )}
@@ -150,7 +150,7 @@ export function ConfirmDialog({
         </>
       }
     >
-      <p className="text-gray-300">{message}</p>
+      <p className="text-[color:var(--dim)]">{message}</p>
     </Dialog>
   );
 }
