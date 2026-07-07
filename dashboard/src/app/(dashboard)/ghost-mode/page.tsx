@@ -293,11 +293,14 @@ export default function GhostModePage() {
         >
           <p style={{ color: "var(--fainter)", fontSize: "13px", lineHeight: "1.6" }}>
             <span style={{ color: "var(--yellow)", fontWeight: 500 }}>Mining caveat:</span> Ghost Mode
-            rejects transactions from peers, so your mempool never fills with anyone else&apos;s fee-paying
-            transactions. Blocks your node builds are therefore near-empty — coinbase subsidy only, no
-            transaction fees. The Public Mining <strong style={{ color: "var(--fg)" }}>+3</strong> share
-            still verifies (the Stratum port stays open), but any block your miners find earns no fees.
-            Ghost Mode suits archive / verification nodes; if you mine for fee revenue, leave it off.
+            rejects transactions from peers, so your mempool never fills with fee-paying transactions and
+            the blocks your node builds are near-empty — coinbase subsidy only. The node operator keeps the
+            transaction fees (miners are paid from the subsidy, less the pool fee), so an empty block means
+            you collect <strong style={{ color: "var(--fg)" }}>zero fee income</strong> — you forfeit your
+            own primary block-finding revenue, while your miners still draw their subsidy as usual. The
+            Public Mining <strong style={{ color: "var(--fg)" }}>+3</strong> share still verifies, but Ghost
+            Mode zeroes out the money that share exists to earn. It suits archive / verification nodes; if
+            you mine for fees, leave it off.
           </p>
         </div>
       </Card>
