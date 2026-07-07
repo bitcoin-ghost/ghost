@@ -69,7 +69,7 @@ function VectorGroup({
       }}
     >
       <div style={{ marginBottom: "10px" }}>
-        <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500 }}>{title}</div>
+        <div style={{ color: "var(--accent)", fontSize: "14px", fontWeight: 500 }}>{title}</div>
         <div style={{ color: "var(--dim)", fontSize: "12px", marginTop: "2px" }}>{note}</div>
       </div>
       <div className="space-y-3">
@@ -201,7 +201,7 @@ export function ReaperControls() {
         >
           <div className="flex items-start justify-between gap-4">
             <div>
-              <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500 }}>Reaper master switch</div>
+              <div style={{ color: "var(--accent)", fontSize: "14px", fontWeight: 500 }}>Reaper master switch</div>
               <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5", marginTop: "2px" }}>
                 When off, every detector is disabled on both the pool template reaper and the ghostd mempool
                 reaper. When on, the per-vector choices below apply. Running Reaper earns +2 capability shares.
@@ -250,7 +250,7 @@ export function ReaperControls() {
             background: "var(--bg)",
           }}
         >
-          <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500, marginBottom: "10px" }}>
+          <div style={{ color: "var(--accent)", fontSize: "14px", fontWeight: 500, marginBottom: "10px" }}>
             Thresholds
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
