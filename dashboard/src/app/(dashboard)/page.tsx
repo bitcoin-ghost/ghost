@@ -148,11 +148,6 @@ function L2Card() {
   // fault) when L2 itself is healthy and only mixing is simply not enabled.
   const wraithActive = !!(isRunning && gp?.wraith_enabled);
   const wraithLabel = isLoading ? "..." : wraithActive ? "Active" : isRunning ? "Not enabled" : "Offline";
-  const wraithReason = wraithActive
-    ? "Active sessions"
-    : isRunning
-    ? "Mixing not enabled on this node"
-    : "Requires Ghost Pay";
 
   return (
     <Card className="border-purple-600/30">
@@ -193,20 +188,9 @@ function L2Card() {
         <Tooltip content={TOOLTIPS.l2_wraith}>
           <div className="p-3 bg-purple-900/10 rounded-lg">
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Wraith</div>
-            <div className="flex items-center gap-2">
-              <StatusDot
-                status={wraithActive ? "online" : "offline"}
-                size="sm"
-              />
-              <span className="text-sm font-mono text-[color:var(--fg)]">
-                {wraithLabel}
-              </span>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
+              {isLoading ? "..." : wraithLabel}
             </div>
-            {!isLoading && (
-              <div className={`text-xs mt-0.5 ${wraithActive ? "text-purple-400" : "text-[color:var(--fainter)]"}`}>
-                {wraithReason}
-              </div>
-            )}
           </div>
         </Tooltip>
         <div className="p-3 bg-purple-900/10 rounded-lg">
