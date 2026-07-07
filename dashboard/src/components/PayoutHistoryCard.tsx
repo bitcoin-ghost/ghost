@@ -46,7 +46,7 @@ function TimeFilterToggle({
         onClick={() => onChange("24h")}
         className={`px-2 py-1 text-xs rounded transition-colors ${
           value === "24h"
-            ? "bg-[var(--accent)] text-[color:var(--fg)]"
+            ? "bg-[var(--accent)] text-white"
             : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
         }`}
       >
@@ -56,7 +56,7 @@ function TimeFilterToggle({
         onClick={() => onChange("7d")}
         className={`px-2 py-1 text-xs rounded transition-colors ${
           value === "7d"
-            ? "bg-[var(--accent)] text-[color:var(--fg)]"
+            ? "bg-[var(--accent)] text-white"
             : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
         }`}
       >
@@ -368,7 +368,7 @@ export function GhostPayPayoutHistoryCard({
           onClick={() => setActiveTab("ghostpay")}
           className={`px-3 py-1.5 text-sm rounded transition-colors ${
             activeTab === "ghostpay"
-              ? "bg-[var(--accent)] text-[color:var(--fg)]"
+              ? "bg-[var(--accent)] text-white"
               : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
           }`}
         >
@@ -378,7 +378,7 @@ export function GhostPayPayoutHistoryCard({
           onClick={() => setActiveTab("wraith")}
           className={`px-3 py-1.5 text-sm rounded transition-colors ${
             activeTab === "wraith"
-              ? "bg-[var(--accent)] text-[color:var(--fg)]"
+              ? "bg-[var(--accent)] text-white"
               : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
           }`}
         >
@@ -491,7 +491,7 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange(undefined)}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               !payoutTypeFilter
-                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                ? "bg-[var(--accent)] text-white"
                 : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >
@@ -501,7 +501,7 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange("node_reward")}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               payoutTypeFilter === "node_reward"
-                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                ? "bg-[var(--accent)] text-white"
                 : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >
@@ -511,7 +511,7 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange("ghostpay_fee")}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               payoutTypeFilter === "ghostpay_fee"
-                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                ? "bg-[var(--accent)] text-white"
                 : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >
@@ -521,7 +521,7 @@ export function NodePayoutHistoryCard({
             onClick={() => onPayoutTypeFilterChange("wraith_fee")}
             className={`px-2 py-1 text-xs rounded transition-colors ${
               payoutTypeFilter === "wraith_fee"
-                ? "bg-[var(--accent)] text-[color:var(--fg)]"
+                ? "bg-[var(--accent)] text-white"
                 : "bg-[var(--surface)] text-[color:var(--dim)] hover:bg-[var(--rule-strong)]"
             }`}
           >

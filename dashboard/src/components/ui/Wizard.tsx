@@ -30,7 +30,7 @@ export function StepIndicator({ steps, currentStep }: StepIndicatorProps) {
                   className={`
                     relative z-10 flex items-center justify-center w-8 h-8 rounded-full text-sm font-semibold
                     transition-colors duration-200
-                    ${isCompleted ? 'bg-[var(--accent)] text-[color:var(--fg)]' : ''}
+                    ${isCompleted ? 'bg-[var(--accent)] text-white' : ''}
                     ${isActive ? 'border-2 border-[color:var(--accent)] text-[color:var(--accent)] bg-[var(--surface)]' : ''}
                     ${isPending ? 'bg-[var(--rule-strong)] text-[color:var(--dim)]' : ''}
                   `}

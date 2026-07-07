@@ -315,9 +315,9 @@ export default function OnboardingPage() {
             />
             <div className="space-y-4">
               {reaperEnabled && (
-                <div className="p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg">
-                  <div className="text-yellow-400 font-medium">Locked by Reaper Mode</div>
-                  <div className="text-sm text-yellow-500/80">
+                <div className="p-3 bg-[color-mix(in_srgb,var(--yellow)_18%,transparent)] border border-[color-mix(in_srgb,var(--yellow)_45%,transparent)] rounded-lg">
+                  <div className="text-[color:var(--yellow)] font-medium">Locked by Reaper Mode</div>
+                  <div className="text-sm text-[color:var(--yellow)]/80">
                     Disable Reaper Mode in the previous step to change profiles.
                   </div>
                 </div>

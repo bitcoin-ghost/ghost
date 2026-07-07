@@ -93,9 +93,9 @@ export default function ShroudPage() {
         />
         <div className="mt-4 p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
           <p className="text-xs text-[color:var(--dim)] leading-relaxed">
-            <span className="text-blue-400 font-medium">Note:</span> The mempool addition is
+            <span className="text-[color:var(--blue)] font-medium">Note:</span> The mempool addition is
             instant — your node can mine and validate the transaction immediately. Shroud only
-            affects the <span className="text-blue-400">outbound relay</span> timing, ensuring
+            affects the <span className="text-[color:var(--blue)]">outbound relay</span> timing, ensuring
             adversaries cannot correlate relay order with transaction origin.
           </p>
         </div>
@@ -132,7 +132,7 @@ export default function ShroudPage() {
                 </span>
               </StatusRow>
               <StatusRow label="Avg Delay" tooltip={TOOLTIPS.avg_delay}>
-                <span className="text-blue-400 font-mono text-sm">
+                <span className="text-[color:var(--blue)] font-mono text-sm">
                   {status.avg_delay_ms.toLocaleString()} ms
                 </span>
               </StatusRow>
@@ -149,8 +149,8 @@ export default function ShroudPage() {
         />
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {/* Protects Against */}
-          <div className="p-4 bg-blue-900/10 rounded-lg border border-blue-600/30">
-            <h4 className="text-sm font-medium text-blue-400 mb-3 flex items-center gap-2">
+          <div className="p-4 bg-[color-mix(in_srgb,var(--blue)_10%,transparent)] rounded-lg border border-[color-mix(in_srgb,var(--blue)_30%,transparent)]">
+            <h4 className="text-sm font-medium text-[color:var(--blue)] mb-3 flex items-center gap-2">
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
               </svg>

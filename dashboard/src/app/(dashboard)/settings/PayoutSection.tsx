@@ -105,7 +105,7 @@ export function PayoutSection() {
             Requires Ghost Pay to be enabled.
           </p>
           {!ghostPayStatus?.l2_height && (
-            <p className="text-xs text-yellow-500 mt-1">
+            <p className="text-xs text-[color:var(--yellow)] mt-1">
               Ghost Pay is not running - fee distributions require an active ghost-pay-node
             </p>
           )}

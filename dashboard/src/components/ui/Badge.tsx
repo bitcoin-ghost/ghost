@@ -12,7 +12,7 @@ const variants: Record<BadgeVariant, string> = {
   success: "bg-[color-mix(in_srgb,var(--green)_16%,transparent)] text-[color:var(--green)] border-[color-mix(in_srgb,var(--green)_40%,transparent)]",
   warning: "bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] text-[color:var(--accent)] border-[color-mix(in_srgb,var(--accent)_40%,transparent)]",
   error: "bg-[color-mix(in_srgb,var(--red)_16%,transparent)] text-[color:var(--red)] border-[color-mix(in_srgb,var(--red)_40%,transparent)]",
-  info: "bg-blue-900 text-blue-300 border-blue-700",
+  info: "bg-[color-mix(in_srgb,var(--blue)_16%,transparent)] text-[color:var(--blue)] border-[color-mix(in_srgb,var(--blue)_40%,transparent)]",
   default: "bg-[var(--surface)] text-[color:var(--dim)] border-[color:var(--rule-strong)]",
 };
 
