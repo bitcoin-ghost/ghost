@@ -205,7 +205,7 @@ export function Sidebar() {
       >
         {/* Brand + collapse toggle */}
         <div
-          className="flex items-center justify-between px-4"
+          className={`flex items-center ${collapsed ? "justify-center" : "justify-between px-4"}`}
           style={{ height: "60px", borderBottom: "1px solid var(--rule)" }}
         >
           {!collapsed ? (
