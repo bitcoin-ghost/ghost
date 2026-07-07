@@ -23,9 +23,9 @@ function LoginForm() {
       });
 
       if (res.ok) {
-        // Always land on Overview after sign-in, regardless of the page the
-        // middleware bounced from — the dashboard opens on the home view.
-        router.push("/");
+        // Always land on Home after sign-in, regardless of the page the
+        // middleware bounced from — the dashboard opens on the Home view.
+        router.push("/home");
       } else {
         setError("Invalid password");
       }
