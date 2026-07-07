@@ -633,11 +633,22 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
         className="relative flex items-center justify-center"
         style={{ width: 'min(42vh, 72vw, 384px)', aspectRatio: '1 / 1' }}
       >
-        {/* Canvas heartbeat layer (behind the SVG ring). */}
+        {/* Canvas heartbeat layer (behind the SVG ring). Circular mask: the
+            emanating pulses expand past the square canvas's half-width, so a
+            bare square bitmap clips them into four stray arc fragments in the
+            diagonal corners (outside the ring). Fading the layer to transparent
+            just inside the corners keeps the pulses reading as full circles and
+            removes the fragments — everything drawn (disk, breathing halo,
+            pulses) stays well within the solid 90% core. */}
         <canvas
           ref={canvasRef}
           className="absolute inset-0"
-          style={{ width: '100%', height: '100%' }}
+          style={{
+            width: '100%',
+            height: '100%',
+            WebkitMaskImage: 'radial-gradient(circle closest-side, #000 90%, transparent 100%)',
+            maskImage: 'radial-gradient(circle closest-side, #000 90%, transparent 100%)',
+          }}
           aria-hidden
         />
 
@@ -677,7 +688,20 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
             opacity={0.5}
             style={{ animation: active ? 'nv-track 6s ease-in-out infinite' : undefined }}
           />
-          <g transform={`rotate(-90 ${CENTER} ${CENTER})`}>
+          {/* Two composed rotations, applied as one angle:
+              -90° brings the SVG circle's 3-o'clock path start to 12 o'clock,
+              and a further -(SEG_VISIBLE/2 path-units → degrees) recentres each
+              segment on its slot boundary. Segment i's visible dash occupies the
+              path interval [i·SEG_SLOT, i·SEG_SLOT+SEG_VISIBLE]; without this
+              extra turn its *centre* sits at i·72°+SEG_VISIBLE/2·3.6° (~30.6°
+              clockwise of where it should). Rotating the whole group back by that
+              half-arc lands each centre exactly on i·72° — Elder at the top,
+              then Reaper/Mining/GhostPay/Archive clockwise — while every dash
+              stays inside [i·20, i·20+17] (max 97 < 100), so none straddles the
+              path's 0/100 seam and no segment splits at the top. */}
+          <g
+            transform={`rotate(${-(90 + (SEG_VISIBLE / 2) * (360 / 100))} ${CENTER} ${CENTER})`}
+          >
             {CAPS.map((cap, i) => {
               const qualified = !!shares?.[cap.key] && uptimeQualified;
               const claimed = !!shares?.[cap.key] && !uptimeQualified;
@@ -725,7 +749,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
         >
           <defs>
             {CAPS.map((cap, i) => {
-              const theta = ((i * SEG_SLOT + SEG_VISIBLE / 2) / 100) * 360; // clockwise from top
+              const theta = ((i * SEG_SLOT) / 100) * 360; // segment centre: i·72° clockwise from top
               const bottom = theta > 90 && theta < 270; // lower half → keep upright
               return (
                 <g key={cap.key}>
