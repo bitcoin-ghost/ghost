@@ -415,6 +415,38 @@ impl NodeConfig {
         self.ghost_pay.as_ref().is_some_and(|gp| gp.wraith_enabled)
     }
 
+    /// Reconcile the mutually-exclusive Ghost Mode / Public Mining pair.
+    ///
+    /// A Ghost Mode node suppresses the peer transaction-relay path, so its
+    /// mempool never fills and the blocks it builds are near-empty — the
+    /// operator forfeits all transaction-fee income (fees accrue to the node
+    /// operator; miners are paid from the subsidy less the pool fee). Running
+    /// Ghost Mode alongside Public Mining (`mining_mode = PublicPool`) is
+    /// therefore self-harming and must never be allowed.
+    ///
+    /// If a config file enables both, this disables Ghost Mode and leaves
+    /// Public Mining active — Public Mining is the income-earning capability, so
+    /// keeping it and dropping the flag that zeroes its revenue is the safe
+    /// resolution. Returns `Some(message)` describing the change so the caller
+    /// can log it loudly, or `None` when there is no conflict.
+    #[must_use]
+    pub fn reconcile_ghost_mode_mining_exclusion(&mut self) -> Option<String> {
+        if self.network.ghost_mode && matches!(self.network.mining_mode, MiningMode::PublicPool) {
+            self.network.ghost_mode = false;
+            Some(
+                "CONFLICT: `ghost_mode = true` and `mining_mode = PublicPool` were both set. \
+                 A Ghost Mode node suppresses peer transactions and builds near-empty blocks, \
+                 forfeiting all transaction-fee income, so it cannot run as a public miner. \
+                 Ghost Mode has been DISABLED and Public Mining left active. Set \
+                 `ghost_mode = false` or switch `mining_mode` away from PublicPool in pool.toml \
+                 to silence this warning."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
     /// Validate the configuration
     ///
     /// Returns validation result with any errors and warnings found.
@@ -2608,6 +2640,55 @@ mod tests {
             custom: None,
         };
         assert_eq!(config.profile, PolicyProfile::BitcoinPure);
+    }
+
+    #[test]
+    fn ghost_mode_and_public_mining_conflict_disables_ghost_mode() {
+        let mut config = NodeConfig::default();
+        config.network.mining_mode = MiningMode::PublicPool;
+        config.network.ghost_mode = true;
+
+        let warning = config.reconcile_ghost_mode_mining_exclusion();
+
+        assert!(
+            warning.is_some(),
+            "a config enabling both Ghost Mode and Public Mining must be reconciled"
+        );
+        assert!(
+            !config.network.ghost_mode,
+            "Ghost Mode must be disabled to preserve fee income"
+        );
+        assert!(
+            matches!(config.network.mining_mode, MiningMode::PublicPool),
+            "Public Mining (the income-earning capability) must be left active"
+        );
+    }
+
+    #[test]
+    fn ghost_mode_without_public_mining_is_left_untouched() {
+        let mut config = NodeConfig::default();
+        config.network.mining_mode = MiningMode::PrivateSolo;
+        config.network.ghost_mode = true;
+
+        let warning = config.reconcile_ghost_mode_mining_exclusion();
+
+        assert!(warning.is_none(), "no conflict without Public Mining");
+        assert!(config.network.ghost_mode, "Ghost Mode must be preserved when it is safe");
+    }
+
+    #[test]
+    fn public_mining_without_ghost_mode_is_left_untouched() {
+        let mut config = NodeConfig::default();
+        config.network.mining_mode = MiningMode::PublicPool;
+        config.network.ghost_mode = false;
+
+        let warning = config.reconcile_ghost_mode_mining_exclusion();
+
+        assert!(warning.is_none(), "no conflict when Ghost Mode is off");
+        assert!(
+            matches!(config.network.mining_mode, MiningMode::PublicPool),
+            "Public Mining must remain active"
+        );
     }
 
     #[test]

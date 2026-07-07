@@ -5643,6 +5643,24 @@ async fn api_config_ghost_mode_post_handler(
 ) -> impl IntoResponse {
     let enabled = payload.enabled;
 
+    // Mutual exclusion with Public Mining. A Ghost Mode node suppresses the
+    // peer transaction-relay path, so its mempool never fills and the blocks it
+    // builds are near-empty — the operator forfeits all transaction-fee income
+    // (fees accrue to the node operator; miners are paid from the subsidy less
+    // the pool fee). Enabling Ghost Mode while Public Mining is active is
+    // therefore self-harming and is refused. Turning Ghost Mode OFF is always
+    // allowed, so this only guards the enable path. No state is mutated on
+    // rejection.
+    if enabled && state.dashboard_config.read().public_mining {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Public Mining is active. Disable it before enabling Ghost Mode — a Ghost Mode node builds empty blocks and forfeits all transaction-fee income."
+            })),
+        );
+    }
+
     // Try to call ghost-core RPC to set ghost mode
     let rpc_result = if let Some(ref rpc) = state.rpc {
         match rpc.set_ghost_mode(enabled).await {
@@ -5681,16 +5699,19 @@ async fn api_config_ghost_mode_post_handler(
         }
     }
 
-    Json(serde_json::json!({
-        "success": true,
-        "enabled": actual_enabled,
-        "rpc_synced": rpc_result.is_some(),
-        "message": if rpc_result.is_some() {
-            "Ghost mode updated and synced with ghost-core"
-        } else {
-            "Ghost mode updated (RPC sync unavailable)"
-        }
-    }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "enabled": actual_enabled,
+            "rpc_synced": rpc_result.is_some(),
+            "message": if rpc_result.is_some() {
+                "Ghost mode updated and synced with ghost-core"
+            } else {
+                "Ghost mode updated (RPC sync unavailable)"
+            }
+        })),
+    )
 }
 
 /// API v1 Config ghost_mode_local_egress POST handler
@@ -5767,12 +5788,32 @@ async fn api_config_public_mining_post_handler(
     Json(payload): Json<ToggleRequest>,
 ) -> impl IntoResponse {
     let mut config = state.dashboard_config.write();
+
+    // Mutual exclusion with Ghost Mode (symmetric with the ghost_mode handler).
+    // A Ghost Mode node builds near-empty blocks and forfeits all
+    // transaction-fee income, so accepting public miners alongside it earns
+    // the operator nothing on fees. Refuse to enable Public Mining while Ghost
+    // Mode is active; disabling it is always allowed. Reject without mutating
+    // state.
+    if payload.enabled && config.ghost_mode {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Ghost Mode is active. Disable it before enabling Public Mining."
+            })),
+        );
+    }
+
     config.public_mining = payload.enabled;
-    Json(serde_json::json!({
-        "success": true,
-        "enabled": payload.enabled,
-        "message": "Public mining updated"
-    }))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "enabled": payload.enabled,
+            "message": "Public mining updated"
+        })),
+    )
 }
 
 /// Resolve the `ghost-setup` binary used to apply the ghostd mempool-reaper
@@ -9459,6 +9500,20 @@ async fn api_mining_public_post_handler(
 ) -> impl IntoResponse {
     if let Some(enabled) = body.enabled {
         let mut config = state.dashboard_config.write();
+        // Mutual exclusion with Ghost Mode (this is the toggle the dashboard
+        // Capabilities page drives). A Ghost Mode node builds near-empty blocks
+        // and forfeits all transaction-fee income, so it must not also accept
+        // public miners. Refuse to enable Public Mining while Ghost Mode is
+        // active; disabling it is always allowed. Reject without mutating state.
+        if enabled && config.ghost_mode {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Ghost Mode is active. Disable it before enabling Public Mining."
+                })),
+            )
+                .into_response();
+        }
         config.public_mining = enabled;
     }
     api_mining_status_handler(State(state))
