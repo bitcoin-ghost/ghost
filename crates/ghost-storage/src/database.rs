@@ -199,6 +199,142 @@ struct DatabaseInner {
     encryption_key: RwLock<Option<[u8; 32]>>,
 }
 
+/// Tables a valid Ghost pool-database backup MUST contain. Used by
+/// [`Database::verify_backup_file`] to reject a file that opens as SQLite but
+/// isn't actually a Ghost pool database.
+pub const REQUIRED_BACKUP_TABLES: &[&str] = &["miners", "shares", "rounds"];
+
+/// Outcome of [`Database::verify_backup_file`]. Purely informational — reading
+/// it never touches the live database or the artifact.
+#[derive(Debug, Clone)]
+pub struct BackupVerification {
+    /// Overall verdict: integrity check passed AND all required tables present.
+    pub valid: bool,
+    /// `PRAGMA integrity_check` returned `ok`.
+    pub integrity_ok: bool,
+    /// The artifact was opened as a SQLCipher-encrypted file (`true`) using the
+    /// node key, or as plain SQLite (`false`).
+    pub encrypted: bool,
+    /// `PRAGMA user_version` (schema version) read from the artifact.
+    pub schema_version: u32,
+    /// Required Ghost tables that were found.
+    pub tables_present: Vec<String>,
+    /// Required Ghost tables that were missing (empty when `valid`).
+    pub missing_tables: Vec<String>,
+    /// Total number of tables in the artifact.
+    pub table_count: u64,
+    /// Row count of the `miners` table (0 when absent).
+    pub miner_count: u64,
+    /// Size of the artifact on disk, in bytes.
+    pub size_bytes: u64,
+    /// Human-readable reason when not `valid`.
+    pub detail: Option<String>,
+}
+
+impl BackupVerification {
+    /// Construct a failed verification that never opened as a database.
+    fn failed(size_bytes: u64, detail: &str) -> Self {
+        Self {
+            valid: false,
+            integrity_ok: false,
+            encrypted: false,
+            schema_version: 0,
+            tables_present: Vec::new(),
+            missing_tables: REQUIRED_BACKUP_TABLES.iter().map(|t| t.to_string()).collect(),
+            table_count: 0,
+            miner_count: 0,
+            size_bytes,
+            detail: Some(detail.to_string()),
+        }
+    }
+}
+
+/// Path where a validated restore artifact is staged, adjacent to the live DB.
+/// The suffix is appended (not an extension replacement) so the file sits next
+/// to `ghost.db` as `ghost.db.restore-pending` on the same filesystem, making
+/// the final swap in [`apply_pending_restore`] an atomic rename.
+pub fn pending_restore_path(db_path: &Path) -> std::path::PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(".restore-pending");
+    std::path::PathBuf::from(os)
+}
+
+/// Apply a pending database restore, if one is staged next to `db_path`.
+///
+/// MUST be called at startup, BEFORE the database is opened, so the swap happens
+/// while the DB file is closed (never corrupting a running database). When a
+/// staged artifact exists it:
+///   1. confirms the staged file at least opens (defence-in-depth; the API
+///      fully verified it before staging),
+///   2. copies the CURRENT live DB (if any) to a timestamped
+///      `<db>.pre-restore-<unix>.db` safety backup,
+///   3. removes the live DB's stale `-wal`/`-shm` sidecars,
+///   4. atomically renames the staged file into `db_path`.
+///
+/// Returns `Ok(true)` when a restore was applied, `Ok(false)` when nothing was
+/// staged. The only destructive step (the final rename) is atomic, so a failure
+/// leaves the existing live DB intact.
+pub fn apply_pending_restore(db_path: &Path) -> GhostResult<bool> {
+    let staged = pending_restore_path(db_path);
+    if !staged.exists() {
+        return Ok(false);
+    }
+    info!(staged = %staged.display(), "Pending database restore detected; applying before open");
+
+    // Defence in depth: the staged file must at least open. A SQLCipher artifact
+    // won't read sqlite_master without a key, so only hard-fail on an OPEN error
+    // (accepts both plain and encrypted staged files — the API already verified
+    // the contents against the node key before staging).
+    {
+        Connection::open_with_flags(
+            &staged,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+        .map_err(|e| GhostError::Database(format!("staged restore not openable: {}", e)))?;
+    }
+
+    // Safety-copy the current live DB. ghost-pool checkpoints the WAL on shutdown
+    // before exiting for a restart, so a plain file copy here is consistent.
+    if db_path.exists() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut os = db_path.as_os_str().to_os_string();
+        os.push(format!(".pre-restore-{}.db", ts));
+        let safety = std::path::PathBuf::from(os);
+        std::fs::copy(db_path, &safety)
+            .map_err(|e| GhostError::Database(format!("safety backup of live DB failed: {}", e)))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&safety, std::fs::Permissions::from_mode(0o600));
+        }
+        info!(backup = %safety.display(), "Live database copied to safety backup before restore");
+    }
+
+    // Drop stale WAL/SHM sidecars so the restored DB isn't reconciled against the
+    // previous database's journal. For `ghost.db` these are `ghost.db-wal` /
+    // `ghost.db-shm`, which `with_extension` produces exactly.
+    for ext in ["db-wal", "db-shm"] {
+        let side = db_path.with_extension(ext);
+        if side.exists() {
+            let _ = std::fs::remove_file(&side);
+        }
+    }
+
+    // Atomic swap (staged is adjacent to db_path → same filesystem).
+    std::fs::rename(&staged, db_path)
+        .map_err(|e| GhostError::Database(format!("failed to move staged restore into place: {}", e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600));
+    }
+    info!(db = %db_path.display(), "Pending database restore applied");
+    Ok(true)
+}
+
 impl Database {
     /// Open a database at the given path
     ///
@@ -842,6 +978,145 @@ impl Database {
         info!(path = %path_str, size_mb = size / (1024 * 1024), "Database backup complete");
 
         Ok(())
+    }
+
+    /// Verify a backup artifact produced by [`Database::backup`] WITHOUT mutating
+    /// it or the live database.
+    ///
+    /// Opens the file read-only and, in order:
+    ///   1. Confirms it is a readable SQLite database. If a plain open cannot
+    ///      read `sqlite_master` and this database has an encryption key
+    ///      configured, it retries once with the same SQLCipher key so an
+    ///      encrypted artifact verifies with the node's own key.
+    ///   2. Runs `PRAGMA integrity_check`.
+    ///   3. Confirms every table in [`REQUIRED_BACKUP_TABLES`] is present, so a
+    ///      random SQLite file that isn't a Ghost pool database is rejected.
+    ///   4. Reads `PRAGMA user_version` and a `miners` row count for reporting.
+    ///
+    /// A file that opens but fails the checks yields `Ok(v)` with `v.valid ==
+    /// false` (with `detail` explaining why); only an I/O-level failure to open
+    /// the path at all is an `Err`. Never logs key material.
+    pub fn verify_backup_file(&self, path: &Path) -> GhostResult<BackupVerification> {
+        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+        let open_ro = || {
+            Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+            )
+        };
+
+        // First attempt: plain (unencrypted) SQLite.
+        let conn = open_ro()
+            .map_err(|e| GhostError::Database(format!("cannot open backup file: {}", e)))?;
+        let (conn, encrypted) = if conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .is_ok()
+        {
+            (conn, false)
+        } else {
+            drop(conn);
+            // Not readable as plain SQLite. If we hold an encryption key, the
+            // artifact may be SQLCipher-encrypted under it — retry once.
+            let key = *self.inner.encryption_key.read();
+            match key {
+                Some(k) => {
+                    let conn = open_ro().map_err(|e| {
+                        GhostError::Database(format!("cannot open backup file: {}", e))
+                    })?;
+                    conn.pragma_update(None, "key", format!("x'{}'", hex::encode(k)))
+                        .map_err(|e| {
+                            GhostError::Database(format!("SQLCipher PRAGMA key: {}", e))
+                        })?;
+                    if conn
+                        .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                        .is_ok()
+                    {
+                        (conn, true)
+                    } else {
+                        return Ok(BackupVerification::failed(
+                            size_bytes,
+                            "file is not a readable SQLite/SQLCipher database (wrong key or corrupt)",
+                        ));
+                    }
+                }
+                None => {
+                    return Ok(BackupVerification::failed(
+                        size_bytes,
+                        "file is not a readable SQLite database (corrupt or encrypted)",
+                    ));
+                }
+            }
+        };
+
+        // Structural integrity.
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap_or_else(|e| format!("integrity_check error: {}", e));
+        let integrity_ok = integrity == "ok";
+
+        // Required Ghost tables.
+        let mut tables_present = Vec::new();
+        let mut missing_tables = Vec::new();
+        for t in REQUIRED_BACKUP_TABLES {
+            let exists = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if exists {
+                tables_present.push((*t).to_string());
+            } else {
+                missing_tables.push((*t).to_string());
+            }
+        }
+
+        let table_count = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
+
+        let miner_count = if tables_present.iter().any(|t| t == "miners") {
+            conn.query_row("SELECT count(*) FROM miners", [], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        let schema_version: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        let valid = integrity_ok && missing_tables.is_empty();
+        let detail = if valid {
+            None
+        } else if !integrity_ok {
+            Some(format!("integrity check failed: {}", integrity))
+        } else {
+            Some(format!(
+                "missing required Ghost tables: {}",
+                missing_tables.join(", ")
+            ))
+        };
+
+        Ok(BackupVerification {
+            valid,
+            integrity_ok,
+            encrypted,
+            schema_version,
+            tables_present,
+            missing_tables,
+            table_count,
+            miner_count,
+            size_bytes,
+            detail,
+        })
     }
 
     /// Prune old, fully-settled rounds from the database.
@@ -1578,5 +1853,91 @@ mod tests {
             .get_node_payout_address(node_id)
             .expect("Failed to get node address");
         assert_eq!(retrieved, Some(address.to_string()));
+    }
+
+    /// Unique scratch path under the system temp dir for a file-based test DB.
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "ghost-verify-test-{}-{}-{}.db",
+            std::process::id(),
+            tag,
+            nanos
+        ))
+    }
+
+    #[test]
+    fn test_backup_and_verify_roundtrip() {
+        let src = temp_db_path("src");
+        let backup = temp_db_path("backup");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&backup);
+
+        let db = Database::open(&src).expect("open source db");
+        // Produce a real backup with VACUUM INTO (same path the API uses).
+        db.backup(&backup).expect("backup");
+
+        // A readable, encrypted-key-free copy that verifies as a Ghost DB.
+        let v = db.verify_backup_file(&backup).expect("verify");
+        assert!(v.valid, "expected valid backup, detail={:?}", v.detail);
+        assert!(v.integrity_ok);
+        assert!(!v.encrypted);
+        assert!(v.missing_tables.is_empty());
+        for required in REQUIRED_BACKUP_TABLES {
+            assert!(
+                v.tables_present.iter().any(|t| t == required),
+                "missing required table {required}"
+            );
+        }
+        assert!(v.size_bytes > 0);
+        assert!(v.table_count >= REQUIRED_BACKUP_TABLES.len() as u64);
+
+        let _ = db.shutdown();
+        drop(db);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&backup);
+        for ext in ["db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(src.with_extension(ext));
+        }
+    }
+
+    #[test]
+    fn test_verify_rejects_corrupt_artifact() {
+        let corrupt = temp_db_path("corrupt");
+        std::fs::write(&corrupt, b"this is definitely not a sqlite database\x00\x01\x02")
+            .expect("write corrupt file");
+
+        // A key-less handle (in-memory) cannot open garbage as SQLite.
+        let db = Database::in_memory().expect("in-memory db");
+        let v = db.verify_backup_file(&corrupt).expect("verify runs");
+        assert!(!v.valid);
+        assert!(!v.integrity_ok);
+        assert!(v.detail.is_some());
+
+        let _ = std::fs::remove_file(&corrupt);
+    }
+
+    #[test]
+    fn test_verify_rejects_non_ghost_sqlite() {
+        let other = temp_db_path("other");
+        let _ = std::fs::remove_file(&other);
+        {
+            // A valid SQLite DB, but NOT a Ghost pool database.
+            let conn = Connection::open(&other).expect("open plain sqlite");
+            conn.execute("CREATE TABLE unrelated (id INTEGER)", [])
+                .expect("create table");
+        }
+
+        let db = Database::in_memory().expect("in-memory db");
+        let v = db.verify_backup_file(&other).expect("verify runs");
+        assert!(!v.valid, "a non-Ghost sqlite file must not verify");
+        // It IS structurally sound — it just lacks the Ghost schema.
+        assert!(v.integrity_ok);
+        assert!(!v.missing_tables.is_empty());
+
+        let _ = std::fs::remove_file(&other);
     }
 }
