@@ -38,14 +38,17 @@ const ACCENT_RGB = '247, 147, 26';
 // A cool tint blended into one nebula wash so the depth field isn't monochrome.
 const COOL = { r: 70, g: 110, b: 190 };
 
-// The 5-4-3-2-1 capability ring, first arc (Archive, +5) to last (Elder, +1).
+// The 1-2-3-4-5 capability ring. Array order is the on-ring order: starting at
+// the top (12 o'clock) and going CLOCKWISE the bonus ASCENDS — Elder (+1) first,
+// then Reaper (+2), Mining (+3), GhostPay (+4), Archive (+5). Both the arcs and
+// the outer labels iterate this array by index, so this order drives both.
 // `key` indexes SharesInfo's boolean capability flags.
 const CAPS: { key: keyof SharesInfo; label: string; bonus: number }[] = [
-  { key: 'archive_mode', label: 'ARCHIVE', bonus: 5 },
-  { key: 'ghost_pay', label: 'GHOSTPAY', bonus: 4 },
-  { key: 'public_mining', label: 'MINING', bonus: 3 },
-  { key: 'reaper', label: 'REAPER', bonus: 2 },
   { key: 'elder', label: 'ELDER', bonus: 1 },
+  { key: 'reaper', label: 'REAPER', bonus: 2 },
+  { key: 'public_mining', label: 'MINING', bonus: 3 },
+  { key: 'ghost_pay', label: 'GHOSTPAY', bonus: 4 },
+  { key: 'archive_mode', label: 'ARCHIVE', bonus: 5 },
 ];
 
 // Ring geometry (SVG userspace units; viewBox is 0 0 400 400).
@@ -423,7 +426,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
     <div
       ref={rootRef}
       className="relative flex h-full w-full flex-col items-center justify-center select-none overflow-hidden"
-      style={{ background: 'var(--bg)', color: 'var(--fg)', gap: 'clamp(20px, 4vh, 56px)' }}
+      style={{ background: 'var(--bg)', color: 'var(--fg)', gap: 'clamp(10px, 2.2vh, 30px)' }}
     >
       <style>{keyframes}</style>
 
@@ -467,7 +470,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
       <div
         ref={wrapRef}
         className="relative flex items-center justify-center"
-        style={{ width: 'min(74vh, 92vw, 620px)', aspectRatio: '1 / 1' }}
+        style={{ width: 'min(52vh, 80vw, 440px)', aspectRatio: '1 / 1' }}
       >
         {/* Canvas heartbeat layer (behind the SVG ring). */}
         <canvas
@@ -618,7 +621,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
           <div
             style={{
               fontFamily: 'var(--font-mono)',
-              fontSize: 'clamp(40px, 9vh, 108px)',
+              fontSize: 'clamp(30px, 6.2vh, 74px)',
               fontWeight: 300,
               lineHeight: 1,
               letterSpacing: '-0.01em',
@@ -646,7 +649,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
               fontSize: 'clamp(11px, 1.6vh, 14px)',
               letterSpacing: '0.1em',
               color: uptimeQualified ? 'var(--dim)' : 'var(--red)',
-              marginTop: 14,
+              marginTop: 10,
             }}
           >
             {shares ? (
@@ -680,7 +683,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
       {/* Vital stat tiles. */}
       <div
         className="relative flex flex-wrap items-stretch justify-center"
-        style={{ gap: 'clamp(10px, 2vw, 28px)', maxWidth: '92vw' }}
+        style={{ gap: 'clamp(8px, 1.5vw, 20px)', maxWidth: '92vw' }}
       >
         <Stat
           label="Pool Hashrate"
@@ -775,9 +778,9 @@ function Stat({
     <div
       className="relative flex flex-col items-center overflow-hidden"
       style={{
-        minWidth: 'clamp(88px, 15vw, 150px)',
-        padding: 'clamp(10px, 1.5vh, 18px) clamp(12px, 1.7vw, 24px)',
-        borderRadius: 14,
+        minWidth: 'clamp(72px, 12vw, 118px)',
+        padding: 'clamp(8px, 1.1vh, 13px) clamp(10px, 1.4vw, 18px)',
+        borderRadius: 12,
         border: '1px solid var(--rule)',
         background: 'linear-gradient(180deg, var(--surface) 0%, var(--bg) 140%)',
         boxShadow: accent
@@ -798,7 +801,7 @@ function Stat({
       <div
         style={{
           fontFamily: 'var(--font-mono)',
-          fontSize: 'clamp(18px, 3vh, 30px)',
+          fontSize: 'clamp(15px, 2.3vh, 24px)',
           fontWeight: 300,
           lineHeight: 1.1,
           fontVariantNumeric: 'tabular-nums',
@@ -815,7 +818,7 @@ function Stat({
           textTransform: 'uppercase',
           letterSpacing: '0.18em',
           color: 'var(--dim)',
-          marginTop: 8,
+          marginTop: 6,
         }}
       >
         {label}
