@@ -67,7 +67,7 @@ interface Vitals {
   syncPct: number;
   peers: number;
   miners: number;
-  poolHashrateHs: number; // mesh/pool-wide hashrate, in H/s
+  nodeHashrateHs: number; // this node's hashrate (miners on this node), in H/s
   uptimeSecs: number;
   bestDifficulty: number;
 }
@@ -153,11 +153,10 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
     isSyncing,
     syncPct: isSyncing ? Math.min(100, (syncHeight / blockHeight) * 100) : status?.is_synced ? 100 : 0,
     peers: status?.peer_count ?? 0,
-    miners: mining?.connected_miners ?? mining?.local_connected_miners ?? 0,
-    // Mesh/pool-wide hashrate — this is a pool node with ~0 self-hashrate, so
-    // the local figure reads as dead. Show the whole pool's work instead (same
-    // source the Pool page labels "Ghost Pool Hashrate"). Never fabricated.
-    poolHashrateHs: (mining?.hashrate_th ?? mining?.total_hashrate ?? 0) * 1e12,
+    miners: mining?.local_connected_miners ?? mining?.connected_miners ?? 0,
+    // This node's own hashrate — the combined hashrate of miners connected to
+    // this node's stratum port (not the mesh-wide total). Never fabricated.
+    nodeHashrateHs: (mining?.local_hashrate_th ?? 0) * 1e12,
     uptimeSecs: status?.uptime_seconds ?? status?.uptime_secs ?? 0,
     bestDifficulty:
       bestHash?.all_time?.difficulty ??
@@ -686,11 +685,11 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
         style={{ gap: 'clamp(8px, 1.5vw, 20px)', maxWidth: '92vw' }}
       >
         <Stat
-          label="Pool Hashrate"
-          sub="all nodes"
+          label="Hashrate"
+          sub="this node"
           value={
-            v.poolHashrateHs > 0
-              ? formatHashrate(v.poolHashrateHs)
+            v.nodeHashrateHs > 0
+              ? formatHashrate(v.nodeHashrateHs)
               : hasStatus
                 ? '0 H/s'
                 : '—'
