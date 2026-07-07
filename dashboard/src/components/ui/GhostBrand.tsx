@@ -8,7 +8,7 @@ interface GhostBrandProps {
   size?: "sm" | "md";
   /** Override the wordmark text. Default "ghost node". */
   label?: string;
-  /** Where the brand links to. Default `/`. Pass `null` to render unlinked. */
+  /** Where the brand links to. Default `/home`. Pass `null` to render unlinked. */
   href?: string | null;
   className?: string;
 }
@@ -22,7 +22,7 @@ interface GhostBrandProps {
 export function GhostBrand({
   size = "md",
   label = "ghost node",
-  href = "/",
+  href = "/home",
   className = "",
 }: GhostBrandProps) {
   const iconSize = size === "sm" ? 20 : 22;
