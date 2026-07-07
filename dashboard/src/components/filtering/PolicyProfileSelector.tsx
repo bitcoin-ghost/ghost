@@ -18,7 +18,7 @@ export const POLICY_PRESETS: {
 }[] = [
   { value: "strict", label: "Strict", tiers: ["T0", "T1"], desc: "Payments, multisig & timelocks only (T0+T1). Drops all data — no OP_RETURN, inscriptions or runes." },
   { value: "permissive", label: "Standard", tiers: ["T0", "T1", "T2"], desc: "Adds small OP_RETURN / Lightning commitments (T0+T1+T2). Still drops inscriptions, runes & BRC-20 (T3)." },
-  { value: "full_open", label: "Everything", tiers: ["T0", "T1", "T2", "T3"], desc: "All valid transactions including inscriptions, runes & BRC-20 (T0–T3). Maximum fees, no tier filtering." },
+  { value: "full_open", label: "Open", tiers: ["T0", "T1", "T2", "T3"], desc: "All valid transactions including inscriptions, runes & BRC-20 (T0–T3). Maximum fees, no tier filtering." },
 ];
 
 // A tight row of four BUDS-class pills. Mined classes are filled with the

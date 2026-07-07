@@ -30,7 +30,7 @@ function modeLabel(profile?: string): string {
     case "permissive":
       return "Standard";
     case "full_open":
-      return "Everything";
+      return "Open";
     case "custom":
       return "Custom";
     default:
@@ -48,7 +48,7 @@ function modeSummary(
 ): { value: string; sublabel: string } {
   switch (profile) {
     case "full_open":
-      return { value: "Everything", sublabel: "Mining every kind of transaction" };
+      return { value: "Open", sublabel: "Mining every kind of transaction" };
     case "permissive":
       return { value: "Standard", sublabel: "Dropping heavy data (T3)" };
     case "bitcoin_pure":
@@ -130,7 +130,7 @@ export default function FilteringOverviewPage() {
   const dataPct = hasSample ? Math.round((dataCount / sampled) * 100) : null;
 
   // What THIS node would drop: the share of the current sample sitting in the
-  // tiers its policy drops. 0% on Everything mode — that's correct, not broken.
+  // tiers its policy drops. 0% on Open mode — that's correct, not broken.
   const droppedCount = dropped.reduce((s, t) => s + (byTier[t] ?? 0), 0);
   const pctFiltered = hasSample ? Math.round((droppedCount / sampled) * 100) : null;
   const droppedLabel = dropped.length ? dropped.join(" + ") : "none";
@@ -147,7 +147,7 @@ export default function FilteringOverviewPage() {
       <PageHeader
         eyebrow="filtering"
         title="Filtering."
-        subtitle="What your node lets in, and what it mines — at a glance. Set it up in Basic, fine-tune in Advanced."
+        subtitle="Your node filters in two independent layers: a tier policy (which transaction classes it will mine) and the Reaper (strips dead-code spam from what it relays and mines, regardless of class). Set the policy in Basic; fine-tune both in Advanced."
         subtitleFullWidth
       />
 
@@ -178,7 +178,7 @@ export default function FilteringOverviewPage() {
               ? `${droppedCount} of ${sampled} in ${droppedLabel}`
               : "You mine every tier"
           }
-          tooltip="Share of that same live sample sitting in the tiers your policy drops. 0% means your node currently mines everything in the mempool — that's expected on Everything mode, not a fault."
+          tooltip="Share of that same live sample sitting in the tiers your policy drops. 0% means your node currently mines everything in the mempool — that's expected on Open mode, not a fault. (This is tier policy only — the Reaper still strips dead-code spam on top of it.)"
         />
         <StatCard
           label="Kept out of your blocks"
@@ -230,10 +230,10 @@ export default function FilteringOverviewPage() {
                 !reaperOn
                   ? "Not removing dead-code transactions."
                   : !blockBuilt
-                    ? "Stripping dead-code junk — no block built yet this run."
+                    ? "Strips dead-code spam from your mempool relay and block templates — no block built yet this run."
                     : lastBlockReaped === 0
-                      ? "On. Nothing to strip from your last block."
-                      : `Stripped ${lastBlockReaped} junk tx (${bytes(lastBlockDeadBytes)}) from your last block.`
+                      ? "Strips dead-code spam from your mempool relay and blocks. Nothing matched in your last block."
+                      : `Strips dead-code spam from your mempool relay and blocks — removed ${lastBlockReaped} junk tx (${bytes(lastBlockDeadBytes)}) from your last block.`
               }
             />
             <StatusRow
@@ -251,7 +251,8 @@ export default function FilteringOverviewPage() {
                   ? `${droppedCount.toLocaleString()} of ${sampled.toLocaleString()} sampled mempool transactions sit in the tiers this node drops (${droppedLabel}).`
                   : `All ${sampled.toLocaleString()} sampled mempool transactions fall in tiers this node mines — nothing is dropped by tier policy.`}{" "}
                 A live single-node reading of your current mempool sample — not a standard-vs-reaper-vs-Knots comparison.
-                {reaperOn && " The reaper runs independently, stripping dead-code junk regardless of tier."}
+                {reaperOn &&
+                  " The Reaper is a separate layer on top: it targets specific dead-code/spam patterns (inscription envelopes, drop-stuffing, dust-flood, oversized OP_RETURN…) in both your mempool relay and blocks — so it only removes the handful of transactions that match those patterns, never whole classes. That's why a wide-open tier policy can still show a small reaped count."}
               </div>
             )}
           </div>

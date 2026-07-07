@@ -50,6 +50,9 @@ interface TimeSeriesChartProps {
   minPointWidth?: number;
   formatValue?: (v: number) => string;
   ariaLabel?: string;
+  /** Floor the Y domain at 0 for non-negative metrics (hashrate, counts) so a
+   *  flat-zero series reads 0…1 instead of −1…1. */
+  minZero?: boolean;
 }
 
 const AXIS_LEFT = 52;
@@ -69,6 +72,7 @@ export function TimeSeriesChart({
   minPointWidth = 8,
   formatValue = (v) => v.toFixed(2),
   ariaLabel,
+  minZero = false,
 }: TimeSeriesChartProps) {
   const { ref, width } = useElementWidth<HTMLDivElement>();
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -89,14 +93,22 @@ export function TimeSeriesChart({
       if (p.v < lo) lo = p.v;
       if (p.v > hi) hi = p.v;
     }
+    let mn: number;
+    let mx: number;
     if (lo === hi) {
       // Flat series: pad so the line sits mid-plot rather than on an edge.
       const pad = Math.abs(lo) > 0 ? Math.abs(lo) * 0.1 : 1;
-      return { min: lo - pad, max: hi + pad };
+      mn = lo - pad;
+      mx = hi + pad;
+    } else {
+      const pad = (hi - lo) * 0.08;
+      mn = lo - pad;
+      mx = hi + pad;
     }
-    const pad = (hi - lo) * 0.08;
-    return { min: lo - pad, max: hi + pad };
-  }, [data]);
+    // Non-negative metrics never show a negative axis.
+    if (minZero && mn < 0) mn = 0;
+    return { min: mn, max: mx };
+  }, [data, minZero]);
 
   const x = (i: number) =>
     AXIS_LEFT + (data.length <= 1 ? innerW / 2 : (i / (data.length - 1)) * innerW);

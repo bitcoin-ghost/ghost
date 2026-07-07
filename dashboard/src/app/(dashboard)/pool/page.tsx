@@ -370,6 +370,7 @@ export default function NodePoolPage() {
           >
             <TimeSeriesChart
               data={series.meshHashrate}
+              minZero
               ariaLabel="Pool hashrate over time"
               formatValue={(v) => formatHashrate(v, 1)}
             />
@@ -382,6 +383,7 @@ export default function NodePoolPage() {
             <TimeSeriesChart
               data={series.miners}
               color="var(--green)"
+              minZero
               ariaLabel="Pool connected miners over time"
               formatValue={(v) => Math.round(v).toString()}
             />
@@ -393,6 +395,7 @@ export default function NodePoolPage() {
           >
             <TimeSeriesChart
               data={series.nodeHashrate}
+              minZero
               ariaLabel="This node hashrate over time"
               formatValue={(v) => formatHashrate(v, 1)}
             />
@@ -401,6 +404,7 @@ export default function NodePoolPage() {
             <TimeSeriesChart
               data={series.nodeMiners}
               color="var(--green)"
+              minZero
               ariaLabel="This node connected miners over time"
               formatValue={(v) => Math.round(v).toString()}
             />

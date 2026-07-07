@@ -101,7 +101,6 @@ const GROUPS: NavGroup[] = [
     label: "ghost pay",
     items: [
       { href: "/ghost-pay", label: "Ghost Pay Network", icon: <Crown {...ICON} /> },
-      { href: "/connect", label: "Connect Wallet", icon: <Smartphone {...ICON} /> },
       { href: "/wraith", label: "Wraith", icon: <Shield {...ICON} /> },
     ],
   },
@@ -134,6 +133,7 @@ const GROUPS: NavGroup[] = [
       { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
       { href: "/capabilities", label: "Capabilities", icon: <ShieldCheck {...ICON} /> },
       { href: "/peers", label: "Peers", icon: <NetworkIcon {...ICON} /> },
+      { href: "/connect", label: "Connect Wallet", icon: <Smartphone {...ICON} /> },
       { href: "/watchdog", label: "Watchdog", icon: <HeartPulse {...ICON} /> },
       { href: "/logs", label: "Logs", icon: <ScrollText {...ICON} /> },
       { href: "/settings", label: "Settings", icon: <Settings {...ICON} /> },
