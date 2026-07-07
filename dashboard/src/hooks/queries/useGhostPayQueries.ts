@@ -3,7 +3,6 @@ import {
   getGhostPayStatus,
   getWraithSessions,
   getWraithStats,
-  getGhostLocks,
   getPayments,
   getSettlement,
   getSettlementStatus,
@@ -45,14 +44,6 @@ export function useWraithSessions(options?: { refetchInterval?: number }) {
     queryKey: ghostPayKeys.wraith(),
     queryFn: getWraithSessions,
     refetchInterval: options?.refetchInterval ?? 5_000,
-  });
-}
-
-export function useGhostLocks(options?: { refetchInterval?: number }) {
-  return useQuery({
-    queryKey: ghostPayKeys.locks(),
-    queryFn: getGhostLocks,
-    refetchInterval: options?.refetchInterval ?? 10_000,
   });
 }
 

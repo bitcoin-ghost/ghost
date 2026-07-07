@@ -1,33 +1,76 @@
 "use client";
 
-import { FlowDiagram } from "@/components/ui/FlowDiagram";
-import { Card, CardHeader } from "@/components/ui/Card";
+import { Card } from "@/components/ui/Card";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { StatCard } from "@/components/ui/StatCard";
 import { Badge } from "@/components/ui/Badge";
-import { StatusDot } from "@/components/ui/StatusDot";
+import { Toggle } from "@/components/ui/Toggle";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { Toggle } from "@/components/ui/Toggle";
+import { EmptyState } from "@/components/ui/EmptyState";
 import { useToast } from "@/components/ui/Toast";
 import { useGhostPayStatus, useWraithStats, useSetWraith } from "@/hooks/queries";
 
-const DENOMINATION_TIERS = [
-  { name: "Tiny", amount: "10,000 sats", btc: "0.0001 BTC", desc: "Micro-transactions, tipping" },
-  { name: "Small", amount: "100,000 sats", btc: "0.001 BTC", desc: "Everyday purchases" },
-  { name: "Medium", amount: "1,000,000 sats", btc: "0.01 BTC", desc: "Standard mixing" },
-  { name: "Large", amount: "10,000,000 sats", btc: "0.1 BTC", desc: "Significant transactions" },
-  { name: "Whale", amount: "100,000,000 sats", btc: "1.0 BTC", desc: "High-value mixing" },
-];
+/**
+ * Wraith — operator view of the CoinJoin mixing this node helps coordinate.
+ *
+ * Wraith is Ghost's CoinJoin mixing on the L2. Choosing amounts and mixing
+ * your own coins happens in the wallet; this page is purely the node
+ * operator's read on the mixing the node facilitates: is it enabled, is it
+ * hosting sessions right now, and how much mixing has it coordinated. Every
+ * value here is a live backend field — nothing is synthesised. Sections with
+ * genuinely empty data say so honestly rather than rendering a misleading zero.
+ */
+
+const labelStyle: React.CSSProperties = {
+  color: "var(--dim)",
+  fontSize: "13px",
+  fontFamily: "var(--font-mono)",
+  textTransform: "uppercase",
+  letterSpacing: "0.06em",
+};
+
+const valueStyle: React.CSSProperties = {
+  color: "var(--fg)",
+  fontSize: "14px",
+  fontFamily: "var(--font-mono)",
+};
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: "16px",
+        padding: "12px 0",
+        borderBottom: "1px solid var(--rule)",
+      }}
+    >
+      <span style={labelStyle}>{label}</span>
+      <span style={valueStyle}>{children}</span>
+    </div>
+  );
+}
+
+function SectionTitle({ title, subtitle, action }: { title: string; subtitle?: string; action?: React.ReactNode }) {
+  return (
+    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "16px", marginBottom: "16px" }}>
+      <div>
+        <h2 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500 }}>{title}</h2>
+        {subtitle && <p style={{ color: "var(--dim)", fontSize: "13px", marginTop: "4px", lineHeight: 1.5 }}>{subtitle}</p>}
+      </div>
+      {action}
+    </div>
+  );
+}
 
 export default function WraithPage() {
-  const { data: ghostPayStatus, isLoading: statusLoading } = useGhostPayStatus();
+  const { data: status, isLoading: statusLoading, error: statusError } = useGhostPayStatus();
   const { data: wraithStats, isLoading: wraithLoading } = useWraithStats();
   const setWraith = useSetWraith();
   const { success, error } = useToast();
-
-  const isLoading = statusLoading || wraithLoading;
-  const wraithEnabled = ghostPayStatus?.wraith_enabled ?? false;
 
   const handleWraithToggle = async (enabled: boolean) => {
     try {
@@ -38,262 +81,150 @@ export default function WraithPage() {
     }
   };
 
+  // Not reachable at all — ghost-pay service down / dashboard can't reach it.
+  if (!statusLoading && statusError) {
+    return (
+      <div className="space-y-6">
+        <PageHeader
+          eyebrow="wraith"
+          title="Your node's view of the mixing."
+          subtitle="Wraith is Ghost's CoinJoin mixing on the L2. Choosing amounts and mixing your own coins happens in the wallet — this is your node's view of the mixing it helps coordinate."
+        />
+        <Card>
+          <EmptyState
+            icon={
+              <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m6-2.457a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+              </svg>
+            }
+            title="Wraith status is not reachable"
+            description="The ghost-pay service on this node isn't responding, so mixing status is unavailable. Enable Ghost Pay in Settings, or check the ghost-pay daemon on port 8800."
+            action={
+              <a href="/settings" className="bare" style={{ color: "var(--accent)", fontSize: "14px" }}>
+                Go to Settings →
+              </a>
+            }
+          />
+        </Card>
+      </div>
+    );
+  }
+
+  const wraithEnabled = status?.wraith_enabled ?? false;
+  const hostsMixing = status?.ghostpay_hosts_mixing ?? false;
+
+  const activeSessions = wraithStats?.active_sessions ?? 0;
+  const totalSessions = wraithStats?.total_sessions ?? 0;
+  const sessionsCompleted = wraithStats?.sessions_completed ?? 0;
+  const sessionsExpired = wraithStats?.sessions_expired ?? 0;
+  const totalParticipants = wraithStats?.total_participants ?? 0;
+
+  const noActivity = totalSessions === 0 && activeSessions === 0 && sessionsCompleted === 0 && totalParticipants === 0;
+
   return (
     <div className="space-y-6">
-      {/* 1. PageHeader */}
+      {/* 1. Header + one-line explainer (replaces the old wallet-brochure cards). */}
       <PageHeader
         eyebrow="wraith"
-        title="Privacy mixing sessions."
-        subtitle="CoinJoin mixing for transaction privacy"
+        title="Your node's view of the mixing."
+        subtitle="Wraith is Ghost's CoinJoin mixing on the L2. Choosing amounts and mixing your own coins happens in the wallet — this is your node's view of the mixing it helps coordinate."
         actions={
-          ghostPayStatus ? (
-            <Badge variant={wraithEnabled ? "success" : "default"}>
-              {wraithEnabled ? "Enabled" : "Disabled"}
+          status ? (
+            <Badge variant={wraithEnabled ? (hostsMixing ? "success" : "warning") : "default"}>
+              {wraithEnabled ? (hostsMixing ? "Hosting mixing" : "Enabled · idle") : "Disabled"}
             </Badge>
           ) : undefined
         }
       />
 
-      {/* 2. StatCards row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard
-          label="Status"
-          value={wraithEnabled ? "Active" : "Inactive"}
-          loading={isLoading}
-        />
-        <StatCard
-          label="Active Sessions"
-          value={wraithStats?.active_sessions ?? 0}
-          loading={isLoading}
-        />
-        <StatCard
-          label="Completed"
-          value={wraithStats?.sessions_completed ?? 0}
-          loading={isLoading}
-        />
-        <StatCard
-          label="Participants"
-          value={wraithStats?.total_participants ?? 0}
-          loading={isLoading}
-        />
-      </div>
-
-      {/* 3. How It Works — collapsible, NOT wrapped in SectionErrorBoundary */}
-      <Card collapsible defaultCollapsed>
-        <CardHeader
-          title="How It Works"
-          subtitle="Two-phase CoinJoin mixing flow"
-        />
-        <div className="space-y-4">
-          <p className="text-gray-300 text-sm leading-relaxed">
-            Wraith is a two-phase CoinJoin mixing protocol that breaks the link between your UTXOs and
-            their history. A single UTXO is split into equal-denomination outputs, mixed with other
-            participants, and merged into a clean UTXO whose transaction history cannot be traced back
-            to its origin.
-          </p>
-          <FlowDiagram
-            accentColor="red"
-            steps={[
-              { label: "Your UTXO", sublabel: "1 input" },
-              { label: "Split (1 \u2192 10)", sublabel: "Phase 1", accent: true },
-              { label: "Mix Pool", sublabel: "Other participants", accent: true },
-              { label: "Merge (10 \u2192 1)", sublabel: "Phase 2", accent: true },
-              { label: "Clean UTXO", sublabel: "Unlinkable output" },
-            ]}
+      {/* 2. Status strip — is mixing enabled and busy on this node. */}
+      <SectionErrorBoundary section="Wraith status">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <StatCard
+            label="Wraith"
+            value={wraithEnabled ? "Enabled" : "Disabled"}
+            sublabel={wraithEnabled ? (hostsMixing ? "hosting mixing" : "idle") : undefined}
+            loading={statusLoading}
           />
-          <div className="p-3 bg-gray-800/50 rounded-lg border border-gray-700">
-            <p className="text-xs text-gray-400 leading-relaxed">
-              <span className="text-red-400 font-medium">Phase 1 (Split):</span> Your UTXO is split into 10 equal-denomination
-              outputs in a single transaction. Each output matches the selected denomination tier exactly.
-              <br className="my-1" />
-              <span className="text-red-400 font-medium">Phase 2 (Merge):</span> Your 10 outputs are combined with outputs from
-              other participants in a CoinJoin transaction. The merged output is a single clean UTXO with no traceable link to
-              the original input.
-            </p>
-          </div>
+          <StatCard
+            label="Active Sessions"
+            value={activeSessions}
+            sublabel="mixing now"
+            loading={statusLoading || wraithLoading}
+          />
+          <StatCard
+            label="Completed"
+            value={sessionsCompleted.toLocaleString()}
+            sublabel={`${totalSessions.toLocaleString()} total`}
+            loading={statusLoading || wraithLoading}
+          />
+          <StatCard
+            label="Participants Served"
+            value={totalParticipants.toLocaleString()}
+            loading={statusLoading || wraithLoading}
+          />
         </div>
-      </Card>
+      </SectionErrorBoundary>
 
-      {/* 4. Primary Content — Denomination table + Status card */}
-      <SectionErrorBoundary section="Denomination Tiers">
+      {/* 3. Mixing activity — the sessions this node has coordinated. */}
+      <SectionErrorBoundary section="Mixing activity">
         <Card>
-          <CardHeader
-            title="Denomination Tiers"
-            subtitle="Available mixing amounts — all participants in a session use the same denomination"
+          <SectionTitle
+            title="Mixing activity"
+            subtitle="CoinJoin sessions this node has helped coordinate. Participants register equal-denomination inputs; the node relays the round to completion."
+            action={
+              activeSessions > 0
+                ? <Badge variant="info">{activeSessions} active</Badge>
+                : <Badge variant="default">idle</Badge>
+            }
           />
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-gray-800">
-                  <th className="text-left py-2 px-3 text-gray-400 font-medium">Tier</th>
-                  <th className="text-right py-2 px-3 text-gray-400 font-medium">Amount</th>
-                  <th className="text-right py-2 px-3 text-gray-400 font-medium">BTC</th>
-                  <th className="text-left py-2 px-3 text-gray-400 font-medium">Use Case</th>
-                </tr>
-              </thead>
-              <tbody>
-                {DENOMINATION_TIERS.map((tier) => (
-                  <tr key={tier.name} className="border-b border-gray-800/50 last:border-b-0">
-                    <td className="py-2.5 px-3 text-gray-100 font-medium">{tier.name}</td>
-                    <td className="py-2.5 px-3 text-right font-mono text-red-400">{tier.amount}</td>
-                    <td className="py-2.5 px-3 text-right font-mono text-gray-400">{tier.btc}</td>
-                    <td className="py-2.5 px-3 text-gray-500">{tier.desc}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div>
+            <Field label="Active sessions">{activeSessions.toLocaleString()}</Field>
+            <Field label="Total sessions">{totalSessions.toLocaleString()}</Field>
+            <Field label="Completed">{sessionsCompleted.toLocaleString()}</Field>
+            <Field label="Expired">{sessionsExpired.toLocaleString()}</Field>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0" }}>
+              <span style={labelStyle}>Participants served</span>
+              <span style={valueStyle}>{totalParticipants.toLocaleString()}</span>
+            </div>
           </div>
+          {noActivity && (
+            <p style={{ color: "var(--fainter)", fontSize: "13px", marginTop: "4px", lineHeight: 1.5 }}>
+              {wraithEnabled
+                ? "No mixing sessions yet. Sessions appear here once wallet participants begin mixing through this node."
+                : "Wraith mixing is disabled on this node, so it is not coordinating any sessions. Enable it below to participate."}
+            </p>
+          )}
         </Card>
       </SectionErrorBoundary>
 
-      <SectionErrorBoundary section="Wraith Status">
-        {isLoading ? <SkeletonCard /> : (
-          <Card>
-            <CardHeader
-              title="Status"
-              action={
-                <StatusDot
-                  status={wraithEnabled ? "online" : "offline"}
-                  label={wraithEnabled ? "Wraith Active" : "Wraith Inactive"}
-                  pulse={wraithEnabled}
-                />
-              }
-            />
-            <div className="space-y-3">
-              <div className="flex justify-between items-start py-2 border-b border-gray-800 gap-4">
+      {/* 4. Config — Wraith on/off. */}
+      <SectionErrorBoundary section="Configuration">
+        <Card>
+          <SectionTitle title="Configuration" subtitle="Whether this node participates in Wraith CoinJoin mixing for L2 wallet users." />
+          {statusLoading ? (
+            <SkeletonCard />
+          ) : (
+            <div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0", borderBottom: "1px solid var(--rule)" }}>
                 <div>
-                  <span className="text-gray-400">Wraith Enabled</span>
-                  <p className="text-xs text-gray-500 mt-0.5 max-w-md">
-                    Mixing lets any L2 participant initiate a CoinJoin session through this node. Off means this
-                    node won&apos;t participate. A ghost-pool restart applies the change.
-                  </p>
+                  <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500 }}>Wraith mixing</div>
+                  <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px", maxWidth: "36rem" }}>
+                    When enabled, any L2 participant can initiate a CoinJoin session through this node. Off means the node won&apos;t coordinate mixing. A ghost-pool restart applies the change.
+                  </div>
                 </div>
                 <Toggle
+                  label="Wraith mixing"
                   enabled={wraithEnabled}
-                  onChange={handleWraithToggle}
-                  label="Toggle Wraith mixing"
                   disabled={setWraith.isPending}
+                  onChange={handleWraithToggle}
                 />
               </div>
-              <div className="flex justify-between items-center py-2 border-b border-gray-800">
-                <span className="text-gray-400">Active Sessions</span>
-                <span className="font-mono text-gray-100">{wraithStats?.active_sessions ?? 0}</span>
-              </div>
-              <div className="flex justify-between items-center py-2 border-b border-gray-800">
-                <span className="text-gray-400">Total Sessions Hosted</span>
-                <span className="font-mono text-gray-100">{wraithStats?.total_sessions?.toLocaleString() ?? 0}</span>
-              </div>
-              <div className="flex justify-between items-center py-2 border-b border-gray-800">
-                <span className="text-gray-400">Sessions Completed</span>
-                <span className="font-mono text-gray-100">{wraithStats?.sessions_completed?.toLocaleString() ?? 0}</span>
-              </div>
-              <div className="flex justify-between items-center py-2">
-                <span className="text-gray-400">Total Participants Served</span>
-                <span className="font-mono text-gray-100">{wraithStats?.total_participants?.toLocaleString() ?? 0}</span>
-              </div>
+              <Field label="Currently hosting">{hostsMixing ? "yes" : "no"}</Field>
             </div>
-          </Card>
-        )}
+          )}
+        </Card>
       </SectionErrorBoundary>
-
-      {/* 5. Technical Details — collapsible, NOT wrapped in SectionErrorBoundary */}
-      <Card collapsible defaultCollapsed>
-        <CardHeader
-          title="Privacy Properties"
-          subtitle="What Wraith does and does not protect against"
-        />
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {/* Protects Against */}
-          <div className="p-4 bg-red-900/10 rounded-lg border border-red-600/30">
-            <h4 className="text-sm font-medium text-red-400 mb-3 flex items-center gap-2">
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-              </svg>
-              Protects Against
-            </h4>
-            <ul className="space-y-3">
-              <li className="flex items-start gap-2">
-                <span className="text-green-400 mt-0.5 flex-shrink-0">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                  </svg>
-                </span>
-                <div>
-                  <span className="text-gray-200 text-sm font-medium">Chain Analysis</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
-                    Equal-denomination outputs in CoinJoin transactions break the deterministic links that chain analysis relies on.
-                  </p>
-                </div>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-green-400 mt-0.5 flex-shrink-0">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                  </svg>
-                </span>
-                <div>
-                  <span className="text-gray-200 text-sm font-medium">UTXO Linking</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
-                    After mixing, your clean UTXO cannot be linked back to the original input through on-chain analysis.
-                  </p>
-                </div>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-green-400 mt-0.5 flex-shrink-0">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                  </svg>
-                </span>
-                <div>
-                  <span className="text-gray-200 text-sm font-medium">Amount Correlation</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
-                    Fixed denomination tiers prevent amount-based correlation between inputs and outputs.
-                  </p>
-                </div>
-              </li>
-            </ul>
-          </div>
-
-          {/* Does Not Protect Against */}
-          <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
-            <h4 className="text-sm font-medium text-gray-400 mb-3 flex items-center gap-2">
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              Does Not Protect Against
-            </h4>
-            <ul className="space-y-3">
-              <li className="flex items-start gap-2">
-                <span className="text-gray-500 mt-0.5 flex-shrink-0">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </span>
-                <div>
-                  <span className="text-gray-300 text-sm font-medium">Timing Correlation</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
-                    If not using Ghost Shroud, an adversary may correlate your mixing activity with relay timing.
-                    Enable Shroud for full privacy.
-                  </p>
-                </div>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-gray-500 mt-0.5 flex-shrink-0">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </span>
-                <div>
-                  <span className="text-gray-300 text-sm font-medium">Endpoint Surveillance</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
-                    If an adversary controls both the sender and receiver endpoints, mixing cannot prevent correlation.
-                  </p>
-                </div>
-              </li>
-            </ul>
-          </div>
-        </div>
-      </Card>
     </div>
   );
 }
