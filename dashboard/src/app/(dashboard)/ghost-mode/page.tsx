@@ -64,6 +64,14 @@ export default function GhostModePage() {
 
   const ghostMode = !!status?.ghost_mode;
   const localEgress = !!status?.ghost_mode_local_egress;
+  const publicMining = !!status?.public_mining;
+  // Ghost Mode and Public Mining are mutually exclusive: a Ghost Mode node
+  // builds near-empty blocks and forfeits all transaction-fee income, so it
+  // must not also run as a public miner. Block the enable path while Public
+  // Mining is active (turning Ghost Mode OFF stays allowed). The backend
+  // enforces the same rule and answers a conflicting enable with a 409.
+  const ghostModeBlocked = publicMining && !ghostMode;
+  const ghostModeToggleDisabled = setGhostMode.isPending || ghostModeBlocked;
   // The sub-toggle only has any effect while Ghost Mode is on; grey it out
   // otherwise so operators can't arm a setting that does nothing.
   const localEgressDisabled = !ghostMode || setLocalEgress.isPending;
@@ -105,7 +113,7 @@ export default function GhostModePage() {
                   error("Failed to update Ghost Mode", e instanceof Error ? e.message : "Unknown error");
                 }
               }}
-              disabled={setGhostMode.isPending}
+              disabled={ghostModeToggleDisabled}
               className="flex-shrink-0"
               style={{
                 width: "44px",
@@ -113,12 +121,13 @@ export default function GhostModePage() {
                 borderRadius: "12px",
                 background: ghostMode ? "var(--accent)" : "var(--rule-strong)",
                 border: "none",
-                cursor: setGhostMode.isPending ? "not-allowed" : "pointer",
-                opacity: setGhostMode.isPending ? 0.6 : 1,
+                cursor: ghostModeToggleDisabled ? "not-allowed" : "pointer",
+                opacity: ghostModeToggleDisabled ? 0.6 : 1,
                 position: "relative",
                 transition: "background 120ms",
               }}
               aria-pressed={ghostMode}
+              aria-disabled={ghostModeToggleDisabled}
             >
               <span
                 style={{
@@ -134,6 +143,33 @@ export default function GhostModePage() {
               />
             </button>
           </div>
+
+          {/* Mutual-exclusion guard: Public Mining active blocks Ghost Mode */}
+          {ghostModeBlocked && (
+            <div
+              style={{
+                marginTop: "14px",
+                padding: "12px 14px",
+                background: "color-mix(in srgb, var(--yellow) 8%, transparent)",
+                border: "1px solid color-mix(in srgb, var(--yellow) 40%, transparent)",
+                borderRadius: "6px",
+              }}
+            >
+              <p style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
+                <span style={{ color: "var(--yellow)", fontWeight: 600 }}>Public Mining is active.</span>{" "}
+                Ghost Mode would make your node build empty blocks and forfeit all fee income, so the
+                two can&apos;t run together — disable Public Mining first on the{" "}
+                <a
+                  href="/settings/capabilities"
+                  className="bare"
+                  style={{ color: "var(--fg)", textDecoration: "underline", textDecorationColor: "var(--yellow)" }}
+                >
+                  Capabilities page
+                </a>
+                .
+              </p>
+            </div>
+          )}
 
           {/* Sub-toggle: local egress (own-tx broadcast) */}
           <div

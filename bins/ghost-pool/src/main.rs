@@ -8656,7 +8656,7 @@ fn reaper_config_from_settings(s: &ReaperSettings) -> ReaperConfig {
 
 /// Load configuration from file
 fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
-    let config = if path.exists() {
+    let mut config = if path.exists() {
         let content = std::fs::read_to_string(path)?;
 
         // One-shot deprecation check: the legacy `public_mining` bool was
@@ -8685,6 +8685,16 @@ fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
         info!("No config file found at {}, using defaults", path.display());
         NodeConfig::default()
     };
+
+    // Enforce the Ghost Mode / Public Mining mutual exclusion at load time. A
+    // Ghost Mode node builds near-empty blocks and forfeits all transaction-fee
+    // income, so it must never also run as a public miner. If a config file sets
+    // both, Ghost Mode is disabled (Public Mining, the income-earning
+    // capability, is left active) and the change is logged loudly rather than
+    // silently allowed.
+    if let Some(warning) = config.reconcile_ghost_mode_mining_exclusion() {
+        warn!("{}", warning);
+    }
 
     // Validate pool configuration
     if let Err(e) = config.pool.validate() {

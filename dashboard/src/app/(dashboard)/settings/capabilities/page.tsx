@@ -25,6 +25,24 @@ export default function CapabilitiesSettingsPage() {
 
   const { success, error } = useToast();
 
+  // Ghost Mode and Public Mining are mutually exclusive: a Ghost Mode node
+  // builds near-empty blocks and forfeits all transaction-fee income, so it
+  // must not also accept public miners. Block enabling Public Mining while
+  // Ghost Mode is active (disabling it stays allowed). The backend enforces the
+  // same rule and answers a conflicting enable with a 409, surfaced below.
+  const ghostModeActive = status?.ghost_mode ?? false;
+  const publicMiningActive = status?.public_mining ?? false;
+  const publicMiningBlocked = ghostModeActive && !publicMiningActive;
+
+  const handlePublicMiningToggle = async (enabled: boolean) => {
+    try {
+      await setPublicMining.mutateAsync(enabled);
+      success("Mode Changed", `Public Mining ${enabled ? "enabled" : "disabled"}`);
+    } catch (err) {
+      error("Failed", err instanceof Error ? err.message : "Unknown error");
+    }
+  };
+
   const handleArchiveModeToggle = async (enabled: boolean) => {
     try {
       await setArchiveMode.mutateAsync(enabled);
@@ -81,15 +99,31 @@ export default function CapabilitiesSettingsPage() {
       <ToggleRow
         label="Public Mining"
         description="Accept mining connections from public miners (+3 shares bonus)"
-        enabled={status?.public_mining ?? false}
-        onChange={(enabled) => setPublicMining.mutate(enabled)}
-        disabled={setPublicMining.isPending}
+        enabled={publicMiningActive}
+        onChange={handlePublicMiningToggle}
+        disabled={setPublicMining.isPending || publicMiningBlocked}
         badge={
-          status?.public_mining ? (
+          publicMiningActive ? (
             <Badge variant="success">+3 Shares</Badge>
           ) : null
         }
       />
+
+      {publicMiningBlocked && (
+        <div
+          className="p-3 rounded-lg"
+          style={{
+            background: "color-mix(in srgb, var(--yellow) 8%, transparent)",
+            border: "1px solid color-mix(in srgb, var(--yellow) 40%, transparent)",
+          }}
+        >
+          <p className="text-sm" style={{ color: "var(--fg)", lineHeight: "1.6" }}>
+            <span style={{ color: "var(--yellow)", fontWeight: 600 }}>Ghost Mode is active</span>{" "}
+            — disable it before enabling Public Mining. A Ghost Mode node builds empty blocks and
+            forfeits all transaction-fee income, so the two can&apos;t run together.
+          </p>
+        </div>
+      )}
 
       <ToggleRow
         label="Ghost Reaper"
