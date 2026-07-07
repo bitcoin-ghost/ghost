@@ -1461,6 +1461,8 @@ private:
     std::atomic<bool> fNetworkActive{true};
     /** Ghost mode: do not request, relay, or announce unconfirmed transactions */
     std::atomic<bool> m_ghost_mode{false};
+    /** Ghost mode local egress: still announce/serve our own (locally-submitted) txs while ghost mode suppresses the rest */
+    std::atomic<bool> m_ghost_mode_local_egress{false};
     /** Tor mode: all connections routed through Tor, suppress clearnet addresses */
     std::atomic<bool> m_tor_mode{false};
     bool fAddressesInitialized{false};
