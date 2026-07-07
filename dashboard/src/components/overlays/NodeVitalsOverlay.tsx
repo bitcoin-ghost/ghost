@@ -49,6 +49,9 @@ interface OverlayProps {
 // Bitcoin orange — identical in both themes (--accent), so the canvas can use
 // it directly without reading it back out of the DOM every frame.
 const ACCENT_RGB = '247, 147, 26';
+// The rotating highlight sweep is green so it stays distinct from the orange
+// capability arcs — obvious even now that the glow band is thin.
+const SWEEP_RGB = '92, 199, 126';
 // A cool tint blended into one nebula wash so the depth field isn't monochrome.
 const COOL = { r: 70, g: 110, b: 190 };
 
@@ -666,7 +669,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
           className="pointer-events-none absolute inset-0"
           style={{
             borderRadius: '9999px',
-            background: `conic-gradient(rgba(${ACCENT_RGB}, 0) 0deg, rgba(${ACCENT_RGB}, 0) 250deg, rgba(${ACCENT_RGB}, 0.45) 322deg, rgba(${ACCENT_RGB}, 0.85) 352deg, rgba(${ACCENT_RGB}, 0) 360deg)`,
+            background: `conic-gradient(rgba(${SWEEP_RGB}, 0) 0deg, rgba(${SWEEP_RGB}, 0) 250deg, rgba(${SWEEP_RGB}, 0.55) 322deg, rgba(${SWEEP_RGB}, 0.95) 352deg, rgba(${SWEEP_RGB}, 0) 360deg)`,
             WebkitMaskImage:
               'radial-gradient(circle closest-side, transparent 69%, #000 72%, #000 78%, transparent 81%)',
             maskImage:
