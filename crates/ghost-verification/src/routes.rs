@@ -481,6 +481,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_ghost_mode_post_handler),
         )
         .route(
+            "/api/v1/config/ghost_mode_local_egress",
+            post(api_config_ghost_mode_local_egress_post_handler),
+        )
+        .route(
             "/api/v1/config/public_mining",
             post(api_config_public_mining_post_handler),
         )
@@ -1479,6 +1483,7 @@ async fn api_node_status_handler(State(state): State<Arc<VerificationState>>) ->
         "private_mining": false,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
+        "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "tor_mode": config.tor_mode,
         "onion_address": config.onion_address
     }))
@@ -3444,6 +3449,7 @@ async fn api_config_handler(State(state): State<Arc<VerificationState>>) -> impl
         "public_mining": config.public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
+        "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "mempool_profile": config.mempool_profile,
         "template_profile": config.template_profile
     }))
@@ -5396,6 +5402,7 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
         "public_mining": config.public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
+        "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "mempool_profile": config.mempool_profile,
         "template_profile": config.template_profile,
         "prune_profile": config.prune_profile,
@@ -5442,6 +5449,13 @@ async fn api_config_ghost_mode_handler(
                         );
                         config.ghost_mode = response.ghost_mode;
                     }
+                    if config.ghost_mode_local_egress != response.ghost_mode_local_egress {
+                        debug!(
+                            "Syncing ghost mode local egress from RPC: {} -> {}",
+                            config.ghost_mode_local_egress, response.ghost_mode_local_egress
+                        );
+                        config.ghost_mode_local_egress = response.ghost_mode_local_egress;
+                    }
                 }
                 Some(response.ghost_mode)
             }
@@ -5462,6 +5476,7 @@ async fn api_config_ghost_mode_handler(
     Json(serde_json::json!({
         "enabled": config.ghost_mode,
         "ghost_mode": config.ghost_mode,
+        "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "rpc_synced": rpc_state.is_some(),
         "message": "Ghost mode configuration"
     }))
@@ -5674,6 +5689,74 @@ async fn api_config_ghost_mode_post_handler(
             "Ghost mode updated and synced with ghost-core"
         } else {
             "Ghost mode updated (RPC sync unavailable)"
+        }
+    }))
+}
+
+/// API v1 Config ghost_mode_local_egress POST handler
+///
+/// Toggles the ghost-mode local-egress sub-setting on the node:
+/// 1. Calls ghost-core RPC to set it (if RPC client available)
+/// 2. Updates the in-memory dashboard config
+/// 3. Persists the setting to disk (if config path available)
+///
+/// Only meaningful while ghost mode is enabled; the sub-setting is stored
+/// independently so it is remembered when ghost mode is toggled back on.
+async fn api_config_ghost_mode_local_egress_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<ToggleRequest>,
+) -> impl IntoResponse {
+    let enabled = payload.enabled;
+
+    // Try to call ghost-core RPC to set the local egress sub-setting
+    let rpc_result = if let Some(ref rpc) = state.rpc {
+        match rpc.set_ghost_mode_local_egress(enabled).await {
+            Ok(response) => {
+                debug!(
+                    "Ghost mode local egress RPC call successful: {:?}",
+                    response
+                );
+                Some(response.ghost_mode_local_egress)
+            }
+            Err(e) => {
+                warn!("Failed to set ghost mode local egress via RPC: {}", e);
+                None
+            }
+        }
+    } else {
+        debug!("No RPC client available, updating local state only");
+        None
+    };
+
+    // Use RPC response if available, otherwise use requested value
+    let actual_enabled = rpc_result.unwrap_or(enabled);
+
+    // Update dashboard config
+    {
+        let mut config = state.dashboard_config.write();
+        config.ghost_mode_local_egress = actual_enabled;
+    }
+
+    // Update and persist node config
+    {
+        let mut node_config = state.node_config.write();
+        node_config.ghost_mode_local_egress = actual_enabled;
+
+        if let Some(ref path) = state.node_config_path {
+            if let Err(e) = node_config.save(path) {
+                error!("Failed to persist node config: {}", e);
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "success": true,
+        "enabled": actual_enabled,
+        "rpc_synced": rpc_result.is_some(),
+        "message": if rpc_result.is_some() {
+            "Ghost mode local egress updated and synced with ghost-core"
+        } else {
+            "Ghost mode local egress updated (RPC sync unavailable)"
         }
     }))
 }
@@ -10714,6 +10797,7 @@ mod tests {
         let config_endpoints = [
             "/api/v1/config/archive_mode",
             "/api/v1/config/ghost_mode",
+            "/api/v1/config/ghost_mode_local_egress",
             "/api/v1/config/policy_profile",
             "/api/v1/config/policy_custom",
             "/api/v1/config/public_mining",

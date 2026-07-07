@@ -691,6 +691,15 @@ public:
         return m_unbroadcast_txids.count(txid) != 0;
     }
 
+    /** Thread-safe variant of IsUnbroadcastTx: takes cs internally. For callers
+     *  (e.g. ghost-mode local egress checks in net_processing) that do not hold
+     *  the mempool lock. */
+    bool IsUnbroadcastTxThreadSafe(const Txid& txid) const EXCLUSIVE_LOCKS_REQUIRED(!cs)
+    {
+        LOCK(cs);
+        return m_unbroadcast_txids.count(txid) != 0;
+    }
+
     /** Guards this internal counter for external reporting */
     uint64_t GetAndIncrementSequence() const EXCLUSIVE_LOCKS_REQUIRED(cs) {
         return m_sequence_number++;

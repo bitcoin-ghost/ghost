@@ -2214,8 +2214,12 @@ void PeerManagerImpl::RelayTransactionDirect(const Txid& txid, const Wtxid& wtxi
 
 void PeerManagerImpl::RelayTransaction(const Txid& txid, const Wtxid& wtxid)
 {
-    // Ghost mode: do not relay transactions to peers
-    if (m_connman.GetGhostMode()) return;
+    // Ghost mode: do not relay peer-received transactions. When local egress is
+    // enabled, still announce our OWN (locally-submitted, still-unbroadcast)
+    // transactions so a connected wallet can reach miners.
+    if (m_connman.GetGhostMode()) {
+        if (!m_connman.GetGhostModeLocalEgress() || !m_mempool.IsUnbroadcastTxThreadSafe(txid)) return;
+    }
 
     if (m_opts.shroud) {
         LOCK(m_shroud_mutex);
@@ -2558,17 +2562,27 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic
             continue;
         }
 
-        // Ghost mode: do not respond to transaction GETDATA requests
-        if (m_connman.GetGhostMode()) {
-            vNotFound.push_back(inv);
-            continue;
-        }
-
         if (auto tx{FindTxForGetData(*tx_relay, ToGenTxid(inv))}) {
+            // Ghost mode: only serve our OWN (locally-submitted, still
+            // unbroadcast) transactions, and only when local egress is enabled.
+            // Peer-received transactions are never served. The inv may be a
+            // MSG_TX (txid) or MSG_WTX (wtxid), so the unbroadcast-set lookup
+            // (keyed by txid) is done on the located tx's hash, not inv.hash.
+            if (m_connman.GetGhostMode() &&
+                (!m_connman.GetGhostModeLocalEgress() || !m_mempool.IsUnbroadcastTxThreadSafe(tx->GetHash()))) {
+                vNotFound.push_back(inv);
+                continue;
+            }
             // WTX and WITNESS_TX imply we serialize with witness
             const auto maybe_with_witness = (inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS);
             MakeAndPushMessage(pfrom, NetMsgType::TX, maybe_with_witness(*tx));
-            m_mempool.RemoveUnbroadcastTx(tx->GetHash());
+            // In ghost mode we keep our own tx in the unbroadcast set so we keep
+            // announcing and serving it to every peer until it confirms —
+            // removing it on the first GETDATA would cap egress at a single peer
+            // and the unbroadcast flag is precisely how we identify our own txs.
+            if (!m_connman.GetGhostMode()) {
+                m_mempool.RemoveUnbroadcastTx(tx->GetHash());
+            }
         } else {
             vNotFound.push_back(inv);
         }
@@ -6263,8 +6277,10 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             peer->m_blocks_for_inv_relay.clear();
         }
 
-        // Ghost mode: skip transaction inventory broadcast entirely
-        if (auto tx_relay = peer->GetTxRelay(); tx_relay != nullptr && !m_connman.GetGhostMode()) {
+        // Ghost mode: skip transaction inventory broadcast entirely. When local
+        // egress is enabled, run the broadcast so our OWN txs can be announced;
+        // the per-tx unbroadcast guards below ensure peer txs are never sent.
+        if (auto tx_relay = peer->GetTxRelay(); tx_relay != nullptr && (!m_connman.GetGhostMode() || m_connman.GetGhostModeLocalEgress())) {
                 LOCK(tx_relay->m_tx_inventory_mutex);
                 // Check whether periodic sends should happen
                 bool fSendTrickle = pto->HasPermission(NetPermissionFlags::NoBan);
@@ -6298,6 +6314,13 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                                              CInv{MSG_WTX, wtxid.ToUint256()} :
                                              CInv{MSG_TX, txid.ToUint256()};
                         tx_relay->m_tx_inventory_to_send.erase(wtxid);
+
+                        // Ghost mode (local egress): never leak our full mempool
+                        // in response to a BIP35 mempool request; only advertise
+                        // our own still-unbroadcast transactions.
+                        if (m_connman.GetGhostMode() && !m_mempool.IsUnbroadcastTxThreadSafe(txid)) {
+                            continue;
+                        }
 
                         // Don't send transactions that peers will not put into their mempool
                         if (txinfo.fee < filterrate.GetFee(txinfo.vsize)) {
@@ -6345,6 +6368,14 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                         // Not in the mempool anymore? don't bother sending it.
                         auto txinfo = m_mempool.info(wtxid);
                         if (!txinfo.tx) {
+                            continue;
+                        }
+                        // Ghost mode (local egress): only announce our own
+                        // still-unbroadcast transactions. Site-1 already gates
+                        // what is queued here in ghost mode; this defends against
+                        // stale peer-tx entries queued before ghost mode was
+                        // toggled on at runtime.
+                        if (m_connman.GetGhostMode() && !m_mempool.IsUnbroadcastTxThreadSafe(txinfo.tx->GetHash())) {
                             continue;
                         }
                         // `TxRelay::m_tx_inventory_known_filter` contains either txids or wtxids

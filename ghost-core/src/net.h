@@ -1143,6 +1143,12 @@ public:
     bool GetGhostMode() const { return m_ghost_mode.load(std::memory_order_relaxed); }
     void SetGhostMode(bool enable) { m_ghost_mode.store(enable, std::memory_order_relaxed); }
 
+    // Ghost mode local egress: when ghost mode is on, still announce and serve
+    // our OWN (locally-submitted) transactions so a connected wallet can reach
+    // miners. Peer-received transactions remain fully suppressed.
+    bool GetGhostModeLocalEgress() const { return m_ghost_mode_local_egress.load(std::memory_order_relaxed); }
+    void SetGhostModeLocalEgress(bool enable) { m_ghost_mode_local_egress.store(enable, std::memory_order_relaxed); }
+
     /** Tor mode: all connections through Tor, onion-only networking */
     bool GetTorMode() const { return m_tor_mode.load(std::memory_order_relaxed); }
     void SetTorMode(bool enable) { m_tor_mode.store(enable, std::memory_order_relaxed); }
@@ -1455,6 +1461,8 @@ private:
     std::atomic<bool> fNetworkActive{true};
     /** Ghost mode: do not request, relay, or announce unconfirmed transactions */
     std::atomic<bool> m_ghost_mode{false};
+    /** Ghost mode local egress: still announce/serve our own (locally-submitted) txs while ghost mode suppresses the rest */
+    std::atomic<bool> m_ghost_mode_local_egress{false};
     /** Tor mode: all connections routed through Tor, suppress clearnet addresses */
     std::atomic<bool> m_tor_mode{false};
     bool fAddressesInitialized{false};

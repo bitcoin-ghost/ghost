@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/Badge";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { useNodeStatus } from "@/hooks/queries/useNodeQueries";
-import { useSetGhostMode } from "@/hooks/queries/useConfigQueries";
+import { useSetGhostMode, useSetGhostModeLocalEgress } from "@/hooks/queries/useConfigQueries";
 import { useToast } from "@/components/ui/Toast";
 
 /**
@@ -46,6 +46,7 @@ function InfoRow({ threat, protection, strong }: { threat: string; protection: s
 export default function GhostModePage() {
   const { data: status, isLoading } = useNodeStatus();
   const setGhostMode = useSetGhostMode();
+  const setLocalEgress = useSetGhostModeLocalEgress();
   const { success, error } = useToast();
 
   if (isLoading) {
@@ -62,6 +63,10 @@ export default function GhostModePage() {
   }
 
   const ghostMode = !!status?.ghost_mode;
+  const localEgress = !!status?.ghost_mode_local_egress;
+  // The sub-toggle only has any effect while Ghost Mode is on; grey it out
+  // otherwise so operators can't arm a setting that does nothing.
+  const localEgressDisabled = !ghostMode || setLocalEgress.isPending;
 
   return (
     <div className="space-y-6">
@@ -129,6 +134,103 @@ export default function GhostModePage() {
               />
             </button>
           </div>
+
+          {/* Sub-toggle: local egress (own-tx broadcast) */}
+          <div
+            className="flex items-start justify-between gap-6"
+            style={{
+              marginTop: "16px",
+              paddingTop: "16px",
+              borderTop: "1px solid var(--rule)",
+              opacity: ghostMode ? 1 : 0.5,
+            }}
+          >
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="flex items-center gap-2 mb-1">
+                <span style={{ color: "var(--fg)", fontWeight: 500, fontSize: "15px" }}>
+                  Allow my own wallet broadcasts
+                </span>
+                {ghostMode && localEgress && <Badge variant="success">on</Badge>}
+              </div>
+              <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5", maxWidth: "60ch" }}>
+                Keep transactions your own node submits (via <code>sendrawtransaction</code> or a connected
+                wallet) flowing to peers so they can reach a miner, while transactions received from other
+                peers stay fully suppressed. Only your <em>own</em> still-unbroadcast transactions are
+                announced and served. {!ghostMode && "Enable Ghost Mode to use this."}
+              </p>
+            </div>
+            <button
+              onClick={async () => {
+                const next = !localEgress;
+                try {
+                  await setLocalEgress.mutateAsync(next);
+                  success(
+                    "Own-tx broadcast " + (next ? "enabled" : "disabled"),
+                    next
+                      ? "Your node will announce its own transactions to peers"
+                      : "Your node is silent about all transactions again"
+                  );
+                } catch (e) {
+                  error("Failed to update own-tx broadcast", e instanceof Error ? e.message : "Unknown error");
+                }
+              }}
+              disabled={localEgressDisabled}
+              className="flex-shrink-0"
+              style={{
+                width: "44px",
+                height: "24px",
+                borderRadius: "12px",
+                background: localEgress && ghostMode ? "var(--accent)" : "var(--rule-strong)",
+                border: "none",
+                cursor: localEgressDisabled ? "not-allowed" : "pointer",
+                opacity: setLocalEgress.isPending ? 0.6 : 1,
+                position: "relative",
+                transition: "background 120ms",
+              }}
+              aria-pressed={localEgress && ghostMode}
+              aria-disabled={localEgressDisabled}
+            >
+              <span
+                style={{
+                  position: "absolute",
+                  top: "3px",
+                  left: localEgress && ghostMode ? "23px" : "3px",
+                  width: "18px",
+                  height: "18px",
+                  borderRadius: "50%",
+                  background: "white",
+                  transition: "left 120ms",
+                }}
+              />
+            </button>
+          </div>
+
+          {/* Privacy caution: broadcasting reveals your txs to peers */}
+          {ghostMode && localEgress && (
+            <div
+              style={{
+                marginTop: "14px",
+                padding: "12px 14px",
+                background: "color-mix(in srgb, var(--yellow) 8%, transparent)",
+                border: "1px solid color-mix(in srgb, var(--yellow) 40%, transparent)",
+                borderRadius: "6px",
+              }}
+            >
+              <p style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
+                <span style={{ color: "var(--yellow)", fontWeight: 600 }}>Heads up:</span> broadcasting your
+                own transactions reveals them to the peers you announce to, which can tie a transaction to
+                your node&apos;s IP address. Enable{" "}
+                <a
+                  href="/network"
+                  className="bare"
+                  style={{ color: "var(--fg)", textDecoration: "underline", textDecorationColor: "var(--yellow)" }}
+                >
+                  Tor mode on the Network page
+                </a>{" "}
+                to keep your IP private while broadcasting.
+              </p>
+            </div>
+          )}
         </Card>
       </SectionErrorBoundary>
 
@@ -159,9 +261,11 @@ export default function GhostModePage() {
         >
           <p style={{ color: "var(--fainter)", fontSize: "13px", lineHeight: "1.6" }}>
             <span style={{ color: "var(--accent)", fontWeight: 500 }}>Trade-off:</span> Ghost Mode is a
-            suppression of the standard relay path, not a replacement transport. A wallet on a Ghost Mode
-            node must find another route to reach miners — an out-of-band relay over Tor, a separate
-            broadcasting node, or a paid broadcast service — otherwise its transactions never confirm.
+            suppression of the standard relay path, not a replacement transport. Without local egress, a
+            wallet on a Ghost Mode node must find another route to reach miners — an out-of-band relay over
+            Tor, a separate broadcasting node, or a paid broadcast service — otherwise its transactions
+            never confirm. Turn on <em>Allow my own wallet broadcasts</em> above to let the node relay its
+            own transactions while staying silent about everyone else&apos;s.
           </p>
         </div>
       </Card>

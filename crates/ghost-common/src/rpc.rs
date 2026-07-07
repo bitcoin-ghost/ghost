@@ -1224,6 +1224,24 @@ impl BitcoinRpc {
         self.call("getghostmode", vec![]).await
     }
 
+    /// Set ghost mode local egress on the node
+    ///
+    /// Only meaningful while ghost mode is enabled. When on, the node still
+    /// announces and serves its own (locally-submitted) transactions so a
+    /// connected wallet can reach miners; peer-received txs stay suppressed.
+    pub async fn set_ghost_mode_local_egress(
+        &self,
+        enable: bool,
+    ) -> GhostResult<GhostModeResponse> {
+        self.call("setghostmodelocalegress", vec![json!(enable)])
+            .await
+    }
+
+    /// Get current ghost mode local egress state
+    pub async fn get_ghost_mode_local_egress(&self) -> GhostResult<GhostModeResponse> {
+        self.call("getghostmodelocalegress", vec![]).await
+    }
+
     // ============================================================
     // Ghost-Core Specific RPC Methods
     // ============================================================
@@ -1826,6 +1844,10 @@ pub struct MempoolInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GhostModeResponse {
     pub ghost_mode: bool,
+    /// Whether local egress (own-tx broadcast) is enabled. Defaults to false so
+    /// responses from older ghost-core builds (which omit the field) still parse.
+    #[serde(default)]
+    pub ghost_mode_local_egress: bool,
 }
 
 // ============================================================

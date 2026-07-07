@@ -35,6 +35,12 @@ use ghost_common::error::{GhostError, GhostResult};
 pub struct NodeConfig {
     /// Ghost mode: do not relay/announce unconfirmed transactions
     pub ghost_mode: bool,
+    /// Ghost mode local egress: while ghost mode is on, still announce and serve
+    /// our OWN (locally-submitted) transactions so a connected wallet can reach
+    /// miners, while peer-received transactions stay fully suppressed. Only
+    /// meaningful alongside `ghost_mode`.
+    #[serde(default)]
+    pub ghost_mode_local_egress: bool,
     /// Shroud: enable random relay delay (0-5s) for transaction origin privacy.
     /// Requires ghost-core restart with -shroud=1 flag to take effect.
     #[serde(default)]
@@ -119,6 +125,7 @@ mod tests {
     fn test_default_config() {
         let config = NodeConfig::default();
         assert!(!config.ghost_mode);
+        assert!(!config.ghost_mode_local_egress);
     }
 
     #[test]
@@ -128,6 +135,7 @@ mod tests {
 
         let config = NodeConfig {
             ghost_mode: true,
+            ghost_mode_local_egress: true,
             shroud_enabled: false,
             nickname: Some("my-node".to_string()),
         };
@@ -135,6 +143,7 @@ mod tests {
 
         let loaded = NodeConfig::load(path).unwrap();
         assert!(loaded.ghost_mode);
+        assert!(loaded.ghost_mode_local_egress);
         assert!(!loaded.shroud_enabled);
         assert_eq!(loaded.nickname.as_deref(), Some("my-node"));
     }

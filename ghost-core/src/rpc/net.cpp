@@ -925,6 +925,7 @@ static RPCHelpMan setghostmode()
                 },
                 RPCResult{RPCResult::Type::OBJ, "", "", {
                     {RPCResult::Type::BOOL, "ghost_mode", "Current ghost mode state"},
+                    {RPCResult::Type::BOOL, "ghost_mode_local_egress", "Whether local egress (own-tx broadcast) is enabled"},
                 }},
                 RPCExamples{
                     HelpExampleCli("setghostmode", "true")
@@ -939,6 +940,7 @@ static RPCHelpMan setghostmode()
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("ghost_mode", connman.GetGhostMode());
+    result.pushKV("ghost_mode_local_egress", connman.GetGhostModeLocalEgress());
     return result;
 },
     };
@@ -953,6 +955,7 @@ static RPCHelpMan getghostmode()
                 {},
                 RPCResult{RPCResult::Type::OBJ, "", "", {
                     {RPCResult::Type::BOOL, "ghost_mode", "Current ghost mode state"},
+                    {RPCResult::Type::BOOL, "ghost_mode_local_egress", "Whether local egress (own-tx broadcast) is enabled"},
                 }},
                 RPCExamples{
                     HelpExampleCli("getghostmode", "")
@@ -965,6 +968,68 @@ static RPCHelpMan getghostmode()
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("ghost_mode", connman.GetGhostMode());
+    result.pushKV("ghost_mode_local_egress", connman.GetGhostModeLocalEgress());
+    return result;
+},
+    };
+}
+
+static RPCHelpMan setghostmodelocalegress()
+{
+    return RPCHelpMan{
+        "setghostmodelocalegress",
+        "Enable or disable ghost mode local egress.\n"
+        "Only meaningful while ghost mode is enabled. When on, the node still announces and\n"
+        "serves its OWN (locally-submitted) transactions so a connected wallet can reach miners,\n"
+        "while peer-received transactions remain fully suppressed.\n",
+                {
+                    {"enable", RPCArg::Type::BOOL, RPCArg::Optional::NO, "true to enable local egress, false to disable"},
+                },
+                RPCResult{RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::BOOL, "ghost_mode", "Current ghost mode state"},
+                    {RPCResult::Type::BOOL, "ghost_mode_local_egress", "Whether local egress (own-tx broadcast) is enabled"},
+                }},
+                RPCExamples{
+                    HelpExampleCli("setghostmodelocalegress", "true")
+                    + HelpExampleRpc("setghostmodelocalegress", "true")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    CConnman& connman = EnsureConnman(node);
+
+    connman.SetGhostModeLocalEgress(request.params[0].get_bool());
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("ghost_mode", connman.GetGhostMode());
+    result.pushKV("ghost_mode_local_egress", connman.GetGhostModeLocalEgress());
+    return result;
+},
+    };
+}
+
+static RPCHelpMan getghostmodelocalegress()
+{
+    return RPCHelpMan{
+        "getghostmodelocalegress",
+        "Returns whether ghost mode local egress (own-tx broadcast) is enabled.\n",
+                {},
+                RPCResult{RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::BOOL, "ghost_mode", "Current ghost mode state"},
+                    {RPCResult::Type::BOOL, "ghost_mode_local_egress", "Whether local egress (own-tx broadcast) is enabled"},
+                }},
+                RPCExamples{
+                    HelpExampleCli("getghostmodelocalegress", "")
+                    + HelpExampleRpc("getghostmodelocalegress", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    CConnman& connman = EnsureConnman(node);
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("ghost_mode", connman.GetGhostMode());
+    result.pushKV("ghost_mode_local_egress", connman.GetGhostModeLocalEgress());
     return result;
 },
     };
@@ -1427,6 +1492,8 @@ void RegisterNetRPCCommands(CRPCTable& t)
         {"network", &setnetworkactive},
         {"network", &setghostmode},
         {"network", &getghostmode},
+        {"network", &setghostmodelocalegress},
+        {"network", &getghostmodelocalegress},
         {"network", &gettormode},
         {"network", &getnodeaddresses},
         {"network", &getaddrmaninfo},

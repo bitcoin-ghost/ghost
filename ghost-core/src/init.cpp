@@ -527,6 +527,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blockreconstructionextratxn=<n>", strprintf("Extra transactions to keep in memory for compact block reconstructions (default: %u)", DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksonly", strprintf("Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transactions, unless the source peer has the 'forcerelay' permission. RPC transactions are not affected. (default: %u)", DEFAULT_BLOCKSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-ghostmode", "Operate in ghost mode: do not request, relay, or announce unconfirmed transactions. Similar to -blocksonly but can be toggled at runtime via RPC (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-ghostmodelocalegress", "In ghost mode, still announce and serve our OWN (locally-submitted) transactions so a connected wallet can reach miners, while peer-received transactions stay fully suppressed. Only meaningful alongside -ghostmode. Can be toggled at runtime via RPC (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-shroud", "Add random delay (0-5s) before relaying transactions to peers, "
         "preventing timing-based origin detection. Does not affect mining. "
         "(default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -1742,6 +1743,13 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (args.GetBoolArg("-ghostmode", false)) {
         node.connman->SetGhostMode(true);
         LogPrintf("Ghost mode enabled: no transaction relay/announce\n");
+    }
+
+    // Initialize ghost mode local egress from startup flag (only meaningful
+    // alongside -ghostmode: announce/serve our own locally-submitted txs).
+    if (args.GetBoolArg("-ghostmodelocalegress", false)) {
+        node.connman->SetGhostModeLocalEgress(true);
+        LogPrintf("Ghost mode local egress enabled: own transactions announced to peers\n");
     }
 
     // Initialize tor mode flag on connman

@@ -1302,6 +1302,12 @@ pub struct NetworkConfig {
     /// Ghost Mode: privacy-enhanced relay + stealth addressing
     #[serde(default)]
     pub ghost_mode: bool,
+    /// Ghost Mode local egress: while ghost mode is on, still announce and serve
+    /// our OWN (locally-submitted) transactions so a connected wallet can reach
+    /// miners, while peer-received transactions stay fully suppressed. Only
+    /// meaningful alongside `ghost_mode`.
+    #[serde(default)]
+    pub ghost_mode_local_egress: bool,
     /// Ghost Shroud: random relay delay (0-5s) to prevent origin analysis
     #[serde(default)]
     pub shroud_enabled: bool,
@@ -1361,6 +1367,7 @@ impl Default for NetworkConfig {
             noise_enabled: true,
             tls: TlsConfig::default(),
             ghost_mode: false,
+            ghost_mode_local_egress: false,
             shroud_enabled: false,
             sv2_authority_public_key: None,
             rate_limit_trusted_ips: Vec::new(),
