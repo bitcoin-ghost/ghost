@@ -6,7 +6,6 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { StatCard } from "@/components/ui/StatCard";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
-import { ProgressBar } from "@/components/ui/ProgressBar";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { DataTable, formatHashrate, formatDuration } from "@/components/ui/DataTable";
 import { TimeSeriesChart, ProportionBar } from "@/components/ui/MiniChart";
@@ -158,7 +157,6 @@ export default function NodePoolPage() {
   const roundElapsed = pool?.current_round_duration_secs ?? 0;
   const roundEta = pool?.estimated_time_to_block_secs ?? 0;
   const hasRoundEta = roundEta > 0;
-  const roundProgress = hasRoundEta ? (roundElapsed / (roundElapsed + roundEta)) * 100 : 0;
   const sharesThisRound = status?.shares_this_round ?? accepted;
 
   // Leaderboard: the operator-authed miners endpoint returns a per-miner list;
@@ -447,23 +445,25 @@ export default function NodePoolPage() {
         <SectionErrorBoundary section="Round Progress">
           <Card>
             <CardHeader
-              title="Round Progress"
+              title="Round"
               subtitle={pool?.round_id ? `Round #${pool.round_id}` : "Current mining round"}
             />
-            {hasRoundEta ? (
-              <ProgressBar
-                value={roundProgress}
-                max={100}
-                label="Elapsed vs estimated time to block"
-                sublabel={`${formatDuration(roundElapsed)} / ~${formatDuration(roundElapsed + roundEta)}`}
-                color="orange"
-                size="lg"
-              />
-            ) : (
-              <div style={{ color: "var(--dim)", fontSize: "13px" }}>
-                No block-time estimate from the node yet.
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Current round</div>
+                <div style={{ color: "var(--fg)", fontSize: "18px", fontWeight: 600 }}>
+                  {formatDuration(roundElapsed)}
+                </div>
+                <div style={{ color: "var(--fainter)", fontSize: "11px" }}>time on the current template</div>
               </div>
-            )}
+              <div>
+                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Est. time to block</div>
+                <div style={{ color: "var(--fg)", fontSize: "18px", fontWeight: 600 }}>
+                  {hasRoundEta ? formatDuration(roundEta) : "—"}
+                </div>
+                <div style={{ color: "var(--fainter)", fontSize: "11px" }}>at this pool&apos;s hashrate vs network difficulty</div>
+              </div>
+            </div>
             <div className="mt-4 grid grid-cols-2 gap-4">
               <div>
                 <div style={{ color: "var(--dim)", fontSize: "12px" }}>Shares this round</div>
