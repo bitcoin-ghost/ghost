@@ -3,6 +3,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/Button";
+import { StickySaveBar } from "@/components/ui/StickySaveBar";
 import { useFullConfig } from "@/hooks/queries/useConfigQueries";
 import {
   setPolicyCustom,
@@ -42,17 +43,19 @@ export function AdvancedPolicyPanel() {
   const queryClient = useQueryClient();
 
   const [form, setForm] = useState<PolicyCustomConfig>(POLICY_CUSTOM_DEFAULTS);
+  // `baseline` is the last-saved (or loaded) state used to compute dirtiness.
+  const [baseline, setBaseline] = useState<PolicyCustomConfig>(POLICY_CUSTOM_DEFAULTS);
   const [confirming, setConfirming] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const isCustomActive = fullConfig?.policy?.profile === "custom";
   const stored = fullConfig?.policy?.custom;
 
-  // Seed the form from the node's persisted custom values once they arrive, so
-  // the panel edits the real config rather than blank defaults.
+  // Seed the form + baseline from the node's persisted custom values once they
+  // arrive, so the panel edits the real config rather than blank defaults.
   useEffect(() => {
     if (stored) {
-      setForm({
+      const seeded: PolicyCustomConfig = {
         allow_t0: stored.allow_t0,
         allow_t1: stored.allow_t1,
         allow_t2: stored.allow_t2,
@@ -65,9 +68,13 @@ export function AdvancedPolicyPanel() {
         max_tx_outputs: stored.max_tx_outputs,
         max_tx_size: stored.max_tx_size,
         min_fee_rate: stored.min_fee_rate,
-      });
+      };
+      setForm(seeded);
+      setBaseline(seeded);
     }
   }, [stored]);
+
+  const dirty = JSON.stringify(form) !== JSON.stringify(baseline);
 
   const setBool = (key: keyof PolicyCustomConfig, value: boolean) =>
     setForm((f) => ({ ...f, [key]: value }));
@@ -81,6 +88,7 @@ export function AdvancedPolicyPanel() {
     try {
       await setPolicyCustom(form);
       success("Custom policy saved", "The node is restarting to apply your custom tier policy.");
+      setBaseline(form);
       setConfirming(false);
       queryClient.invalidateQueries({ queryKey: ["config"] });
     } catch (e) {
@@ -149,18 +157,21 @@ export function AdvancedPolicyPanel() {
         ))}
       </PanelSection>
 
-      {!confirming ? (
-        <Button variant="secondary" size="sm" onClick={() => setConfirming(true)}>
-          Save custom policy…
-        </Button>
-      ) : (
+      {confirming ? (
+        // Sticky confirm bar — keeps the restart confirmation reachable no
+        // matter how far the operator has scrolled. Cancel/back-out is safe.
         <div
+          className="animate-slide-up"
           style={{
-            marginTop: "4px",
+            position: "sticky",
+            bottom: 0,
+            zIndex: 20,
+            marginTop: "8px",
             padding: "12px 14px",
             border: "1px solid var(--accent)",
             borderRadius: "6px",
             background: "var(--accent-weak)",
+            boxShadow: "0 -6px 20px -8px rgba(0, 0, 0, 0.35)",
           }}
         >
           <div style={{ color: "var(--fg)", fontSize: "13px", marginBottom: "10px" }}>
@@ -176,6 +187,22 @@ export function AdvancedPolicyPanel() {
             </Button>
           </div>
         </div>
+      ) : dirty ? (
+        // Pending edits: the sticky Save bar takes over as the save affordance.
+        // Save opens the restart-confirm flow above; Reset reverts to baseline.
+        <StickySaveBar
+          dirty={dirty}
+          saving={saving}
+          onSave={() => setConfirming(true)}
+          onReset={() => setForm(baseline)}
+          saveLabel="Save custom policy…"
+        />
+      ) : (
+        // No pending edits: the plain trigger still lets an operator (re)apply
+        // the custom profile — e.g. to switch a preset node over to custom.
+        <Button variant="secondary" size="sm" onClick={() => setConfirming(true)}>
+          Save custom policy…
+        </Button>
       )}
     </div>
   );

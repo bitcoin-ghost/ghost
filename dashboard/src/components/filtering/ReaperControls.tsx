@@ -6,6 +6,7 @@ import { Toggle } from "@/components/ui/Toggle";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { useToast } from "@/components/ui/Toast";
+import { StickySaveBar } from "@/components/ui/StickySaveBar";
 import { useReaperConfig, useSetReaper } from "@/hooks/queries/useConfigQueries";
 import { type ReaperSettings } from "@/lib/api/config";
 
@@ -318,6 +319,10 @@ export function ReaperControls() {
             <code>ghost-setup apply-reaper</code> step is needed.
           </p>
         </div>
+
+        {/* Sticky bottom bar — keeps Save/Reset reachable while editing the
+            thresholds at the bottom, where the top header bar is off-screen. */}
+        <StickySaveBar dirty={dirty} saving={pending} onSave={onSave} onReset={onReset} />
       </div>
     </Card>
   );
