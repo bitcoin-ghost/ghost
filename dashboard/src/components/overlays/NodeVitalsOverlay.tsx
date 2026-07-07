@@ -668,9 +668,9 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
             borderRadius: '9999px',
             background: `conic-gradient(rgba(${ACCENT_RGB}, 0) 0deg, rgba(${ACCENT_RGB}, 0) 250deg, rgba(${ACCENT_RGB}, 0.45) 322deg, rgba(${ACCENT_RGB}, 0.85) 352deg, rgba(${ACCENT_RGB}, 0) 360deg)`,
             WebkitMaskImage:
-              'radial-gradient(circle closest-side, transparent 66%, #000 71%, #000 80%, transparent 85%)',
+              'radial-gradient(circle closest-side, transparent 69%, #000 72%, #000 78%, transparent 81%)',
             maskImage:
-              'radial-gradient(circle closest-side, transparent 66%, #000 71%, #000 80%, transparent 85%)',
+              'radial-gradient(circle closest-side, transparent 69%, #000 72%, #000 78%, transparent 81%)',
             mixBlendMode: 'screen',
             opacity: 0.75,
             animation: active ? 'nv-sweep 15s linear infinite' : undefined,
