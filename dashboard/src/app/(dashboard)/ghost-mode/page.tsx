@@ -312,12 +312,13 @@ export default function GhostModePage() {
           Does this affect my capability shares?
         </h3>
         <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginBottom: "12px" }}>
-          <strong style={{ color: "var(--fg)" }}>No.</strong> Every capability is verified by an HTTP
-          challenge–response to your node&apos;s API — Archive by historical-block retrieval, Ghost Pay by
-          L2-block lookup, Reaper by policy classification — plus a Stratum port check for Public Mining.
-          None of that rides the P2P transaction-relay path Ghost Mode suppresses, so you keep all of your
-          5-4-3-2-1 shares while running silent. Ghost Mode composes cleanly with an archive / verification
-          node behind Tor: a private, silent node that still earns its full share of the reward pool.
+          <strong style={{ color: "var(--fg)" }}>Not for most of them.</strong> Archive, Ghost Pay, Reaper
+          and Elder are each verified by an HTTP challenge–response to your node&apos;s API (block
+          retrieval, L2-block lookup, policy classification, registration order) — none of which rides the
+          P2P transaction-relay path Ghost Mode suppresses, so those <strong style={{ color: "var(--fg)" }}>+5
+          / +4 / +2 / +1</strong> shares are untouched. Ghost Mode composes cleanly with an archive /
+          verification node behind Tor: a private, silent node that still earns those shares of the reward
+          pool. The one exception is Public Mining — see below.
         </p>
         <div
           style={{
@@ -328,15 +329,15 @@ export default function GhostModePage() {
           }}
         >
           <p style={{ color: "var(--fainter)", fontSize: "13px", lineHeight: "1.6" }}>
-            <span style={{ color: "var(--yellow)", fontWeight: 500 }}>Mining caveat:</span> Ghost Mode
-            rejects transactions from peers, so your mempool never fills with fee-paying transactions and
-            the blocks your node builds are near-empty — coinbase subsidy only. The node operator keeps the
-            transaction fees (miners are paid from the subsidy, less the pool fee), so an empty block means
-            you collect <strong style={{ color: "var(--fg)" }}>zero fee income</strong> — you forfeit your
-            own primary block-finding revenue, while your miners still draw their subsidy as usual. The
-            Public Mining <strong style={{ color: "var(--fg)" }}>+3</strong> share still verifies, but Ghost
-            Mode zeroes out the money that share exists to earn. It suits archive / verification nodes; if
-            you mine for fees, leave it off.
+            <span style={{ color: "var(--yellow)", fontWeight: 500 }}>Public Mining is mutually exclusive.</span>{" "}
+            Ghost Mode rejects transactions from peers, so your mempool never fills with fee-paying
+            transactions and the blocks your node builds are near-empty — coinbase subsidy only. Since the
+            node operator keeps the transaction fees (miners are paid from the subsidy, less the pool fee),
+            an empty block means <strong style={{ color: "var(--fg)" }}>zero fee income</strong>. So you
+            can&apos;t offer external miners a public pool of empty blocks: the Public Mining{" "}
+            <strong style={{ color: "var(--fg)" }}>+3</strong> toggle is blocked while Ghost Mode is on, and
+            vice versa. <strong style={{ color: "var(--fg)" }}>Private and solo mining are still allowed</strong>{" "}
+            — it&apos;s your choice to mine your own empty blocks and forfeit your own fee income.
           </p>
         </div>
       </Card>
