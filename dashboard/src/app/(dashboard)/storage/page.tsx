@@ -50,7 +50,7 @@ export default function StoragePage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-100">Storage & Pruning</h1>
+        <h1 className="text-2xl font-bold text-[color:var(--fg)]">Storage & Pruning</h1>
         {archiveMode && <Badge variant="success">+5 Shares (Archive)</Badge>}
       </div>
 
@@ -72,11 +72,11 @@ export default function StoragePage() {
             />
             <div className="space-y-4">
               {!ghostPayRunning ? (
-                <div className="p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
+                <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
                   <div className="flex items-center gap-2">
                     <Badge variant="warning">Ghost Pay Not Running</Badge>
                   </div>
-                  <p className="text-sm text-yellow-300 mt-2">
+                  <p className="text-sm text-[color:var(--accent)] mt-2">
                     Start ghost-pay-node to enable L2 functionality and see pruning status.
                   </p>
                 </div>
@@ -86,33 +86,33 @@ export default function StoragePage() {
                 <>
                   {/* L2 Pruning Config */}
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div className="p-4 bg-gray-800/50 rounded-lg">
-                      <div className="text-sm text-gray-400">Retention Period</div>
-                      <div className="text-xl font-bold text-gray-100 mt-1">
+                    <div className="p-4 bg-[var(--surface)] rounded-lg">
+                      <div className="text-sm text-[color:var(--dim)]">Retention Period</div>
+                      <div className="text-xl font-bold text-[color:var(--fg)] mt-1">
                         {l2Pruning.retention_days} days
                       </div>
                     </div>
-                    <div className="p-4 bg-gray-800/50 rounded-lg">
-                      <div className="text-sm text-gray-400">Auto Prune</div>
+                    <div className="p-4 bg-[var(--surface)] rounded-lg">
+                      <div className="text-sm text-[color:var(--dim)]">Auto Prune</div>
                       <div className="mt-1">
                         <Badge variant="success">Always On</Badge>
                       </div>
-                      <div className="text-xs text-gray-500 mt-1">
+                      <div className="text-xs text-[color:var(--fainter)] mt-1">
                         Every {l2Pruning.prune_interval_hours}h
                       </div>
                     </div>
-                    <div className="p-4 bg-gray-800/50 rounded-lg">
-                      <div className="text-sm text-gray-400">Last Prune</div>
-                      <div className="text-lg font-medium text-gray-100 mt-1">
+                    <div className="p-4 bg-[var(--surface)] rounded-lg">
+                      <div className="text-sm text-[color:var(--dim)]">Last Prune</div>
+                      <div className="text-lg font-medium text-[color:var(--fg)] mt-1">
                         {formatTimeAgo(l2Pruning.last_prune_timestamp ?? 0)}
                       </div>
-                      <div className="text-xs text-gray-500 mt-1">
+                      <div className="text-xs text-[color:var(--fainter)] mt-1">
                         {formatTimestamp(l2Pruning.last_prune_timestamp ?? 0)}
                       </div>
                     </div>
-                    <div className="p-4 bg-gray-800/50 rounded-lg">
-                      <div className="text-sm text-gray-400">Last Run Stats</div>
-                      <div className="text-sm text-gray-300 mt-2 space-y-1">
+                    <div className="p-4 bg-[var(--surface)] rounded-lg">
+                      <div className="text-sm text-[color:var(--dim)]">Last Run Stats</div>
+                      <div className="text-sm text-[color:var(--dim)] mt-2 space-y-1">
                         <div>Payments: {l2Pruning.payments_pruned}</div>
                         <div>Attestations: {l2Pruning.attestations_pruned}</div>
                         <div>Locks: {l2Pruning.locks_pruned}</div>
@@ -122,32 +122,32 @@ export default function StoragePage() {
 
                   {/* L2 Pruning Info - Two Columns */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="p-4 bg-red-900/20 border border-red-800 rounded-lg">
-                      <h4 className="text-red-300 font-medium mb-3">What Gets Pruned</h4>
-                      <ul className="text-sm text-red-200/80 space-y-2">
+                    <div className="p-4 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
+                      <h4 className="text-[color:var(--red)] font-medium mb-3">What Gets Pruned</h4>
+                      <ul className="text-sm text-[color:var(--red)] space-y-2">
                         <li className="flex items-start gap-2">
-                          <span className="text-red-400 mt-0.5">•</span>
+                          <span className="text-[color:var(--red)] mt-0.5">•</span>
                           <span>Payments (with ZK proofs) older than {l2Pruning.retention_days} days</span>
                         </li>
                         <li className="flex items-start gap-2">
-                          <span className="text-red-400 mt-0.5">•</span>
+                          <span className="text-[color:var(--red)] mt-0.5">•</span>
                           <span>Attestations older than {l2Pruning.retention_days} days</span>
                         </li>
                         <li className="flex items-start gap-2">
-                          <span className="text-red-400 mt-0.5">•</span>
+                          <span className="text-[color:var(--red)] mt-0.5">•</span>
                           <span>Closed locks (reconciled or jumped) older than {l2Pruning.retention_days} days</span>
                         </li>
                       </ul>
                     </div>
-                    <div className="p-4 bg-green-900/20 border border-green-800 rounded-lg">
-                      <h4 className="text-green-300 font-medium mb-3">What is Never Pruned</h4>
-                      <ul className="text-sm text-green-200/80 space-y-2">
+                    <div className="p-4 bg-[var(--surface)] border border-[color:var(--green)] rounded-lg">
+                      <h4 className="text-[color:var(--green)] font-medium mb-3">What is Never Pruned</h4>
+                      <ul className="text-sm text-[color:var(--green)] space-y-2">
                         <li className="flex items-start gap-2">
-                          <span className="text-green-400 mt-0.5">•</span>
+                          <span className="text-[color:var(--green)] mt-0.5">•</span>
                           <span>Active locks (regardless of age)</span>
                         </li>
                         <li className="flex items-start gap-2">
-                          <span className="text-green-400 mt-0.5">•</span>
+                          <span className="text-[color:var(--green)] mt-0.5">•</span>
                           <span>L2 block headers (contain state_root commitments)</span>
                         </li>
                       </ul>
@@ -155,7 +155,7 @@ export default function StoragePage() {
                   </div>
                 </>
               ) : (
-                <div className="p-4 bg-gray-800/50 rounded-lg text-gray-400">
+                <div className="p-4 bg-[var(--surface)] rounded-lg text-[color:var(--dim)]">
                   Unable to fetch L2 pruning status. Ensure ghost-pay-node API is accessible.
                 </div>
               )}
@@ -168,21 +168,21 @@ export default function StoragePage() {
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="text-left text-gray-400 border-b border-gray-800">
+                  <tr className="text-left text-[color:var(--dim)] border-b border-[var(--rule)]">
                     <th className="pb-3 font-medium">Layer</th>
                     <th className="pb-3 font-medium">Window</th>
                     <th className="pb-3 font-medium">Duration</th>
                     <th className="pb-3 font-medium">Behavior</th>
                   </tr>
                 </thead>
-                <tbody className="text-gray-300">
-                  <tr className="border-b border-gray-800/50">
+                <tbody className="text-[color:var(--dim)]">
+                  <tr className="border-b border-[var(--rule)]">
                     <td className="py-3">L1</td>
                     <td className="py-3">Validator (VW)</td>
                     <td className="py-3">288 blocks (~2 days)</td>
                     <td className="py-3">Full retention - Bitcoin Core minimum</td>
                   </tr>
-                  <tr className="border-b border-gray-800/50">
+                  <tr className="border-b border-[var(--rule)]">
                     <td className="py-3">L1</td>
                     <td className="py-3">Operator (OW)</td>
                     <td className="py-3">{fullConfig?.pruning?.ow_blocks ?? 2016} blocks (~{formatDuration(fullConfig?.pruning?.ow_blocks ?? 2016)})</td>
@@ -190,7 +190,7 @@ export default function StoragePage() {
                       {archiveMode ? "Archive Mode - no pruning" : `BUDS pruning (${fullConfig?.pruning?.prune_profile ?? "default"})`}
                     </td>
                   </tr>
-                  <tr className="border-b border-gray-800/50">
+                  <tr className="border-b border-[var(--rule)]">
                     <td className="py-3">L1</td>
                     <td className="py-3">Archive (AW)</td>
                     <td className="py-3">{archiveMode ? "Infinite" : "N/A"}</td>

@@ -75,7 +75,7 @@ export default function ShroudPage() {
           title="How It Works"
           subtitle="Transaction relay flow with Shroud enabled"
         />
-        <p className="text-gray-300 text-sm leading-relaxed mb-4">
+        <p className="text-[color:var(--dim)] text-sm leading-relaxed mb-4">
           Ghost Shroud adds random delays before relaying transactions to peers, breaking
           timing-based origin detection. Your transactions enter your mempool instantly for
           mining and validation — only the outbound relay to other nodes is delayed, making it
@@ -91,8 +91,8 @@ export default function ShroudPage() {
             { label: "Relay to peers", sublabel: "Delayed broadcast" },
           ]}
         />
-        <div className="mt-4 p-3 bg-gray-800/50 rounded-lg border border-gray-700">
-          <p className="text-xs text-gray-400 leading-relaxed">
+        <div className="mt-4 p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
+          <p className="text-xs text-[color:var(--dim)] leading-relaxed">
             <span className="text-blue-400 font-medium">Note:</span> The mempool addition is
             instant — your node can mine and validate the transaction immediately. Shroud only
             affects the <span className="text-blue-400">outbound relay</span> timing, ensuring
@@ -111,7 +111,7 @@ export default function ShroudPage() {
               title="Status"
               subtitle="Current Shroud relay configuration"
             />
-            <div className="divide-y divide-gray-800">
+            <div className="divide-y divide-[var(--rule)]">
               <StatusRow label="Shroud Enabled" tooltip={TOOLTIPS.enabled}>
                 <StatusDot
                   status={status.enabled ? "online" : "offline"}
@@ -127,7 +127,7 @@ export default function ShroudPage() {
                 />
               </StatusRow>
               <StatusRow label="Max Delay" tooltip={TOOLTIPS.max_delay}>
-                <span className="text-gray-100 font-mono text-sm">
+                <span className="text-[color:var(--fg)] font-mono text-sm">
                   {status.max_delay_ms.toLocaleString()} ms
                 </span>
               </StatusRow>
@@ -158,27 +158,27 @@ export default function ShroudPage() {
             </h4>
             <ul className="space-y-3">
               <li className="flex items-start gap-2">
-                <span className="text-green-400 mt-0.5 flex-shrink-0">
+                <span className="text-[color:var(--green)] mt-0.5 flex-shrink-0">
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                   </svg>
                 </span>
                 <div>
-                  <span className="text-gray-200 text-sm font-medium">Timing Analysis</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
+                  <span className="text-[color:var(--fg)] text-sm font-medium">Timing Analysis</span>
+                  <p className="text-[color:var(--fainter)] text-xs mt-0.5">
                     Random delays make it impossible to identify the originating node by relay timing.
                   </p>
                 </div>
               </li>
               <li className="flex items-start gap-2">
-                <span className="text-green-400 mt-0.5 flex-shrink-0">
+                <span className="text-[color:var(--green)] mt-0.5 flex-shrink-0">
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                   </svg>
                 </span>
                 <div>
-                  <span className="text-gray-200 text-sm font-medium">Topology Mapping</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
+                  <span className="text-[color:var(--fg)] text-sm font-medium">Topology Mapping</span>
+                  <p className="text-[color:var(--fainter)] text-xs mt-0.5">
                     Obscures the network graph by preventing relay order inference between peers.
                   </p>
                 </div>
@@ -187,8 +187,8 @@ export default function ShroudPage() {
           </div>
 
           {/* Does Not Protect Against */}
-          <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-700">
-            <h4 className="text-sm font-medium text-gray-400 mb-3 flex items-center gap-2">
+          <div className="p-4 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
+            <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3 flex items-center gap-2">
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
@@ -196,27 +196,27 @@ export default function ShroudPage() {
             </h4>
             <ul className="space-y-3">
               <li className="flex items-start gap-2">
-                <span className="text-gray-500 mt-0.5 flex-shrink-0">
+                <span className="text-[color:var(--fainter)] mt-0.5 flex-shrink-0">
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
                   </svg>
                 </span>
                 <div>
-                  <span className="text-gray-300 text-sm font-medium">Content Encryption</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
+                  <span className="text-[color:var(--dim)] text-sm font-medium">Content Encryption</span>
+                  <p className="text-[color:var(--fainter)] text-xs mt-0.5">
                     Transaction contents are not encrypted. Shroud only affects relay timing, not data.
                   </p>
                 </div>
               </li>
               <li className="flex items-start gap-2">
-                <span className="text-gray-500 mt-0.5 flex-shrink-0">
+                <span className="text-[color:var(--fainter)] mt-0.5 flex-shrink-0">
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
                   </svg>
                 </span>
                 <div>
-                  <span className="text-gray-300 text-sm font-medium">Global Observer</span>
-                  <p className="text-gray-500 text-xs mt-0.5">
+                  <span className="text-[color:var(--dim)] text-sm font-medium">Global Observer</span>
+                  <p className="text-[color:var(--fainter)] text-xs mt-0.5">
                     An adversary monitoring all network links simultaneously may still correlate transactions.
                   </p>
                 </div>

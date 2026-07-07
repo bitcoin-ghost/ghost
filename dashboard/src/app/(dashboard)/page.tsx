@@ -44,7 +44,7 @@ const SHARE_TIERS = [
 
 function InfoIcon() {
   return (
-    <svg className="w-3 h-3 text-gray-600 inline-block mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <svg className="w-3 h-3 text-[color:var(--fainter)] inline-block mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <circle cx="12" cy="12" r="10" />
       <path d="M12 16v-4M12 8h.01" />
     </svg>
@@ -63,9 +63,9 @@ function L1Card() {
   const isSyncing = syncStatus === false && syncHeight > 0 && blockHeight > 0;
 
   return (
-    <Card className="border-orange-600/30">
+    <Card className="border-[color:var(--accent)]">
       <CardHeader
-        title={<span className="text-orange-400">L1 &middot; Bitcoin</span>}
+        title={<span className="text-[color:var(--accent)]">L1 &middot; Bitcoin</span>}
         action={
           syncStatus != null && (
             <StatusDot
@@ -78,56 +78,56 @@ function L1Card() {
       />
       <div className="grid grid-cols-2 gap-3">
         <Tooltip content={TOOLTIPS.block_height}>
-          <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Block Height</div>
-            <div className="text-lg font-mono font-semibold text-gray-100">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Block Height</div>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : isSyncing
-                ? <span>{syncHeight.toLocaleString()} <span className="text-xs text-orange-400">/ {blockHeight.toLocaleString()}</span></span>
+                ? <span>{syncHeight.toLocaleString()} <span className="text-xs text-[color:var(--accent)]">/ {blockHeight.toLocaleString()}</span></span>
                 : syncHeight.toLocaleString()
               }
             </div>
             {isSyncing && (
-              <div className="text-xs text-orange-400 mt-0.5">
+              <div className="text-xs text-[color:var(--accent)] mt-0.5">
                 IBD &middot; {blockHeight > 0 ? ((syncHeight / blockHeight) * 100).toFixed(1) : 0}%
               </div>
             )}
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.l1_peers}>
-          <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Mesh Peers</div>
-            <div className="text-lg font-mono font-semibold text-gray-100">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Mesh Peers</div>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : `${status?.peer_count ?? 0} connected`}
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.network_hashrate}>
-          <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Network Hashrate</div>
-            <div className="text-lg font-mono font-semibold text-gray-100">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Network Hashrate</div>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {bestHashLoading ? "..." : bestHash?.network_hashrate ? formatHashrate(bestHash.network_hashrate) : "--"}
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.pool_hashrate}>
-          <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Pool Hashrate</div>
-            <div className="text-lg font-mono font-semibold text-gray-100">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Ghost Pool Hashrate</div>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : mining ? formatHashrate((mining.hashrate_th ?? 0) * 1e12) : "0 H/s"}
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.l1_hashrate}>
-          <div className="p-3 bg-orange-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Your Hashrate</div>
-            <div className="text-lg font-mono font-semibold text-gray-100">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Your Hashrate</div>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : mining ? formatHashrate((mining.local_hashrate_th ?? 0) * 1e12) : "0 H/s"}
             </div>
           </div>
         </Tooltip>
-        <div className="p-3 bg-orange-900/10 rounded-lg">
-          <div className="text-xs text-gray-500 mb-1">Miners</div>
-          <div className="text-lg font-mono font-semibold text-gray-100">
+        <div className="p-3 bg-[var(--surface)] rounded-lg">
+          <div className="text-xs text-[color:var(--fainter)] mb-1">Miners</div>
+          <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
             {isLoading ? "..." : `${mining?.connected_miners ?? 0} connected`}
           </div>
         </div>
@@ -171,8 +171,8 @@ function L2Card() {
       <div className="grid grid-cols-2 gap-3">
         <Tooltip content={TOOLTIPS.l2_height}>
           <div className="p-3 bg-purple-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> L2 Height</div>
-            <div className="text-lg font-mono font-semibold text-gray-100">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> L2 Height</div>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : isSyncing ? <span className="text-purple-400">Syncing...</span> : height}
             </div>
             {isSyncing && (
@@ -184,34 +184,34 @@ function L2Card() {
         </Tooltip>
         <Tooltip content={TOOLTIPS.l2_peers}>
           <div className="p-3 bg-purple-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> L2 Peers</div>
-            <div className="text-lg font-mono font-semibold text-gray-100">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> L2 Peers</div>
+            <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : `${gp?.peer_count ?? 0} connected`}
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.l2_wraith}>
           <div className="p-3 bg-purple-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Wraith</div>
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Wraith</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={wraithActive ? "online" : "offline"}
                 size="sm"
               />
-              <span className="text-sm font-mono text-gray-100">
+              <span className="text-sm font-mono text-[color:var(--fg)]">
                 {wraithLabel}
               </span>
             </div>
             {!isLoading && (
-              <div className={`text-xs mt-0.5 ${wraithActive ? "text-purple-400" : "text-gray-500"}`}>
+              <div className={`text-xs mt-0.5 ${wraithActive ? "text-purple-400" : "text-[color:var(--fainter)]"}`}>
                 {wraithReason}
               </div>
             )}
           </div>
         </Tooltip>
         <div className="p-3 bg-purple-900/10 rounded-lg">
-          <div className="text-xs text-gray-500 mb-1">Status</div>
-          <div className="text-lg font-mono font-semibold text-gray-100">
+          <div className="text-xs text-[color:var(--fainter)] mb-1">Status</div>
+          <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
             {isLoading ? "..." : isRunning ? "Active" : "Not enabled"}
           </div>
         </div>
@@ -235,8 +235,8 @@ function SharesSection() {
         subtitle="5-4-3-2-1 Reward System"
         action={
           <Tooltip content={TOOLTIPS.shares}>
-            <span className="text-2xl font-bold text-gray-100">
-              {shares.total}<span className="text-gray-500 text-lg"> / {shares.max_shares}</span>
+            <span className="text-2xl font-bold text-[color:var(--fg)]">
+              {shares.total}<span className="text-[color:var(--fainter)] text-lg"> / {shares.max_shares}</span>
               <InfoIcon />
             </span>
           </Tooltip>
@@ -252,13 +252,13 @@ function SharesSection() {
 
       {/* Uptime gatekeeper */}
       {!shares.uptime_qualified && (
-        <div className="mb-4 p-3 rounded-lg bg-red-900/20 border border-red-800">
+        <div className="mb-4 p-3 rounded-lg bg-[var(--surface)] border border-[color:var(--red)]">
           <div className="flex items-center gap-2">
-            <span className="text-red-400">&#10007;</span>
-            <span className="text-sm text-gray-300">Uptime below 95%</span>
+            <span className="text-[color:var(--red)]">&#10007;</span>
+            <span className="text-sm text-[color:var(--dim)]">Uptime below 95%</span>
             <Badge variant="error">{(shares.uptime_percent ?? 0).toFixed(1)}%</Badge>
           </div>
-          <p className="text-xs text-red-400 mt-1">All shares disabled until uptime recovers</p>
+          <p className="text-xs text-[color:var(--red)] mt-1">All shares disabled until uptime recovers</p>
         </div>
       )}
 
@@ -267,12 +267,12 @@ function SharesSection() {
           const isActive = shares[tier.key as keyof typeof shares] as boolean;
           const disabled = !shares.uptime_qualified;
           return (
-            <div key={tier.key} className="flex items-center justify-between py-1.5 px-2 rounded hover:bg-gray-800/30">
+            <div key={tier.key} className="flex items-center justify-between py-1.5 px-2 rounded hover:bg-[var(--surface)]">
               <div className="flex items-center gap-2">
-                <span className={isActive && !disabled ? "text-green-400" : "text-gray-600"}>
+                <span className={isActive && !disabled ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}>
                   {isActive ? "\u2713" : "\u2717"}
                 </span>
-                <span className={isActive && !disabled ? "text-gray-100 text-sm" : "text-gray-500 text-sm"}>
+                <span className={isActive && !disabled ? "text-[color:var(--fg)] text-sm" : "text-[color:var(--fainter)] text-sm"}>
                   {tier.name}
                 </span>
               </div>
@@ -295,7 +295,7 @@ function HealthSection() {
   const statusColor = overallStatus === "healthy" ? "online" : overallStatus === "degraded" ? "warning" : "offline";
 
   return (
-    <Card className="border-green-600/30">
+    <Card className="border-[color:var(--green)]">
       <CardHeader
         title="Health"
         action={
@@ -317,7 +317,7 @@ function HealthSection() {
         ))}
       </div>
       {/* Color legend */}
-      <div className="flex gap-4 text-[10px] text-gray-500 border-t border-gray-800 pt-2">
+      <div className="flex gap-4 text-[10px] text-[color:var(--fainter)] border-t border-[var(--rule)] pt-2">
         <div className="flex items-center gap-1">
           <span className="w-2 h-2 rounded-full bg-green-500" />
           Running
@@ -356,66 +356,66 @@ function PrivacySection() {
   const wraithActive = gpRunning && gp?.wraith_enabled;
 
   return (
-    <Card className="border-red-600/30">
-      <CardHeader title={<span className="text-red-400">Privacy Status</span>} />
+    <Card className="border-[color:var(--red)]">
+      <CardHeader title={<span className="text-[color:var(--red)]">Privacy Status</span>} />
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <Tooltip content={TOOLTIPS.ghost_mode}>
-          <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Mode</div>
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Ghost Mode</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={ghostModeActive ? "online" : "offline"}
                 size="sm"
               />
-              <span className="text-sm text-gray-100">{ghostModeActive ? "Active" : "Off"}</span>
+              <span className="text-sm text-[color:var(--fg)]">{ghostModeActive ? "Active" : "Off"}</span>
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_tor}>
-          <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Tor Mode</div>
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Tor Mode</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={torActive ? "online" : "offline"}
                 size="sm"
               />
-              <span className="text-sm text-gray-100">{torActive ? "Active" : "Off"}</span>
+              <span className="text-sm text-[color:var(--fg)]">{torActive ? "Active" : "Off"}</span>
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_haze}>
-          <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Haze</div>
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Ghost Haze</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={hazeActive ? "online" : "offline"}
                 size="sm"
               />
-              <span className="text-sm text-gray-100">{hazeLabel}</span>
+              <span className="text-sm text-[color:var(--fg)]">{hazeLabel}</span>
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_shroud}>
-          <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Ghost Shroud</div>
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Ghost Shroud</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={shroudActive ? "online" : "offline"}
                 size="sm"
               />
-              <span className="text-sm text-gray-100">{shroudLabel}</span>
+              <span className="text-sm text-[color:var(--fg)]">{shroudLabel}</span>
             </div>
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.privacy_wraith}>
-          <div className="p-3 bg-red-900/10 rounded-lg">
-            <div className="text-xs text-gray-500 mb-1"><InfoIcon /> Wraith</div>
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <div className="text-xs text-[color:var(--fainter)] mb-1"><InfoIcon /> Wraith</div>
             <div className="flex items-center gap-2">
               <StatusDot
                 status={wraithActive ? "online" : "offline"}
                 size="sm"
               />
-              <span className="text-sm text-gray-100">{wraithActive ? "Active" : "Off"}</span>
+              <span className="text-sm text-[color:var(--fg)]">{wraithActive ? "Active" : "Off"}</span>
             </div>
           </div>
         </Tooltip>
