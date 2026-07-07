@@ -283,9 +283,19 @@ export default function SwarmPage() {
     }
   };
 
-  // Individual refresh button now refreshes ALL nodes
-  const handleRefreshNode = async (_node: SwarmNode) => {
-    await handleRefreshAll(true);
+  // Per-node refresh: poll just this node so the button's own spinner
+  // (loading={refreshNode.isPending}) reflects the in-flight request.
+  const handleRefreshNode = (node: SwarmNode) => {
+    refreshNode.mutate(node.node_id, {
+      onSuccess: () => {
+        markNodeStale(node.node_id, false);
+        success("Node Refreshed", `${node.name} updated`);
+      },
+      onError: (err) => {
+        markNodeStale(node.node_id, true);
+        error("Refresh Failed", err instanceof Error ? err.message : "Unknown error");
+      },
+    });
   };
 
   // Auto-refresh all nodes every 30 seconds
@@ -595,7 +605,7 @@ export default function SwarmPage() {
                   </Tooltip>
                   {node.address !== "localhost" && !isMeshNode(node) && (
                     <Tooltip content={TOOLTIPS.refresh}>
-                      <Button variant="ghost" size="sm" onClick={() => handleRefreshNode(node)} className="text-xs px-2">
+                      <Button variant="ghost" size="sm" onClick={() => handleRefreshNode(node)} loading={refreshNode.isPending} className="text-xs px-2">
                         Refresh
                       </Button>
                     </Tooltip>

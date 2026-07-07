@@ -70,7 +70,10 @@ export function useSetGhostMode() {
   return useMutation({
     mutationFn: (enabled: boolean) => setGhostMode(enabled),
     onSuccess: () => {
+      // The toggle binds to node status (status.ghost_mode), so refresh both
+      // the config and node status caches to keep the control in sync.
       queryClient.invalidateQueries({ queryKey: configKeys.all });
+      queryClient.invalidateQueries({ queryKey: nodeKeys.status() });
     },
   });
 }
@@ -109,7 +112,10 @@ export function useSetArchiveMode() {
   return useMutation({
     mutationFn: (enabled: boolean) => setArchiveMode(enabled),
     onSuccess: () => {
+      // The toggle binds to node status (status.archive_mode), so refresh both
+      // the config and node status caches to keep the control in sync.
       queryClient.invalidateQueries({ queryKey: configKeys.all });
+      queryClient.invalidateQueries({ queryKey: nodeKeys.status() });
     },
   });
 }

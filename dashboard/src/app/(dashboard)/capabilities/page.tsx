@@ -219,11 +219,7 @@ export default function CapabilitiesPage() {
       )}
 
       <p style={{ color: "var(--fainter)", fontSize: "13px" }}>
-        Qualification is calculated from peer-issued verification challenges over a 7-day rolling window. A capability counts at payout when ≥10 challenges have completed at ≥95% pass rate (≥90% for Ghost Pay) from at least 2 unique peers. Source:{" "}
-        <a href="/docs/#" className="bare" style={{ color: "var(--dim)", textDecoration: "underline", textDecorationColor: "var(--rule-strong)" }}>
-          economics-deep-dive
-        </a>
-        .
+        Qualification is calculated from peer-issued verification challenges over a 7-day rolling window. A capability counts at payout when ≥10 challenges have completed at ≥95% pass rate (≥90% for Ghost Pay) from at least 2 unique peers.
       </p>
     </div>
   );
