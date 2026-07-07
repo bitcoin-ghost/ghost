@@ -84,8 +84,7 @@ export function TemplateProfileDialog({
                 affect your mining efficiency or block validity.
               </p>
               <p className="text-[color:var(--accent)]/80 text-sm mt-2">
-                If you&apos;re unsure, use one of the preset profiles instead. For guidance, refer to
-                the <a href="/docs/template-profiles" className="text-[color:var(--accent)] underline hover:text-[color:var(--accent)]">Block Template Guide</a>.
+                If you&apos;re unsure, use one of the preset profiles instead.
               </p>
             </div>
           </div>

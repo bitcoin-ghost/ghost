@@ -19,7 +19,16 @@ type ServiceAction = "start" | "stop" | "restart";
 
 
 function formatTimestamp(timestamp: number): string {
-  return new Date(timestamp * 1000).toLocaleString();
+  if (!timestamp) return "—";
+  // Backend timestamps are Unix seconds; guard against values already in ms.
+  const ms = timestamp < 1e12 ? timestamp * 1000 : timestamp;
+  return new Date(ms).toLocaleString();
+}
+
+// A component/service is "running" when it reports an active state. Anything
+// else (stopped, error, unknown, not_enabled) should offer Start, not Stop.
+function isRunningStatus(status: string): boolean {
+  return status === "ok" || status === "running" || status === "syncing";
 }
 
 function getStatusBadge(status: string): { variant: "success" | "warning" | "error" | "info" | "default"; label: string } {
@@ -31,6 +40,8 @@ function getStatusBadge(status: string): { variant: "success" | "warning" | "err
       return { variant: "info", label: "Syncing" };
     case "stopped":
       return { variant: "default", label: "Stopped" };
+    case "not_enabled":
+      return { variant: "default", label: "Not Enabled" };
     case "error":
     case "unknown":
       return { variant: "error", label: "Error" };
@@ -357,16 +368,7 @@ export default function WatchdogPage() {
                         <Badge variant={statusBadge.variant}>{statusBadge.label}</Badge>
                       </div>
                       <div className="flex gap-2">
-                        {service.status === "stopped" || service.status === "error" ? (
-                          <Button
-                            size="sm"
-                            variant="success"
-                            onClick={() => handleActionClick(service.name, "start")}
-                            disabled={isPending}
-                          >
-                            Start
-                          </Button>
-                        ) : (
+                        {isRunningStatus(service.status) ? (
                           <Button
                             size="sm"
                             variant="danger"
@@ -374,6 +376,15 @@ export default function WatchdogPage() {
                             disabled={isPending}
                           >
                             Stop
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="success"
+                            onClick={() => handleActionClick(service.name, "start")}
+                            disabled={isPending}
+                          >
+                            Start
                           </Button>
                         )}
                         <Button
@@ -461,16 +472,7 @@ export default function WatchdogPage() {
                         </td>
                         <td className="py-3">
                           <div className="flex gap-2">
-                            {component.status === "error" || component.status === "unknown" ? (
-                              <Button
-                                size="sm"
-                                variant="success"
-                                onClick={() => handleActionClick(component.name, "start")}
-                                disabled={isPending}
-                              >
-                                Start
-                              </Button>
-                            ) : (
+                            {isRunningStatus(component.status) ? (
                               <Button
                                 size="sm"
                                 variant="danger"
@@ -478,6 +480,15 @@ export default function WatchdogPage() {
                                 disabled={isPending}
                               >
                                 Stop
+                              </Button>
+                            ) : (
+                              <Button
+                                size="sm"
+                                variant="success"
+                                onClick={() => handleActionClick(component.name, "start")}
+                                disabled={isPending}
+                              >
+                                Start
                               </Button>
                             )}
                             <Button

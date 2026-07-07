@@ -52,6 +52,7 @@ function formatBytes(bytes: number): string {
 }
 
 function formatDate(dateStr: string): string {
+  if (!dateStr) return "—";
   try {
     return new Date(dateStr).toLocaleDateString(undefined, {
       year: "numeric",
@@ -64,6 +65,7 @@ function formatDate(dateStr: string): string {
 }
 
 function formatTimestampDate(timestamp: number): string {
+  if (!timestamp) return "—";
   return new Date(timestamp * 1000).toLocaleString();
 }
 
@@ -224,8 +226,10 @@ export default function SystemPage() {
 
   const handleCheckForUpdates = async () => {
     try {
-      await recheckUpdates();
-      if (!updateCheck?.update_available) {
+      // Use the freshly refetched result, not the closure-captured value
+      // (updateCheck reflects the state from before this refetch).
+      const { data } = await recheckUpdates();
+      if (!data?.update_available) {
         success("Up to Date", "You are running the latest version");
       }
     } catch (err) {
@@ -457,7 +461,7 @@ export default function SystemPage() {
                       <ProgressBar
                         value={updateStatus.progress.progress_percent ?? 0}
                         label={updateStatus.progress.step}
-                        sublabel={`${updateStatus.progress.progress_percent}%`}
+                        sublabel={`${updateStatus.progress.progress_percent ?? 0}%`}
                         color="orange"
                       />
                       <p className="text-sm text-[color:var(--fainter)]">{updateStatus.progress.message}</p>

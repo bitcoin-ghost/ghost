@@ -85,8 +85,7 @@ export function MempoolProfileDialog({
                 cause your node to reject valid transactions or accept unwanted ones.
               </p>
               <p className="text-[color:var(--accent)]/80 text-sm mt-2">
-                If you&apos;re unsure, use one of the preset profiles instead. For guidance, refer to
-                the <a href="/docs/mempool-profiles" className="text-[color:var(--accent)] underline hover:text-[color:var(--accent)]">Mempool Profile Guide</a>.
+                If you&apos;re unsure, use one of the preset profiles instead.
               </p>
             </div>
           </div>
