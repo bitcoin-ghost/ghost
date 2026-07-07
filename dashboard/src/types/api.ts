@@ -37,6 +37,7 @@ export interface NodeStatus {
   uptime_seconds?: number;
   uptime_secs?: number;
   ghost_mode?: boolean;
+  ghost_mode_local_egress?: boolean;
   tor_mode?: boolean;
   onion_address?: string;
   archive_mode?: boolean;
@@ -72,6 +73,7 @@ export interface BlockchainStatus {
 
 export interface NodeConfig {
   ghost_mode?: boolean;
+  ghost_mode_local_egress?: boolean;
   archive_mode?: boolean;
   reaper?: boolean;
   public_mining?: boolean;
@@ -93,6 +95,7 @@ export interface FullNodeConfig {
   // Backend may return flat or nested structure
   node?: {
     ghost_mode: boolean;
+    ghost_mode_local_egress?: boolean;
     archive_mode: boolean;
     public_mining: boolean;
     mempool_profile: string;
@@ -135,6 +138,7 @@ export interface FullNodeConfig {
   };
   // Flat fields from backend
   ghost_mode?: boolean;
+  ghost_mode_local_egress?: boolean;
   archive_mode?: boolean;
   public_mining?: boolean;
   reaper?: boolean;
@@ -266,6 +270,7 @@ export interface NodeStatusSnapshot {
   uptime_seconds?: number;
   uptime_secs?: number;
   ghost_mode?: boolean;
+  ghost_mode_local_egress?: boolean;
   archive_mode?: boolean;
 }
 

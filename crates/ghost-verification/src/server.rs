@@ -966,6 +966,8 @@ fn parse_user_identity(user_identity: &str) -> (String, String) {
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
     pub ghost_mode: bool,
+    /// Ghost mode local egress: announce/serve our own txs while ghost mode is on
+    pub ghost_mode_local_egress: bool,
     pub archive_mode: bool,
     pub ghost_pay: bool,
     pub public_mining: bool,
@@ -1021,6 +1023,10 @@ impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
             ghost_mode: true,
+            // Opt-in sub-toggle: only announces our own txs, and only while
+            // ghost mode is on. Off by default so a default ghost node never
+            // reveals any transactions to peers.
+            ghost_mode_local_egress: false,
             // Opt-in: archiving needs the full unpruned chain plus lots of disk,
             // so the node must never advertise the Archive capability by default.
             // The real value is synced from `storage.archive_mode` in
@@ -1825,6 +1831,7 @@ impl VerificationState {
         {
             let mut dashboard = self.dashboard_config.write();
             dashboard.ghost_mode = config.ghost_mode;
+            dashboard.ghost_mode_local_egress = config.ghost_mode_local_egress;
             if config.nickname.is_some() {
                 dashboard.nickname = config.nickname.clone();
             }
@@ -1954,7 +1961,10 @@ impl VerificationState {
         };
 
         // Get local config state
-        let local_ghost_mode = self.node_config.read().ghost_mode;
+        let (local_ghost_mode, local_local_egress) = {
+            let cfg = self.node_config.read();
+            (cfg.ghost_mode, cfg.ghost_mode_local_egress)
+        };
 
         // Query ghost-core for current state
         match rpc.get_ghost_mode().await {
@@ -1980,10 +1990,32 @@ impl VerificationState {
                     debug!("Ghost mode already in sync: {}", local_ghost_mode);
                 }
 
+                // Sync local egress sub-toggle the same way (local persisted wins).
+                if response.ghost_mode_local_egress != local_local_egress {
+                    info!(
+                        "Ghost mode local egress mismatch: local={}, core={}. Syncing core to local.",
+                        local_local_egress, response.ghost_mode_local_egress
+                    );
+                    match rpc.set_ghost_mode_local_egress(local_local_egress).await {
+                        Ok(_) => {
+                            info!(
+                                "Successfully synced ghost-core to ghost_mode_local_egress={}",
+                                local_local_egress
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to sync ghost mode local egress to ghost-core: {}", e);
+                        }
+                    }
+                } else {
+                    debug!("Ghost mode local egress already in sync: {}", local_local_egress);
+                }
+
                 // Sync dashboard config
                 {
                     let mut dashboard = self.dashboard_config.write();
                     dashboard.ghost_mode = local_ghost_mode;
+                    dashboard.ghost_mode_local_egress = local_local_egress;
                 }
             }
             Err(e) => {

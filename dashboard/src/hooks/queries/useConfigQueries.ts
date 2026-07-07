@@ -3,6 +3,7 @@ import {
   getConfig,
   getFullConfig,
   setGhostMode,
+  setGhostModeLocalEgress,
   setTor,
   setArchiveMode,
   setReaper,
@@ -70,6 +71,20 @@ export function useSetGhostMode() {
     mutationFn: (enabled: boolean) => setGhostMode(enabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
+    },
+  });
+}
+
+export function useSetGhostModeLocalEgress() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (enabled: boolean) => setGhostModeLocalEgress(enabled),
+    onSuccess: () => {
+      // The toggle state is surfaced on node status (ghost_mode_local_egress),
+      // so refresh both config and status caches.
+      queryClient.invalidateQueries({ queryKey: configKeys.all });
+      queryClient.invalidateQueries({ queryKey: nodeKeys.status() });
     },
   });
 }

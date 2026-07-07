@@ -207,6 +207,9 @@ pub fn apply_change_setup(
         if let Some(v) = fields.get("ghost_mode") {
             config.network.ghost_mode = v.as_bool();
         }
+        if let Some(v) = fields.get("ghost_mode_local_egress") {
+            config.network.ghost_mode_local_egress = v.as_bool();
+        }
         if let Some(v) = fields.get("mempool_profile") {
             config.policy.profile = match v.as_selected() {
                 1 => PolicyProfile::BitcoinPure,
@@ -367,6 +370,9 @@ pub fn apply_ghost_mode(
     load_and_modify(config_path, |config| {
         if let Some(v) = fields.get("ghost_mode") {
             config.network.ghost_mode = v.as_bool();
+        }
+        if let Some(v) = fields.get("ghost_mode_local_egress") {
+            config.network.ghost_mode_local_egress = v.as_bool();
         }
     })
 }

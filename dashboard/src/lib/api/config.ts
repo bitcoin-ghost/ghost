@@ -37,6 +37,16 @@ export async function setGhostMode(enabled: boolean): Promise<NodeConfig> {
   });
 }
 
+// Ghost Mode local egress: while ghost mode is on, still announce and serve our
+// OWN (locally-submitted) transactions so a connected wallet can reach miners,
+// while peer-received transactions stay fully suppressed. Toggles live.
+export async function setGhostModeLocalEgress(enabled: boolean): Promise<NodeConfig> {
+  return fetchApi<NodeConfig>('/api/v1/config/ghost_mode_local_egress', {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 // Result of toggling ghostd Tor mode. The apply happens off the request path
 // (ghostd restarts, then the pool bounces); poll the reaper GET's ghostd_apply
 // for the terminal state.
