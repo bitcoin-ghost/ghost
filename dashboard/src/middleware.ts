@@ -25,6 +25,26 @@ import { resolveJwtSecret, verifySession } from "@/lib/jwt";
 // supporting auth API (login/logout/refresh), and Next.js static assets.
 const PUBLIC_PREFIXES = ["/login", "/api/auth/"];
 
+// Paths owned ENTIRELY by the custom Node server (`server.js`), never by Next —
+// this middleware must not touch them.
+//
+// `/api/ws` is the authenticated WebSocket relay. A real handshake is an HTTP
+// `upgrade` event that `server.js` intercepts and authorises itself (same JWT),
+// so it never reaches this middleware. But a NON-upgrade request to the very
+// same path — an intermediary/SSH-tunnel/proxy that strips the `Upgrade`
+// header, or a browser reconnect quirk — DOES fall through to Next and lands
+// here. Because `/api/ws` is not a Next route, the middleware would treat it as
+// a protected page/API and, when the cookie is absent-or-lapsed, run
+// `denyAccess`, whose 401 response carries a `Set-Cookie` that DELETES
+// `ghost-session`. That turns a transient blip into a hard logout — and on the
+// always-on Home screen, whose socket reconnects continuously, it fires
+// repeatedly, ejecting a working operator to /login.
+//
+// The relay owns its own auth, so leave `/api/ws` strictly alone here. This is
+// NOT an auth hole: a genuine handshake is still gated by `server.js`, and a
+// non-upgrade GET to `/api/ws` matches no route and 404s (it proxies nothing).
+const RELAY_OWNED_PREFIXES = ["/api/ws"];
+
 const SECURITY_HEADERS = {
   "X-Frame-Options": "DENY",
   "X-Content-Type-Options": "nosniff",
@@ -53,6 +73,17 @@ export async function middleware(request: NextRequest) {
 
   // Public, unauthenticated paths: login flow + Next.js internals/static.
   if (PUBLIC_PREFIXES.some((p) => pathname.startsWith(p)) || isStaticAsset(pathname)) {
+    return NextResponse.next();
+  }
+
+  // Relay-owned paths (the WebSocket relay): pass through untouched so the
+  // middleware can never clear `ghost-session` on a stray `/api/ws` request.
+  // `server.js` authenticates the actual upgrade; see RELAY_OWNED_PREFIXES.
+  if (
+    RELAY_OWNED_PREFIXES.some(
+      (p) => pathname === p || pathname.startsWith(`${p}/`),
+    )
+  ) {
     return NextResponse.next();
   }
 
