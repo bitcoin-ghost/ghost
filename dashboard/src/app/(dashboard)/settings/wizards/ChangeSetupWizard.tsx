@@ -17,9 +17,8 @@ import {
   useSetArchiveMode,
   useSetReaper,
   useSetGhostPay,
-  useSetMempoolProfile,
+  useActivateMempoolProfile,
 } from '@/hooks/queries';
-import type { MempoolProfile } from '@/types/api';
 
 interface ChangeSetupData {
   nickname: string;
@@ -69,7 +68,9 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
   const setArchiveMode = useSetArchiveMode();
   const setReaper = useSetReaper();
   const setGhostPay = useSetGhostPay();
-  const setMempoolProfile = useSetMempoolProfile();
+  // Cosmetic mempool_profile mirror is written via the profile-activate route;
+  // POST /config/mempool_profile is GET-only on the node and 405s.
+  const activateMempoolProfile = useActivateMempoolProfile();
   const toast = useToast();
 
   // Track original values to detect changes
@@ -191,7 +192,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
           changeCount++;
         }
         if (data.mempool_profile !== original.mempool_profile) {
-          await setMempoolProfile.mutateAsync(data.mempool_profile as MempoolProfile);
+          await activateMempoolProfile.mutateAsync(data.mempool_profile);
           changeCount++;
         }
 
@@ -209,7 +210,7 @@ export default function ChangeSetupWizard({ isOpen, onClose }: ChangeSetupWizard
   ], [
     configLoading, setNickname, setPublicMiningConfig, setPayoutAddress,
     setGhostMode, setArchiveMode, setReaper, setGhostPay,
-    setMempoolProfile, toast, onClose,
+    activateMempoolProfile, toast, onClose,
   ]);
 
   const wizard = useWizard<ChangeSetupData>({

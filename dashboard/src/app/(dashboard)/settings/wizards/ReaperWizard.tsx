@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Toggle } from '@/components/ui/Toggle';
@@ -73,6 +74,22 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
     steps,
     initialData: reaper?.settings ?? REAPER_DEFAULTS,
   });
+
+  // The wizard captures its initial data at mount, before `useReaperConfig` has
+  // resolved — so without this it would show REAPER_DEFAULTS and an untouched
+  // Finish would overwrite the node's live per-vector reaper config with
+  // all-on defaults. Re-seed from the live settings each time the dialog opens.
+  const hydratedRef = useRef(false);
+  useEffect(() => {
+    if (!isOpen) {
+      hydratedRef.current = false;
+      return;
+    }
+    if (reaper?.settings && !hydratedRef.current) {
+      hydratedRef.current = true;
+      wizard.reset(reaper.settings);
+    }
+  }, [isOpen, reaper]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const renderGroup = (
     title: string,

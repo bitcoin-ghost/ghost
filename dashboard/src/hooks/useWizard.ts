@@ -27,7 +27,7 @@ export interface UseWizardReturn<TData> {
   isSubmitting: boolean;
   next: () => Promise<void>;
   back: () => void;
-  reset: () => void;
+  reset: (overrideData?: TData) => void;
   isFirst: boolean;
   isLast: boolean;
   isComplete: boolean;
@@ -93,9 +93,13 @@ export function useWizard<TData>(config: UseWizardConfig<TData>): UseWizardRetur
     setError(null);
   }, []);
 
-  const reset = useCallback(() => {
+  // Reset the wizard to its first step. Pass `overrideData` to seed it with a
+  // freshly-resolved value (e.g. once an async config query lands) instead of
+  // the `initialData` captured at mount — this is what lets a re-opened wizard
+  // reflect live node state rather than a stale default.
+  const reset = useCallback((overrideData?: TData) => {
     setCurrentStep(0);
-    setDataState(initialData);
+    setDataState(overrideData ?? initialData);
     setError(null);
     setIsSubmitting(false);
     setIsComplete(false);

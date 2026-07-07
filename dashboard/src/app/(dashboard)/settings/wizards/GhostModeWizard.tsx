@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { useWizard, WizardStep } from '@/hooks/useWizard';
 import { WizardDialog } from '@/components/ui/Wizard';
 import { Toggle } from '@/components/ui/Toggle';
@@ -53,6 +54,23 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
       enabled: config?.ghost_mode ?? false,
     },
   });
+
+  // The wizard seeds its editable data once at mount, before `useConfig` has
+  // resolved — so without this it would show the `false` fallback and an
+  // untouched Finish would write Ghost Mode OFF over a node that had it ON.
+  // Re-seed from live config each time the dialog opens (and once the query
+  // lands if it opens first), so an untouched Finish is a no-op.
+  const hydratedRef = useRef(false);
+  useEffect(() => {
+    if (!isOpen) {
+      hydratedRef.current = false;
+      return;
+    }
+    if (config && !hydratedRef.current) {
+      hydratedRef.current = true;
+      wizard.reset({ enabled: config.ghost_mode ?? false });
+    }
+  }, [isOpen, config]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <WizardDialog
