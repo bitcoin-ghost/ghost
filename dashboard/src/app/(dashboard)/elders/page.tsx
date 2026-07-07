@@ -85,7 +85,7 @@ const contributorColumns: ColumnDef<MpcContributor>[] = [
     accessorKey: "position",
     header: "#",
     cell: ({ row }) => (
-      <span className="font-mono text-orange-400 font-medium">
+      <span className="font-mono text-[color:var(--accent)] font-medium">
         {row.original.position}
       </span>
     ),
@@ -110,7 +110,7 @@ const contributorColumns: ColumnDef<MpcContributor>[] = [
     accessorKey: "created_at",
     header: "Contributed",
     cell: ({ row }) => (
-      <span className="text-gray-400 text-sm">{formatContributed(row.original.created_at)}</span>
+      <span className="text-[color:var(--dim)] text-sm">{formatContributed(row.original.created_at)}</span>
     ),
   },
 ];
@@ -259,20 +259,20 @@ export default function EldersPage() {
 
               {/* Details grid */}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div className="p-3 bg-gray-800/50 rounded-lg">
-                  <div className="text-xs text-gray-400 mb-1">Phase</div>
+                <div className="p-3 bg-[var(--surface)] rounded-lg">
+                  <div className="text-xs text-[color:var(--dim)] mb-1">Phase</div>
                   <Badge variant={ceremonyPhase.variant}>{ceremonyPhase.label}</Badge>
                 </div>
-                <div className="p-3 bg-gray-800/50 rounded-lg">
-                  <div className="text-xs text-gray-400 mb-1">Your Status</div>
+                <div className="p-3 bg-[var(--surface)] rounded-lg">
+                  <div className="text-xs text-[color:var(--dim)] mb-1">Your Status</div>
                   <Badge variant={yourStatus.variant}>{yourStatus.label}</Badge>
                 </div>
-                <div className="p-3 bg-gray-800/50 rounded-lg">
-                  <div className="text-xs text-gray-400 mb-1">Circuit Type</div>
-                  <span className="font-mono text-sm text-gray-100">Groth16</span>
+                <div className="p-3 bg-[var(--surface)] rounded-lg">
+                  <div className="text-xs text-[color:var(--dim)] mb-1">Circuit Type</div>
+                  <span className="font-mono text-sm text-[color:var(--fg)]">Groth16</span>
                 </div>
-                <div className="p-3 bg-gray-800/50 rounded-lg">
-                  <div className="text-xs text-gray-400 mb-1">Parameters</div>
+                <div className="p-3 bg-[var(--surface)] rounded-lg">
+                  <div className="text-xs text-[color:var(--dim)] mb-1">Parameters</div>
                   <StatusDot
                     status={mpc?.has_params ? "online" : "offline"}
                     label={mpc?.has_params ? "Generated" : "Pending"}
@@ -283,11 +283,11 @@ export default function EldersPage() {
 
               {/* Downtime warning */}
               {elder?.downtime_warning && (
-                <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded-lg">
-                  <p className="text-yellow-400 text-sm font-medium">
+                <div className="p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
+                  <p className="text-[color:var(--accent)] text-sm font-medium">
                     Downtime Warning
                   </p>
-                  <p className="text-yellow-400/70 text-sm mt-1">
+                  <p className="text-[color:var(--accent)] text-sm mt-1">
                     {elder.consecutive_downtime_days} consecutive days of downtime detected.
                     Elder status requires 95% uptime over a trailing 7-day window.
                   </p>
@@ -306,7 +306,7 @@ export default function EldersPage() {
             subtitle={`${contributorsData?.count ?? contributors.length} MPC contributors`}
             action={
               mpc?.node_id ? (
-                <span className="text-xs text-gray-500 font-mono">
+                <span className="text-xs text-[color:var(--fainter)] font-mono">
                   You: {truncateId(mpc.node_id, 6)}
                 </span>
               ) : undefined
@@ -332,9 +332,9 @@ export default function EldersPage() {
             title="Zero-Knowledge Proof Info"
             subtitle="How the MPC ceremony secures the network"
           />
-          <div className="space-y-4 text-sm text-gray-400 leading-relaxed">
+          <div className="space-y-4 text-sm text-[color:var(--dim)] leading-relaxed">
             <div>
-              <h4 className="text-gray-200 font-medium mb-1">What is the MPC Ceremony?</h4>
+              <h4 className="text-[color:var(--fg)] font-medium mb-1">What is the MPC Ceremony?</h4>
               <p>
                 The Multi-Party Computation (MPC) ceremony generates trusted setup parameters
                 for Groth16 zero-knowledge proofs. Each of the 101 contributors adds a layer of
@@ -343,7 +343,7 @@ export default function EldersPage() {
               </p>
             </div>
             <div>
-              <h4 className="text-gray-200 font-medium mb-1">Why Groth16?</h4>
+              <h4 className="text-[color:var(--fg)] font-medium mb-1">Why Groth16?</h4>
               <p>
                 Groth16 produces the smallest proofs (just 3 group elements, ~128 bytes) with the
                 fastest verification time of any general-purpose ZK proof system. The tradeoff is
@@ -351,7 +351,7 @@ export default function EldersPage() {
               </p>
             </div>
             <div>
-              <h4 className="text-gray-200 font-medium mb-1">Elder Status</h4>
+              <h4 className="text-[color:var(--fg)] font-medium mb-1">Elder Status</h4>
               <p>
                 Nodes that contribute to the MPC ceremony earn permanent Elder status, granting +1
                 share in the 5-4-3-2-1 capability system. The first 101 nodes to contribute claim
@@ -360,30 +360,30 @@ export default function EldersPage() {
               </p>
             </div>
             <div>
-              <h4 className="text-gray-200 font-medium mb-1">Ossification</h4>
+              <h4 className="text-[color:var(--fg)] font-medium mb-1">Ossification</h4>
               <p>
                 Once all 101 slots are filled, the ceremony is ossified. No new contributions
                 can be accepted and the parameters are finalized. The ceremony cannot be restarted
                 or modified after ossification.
               </p>
             </div>
-            <div className="pt-2 border-t border-gray-800">
+            <div className="pt-2 border-t border-[var(--rule)]">
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <span className="text-gray-500">Circuit</span>
-                  <p className="text-gray-200 font-mono">Groth16 (BN254)</p>
+                  <span className="text-[color:var(--fainter)]">Circuit</span>
+                  <p className="text-[color:var(--fg)] font-mono">Groth16 (BN254)</p>
                 </div>
                 <div>
-                  <span className="text-gray-500">Max Contributors</span>
-                  <p className="text-gray-200 font-mono">101</p>
+                  <span className="text-[color:var(--fainter)]">Max Contributors</span>
+                  <p className="text-[color:var(--fg)] font-mono">101</p>
                 </div>
                 <div>
-                  <span className="text-gray-500">Proof Size</span>
-                  <p className="text-gray-200 font-mono">~128 bytes</p>
+                  <span className="text-[color:var(--fainter)]">Proof Size</span>
+                  <p className="text-[color:var(--fg)] font-mono">~128 bytes</p>
                 </div>
                 <div>
-                  <span className="text-gray-500">Share Bonus</span>
-                  <p className="text-gray-200 font-mono">+1 (Elder)</p>
+                  <span className="text-[color:var(--fainter)]">Share Bonus</span>
+                  <p className="text-[color:var(--fg)] font-mono">+1 (Elder)</p>
                 </div>
               </div>
             </div>

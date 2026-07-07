@@ -32,7 +32,7 @@ const peerColumns: ColumnDef<PeerInfo>[] = [
     accessorKey: "version",
     header: "Version",
     cell: ({ row }) => (
-      <span className="font-mono text-gray-400">{row.original.version || "N/A"}</span>
+      <span className="font-mono text-[color:var(--dim)]">{row.original.version || "N/A"}</span>
     ),
   },
   {
@@ -40,7 +40,7 @@ const peerColumns: ColumnDef<PeerInfo>[] = [
     header: "Latency",
     cell: ({ row }) => {
       const latency = row.original.latency_ms;
-      if (latency == null) return <span className="text-gray-500">--</span>;
+      if (latency == null) return <span className="text-[color:var(--fainter)]">--</span>;
       return (
         <Badge variant={latency < 100 ? "success" : latency < 500 ? "warning" : "error"}>
           {latency}ms
@@ -64,10 +64,10 @@ const peerColumns: ColumnDef<PeerInfo>[] = [
     header: "Connected",
     cell: ({ row }) => {
       const connectedAt = row.original.connected_at ?? 0;
-      if (!connectedAt) return <span className="text-gray-500">N/A</span>;
+      if (!connectedAt) return <span className="text-[color:var(--fainter)]">N/A</span>;
       const connectedAgo = Math.floor(Date.now() / 1000 - connectedAt);
-      if (connectedAgo < 0 || connectedAgo > 86400 * 365) return <span className="text-gray-500">N/A</span>;
-      return <span className="text-gray-400">{formatDuration(connectedAgo)}</span>;
+      if (connectedAgo < 0 || connectedAgo > 86400 * 365) return <span className="text-[color:var(--fainter)]">N/A</span>;
+      return <span className="text-[color:var(--dim)]">{formatDuration(connectedAgo)}</span>;
     },
   },
 ];

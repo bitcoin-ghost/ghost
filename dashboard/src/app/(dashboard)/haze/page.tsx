@@ -128,7 +128,7 @@ export default function HazePage() {
         />
         <div className="space-y-5">
           {/* Explanation */}
-          <p className="text-gray-300 text-sm leading-relaxed">
+          <p className="text-[color:var(--dim)] text-sm leading-relaxed">
             Ghost Haze is a storage privacy layer that classifies and strips non-financial data from blocks
             before writing them to disk. Hazed nodes retain full transaction validity and UTXO integrity
             while ensuring no arbitrary embedded content is persisted locally. This lets node operators
@@ -137,44 +137,44 @@ export default function HazePage() {
 
           {/* 4-step exorcism pipeline */}
           <div>
-            <h4 className="text-gray-200 font-medium text-sm mb-3">The Exorcism Pipeline</h4>
+            <h4 className="text-[color:var(--fg)] font-medium text-sm mb-3">The Exorcism Pipeline</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div className="p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+              <div className="p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-amber-400 font-mono text-xs font-bold">1</span>
-                  <span className="text-gray-100 text-sm font-medium">Field Classification</span>
+                  <span className="text-[color:var(--accent)] font-mono text-xs font-bold">1</span>
+                  <span className="text-[color:var(--fg)] text-sm font-medium">Field Classification</span>
                 </div>
-                <p className="text-gray-400 text-xs leading-relaxed">
+                <p className="text-[color:var(--dim)] text-xs leading-relaxed">
                   The BUDS system classifies each field in a transaction — witness data, OP_RETURN payloads,
                   script patterns — into financial and non-financial categories.
                 </p>
               </div>
-              <div className="p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+              <div className="p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-amber-400 font-mono text-xs font-bold">2</span>
-                  <span className="text-gray-100 text-sm font-medium">Block Stripping</span>
+                  <span className="text-[color:var(--accent)] font-mono text-xs font-bold">2</span>
+                  <span className="text-[color:var(--fg)] text-sm font-medium">Block Stripping</span>
                 </div>
-                <p className="text-gray-400 text-xs leading-relaxed">
+                <p className="text-[color:var(--dim)] text-xs leading-relaxed">
                   Non-financial data is stripped from the block at the validation layer, before the block
                   is written to disk. Financial data and consensus-critical fields remain untouched.
                 </p>
               </div>
-              <div className="p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+              <div className="p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-amber-400 font-mono text-xs font-bold">3</span>
-                  <span className="text-gray-100 text-sm font-medium">GSB Storage</span>
+                  <span className="text-[color:var(--accent)] font-mono text-xs font-bold">3</span>
+                  <span className="text-[color:var(--fg)] text-sm font-medium">GSB Storage</span>
                 </div>
-                <p className="text-gray-400 text-xs leading-relaxed">
-                  Stripped blocks are stored in Ghost Stripped Block (<code className="text-amber-400">.gsb</code>) format —
+                <p className="text-[color:var(--dim)] text-xs leading-relaxed">
+                  Stripped blocks are stored in Ghost Stripped Block (<code className="text-[color:var(--accent)]">.gsb</code>) format —
                   a compact representation that preserves all data needed for chain validation.
                 </p>
               </div>
-              <div className="p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+              <div className="p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-amber-400 font-mono text-xs font-bold">4</span>
-                  <span className="text-gray-100 text-sm font-medium">UTXO Preservation</span>
+                  <span className="text-[color:var(--accent)] font-mono text-xs font-bold">4</span>
+                  <span className="text-[color:var(--fg)] text-sm font-medium">UTXO Preservation</span>
                 </div>
-                <p className="text-gray-400 text-xs leading-relaxed">
+                <p className="text-[color:var(--dim)] text-xs leading-relaxed">
                   All financial data and the UTXO set integrity are preserved. Your node can fully validate
                   the chain, spend coins, and participate in consensus without any embedded content on disk.
                 </p>
@@ -183,16 +183,16 @@ export default function HazePage() {
           </div>
 
           {/* Exorcist Mode A */}
-          <div className="p-3 bg-gray-800/50 rounded-lg border border-gray-700">
-            <h4 className="text-gray-200 font-medium text-sm mb-1">The Exorcist</h4>
-            <p className="text-gray-400 text-xs leading-relaxed">
+          <div className="p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
+            <h4 className="text-[color:var(--fg)] font-medium text-sm mb-1">The Exorcist</h4>
+            <p className="text-[color:var(--dim)] text-xs leading-relaxed">
               The Exorcist is the core component that performs the actual stripping. It runs inside
-              Ghost Core (<code className="text-amber-400">ghostd</code>) at the block acceptance layer,
+              Ghost Core (<code className="text-[color:var(--accent)]">ghostd</code>) at the block acceptance layer,
               intercepting blocks before they are serialized to disk.
             </p>
-            <div className="mt-2 p-2 bg-gray-900/50 rounded border border-gray-700">
-              <div className="text-xs text-gray-400 leading-relaxed">
-                <span className="text-amber-400 font-medium">Mode A (Active Stripping):</span> The Exorcist
+            <div className="mt-2 p-2 bg-[var(--surface)] rounded border border-[var(--rule-strong)]">
+              <div className="text-xs text-[color:var(--dim)] leading-relaxed">
+                <span className="text-[color:var(--accent)] font-medium">Mode A (Active Stripping):</span> The Exorcist
                 strips classified content before the block is written to disk. This is the default mode for
                 hazed nodes — blocks arrive from the network, get stripped in memory, and only the clean
                 version is persisted.
@@ -207,8 +207,8 @@ export default function HazePage() {
         {isLoading ? <SkeletonCard /> : error ? (
           <Card>
             <CardHeader title="Node Status" />
-            <div className="p-4 bg-red-900/20 border border-red-800 rounded-lg">
-              <p className="text-red-400 text-sm">
+            <div className="p-4 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
+              <p className="text-[color:var(--red)] text-sm">
                 Unable to fetch Ghost Haze status. Ensure Ghost Core is running and the Haze module is enabled.
               </p>
             </div>
@@ -225,19 +225,19 @@ export default function HazePage() {
                 />
               }
             />
-            <div className="divide-y divide-gray-800">
+            <div className="divide-y divide-[var(--rule)]">
               <StatusRow label="Storage Mode">
                 <Badge variant={getModeBadgeVariant(mode)}>
                   {getModeLabel(mode)}
                 </Badge>
               </StatusRow>
               <StatusRow label="Blocks Processed">
-                <span className="font-mono text-sm text-gray-100">
+                <span className="font-mono text-sm text-[color:var(--fg)]">
                   {haze?.blocks.toLocaleString() ?? 0}
                 </span>
               </StatusRow>
               <StatusRow label="Storage on Disk">
-                <span className="font-mono text-sm text-gray-100">
+                <span className="font-mono text-sm text-[color:var(--fg)]">
                   {haze ? formatStorageGB(haze.size_on_disk) : "--"}
                 </span>
               </StatusRow>
@@ -252,14 +252,14 @@ export default function HazePage() {
                 </Badge>
               </StatusRow>
               <StatusRow label="Chain">
-                <span className="font-mono text-sm text-gray-100">
+                <span className="font-mono text-sm text-[color:var(--fg)]">
                   {haze?.chain ?? "--"}
                 </span>
               </StatusRow>
             </div>
             {haze?.error && (
-              <div className="mt-4 p-3 bg-red-900/20 border border-red-800 rounded-lg">
-                <p className="text-red-400 text-sm">{haze.error}</p>
+              <div className="mt-4 p-3 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
+                <p className="text-[color:var(--red)] text-sm">{haze.error}</p>
               </div>
             )}
           </Card>
@@ -273,9 +273,9 @@ export default function HazePage() {
           subtitle="Legal compliance and data classification"
         />
         <div className="space-y-4">
-          <div className="p-4 bg-gray-800/50 rounded-lg">
-            <h4 className="text-amber-400 font-medium mb-2">No Illegal Content Storage</h4>
-            <p className="text-gray-300 text-sm leading-relaxed">
+          <div className="p-4 bg-[var(--surface)] rounded-lg">
+            <h4 className="text-[color:var(--accent)] font-medium mb-2">No Illegal Content Storage</h4>
+            <p className="text-[color:var(--dim)] text-sm leading-relaxed">
               Hazed nodes use the BUDS classification system to identify and strip non-financial data
               (OP_RETURN payloads, witness bloat, inscriptions, and other arbitrary content) before
               blocks are written to disk. This means your node never persists content that could
@@ -283,32 +283,32 @@ export default function HazePage() {
             </p>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="p-4 bg-gray-800/50 rounded-lg">
+            <div className="p-4 bg-[var(--surface)] rounded-lg">
               <div className="flex items-start gap-3">
-                <div className="w-8 h-8 rounded-full bg-green-900/30 border border-green-700 flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <svg className="w-4 h-4 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <div className="w-8 h-8 rounded-full bg-[var(--surface)] border border-[color:var(--green)] flex items-center justify-center flex-shrink-0 mt-0.5">
+                  <svg className="w-4 h-4 text-[color:var(--green)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
                   </svg>
                 </div>
                 <div>
-                  <h5 className="text-gray-100 font-medium text-sm">What is Preserved</h5>
-                  <p className="text-gray-400 text-xs mt-1">
+                  <h5 className="text-[color:var(--fg)] font-medium text-sm">What is Preserved</h5>
+                  <p className="text-[color:var(--dim)] text-xs mt-1">
                     All financial transaction data, UTXO set integrity, block headers, and consensus-critical
                     information remain intact. Your node can fully validate the chain.
                   </p>
                 </div>
               </div>
             </div>
-            <div className="p-4 bg-gray-800/50 rounded-lg">
+            <div className="p-4 bg-[var(--surface)] rounded-lg">
               <div className="flex items-start gap-3">
-                <div className="w-8 h-8 rounded-full bg-amber-900/30 border border-amber-700 flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <svg className="w-4 h-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <div className="w-8 h-8 rounded-full bg-[var(--surface)] border border-[color:var(--accent)] flex items-center justify-center flex-shrink-0 mt-0.5">
+                  <svg className="w-4 h-4 text-[color:var(--accent)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m0-10.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
                   </svg>
                 </div>
                 <div>
-                  <h5 className="text-gray-100 font-medium text-sm">What is Stripped</h5>
-                  <p className="text-gray-400 text-xs mt-1">
+                  <h5 className="text-[color:var(--fg)] font-medium text-sm">What is Stripped</h5>
+                  <p className="text-[color:var(--dim)] text-xs mt-1">
                     Arbitrary data embedded in OP_RETURN outputs, oversized witness data, inscriptions, and
                     other non-financial payloads are removed before storage.
                   </p>
@@ -316,8 +316,8 @@ export default function HazePage() {
               </div>
             </div>
           </div>
-          <div className="pt-2 border-t border-gray-700">
-            <p className="text-gray-400 text-xs mb-3">
+          <div className="pt-2 border-t border-[var(--rule-strong)]">
+            <p className="text-[color:var(--dim)] text-xs mb-3">
               BUDS classification specification and legal framework for operating a hazed node.
             </p>
             <a

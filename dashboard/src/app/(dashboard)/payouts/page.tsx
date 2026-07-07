@@ -61,7 +61,7 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
     id: "rank",
     header: "#",
     cell: ({ row }) => (
-      <span className="text-gray-500 text-sm">{row.index + 1}</span>
+      <span className="text-[color:var(--fainter)] text-sm">{row.index + 1}</span>
     ),
   },
   {
@@ -69,7 +69,7 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
     header: "Node",
     cell: ({ row }) => (
       <div className="flex items-center gap-2">
-        <span className="font-mono text-sm text-gray-300">
+        <span className="font-mono text-sm text-[color:var(--dim)]">
           {row.original.node_id.slice(0, 12)}...
         </span>
         {row.original.is_self && (
@@ -82,7 +82,7 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
     accessorKey: "balance_sats",
     header: "Balance",
     cell: ({ row }) => (
-      <span className="font-mono text-green-400">
+      <span className="font-mono text-[color:var(--green)]">
         {formatSats(row.original.balance_sats)}
       </span>
     ),
@@ -91,7 +91,7 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
     accessorKey: "total_credits_sats",
     header: "Lifetime Earned",
     cell: ({ row }) => (
-      <span className="font-mono text-gray-300">
+      <span className="font-mono text-[color:var(--dim)]">
         {formatSats(row.original.total_credits_sats)}
       </span>
     ),
@@ -100,7 +100,7 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
     accessorKey: "total_withdrawals_sats",
     header: "Withdrawn",
     cell: ({ row }) => (
-      <span className="font-mono text-gray-400">
+      <span className="font-mono text-[color:var(--dim)]">
         {formatSats(row.original.total_withdrawals_sats)}
       </span>
     ),
@@ -109,7 +109,7 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
     accessorKey: "last_credited_round",
     header: "Last Credit",
     cell: ({ row }) => (
-      <span className="text-gray-400 text-sm">
+      <span className="text-[color:var(--dim)] text-sm">
         Round #{row.original.last_credited_round}
       </span>
     ),
@@ -118,7 +118,7 @@ const nodeBalanceColumns: ColumnDef<NodeBalanceEntry>[] = [
     accessorKey: "updated_at",
     header: "Updated",
     cell: ({ row }) => (
-      <span className="text-gray-500 text-sm">
+      <span className="text-[color:var(--fainter)] text-sm">
         {formatTimestamp(row.original.updated_at)}
       </span>
     ),
@@ -236,11 +236,11 @@ export default function PayoutsPage() {
           <CardHeader title="Where Rewards Come From" subtitle="Nodes earn from multiple revenue streams" />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {REWARD_SOURCES.map((source) => (
-              <div key={source.name} className="flex items-start gap-3 p-3 bg-gray-800/30 rounded-lg">
+              <div key={source.name} className="flex items-start gap-3 p-3 bg-[var(--surface)] rounded-lg">
                 <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${source.color}`} />
                 <div>
-                  <div className="text-sm font-medium text-gray-200">{source.name}</div>
-                  <div className="text-xs text-gray-500 mt-0.5">{source.desc}</div>
+                  <div className="text-sm font-medium text-[color:var(--fg)]">{source.name}</div>
+                  <div className="text-xs text-[color:var(--fainter)] mt-0.5">{source.desc}</div>
                 </div>
               </div>
             ))}

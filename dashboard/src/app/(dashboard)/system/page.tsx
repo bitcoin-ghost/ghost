@@ -405,21 +405,21 @@ export default function SystemPage() {
           <Card>
             <CardHeader title="Version" />
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="p-4 bg-gray-800/50 rounded-lg">
-                <div className="text-sm text-gray-400 mb-1">Version</div>
-                <div className="text-xl font-bold text-orange-400">
+              <div className="p-4 bg-[var(--surface)] rounded-lg">
+                <div className="text-sm text-[color:var(--dim)] mb-1">Version</div>
+                <div className="text-xl font-bold text-[color:var(--accent)]">
                   {version?.version ?? version?.node_version ?? "Unknown"}
                 </div>
               </div>
-              <div className="p-4 bg-gray-800/50 rounded-lg">
-                <div className="text-sm text-gray-400 mb-1">Build Date</div>
-                <div className="text-gray-100">
+              <div className="p-4 bg-[var(--surface)] rounded-lg">
+                <div className="text-sm text-[color:var(--dim)] mb-1">Build Date</div>
+                <div className="text-[color:var(--fg)]">
                   {version?.build_time ? formatDate(version.build_time) : "Unknown"}
                 </div>
               </div>
-              <div className="p-4 bg-gray-800/50 rounded-lg">
-                <div className="text-sm text-gray-400 mb-1">Git Commit</div>
-                <code className="text-gray-300 text-sm">
+              <div className="p-4 bg-[var(--surface)] rounded-lg">
+                <div className="text-sm text-[color:var(--dim)] mb-1">Git Commit</div>
+                <code className="text-[color:var(--dim)] text-sm">
                   {version?.git_hash?.substring(0, 8) ?? "Unknown"}
                 </code>
               </div>
@@ -444,9 +444,9 @@ export default function SystemPage() {
             <div className="space-y-6">
               {/* Update Progress (visible only while updating) */}
               {isUpdating && updateStatus && (
-                <div className="space-y-4 p-4 bg-gray-800/50 rounded-lg">
+                <div className="space-y-4 p-4 bg-[var(--surface)] rounded-lg">
                   <div className="flex items-center justify-between">
-                    <span className="text-gray-300">Status</span>
+                    <span className="text-[color:var(--dim)]">Status</span>
                     <Badge variant={getStatusBadge(updateStatus.status).variant}>
                       {getStatusBadge(updateStatus.status).label}
                     </Badge>
@@ -460,14 +460,14 @@ export default function SystemPage() {
                         sublabel={`${updateStatus.progress.progress_percent}%`}
                         color="orange"
                       />
-                      <p className="text-sm text-gray-500">{updateStatus.progress.message}</p>
+                      <p className="text-sm text-[color:var(--fainter)]">{updateStatus.progress.message}</p>
                     </>
                   )}
 
                   {updateStatus.status === "verifying" && (
                     <div className="flex items-center gap-2">
-                      <div className="animate-spin w-4 h-4 border-2 border-orange-500 border-t-transparent rounded-full" />
-                      <span className="text-gray-400">Verifying SHA256 checksum...</span>
+                      <div className="animate-spin w-4 h-4 border-2 border-[color:var(--accent)] border-t-transparent rounded-full" />
+                      <span className="text-[color:var(--dim)]">Verifying SHA256 checksum...</span>
                     </div>
                   )}
                 </div>
@@ -476,16 +476,16 @@ export default function SystemPage() {
               {/* Available Update */}
               {hasUpdate && updateInfo ? (
                 <>
-                  <div className="p-4 bg-orange-900/20 border border-orange-700 rounded-lg">
+                  <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
                     <div className="flex items-start justify-between">
                       <div>
                         <div className="flex items-center gap-3 mb-2">
-                          <h3 className="text-lg font-bold text-orange-300">
+                          <h3 className="text-lg font-bold text-[color:var(--accent)]">
                             Version {updateInfo.version}
                           </h3>
                           <Badge variant="success">New</Badge>
                         </div>
-                        <p className="text-sm text-gray-400">
+                        <p className="text-sm text-[color:var(--dim)]">
                           Released {formatDate(updateInfo.release_date ?? "")} &middot;{" "}
                           {formatBytes(updateInfo.size_bytes ?? 0)}
                         </p>
@@ -501,10 +501,10 @@ export default function SystemPage() {
                   </div>
 
                   {updateInfo.changelog && (
-                    <div className="p-4 bg-gray-800/50 rounded-lg">
-                      <h4 className="text-sm font-medium text-gray-300 mb-3">Release Notes</h4>
+                    <div className="p-4 bg-[var(--surface)] rounded-lg">
+                      <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3">Release Notes</h4>
                       <div className="prose prose-sm prose-invert max-w-none">
-                        <pre className="text-sm text-gray-400 whitespace-pre-wrap font-sans">
+                        <pre className="text-sm text-[color:var(--dim)] whitespace-pre-wrap font-sans">
                           {updateInfo.changelog}
                         </pre>
                       </div>
@@ -514,10 +514,10 @@ export default function SystemPage() {
               ) : (
                 <div className="text-center py-6">
                   <div className="text-4xl mb-3">&#10003;</div>
-                  <h3 className="text-lg font-medium text-gray-100 mb-1">
+                  <h3 className="text-lg font-medium text-[color:var(--fg)] mb-1">
                     You&apos;re up to date!
                   </h3>
-                  <p className="text-gray-400 mb-4">
+                  <p className="text-[color:var(--dim)] mb-4">
                     Running version {updateCheck?.current_version ?? version?.version ?? version?.node_version}
                   </p>
                 </div>
@@ -534,16 +534,16 @@ export default function SystemPage() {
               </Button>
 
               {/* Automatic Updates (opt-in, default OFF). Shared with /settings/system. */}
-              <div className="pt-4 border-t border-gray-800">
+              <div className="pt-4 border-t border-[var(--rule)]">
                 <AutoUpdateSection />
               </div>
 
               {/* Rollback */}
-              <div className="pt-4 border-t border-gray-800">
+              <div className="pt-4 border-t border-[var(--rule)]">
                 <div className="flex items-center justify-between">
                   <div>
-                    <div className="text-sm font-medium text-gray-300">Rollback</div>
-                    <p className="text-xs text-gray-500 mt-0.5">
+                    <div className="text-sm font-medium text-[color:var(--dim)]">Rollback</div>
+                    <p className="text-xs text-[color:var(--fainter)] mt-0.5">
                       Revert to the previous version if an update causes issues. The node will restart.
                     </p>
                   </div>
@@ -560,9 +560,9 @@ export default function SystemPage() {
               </div>
 
               {/* About Updates */}
-              <div className="p-4 bg-orange-900/20 border border-orange-800 rounded-lg">
-                <h4 className="text-orange-300 font-medium mb-2">About Updates</h4>
-                <ul className="text-sm text-orange-300/80 space-y-1 list-disc list-inside">
+              <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
+                <h4 className="text-[color:var(--accent)] font-medium mb-2">About Updates</h4>
+                <ul className="text-sm text-[color:var(--accent)] space-y-1 list-disc list-inside">
                   <li>Updates are downloaded from official GitHub releases</li>
                   <li>SHA256 checksums are verified before installation</li>
                   <li>Current binaries are backed up before updating</li>
@@ -592,17 +592,17 @@ export default function SystemPage() {
             <div className="space-y-6">
               {/* ---------- L1 Pruning ---------- */}
               <div className="space-y-6">
-                <h4 className="text-sm font-medium text-gray-300 uppercase tracking-wider">L1 Pruning</h4>
+                <h4 className="text-sm font-medium text-[color:var(--dim)] uppercase tracking-wider">L1 Pruning</h4>
 
                 {/* Archive Mode Toggle */}
-                <div className="p-4 bg-gray-800/50 rounded-lg">
+                <div className="p-4 bg-[var(--surface)] rounded-lg">
                   <div className="flex items-center justify-between">
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="text-gray-100 font-medium">Archive Mode</span>
+                        <span className="text-[color:var(--fg)] font-medium">Archive Mode</span>
                         {archiveMode && <Badge variant="success">+5 Shares</Badge>}
                       </div>
-                      <p className="text-sm text-gray-400 mt-1">
+                      <p className="text-sm text-[color:var(--dim)] mt-1">
                         Store complete blockchain history. Disables all pruning and earns bonus shares.
                       </p>
                     </div>
@@ -618,41 +618,41 @@ export default function SystemPage() {
 
                 {/* Window Visualization */}
                 <div className="grid grid-cols-3 gap-4">
-                  <div className="p-4 bg-orange-900/20 border border-orange-800 rounded-lg">
-                    <div className="text-orange-400 font-medium mb-2">Validator Window (VW)</div>
-                    <div className="text-2xl font-bold text-gray-100">288 blocks</div>
-                    <div className="text-sm text-gray-400 mt-1">~2 days</div>
-                    <div className="mt-3 text-xs text-orange-300">
+                  <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
+                    <div className="text-[color:var(--accent)] font-medium mb-2">Validator Window (VW)</div>
+                    <div className="text-2xl font-bold text-[color:var(--fg)]">288 blocks</div>
+                    <div className="text-sm text-[color:var(--dim)] mt-1">~2 days</div>
+                    <div className="mt-3 text-xs text-[color:var(--accent)]">
                       Fixed - Bitcoin Core minimum for reorg safety
                     </div>
                   </div>
 
-                  <div className={`p-4 rounded-lg border ${archiveMode ? "bg-gray-800/30 border-gray-700" : "bg-orange-900/20 border-orange-800"}`}>
-                    <div className={`font-medium mb-2 ${archiveMode ? "text-gray-500" : "text-orange-400"}`}>
+                  <div className={`p-4 rounded-lg border ${archiveMode ? "bg-[var(--surface)] border-[var(--rule-strong)]" : "bg-[var(--surface)] border-[color:var(--accent)]"}`}>
+                    <div className={`font-medium mb-2 ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--accent)]"}`}>
                       Operator Window (OW)
                     </div>
-                    <div className={`text-2xl font-bold ${archiveMode ? "text-gray-500" : "text-gray-100"}`}>
+                    <div className={`text-2xl font-bold ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--fg)]"}`}>
                       {fullConfig?.pruning?.ow_blocks ?? 2016} blocks
                     </div>
-                    <div className="text-sm text-gray-400 mt-1">
+                    <div className="text-sm text-[color:var(--dim)] mt-1">
                       ~{formatDuration(fullConfig?.pruning?.ow_blocks ?? 2016)}
                     </div>
-                    <div className={`mt-3 text-xs ${archiveMode ? "text-gray-500" : "text-orange-300"}`}>
+                    <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--accent)]"}`}>
                       {archiveMode ? "Disabled (Archive Mode)" : "BUDS-based pruning applied here"}
                     </div>
                   </div>
 
-                  <div className={`p-4 rounded-lg border ${archiveMode ? "bg-green-900/20 border-green-800" : "bg-gray-800/30 border-gray-700"}`}>
-                    <div className={`font-medium mb-2 ${archiveMode ? "text-green-400" : "text-gray-500"}`}>
+                  <div className={`p-4 rounded-lg border ${archiveMode ? "bg-[var(--surface)] border-[color:var(--green)]" : "bg-[var(--surface)] border-[var(--rule-strong)]"}`}>
+                    <div className={`font-medium mb-2 ${archiveMode ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}`}>
                       Archive Window (AW)
                     </div>
-                    <div className={`text-2xl font-bold ${archiveMode ? "text-gray-100" : "text-gray-500"}`}>
+                    <div className={`text-2xl font-bold ${archiveMode ? "text-[color:var(--fg)]" : "text-[color:var(--fainter)]"}`}>
                       {archiveMode ? "Infinite" : "Pruned"}
                     </div>
-                    <div className="text-sm text-gray-400 mt-1">
+                    <div className="text-sm text-[color:var(--dim)] mt-1">
                       {archiveMode ? "All history retained" : "Data beyond OW is deleted"}
                     </div>
-                    <div className={`mt-3 text-xs ${archiveMode ? "text-green-300" : "text-gray-500"}`}>
+                    <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}`}>
                       {archiveMode ? "Full chain storage enabled" : "Enable Archive Mode for +5 shares"}
                     </div>
                   </div>
@@ -661,7 +661,7 @@ export default function SystemPage() {
                 {/* Operator Window Selection */}
                 {!archiveMode && (
                   <div className="space-y-3">
-                    <label className="text-sm font-medium text-gray-300">Operator Window Size</label>
+                    <label className="text-sm font-medium text-[color:var(--dim)]">Operator Window Size</label>
                     <div className="grid grid-cols-3 gap-3">
                       {OW_PRESETS.map((preset) => (
                         <button
@@ -670,13 +670,13 @@ export default function SystemPage() {
                           disabled={setOperatorWindow.isPending}
                           className={`p-3 rounded-lg border transition-colors text-left ${
                             fullConfig?.pruning?.ow_blocks === preset.blocks
-                              ? "bg-orange-900/30 border-orange-600 text-orange-300"
-                              : "bg-gray-800/50 border-gray-700 text-gray-300 hover:border-gray-500"
+                              ? "bg-[var(--surface)] border-[color:var(--accent)] text-[color:var(--accent)]"
+                              : "bg-[var(--surface)] border-[var(--rule-strong)] text-[color:var(--dim)] hover:border-[var(--rule-strong)]"
                           }`}
                         >
                           <div className="font-medium">{preset.label}</div>
-                          <div className="text-xs text-gray-500 mt-1">{preset.blocks} blocks</div>
-                          <div className="text-xs text-gray-400 mt-1">{preset.description}</div>
+                          <div className="text-xs text-[color:var(--fainter)] mt-1">{preset.blocks} blocks</div>
+                          <div className="text-xs text-[color:var(--dim)] mt-1">{preset.description}</div>
                         </button>
                       ))}
                     </div>
@@ -686,8 +686,8 @@ export default function SystemPage() {
                 {/* Prune Profile Selection */}
                 {!archiveMode && (
                   <div className="space-y-3">
-                    <label className="text-sm font-medium text-gray-300">BUDS Prune Profile</label>
-                    <p className="text-xs text-gray-500">
+                    <label className="text-sm font-medium text-[color:var(--dim)]">BUDS Prune Profile</label>
+                    <p className="text-xs text-[color:var(--fainter)]">
                       Controls which BUDS tiers are retained in the Operator Window
                     </p>
                     <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
@@ -698,13 +698,13 @@ export default function SystemPage() {
                           disabled={setPruneProfile.isPending}
                           className={`p-3 rounded-lg border transition-colors text-left ${
                             fullConfig?.pruning?.prune_profile === profile.value
-                              ? "bg-orange-900/30 border-orange-600 text-orange-300"
-                              : "bg-gray-800/50 border-gray-700 text-gray-300 hover:border-gray-500"
+                              ? "bg-[var(--surface)] border-[color:var(--accent)] text-[color:var(--accent)]"
+                              : "bg-[var(--surface)] border-[var(--rule-strong)] text-[color:var(--dim)] hover:border-[var(--rule-strong)]"
                           }`}
                         >
                           <div className="font-medium capitalize">{profile.label}</div>
-                          <div className="text-xs text-green-400 mt-1">Keep: {profile.keep}</div>
-                          <div className="text-xs text-red-400">Prune: {profile.prune}</div>
+                          <div className="text-xs text-[color:var(--green)] mt-1">Keep: {profile.keep}</div>
+                          <div className="text-xs text-[color:var(--red)]">Prune: {profile.prune}</div>
                         </button>
                       ))}
                     </div>
@@ -713,15 +713,15 @@ export default function SystemPage() {
               </div>
 
               {/* ---------- L2 Pruning ---------- */}
-              <div className="space-y-4 pt-4 border-t border-gray-800">
-                <h4 className="text-sm font-medium text-gray-300 uppercase tracking-wider">L2 Pruning (Ghost Pay)</h4>
+              <div className="space-y-4 pt-4 border-t border-[var(--rule)]">
+                <h4 className="text-sm font-medium text-[color:var(--dim)] uppercase tracking-wider">L2 Pruning (Ghost Pay)</h4>
 
                 {!ghostPayRunning ? (
-                  <div className="p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
+                  <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
                     <div className="flex items-center gap-2">
                       <Badge variant="warning">Ghost Pay Not Running</Badge>
                     </div>
-                    <p className="text-sm text-yellow-300 mt-2">
+                    <p className="text-sm text-[color:var(--accent)] mt-2">
                       Start ghost-pay-node to enable L2 functionality and see pruning status.
                     </p>
                   </div>
@@ -730,33 +730,33 @@ export default function SystemPage() {
                 ) : l2Pruning ? (
                   <>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                      <div className="p-4 bg-gray-800/50 rounded-lg">
-                        <div className="text-sm text-gray-400">Retention Period</div>
-                        <div className="text-xl font-bold text-gray-100 mt-1">
+                      <div className="p-4 bg-[var(--surface)] rounded-lg">
+                        <div className="text-sm text-[color:var(--dim)]">Retention Period</div>
+                        <div className="text-xl font-bold text-[color:var(--fg)] mt-1">
                           {l2Pruning.retention_days} days
                         </div>
                       </div>
-                      <div className="p-4 bg-gray-800/50 rounded-lg">
-                        <div className="text-sm text-gray-400">Auto Prune</div>
+                      <div className="p-4 bg-[var(--surface)] rounded-lg">
+                        <div className="text-sm text-[color:var(--dim)]">Auto Prune</div>
                         <div className="mt-1">
                           <Badge variant="success">Always On</Badge>
                         </div>
-                        <div className="text-xs text-gray-500 mt-1">
+                        <div className="text-xs text-[color:var(--fainter)] mt-1">
                           Every {l2Pruning.prune_interval_hours}h
                         </div>
                       </div>
-                      <div className="p-4 bg-gray-800/50 rounded-lg">
-                        <div className="text-sm text-gray-400">Last Prune</div>
-                        <div className="text-lg font-medium text-gray-100 mt-1">
+                      <div className="p-4 bg-[var(--surface)] rounded-lg">
+                        <div className="text-sm text-[color:var(--dim)]">Last Prune</div>
+                        <div className="text-lg font-medium text-[color:var(--fg)] mt-1">
                           {formatTimeAgo(l2Pruning.last_prune_timestamp ?? 0)}
                         </div>
-                        <div className="text-xs text-gray-500 mt-1">
+                        <div className="text-xs text-[color:var(--fainter)] mt-1">
                           {formatTimestamp(l2Pruning.last_prune_timestamp ?? 0)}
                         </div>
                       </div>
-                      <div className="p-4 bg-gray-800/50 rounded-lg">
-                        <div className="text-sm text-gray-400">Last Run Stats</div>
-                        <div className="text-sm text-gray-300 mt-2 space-y-1">
+                      <div className="p-4 bg-[var(--surface)] rounded-lg">
+                        <div className="text-sm text-[color:var(--dim)]">Last Run Stats</div>
+                        <div className="text-sm text-[color:var(--dim)] mt-2 space-y-1">
                           <div>Payments: {l2Pruning.payments_pruned}</div>
                           <div>Attestations: {l2Pruning.attestations_pruned}</div>
                           <div>Locks: {l2Pruning.locks_pruned}</div>
@@ -765,32 +765,32 @@ export default function SystemPage() {
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="p-4 bg-red-900/20 border border-red-800 rounded-lg">
-                        <h4 className="text-red-300 font-medium mb-3">What Gets Pruned</h4>
-                        <ul className="text-sm text-red-200/80 space-y-2">
+                      <div className="p-4 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
+                        <h4 className="text-[color:var(--red)] font-medium mb-3">What Gets Pruned</h4>
+                        <ul className="text-sm text-[color:var(--red)] space-y-2">
                           <li className="flex items-start gap-2">
-                            <span className="text-red-400 mt-0.5">&bull;</span>
+                            <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
                             <span>Payments (with ZK proofs) older than {l2Pruning.retention_days} days</span>
                           </li>
                           <li className="flex items-start gap-2">
-                            <span className="text-red-400 mt-0.5">&bull;</span>
+                            <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
                             <span>Attestations older than {l2Pruning.retention_days} days</span>
                           </li>
                           <li className="flex items-start gap-2">
-                            <span className="text-red-400 mt-0.5">&bull;</span>
+                            <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
                             <span>Closed locks (reconciled or jumped) older than {l2Pruning.retention_days} days</span>
                           </li>
                         </ul>
                       </div>
-                      <div className="p-4 bg-green-900/20 border border-green-800 rounded-lg">
-                        <h4 className="text-green-300 font-medium mb-3">What is Never Pruned</h4>
-                        <ul className="text-sm text-green-200/80 space-y-2">
+                      <div className="p-4 bg-[var(--surface)] border border-[color:var(--green)] rounded-lg">
+                        <h4 className="text-[color:var(--green)] font-medium mb-3">What is Never Pruned</h4>
+                        <ul className="text-sm text-[color:var(--green)] space-y-2">
                           <li className="flex items-start gap-2">
-                            <span className="text-green-400 mt-0.5">&bull;</span>
+                            <span className="text-[color:var(--green)] mt-0.5">&bull;</span>
                             <span>Active locks (regardless of age)</span>
                           </li>
                           <li className="flex items-start gap-2">
-                            <span className="text-green-400 mt-0.5">&bull;</span>
+                            <span className="text-[color:var(--green)] mt-0.5">&bull;</span>
                             <span>L2 block headers (contain state_root commitments)</span>
                           </li>
                         </ul>
@@ -798,33 +798,33 @@ export default function SystemPage() {
                     </div>
                   </>
                 ) : (
-                  <div className="p-4 bg-gray-800/50 rounded-lg text-gray-400">
+                  <div className="p-4 bg-[var(--surface)] rounded-lg text-[color:var(--dim)]">
                     Unable to fetch L2 pruning status. Ensure ghost-pay-node API is accessible.
                   </div>
                 )}
               </div>
 
               {/* Quick Reference Table */}
-              <div className="pt-4 border-t border-gray-800">
-                <h4 className="text-sm font-medium text-gray-300 mb-3">Quick Reference</h4>
+              <div className="pt-4 border-t border-[var(--rule)]">
+                <h4 className="text-sm font-medium text-[color:var(--dim)] mb-3">Quick Reference</h4>
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
-                      <tr className="text-left text-gray-400 border-b border-gray-800">
+                      <tr className="text-left text-[color:var(--dim)] border-b border-[var(--rule)]">
                         <th className="pb-3 font-medium">Layer</th>
                         <th className="pb-3 font-medium">Window</th>
                         <th className="pb-3 font-medium">Duration</th>
                         <th className="pb-3 font-medium">Behavior</th>
                       </tr>
                     </thead>
-                    <tbody className="text-gray-300">
-                      <tr className="border-b border-gray-800/50">
+                    <tbody className="text-[color:var(--dim)]">
+                      <tr className="border-b border-[var(--rule)]">
                         <td className="py-3">L1</td>
                         <td className="py-3">Validator (VW)</td>
                         <td className="py-3">288 blocks (~2 days)</td>
                         <td className="py-3">Full retention - Bitcoin Core minimum</td>
                       </tr>
-                      <tr className="border-b border-gray-800/50">
+                      <tr className="border-b border-[var(--rule)]">
                         <td className="py-3">L1</td>
                         <td className="py-3">Operator (OW)</td>
                         <td className="py-3">
@@ -836,7 +836,7 @@ export default function SystemPage() {
                             : `BUDS pruning (${fullConfig?.pruning?.prune_profile ?? "default"})`}
                         </td>
                       </tr>
-                      <tr className="border-b border-gray-800/50">
+                      <tr className="border-b border-[var(--rule)]">
                         <td className="py-3">L1</td>
                         <td className="py-3">Archive (AW)</td>
                         <td className="py-3">{archiveMode ? "Infinite" : "N/A"}</td>
@@ -869,9 +869,9 @@ export default function SystemPage() {
           <div className="space-y-6">
             {/* Export / Import buttons */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="p-4 bg-gray-800/50 rounded-lg">
-                <div className="text-gray-100 font-medium mb-1">Export Backup</div>
-                <p className="text-gray-400 text-sm mb-3">
+              <div className="p-4 bg-[var(--surface)] rounded-lg">
+                <div className="text-[color:var(--fg)] font-medium mb-1">Export Backup</div>
+                <p className="text-[color:var(--dim)] text-sm mb-3">
                   Create a full snapshot of this node&apos;s pool database (miners, shares,
                   rounds, payouts) and download it. The artifact is encrypted with this
                   node&apos;s own key.
@@ -881,9 +881,9 @@ export default function SystemPage() {
                 </Button>
               </div>
 
-              <div className="p-4 bg-gray-800/50 rounded-lg">
-                <div className="text-gray-100 font-medium mb-1">Import Backup</div>
-                <p className="text-gray-400 text-sm mb-3">
+              <div className="p-4 bg-[var(--surface)] rounded-lg">
+                <div className="text-[color:var(--fg)] font-medium mb-1">Import Backup</div>
+                <p className="text-[color:var(--dim)] text-sm mb-3">
                   Restore from a backup file. The artifact is verified, then staged and applied
                   atomically on the next ghost-pool restart (your current database is copied to a
                   safety backup first).
@@ -895,9 +895,9 @@ export default function SystemPage() {
             </div>
 
             {/* Backup History */}
-            <div className="pt-4 border-t border-gray-800">
+            <div className="pt-4 border-t border-[var(--rule)]">
               <div className="flex items-center justify-between mb-4">
-                <h4 className="text-sm font-medium text-gray-300">
+                <h4 className="text-sm font-medium text-[color:var(--dim)]">
                   Backup History ({backupHistory.length})
                 </h4>
               </div>
@@ -906,8 +906,8 @@ export default function SystemPage() {
                 <SkeletonCard />
               ) : backupHistory.length === 0 ? (
                 <div className="text-center py-6">
-                  <p className="text-gray-400">No backups created yet</p>
-                  <p className="text-sm text-gray-500 mt-1">
+                  <p className="text-[color:var(--dim)]">No backups created yet</p>
+                  <p className="text-sm text-[color:var(--fainter)] mt-1">
                     Create your first backup to protect your node data
                   </p>
                 </div>
@@ -916,15 +916,15 @@ export default function SystemPage() {
                   {backupHistory.map((backup, idx) => (
                     <div
                       key={`${backup.filename}-${idx}`}
-                      className="p-4 bg-gray-800/50 rounded-lg border border-gray-700"
+                      className="p-4 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]"
                     >
                       <div className="flex items-center justify-between">
                         <div>
                           <div className="flex items-center gap-2">
-                            <span className="text-gray-100 font-medium">{backup.filename}</span>
+                            <span className="text-[color:var(--fg)] font-medium">{backup.filename}</span>
                             <Badge variant="info">{formatBytes(backup.size_bytes ?? 0)}</Badge>
                           </div>
-                          <div className="text-sm text-gray-400 mt-1">
+                          <div className="text-sm text-[color:var(--dim)] mt-1">
                             Created: {formatTimestampDate(backup.created_at ?? 0)}
                           </div>
                         </div>
@@ -954,9 +954,9 @@ export default function SystemPage() {
             </div>
 
             {/* Backup Best Practices */}
-            <div className="p-4 bg-orange-900/20 border border-orange-800 rounded-lg">
-              <h4 className="text-orange-300 font-medium mb-2">Backup Best Practices</h4>
-              <ul className="text-sm text-orange-300/80 space-y-1 list-disc list-inside">
+            <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
+              <h4 className="text-[color:var(--accent)] font-medium mb-2">Backup Best Practices</h4>
+              <ul className="text-sm text-[color:var(--accent)] space-y-1 list-disc list-inside">
                 <li>Create regular backups before making configuration changes</li>
                 <li>Store backup files in a secure location separate from your node</li>
                 <li>The artifact is encrypted with this node&apos;s key — restore it on this node</li>
@@ -986,17 +986,17 @@ export default function SystemPage() {
         title="Install Update"
       >
         <div className="space-y-4">
-          <p className="text-gray-300">
+          <p className="text-[color:var(--dim)]">
             Are you sure you want to update to version{" "}
-            <strong className="text-white">{updateInfo?.version}</strong>?
+            <strong className="text-[color:var(--fg)]">{updateInfo?.version}</strong>?
           </p>
-          <div className="p-3 bg-orange-900/20 border border-orange-800 rounded">
-            <p className="text-sm text-orange-400">
+          <div className="p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded">
+            <p className="text-sm text-[color:var(--accent)]">
               The node will be stopped during the update and automatically restarted once complete.
               Your current version will be backed up in case you need to rollback.
             </p>
           </div>
-          <div className="flex gap-3 pt-4 border-t border-gray-800">
+          <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
             <Button
               variant="ghost"
               className="flex-1"
@@ -1023,16 +1023,16 @@ export default function SystemPage() {
         title="Rollback to Previous Version"
       >
         <div className="space-y-4">
-          <p className="text-gray-300">
+          <p className="text-[color:var(--dim)]">
             Are you sure you want to rollback to the previous version?
           </p>
-          <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded">
-            <p className="text-sm text-yellow-400">
+          <div className="p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded">
+            <p className="text-sm text-[color:var(--accent)]">
               This will restore the backup of your previous Ghost Node version.
               The node will restart after the rollback completes.
             </p>
           </div>
-          <div className="flex gap-3 pt-4 border-t border-gray-800">
+          <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
             <Button
               variant="ghost"
               className="flex-1"
@@ -1059,27 +1059,27 @@ export default function SystemPage() {
         title="Create Backup"
       >
         <div className="space-y-4">
-          <p className="text-sm text-gray-300">
+          <p className="text-sm text-[color:var(--dim)]">
             This creates a consistent, compact snapshot of this node&apos;s pool database
-            (<span className="font-mono text-gray-200">VACUUM INTO</span>) — miners, shares,
+            (<span className="font-mono text-[color:var(--fg)]">VACUUM INTO</span>) — miners, shares,
             rounds and payout records — and downloads it as a timestamped
-            <span className="font-mono text-gray-200"> .db</span> file.
+            <span className="font-mono text-[color:var(--fg)]"> .db</span> file.
           </p>
 
-          <div className="p-3 bg-gray-800/50 border border-gray-700 rounded space-y-1">
-            <p className="text-sm text-gray-300">
+          <div className="p-3 bg-[var(--surface)] border border-[var(--rule-strong)] rounded space-y-1">
+            <p className="text-sm text-[color:var(--dim)]">
               The artifact is encrypted with this node&apos;s own key: payout addresses stay
               field-encrypted, so no separate backup password is needed.
             </p>
           </div>
 
-          <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded">
-            <p className="text-yellow-400 text-sm">
+          <div className="p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded">
+            <p className="text-[color:var(--accent)] text-sm">
               Because it is bound to this node&apos;s key, restore this backup on this same node.
             </p>
           </div>
 
-          <div className="flex gap-3 pt-4 border-t border-gray-800">
+          <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
             <Button variant="ghost" className="flex-1" onClick={() => setExportDialogOpen(false)}>
               Cancel
             </Button>
@@ -1108,7 +1108,7 @@ export default function SystemPage() {
       >
         <div className="space-y-4">
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Backup File</label>
+            <label className="block text-sm text-[color:var(--dim)] mb-1">Backup File</label>
             <input
               ref={fileInputRef}
               type="file"
@@ -1153,20 +1153,20 @@ export default function SystemPage() {
             <div
               className={`p-4 rounded-lg border ${
                 verifyResult.valid
-                  ? "bg-green-900/20 border-green-800"
-                  : "bg-red-900/20 border-red-800"
+                  ? "bg-[var(--surface)] border-[color:var(--green)]"
+                  : "bg-[var(--surface)] border-[color:var(--red)]"
               }`}
             >
               <div className="flex items-center gap-2 mb-2">
                 <Badge variant={verifyResult.valid ? "success" : "error"}>
                   {verifyResult.valid ? "Valid" : "Invalid"}
                 </Badge>
-                <span className={verifyResult.valid ? "text-green-400" : "text-red-400"}>
+                <span className={verifyResult.valid ? "text-[color:var(--green)]" : "text-[color:var(--red)]"}>
                   {verifyResult.valid ? "Passed integrity + schema checks" : verifyResult.error}
                 </span>
               </div>
               {verifyResult.valid && verifyResult.info && (
-                <div className="text-sm text-gray-400 space-y-1">
+                <div className="text-sm text-[color:var(--dim)] space-y-1">
                   <p>Integrity: {verifyResult.info.integrity_ok ? "ok" : "failed"}</p>
                   <p>Schema version: {verifyResult.info.schema_version ?? "?"}</p>
                   <p>Tables: {verifyResult.info.table_count ?? 0}</p>
@@ -1181,8 +1181,8 @@ export default function SystemPage() {
           )}
 
           {!restartRequired && verifyResult?.valid && (
-            <div className="p-3 bg-yellow-900/20 border border-yellow-800 rounded">
-              <p className="text-yellow-400 text-sm">
+            <div className="p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded">
+              <p className="text-[color:var(--accent)] text-sm">
                 Restoring stages this artifact and applies it on the next ghost-pool restart.
                 Your current database is copied to a timestamped safety backup first, then
                 replaced. Restart the node to complete the restore.
@@ -1196,7 +1196,7 @@ export default function SystemPage() {
                 <Badge variant="info">Restart required</Badge>
                 <span className="text-blue-300">Restore staged</span>
               </div>
-              <p className="text-sm text-gray-400">
+              <p className="text-sm text-[color:var(--dim)]">
                 The backup was verified and staged. Restart ghost-pool (System &gt; Restart, or
                 the node&apos;s service manager) to apply it. The current database is copied to a
                 <span className="font-mono"> .pre-restore-*.db </span> safety backup automatically
@@ -1205,7 +1205,7 @@ export default function SystemPage() {
             </div>
           )}
 
-          <div className="flex gap-3 pt-4 border-t border-gray-800">
+          <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
             <Button
               variant="ghost"
               className="flex-1"

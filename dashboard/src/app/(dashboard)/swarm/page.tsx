@@ -47,7 +47,7 @@ function formatHashrate(th: number): string {
 // is wrapped in a <Tooltip> that carries the explanatory copy.
 function InfoIcon() {
   return (
-    <svg className="w-3 h-3 text-gray-600 inline-block mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <svg className="w-3 h-3 text-[color:var(--fainter)] inline-block mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <circle cx="12" cy="12" r="10" />
       <path d="M12 16v-4M12 8h.01" />
     </svg>
@@ -366,13 +366,13 @@ export default function SwarmPage() {
         actions={
           <>
             <Tooltip content={TOOLTIPS.viewToggle}>
-              <div className="flex rounded-lg border border-gray-700 overflow-hidden">
+              <div className="flex rounded-lg border border-[var(--rule-strong)] overflow-hidden">
                 <button
                   onClick={() => setViewMode("list")}
                   className={`px-3 py-1.5 text-sm ${
                     viewMode === "list"
-                      ? "bg-gray-700 text-white"
-                      : "bg-gray-800 text-gray-400 hover:text-white"
+                      ? "bg-[var(--accent)] text-white"
+                      : "bg-[var(--surface)] text-[color:var(--dim)] hover:text-[color:var(--fg)]"
                   }`}
                 >
                   List
@@ -381,8 +381,8 @@ export default function SwarmPage() {
                   onClick={() => setViewMode("grid")}
                   className={`px-3 py-1.5 text-sm ${
                     viewMode === "grid"
-                      ? "bg-gray-700 text-white"
-                      : "bg-gray-800 text-gray-400 hover:text-white"
+                      ? "bg-[var(--accent)] text-white"
+                      : "bg-[var(--surface)] text-[color:var(--dim)] hover:text-[color:var(--fg)]"
                   }`}
                 >
                   Grid
@@ -450,30 +450,30 @@ export default function SwarmPage() {
       {/* Local Node Setup Info */}
       <SectionErrorBoundary section="This Node">
         {nodeInfo && (
-          <Card className="border-orange-600/50">
+          <Card className="border-[color:var(--accent)]">
             <CardHeader
               title="This Node"
               subtitle="Use these details when adding this node to another swarm"
             />
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="p-3 bg-gray-800/50 rounded-lg">
+              <div className="p-3 bg-[var(--surface)] rounded-lg">
                 <Tooltip content={TOOLTIPS.nodeId}>
-                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Node ID</div>
+                  <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Node ID</div>
                 </Tooltip>
-                <div className="font-mono text-sm text-gray-100 break-all select-all">
+                <div className="font-mono text-sm text-[color:var(--fg)] break-all select-all">
                   {nodeInfo.node_id}
                 </div>
               </div>
-              <div className="p-3 bg-gray-800/50 rounded-lg">
+              <div className="p-3 bg-[var(--surface)] rounded-lg">
                 <Tooltip content={TOOLTIPS.connectionAddress}>
-                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Connection Address</div>
+                  <div className="text-xs text-[color:var(--fainter)] uppercase tracking-wide mb-1 inline-block"><InfoIcon /> Connection Address</div>
                 </Tooltip>
-                <div className="font-mono text-sm text-gray-100 mb-2 select-all">
+                <div className="font-mono text-sm text-[color:var(--fg)] mb-2 select-all">
                   {swarmData?.self?.address
                     ? `http://${swarmData.self.address}`
                     : "http://<your-ip>:8080"}
                 </div>
-                <p className="text-xs text-gray-500">
+                <p className="text-xs text-[color:var(--fainter)]">
                   {swarmData?.self?.address
                     ? "Other nodes can add this address to their swarm."
                     : "Template — replace <your-ip> with your public IP or hostname, then other nodes can add this address to their swarm."}
@@ -502,13 +502,13 @@ export default function SwarmPage() {
           /* Grid View - Compact cards */
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {nodes.map((node) => (
-              <Card key={node.node_id} className={node.address === "localhost" ? "border-orange-600/50" : ""}>
+              <Card key={node.node_id} className={node.address === "localhost" ? "border-[color:var(--accent)]" : ""}>
                 <div className="flex items-center justify-between mb-3">
                   <div className="flex items-center gap-2">
                     <span
                       className={`w-2.5 h-2.5 rounded-full ${node.online ? "bg-green-500" : "bg-red-500"}`}
                     />
-                    <span className="font-semibold text-gray-100">{node.name}</span>
+                    <span className="font-semibold text-[color:var(--fg)]">{node.name}</span>
                     {node.is_self && (
                       <Tooltip content={TOOLTIPS.you}>
                         <Badge variant="info" className="text-xs">
@@ -548,31 +548,31 @@ export default function SwarmPage() {
                   </div>
                 </div>
 
-                <div className="text-xs text-gray-400 mb-3 font-mono truncate">{node.address}</div>
+                <div className="text-xs text-[color:var(--dim)] mb-3 font-mono truncate">{node.address}</div>
 
                 <div className="grid grid-cols-2 gap-2 text-xs mb-3">
                   <Tooltip content={TOOLTIPS.l1Height}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> L1:</span>{" "}
-                      <span className="text-gray-300">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L1:</span>{" "}
+                      <span className="text-[color:var(--dim)]">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.l2Height}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> L2:</span>{" "}
-                      <span className="text-gray-300">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L2:</span>{" "}
+                      <span className="text-[color:var(--dim)]">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.peers}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> Peers:</span>{" "}
-                      <span className="text-gray-300">{orDash(node.peer_count, (v) => String(v))}</span>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> Peers:</span>{" "}
+                      <span className="text-[color:var(--dim)]">{orDash(node.peer_count, (v) => String(v))}</span>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.shares}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> Shares:</span>{" "}
-                      <span className="text-gray-300">{node.shares ?? 0}/{node.max_shares ?? 15}</span>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> Shares:</span>{" "}
+                      <span className="text-[color:var(--dim)]">{node.shares ?? 0}/{node.max_shares ?? 15}</span>
                     </div>
                   </Tooltip>
                 </div>
@@ -587,7 +587,7 @@ export default function SwarmPage() {
                   </div>
                 </Tooltip>
 
-                <div className="flex gap-1 pt-2 border-t border-gray-800">
+                <div className="flex gap-1 pt-2 border-t border-[var(--rule)]">
                   <Tooltip content={TOOLTIPS.edit}>
                     <Button variant="ghost" size="sm" onClick={() => handleEditClick(node)} className="text-xs px-2">
                       Edit
@@ -615,7 +615,7 @@ export default function SwarmPage() {
           /* List View - Full detail cards */
           <div className="space-y-4">
             {nodes.map((node) => (
-              <Card key={node.node_id} className={node.address === "localhost" ? "border-orange-600/50" : ""}>
+              <Card key={node.node_id} className={node.address === "localhost" ? "border-[color:var(--accent)]" : ""}>
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div className="flex items-center gap-3">
                     <span
@@ -623,8 +623,8 @@ export default function SwarmPage() {
                     />
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="text-lg font-semibold text-gray-100">{node.name}</span>
-                        <span className="text-gray-500 font-mono text-sm">
+                        <span className="text-lg font-semibold text-[color:var(--fg)]">{node.name}</span>
+                        <span className="text-[color:var(--fainter)] font-mono text-sm">
                           ({truncateId(node.node_id, 6)})
                         </span>
                         <Tooltip content={TOOLTIPS.statusOnline}>
@@ -650,15 +650,15 @@ export default function SwarmPage() {
                           </Badge>
                         )}
                       </div>
-                      <div className="text-sm text-gray-400 mt-1">{node.address}</div>
+                      <div className="text-sm text-[color:var(--dim)] mt-1">{node.address}</div>
                     </div>
                   </div>
                   <div className="text-right">
-                    <div className="text-lg font-bold text-gray-100">
+                    <div className="text-lg font-bold text-[color:var(--fg)]">
                       {orDash(node.balance_btc, (v) => `${formatBtc(v)} BTC`)}
                     </div>
                     <Tooltip content={TOOLTIPS.shares}>
-                      <div className="text-sm text-gray-400 inline-block">
+                      <div className="text-sm text-[color:var(--dim)] inline-block">
                         <InfoIcon /> {node.shares ?? 0}/{node.max_shares ?? 15} shares
                       </div>
                     </Tooltip>
@@ -668,16 +668,16 @@ export default function SwarmPage() {
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 text-sm">
                   <Tooltip content={TOOLTIPS.uptime}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> Uptime</span>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> Uptime</span>
                       <div
                         className={`font-medium ${
                           node.uptime_percent === undefined || node.uptime_percent === null
-                            ? "text-gray-400"
+                            ? "text-[color:var(--dim)]"
                             : node.uptime_percent >= 95
-                              ? "text-green-400"
+                              ? "text-[color:var(--green)]"
                               : node.uptime_percent >= 90
-                                ? "text-yellow-400"
-                                : "text-red-400"
+                                ? "text-[color:var(--accent)]"
+                                : "text-[color:var(--red)]"
                         }`}
                       >
                         {orDash(node.uptime_percent, formatUptime)}
@@ -686,20 +686,20 @@ export default function SwarmPage() {
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.peers}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> Peers</span>
-                      <div className="text-gray-100">{orDash(node.peer_count, (v) => String(v))}</div>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> Peers</span>
+                      <div className="text-[color:var(--fg)]">{orDash(node.peer_count, (v) => String(v))}</div>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.l1Height}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> L1 Height</span>
-                      <div className="text-gray-100 font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L1 Height</span>
+                      <div className="text-[color:var(--fg)] font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
                     </div>
                   </Tooltip>
                   <Tooltip content={TOOLTIPS.l2Height}>
                     <div>
-                      <span className="text-gray-500"><InfoIcon /> L2 Height</span>
-                      <div className="text-gray-100 font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
+                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L2 Height</span>
+                      <div className="text-[color:var(--fg)] font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
                     </div>
                   </Tooltip>
                 </div>
@@ -716,7 +716,7 @@ export default function SwarmPage() {
                   </div>
                 </Tooltip>
 
-                <div className="flex gap-2 mt-4 pt-4 border-t border-gray-800">
+                <div className="flex gap-2 mt-4 pt-4 border-t border-[var(--rule)]">
                   <Tooltip content={TOOLTIPS.edit}>
                     <Button
                       variant="secondary"
@@ -778,10 +778,10 @@ export default function SwarmPage() {
                   key={alert.id}
                   className={`p-3 rounded-lg flex items-start gap-3 ${
                     alert.severity === "error"
-                      ? "bg-red-900/20 border border-red-800"
+                      ? "bg-[var(--surface)] border border-[color:var(--red)]"
                       : alert.severity === "warning"
-                        ? "bg-yellow-900/20 border border-yellow-800"
-                        : "bg-orange-900/20 border border-orange-800"
+                        ? "bg-[var(--surface)] border border-[color:var(--accent)]"
+                        : "bg-[var(--surface)] border border-[color:var(--accent)]"
                   }`}
                 >
                   <span
@@ -799,15 +799,15 @@ export default function SwarmPage() {
                     <p
                       className={`${
                         alert.severity === "error"
-                          ? "text-red-400"
+                          ? "text-[color:var(--red)]"
                           : alert.severity === "warning"
-                            ? "text-yellow-400"
-                            : "text-orange-400"
+                            ? "text-[color:var(--accent)]"
+                            : "text-[color:var(--accent)]"
                       }`}
                     >
                       {alert.message}
                     </p>
-                    <p className="text-xs text-gray-500 mt-1">
+                    <p className="text-xs text-[color:var(--fainter)] mt-1">
                       {new Date((alert.timestamp ?? 0) * 1000).toLocaleString()}
                     </p>
                   </div>
@@ -826,7 +826,7 @@ export default function SwarmPage() {
       >
         <div className="space-y-4">
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Node Name</label>
+            <label className="block text-sm text-[color:var(--dim)] mb-1">Node Name</label>
             <Input
               value={newNodeName}
               onChange={(e) => setNewNodeName(e.target.value)}
@@ -835,18 +835,18 @@ export default function SwarmPage() {
           </div>
 
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Node Address</label>
+            <label className="block text-sm text-[color:var(--dim)] mb-1">Node Address</label>
             <Input
               value={newNodeAddress}
               onChange={(e) => setNewNodeAddress(e.target.value)}
               placeholder="e.g., 192.168.1.100:8080"
             />
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-[color:var(--fainter)] mt-1">
               The node must have API access enabled for remote connections
             </p>
           </div>
 
-          <div className="flex gap-3 pt-4 border-t border-gray-800">
+          <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
             <Button variant="ghost" className="flex-1" onClick={() => setAddDialogOpen(false)}>
               Cancel
             </Button>
@@ -871,7 +871,7 @@ export default function SwarmPage() {
       >
         <div className="space-y-4">
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Node Name</label>
+            <label className="block text-sm text-[color:var(--dim)] mb-1">Node Name</label>
             <Input
               value={editNodeName}
               onChange={(e) => setEditNodeName(e.target.value)}
@@ -881,19 +881,19 @@ export default function SwarmPage() {
 
           {selectedNode?.address !== "localhost" && (
             <div>
-              <label className="block text-sm text-gray-400 mb-1">Node Address</label>
+              <label className="block text-sm text-[color:var(--dim)] mb-1">Node Address</label>
               <Input
                 value={editNodeAddress}
                 onChange={(e) => setEditNodeAddress(e.target.value)}
                 placeholder="e.g., 192.168.1.100:8080"
               />
-              <p className="text-xs text-gray-500 mt-1">
+              <p className="text-xs text-[color:var(--fainter)] mt-1">
                 Do not include http:// prefix
               </p>
             </div>
           )}
 
-          <div className="flex gap-3 pt-4 border-t border-gray-800">
+          <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
             <Button variant="ghost" className="flex-1" onClick={() => setEditDialogOpen(false)}>
               Cancel
             </Button>
@@ -917,9 +917,9 @@ export default function SwarmPage() {
         title="Update All Swarm Nodes"
       >
         <div className="space-y-4">
-          <div className="p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
-            <p className="text-yellow-300 text-sm font-medium mb-2">Warning</p>
-            <p className="text-yellow-200/80 text-sm">
+          <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
+            <p className="text-[color:var(--accent)] text-sm font-medium mb-2">Warning</p>
+            <p className="text-[color:var(--accent)] text-sm">
               This will initiate updates on ALL {nodes.length} nodes in the swarm.
               Each node will download the update from GitHub and restart.
               Rollback must be done individually on each node if needed.
@@ -927,19 +927,19 @@ export default function SwarmPage() {
           </div>
 
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Version</label>
+            <label className="block text-sm text-[color:var(--dim)] mb-1">Version</label>
             <Input
               value={updateVersion}
               onChange={(e) => setUpdateVersion(e.target.value)}
               placeholder="e.g., 0.2.0 or v0.2.0"
             />
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-[color:var(--fainter)] mt-1">
               Enter the release version from GitHub (e.g., 0.2.0)
             </p>
           </div>
 
-          <div className="p-3 bg-gray-800/50 rounded-lg">
-            <p className="text-sm text-gray-300 mb-2">Nodes to update:</p>
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
+            <p className="text-sm text-[color:var(--dim)] mb-2">Nodes to update:</p>
             <div className="flex flex-wrap gap-2">
               {nodes.map((node) => (
                 <Badge
@@ -952,7 +952,7 @@ export default function SwarmPage() {
             </div>
           </div>
 
-          <div className="flex gap-3 pt-4 border-t border-gray-800">
+          <div className="flex gap-3 pt-4 border-t border-[var(--rule)]">
             <Button
               variant="ghost"
               className="flex-1"

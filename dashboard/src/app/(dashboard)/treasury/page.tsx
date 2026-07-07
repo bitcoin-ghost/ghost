@@ -43,7 +43,7 @@ function TreasuryDetails() {
 
   const phase = treasury.phase ?? "bootstrap";
   const phaseLabel = { bootstrap: "Bootstrap", decay: "Decay", ossified: "Ossified" }[phase] ?? "Unknown";
-  const phaseColor = { bootstrap: "text-yellow-400", decay: "text-orange-400", ossified: "text-green-400" }[phase] ?? "text-gray-400";
+  const phaseColor = { bootstrap: "text-[color:var(--accent)]", decay: "text-[color:var(--accent)]", ossified: "text-[color:var(--green)]" }[phase] ?? "text-[color:var(--dim)]";
 
   return (
     <>
@@ -52,10 +52,10 @@ function TreasuryDetails() {
         <CardHeader title="Treasury Progress" />
         <div className="space-y-4">
           <div className="flex justify-between text-sm mb-1">
-            <span className="text-gray-400">Accumulated</span>
-            <span className="text-gray-100">
+            <span className="text-[color:var(--dim)]">Accumulated</span>
+            <span className="text-[color:var(--fg)]">
               {formatBtc(treasury.accumulated_btc ?? 0)} / {(treasury.target_btc ?? 21).toFixed(1)} BTC
-              <span className="text-gray-500 ml-2">({(treasury.progress_percent ?? 0).toFixed(1)}%)</span>
+              <span className="text-[color:var(--fainter)] ml-2">({(treasury.progress_percent ?? 0).toFixed(1)}%)</span>
             </span>
           </div>
           <ProgressBar value={treasury.progress_percent ?? 0} color="orange" size="lg" />
@@ -67,27 +67,27 @@ function TreasuryDetails() {
         <CardHeader title="Phase Details" />
         <div className="space-y-3">
           <div className="flex justify-between">
-            <span className="text-gray-400">Current Phase</span>
+            <span className="text-[color:var(--dim)]">Current Phase</span>
             <span className={`font-semibold ${phaseColor}`}>{phaseLabel}</span>
           </div>
           <div className="flex justify-between">
-            <span className="text-gray-400">Treasury Share</span>
-            <span className="font-mono text-gray-100">{(treasury.treasury_percent ?? 50).toFixed(0)}% of block rewards</span>
+            <span className="text-[color:var(--dim)]">Treasury Share</span>
+            <span className="font-mono text-[color:var(--fg)]">{(treasury.treasury_percent ?? 50).toFixed(0)}% of block rewards</span>
           </div>
           <div className="flex justify-between">
-            <span className="text-gray-400">Node Pool Share</span>
-            <span className="font-mono text-gray-100">{(treasury.node_pool_percent ?? 50).toFixed(0)}% of block rewards</span>
+            <span className="text-[color:var(--dim)]">Node Pool Share</span>
+            <span className="font-mono text-[color:var(--fg)]">{(treasury.node_pool_percent ?? 50).toFixed(0)}% of block rewards</span>
           </div>
           {treasury.decay_started && treasury.decay_year != null && (
             <div className="flex justify-between">
-              <span className="text-gray-400">Decay Year</span>
-              <span className="font-mono text-gray-100">Year {treasury.decay_year}</span>
+              <span className="text-[color:var(--dim)]">Decay Year</span>
+              <span className="font-mono text-[color:var(--fg)]">Year {treasury.decay_year}</span>
             </div>
           )}
           {treasury.blocks_until_full != null && treasury.blocks_until_full > 0 && (
             <div className="flex justify-between">
-              <span className="text-gray-400">Blocks Until Full</span>
-              <span className="font-mono text-gray-100">{treasury.blocks_until_full.toLocaleString()}</span>
+              <span className="text-[color:var(--dim)]">Blocks Until Full</span>
+              <span className="font-mono text-[color:var(--fg)]">{treasury.blocks_until_full.toLocaleString()}</span>
             </div>
           )}
         </div>
@@ -103,7 +103,7 @@ function TreasuryDetails() {
             const isPast = treasury.decay_started && treasury.decay_year != null && step.year < decayYear;
             const isOssified = treasury.phase === "ossified";
 
-            let dotColor = "bg-gray-600";
+            let dotColor = "bg-[var(--surface)]";
             if (isOssified && step.year === 5) dotColor = "bg-green-500";
             else if (isCurrentYear) dotColor = "bg-orange-500 animate-pulse";
             else if (isPast) dotColor = "bg-orange-400";
@@ -113,8 +113,8 @@ function TreasuryDetails() {
               <Tooltip key={step.year} content={`Treasury: ${(step.treasury * 100).toFixed(0)}% / Node Pool: ${(step.nodePool * 100).toFixed(0)}%`}>
                 <div className="flex flex-col items-center flex-1">
                   <div className={`w-3.5 h-3.5 rounded-full ${dotColor}`} />
-                  <div className="text-xs text-gray-500 mt-1.5">{step.label}</div>
-                  <div className="text-[10px] text-gray-600 mt-0.5">
+                  <div className="text-xs text-[color:var(--fainter)] mt-1.5">{step.label}</div>
+                  <div className="text-[10px] text-[color:var(--fainter)] mt-0.5">
                     {(step.treasury * 100).toFixed(0)}% / {(step.nodePool * 100).toFixed(0)}%
                   </div>
                 </div>
