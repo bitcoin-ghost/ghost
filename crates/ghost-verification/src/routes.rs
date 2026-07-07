@@ -24,9 +24,9 @@
 
 use axum::{
     extract::{ws::WebSocketUpgrade, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -554,13 +554,11 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             get(api_backup_export_handler).post(api_backup_export_handler),
         )
         .route(
-            "/api/v1/backup/import",
-            get(api_backup_import_handler).post(api_backup_import_handler),
+            "/api/v1/backup/download/:filename",
+            get(api_backup_download_handler),
         )
-        .route(
-            "/api/v1/backup/verify",
-            get(api_backup_verify_handler).post(api_backup_verify_handler),
-        )
+        .route("/api/v1/backup/import", post(api_backup_import_handler))
+        .route("/api/v1/backup/verify", post(api_backup_verify_handler))
         .route(
             "/api/v1/backup/delete/:filename",
             delete(api_backup_delete_handler),
@@ -7099,36 +7097,454 @@ async fn api_watchdog_clear_cache_handler(
 // ============================================================================
 // Backup Endpoints
 // ============================================================================
+//
+// These endpoints drive the dashboard "Backup & Restore" card against the REAL
+// backup path (`Database::backup` = `VACUUM INTO`, the same routine the daily
+// and scheduled-backup tasks use). The produced artifact is a consistent,
+// compact copy of the live pool database and inherits whatever at-rest
+// protection the live DB has (payout addresses stay field-encrypted under the
+// node's P-4 key; if the DB itself is SQLCipher-encrypted the copy is encrypted
+// under the same key). Nothing here fabricates success — export writes a real
+// file, verify runs a real integrity/structure check, and import stages a
+// verified artifact for an atomic swap on the next restart.
 
-/// API v1 Backup export handler
-async fn api_backup_export_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "idle",
-        "message": "Backup export not started"
-    }))
+/// Uploaded-artifact request body for verify/import. `file_content` is the
+/// backup file as standard base64 (the dashboard reads the file client-side and
+/// sends it through the HMAC-signing proxy as text-safe base64).
+#[derive(Debug, Deserialize)]
+struct BackupArtifactRequest {
+    #[serde(default)]
+    file_content: String,
 }
 
-/// API v1 Backup import handler
+/// Base directories a backup artifact is allowed to live under (M-15). Mirrors
+/// the allow-list the backup-history endpoint enforces, so export/download/
+/// delete all honour the same traversal guard.
+fn backup_allowed_bases() -> [std::path::PathBuf; 4] {
+    [
+        std::path::PathBuf::from("/home/ghost/.ghost"),
+        std::path::PathBuf::from("/var/lib/ghost"),
+        std::path::PathBuf::from("/tmp/ghost-backups"),
+        std::path::PathBuf::from("/opt/ghost"),
+    ]
+}
+
+/// Whether a canonical directory sits within an allowed base (M-15).
+fn backup_dir_within_allowed(canonical: &std::path::Path) -> bool {
+    backup_allowed_bases().iter().any(|base| match base.canonicalize() {
+        Ok(canonical_base) => canonical.starts_with(&canonical_base),
+        Err(_) => canonical.starts_with(base),
+    })
+}
+
+/// Resolve + validate the configured backup directory. Enforces the same M-15
+/// guards as the history endpoint (absolute, canonicalised, within an allowed
+/// base). When `create`, the directory is created first so an export can write
+/// into a not-yet-existing dir.
+fn resolve_backup_dir(
+    state: &VerificationState,
+    create: bool,
+) -> Result<std::path::PathBuf, String> {
+    let raw = { state.dashboard_config.read().backup_dir.clone() };
+    let p = std::path::Path::new(&raw);
+    if !p.is_absolute() {
+        return Err("Backup directory must be an absolute path".to_string());
+    }
+    if create {
+        std::fs::create_dir_all(p)
+            .map_err(|e| format!("Failed to create backup directory: {}", e))?;
+    }
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("Invalid backup directory path: {}", e))?;
+    if !backup_dir_within_allowed(&canonical) {
+        return Err("Backup directory must be within allowed paths".to_string());
+    }
+    Ok(canonical)
+}
+
+/// Validate an artifact filename (no path components / traversal, `.db`/`.backup`
+/// only) and join it under `dir`.
+fn resolve_backup_file(
+    dir: &std::path::Path,
+    filename: &str,
+) -> Result<std::path::PathBuf, String> {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return Err("Invalid backup filename".to_string());
+    }
+    let path = dir.join(filename);
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("db") | Some("backup") => Ok(path),
+        _ => Err("Invalid backup file extension".to_string()),
+    }
+}
+
+/// Timestamped filename for a manual backup: `ghost-manual-YYYYMMDD-HHMMSS.db`.
+/// The `ghost-manual-` prefix keeps manual artifacts distinct from the scheduled
+/// `ghost-backup-` ones (so the scheduled retention prune never removes them),
+/// and the `.db` extension makes them show up in the backup-history list.
+fn manual_backup_filename(unix_secs: u64) -> String {
+    use chrono::{TimeZone, Utc};
+    let stamp = Utc
+        .timestamp_opt(unix_secs as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y%m%d-%H%M%S").to_string())
+        .unwrap_or_else(|| format!("{unix_secs:012}"));
+    format!("ghost-manual-{stamp}.db")
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A unique scratch path adjacent to the live DB for an uploaded artifact.
+/// Placing it beside the live DB keeps it on the same filesystem as the restore
+/// staging path, so the import rename is atomic.
+fn artifact_temp_path(db_path: &str, tag: &str) -> std::path::PathBuf {
+    let parent = std::path::Path::new(db_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".ghost-{}-{}-{}.tmp", tag, std::process::id(), nanos))
+}
+
+/// Write uploaded artifact bytes to `path` with restrictive (0600) permissions.
+fn write_artifact_temp(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Standard error envelope for backup endpoints.
+fn backup_error(status: StatusCode, msg: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "success": false, "error": msg })),
+    )
+        .into_response()
+}
+
+/// Decode a base64 uploaded artifact into raw bytes.
+fn decode_artifact(file_content: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(file_content.trim())
+        .map_err(|e| format!("invalid file encoding: {}", e))?;
+    if bytes.is_empty() {
+        return Err("uploaded backup file is empty".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Render a [`ghost_storage::BackupVerification`] into the dashboard-facing
+/// `VerifyBackupResponse` shape.
+fn verification_to_json(v: &ghost_storage::BackupVerification) -> serde_json::Value {
+    serde_json::json!({
+        "valid": v.valid,
+        "error": if v.valid { serde_json::Value::Null } else {
+            serde_json::Value::String(
+                v.detail.clone().unwrap_or_else(|| "backup failed verification".to_string())
+            )
+        },
+        "info": {
+            "integrity_ok": v.integrity_ok,
+            "encrypted": v.encrypted,
+            "schema_version": v.schema_version,
+            "table_count": v.table_count,
+            "miner_count": v.miner_count,
+            "missing_tables": v.missing_tables,
+            "size_bytes": v.size_bytes,
+            "checksum_valid": v.integrity_ok,
+        }
+    })
+}
+
+/// API v1 Backup export handler.
+///
+/// Runs `Database::backup` (VACUUM INTO) into the configured backup directory
+/// under a timestamped `ghost-manual-*.db` name and returns the filename +
+/// metadata. The dashboard then downloads the bytes via
+/// `GET /api/v1/backup/download/:filename`. The body (if any) is ignored — the
+/// artifact is a full snapshot encrypted with the node's own key, so there is
+/// no per-request password or partial-selection to honour.
+async fn api_backup_export_handler(State(state): State<Arc<VerificationState>>) -> Response {
+    let Some(db) = state.database.clone() else {
+        return backup_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database is not available on this node",
+        );
+    };
+    let dir = match resolve_backup_dir(&state, true) {
+        Ok(d) => d,
+        Err(e) => return backup_error(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let created_at = now_unix();
+    let filename = manual_backup_filename(created_at);
+    let path = dir.join(&filename);
+
+    // VACUUM INTO is blocking DB + filesystem work — keep it off the async worker.
+    let path_for_task = path.clone();
+    let result = tokio::task::spawn_blocking(move || db.backup(&path_for_task)).await;
+
+    match result {
+        Ok(Ok(())) => {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            info!(filename = %filename, size_bytes = size, "Manual backup export created");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "filename": filename,
+                    "size_bytes": size,
+                    "created_at": created_at,
+                    "download_url": format!("/api/v1/backup/download/{}", filename),
+                    "message": "Encrypted backup created"
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            error!(error = %e, "Manual backup export failed");
+            backup_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("backup failed: {}", e),
+            )
+        }
+        Err(e) => backup_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("backup task failed: {}", e),
+        ),
+    }
+}
+
+/// API v1 Backup download handler — streams an artifact from the backup dir with
+/// an attachment disposition. Path-guarded like the history endpoint.
+async fn api_backup_download_handler(
+    State(state): State<Arc<VerificationState>>,
+    Path(filename): Path<String>,
+) -> Response {
+    let dir = match resolve_backup_dir(&state, false) {
+        Ok(d) => d,
+        Err(e) => return backup_error(StatusCode::BAD_REQUEST, &e),
+    };
+    let path = match resolve_backup_file(&dir, &filename) {
+        Ok(p) => p,
+        Err(e) => return backup_error(StatusCode::BAD_REQUEST, &e),
+    };
+    // Canonicalize + confirm the resolved file is directly inside the backup dir
+    // (defeats symlink escapes), matching the M-15 history guard.
+    let canonical = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return backup_error(StatusCode::NOT_FOUND, "backup file not found"),
+    };
+    if canonical.parent() != Some(dir.as_path()) {
+        return backup_error(StatusCode::BAD_REQUEST, "invalid backup path");
+    }
+
+    let bytes = match tokio::fs::read(&canonical).await {
+        Ok(b) => b,
+        Err(e) => {
+            return backup_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to read backup: {}", e),
+            )
+        }
+    };
+
+    let safe_name = filename.replace(['"', '\\'], "");
+    let disposition = format!("attachment; filename=\"{}\"", safe_name);
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// API v1 Backup import (restore) handler.
+///
+/// SAFE restore: the uploaded artifact is written to a temp file, VERIFIED with
+/// the same integrity/structure check as `/verify`, and — only if it passes —
+/// staged next to the live DB as `<db>.restore-pending`. The live database is
+/// NOT touched in-process (that would corrupt a running WAL DB). The swap is
+/// applied atomically on the next startup by `apply_pending_restore`, which
+/// first copies the current DB to a timestamped `.pre-restore-*.db` safety
+/// backup. The response therefore reports `restart_required: true`.
 async fn api_backup_import_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "idle",
-        "message": "No backup import in progress"
-    }))
+    State(state): State<Arc<VerificationState>>,
+    Json(req): Json<BackupArtifactRequest>,
+) -> Response {
+    let Some(db) = state.database.clone() else {
+        return backup_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database is not available on this node",
+        );
+    };
+    let db_path = db.path().to_string();
+    if db_path == ":memory:" {
+        return backup_error(
+            StatusCode::BAD_REQUEST,
+            "cannot restore into an in-memory database",
+        );
+    }
+
+    let bytes = match decode_artifact(&req.file_content) {
+        Ok(b) => b,
+        Err(e) => return backup_error(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let tmp = artifact_temp_path(&db_path, "restore-upload");
+    if let Err(e) = write_artifact_temp(&tmp, &bytes) {
+        return backup_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to stage uploaded backup: {}", e),
+        );
+    }
+
+    // Verify BEFORE touching anything durable.
+    let db_verify = db.clone();
+    let tmp_verify = tmp.clone();
+    let verification =
+        tokio::task::spawn_blocking(move || db_verify.verify_backup_file(&tmp_verify)).await;
+
+    let v = match verification {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tmp);
+            return backup_error(
+                StatusCode::BAD_REQUEST,
+                &format!("could not verify uploaded backup: {}", e),
+            );
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return backup_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("verify task failed: {}", e),
+            );
+        }
+    };
+
+    if !v.valid {
+        let _ = std::fs::remove_file(&tmp);
+        let detail = v.detail.unwrap_or_else(|| "failed verification".to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "restart_required": false,
+                "error": format!("refusing to restore: uploaded file failed verification ({})", detail)
+            })),
+        )
+            .into_response();
+    }
+
+    // Stage the validated artifact for the atomic startup swap.
+    let staged = ghost_storage::pending_restore_path(std::path::Path::new(&db_path));
+    if let Err(e) = std::fs::rename(&tmp, &staged) {
+        // Cross-device fallback (temp + staged should be same fs, but be safe).
+        if std::fs::copy(&tmp, &staged).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return backup_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to stage restore: {}", e),
+            );
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    info!(
+        staged = %staged.display(),
+        schema_version = v.schema_version,
+        miner_count = v.miner_count,
+        "Backup verified and staged for restore on next restart"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "restart_required": true,
+            "staged_path": staged.to_string_lossy(),
+            "message": "Backup verified and staged. Restart ghost-pool to apply the restore; \
+                        the current database is copied to a timestamped .pre-restore backup \
+                        automatically before the swap."
+        })),
+    )
+        .into_response()
 }
 
-/// API v1 Backup verify handler
+/// API v1 Backup verify handler — decodes the uploaded artifact, runs the real
+/// integrity + Ghost-schema check, and returns a genuine pass/fail with detail.
 async fn api_backup_verify_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "ok",
-        "valid": true,
-        "message": "Backup verification status"
-    }))
+    State(state): State<Arc<VerificationState>>,
+    Json(req): Json<BackupArtifactRequest>,
+) -> Response {
+    let Some(db) = state.database.clone() else {
+        return backup_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database is not available on this node",
+        );
+    };
+
+    let bytes = match decode_artifact(&req.file_content) {
+        Ok(b) => b,
+        // A decode failure is a genuine "invalid backup" verdict, not an HTTP error.
+        Err(e) => {
+            return Json(serde_json::json!({
+                "valid": false,
+                "error": e,
+                "info": serde_json::Value::Null
+            }))
+            .into_response()
+        }
+    };
+
+    let db_path = db.path().to_string();
+    let tmp = artifact_temp_path(&db_path, "verify-upload");
+    if let Err(e) = write_artifact_temp(&tmp, &bytes) {
+        return backup_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to stage uploaded backup: {}", e),
+        );
+    }
+
+    let tmp_verify = tmp.clone();
+    let verification =
+        tokio::task::spawn_blocking(move || db.verify_backup_file(&tmp_verify)).await;
+    let _ = std::fs::remove_file(&tmp);
+
+    match verification {
+        Ok(Ok(v)) => Json(verification_to_json(&v)).into_response(),
+        Ok(Err(e)) => Json(serde_json::json!({
+            "valid": false,
+            "error": format!("verification error: {}", e),
+            "info": serde_json::Value::Null
+        }))
+        .into_response(),
+        Err(e) => backup_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("verify task failed: {}", e),
+        ),
+    }
 }
 
 /// Auth token handler (returns null token for dashboard compatibility)
@@ -8999,16 +9415,45 @@ async fn api_config_operator_window_post_handler(
     }
 }
 
-/// Backup delete handler
+/// Backup delete handler — removes an artifact from the backup directory after
+/// the same path-safety checks as download. Reports a real success/failure.
 async fn api_backup_delete_handler(
-    State(_state): State<Arc<VerificationState>>,
+    State(state): State<Arc<VerificationState>>,
     Path(filename): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     debug!(filename = %filename, "Delete backup requested");
-    Json(serde_json::json!({
-        "success": true,
-        "message": format!("Backup {} deleted", filename)
-    }))
+    let dir = match resolve_backup_dir(&state, false) {
+        Ok(d) => d,
+        Err(e) => return backup_error(StatusCode::BAD_REQUEST, &e),
+    };
+    let path = match resolve_backup_file(&dir, &filename) {
+        Ok(p) => p,
+        Err(e) => return backup_error(StatusCode::BAD_REQUEST, &e),
+    };
+    let canonical = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return backup_error(StatusCode::NOT_FOUND, "backup file not found"),
+    };
+    if canonical.parent() != Some(dir.as_path()) {
+        return backup_error(StatusCode::BAD_REQUEST, "invalid backup path");
+    }
+    match std::fs::remove_file(&canonical) {
+        Ok(()) => {
+            info!(filename = %filename, "Backup deleted");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "message": format!("Backup {} deleted", filename)
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => backup_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to delete backup: {}", e),
+        ),
+    }
 }
 
 /// Build the detailed connected-miner list (miners with a share in the last

@@ -3759,6 +3759,7 @@ name = "ghost-verification"
 version = "1.10.21"
 dependencies = [
  "axum 0.7.9",
+ "base64 0.22.1",
  "bitcoin",
  "chrono",
  "ed25519-dalek",
