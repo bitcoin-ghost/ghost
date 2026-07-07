@@ -85,21 +85,6 @@ export function ConfigCard() {
             disabled={updating === "archive_mode"}
           />
         </div>
-
-        <div className="pt-4 border-t border-[color:var(--rule)]">
-          <div className="flex justify-between mb-2">
-            <span className="text-[color:var(--dim)]">Mempool Profile</span>
-            <span className="text-[color:var(--fg)] capitalize">
-              {(config.mempool_profile ?? "standard").replace("_", " ")}
-            </span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-[color:var(--dim)]">Template Profile</span>
-            <span className="text-[color:var(--fg)] capitalize">
-              {(config.template_profile ?? "standard").replace("_", " ")}
-            </span>
-          </div>
-        </div>
       </div>
     </Card>
   );

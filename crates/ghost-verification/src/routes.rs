@@ -346,16 +346,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             get(api_config_ghost_mode_handler),
         )
         .route(
-            "/api/v1/config/mempool_profile",
-            get(api_config_mempool_profile_handler),
-        )
-        .route(
             "/api/v1/config/public_mining",
             get(api_config_public_mining_handler),
-        )
-        .route(
-            "/api/v1/config/template_profile",
-            get(api_config_template_profile_handler),
         )
         .route("/api/v1/config/reaper", get(api_config_reaper_handler))
         .route("/api/v1/config/daemon", get(api_config_daemon_handler))
@@ -370,10 +362,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         .route("/api/v1/config/wraith", get(api_config_wraith_handler))
         .route("/api/v1/config/elder", get(api_config_elder_handler))
-        .route(
-            "/api/v1/config/prune_profile",
-            get(api_config_prune_profile_handler),
-        )
         .route(
             "/api/v1/config/operator_window",
             get(api_config_operator_window_handler),
@@ -527,10 +515,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_wraith_post_handler),
         )
         .route("/api/v1/config/elder", post(api_config_elder_post_handler))
-        .route(
-            "/api/v1/config/prune_profile",
-            post(api_config_prune_profile_post_handler),
-        )
         // M-14: Miner stats endpoint moved here to require HMAC authentication
         // Exposes individual miner work values, hashrates, and share history
         .route("/api/v1/miners/stats", get(api_miner_stats_handler))
@@ -615,33 +599,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/watchdog/clear-cache",
             get(api_watchdog_clear_cache_handler).post(api_watchdog_clear_cache_handler),
-        )
-        // Dashboard: Config profile CRUD
-        .route(
-            "/api/v1/config/profiles/mempool",
-            get(api_config_profiles_mempool_list_handler)
-                .post(api_config_profiles_mempool_post_handler),
-        )
-        .route(
-            "/api/v1/config/profiles/mempool/:name",
-            delete(api_config_profiles_mempool_delete_handler),
-        )
-        .route(
-            "/api/v1/config/profiles/mempool/:name/activate",
-            post(api_config_profiles_mempool_activate_handler),
-        )
-        .route(
-            "/api/v1/config/profiles/template",
-            get(api_config_profiles_template_list_handler)
-                .post(api_config_profiles_template_post_handler),
-        )
-        .route(
-            "/api/v1/config/profiles/template/:name",
-            delete(api_config_profiles_template_delete_handler),
-        )
-        .route(
-            "/api/v1/config/profiles/template/:name/activate",
-            post(api_config_profiles_template_activate_handler),
         )
         // Dashboard: GhostPay payout address POST
         .route(
@@ -1477,8 +1434,6 @@ async fn api_node_status_handler(State(state): State<Arc<VerificationState>>) ->
         "miner_count": health.miner_count,
         "is_synced": true,
         // Capability flags are public - used for verification challenges
-        "mempool_profile": config.mempool_profile,
-        "template_profile": config.template_profile,
         "archive_mode": config.archive_mode,
         "ghost_pay": config.ghost_pay,
         "public_mining": config.public_mining,
@@ -1582,9 +1537,7 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "archive_mode": config.archive_mode,
         "ghost_pay": config.ghost_pay,
         "public_mining": config.public_mining,
-        "reaper": config.reaper,
-        "mempool_profile": config.mempool_profile,
-        "template_profile": config.template_profile
+        "reaper": config.reaper
     }))
 }
 
@@ -3468,9 +3421,7 @@ async fn api_config_handler(State(state): State<Arc<VerificationState>>) -> impl
         "public_mining": config.public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
-        "ghost_mode_local_egress": config.ghost_mode_local_egress,
-        "mempool_profile": config.mempool_profile,
-        "template_profile": config.template_profile
+        "ghost_mode_local_egress": config.ghost_mode_local_egress
     }))
 }
 
@@ -5413,15 +5364,14 @@ async fn api_rewards_node_history_handler(
 /// that have a real persisted home are sourced from the FULL node config
 /// (pool.toml) — NOT the ephemeral `dashboard_config` mirror — so a
 /// POST→`save_atomic`→GET round-trips the value from disk:
-///   * `payout.address`   ← `pool.node_payout_address`
-///   * `public_mining`    ← `network.mining_mode == PublicPool`
-///   * `pool_name`        ← `pool.pool_name`
-///   * `archive_mode`     ← `storage.archive_mode`
-///   * `pruning`          ← nested object from `storage` (real fields only)
-///
-/// `payout.ghostpay_address` and the pruning `operator_window`/`vw_blocks`/
-/// `ow_blocks` knobs have no persisted config field yet (tracked as Group C),
-/// so they are emitted as `null`/omitted rather than faked.
+///   * `payout.address`           ← `pool.node_payout_address`
+///   * `payout.ghostpay_address`   ← `ghost_pay.payout_address`
+///   * `public_mining`            ← `network.mining_mode == PublicPool`
+///   * `pool_name`                ← `pool.pool_name`
+///   * `archive_mode`             ← `storage.archive_mode`
+///   * `pruning`                  ← VW/OW/AW model from `storage` (VW floor is a
+///                                  read-only consensus constant, OW = `prune_height`,
+///                                  AW = `archive_mode`)
 async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
     let config = state.dashboard_config.read();
@@ -5439,8 +5389,10 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
             (
                 serde_json::json!({
                     "address": cfg.pool.node_payout_address,
-                    // GhostPay payout address has no persisted field yet (Group C).
-                    "ghostpay_address": serde_json::Value::Null,
+                    "ghostpay_address": cfg
+                        .ghost_pay
+                        .as_ref()
+                        .and_then(|gp| gp.payout_address.clone()),
                 }),
                 matches!(
                     cfg.network.mining_mode,
@@ -5449,12 +5401,13 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
                 cfg.pool.pool_name.clone(),
                 cfg.storage.archive_mode,
                 serde_json::json!({
-                    // `prune_profile` is still a dashboard-mirror string until it
-                    // gains a persisted home (Group C); `prune_height` is the real
-                    // storage field. `vw_blocks`/`ow_blocks`/`operator_window`
-                    // have no persisted field yet, so they are omitted.
-                    "prune_profile": config.prune_profile,
-                    "prune_height": cfg.storage.prune_height,
+                    // VW/OW/AW model. VW is the mandatory Bitcoin Core prune floor
+                    // (read-only consensus constant); OW is the one editable depth
+                    // knob = `storage.prune_height` (blocks to keep, 0 = keep all);
+                    // AW = `storage.archive_mode`.
+                    "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+                    "ow_blocks": cfg.storage.prune_height,
+                    "archive_mode": cfg.storage.archive_mode,
                 }),
             )
         } else {
@@ -5468,7 +5421,11 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
                 config.public_mining,
                 config.pool_name.clone(),
                 config.archive_mode,
-                serde_json::json!({ "prune_profile": config.prune_profile }),
+                serde_json::json!({
+                    "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+                    "ow_blocks": 0,
+                    "archive_mode": config.archive_mode,
+                }),
             )
         };
 
@@ -5479,14 +5436,10 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress,
-        "mempool_profile": config.mempool_profile,
-        "template_profile": config.template_profile,
-        "prune_profile": config.prune_profile,
         "pruning": pruning,
         "payout": payout,
         "pool_name": pool_name,
         "policy": policy,
-        "operator_window": 100,
         "network": state.network.as_str(),
         "stratum_sv2_port": 4444,
         "stratum_sv1_port": 3333,
@@ -5561,17 +5514,6 @@ async fn api_config_ghost_mode_handler(
     }))
 }
 
-/// API v1 Config mempool profile handler
-async fn api_config_mempool_profile_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-    Json(serde_json::json!({
-        "profile": config.mempool_profile,
-        "message": "Current mempool profile"
-    }))
-}
-
 /// API v1 Config public mining handler
 async fn api_config_public_mining_handler(
     State(state): State<Arc<VerificationState>>,
@@ -5580,17 +5522,6 @@ async fn api_config_public_mining_handler(
     Json(serde_json::json!({
         "enabled": config.public_mining,
         "message": "Public mining configuration"
-    }))
-}
-
-/// API v1 Config template profile handler
-async fn api_config_template_profile_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-    Json(serde_json::json!({
-        "profile": config.template_profile,
-        "message": "Current template profile"
     }))
 }
 
@@ -5663,24 +5594,24 @@ async fn api_config_ghost_pay_handler(
     }))
 }
 
-/// API v1 Config prune profile handler
-async fn api_config_prune_profile_handler(
+/// API v1 Config operator window handler
+///
+/// The Operator Window (OW) is the one editable pruning-depth knob: it maps
+/// directly to `storage.prune_height` (blocks to keep, 0 = keep everything). The
+/// read-only Validator Window (VW) floor is also reported so the dashboard can
+/// present the three-window model without hardcoding the consensus constant.
+async fn api_config_operator_window_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
+    let window = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().storage.prune_height)
+        .unwrap_or(0);
     Json(serde_json::json!({
-        "profile": config.prune_profile,
-        "message": "Pruning profile configuration"
-    }))
-}
-
-/// API v1 Config operator window handler
-async fn api_config_operator_window_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "window": 100,
-        "message": "Operator window configuration"
+        "window": window,
+        "vw_floor": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+        "message": "Operator window (prune depth) configuration"
     }))
 }
 
@@ -5688,12 +5619,6 @@ async fn api_config_operator_window_handler(
 #[derive(Debug, Deserialize)]
 struct ToggleRequest {
     enabled: bool,
-}
-
-/// Request body for profile config endpoints
-#[derive(Debug, Deserialize)]
-struct ProfileRequest {
-    profile: String,
 }
 
 /// API v1 Config archive_mode POST handler
@@ -7100,20 +7025,6 @@ async fn api_config_elder_post_handler(
     )
 }
 
-/// API v1 Config prune_profile POST handler
-async fn api_config_prune_profile_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ProfileRequest>,
-) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.prune_profile = payload.profile.clone();
-    Json(serde_json::json!({
-        "success": true,
-        "profile": payload.profile,
-        "message": "Prune profile updated"
-    }))
-}
-
 // ============================================================================
 // Mining Endpoints
 // ============================================================================
@@ -7206,24 +7117,18 @@ async fn api_mining_public_handler(
 // ============================================================================
 
 /// API v1 Ghost Pay pruning handler
+///
+/// Reports the L2 (ghost-pay) lock-pruning status. L2 lock pruning is not an
+/// operator-configurable setting: there is no persisted config field for it, so
+/// this returns a stable "disabled" default (no locks pruned by threshold). This
+/// is deliberately decoupled from L1 block pruning (`storage.prune_height`) —
+/// block-storage pruning and L2 lock retention are unrelated concerns.
 async fn api_ghostpay_pruning_handler(
-    State(state): State<Arc<VerificationState>>,
+    State(_state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-
-    // Get pruning profile settings
-    let (enabled, threshold) = match config.prune_profile.as_str() {
-        "none" => (false, 0),
-        "minimal" => (true, 100000),      // Prune locks below 100k sats
-        "moderate" => (true, 1000000),    // Prune locks below 1M sats
-        "aggressive" => (true, 10000000), // Prune locks below 10M sats
-        _ => (false, 0),
-    };
-
     Json(serde_json::json!({
-        "enabled": enabled,
-        "profile": config.prune_profile,
-        "threshold_sats": threshold,
+        "enabled": false,
+        "threshold_sats": 0,
         "last_prune": null
     }))
 }
@@ -7233,12 +7138,28 @@ async fn api_ghostpay_pruning_handler(
 // ============================================================================
 
 /// API v1 Settings ghostpay payout address handler
+///
+/// Reports the GhostPay L2 payout address from the REAL persisted config
+/// (`[ghost_pay] payout_address` in pool.toml), NOT the ephemeral dashboard
+/// mirror. This is the address GhostPay L2 transaction-fee distributions settle
+/// to.
 async fn api_settings_ghostpay_payout_address_handler(
-    State(_state): State<Arc<VerificationState>>,
+    State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
+    let address = state
+        .full_node_config
+        .as_ref()
+        .and_then(|c| c.read().ghost_pay.as_ref().and_then(|gp| gp.payout_address.clone()));
+
+    let message = if address.is_some() {
+        "Ghost Pay payout address"
+    } else {
+        "No Ghost Pay payout address configured"
+    };
+
     Json(serde_json::json!({
-        "address": null,
-        "message": "No Ghost Pay payout address configured"
+        "address": address,
+        "message": message
     }))
 }
 
@@ -9580,170 +9501,6 @@ async fn watchdog_service_control(service: &str, action: &str) -> axum::response
     }
 }
 
-/// Config profile save body (mempool)
-#[derive(Debug, Deserialize)]
-struct ProfileSaveBody {
-    name: String,
-    #[serde(flatten)]
-    settings: serde_json::Value,
-}
-
-/// Build the `{ profiles: [...] }` list the dashboard expects from a stored
-/// custom-profile map. Each entry is its saved settings object with the profile
-/// `name` merged back in (the name is stored as the map key, split out of the
-/// flattened settings on save), so the shape round-trips the dashboard's
-/// `CustomMempoolProfile` / `CustomTemplateProfile` types
-/// (`{ profiles: [{ name, ...settings }] }`).
-fn custom_profiles_list(
-    profiles: &std::collections::HashMap<String, serde_json::Value>,
-) -> serde_json::Value {
-    let list: Vec<serde_json::Value> = profiles
-        .iter()
-        .map(|(name, settings)| {
-            let mut obj = match settings {
-                serde_json::Value::Object(map) => map.clone(),
-                _ => serde_json::Map::new(),
-            };
-            obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
-            serde_json::Value::Object(obj)
-        })
-        .collect();
-    serde_json::json!({ "profiles": list })
-}
-
-/// API v1 Config: List saved custom mempool profiles.
-///
-/// The dashboard GETs this to enumerate the saved custom mempool profiles it can
-/// activate. NOTE: these profiles live only in the in-memory `dashboard_config`
-/// map, so they do NOT survive a ghost-pool restart — persisting them is a
-/// separate, larger change (needs a real store) and is out of scope here.
-async fn api_config_profiles_mempool_list_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-    Json(custom_profiles_list(&config.custom_mempool_profiles))
-}
-
-/// API v1 Config: List saved custom template profiles.
-///
-/// See [`api_config_profiles_mempool_list_handler`] — same in-memory-only
-/// caveat: template profiles are not persisted across restart.
-async fn api_config_profiles_template_list_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-    Json(custom_profiles_list(&config.custom_template_profiles))
-}
-
-/// API v1 Config: Save custom mempool profile
-async fn api_config_profiles_mempool_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<ProfileSaveBody>,
-) -> impl IntoResponse {
-    let name = body.name.trim().to_string();
-    if name.is_empty() || name.len() > 64 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid profile name"})),
-        )
-            .into_response();
-    }
-
-    // Store in dashboard config custom profiles
-    {
-        let mut config = state.dashboard_config.write();
-        config
-            .custom_mempool_profiles
-            .insert(name.clone(), body.settings.clone());
-    }
-
-    Json(serde_json::json!({
-        "name": name,
-        "settings": body.settings
-    }))
-    .into_response()
-}
-
-/// API v1 Config: Delete custom mempool profile
-async fn api_config_profiles_mempool_delete_handler(
-    State(state): State<Arc<VerificationState>>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.custom_mempool_profiles.remove(&name);
-    StatusCode::NO_CONTENT
-}
-
-/// API v1 Config: Activate a mempool profile
-async fn api_config_profiles_mempool_activate_handler(
-    State(state): State<Arc<VerificationState>>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    // Record the selection in the dashboard mirror. This is a cosmetic display
-    // field; the real mining lever is `/api/v1/config/policy_profile`.
-    let mut config = state.dashboard_config.write();
-    config.mempool_profile = name.clone();
-    Json(serde_json::json!({
-        "success": true,
-        "profile": name,
-        "message": "Mempool profile updated"
-    }))
-}
-
-/// API v1 Config: Save custom template profile
-async fn api_config_profiles_template_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<ProfileSaveBody>,
-) -> impl IntoResponse {
-    let name = body.name.trim().to_string();
-    if name.is_empty() || name.len() > 64 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid profile name"})),
-        )
-            .into_response();
-    }
-
-    {
-        let mut config = state.dashboard_config.write();
-        config
-            .custom_template_profiles
-            .insert(name.clone(), body.settings.clone());
-    }
-
-    Json(serde_json::json!({
-        "name": name,
-        "settings": body.settings
-    }))
-    .into_response()
-}
-
-/// API v1 Config: Delete custom template profile
-async fn api_config_profiles_template_delete_handler(
-    State(state): State<Arc<VerificationState>>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.custom_template_profiles.remove(&name);
-    StatusCode::NO_CONTENT
-}
-
-/// API v1 Config: Activate a template profile
-async fn api_config_profiles_template_activate_handler(
-    State(state): State<Arc<VerificationState>>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    // Cosmetic dashboard mirror; the real mining lever is
-    // `/api/v1/config/policy_profile`.
-    let mut config = state.dashboard_config.write();
-    config.template_profile = name.clone();
-    Json(serde_json::json!({
-        "success": true,
-        "profile": name,
-        "message": "Template profile updated"
-    }))
-}
-
 /// GhostPay payout address body
 #[derive(Debug, Deserialize)]
 struct GhostPayAddressBody {
@@ -9751,18 +9508,66 @@ struct GhostPayAddressBody {
 }
 
 /// API v1 Settings: Set GhostPay payout address (POST)
+///
+/// Persists the operator's GhostPay L2 payout address to the REAL config
+/// (`[ghost_pay] payout_address` in pool.toml) via `save_atomic`, so it survives
+/// a restart and is read by the L2 settlement path. A null/empty address clears
+/// the setting. Non-empty addresses are validated against the node's network
+/// prefix so a typo can't silently redirect L2 fee distributions.
 async fn api_settings_ghostpay_payout_address_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(body): Json<GhostPayAddressBody>,
 ) -> impl IntoResponse {
-    {
-        let mut config = state.dashboard_config.write();
-        config.ghostpay_payout_address = body.address.clone();
+    // Normalise: trim and treat empty as "clear" (None).
+    let new_address: Option<String> = match body.address {
+        Some(ref a) if !a.trim().is_empty() => Some(a.trim().to_string()),
+        _ => None,
+    };
+
+    // Validate non-empty addresses against the node's network prefix.
+    if let Some(ref addr) = new_address {
+        if !validate_address_prefix(addr, state.network) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!(
+                        "Invalid address prefix for {} network",
+                        state.network.as_str()
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Persist to pool.toml. GhostPayConfig is optional; create a default when the
+    // operator sets an address before ghost-pay is otherwise configured.
+    let persist = persist_full_config(&state, |cfg| {
+        match cfg.ghost_pay {
+            Some(ref mut gp) => gp.payout_address = new_address.clone(),
+            None => {
+                let mut gp = ghost_common::config::GhostPayConfig::default();
+                gp.payout_address = new_address.clone();
+                cfg.ghost_pay = Some(gp);
+            }
+        }
+    });
+    if let Err((code, msg)) = persist {
+        error!(error = %msg, "Failed to persist GhostPay payout address");
+        return (
+            code,
+            Json(serde_json::json!({"success": false, "error": msg})),
+        )
+            .into_response();
     }
 
     Json(serde_json::json!({
-        "address": body.address
+        "success": true,
+        "address": new_address,
+        "message": "GhostPay payout address saved."
     }))
+    .into_response()
 }
 
 /// Mining toggle body
@@ -9964,21 +9769,53 @@ struct OperatorWindowBody {
 }
 
 /// API v1 Config: Set operator window (POST)
+///
+/// The Operator Window (OW) is the one editable pruning-depth knob. It persists
+/// directly to `storage.prune_height` (blocks to keep, 0 = keep everything) in
+/// pool.toml via `save_atomic`. A non-zero depth is clamped up to the Validator
+/// Window (VW) floor — the mandatory Bitcoin Core minimum for reorg safety — so
+/// the operator can never prune below the consensus-safe window.
+///
+/// The persisted depth takes effect in ghostd's `-prune` flag via the Archive /
+/// launch-flag plumbing (Group F); here we durably record the operator's choice.
 async fn api_config_operator_window_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(body): Json<OperatorWindowBody>,
 ) -> impl IntoResponse {
-    if let Some(blocks) = body.blocks {
-        let mut config = state.dashboard_config.write();
-        config.operator_window = Some(blocks);
+    let Some(requested) = body.blocks else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": "Missing 'blocks' field"})),
+        )
+            .into_response();
+    };
+
+    // Clamp a non-zero depth up to the VW floor (0 = keep everything, allowed).
+    let clamped = if requested == 0 {
+        0
+    } else {
+        requested.max(ghost_common::config::VALIDATOR_WINDOW_BLOCKS)
+    };
+
+    if let Err((code, msg)) = persist_full_config(&state, |cfg| {
+        cfg.storage.prune_height = clamped;
+    }) {
+        error!(error = %msg, "Failed to persist operator window (prune_height)");
+        return (
+            code,
+            Json(serde_json::json!({"success": false, "error": msg})),
+        )
+            .into_response();
     }
 
-    if let Some(ref fnc) = state.full_node_config {
-        let config = fnc.read();
-        Json(serde_json::json!(config.clone())).into_response()
-    } else {
-        Json(serde_json::json!({"error": "Config not available"})).into_response()
-    }
+    Json(serde_json::json!({
+        "success": true,
+        "window": clamped,
+        "vw_floor": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+        "clamped": clamped != requested,
+        "message": "Operator window (prune depth) saved."
+    }))
+    .into_response()
 }
 
 /// Backup delete handler — removes an artifact from the backup directory after
@@ -11230,6 +11067,10 @@ mod tests {
         cfg.storage.archive_mode = true;
         cfg.storage.prune_height = 5000;
         cfg.network.mining_mode = MiningMode::PublicPool;
+        cfg.ghost_pay = Some(ghost_common::config::GhostPayConfig {
+            payout_address: Some("tb1qghostpayaddr".to_string()),
+            ..Default::default()
+        });
 
         let state = Arc::new(
             crate::server::VerificationState::new(
@@ -11260,11 +11101,25 @@ mod tests {
             json["payout"]["address"].as_str(),
             Some("tb1qexamplepayoutaddr")
         );
-        assert!(json["payout"]["ghostpay_address"].is_null());
+        // GhostPay payout address now surfaces from the real config (Group C).
+        assert_eq!(
+            json["payout"]["ghostpay_address"].as_str(),
+            Some("tb1qghostpayaddr")
+        );
         assert_eq!(json["pool_name"].as_str(), Some("SatoshiPool"));
         assert_eq!(json["archive_mode"].as_bool(), Some(true));
         assert_eq!(json["public_mining"].as_bool(), Some(true));
-        assert_eq!(json["pruning"]["prune_height"].as_u64(), Some(5000));
+        // VW/OW/AW model: OW = prune_height, VW = the read-only floor, AW mirrors
+        // archive_mode. The old `prune_profile`/`operator_window` fakes are gone.
+        assert_eq!(json["pruning"]["ow_blocks"].as_u64(), Some(5000));
+        assert_eq!(
+            json["pruning"]["vw_blocks"].as_u64(),
+            Some(ghost_common::config::VALIDATOR_WINDOW_BLOCKS)
+        );
+        assert_eq!(json["pruning"]["archive_mode"].as_bool(), Some(true));
+        assert!(json["pruning"]["prune_profile"].is_null());
+        assert!(json.get("operator_window").is_none());
+        assert!(json.get("mempool_profile").is_none());
     }
 
     /// Group B: Pool Name POST persists `[pool] pool_name` to pool.toml and
@@ -11384,6 +11239,178 @@ mod tests {
         );
     }
 
+    /// Group C: GhostPay payout POST persists `[ghost_pay] payout_address`,
+    /// rejects a wrong-network prefix, and the dedicated GET reads it back.
+    #[tokio::test]
+    async fn test_ghostpay_payout_address_post_persists_and_reads_back() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        let post = |body: &'static str| {
+            let state = Arc::clone(&state);
+            let auth = auth.clone();
+            async move {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let signature = auth.sign(timestamp, body.as_bytes());
+                super::create_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/settings/ghostpay_payout_address")
+                            .header("Content-Type", "application/json")
+                            .header("X-Ghost-Signature", signature)
+                            .header("X-Ghost-Timestamp", timestamp.to_string())
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Wrong-network (mainnet) prefix on a Signet node → 400, nothing persisted
+        // (the config is unchanged; no file is written on the rejected path).
+        let bad = post(r#"{"address": "bc1qmainnetaddress"}"#).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert!(state
+            .full_node_config
+            .as_ref()
+            .unwrap()
+            .read()
+            .ghost_pay
+            .as_ref()
+            .and_then(|gp| gp.payout_address.as_ref())
+            .is_none());
+
+        // Correct signet prefix → 200 and persisted to disk (ghost_pay created).
+        let good = post(r#"{"address": "tb1qsignetghostpayaddr"}"#).await;
+        assert_eq!(good.status(), StatusCode::OK);
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .ghost_pay
+                .as_ref()
+                .and_then(|gp| gp.payout_address.as_deref()),
+            Some("tb1qsignetghostpayaddr")
+        );
+
+        // The dedicated GET reads the persisted value back (not a hardcoded null).
+        let get_resp = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/settings/ghostpay_payout_address")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(get_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["address"].as_str(), Some("tb1qsignetghostpayaddr"));
+
+        // Clearing with an empty address resets the field to None.
+        let cleared = post(r#"{"address": ""}"#).await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert!(FullNodeConfig::load(&path)
+            .unwrap()
+            .ghost_pay
+            .and_then(|gp| gp.payout_address)
+            .is_none());
+    }
+
+    /// Group C: Operator Window POST persists `storage.prune_height` and clamps a
+    /// non-zero depth up to the Validator Window floor (0 = keep all is allowed).
+    #[tokio::test]
+    async fn test_operator_window_post_persists_and_clamps() {
+        use ghost_common::config::{NodeConfig as FullNodeConfig, VALIDATOR_WINDOW_BLOCKS};
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        let post = |body: &'static str| {
+            let state = Arc::clone(&state);
+            let auth = auth.clone();
+            async move {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let signature = auth.sign(timestamp, body.as_bytes());
+                super::create_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/config/operator_window")
+                            .header("Content-Type", "application/json")
+                            .header("X-Ghost-Signature", signature)
+                            .header("X-Ghost-Timestamp", timestamp.to_string())
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A comfortable depth above the floor persists verbatim.
+        let ok = post(r#"{"blocks": 2016}"#).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(FullNodeConfig::load(&path).unwrap().storage.prune_height, 2016);
+
+        // A non-zero depth below the VW floor is clamped up to it.
+        let clamped = post(r#"{"blocks": 10}"#).await;
+        assert_eq!(clamped.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(clamped.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["clamped"].as_bool(), Some(true));
+        assert_eq!(
+            FullNodeConfig::load(&path).unwrap().storage.prune_height,
+            VALIDATOR_WINDOW_BLOCKS
+        );
+
+        // Zero (keep everything) is allowed and stored as-is.
+        let keep_all = post(r#"{"blocks": 0}"#).await;
+        assert_eq!(keep_all.status(), StatusCode::OK);
+        assert_eq!(FullNodeConfig::load(&path).unwrap().storage.prune_height, 0);
+    }
+
     /// Group B: Public Mining POST must NOT persist an invalid mode transition
     /// (switching to a private mode with no password would brick startup).
     #[tokio::test]
@@ -11488,59 +11515,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
-    /// Group D: the custom-profile list GET returns the saved profiles wrapped
-    /// in `{ profiles: [{ name, ...settings }] }`.
-    #[tokio::test]
-    async fn test_config_profiles_list_returns_saved() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone()),
-        );
-        {
-            let mut config = state.dashboard_config.write();
-            config.custom_mempool_profiles.insert(
-                "myprofile".to_string(),
-                serde_json::json!({ "max_tx_size": 1234 }),
-            );
-        }
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let signature = auth.sign(timestamp, b"");
-        let response = super::create_router(Arc::clone(&state))
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/config/profiles/mempool")
-                    .header("X-Ghost-Signature", signature)
-                    .header("X-Ghost-Timestamp", timestamp.to_string())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let profiles = json["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0]["name"].as_str(), Some("myprofile"));
-        assert_eq!(profiles[0]["max_tx_size"].as_u64(), Some(1234));
-    }
-
     /// Group E: Elder GET reports the REAL mesh-assigned status from the
     /// verified capability set and is flagged read-only.
     #[tokio::test]
@@ -11640,7 +11614,7 @@ mod tests {
             "/api/v1/config/ghost_pay",
             "/api/v1/config/wraith",
             "/api/v1/config/elder",
-            "/api/v1/config/prune_profile",
+            "/api/v1/config/operator_window",
         ];
 
         for endpoint in config_endpoints {
@@ -11651,7 +11625,7 @@ mod tests {
                 "/api/v1/config/policy_custom" => {
                     r#"{"allow_t0": true, "allow_t1": true, "allow_t2": false, "allow_t3": false, "allow_inscriptions": false, "allow_runes": false, "allow_brc20": false, "max_op_return_size": 40, "max_witness_per_input": 500, "max_tx_outputs": 8, "max_tx_size": 90000, "min_fee_rate": 1.0}"#
                 }
-                "/api/v1/config/prune_profile" => r#"{"profile": "standard"}"#,
+                "/api/v1/config/operator_window" => r#"{"blocks": 2016}"#,
                 "/api/v1/config/elder" => r#"{"enabled": true, "slot": 1}"#,
                 _ => r#"{"enabled": true}"#,
             };

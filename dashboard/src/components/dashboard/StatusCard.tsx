@@ -73,20 +73,6 @@ export function StatusCard() {
           <span className="font-mono text-[color:var(--fg)]">{status.peer_count ?? 0}</span>
         </div>
 
-        <div className="flex justify-between items-center">
-          <span className="text-[color:var(--dim)]">Mempool Profile</span>
-          <span className="font-mono text-[color:var(--fg)] text-sm capitalize">
-            {(status.mempool_profile ?? "standard").replace("_", " ")}
-          </span>
-        </div>
-
-        <div className="flex justify-between items-center">
-          <span className="text-[color:var(--dim)]">Template Profile</span>
-          <span className="font-mono text-[color:var(--fg)] text-sm capitalize">
-            {(status.template_profile ?? "standard").replace("_", " ")}
-          </span>
-        </div>
-
         <div className="pt-4 border-t border-[color:var(--rule)] space-y-2">
           {MODE_CONFIG_PRIMARY.map((mode) => {
             const isActive = status[mode.key as keyof typeof status] as boolean;

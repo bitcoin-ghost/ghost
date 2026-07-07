@@ -7,13 +7,13 @@ import { Input } from '@/components/ui/Input';
 import { Toggle } from '@/components/ui/Toggle';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
+import { useSetPolicyProfile } from '@/hooks/queries';
 import {
-  useSaveMempoolProfile,
-  useActivateMempoolProfile,
-  useActivateTemplateProfile,
-} from '@/hooks/queries';
-import { DEFAULT_MEMPOOL_PROFILE } from '../MempoolProfileDialog';
-import type { CustomMempoolProfile } from '@/lib/api/config';
+  setPolicyCustom,
+  toPolicyProfile,
+  POLICY_CUSTOM_DEFAULTS,
+  type PolicyProfileType,
+} from '@/lib/api/config';
 
 interface MempoolPolicyData {
   mempool_profile: string;
@@ -70,12 +70,11 @@ const TEMPLATE_PROFILES = [
 ];
 
 export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWizardProps) {
-  // The mempool/template profile fields are the node's cosmetic dashboard
-  // mirror, written via the profile-activate routes. The old POST
-  // /config/{mempool,template}_profile endpoints are GET-only and 405.
-  const saveMempoolProfile = useSaveMempoolProfile();
-  const activateMempoolProfile = useActivateMempoolProfile();
-  const activateTemplateProfile = useActivateTemplateProfile();
+  // The wizard drives the REAL tier-policy lever (`/config/policy_profile`, or
+  // `/config/policy_custom` for the custom flow). That single policy governs both
+  // the mempool and the block template, so there is no separate template lever to
+  // apply — the template step widens the policy for the "Maximum" choice.
+  const setPolicyProfile = useSetPolicyProfile();
   const toast = useToast();
 
   const steps = useMemo<WizardStep<MempoolPolicyData>[]>(() => {
@@ -127,38 +126,38 @@ export default function MempoolPolicyWizard({ isOpen, onClose }: MempoolPolicyWi
         description: 'Review and apply your mempool policy',
         onSubmit: async (data) => {
           if (data.mempool_profile === 'custom') {
-            // Build a real custom profile from the collected fields (defaults
-            // fill in everything the wizard doesn't surface), persist it, then
-            // activate it — mirroring MempoolProfileDialog's save+activate flow.
-            const customProfile: CustomMempoolProfile = {
-              ...DEFAULT_MEMPOOL_PROFILE,
-              name: data.profile_name.trim(),
-              min_relay_tx_fee: data.min_relay_tx_fee,
-              max_mempool_size: data.max_mempool_size,
-              mempool_expiry: data.mempool_expiry,
-              datacarrier: data.datacarrier,
-              filter_inscriptions: data.filter_inscriptions,
-              filter_brc20: data.filter_brc20,
-              filter_runes: data.filter_runes,
-            };
-            await saveMempoolProfile.mutateAsync(customProfile);
-            await activateMempoolProfile.mutateAsync(customProfile.name);
+            // Map the wizard's collected fields onto the REAL custom tier policy
+            // (`/config/policy_custom`), which persists every field and applies on
+            // a graceful restart. Fields the wizard doesn't surface fall back to
+            // the sensible custom defaults.
+            await setPolicyCustom({
+              ...POLICY_CUSTOM_DEFAULTS,
+              min_fee_rate: data.min_relay_tx_fee,
+              max_op_return_size: data.datacarrier ? POLICY_CUSTOM_DEFAULTS.max_op_return_size : 0,
+              allow_inscriptions: !data.filter_inscriptions,
+              allow_brc20: !data.filter_brc20,
+              allow_runes: !data.filter_runes,
+            });
+            toast.success(
+              'Mempool Policy Updated',
+              `Custom tier policy applied (min fee ${data.min_relay_tx_fee} sat/vB).`
+            );
           } else {
-            await activateMempoolProfile.mutateAsync(data.mempool_profile);
+            // The single tier policy governs both mempool and block template. The
+            // "Maximum" template choice widens a non-strict policy to full_open.
+            let profile: PolicyProfileType = toPolicyProfile(data.mempool_profile);
+            if (data.template_profile === 'max_fee' && profile !== 'strict') {
+              profile = 'full_open';
+            }
+            await setPolicyProfile.mutateAsync(profile);
+            toast.success('Mempool Policy Updated', `Tier policy set to ${profile}.`);
           }
-          await activateTemplateProfile.mutateAsync(data.template_profile);
-          toast.success(
-            'Mempool Policy Updated',
-            data.mempool_profile === 'custom'
-              ? `Custom profile "${data.profile_name.trim()}" saved and activated, template set to ${data.template_profile}`
-              : `Mempool profile set to ${data.mempool_profile}, template set to ${data.template_profile}`
-          );
           onClose();
         },
       },
     ];
     return allSteps;
-  }, [saveMempoolProfile, activateMempoolProfile, activateTemplateProfile, toast, onClose]);
+  }, [setPolicyProfile, toast, onClose]);
 
   const wizard = useWizard<MempoolPolicyData>({
     steps,

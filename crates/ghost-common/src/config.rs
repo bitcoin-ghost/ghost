@@ -1549,6 +1549,14 @@ pub enum HazeMode {
     FullArchive,
 }
 
+/// Validator Window (VW) — the mandatory Bitcoin Core prune floor, in blocks.
+///
+/// This is the minimum number of recent blocks a pruning node must retain for
+/// reorg safety (Bitcoin Core's `MIN_BLOCKS_TO_KEEP`). The operator-configurable
+/// pruning depth (`StorageConfig::prune_height`, the "Operator Window") may never
+/// be set below this floor. It is presented read-only in the dashboard.
+pub const VALIDATOR_WINDOW_BLOCKS: u64 = 288;
+
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -1588,6 +1596,9 @@ pub struct GhostPayConfig {
     pub epoch_blocks: u64,
     /// Enable Wraith mixing
     pub wraith_enabled: bool,
+    /// Operator payout address for GhostPay L2 settlements (None = unset)
+    #[serde(default)]
+    pub payout_address: Option<String>,
 }
 
 impl Default for GhostPayConfig {
@@ -1597,6 +1608,7 @@ impl Default for GhostPayConfig {
             virtual_block_secs: L2_VIRTUAL_BLOCK_SECS,
             epoch_blocks: L2_EPOCH_BLOCKS,
             wraith_enabled: true,
+            payout_address: None,
         }
     }
 }

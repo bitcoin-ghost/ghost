@@ -8,34 +8,31 @@ import { Badge } from "@/components/ui/Badge";
 import { StepIndicator } from "@/components/ui/Wizard";
 import { useToast } from "@/components/ui/Toast";
 import { ToggleRow, StatusRow } from "../shared";
-import { MempoolProfileDialog, DEFAULT_MEMPOOL_PROFILE } from "../MempoolProfileDialog";
 import ReaperWizard from "../wizards/ReaperWizard";
 import {
   useNodeStatus,
   useHealth,
   useShares,
   useConfig,
+  useFullConfig,
   useGhostPayStatus,
   useSetArchiveMode,
   useSetPublicMining,
   useSetReaper,
   useSetGhostPay,
   useSetWraith,
-  useActivateMempoolProfile,
-  useSaveMempoolProfile,
-  type CustomMempoolProfile,
+  useSetPolicyProfile,
 } from "@/hooks/queries";
+import type { PolicyProfileType } from "@/lib/api/config";
 import { useOnboarding } from "@/hooks/useOnboarding";
 
-// Preset mempool profiles, mirroring the Policy settings page. Selecting one
-// goes through the real `activateMempoolProfile` endpoint.
-const MEMPOOL_PRESETS = [
-  { name: "standard", desc: "Bitcoin Core defaults — balanced acceptance" },
-  { name: "strict", desc: "Higher fees, reject low-value transactions" },
-  { name: "clean", desc: "Filter inscriptions, ordinals, and BRC-20" },
-  { name: "structured", desc: "Optimized for transaction batching" },
-  { name: "app_friendly", desc: "Accept more experimental tx types" },
-  { name: "ghost", desc: "Full Ghost protocol support (requires Ghost Mode)" },
+// The REAL tier-policy presets (pool.toml [policy].profile). This is the lever
+// the block builder actually keys off; the advanced custom policy lives on the
+// Filtering page. Selecting one persists via `/config/policy_profile`.
+const POLICY_PRESETS: { name: PolicyProfileType; desc: string }[] = [
+  { name: "permissive", desc: "Accept all standard transactions — balanced, most inclusive" },
+  { name: "strict", desc: "Higher fee thresholds, reject low-value and spam-like transactions" },
+  { name: "full_open", desc: "Accept everything, including data-carrier transactions" },
 ];
 
 const STEPS = [
@@ -66,27 +63,23 @@ export default function OnboardingPage() {
   const { data: health } = useHealth();
   const { data: shares } = useShares();
   const { data: config } = useConfig();
+  const { data: fullConfig } = useFullConfig();
   const { data: ghostPay } = useGhostPayStatus();
 
-  // Writes — the SAME hooks the Capabilities/Policy settings pages use.
+  // Writes — the SAME hooks the Capabilities/Filtering settings pages use.
   const setArchiveMode = useSetArchiveMode();
   const setPublicMining = useSetPublicMining();
   const setReaper = useSetReaper();
   const setGhostPay = useSetGhostPay();
   const setWraith = useSetWraith();
-  const activateMempoolProfile = useActivateMempoolProfile();
-  const saveMempoolProfile = useSaveMempoolProfile();
+  const setPolicyProfile = useSetPolicyProfile();
 
-  // Composed wizard / dialog state.
+  // Composed wizard state.
   const [reaperWizardOpen, setReaperWizardOpen] = useState(false);
-  const [mempoolDialogOpen, setMempoolDialogOpen] = useState(false);
-  const [editingMempool, setEditingMempool] = useState<CustomMempoolProfile | null>(null);
 
-  const activeMempoolProfile = String(config?.mempool_profile ?? "standard");
-  const activeTemplateProfile = String(config?.template_profile ?? "default");
+  const activePolicyProfile = String(fullConfig?.policy?.profile ?? "permissive");
   const ghostPayRunning = Boolean(ghostPay?.l2_height);
   const ghostPayEnabled = status?.ghost_pay ?? false;
-  const budsEnabled = status?.ghost_pay ?? false;
   const wraithEnabled = ghostPay?.wraith_enabled ?? false;
 
   const handleArchiveToggle = async (enabled: boolean) => {
@@ -134,27 +127,12 @@ export default function OnboardingPage() {
     }
   };
 
-  const handleActivatePreset = async (name: string) => {
+  const handleActivatePreset = async (name: PolicyProfileType) => {
     try {
-      await activateMempoolProfile.mutateAsync(name);
-      success("Profile Applied", `Mempool profile "${name}" is now active`);
+      await setPolicyProfile.mutateAsync(name);
+      success("Policy Applied", `Tier policy "${name}" set — restart applies it`);
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
-  const handleMempoolSave = async () => {
-    if (!editingMempool || !editingMempool.name.trim()) {
-      error("Invalid Name", "Profile name is required");
-      return;
-    }
-    try {
-      await saveMempoolProfile.mutateAsync(editingMempool);
-      success("Profile Saved", `Custom mempool profile "${editingMempool.name}" saved`);
-      setMempoolDialogOpen(false);
-      setEditingMempool(null);
-    } catch (err) {
-      error("Save Failed", err instanceof Error ? err.message : "Unknown error");
     }
   };
 
@@ -310,15 +288,15 @@ export default function OnboardingPage() {
         <div className="space-y-6">
           <Card>
             <CardHeader
-              title="Mempool Policy"
-              subtitle="Choose which transactions your node accepts. The default profile is a sane starting point — tune later from Settings → Policy."
+              title="Transaction Policy"
+              subtitle="Choose which transactions your node accepts and mines. This tier policy is a sane starting point — tune the advanced per-field controls later from Settings → Filtering."
             />
             <div className="space-y-4">
               {reaperEnabled && (
                 <div className="p-3 bg-[color-mix(in_srgb,var(--yellow)_18%,transparent)] border border-[color-mix(in_srgb,var(--yellow)_45%,transparent)] rounded-lg">
                   <div className="text-[color:var(--yellow)] font-medium">Locked by Reaper Mode</div>
                   <div className="text-sm text-[color:var(--yellow)]/80">
-                    Disable Reaper Mode in the previous step to change profiles.
+                    Disable Reaper Mode in the previous step to change the tier policy.
                   </div>
                 </div>
               )}
@@ -329,10 +307,10 @@ export default function OnboardingPage() {
                 }`}
               >
                 <div>
-                  <div className="text-[color:var(--fg)]">Current Profile</div>
-                  <div className="text-sm text-[color:var(--dim)]">{activeMempoolProfile}</div>
+                  <div className="text-[color:var(--fg)]">Current Policy</div>
+                  <div className="text-sm text-[color:var(--dim)] capitalize">{activePolicyProfile.replace(/_/g, " ")}</div>
                 </div>
-                <Badge variant="info">{activeMempoolProfile}</Badge>
+                <Badge variant="info">{activePolicyProfile.replace(/_/g, " ")}</Badge>
               </div>
 
               <div
@@ -340,13 +318,13 @@ export default function OnboardingPage() {
                   reaperEnabled ? "opacity-50 pointer-events-none" : ""
                 }`}
               >
-                {MEMPOOL_PRESETS.map((p) => (
+                {POLICY_PRESETS.map((p) => (
                   <button
                     key={p.name}
                     onClick={() => handleActivatePreset(p.name)}
-                    disabled={reaperEnabled || activateMempoolProfile.isPending}
+                    disabled={reaperEnabled || setPolicyProfile.isPending}
                     className={`p-3 rounded-lg border transition-colors text-left ${
-                      activeMempoolProfile === p.name
+                      activePolicyProfile === p.name
                         ? "bg-[var(--accent)]/30 border-[var(--accent)] text-[color:var(--accent)]"
                         : "bg-[var(--surface)]/50 border-[var(--rule-strong)] text-[color:var(--dim)] hover:border-[var(--rule-strong)]"
                     }`}
@@ -356,18 +334,6 @@ export default function OnboardingPage() {
                   </button>
                 ))}
               </div>
-
-              <Button
-                variant="secondary"
-                className="w-full"
-                disabled={reaperEnabled}
-                onClick={() => {
-                  setEditingMempool({ name: "", ...DEFAULT_MEMPOOL_PROFILE });
-                  setMempoolDialogOpen(true);
-                }}
-              >
-                Create Custom Mempool Profile
-              </Button>
             </div>
           </Card>
 
@@ -418,22 +384,12 @@ export default function OnboardingPage() {
               value={<Badge variant={reaperEnabled ? "success" : "default"}>{reaperEnabled ? "On" : "Off"}</Badge>}
             />
             <StatItem
-              label="Mempool Profile"
+              label="Transaction Policy"
               value={
                 reaperEnabled ? (
                   <Badge variant="warning">Reaper Mode</Badge>
                 ) : (
-                  <Badge variant="info">{activeMempoolProfile}</Badge>
-                )
-              }
-            />
-            <StatItem
-              label="Pool Template Profile"
-              value={
-                reaperEnabled ? (
-                  <Badge variant="warning">Reaper Mode</Badge>
-                ) : (
-                  <Badge variant="info">{activeTemplateProfile}</Badge>
+                  <Badge variant="info">{activePolicyProfile.replace(/_/g, " ")}</Badge>
                 )
               }
             />
@@ -467,20 +423,8 @@ export default function OnboardingPage() {
         </div>
       </div>
 
-      {/* Composed real wizards / dialogs */}
+      {/* Composed real wizards */}
       <ReaperWizard isOpen={reaperWizardOpen} onClose={() => setReaperWizardOpen(false)} />
-      <MempoolProfileDialog
-        isOpen={mempoolDialogOpen}
-        onClose={() => {
-          setMempoolDialogOpen(false);
-          setEditingMempool(null);
-        }}
-        profile={editingMempool}
-        onProfileChange={setEditingMempool}
-        onSave={handleMempoolSave}
-        saving={saveMempoolProfile.isPending}
-        budsEnabled={budsEnabled}
-      />
     </div>
   );
 }

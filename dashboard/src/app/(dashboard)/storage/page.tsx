@@ -181,15 +181,19 @@ export default function StoragePage() {
                   <tr className="border-b border-[var(--rule)]">
                     <td className="py-3">L1</td>
                     <td className="py-3">Validator (VW)</td>
-                    <td className="py-3">288 blocks (~2 days)</td>
+                    <td className="py-3">{fullConfig?.pruning?.vw_blocks ?? 288} blocks (~{formatDuration(fullConfig?.pruning?.vw_blocks ?? 288)})</td>
                     <td className="py-3">Full retention - Bitcoin Core minimum</td>
                   </tr>
                   <tr className="border-b border-[var(--rule)]">
                     <td className="py-3">L1</td>
                     <td className="py-3">Operator (OW)</td>
-                    <td className="py-3">{fullConfig?.pruning?.ow_blocks ?? 2016} blocks (~{formatDuration(fullConfig?.pruning?.ow_blocks ?? 2016)})</td>
                     <td className="py-3">
-                      {archiveMode ? "Archive Mode - no pruning" : `BUDS pruning (${fullConfig?.pruning?.prune_profile ?? "default"})`}
+                      {(fullConfig?.pruning?.ow_blocks ?? 0) > 0
+                        ? `${fullConfig?.pruning?.ow_blocks} blocks (~${formatDuration(fullConfig?.pruning?.ow_blocks ?? 0)})`
+                        : "Keep all"}
+                    </td>
+                    <td className="py-3">
+                      {archiveMode ? "Archive Mode - no pruning" : "Prune depth (prune_height)"}
                     </td>
                   </tr>
                   <tr className="border-b border-[var(--rule)]">

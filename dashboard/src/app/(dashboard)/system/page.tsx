@@ -20,7 +20,6 @@ import {
   useFullConfig,
   useNodeStatus,
   useL2PruningStatus,
-  useSetPruneProfile,
   useSetOperatorWindow,
   useSetArchiveMode,
   useGhostPayStatus,
@@ -36,7 +35,6 @@ import { useToast } from "@/components/ui/Toast";
 import { AutoUpdateSection } from "@/components/settings/AutoUpdateSection";
 import { ScheduledBackupsCard } from "@/components/settings/ScheduledBackupsCard";
 import type { UpdateStatus } from "@/lib/api/system";
-import type { PruneProfile } from "@/types/api";
 import type { VerifyBackupResponse } from "@/types/api";
 
 // ---------------------------------------------------------------------------
@@ -129,14 +127,6 @@ const OW_PRESETS = [
   { blocks: 4032, label: "30 days", description: "Extended retention" },
 ];
 
-const PRUNE_PROFILES: { value: PruneProfile; label: string; keep: string; prune: string }[] = [
-  { value: "default", label: "Default", keep: "T0, T1, T2", prune: "T3 only" },
-  { value: "strict", label: "Strict", keep: "T0, T1", prune: "T2, T3" },
-  { value: "clean", label: "Clean", keep: "T0, T1", prune: "T2, T3" },
-  { value: "structured", label: "Structured", keep: "T0, T1, T2", prune: "T3" },
-  { value: "archive", label: "Archive", keep: "All (T0-T3)", prune: "None" },
-];
-
 // ---------------------------------------------------------------------------
 // Page Component
 // ---------------------------------------------------------------------------
@@ -173,7 +163,6 @@ export default function SystemPage() {
   const { data: l2Pruning, isLoading: l2Loading } = useL2PruningStatus();
   const { data: ghostPayStatus } = useGhostPayStatus();
 
-  const setPruneProfile = useSetPruneProfile();
   const setOperatorWindow = useSetOperatorWindow();
   const setArchiveMode = useSetArchiveMode();
 
@@ -269,15 +258,6 @@ export default function SystemPage() {
   // -------------------------------------------------------------------------
   // Storage handlers
   // -------------------------------------------------------------------------
-
-  const handlePruneProfileChange = async (profile: PruneProfile) => {
-    try {
-      await setPruneProfile.mutateAsync(profile);
-      success("Profile Updated", `Prune profile set to "${profile}"`);
-    } catch (err) {
-      toastError("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
 
   const handleOperatorWindowChange = async (blocks: number) => {
     try {
@@ -624,8 +604,8 @@ export default function SystemPage() {
                 <div className="grid grid-cols-3 gap-4">
                   <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
                     <div className="text-[color:var(--accent)] font-medium mb-2">Validator Window (VW)</div>
-                    <div className="text-2xl font-bold text-[color:var(--fg)]">288 blocks</div>
-                    <div className="text-sm text-[color:var(--dim)] mt-1">~2 days</div>
+                    <div className="text-2xl font-bold text-[color:var(--fg)]">{fullConfig?.pruning?.vw_blocks ?? 288} blocks</div>
+                    <div className="text-sm text-[color:var(--dim)] mt-1">~{formatDuration(fullConfig?.pruning?.vw_blocks ?? 288)}</div>
                     <div className="mt-3 text-xs text-[color:var(--accent)]">
                       Fixed - Bitcoin Core minimum for reorg safety
                     </div>
@@ -636,13 +616,13 @@ export default function SystemPage() {
                       Operator Window (OW)
                     </div>
                     <div className={`text-2xl font-bold ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--fg)]"}`}>
-                      {fullConfig?.pruning?.ow_blocks ?? 2016} blocks
+                      {(fullConfig?.pruning?.ow_blocks ?? 0) > 0 ? `${fullConfig?.pruning?.ow_blocks} blocks` : "Keep all"}
                     </div>
                     <div className="text-sm text-[color:var(--dim)] mt-1">
-                      ~{formatDuration(fullConfig?.pruning?.ow_blocks ?? 2016)}
+                      {(fullConfig?.pruning?.ow_blocks ?? 0) > 0 ? `~${formatDuration(fullConfig?.pruning?.ow_blocks ?? 0)}` : "No pruning depth set"}
                     </div>
                     <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--accent)]"}`}>
-                      {archiveMode ? "Disabled (Archive Mode)" : "BUDS-based pruning applied here"}
+                      {archiveMode ? "Disabled (Archive Mode)" : "Prune depth (prune_height)"}
                     </div>
                   </div>
 
@@ -666,6 +646,10 @@ export default function SystemPage() {
                 {!archiveMode && (
                   <div className="space-y-3">
                     <label className="text-sm font-medium text-[color:var(--dim)]">Operator Window Size</label>
+                    <p className="text-xs text-[color:var(--fainter)]">
+                      How many recent blocks to keep on disk (prune_height). Any non-zero depth is
+                      clamped up to the Validator Window floor.
+                    </p>
                     <div className="grid grid-cols-3 gap-3">
                       {OW_PRESETS.map((preset) => (
                         <button
@@ -681,34 +665,6 @@ export default function SystemPage() {
                           <div className="font-medium">{preset.label}</div>
                           <div className="text-xs text-[color:var(--fainter)] mt-1">{preset.blocks} blocks</div>
                           <div className="text-xs text-[color:var(--dim)] mt-1">{preset.description}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Prune Profile Selection */}
-                {!archiveMode && (
-                  <div className="space-y-3">
-                    <label className="text-sm font-medium text-[color:var(--dim)]">BUDS Prune Profile</label>
-                    <p className="text-xs text-[color:var(--fainter)]">
-                      Controls which BUDS tiers are retained in the Operator Window
-                    </p>
-                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-                      {PRUNE_PROFILES.filter((p) => p.value !== "archive").map((profile) => (
-                        <button
-                          key={profile.value}
-                          onClick={() => handlePruneProfileChange(profile.value)}
-                          disabled={setPruneProfile.isPending}
-                          className={`p-3 rounded-lg border transition-colors text-left ${
-                            fullConfig?.pruning?.prune_profile === profile.value
-                              ? "bg-[var(--surface)] border-[color:var(--accent)] text-[color:var(--accent)]"
-                              : "bg-[var(--surface)] border-[var(--rule-strong)] text-[color:var(--dim)] hover:border-[var(--rule-strong)]"
-                          }`}
-                        >
-                          <div className="font-medium capitalize">{profile.label}</div>
-                          <div className="text-xs text-[color:var(--green)] mt-1">Keep: {profile.keep}</div>
-                          <div className="text-xs text-[color:var(--red)]">Prune: {profile.prune}</div>
                         </button>
                       ))}
                     </div>
@@ -825,19 +781,21 @@ export default function SystemPage() {
                       <tr className="border-b border-[var(--rule)]">
                         <td className="py-3">L1</td>
                         <td className="py-3">Validator (VW)</td>
-                        <td className="py-3">288 blocks (~2 days)</td>
+                        <td className="py-3">{fullConfig?.pruning?.vw_blocks ?? 288} blocks (~{formatDuration(fullConfig?.pruning?.vw_blocks ?? 288)})</td>
                         <td className="py-3">Full retention - Bitcoin Core minimum</td>
                       </tr>
                       <tr className="border-b border-[var(--rule)]">
                         <td className="py-3">L1</td>
                         <td className="py-3">Operator (OW)</td>
                         <td className="py-3">
-                          {fullConfig?.pruning?.ow_blocks ?? 2016} blocks (~{formatDuration(fullConfig?.pruning?.ow_blocks ?? 2016)})
+                          {(fullConfig?.pruning?.ow_blocks ?? 0) > 0
+                            ? `${fullConfig?.pruning?.ow_blocks} blocks (~${formatDuration(fullConfig?.pruning?.ow_blocks ?? 0)})`
+                            : "Keep all"}
                         </td>
                         <td className="py-3">
                           {archiveMode
                             ? "Archive Mode - no pruning"
-                            : `BUDS pruning (${fullConfig?.pruning?.prune_profile ?? "default"})`}
+                            : "Prune depth (prune_height)"}
                         </td>
                       </tr>
                       <tr className="border-b border-[var(--rule)]">
