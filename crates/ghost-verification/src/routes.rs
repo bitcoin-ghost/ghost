@@ -619,7 +619,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // Dashboard: Config profile CRUD
         .route(
             "/api/v1/config/profiles/mempool",
-            post(api_config_profiles_mempool_post_handler),
+            get(api_config_profiles_mempool_list_handler)
+                .post(api_config_profiles_mempool_post_handler),
         )
         .route(
             "/api/v1/config/profiles/mempool/:name",
@@ -631,7 +632,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         .route(
             "/api/v1/config/profiles/template",
-            post(api_config_profiles_template_post_handler),
+            get(api_config_profiles_template_list_handler)
+                .post(api_config_profiles_template_post_handler),
         )
         .route(
             "/api/v1/config/profiles/template/:name",
@@ -1759,6 +1761,23 @@ async fn api_mining_status_handler(
         .and_then(|c| c.read().network.sv2_authority_public_key.clone())
         .unwrap_or_else(|| SV2_AUTHORITY_PUBLIC_KEY.to_string());
 
+    // Source the operator's pool name and node-reward payout address from the
+    // REAL persisted config (pool.toml) so the dashboard round-trips the saved
+    // value across a restart. Fall back to the ephemeral mirror only when the
+    // full config is not loaded. (Non-async lock, safe alongside the dashboard
+    // config guard held above — no await points follow.)
+    let (real_pool_name, real_payout_address) = state
+        .full_node_config
+        .as_ref()
+        .map(|c| {
+            let cfg = c.read();
+            (
+                cfg.pool.pool_name.clone(),
+                cfg.pool.node_payout_address.clone(),
+            )
+        })
+        .unwrap_or_else(|| (config.pool_name.clone(), config.payout_address.clone()));
+
     Json(serde_json::json!({
         // Backend fields
         "active": true,
@@ -1789,8 +1808,8 @@ async fn api_mining_status_handler(
         "authority_public_key": authority_public_key,
         "stratum_v1_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV1_STRATUM_PORT),
         "stratum_v2_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV2_STRATUM_PORT),
-        "payout_address": config.payout_address,
-        "pool_name": config.pool_name,
+        "payout_address": real_payout_address,
+        "pool_name": real_pool_name,
         "blocks_found": state.database.as_ref()
             .and_then(|db| db.get_blocks_found_count().ok())
             .unwrap_or(0),
@@ -5389,6 +5408,20 @@ async fn api_rewards_node_history_handler(
 // ============================================================================
 
 /// API v1 Config full handler
+///
+/// Surfaces the node's operator-editable settings for the dashboard. Fields
+/// that have a real persisted home are sourced from the FULL node config
+/// (pool.toml) — NOT the ephemeral `dashboard_config` mirror — so a
+/// POST→`save_atomic`→GET round-trips the value from disk:
+///   * `payout.address`   ← `pool.node_payout_address`
+///   * `public_mining`    ← `network.mining_mode == PublicPool`
+///   * `pool_name`        ← `pool.pool_name`
+///   * `archive_mode`     ← `storage.archive_mode`
+///   * `pruning`          ← nested object from `storage` (real fields only)
+///
+/// `payout.ghostpay_address` and the pruning `operator_window`/`vw_blocks`/
+/// `ow_blocks` knobs have no persisted config field yet (tracked as Group C),
+/// so they are emitted as `null`/omitted rather than faked.
 async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
     let config = state.dashboard_config.read();
@@ -5396,16 +5429,62 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
     // the current preset AND, for the Custom profile, pre-fill the advanced
     // per-field controls. Read from the full node config when it is loaded.
     let policy = policy_json(&state);
+
+    // Read the persisted operator settings from the real config (pool.toml).
+    // The read guard is held only across this synchronous block — no await
+    // points follow — so the !Send parking_lot guard is safe here.
+    let (payout, public_mining, pool_name, archive_mode, pruning) =
+        if let Some(ref full) = state.full_node_config {
+            let cfg = full.read();
+            (
+                serde_json::json!({
+                    "address": cfg.pool.node_payout_address,
+                    // GhostPay payout address has no persisted field yet (Group C).
+                    "ghostpay_address": serde_json::Value::Null,
+                }),
+                matches!(
+                    cfg.network.mining_mode,
+                    ghost_common::config::MiningMode::PublicPool
+                ),
+                cfg.pool.pool_name.clone(),
+                cfg.storage.archive_mode,
+                serde_json::json!({
+                    // `prune_profile` is still a dashboard-mirror string until it
+                    // gains a persisted home (Group C); `prune_height` is the real
+                    // storage field. `vw_blocks`/`ow_blocks`/`operator_window`
+                    // have no persisted field yet, so they are omitted.
+                    "prune_profile": config.prune_profile,
+                    "prune_height": cfg.storage.prune_height,
+                }),
+            )
+        } else {
+            // No full config loaded (e.g. tests / minimal startup): fall back to
+            // the mirror so the dashboard still renders something coherent.
+            (
+                serde_json::json!({
+                    "address": serde_json::Value::Null,
+                    "ghostpay_address": serde_json::Value::Null,
+                }),
+                config.public_mining,
+                config.pool_name.clone(),
+                config.archive_mode,
+                serde_json::json!({ "prune_profile": config.prune_profile }),
+            )
+        };
+
     Json(serde_json::json!({
-        "archive_mode": config.archive_mode,
+        "archive_mode": archive_mode,
         "ghost_pay": config.ghost_pay,
-        "public_mining": config.public_mining,
+        "public_mining": public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "mempool_profile": config.mempool_profile,
         "template_profile": config.template_profile,
         "prune_profile": config.prune_profile,
+        "pruning": pruning,
+        "payout": payout,
+        "pool_name": pool_name,
         "policy": policy,
         "operator_window": 100,
         "network": state.network.as_str(),
@@ -5783,37 +5862,31 @@ async fn api_config_ghost_mode_local_egress_post_handler(
 }
 
 /// API v1 Config public_mining POST handler
+///
+/// Persists to the REAL config: toggles `network.mining_mode` between
+/// `PublicPool` and a private mode via `save_atomic`, preserving the Ghost-Mode
+/// mutual exclusion and rejecting invalid mode transitions (see
+/// [`apply_public_mining`]). Requests a graceful restart to apply.
 async fn api_config_public_mining_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(payload): Json<ToggleRequest>,
 ) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-
-    // Mutual exclusion with Ghost Mode (symmetric with the ghost_mode handler).
-    // A Ghost Mode node builds near-empty blocks and forfeits all
-    // transaction-fee income, so accepting public miners alongside it earns
-    // the operator nothing on fees. Refuse to enable Public Mining while Ghost
-    // Mode is active; disabling it is always allowed. Reject without mutating
-    // state.
-    if payload.enabled && config.ghost_mode {
-        return (
-            StatusCode::CONFLICT,
+    match apply_public_mining(&state, payload.enabled) {
+        Ok(changed) => (
+            StatusCode::OK,
             Json(serde_json::json!({
-                "success": false,
-                "error": "Ghost Mode is active. Disable it before enabling Public Mining."
+                "success": true,
+                "enabled": payload.enabled,
+                "restart_pending": changed,
+                "message": if changed {
+                    "Public mining updated. ghost-pool will restart to apply the new mining mode."
+                } else {
+                    "Public mining already in the requested state."
+                }
             })),
-        );
+        ),
+        Err((code, body)) => (code, Json(body)),
     }
-
-    config.public_mining = payload.enabled;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "success": true,
-            "enabled": payload.enabled,
-            "message": "Public mining updated"
-        })),
-    )
 }
 
 /// Resolve the `ghost-setup` binary used to apply the ghostd mempool-reaper
@@ -6987,39 +7060,44 @@ async fn api_config_wraith_post_handler(
     }))
 }
 
-/// Request body for elder config
-#[derive(Debug, Deserialize)]
-struct ElderRequest {
-    enabled: bool,
-    slot: Option<u32>,
-}
-
-/// API v1 Config elder handler
+/// API v1 Config elder handler (READ-ONLY status).
+///
+/// Elder status is NOT operator-set: the Elder capability (+1 share) is earned
+/// by registration order (MPC contributor position, first 101 nodes) and
+/// verified by the mesh. This endpoint therefore reports the node's REAL
+/// elder status from its verified capability set (`capabilities.elder_status`,
+/// derived from the MPC elder position at startup — `main.rs`), NOT a writable
+/// dashboard toggle.
 async fn api_config_elder_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
+    let health = state.get_health().await;
     Json(serde_json::json!({
-        "enabled": config.elder,
-        "slot": config.elder_slot,
-        "message": "Elder status configuration"
+        "enabled": health.capabilities.elder_status,
+        // Elder status is mesh-assigned and cannot be operator-set.
+        "read_only": true,
+        "message": "Elder status is mesh-assigned (MPC registration order) and read-only"
     }))
 }
 
-/// API v1 Config elder POST handler
+/// API v1 Config elder POST handler — NEUTERED.
+///
+/// Elder status is mesh-assigned (registration order, verified by the mesh), so
+/// it must NOT be operator-set: writing an operator-chosen elder flag into
+/// config would let a node falsely claim the +1 share and desync from mesh
+/// reality. This handler intentionally does NOT mutate any state and returns a
+/// 403 explaining that elder status is read-only.
 async fn api_config_elder_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ElderRequest>,
+    State(_state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.elder = payload.enabled;
-    config.elder_slot = payload.slot;
-    Json(serde_json::json!({
-        "success": true,
-        "enabled": payload.enabled,
-        "slot": payload.slot,
-        "message": "Elder status updated"
-    }))
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "success": false,
+            "error": "Elder status is mesh-assigned by registration order and cannot be set by the operator.",
+            "code": "ELDER_READ_ONLY"
+        })),
+    )
 }
 
 /// API v1 Config prune_profile POST handler
@@ -7041,12 +7119,28 @@ async fn api_config_prune_profile_post_handler(
 // ============================================================================
 
 /// API v1 Mining payout address handler
+///
+/// Reports the operator's node-reward payout address from the REAL persisted
+/// config (`[pool] node_payout_address` in pool.toml), NOT the ephemeral
+/// dashboard mirror. This is the address node-reward (5-4-3-2-1 capability
+/// share) payouts are sent to, loaded into the DB at startup (`main.rs`).
 async fn api_mining_payout_address_handler(
-    State(_state): State<Arc<VerificationState>>,
+    State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
+    let address = state
+        .full_node_config
+        .as_ref()
+        .and_then(|c| c.read().pool.node_payout_address.clone());
+
+    let message = if address.is_some() {
+        "Node-reward payout address"
+    } else {
+        "No payout address configured"
+    };
+
     Json(serde_json::json!({
-        "address": null,
-        "message": "No payout address configured"
+        "address": address,
+        "message": message
     }))
 }
 
@@ -7814,6 +7908,158 @@ pub struct ConfigUpdateError {
     pub error: String,
     /// Error code for programmatic handling
     pub code: String,
+}
+
+/// Persist a mutation to the full node config (pool.toml) via `save_atomic`.
+///
+/// This is the shared plumbing behind the operator-setting POST reroutes
+/// (pool name, public mining, node payout address): it runs `mutate` against
+/// the live `FullNodeConfig` write guard and then atomically writes the whole
+/// config to its configured path. It fails-closed with a descriptive
+/// `(StatusCode, message)` when the full config or its path is not loaded, so
+/// callers surface an honest "not persisted" response instead of silently
+/// mutating an in-memory copy that would die on the next restart.
+fn persist_full_config<F>(
+    state: &Arc<VerificationState>,
+    mutate: F,
+) -> Result<(), (StatusCode, String)>
+where
+    F: FnOnce(&mut ghost_common::config::NodeConfig),
+{
+    let Some(ref full) = state.full_node_config else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Config update API not available: full node config not loaded".to_string(),
+        ));
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Config update API not available: no node config path configured".to_string(),
+        ));
+    };
+    let mut cfg = full.write();
+    mutate(&mut cfg);
+    cfg.save_atomic(path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to persist config: {e}")))
+}
+
+/// Apply a public-mining on/off request to the REAL `network.mining_mode`.
+///
+/// The legacy `public_mining` bool was removed from the config — `mining_mode`
+/// is the single source of truth — so "public mining on/off" maps to:
+/// `enable` → `PublicPool`; `disable` → the operator's existing private mode if
+/// already private, else `PrivatePool`.
+///
+/// It preserves the Ghost-Mode mutual-exclusion (409) and — critically —
+/// validates the *resulting* config before writing it. A mode transition that
+/// would leave the config invalid (e.g. switching to PublicPool without a
+/// `signing_key`, or to a private mode without a `private_mining_password`) is
+/// rejected with 400 rather than persisted: startup exits on any validation
+/// error (`main.rs`), so persisting an invalid mode would brick the node in a
+/// restart loop. On success it persists via `save_atomic`, mirrors the flag for
+/// in-session display, and requests a restart (mining_mode is read at startup).
+///
+/// Returns `Ok(true)` when a transition was persisted, `Ok(false)` when the
+/// node was already in the requested state (no-op), or `Err((status, body))`.
+fn apply_public_mining(
+    state: &Arc<VerificationState>,
+    enable: bool,
+) -> Result<bool, (StatusCode, serde_json::Value)> {
+    use ghost_common::config::MiningMode;
+
+    let Some(ref full) = state.full_node_config else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+            }),
+        ));
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+            }),
+        ));
+    };
+
+    let mut cfg = full.write();
+
+    // Ghost-Mode mutual exclusion: a Ghost Mode node builds near-empty blocks
+    // and forfeits all transaction-fee income, so it must not also accept
+    // public miners. Refuse to ENABLE Public Mining while Ghost Mode is active;
+    // disabling is always allowed.
+    if enable && cfg.network.ghost_mode {
+        return Err((
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "success": false,
+                "error": "Ghost Mode is active. Disable it before enabling Public Mining."
+            }),
+        ));
+    }
+
+    // No-op if already in the requested public/private state.
+    let currently_public = matches!(cfg.network.mining_mode, MiningMode::PublicPool);
+    if currently_public == enable {
+        return Ok(false);
+    }
+
+    // Resolve the target mode.
+    let target = if enable {
+        MiningMode::PublicPool
+    } else {
+        match cfg.network.mining_mode {
+            MiningMode::PrivatePool | MiningMode::PrivateSolo => cfg.network.mining_mode,
+            MiningMode::PublicPool => MiningMode::PrivatePool,
+        }
+    };
+
+    // Validate a candidate BEFORE writing: only persist a mode the node can
+    // actually boot with. Since the running config already validated at
+    // startup, any error surfaced here is one the mode change introduced.
+    let mut candidate = cfg.clone();
+    candidate.network.mining_mode = target;
+    let validation = candidate.validate();
+    if !validation.is_valid() {
+        let detail = validation
+            .errors
+            .iter()
+            .map(|e| format!("{}: {}", e.field, e.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "success": false,
+                "error": format!("Cannot switch mining mode: {detail}"),
+                "code": "INVALID_MODE_TRANSITION",
+            }),
+        ));
+    }
+
+    cfg.network.mining_mode = target;
+    if let Err(e) = cfg.save_atomic(path) {
+        error!(error = %e, "Failed to persist mining mode");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({
+                "success": false,
+                "error": format!("Failed to persist mining mode: {e}"),
+            }),
+        ));
+    }
+    drop(cfg);
+
+    // Mirror for in-session display; mining_mode is resolved at startup so a
+    // graceful restart is required to actually apply it.
+    state.dashboard_config.write().public_mining = enable;
+    state.request_restart();
+    Ok(true)
 }
 
 /// Validate a mining mode string
@@ -9342,6 +9588,53 @@ struct ProfileSaveBody {
     settings: serde_json::Value,
 }
 
+/// Build the `{ profiles: [...] }` list the dashboard expects from a stored
+/// custom-profile map. Each entry is its saved settings object with the profile
+/// `name` merged back in (the name is stored as the map key, split out of the
+/// flattened settings on save), so the shape round-trips the dashboard's
+/// `CustomMempoolProfile` / `CustomTemplateProfile` types
+/// (`{ profiles: [{ name, ...settings }] }`).
+fn custom_profiles_list(
+    profiles: &std::collections::HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = profiles
+        .iter()
+        .map(|(name, settings)| {
+            let mut obj = match settings {
+                serde_json::Value::Object(map) => map.clone(),
+                _ => serde_json::Map::new(),
+            };
+            obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    serde_json::json!({ "profiles": list })
+}
+
+/// API v1 Config: List saved custom mempool profiles.
+///
+/// The dashboard GETs this to enumerate the saved custom mempool profiles it can
+/// activate. NOTE: these profiles live only in the in-memory `dashboard_config`
+/// map, so they do NOT survive a ghost-pool restart — persisting them is a
+/// separate, larger change (needs a real store) and is out of scope here.
+async fn api_config_profiles_mempool_list_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let config = state.dashboard_config.read();
+    Json(custom_profiles_list(&config.custom_mempool_profiles))
+}
+
+/// API v1 Config: List saved custom template profiles.
+///
+/// See [`api_config_profiles_mempool_list_handler`] — same in-memory-only
+/// caveat: template profiles are not persisted across restart.
+async fn api_config_profiles_template_list_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let config = state.dashboard_config.read();
+    Json(custom_profiles_list(&config.custom_template_profiles))
+}
+
 /// API v1 Config: Save custom mempool profile
 async fn api_config_profiles_mempool_post_handler(
     State(state): State<Arc<VerificationState>>,
@@ -9494,27 +9787,19 @@ async fn api_mining_private_post_handler(
 }
 
 /// API v1 Mining: Set public mining mode (POST)
+///
+/// Persists to the REAL config via [`apply_public_mining`] (toggles
+/// `network.mining_mode`), preserving the Ghost-Mode mutual exclusion and
+/// rejecting invalid mode transitions. Returns the refreshed mining status,
+/// which now reflects the persisted mode.
 async fn api_mining_public_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(body): Json<MiningToggleBody>,
 ) -> impl IntoResponse {
     if let Some(enabled) = body.enabled {
-        let mut config = state.dashboard_config.write();
-        // Mutual exclusion with Ghost Mode (this is the toggle the dashboard
-        // Capabilities page drives). A Ghost Mode node builds near-empty blocks
-        // and forfeits all transaction-fee income, so it must not also accept
-        // public miners. Refuse to enable Public Mining while Ghost Mode is
-        // active; disabling it is always allowed. Reject without mutating state.
-        if enabled && config.ghost_mode {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "Ghost Mode is active. Disable it before enabling Public Mining."
-                })),
-            )
-                .into_response();
+        if let Err((code, body)) = apply_public_mining(&state, enabled) {
+            return (code, Json(body)).into_response();
         }
-        config.public_mining = enabled;
     }
     api_mining_status_handler(State(state))
         .await
@@ -9528,17 +9813,74 @@ struct PayoutAddressBody {
 }
 
 /// API v1 Mining: Set payout address (POST)
+///
+/// Persists the operator's node-reward payout address to the REAL config
+/// (`[pool] node_payout_address` in pool.toml) via `save_atomic`, then applies
+/// it live to the DB (`update_node_payout_address`) so node-reward payouts pick
+/// it up without a restart (startup also reloads it from config). Validates the
+/// address minimally against the node's network prefix.
 async fn api_mining_payout_address_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(body): Json<PayoutAddressBody>,
 ) -> impl IntoResponse {
+    let address = body.address.trim().to_string();
+
+    // Minimal validation: reject empty and wrong-network prefixes so a typo
+    // can't silently redirect node rewards into an unspendable address.
+    if address.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success": false, "error": "Payout address cannot be empty"})),
+        )
+            .into_response();
+    }
+    if !validate_address_prefix(&address, state.network) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "Invalid address prefix for {} network",
+                    state.network.as_str()
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    // Persist to pool.toml. Fail-closed if the full config isn't loaded.
+    if let Err((code, msg)) = persist_full_config(&state, |cfg| {
+        cfg.pool.node_payout_address = Some(address.clone());
+    }) {
+        error!(error = %msg, "Failed to persist node payout address");
+        return (
+            code,
+            Json(serde_json::json!({"success": false, "error": msg})),
+        )
+            .into_response();
+    }
+
+    // Apply live to the DB so node-reward payouts use the new address without a
+    // restart. A failure here is non-fatal: the config is already persisted, so
+    // the next startup reconciles the DB from it.
+    if let Some(ref db) = state.database {
+        if let Err(e) = db.update_node_payout_address(&state.node_id, &address) {
+            warn!(error = %e, "Persisted payout address but failed to apply to DB; a restart will reconcile it");
+        }
+    }
+
+    // Keep the mirror in sync for immediate in-session display.
     {
         let mut config = state.dashboard_config.write();
-        config.payout_address = Some(body.address);
+        config.payout_address = Some(address.clone());
     }
-    api_mining_status_handler(State(state))
-        .await
-        .into_response()
+
+    Json(serde_json::json!({
+        "success": true,
+        "address": address,
+        "message": "Node-reward payout address saved."
+    }))
+    .into_response()
 }
 
 /// Pool name body
@@ -9550,41 +9892,69 @@ struct PoolNameBody {
 /// API v1 Mining: Set pool name (POST)
 /// Validates: ASCII printable, max 30 chars, no control characters.
 /// Set name to null/empty to clear.
+///
+/// Persists to the REAL config: `[pool] pool_name` in pool.toml via
+/// `save_atomic`, then requests a graceful ghost-pool restart. The coinbase tag
+/// is resolved once at startup from `pool.pool_name` (`main.rs`), so the block
+/// tag only changes after the restart applies the new name. The dashboard
+/// mirror is kept in sync for immediate in-session display.
 async fn api_mining_pool_name_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(body): Json<PoolNameBody>,
 ) -> impl IntoResponse {
-    if let Some(ref name) = body.name {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            let mut config = state.dashboard_config.write();
-            config.pool_name = None;
-        } else if trimmed.len() > 30 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Pool name must be 30 characters or fewer"})),
-            )
-                .into_response();
-        } else if !trimmed
-            .chars()
-            .all(|c| c.is_ascii() && !c.is_ascii_control())
-        {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Pool name must be ASCII printable characters only"})),
-            )
-                .into_response();
-        } else {
-            let mut config = state.dashboard_config.write();
-            config.pool_name = Some(trimmed.to_string());
+    // Validate and normalise into the value to persist (None clears the name).
+    let new_name: Option<String> = match body.name {
+        Some(ref name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() > 30 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Pool name must be 30 characters or fewer"})),
+                )
+                    .into_response();
+            } else if !trimmed.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Pool name must be ASCII printable characters only"})),
+                )
+                    .into_response();
+            } else {
+                Some(trimmed.to_string())
+            }
         }
-    } else {
-        let mut config = state.dashboard_config.write();
-        config.pool_name = None;
+        None => None,
+    };
+
+    // Persist to pool.toml. Fail-closed if the full config isn't loaded so the
+    // operator gets an honest error instead of a value that dies on restart.
+    if let Err((code, msg)) = persist_full_config(&state, |cfg| {
+        cfg.pool.pool_name = new_name.clone();
+    }) {
+        error!(error = %msg, "Failed to persist pool name");
+        return (
+            code,
+            Json(serde_json::json!({"success": false, "error": msg})),
+        )
+            .into_response();
     }
-    api_mining_status_handler(State(state))
-        .await
-        .into_response()
+
+    // Mirror for immediate in-session display; the coinbase tag rebuilds at
+    // startup, so request a graceful restart to actually apply the new tag.
+    {
+        let mut config = state.dashboard_config.write();
+        config.pool_name = new_name.clone();
+    }
+    state.request_restart();
+
+    Json(serde_json::json!({
+        "success": true,
+        "pool_name": new_name,
+        "restart_pending": true,
+        "message": "Pool name saved. ghost-pool will restart to apply the new coinbase tag."
+    }))
+    .into_response()
 }
 
 /// Operator window body
@@ -10841,6 +11211,416 @@ mod tests {
         assert_eq!(c["max_op_return_size"].as_u64(), Some(33));
         assert_eq!(c["max_tx_outputs"].as_u64(), Some(7));
         assert_eq!(c["min_fee_rate"].as_f64(), Some(3.0));
+    }
+
+    /// Group A: `/config/full` must surface operator settings from the REAL
+    /// persisted config (pool.toml), not the ephemeral dashboard mirror.
+    #[tokio::test]
+    async fn test_config_full_reads_real_config() {
+        use ghost_common::config::{MiningMode, NodeConfig as FullNodeConfig};
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+
+        let mut cfg = FullNodeConfig::default();
+        cfg.pool.node_payout_address = Some("tb1qexamplepayoutaddr".to_string());
+        cfg.pool.pool_name = Some("SatoshiPool".to_string());
+        cfg.storage.archive_mode = true;
+        cfg.storage.prune_height = 5000;
+        cfg.network.mining_mode = MiningMode::PublicPool;
+
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_full_node_config(cfg, path.clone()),
+        );
+
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config/full")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["payout"]["address"].as_str(),
+            Some("tb1qexamplepayoutaddr")
+        );
+        assert!(json["payout"]["ghostpay_address"].is_null());
+        assert_eq!(json["pool_name"].as_str(), Some("SatoshiPool"));
+        assert_eq!(json["archive_mode"].as_bool(), Some(true));
+        assert_eq!(json["public_mining"].as_bool(), Some(true));
+        assert_eq!(json["pruning"]["prune_height"].as_u64(), Some(5000));
+    }
+
+    /// Group B: Pool Name POST persists `[pool] pool_name` to pool.toml and
+    /// requests a restart (the coinbase tag is built once at startup).
+    #[tokio::test]
+    async fn test_pool_name_post_persists_and_restarts() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        let body = r#"{"name": "SatoshiPool"}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, body.as_bytes());
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/mining/pool_name")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"].as_bool(), Some(true));
+        assert_eq!(json["restart_pending"].as_bool(), Some(true));
+
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert_eq!(reloaded.pool.pool_name.as_deref(), Some("SatoshiPool"));
+        assert!(state.restart_requested());
+    }
+
+    /// Group B: Mining payout POST persists `[pool] node_payout_address` and
+    /// rejects a wrong-network address prefix.
+    #[tokio::test]
+    async fn test_payout_address_post_persists_and_validates() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        // Default network is Signet, so a `bc1` (mainnet) address must be rejected
+        // and a `tb1` address accepted.
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        let post = |body: &'static str| {
+            let state = Arc::clone(&state);
+            let auth = auth.clone();
+            async move {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let signature = auth.sign(timestamp, body.as_bytes());
+                super::create_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/mining/payout_address")
+                            .header("Content-Type", "application/json")
+                            .header("X-Ghost-Signature", signature)
+                            .header("X-Ghost-Timestamp", timestamp.to_string())
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Wrong-network prefix → 400, nothing persisted.
+        let bad = post(r#"{"address": "bc1qmainnetaddress"}"#).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        // Correct signet prefix → 200 and persisted to disk.
+        let good = post(r#"{"address": "tb1qsignetpayoutaddress"}"#).await;
+        assert_eq!(good.status(), StatusCode::OK);
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert_eq!(
+            reloaded.pool.node_payout_address.as_deref(),
+            Some("tb1qsignetpayoutaddress")
+        );
+    }
+
+    /// Group B: Public Mining POST must NOT persist an invalid mode transition
+    /// (switching to a private mode with no password would brick startup).
+    #[tokio::test]
+    async fn test_public_mining_invalid_transition_rejected() {
+        use ghost_common::config::{MiningMode, NodeConfig as FullNodeConfig};
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        // Default mining_mode is PublicPool; disabling it targets PrivatePool,
+        // which has no password → the resulting config is invalid.
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        let body = r#"{"enabled": false}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, body.as_bytes());
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/public_mining")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Mode unchanged in memory, no restart requested, nothing written.
+        assert!(matches!(
+            state
+                .full_node_config
+                .as_ref()
+                .unwrap()
+                .read()
+                .network
+                .mining_mode,
+            MiningMode::PublicPool
+        ));
+        assert!(!state.restart_requested());
+        assert!(!path.exists(), "an invalid transition must not write pool.toml");
+    }
+
+    /// Group B: Public Mining POST preserves the Ghost-Mode mutual exclusion.
+    #[tokio::test]
+    async fn test_public_mining_ghost_mode_conflict_409() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let mut cfg = FullNodeConfig::default();
+        cfg.network.ghost_mode = true;
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(cfg, path.clone()),
+        );
+
+        let body = r#"{"enabled": true}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, body.as_bytes());
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/public_mining")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// Group D: the custom-profile list GET returns the saved profiles wrapped
+    /// in `{ profiles: [{ name, ...settings }] }`.
+    #[tokio::test]
+    async fn test_config_profiles_list_returns_saved() {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone()),
+        );
+        {
+            let mut config = state.dashboard_config.write();
+            config.custom_mempool_profiles.insert(
+                "myprofile".to_string(),
+                serde_json::json!({ "max_tx_size": 1234 }),
+            );
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, b"");
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config/profiles/mempool")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let profiles = json["profiles"].as_array().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0]["name"].as_str(), Some("myprofile"));
+        assert_eq!(profiles[0]["max_tx_size"].as_u64(), Some(1234));
+    }
+
+    /// Group E: Elder GET reports the REAL mesh-assigned status from the
+    /// verified capability set and is flagged read-only.
+    #[tokio::test]
+    async fn test_elder_get_read_only_from_capabilities() {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let caps = NodeCapabilities {
+            elder_status: true,
+            ..Default::default()
+        };
+        let state = Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            caps,
+        ));
+
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config/elder")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["enabled"].as_bool(), Some(true));
+        assert_eq!(json["read_only"].as_bool(), Some(true));
+    }
+
+    /// Group E: Elder POST is neutered — even with valid auth it must NOT
+    /// mutate state and returns 403 (elder is mesh-assigned, not operator-set).
+    #[tokio::test]
+    async fn test_elder_post_neutered() {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone()),
+        );
+
+        let body = r#"{"enabled": true, "slot": 1}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, body.as_bytes());
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/elder")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["code"].as_str(), Some("ELDER_READ_ONLY"));
     }
 
     /// CRIT-6: Test that all config POST endpoints require auth
