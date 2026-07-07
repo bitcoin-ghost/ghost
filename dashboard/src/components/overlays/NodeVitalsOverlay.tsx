@@ -225,12 +225,20 @@ function deriveLeds(status: WatchdogStatus | undefined): Led[] {
     status.components && status.components.length > 0
       ? status.components.map((c) => ({ name: c.name, status: String(c.status) }))
       : (status.services ?? []).map((s) => ({ name: s.name, status: String(s.status) }));
-  return src.map((s) => ({
+  const leds = src.map((s) => ({
     name: s.name,
     label: shortName(s.name),
     tone: ledTone(s.status),
     title: `${s.name}: ${s.status}`,
   }));
+  // Preferred glance-row order: core (ghostd) before pool, then pay; any other
+  // service keeps its original order after these (Array.sort is stable).
+  const ORDER = ['core', 'pool', 'pay'];
+  const rank = (l: string) => {
+    const i = ORDER.indexOf(l.toLowerCase());
+    return i === -1 ? ORDER.length : i;
+  };
+  return leds.sort((a, b) => rank(a.label) - rank(b.label));
 }
 
 // Resource usage → tone, mirroring the Watchdog page's threshold colouring.
