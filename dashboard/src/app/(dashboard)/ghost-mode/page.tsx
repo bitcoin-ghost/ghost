@@ -86,7 +86,7 @@ export default function GhostModePage() {
                 <span style={{ color: "var(--fg)", fontWeight: 500, fontSize: "15px" }}>Ghost Mode</span>
                 {ghostMode && <Badge variant="success">+privacy</Badge>}
               </div>
-              <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5", maxWidth: "60ch" }}>
+              <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5" }}>
                 When enabled, your node still accepts, validates and forwards blocks, but never relays
                 unconfirmed transactions, sends no <code>INV</code> announcements, and answers every
                 transaction <code>getdata</code> with <code>NOT_FOUND</code>. Toggles live with no restart.
@@ -152,7 +152,7 @@ export default function GhostModePage() {
                 </span>
                 {ghostMode && localEgress && <Badge variant="success">on</Badge>}
               </div>
-              <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5", maxWidth: "60ch" }}>
+              <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5" }}>
                 Keep transactions your own node submits (via <code>sendrawtransaction</code> or a connected
                 wallet) flowing to peers so they can reach a miner, while transactions received from other
                 peers stay fully suppressed. Only your <em>own</em> still-unbroadcast transactions are
@@ -239,13 +239,13 @@ export default function GhostModePage() {
         <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
           What it does
         </h3>
-        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginBottom: "12px", maxWidth: "68ch" }}>
-          Shroud delays <em>when</em> you relay; Ghost Mode decides <em>whether</em> you relay at all. It is
+        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginBottom: "12px" }}>
+          Ghost Mode decides <em>whether</em> your node relays unconfirmed transactions at all — it is
           ghost-core&apos;s integrated take on Bitcoin Core&apos;s <code>-blocksonly</code>, wired into the runtime
           config with a friendly toggle. When <code>ghost_mode = true</code>:
         </p>
-        <ul style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.7", paddingLeft: "18px", listStyle: "disc", maxWidth: "68ch" }}>
-          <li><strong style={{ color: "var(--fg)" }}>Relay is suppressed.</strong> <code>RelayTransaction()</code> returns early — your node never pushes transactions to peers, and the Shroud delay queue is bypassed (nothing to delay).</li>
+        <ul style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.7", paddingLeft: "18px", listStyle: "disc" }}>
+          <li><strong style={{ color: "var(--fg)" }}>Relay is suppressed.</strong> <code>RelayTransaction()</code> returns early — your node never pushes unconfirmed transactions to peers.</li>
           <li><strong style={{ color: "var(--fg)" }}>getdata returns NOT_FOUND.</strong> A peer asking &quot;give me transaction X&quot; is answered <code>NOT_FOUND</code> regardless of whether X is in your mempool. Your mempool stops being a public lookup table.</li>
           <li><strong style={{ color: "var(--fg)" }}>No INV announcements.</strong> Your node doesn&apos;t tell peers about unconfirmed transactions it has seen.</li>
           <li><strong style={{ color: "var(--fg)" }}>Blocks are unaffected.</strong> You still receive, validate and forward blocks; the chain propagates through your node normally.</li>
@@ -275,7 +275,7 @@ export default function GhostModePage() {
         <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
           What it protects against
         </h3>
-        <p style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "4px", maxWidth: "68ch" }}>
+        <p style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "4px" }}>
           Ghost Mode is transaction-level silence at the gossip layer. It does not change consensus and
           does not make your node invisible.
         </p>
@@ -295,10 +295,10 @@ export default function GhostModePage() {
         <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
           When to enable it
         </h3>
-        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", maxWidth: "68ch" }}>
+        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6" }}>
           Ghost Mode is for privacy-maximising operators who want zero P2P-layer transaction footprint and
-          already have a separate broadcast path for their own payments. Most users only need Shroud for
-          basic relay-timing protection. Ghost Mode composes with Tor mode — running both gives a node
+          already have a separate broadcast path for their own payments (or use <em>Allow my own wallet
+          broadcasts</em> above). Ghost Mode composes with Tor mode — running both gives a node
           that is behind Tor <em>and</em> silent about transactions. If you don&apos;t have an out-of-band
           broadcast route, leave it off, or your own transactions won&apos;t reach a miner.
         </p>
@@ -308,10 +308,6 @@ export default function GhostModePage() {
         For network-exposure controls (Tor mode, onion address) see{" "}
         <a href="/network" className="bare" style={{ color: "var(--dim)", textDecoration: "underline", textDecorationColor: "var(--rule-strong)" }}>
           Network
-        </a>
-        . For relay-timing privacy see{" "}
-        <a href="/shroud" className="bare" style={{ color: "var(--dim)", textDecoration: "underline", textDecorationColor: "var(--rule-strong)" }}>
-          Shroud
         </a>
         .
       </p>
