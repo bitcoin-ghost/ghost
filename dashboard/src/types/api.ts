@@ -575,6 +575,7 @@ export interface GhostPayStatus {
   uptime_secs?: number;
   sync_state?: string;
   wraith_enabled?: boolean;
+  ghostpay_hosts_mixing?: boolean;
   total_balances?: number;
 }
 

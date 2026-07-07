@@ -5,7 +5,6 @@ import type {
   WraithSessionsResponse,
   WraithStats,
   WraithSession,
-  GhostLocksResponse,
   GhostLock,
   PaymentsResponse,
   SettlementResponse,
@@ -75,10 +74,6 @@ export async function joinWraithSession(sessionId: string, lockId: string): Prom
 }
 
 // Ghost Locks
-export async function getGhostLocks(): Promise<GhostLocksResponse> {
-  return fetchApi<GhostLocksResponse>('/api/v1/locks');
-}
-
 export async function getGhostLock(lockId: string): Promise<GhostLock> {
   return fetchApi<GhostLock>(`/api/v1/locks/${lockId}`);
 }
@@ -110,19 +105,23 @@ export async function getSettlement(): Promise<SettlementResponse> {
   return fetchApi<SettlementResponse>('/api/v1/settlement/status');
 }
 
-// Wraith Stats (aggregate stats, not wallet-specific)
+// Wraith Stats (node-level aggregate mixing stats, not wallet-specific).
+// The backend returns the aggregate counts at the TOP LEVEL of the response
+// (total_sessions, active_sessions, sessions_completed, …); prefer those real
+// fields, then a nested `stats` object, then a count derived from the live
+// session list as a last resort.
 export async function getWraithStats(): Promise<WraithStats> {
   try {
-    // Try to get from wraith sessions and compute stats
     const sessions = await fetchApi<WraithSessionsResponse>('/api/v1/wraith/sessions');
+    const list = sessions.sessions ?? [];
     return {
-      total_sessions: sessions.stats?.total_sessions ?? sessions.sessions?.length ?? 0,
-      active_sessions: sessions.stats?.active_sessions ?? sessions.sessions?.filter(s => s.status === 'Filling' || s.status === 'Full').length ?? 0,
-      sessions_completed: sessions.stats?.sessions_completed ?? sessions.sessions?.filter(s => s.status === 'Complete').length ?? 0,
-      sessions_expired: sessions.stats?.sessions_expired ?? sessions.sessions?.filter(s => s.status === 'Expired').length ?? 0,
-      total_participants: sessions.sessions?.reduce((sum, s) => sum + (s.participant_count ?? 0), 0) ?? 0,
-      avg_fill_rate: sessions.sessions?.length > 0
-        ? sessions.sessions.reduce((sum, s) => sum + (s.fill_percentage ?? 0), 0) / sessions.sessions.length / 100
+      total_sessions: sessions.total_sessions ?? sessions.total ?? sessions.stats?.total_sessions ?? list.length,
+      active_sessions: sessions.active_sessions ?? sessions.active ?? sessions.stats?.active_sessions ?? list.filter(s => s.status === 'Filling' || s.status === 'Full').length,
+      sessions_completed: sessions.sessions_completed ?? sessions.stats?.sessions_completed ?? list.filter(s => s.status === 'Complete').length,
+      sessions_expired: sessions.sessions_expired ?? sessions.stats?.sessions_expired ?? list.filter(s => s.status === 'Expired').length,
+      total_participants: sessions.total_participants ?? sessions.stats?.total_participants ?? list.reduce((sum, s) => sum + (s.participant_count ?? 0), 0),
+      avg_fill_rate: list.length > 0
+        ? list.reduce((sum, s) => sum + (s.fill_percentage ?? 0), 0) / list.length / 100
         : 0,
       your_participations: sessions.stats?.your_participations ?? 0,
       your_completed: sessions.stats?.your_completed ?? 0,
