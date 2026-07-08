@@ -371,8 +371,9 @@ export default function GhostModePage() {
           Ghost Mode is for privacy-maximising operators who want zero P2P-layer transaction footprint and
           already have a separate broadcast path for their own payments (or use Allow my own wallet
           broadcasts above). Ghost Mode composes with Tor mode — running both gives a node
-          that is behind Tor and silent about transactions. If you don&apos;t have an out-of-band
-          broadcast route, leave it off, or your own transactions won&apos;t reach a miner.
+          that is behind Tor and silent about transactions. If you leave Allow my own wallet
+          broadcasts off and have no out-of-band broadcast route, your own transactions won&apos;t
+          reach a miner.
         </p>
       </Card>
 
