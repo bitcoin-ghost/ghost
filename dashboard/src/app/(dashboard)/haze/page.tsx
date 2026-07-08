@@ -292,16 +292,9 @@ export default function HazePage() {
               {formatBytes(savings.strippedBytes)}
             </div>
             <p className="text-[color:var(--dim)] text-sm mt-3 max-w-2xl leading-relaxed">
-              Ghost Exorcism has removed{" "}
-              <span className="text-[color:var(--fg)] font-medium">
-                {formatBytes(savings.strippedBytes)}
-              </span>{" "}
-              of non-consensus content across{" "}
-              <span className="text-[color:var(--fg)] font-medium">
-                {(haze?.blocks_stripped ?? 0).toLocaleString()}
-              </span>{" "}
-              blocks — inscriptions, spam and data-carrier payloads that never reached your
-              disk.
+              Ghost Exorcism has removed {formatBytes(savings.strippedBytes)} of non-consensus
+              content across {(haze?.blocks_stripped ?? 0).toLocaleString()} blocks — inscriptions,
+              spam and data-carrier payloads that never reached your disk.
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6">
               <div className="rounded-lg p-4 bg-[var(--surface)] border border-[color:var(--rule)]">
@@ -519,8 +512,7 @@ export default function HazePage() {
             <div className="p-4 rounded-lg bg-[var(--surface)] border border-[color:var(--rule-strong)]">
               <p className="text-[color:var(--dim)] text-sm leading-relaxed">
                 The Legal Compliance Pack is a signed, court-ready proof that your node does
-                not persist arbitrary embedded content. It is generated once{" "}
-                <span className="text-[color:var(--fg)] font-medium">Haze is enabled</span> and
+                not persist arbitrary embedded content. It is generated once Haze is enabled and
                 the Exorcist is stripping blocks.
                 {legal?.reason && (
                   <span className="block mt-2 text-xs text-[color:var(--fainter)]">
@@ -540,7 +532,7 @@ export default function HazePage() {
           subtitle="Non-consensus fields removed by Ghost Haze's own field classifier"
         />
         <p className="text-[color:var(--dim)] text-sm leading-relaxed mb-4">
-          Ghost Haze uses its own <code className="text-[color:var(--accent)]">field_classifier</code>{" "}
+          Ghost Haze uses its own <code>field_classifier</code>{" "}
           — distinct from the BUDS policy system — to identify the non-consensus bytes where
           inscriptions and spam live. These are stripped after full validation, so consensus and
           the UTXO set are untouched while the arbitrary payloads never reach disk.
@@ -552,7 +544,7 @@ export default function HazePage() {
               className="p-3 bg-[var(--surface)] rounded-lg border border-[color:var(--rule-strong)]"
             >
               <div className="flex items-center gap-2 mb-1.5">
-                <span className="text-[color:var(--accent)] font-mono text-xs font-bold">✕</span>
+                <span className="text-[color:var(--dim)] font-mono text-xs">✕</span>
                 <span className="text-[color:var(--fg)] text-sm font-medium">{f.title}</span>
               </div>
               <p className="text-[color:var(--dim)] text-xs leading-relaxed">{f.body}</p>
@@ -660,8 +652,8 @@ export default function HazePage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* 5. The Exorcism pipeline */}
-      <Card collapsible defaultCollapsed>
+      {/* 5. The Exorcism pipeline — always-open reference section */}
+      <Card>
         <CardHeader
           title="The Exorcism pipeline"
           subtitle="How Ghost Haze strips blocks before they hit disk"
@@ -676,18 +668,18 @@ export default function HazePage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="p-3 bg-[var(--surface)] rounded-lg border border-[color:var(--rule-strong)]">
               <div className="flex items-center gap-2 mb-1.5">
-                <span className="text-[color:var(--accent)] font-mono text-xs font-bold">1</span>
+                <span className="text-[color:var(--dim)] font-mono text-xs">1</span>
                 <span className="text-[color:var(--fg)] text-sm font-medium">Field Classification</span>
               </div>
               <p className="text-[color:var(--dim)] text-xs leading-relaxed">
-                Ghost Haze&apos;s own <code className="text-[color:var(--accent)]">field_classifier</code>{" "}
+                Ghost Haze&apos;s own <code>field_classifier</code>{" "}
                 (not BUDS) marks each non-consensus field — witness data, scriptSig, OP_RETURN
                 payloads and coinbase scriptSig — as strippable once validated.
               </p>
             </div>
             <div className="p-3 bg-[var(--surface)] rounded-lg border border-[color:var(--rule-strong)]">
               <div className="flex items-center gap-2 mb-1.5">
-                <span className="text-[color:var(--accent)] font-mono text-xs font-bold">2</span>
+                <span className="text-[color:var(--dim)] font-mono text-xs">2</span>
                 <span className="text-[color:var(--fg)] text-sm font-medium">Block Stripping</span>
               </div>
               <p className="text-[color:var(--dim)] text-xs leading-relaxed">
@@ -697,18 +689,18 @@ export default function HazePage() {
             </div>
             <div className="p-3 bg-[var(--surface)] rounded-lg border border-[color:var(--rule-strong)]">
               <div className="flex items-center gap-2 mb-1.5">
-                <span className="text-[color:var(--accent)] font-mono text-xs font-bold">3</span>
+                <span className="text-[color:var(--dim)] font-mono text-xs">3</span>
                 <span className="text-[color:var(--fg)] text-sm font-medium">GSB Storage</span>
               </div>
               <p className="text-[color:var(--dim)] text-xs leading-relaxed">
                 Stripped blocks are stored in Ghost Stripped Block (
-                <code className="text-[color:var(--accent)]">.gsb</code>) format — a compact
+                <code>.gsb</code>) format — a compact
                 representation that preserves everything needed for chain validation.
               </p>
             </div>
             <div className="p-3 bg-[var(--surface)] rounded-lg border border-[color:var(--rule-strong)]">
               <div className="flex items-center gap-2 mb-1.5">
-                <span className="text-[color:var(--accent)] font-mono text-xs font-bold">4</span>
+                <span className="text-[color:var(--dim)] font-mono text-xs">4</span>
                 <span className="text-[color:var(--fg)] text-sm font-medium">UTXO Preservation</span>
               </div>
               <p className="text-[color:var(--dim)] text-xs leading-relaxed">
@@ -723,12 +715,12 @@ export default function HazePage() {
             <h4 className="text-[color:var(--fg)] font-medium text-sm mb-1">The Exorcist</h4>
             <p className="text-[color:var(--dim)] text-xs leading-relaxed">
               The Exorcist is the component that performs the actual stripping. It runs inside
-              Ghost Core (<code className="text-[color:var(--accent)]">ghostd</code>) at the block
+              Ghost Core (<code>ghostd</code>) at the block
               acceptance layer, intercepting blocks before they are serialized to disk.
             </p>
             <div className="mt-2 p-2 bg-[var(--surface)] rounded border border-[color:var(--rule-strong)]">
               <div className="text-xs text-[color:var(--dim)] leading-relaxed">
-                <span className="text-[color:var(--accent)] font-medium">Mode A (Active Stripping):</span>{" "}
+                Mode A (Active Stripping):{" "}
                 the Exorcist strips classified content before the block is written. Blocks arrive
                 from the network, get stripped in memory, and only the clean version is persisted.
               </div>
@@ -765,9 +757,9 @@ export default function HazePage() {
             </div>
             <p className="text-[color:var(--dim)] text-xs leading-relaxed">
               This is a one-time batch job that rewrites existing block files into stripped
-              structural blocks. It is <span className="text-[color:var(--fg)]">resumable</span> —
+              structural blocks. It is resumable —
               if the node restarts, conversion continues from where it left off. Your Legal Pack
-              is finalised once it reads <span className="font-mono">COMPLETE</span>.
+              is finalised once it reads <code>COMPLETE</code>.
             </p>
           </div>
         </Card>
@@ -790,7 +782,7 @@ export default function HazePage() {
               Forward — haze from genesis
             </div>
             <p className="text-[color:var(--dim)] text-xs leading-relaxed">
-              A <span className="text-[color:var(--fg)]">fresh</span> node can start hazed and strip
+              A fresh node can start hazed and strip
               every block as it syncs. Nothing arbitrary is ever written — no conversion needed.
             </p>
           </div>
@@ -799,7 +791,7 @@ export default function HazePage() {
               Retroactive — convert existing blocks
             </div>
             <p className="text-[color:var(--dim)] text-xs leading-relaxed">
-              An <span className="text-[color:var(--fg)]">already-synced</span> full or pruned node
+              An already-synced full or pruned node
               cannot simply flip to hazed — it must run a one-time, resumable conversion that strips
               the blocks it already holds. This is the only path to haze later.
             </p>

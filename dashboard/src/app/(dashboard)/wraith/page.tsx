@@ -132,7 +132,7 @@ export default function WraithPage() {
           ) : (
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
               <div>
-                <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>Wraith mixing</div>
+                <div className="t-title" style={{ color: "var(--fg)" }}>Wraith mixing</div>
                 <div className="t-caption" style={{ color: "var(--dim)", marginTop: "2px", maxWidth: "36rem" }}>
                   When enabled, any L2 participant can initiate a CoinJoin session through this node. Off means the node won&apos;t coordinate mixing. A ghost-pool restart applies the change.
                 </div>
