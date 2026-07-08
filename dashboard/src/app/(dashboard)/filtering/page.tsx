@@ -147,7 +147,7 @@ export default function FilteringOverviewPage() {
       <PageHeader
         eyebrow="filtering"
         title="Filtering."
-        subtitle="Your node filters in two independent layers: a tier policy (which transaction classes it will mine) and the Reaper (strips dead-code spam from what it relays and mines, regardless of class). Set the policy in Basic; fine-tune both in Advanced."
+        subtitle="Two layers keep your blocks clean — the Reaper filters spam, and a tier policy picks which transaction classes you mine. Set it in Basic; fine-tune both in Advanced."
         subtitleFullWidth
       />
 
@@ -203,6 +203,40 @@ export default function FilteringOverviewPage() {
           tooltip="Dead-code and malformed data the reaper stripped from the last block template this node built. This is per-block, not a running total — it reflects your most recent block only."
         />
       </div>
+
+      {/* How filtering works — plain-English teaching block for newcomers */}
+      <Card>
+        <CardHeader title="How filtering works" subtitle="Two layers, in plain terms." />
+        <div className="space-y-4">
+          <div>
+            <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 500, marginBottom: "4px" }}>
+              The Reaper — your junk filter
+            </div>
+            <p className="t-body" style={{ color: "var(--dim)", lineHeight: 1.6 }}>
+              It recognises known spam patterns — inscription stuffing, dust floods, oversized data — and
+              throws them out of your mempool and your blocks entirely. Junk it catches is never relayed on.
+              The Reaper runs all the time on a sensible default; tune its individual detectors in Advanced.
+            </p>
+          </div>
+          <div>
+            <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 500, marginBottom: "4px" }}>
+              Tier policy (BUDS) — what your blocks mine
+            </div>
+            <p className="t-body" style={{ color: "var(--dim)", lineHeight: 1.6 }}>
+              Legitimate transactions come in classes, from ordinary payments (T0) up to heavy data (T3).
+              This is your choice of which classes earn space in the blocks you mine. It does not block relay —
+              valid transactions still flow through your node to the network; you are only deciding what goes
+              in your block. Set it in Basic, customise it in Advanced.
+            </p>
+          </div>
+          <div style={{ borderTop: "1px solid var(--rule)", paddingTop: "12px" }}>
+            <p className="t-body" style={{ color: "var(--dim)", lineHeight: 1.6 }}>
+              In one line: the Reaper is the bouncer that keeps junk out; the tier policy is the menu deciding
+              which of the legitimate rest you mine. Basic sets the menu; Advanced tunes both.
+            </p>
+          </div>
+        </div>
+      </Card>
 
       {/* Status readout — which settings are active */}
       <SectionErrorBoundary section="Active settings">
