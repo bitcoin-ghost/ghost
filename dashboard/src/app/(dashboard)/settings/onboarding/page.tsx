@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/Badge";
 import { StepIndicator } from "@/components/ui/Wizard";
 import { useToast } from "@/components/ui/Toast";
 import { ToggleRow, StatusRow } from "../shared";
+import { CapabilityToggles } from "@/components/settings/CapabilityToggles";
 import ReaperWizard from "../wizards/ReaperWizard";
 import {
   useNodeStatus,
@@ -16,10 +17,6 @@ import {
   useConfig,
   useFullConfig,
   useGhostPayStatus,
-  useSetArchiveMode,
-  useSetPublicMining,
-  useSetReaper,
-  useSetGhostPay,
   useSetWraith,
   useSetPolicyProfile,
 } from "@/hooks/queries";
@@ -66,11 +63,9 @@ export default function OnboardingPage() {
   const { data: fullConfig } = useFullConfig();
   const { data: ghostPay } = useGhostPayStatus();
 
-  // Writes — the SAME hooks the Capabilities/Filtering settings pages use.
-  const setArchiveMode = useSetArchiveMode();
-  const setPublicMining = useSetPublicMining();
-  const setReaper = useSetReaper();
-  const setGhostPay = useSetGhostPay();
+  // Writes — Wraith mixing and the tier policy still live here; the five
+  // canonical capability rows are driven inside the shared CapabilityToggles
+  // component (the SAME hooks Settings › Capabilities uses).
   const setWraith = useSetWraith();
   const setPolicyProfile = useSetPolicyProfile();
 
@@ -79,49 +74,12 @@ export default function OnboardingPage() {
 
   const activePolicyProfile = String(fullConfig?.policy?.profile ?? "permissive");
   const ghostPayRunning = Boolean(ghostPay?.l2_height);
-  const ghostPayEnabled = status?.ghost_pay ?? false;
   const wraithEnabled = ghostPay?.wraith_enabled ?? false;
-
-  const handleArchiveToggle = async (enabled: boolean) => {
-    try {
-      await setArchiveMode.mutateAsync(enabled);
-      success("Saved", `Archive Mode ${enabled ? "enabled" : "disabled"}`);
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
-  const handlePublicMiningToggle = async (enabled: boolean) => {
-    try {
-      await setPublicMining.mutateAsync(enabled);
-      success("Saved", `Public Mining ${enabled ? "enabled" : "disabled"}`);
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
-  const handleGhostPayToggle = async (enabled: boolean) => {
-    try {
-      await setGhostPay.mutateAsync(enabled);
-      success("Saved", `Ghost Pay ${enabled ? "enabled" : "disabled"}`);
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
 
   const handleWraithToggle = async (enabled: boolean) => {
     try {
       await setWraith.mutateAsync(enabled);
       success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-pool to apply`);
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
-  const handleReaperToggle = async (enabled: boolean) => {
-    try {
-      await setReaper.mutateAsync(enabled);
-      success("Saved", `Ghost Reaper ${enabled ? "enabled" : "disabled"}`);
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
     }
@@ -216,67 +174,23 @@ export default function OnboardingPage() {
             subtitle="Capabilities earn shares in the node reward pool (5-4-3-2-1). Toggles are pre-set to your node's current values and save immediately."
           />
           <div className="space-y-3">
-            <ToggleRow
-              label="Archive Mode"
-              description="Store full blockchain history. Archive +5 shares."
-              enabled={archiveEnabled}
-              onChange={handleArchiveToggle}
-              disabled={setArchiveMode.isPending}
-              badge={archiveEnabled ? <Badge variant="success">+5 Shares</Badge> : null}
-            />
-            <ToggleRow
-              label="Ghost Pay"
-              description={`L2 payment network participation — requires ghost-pay-node${ghostPay?.l2_height ? ` (L2 height: ${ghostPay.l2_height})` : ""}. Ghost Pay +4 shares.`}
-              enabled={ghostPayEnabled}
-              onChange={handleGhostPayToggle}
-              disabled={setGhostPay.isPending}
-              badge={
-                ghostPayEnabled ? (
-                  ghostPayRunning ? (
-                    <Badge variant="success">+4 Shares</Badge>
-                  ) : (
-                    <Badge variant="warning">Not Running</Badge>
-                  )
-                ) : null
-              }
-            />
-            <ToggleRow
-              label="Wraith Mixing"
-              description="Let any L2 participant initiate a CoinJoin session through this node. Off means this node won't take part in mixing. Not a reward capability — a restart applies the change."
-              enabled={wraithEnabled}
-              onChange={handleWraithToggle}
-              disabled={setWraith.isPending}
-              badge={wraithEnabled ? <Badge variant="info">Mixing On</Badge> : null}
-            />
-            <ToggleRow
-              label="Public Mining"
-              description="Accept connections from public miners. Public Mining +3 shares."
-              enabled={publicMiningEnabled}
-              onChange={handlePublicMiningToggle}
-              disabled={setPublicMining.isPending}
-              badge={publicMiningEnabled ? <Badge variant="success">+3 Shares</Badge> : null}
-            />
-            <ToggleRow
-              label="Ghost Reaper"
-              description="Reject non-financial data (inscriptions, drop-stuffing, dust-flood) from your mempool and blocks. Reaper +2 shares."
-              enabled={reaperEnabled}
-              onChange={handleReaperToggle}
-              disabled={setReaper.isPending}
-              badge={reaperEnabled ? <Badge variant="success">+2 Shares</Badge> : null}
-            />
-            <StatusRow
-              label="Elder Status"
-              description={
-                shares?.elder
-                  ? `MPC contributor — Elder slot #${shares.elder_slot ?? "?"}`
-                  : "Contribute to the MPC ceremony to earn Elder status. Elder +1 share."
-              }
-              badge={
-                shares?.elder ? (
-                  <Badge variant="success">+1 Share</Badge>
-                ) : (
-                  <Badge variant="default">Not Elder</Badge>
-                )
+            {/*
+             * The five reward capabilities share their markup + hooks with
+             * Settings › Capabilities. Onboarding presents Ghost Pay as an
+             * editable toggle and slots its Wraith mixing control in right
+             * after it.
+             */}
+            <CapabilityToggles
+              ghostPayControl="toggle"
+              afterGhostPay={
+                <ToggleRow
+                  label="Wraith Mixing"
+                  description="Let any L2 participant initiate a CoinJoin session through this node. Off means this node won't take part in mixing. Not a reward capability — a restart applies the change."
+                  enabled={wraithEnabled}
+                  onChange={handleWraithToggle}
+                  disabled={setWraith.isPending}
+                  badge={wraithEnabled ? <Badge variant="info">Mixing On</Badge> : null}
+                />
               }
             />
           </div>
