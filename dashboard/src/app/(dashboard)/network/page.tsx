@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card } from "@/components/ui/Card";
+import { StatCard } from "@/components/ui/StatCard";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
@@ -81,34 +82,32 @@ export default function NetworkPage() {
       />
 
       <SectionErrorBoundary section="Exposure summary">
-        <Card>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-6 mb-2">
-            <Stat label="outbound transport" value={torActive ? "Tor" : "clearnet"} />
-            <Stat label="connected peers" value={peerCount.toLocaleString()} />
-            <Stat
-              label="onion address"
-              value={onion ? "✓ present" : "—"}
-              accent={onion ? "var(--green)" : "var(--dim)"}
-            />
-          </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+          <StatCard label="Outbound transport" value={torActive ? "Tor" : "clearnet"} />
+          <StatCard label="Connected peers" value={peerCount.toLocaleString()} />
+          <StatCard
+            label="Onion address"
+            value={onion ? "present" : "—"}
+            valueColor={onion ? "var(--green)" : undefined}
+          />
+        </div>
 
-          {onion && (
-            <div
-              className="flex items-center justify-between gap-3 mt-4 t-label"
-              style={{
-                background: "var(--bg)",
-                border: "1px solid var(--rule)",
-                borderRadius: "4px",
-                padding: "12px 16px",
-                fontFamily: "var(--font-mono)",
-                overflow: "auto",
-              }}
-            >
-              <code style={{ color: "var(--fg)", whiteSpace: "nowrap" }}>{onion}</code>
-              <CopyButton text={onion} />
-            </div>
-          )}
-        </Card>
+        {onion && (
+          <div
+            className="flex items-center justify-between gap-3 mt-4 t-label"
+            style={{
+              background: "var(--bg)",
+              border: "1px solid var(--rule)",
+              borderRadius: "4px",
+              padding: "12px 16px",
+              fontFamily: "var(--font-mono)",
+              overflow: "auto",
+            }}
+          >
+            <code style={{ color: "var(--fg)", whiteSpace: "nowrap" }}>{onion}</code>
+            <CopyButton text={onion} />
+          </div>
+        )}
       </SectionErrorBoundary>
 
       <SectionErrorBoundary section="Privacy modes">
@@ -254,25 +253,6 @@ function TorRow({
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function Stat({ label, value, accent }: { label: string; value: string; accent?: string }) {
-  return (
-    <div>
-      <div
-        className="t-label-mono"
-        style={{ color: "var(--dim)", marginBottom: "4px" }}
-      >
-        {label}
-      </div>
-      <div
-        className="t-stat"
-        style={{ color: accent ?? "var(--fg)", fontFamily: "var(--font-mono)" }}
-      >
-        {value}
-      </div>
     </div>
   );
 }

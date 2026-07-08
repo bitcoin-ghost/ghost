@@ -12,9 +12,12 @@ interface StatCardProps {
   sublabel?: string;
   loading?: boolean;
   className?: string;
+  /** Optional colour for the value (e.g. a status value like var(--green)).
+   *  Defaults to the standard foreground. */
+  valueColor?: string;
 }
 
-export function StatCard({ label, value, tooltip, icon, sublabel, loading, className = '' }: StatCardProps) {
+export function StatCard({ label, value, tooltip, icon, sublabel, loading, className = '', valueColor }: StatCardProps) {
   if (loading) {
     return (
       <div className={`bg-[var(--surface)] border border-[color:var(--rule)] rounded-lg p-4 h-[104px] ${className}`}>
@@ -38,7 +41,7 @@ export function StatCard({ label, value, tooltip, icon, sublabel, loading, class
         <span className="truncate">{label}</span>
       </div>
       <div>
-        <div className="text-2xl font-bold text-[color:var(--fg)] truncate">{value}</div>
+        <div className="text-2xl font-bold text-[color:var(--fg)] truncate" style={valueColor ? { color: valueColor } : undefined}>{value}</div>
         {sublabel && <div className="text-xs text-[color:var(--fainter)] truncate">{sublabel}</div>}
       </div>
     </div>
