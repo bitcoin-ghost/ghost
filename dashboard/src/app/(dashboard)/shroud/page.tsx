@@ -1,15 +1,18 @@
 "use client";
 
+import { useState } from "react";
 import { StatusRow } from "@/components/ui/StatusRow";
 import { FlowDiagram } from "@/components/ui/FlowDiagram";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { StatCard } from "@/components/ui/StatCard";
 import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { useShroudStatus } from "@/hooks/queries/useShroudQueries";
+import ShroudWizard from "../settings/wizards/ShroudWizard";
 
 const TOOLTIPS = {
   enabled: "Whether Ghost Shroud relay delay is currently active on your node.",
@@ -22,22 +25,29 @@ const TOOLTIPS = {
 
 export default function ShroudPage() {
   const { data: status, isLoading, error } = useShroudStatus({ refetchInterval: 10_000 });
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   const showSkeleton = isLoading && !status;
 
   return (
     <div className="space-y-6">
-      {/* 1. PageHeader */}
+      {/* 1. PageHeader — Configure opens the ShroudWizard inline so operators
+           can enable/disable Shroud here rather than hunting for it in Settings. */}
       <PageHeader
         eyebrow="shroud"
         title="Relay-timing privacy."
         subtitle="Transaction relay privacy"
         actions={
-          status ? (
-            <Badge variant={status.enabled ? "success" : "default"}>
-              {status.enabled ? "Enabled" : "Disabled"}
-            </Badge>
-          ) : undefined
+          <div className="flex items-center gap-3">
+            {status && (
+              <Badge variant={status.enabled ? "success" : "default"}>
+                {status.enabled ? "Enabled" : "Disabled"}
+              </Badge>
+            )}
+            <Button variant="primary" size="sm" onClick={() => setWizardOpen(true)}>
+              Configure Shroud
+            </Button>
+          </div>
         }
       />
 
@@ -234,6 +244,8 @@ export default function ShroudPage() {
           </div>
         </div>
       </Card>
+
+      <ShroudWizard isOpen={wizardOpen} onClose={() => setWizardOpen(false)} />
     </div>
   );
 }

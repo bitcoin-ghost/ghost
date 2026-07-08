@@ -26,12 +26,11 @@ function InfoRow({ threat, protection, strong }: { threat: string; protection: s
       className="flex items-start justify-between gap-6"
       style={{ padding: "12px 0", borderTop: "1px solid var(--rule)" }}
     >
-      <span style={{ color: "var(--fg)", fontSize: "14px", flex: 1, minWidth: 0 }}>{threat}</span>
+      <span className="t-body" style={{ color: "var(--fg)", flex: 1, minWidth: 0 }}>{threat}</span>
       <span
-        className="flex-shrink-0"
+        className="flex-shrink-0 t-label"
         style={{
           color: strong ? "var(--green)" : "var(--dim)",
-          fontSize: "13px",
           fontFamily: "var(--font-mono)",
           maxWidth: "24ch",
           textAlign: "right",
@@ -91,10 +90,10 @@ export default function GhostModePage() {
           <div className="flex items-start justify-between gap-6">
             <div style={{ flex: 1, minWidth: 0 }}>
               <div className="flex items-center gap-2 mb-1">
-                <span style={{ color: "var(--fg)", fontWeight: 500, fontSize: "15px" }}>Ghost Mode</span>
+                <span className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>Ghost Mode</span>
                 {ghostMode && <Badge variant="success">+privacy</Badge>}
               </div>
-              <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5" }}>
+              <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5" }}>
                 When enabled, your node still accepts, validates and forwards blocks, but never relays
                 unconfirmed transactions, sends no <code>INV</code> announcements, and answers every
                 transaction <code>getdata</code> with <code>NOT_FOUND</code>. Toggles live with no restart.
@@ -155,7 +154,7 @@ export default function GhostModePage() {
                 borderRadius: "6px",
               }}
             >
-              <p style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
+              <p className="t-label" style={{ color: "var(--fg)", lineHeight: "1.6" }}>
                 <span style={{ color: "var(--yellow)", fontWeight: 600 }}>Public Mining is active.</span>{" "}
                 Ghost Mode would make your node build empty blocks and forfeit all fee income, so the
                 two can&apos;t run together — disable Public Mining first on the{" "}
@@ -183,12 +182,12 @@ export default function GhostModePage() {
           >
             <div style={{ flex: 1, minWidth: 0 }}>
               <div className="flex items-center gap-2 mb-1">
-                <span style={{ color: "var(--fg)", fontWeight: 500, fontSize: "15px" }}>
+                <span className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>
                   Allow my own wallet broadcasts
                 </span>
                 {ghostMode && localEgress && <Badge variant="success">on</Badge>}
               </div>
-              <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5" }}>
+              <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5" }}>
                 Keep transactions your own node submits (via <code>sendrawtransaction</code> or a connected
                 wallet) flowing to peers so they can reach a miner, while transactions received from other
                 peers stay fully suppressed. Only your <em>own</em> still-unbroadcast transactions are
@@ -252,7 +251,7 @@ export default function GhostModePage() {
                 borderRadius: "6px",
               }}
             >
-              <p style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
+              <p className="t-label" style={{ color: "var(--fg)", lineHeight: "1.6" }}>
                 <span style={{ color: "var(--yellow)", fontWeight: 600 }}>Heads up:</span> broadcasting your
                 own transactions reveals them to the peers you announce to, which can tie a transaction to
                 your node&apos;s IP address. Enable{" "}
@@ -272,15 +271,15 @@ export default function GhostModePage() {
 
       {/* What it does */}
       <Card>
-        <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+        <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
           What it does
         </h3>
-        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginBottom: "12px" }}>
+        <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.6", marginBottom: "12px" }}>
           Ghost Mode decides <em>whether</em> your node relays unconfirmed transactions at all — it is
           ghost-core&apos;s integrated take on Bitcoin Core&apos;s <code>-blocksonly</code>, wired into the runtime
           config with a friendly toggle. When <code>ghost_mode = true</code>:
         </p>
-        <ul style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.7", paddingLeft: "18px", listStyle: "disc" }}>
+        <ul className="t-label" style={{ color: "var(--dim)", lineHeight: "1.7", paddingLeft: "18px", listStyle: "disc" }}>
           <li><strong style={{ color: "var(--fg)" }}>Relay is suppressed.</strong> <code>RelayTransaction()</code> returns early — your node never pushes unconfirmed transactions to peers.</li>
           <li><strong style={{ color: "var(--fg)" }}>getdata returns NOT_FOUND.</strong> A peer asking &quot;give me transaction X&quot; is answered <code>NOT_FOUND</code> regardless of whether X is in your mempool. Your mempool stops being a public lookup table.</li>
           <li><strong style={{ color: "var(--fg)" }}>No INV announcements.</strong> Your node doesn&apos;t tell peers about unconfirmed transactions it has seen.</li>
@@ -295,7 +294,7 @@ export default function GhostModePage() {
             borderRadius: "6px",
           }}
         >
-          <p style={{ color: "var(--fainter)", fontSize: "13px", lineHeight: "1.6" }}>
+          <p className="t-label" style={{ color: "var(--fainter)", lineHeight: "1.6" }}>
             <span style={{ color: "var(--accent)", fontWeight: 500 }}>Trade-off:</span> Ghost Mode is a
             suppression of the standard relay path, not a replacement transport. Without local egress, a
             wallet on a Ghost Mode node must find another route to reach miners — an out-of-band relay over
@@ -308,10 +307,10 @@ export default function GhostModePage() {
 
       {/* Rewards / capability shares */}
       <Card>
-        <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+        <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
           Does this affect my capability shares?
         </h3>
-        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginBottom: "12px" }}>
+        <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.6", marginBottom: "12px" }}>
           <strong style={{ color: "var(--fg)" }}>Not for most of them.</strong> Archive, Ghost Pay, Reaper
           and Elder are each verified by an HTTP challenge–response to your node&apos;s API (block
           retrieval, L2-block lookup, policy classification, registration order) — none of which rides the
@@ -328,7 +327,7 @@ export default function GhostModePage() {
             borderRadius: "6px",
           }}
         >
-          <p style={{ color: "var(--fainter)", fontSize: "13px", lineHeight: "1.6" }}>
+          <p className="t-label" style={{ color: "var(--fainter)", lineHeight: "1.6" }}>
             <span style={{ color: "var(--yellow)", fontWeight: 500 }}>Public Mining is mutually exclusive.</span>{" "}
             Ghost Mode rejects transactions from peers, so your mempool never fills with fee-paying
             transactions and the blocks your node builds are near-empty — coinbase subsidy only. Since the
@@ -344,10 +343,10 @@ export default function GhostModePage() {
 
       {/* Threat model */}
       <Card>
-        <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+        <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
           What it protects against
         </h3>
-        <p style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "4px" }}>
+        <p className="t-label" style={{ color: "var(--dim)", marginBottom: "4px" }}>
           Ghost Mode is transaction-level silence at the gossip layer. It does not change consensus and
           does not make your node invisible.
         </p>
@@ -364,10 +363,10 @@ export default function GhostModePage() {
 
       {/* When to use */}
       <Card>
-        <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+        <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
           When to enable it
         </h3>
-        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6" }}>
+        <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
           Ghost Mode is for privacy-maximising operators who want zero P2P-layer transaction footprint and
           already have a separate broadcast path for their own payments (or use <em>Allow my own wallet
           broadcasts</em> above). Ghost Mode composes with Tor mode — running both gives a node
@@ -376,7 +375,7 @@ export default function GhostModePage() {
         </p>
       </Card>
 
-      <p style={{ color: "var(--fainter)", fontSize: "13px" }}>
+      <p className="t-label" style={{ color: "var(--fainter)" }}>
         For network-exposure controls (Tor mode, onion address) see{" "}
         <a href="/network" className="bare" style={{ color: "var(--dim)", textDecoration: "underline", textDecorationColor: "var(--rule-strong)" }}>
           Network

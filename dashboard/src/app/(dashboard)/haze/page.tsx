@@ -315,7 +315,7 @@ export default function HazePage() {
                 <div className="text-2xl font-bold text-[color:var(--fg)]">
                   {savings.fullArchiveBytes > 0 ? formatBytes(savings.fullArchiveBytes) : "--"}
                 </div>
-                <div className="text-[11px] text-[color:var(--fainter)] mt-0.5">
+                <div className="t-caption text-[color:var(--fainter)] mt-0.5">
                   {(haze?.chain_tip ?? 0).toLocaleString()} blocks × ~1.6 MB
                 </div>
               </div>
@@ -856,7 +856,7 @@ export default function HazePage() {
                   </div>
                   <p className="text-[color:var(--dim)] text-xs leading-relaxed flex-1">{opt.desc}</p>
                   {opt.action && !selected && (
-                    <span className="mt-2 inline-block text-[11px] font-medium text-[color:var(--accent)]">
+                    <span className="mt-2 inline-block t-caption font-medium text-[color:var(--accent)]">
                       {opt.action} →
                     </span>
                   )}

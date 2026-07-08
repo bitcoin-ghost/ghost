@@ -53,7 +53,7 @@ export default function NetworkPage() {
           subtitle="Live view of your node's outbound transport, onion address, and relay-suppression state."
         />
         <Card>
-          <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+          <p className="t-body" style={{ color: "var(--dim)" }}>
             Could not reach the node status endpoint.{" "}
             {statusError instanceof Error ? statusError.message : "Ensure Ghost Core is running."}
           </p>
@@ -94,14 +94,13 @@ export default function NetworkPage() {
 
           {onion && (
             <div
-              className="flex items-center justify-between gap-3 mt-4"
+              className="flex items-center justify-between gap-3 mt-4 t-label"
               style={{
                 background: "var(--bg)",
                 border: "1px solid var(--rule)",
                 borderRadius: "4px",
                 padding: "12px 16px",
                 fontFamily: "var(--font-mono)",
-                fontSize: "13px",
                 overflow: "auto",
               }}
             >
@@ -114,10 +113,10 @@ export default function NetworkPage() {
 
       <SectionErrorBoundary section="Privacy modes">
         <Card>
-          <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+          <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
             Privacy modes
           </h3>
-          <p style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "8px" }}>
+          <p className="t-label" style={{ color: "var(--dim)", marginBottom: "8px" }}>
             Tor mode is a ghostd startup flag (<code>-tormode</code>): toggling it restarts ghostd, so it asks
             for confirmation. With Tor enabled, your node&rsquo;s real IP address is never leaked to peers.
           </p>
@@ -146,7 +145,7 @@ export default function NetworkPage() {
         </Card>
       </SectionErrorBoundary>
 
-      <p style={{ color: "var(--fainter)", fontSize: "13px" }}>
+      <p className="t-label" style={{ color: "var(--fainter)" }}>
         For the underlying config (ghostd flags, bridge configuration, etc.) see{" "}
         <a
           href="/settings/privacy"
@@ -183,10 +182,10 @@ function TorRow({
       <div className="flex items-start justify-between gap-6">
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="flex items-center gap-2 mb-1">
-            <span style={{ color: "var(--fg)", fontWeight: 500, fontSize: "15px" }}>Tor mode</span>
+            <span className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>Tor mode</span>
             {enabled && <Badge variant="success">+anonymity</Badge>}
           </div>
-          <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5", maxWidth: "60ch" }}>
+          <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5", maxWidth: "60ch" }}>
             When enabled, ghostd routes all outbound P2P through Tor (<code>-tormode=1</code>) and publishes an
             onion service; clearnet address gossip is suppressed. This is a startup flag, so changing it
             restarts ghostd and briefly bounces the pool.
@@ -234,7 +233,7 @@ function TorRow({
             background: "var(--accent-weak)",
           }}
         >
-          <div style={{ color: "var(--fg)", fontSize: "13px", marginBottom: "10px" }}>
+          <div className="t-label" style={{ color: "var(--fg)", marginBottom: "10px" }}>
             {target ? "Enable" : "Disable"} <strong>Tor mode</strong>? This writes the config and{" "}
             <strong>restarts ghostd</strong> (then bounces the pool) to apply.
           </div>
@@ -264,24 +263,14 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
   return (
     <div>
       <div
-        style={{
-          fontSize: "11px",
-          fontFamily: "var(--font-mono)",
-          textTransform: "uppercase",
-          letterSpacing: "0.06em",
-          color: "var(--dim)",
-          marginBottom: "4px",
-        }}
+        className="t-label-mono"
+        style={{ color: "var(--dim)", marginBottom: "4px" }}
       >
         {label}
       </div>
       <div
-        style={{
-          fontSize: "22px",
-          fontWeight: 500,
-          color: accent ?? "var(--fg)",
-          fontFamily: "var(--font-mono)",
-        }}
+        className="t-stat"
+        style={{ color: accent ?? "var(--fg)", fontFamily: "var(--font-mono)" }}
       >
         {value}
       </div>
