@@ -301,7 +301,7 @@ function HealthSection() {
         ))}
       </div>
       {/* Color legend */}
-      <div className="flex gap-4 text-[10px] text-[color:var(--fainter)] border-t border-[var(--rule)] pt-2">
+      <div className="flex gap-4 t-caption text-[color:var(--fainter)] border-t border-[var(--rule)] pt-2">
         <div className="flex items-center gap-1">
           <span className="w-2 h-2 rounded-full bg-green-500" />
           Running

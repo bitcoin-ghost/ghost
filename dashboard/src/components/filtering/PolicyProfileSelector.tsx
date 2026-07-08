@@ -33,10 +33,9 @@ function TierPills({ mined }: { mined: BudsTierKey[] }) {
         return (
           <span
             key={key}
+            className="t-eyebrow"
             title={isMined ? `${key} mined` : `${key} dropped`}
             style={{
-              fontFamily: "var(--font-mono, ui-monospace, monospace)",
-              fontSize: "11px",
               fontWeight: 600,
               lineHeight: 1,
               letterSpacing: "0.02em",
@@ -113,13 +112,13 @@ export function PolicyProfileSelector() {
               }}
             >
               <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
-                <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>{p.label}</span>
+                <span className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>{p.label}</span>
                 {isCurrent && (
-                  <span style={{ color: "var(--accent)", fontSize: "11px", fontWeight: 600 }}>· current</span>
+                  <span className="t-caption" style={{ color: "var(--accent)", fontWeight: 600 }}>· current</span>
                 )}
               </div>
               <TierPills mined={p.tiers} />
-              <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5" }}>{p.desc}</div>
+              <div className="t-caption" style={{ color: "var(--dim)", lineHeight: "1.5" }}>{p.desc}</div>
             </button>
           );
         })}
@@ -134,7 +133,7 @@ export function PolicyProfileSelector() {
             background: "var(--accent-weak)",
           }}
         >
-          <div style={{ color: "var(--fg)", fontSize: "13px", marginBottom: "10px" }}>
+          <div className="t-label" style={{ color: "var(--fg)", marginBottom: "10px" }}>
             Switch mining policy to <strong>{POLICY_PRESETS.find((p) => p.value === pending)?.label}</strong>? This
             writes the config and <strong>restarts the node</strong> to apply.
           </div>

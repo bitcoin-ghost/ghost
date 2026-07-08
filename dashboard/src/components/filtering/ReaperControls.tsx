@@ -70,15 +70,15 @@ function VectorGroup({
       }}
     >
       <div style={{ marginBottom: "10px" }}>
-        <div style={{ color: "var(--accent)", fontSize: "14px", fontWeight: 500 }}>{title}</div>
-        <div style={{ color: "var(--dim)", fontSize: "12px", marginTop: "2px" }}>{note}</div>
+        <div className="t-body" style={{ color: "var(--accent)", fontWeight: 500 }}>{title}</div>
+        <div className="t-caption" style={{ color: "var(--dim)", marginTop: "2px" }}>{note}</div>
       </div>
       <div className="space-y-3">
         {vectors.map((v) => (
           <div key={v.key} className="flex items-start justify-between gap-4">
             <div>
-              <div style={{ color: "var(--fg)", fontSize: "13px" }}>{v.label}</div>
-              <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5" }}>{v.desc}</div>
+              <div className="t-label" style={{ color: "var(--fg)" }}>{v.label}</div>
+              <div className="t-caption" style={{ color: "var(--dim)", lineHeight: "1.5" }}>{v.desc}</div>
             </div>
             <Toggle
               enabled={Boolean(data[v.key])}
@@ -118,7 +118,7 @@ export function ReaperControls() {
     return (
       <Card>
         <CardHeader title="Adjust reaper" subtitle="Per-vector controls" />
-        <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+        <p className="t-body" style={{ color: "var(--dim)" }}>
           Could not load the reaper configuration from ghost-pool. The controls are unavailable until
           the node responds.
         </p>
@@ -130,7 +130,7 @@ export function ReaperControls() {
     return (
       <Card>
         <CardHeader title="Adjust reaper" subtitle="Per-vector controls" />
-        <p style={{ color: "var(--dim)", fontSize: "14px" }}>Loading current reaper configuration…</p>
+        <p className="t-body" style={{ color: "var(--dim)" }}>Loading current reaper configuration…</p>
       </Card>
     );
   }
@@ -202,8 +202,8 @@ export function ReaperControls() {
         >
           <div className="flex items-start justify-between gap-4">
             <div>
-              <div style={{ color: "var(--accent)", fontSize: "14px", fontWeight: 500 }}>Reaper master switch</div>
-              <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5", marginTop: "2px" }}>
+              <div className="t-body" style={{ color: "var(--accent)", fontWeight: 500 }}>Reaper master switch</div>
+              <div className="t-caption" style={{ color: "var(--dim)", lineHeight: "1.5", marginTop: "2px" }}>
                 When off, every detector is disabled on both the pool template reaper and the ghostd mempool
                 reaper. When on, the per-vector choices below apply. Running Reaper earns +2 capability shares.
               </div>
@@ -251,7 +251,7 @@ export function ReaperControls() {
             background: "var(--bg)",
           }}
         >
-          <div style={{ color: "var(--accent)", fontSize: "14px", fontWeight: 500, marginBottom: "10px" }}>
+          <div className="t-body" style={{ color: "var(--accent)", fontWeight: 500, marginBottom: "10px" }}>
             Thresholds
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -299,7 +299,7 @@ export function ReaperControls() {
         </div>
 
         {errorMsg && (
-          <p style={{ color: "var(--red)", fontSize: "13px" }}>{errorMsg}</p>
+          <p className="t-label" style={{ color: "var(--red)" }}>{errorMsg}</p>
         )}
 
         <div
@@ -310,7 +310,7 @@ export function ReaperControls() {
             borderRadius: "4px",
           }}
         >
-          <p style={{ color: "var(--fg)", fontSize: "13px", lineHeight: "1.6" }}>
+          <p className="t-label" style={{ color: "var(--fg)", lineHeight: "1.6" }}>
             Saving writes these settings to the node config (<code>pool.toml [reaper]</code>) and applies
             them to <strong>both</strong> reapers automatically. The pool template reaper picks them up when{" "}
             <strong style={{ color: "var(--accent)" }}>ghost-pool restarts</strong>, and the ghostd{" "}

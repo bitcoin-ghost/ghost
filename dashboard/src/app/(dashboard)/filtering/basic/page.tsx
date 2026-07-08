@@ -80,7 +80,7 @@ export default function BasicFilteringPage() {
       {/* The four classes, explained — lead with what BUDS is */}
       <SectionErrorBoundary section="Transaction classes">
         <Card>
-          <p style={{ color: "var(--dim)", fontSize: "14px", lineHeight: "1.6", marginBottom: "16px" }}>
+          <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6", marginBottom: "16px" }}>
             <strong style={{ color: "var(--fg)" }}>BUDS — Bitcoin Universal Data Specification.</strong>{" "}
             We use BUDS to sort every transaction into a class (T0–T3), so filtering is one simple choice
             instead of dozens of settings.
@@ -103,11 +103,11 @@ export default function BasicFilteringPage() {
               >
                 <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
                   <span style={{ width: "10px", height: "10px", borderRadius: "2px", background: t.color, display: "inline-block" }} />
-                  <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>{t.name}</span>
-                  <span style={{ color: "var(--dim)", fontSize: "12px" }}>· {t.short}</span>
+                  <span className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>{t.name}</span>
+                  <span className="t-caption" style={{ color: "var(--dim)" }}>· {t.short}</span>
                 </div>
-                <div style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.5" }}>{t.blurb}</div>
-                <div style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "6px" }}>
+                <div className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5" }}>{t.blurb}</div>
+                <div className="t-caption" style={{ color: "var(--fainter)", marginTop: "6px" }}>
                   e.g. {t.examples}
                 </div>
               </div>
@@ -136,7 +136,7 @@ export default function BasicFilteringPage() {
           />
           <div className="space-y-3">
             {mempool?.message ? (
-              <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+              <p className="t-label" style={{ color: "var(--dim)" }}>
                 Mempool classification is unavailable — {mempool.message}
               </p>
             ) : (
@@ -159,10 +159,10 @@ export default function BasicFilteringPage() {
                       <div key={t.key} style={{ padding: "10px 12px", border: "1px solid var(--rule)", borderRadius: "4px", background: "var(--bg)" }}>
                         <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
                           <span style={{ width: "10px", height: "10px", borderRadius: "2px", background: t.color, display: "inline-block" }} />
-                          <span style={{ color: "var(--fg)", fontSize: "13px", fontWeight: 500 }}>{t.name}</span>
+                          <span className="t-label" style={{ color: "var(--fg)", fontWeight: 500 }}>{t.name}</span>
                         </div>
-                        <div style={{ fontFamily: "var(--font-mono)", fontSize: "18px", color: "var(--fg)" }}>{pct.toFixed(0)}%</div>
-                        <div style={{ color: "var(--dim)", fontSize: "12px" }}>{count.toLocaleString()} sampled</div>
+                        <div className="t-title" style={{ fontFamily: "var(--font-mono)", color: "var(--fg)" }}>{pct.toFixed(0)}%</div>
+                        <div className="t-caption" style={{ color: "var(--dim)" }}>{count.toLocaleString()} sampled</div>
                       </div>
                     );
                   })}

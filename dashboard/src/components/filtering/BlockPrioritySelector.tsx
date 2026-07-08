@@ -85,12 +85,12 @@ export function BlockPrioritySelector() {
               }}
             >
               <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
-                <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>{opt.label}</span>
+                <span className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>{opt.label}</span>
                 {isCurrent && (
-                  <span style={{ color: "var(--accent)", fontSize: "11px", fontWeight: 600 }}>· current</span>
+                  <span className="t-caption" style={{ color: "var(--accent)", fontWeight: 600 }}>· current</span>
                 )}
               </div>
-              <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5" }}>{opt.desc}</div>
+              <div className="t-caption" style={{ color: "var(--dim)", lineHeight: "1.5" }}>{opt.desc}</div>
             </button>
           );
         })}
@@ -109,7 +109,7 @@ export function BlockPrioritySelector() {
             background: "var(--accent-weak)",
           }}
         >
-          <div style={{ color: "var(--fg)", fontSize: "13px", marginBottom: "10px" }}>
+          <div className="t-label" style={{ color: "var(--fg)", marginBottom: "10px" }}>
             Switch block priority to{" "}
             <strong>{BLOCK_PRIORITY_OPTIONS.find((o) => o.value === pending)?.label}</strong>? This writes the
             config and <strong>restarts the node</strong> to apply.

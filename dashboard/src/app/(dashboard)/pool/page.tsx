@@ -77,22 +77,22 @@ function BestShareCard({ title, entry }: { title: string; entry: BestHashEntry |
       className="rounded-lg p-3"
       style={{ background: "var(--surface)", border: "1px solid var(--rule)" }}
     >
-      <div style={{ color: "var(--dim)", fontSize: "12px", marginBottom: "4px" }}>{title}</div>
+      <div className="t-caption" style={{ color: "var(--dim)", marginBottom: "4px" }}>{title}</div>
       {hasData ? (
         <>
-          <div style={{ color: "var(--accent)", fontSize: "18px", fontWeight: 600 }}>{formatDifficulty(diff)}</div>
-          <div className="truncate" style={{ color: "var(--dim)", fontFamily: "var(--font-mono)", fontSize: "11px" }}>
+          <div className="t-title" style={{ color: "var(--accent)", fontWeight: 600 }}>{formatDifficulty(diff)}</div>
+          <div className="truncate t-caption" style={{ color: "var(--dim)", fontFamily: "var(--font-mono)" }}>
             {entry.hash}
           </div>
-          <div style={{ color: "var(--fainter)", fontSize: "11px", marginTop: "2px" }}>
+          <div className="t-caption" style={{ color: "var(--fainter)", marginTop: "2px" }}>
             {calculateLeadingZeros(diff)} leading zeros
           </div>
-          <div style={{ color: "var(--fainter)", fontSize: "11px", marginTop: "2px" }}>
+          <div className="t-caption" style={{ color: "var(--fainter)", marginTop: "2px" }}>
             {formatTimeAgo(entry.timestamp ?? 0)}
           </div>
         </>
       ) : (
-        <div style={{ color: "var(--fainter)", fontSize: "13px" }}>No data yet</div>
+        <div className="t-label" style={{ color: "var(--fainter)" }}>No data yet</div>
       )}
     </div>
   );
@@ -116,11 +116,11 @@ function ChartCard({
     <Card>
       <div className="mb-3 flex items-start justify-between gap-2">
         <div>
-          <h3 className="font-medium" style={{ color: "var(--fg)", fontSize: "15px" }}>
+          <h3 className="font-medium t-lead" style={{ color: "var(--fg)" }}>
             {title}
           </h3>
           {subtitle && (
-            <p style={{ color: "var(--dim)", fontSize: "12px", marginTop: "2px" }}>{subtitle}</p>
+            <p className="t-caption" style={{ color: "var(--dim)", marginTop: "2px" }}>{subtitle}</p>
           )}
         </div>
         <Badge variant="default">{serverBacked ? "history" : "live (session)"}</Badge>
@@ -183,7 +183,7 @@ export default function NodePoolPage() {
         header: "Miner / Worker",
         accessorFn: (m) => minerName(m),
         cell: ({ getValue }) => (
-          <span className="truncate" style={{ fontFamily: "var(--font-mono)", fontSize: "12px" }}>
+          <span className="truncate t-caption" style={{ fontFamily: "var(--font-mono)" }}>
             {String(getValue())}
           </span>
         ),
@@ -227,7 +227,7 @@ export default function NodePoolPage() {
         header: "Node",
         accessorFn: (n) => n.name || n.node_id.slice(0, 10),
         cell: ({ row }) => (
-          <span className="truncate" style={{ fontFamily: "var(--font-mono)", fontSize: "12px" }}>
+          <span className="truncate t-caption" style={{ fontFamily: "var(--font-mono)" }}>
             {row.original.name || row.original.node_id.slice(0, 10)}
             {row.original.is_self && (
               <Badge variant="default" className="ml-2">
@@ -419,20 +419,20 @@ export default function NodePoolPage() {
             <CardHeader title="Shares" subtitle="Accepted vs rejected this round" />
             <div className="mb-4 grid grid-cols-3 gap-4">
               <div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Submitted</div>
-                <div style={{ color: "var(--fg)", fontSize: "20px", fontWeight: 600 }}>
+                <div className="t-caption" style={{ color: "var(--dim)" }}>Submitted</div>
+                <div className="t-title" style={{ color: "var(--fg)", fontWeight: 600 }}>
                   {submitted.toLocaleString()}
                 </div>
               </div>
               <div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Accepted</div>
-                <div style={{ color: "var(--green)", fontSize: "20px", fontWeight: 600 }}>
+                <div className="t-caption" style={{ color: "var(--dim)" }}>Accepted</div>
+                <div className="t-title" style={{ color: "var(--green)", fontWeight: 600 }}>
                   {accepted.toLocaleString()}
                 </div>
               </div>
               <div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Rejected</div>
-                <div style={{ color: "var(--red)", fontSize: "20px", fontWeight: 600 }}>
+                <div className="t-caption" style={{ color: "var(--dim)" }}>Rejected</div>
+                <div className="t-title" style={{ color: "var(--red)", fontWeight: 600 }}>
                   {rejected.toLocaleString()}
                 </div>
               </div>
@@ -454,30 +454,30 @@ export default function NodePoolPage() {
             />
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Current round</div>
-                <div style={{ color: "var(--fg)", fontSize: "18px", fontWeight: 600 }}>
+                <div className="t-caption" style={{ color: "var(--dim)" }}>Current round</div>
+                <div className="t-title" style={{ color: "var(--fg)", fontWeight: 600 }}>
                   {formatDuration(roundElapsed)}
                 </div>
-                <div style={{ color: "var(--fainter)", fontSize: "11px" }}>time on the current template</div>
+                <div className="t-caption" style={{ color: "var(--fainter)" }}>time on the current template</div>
               </div>
               <div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Est. time to block</div>
-                <div style={{ color: "var(--fg)", fontSize: "18px", fontWeight: 600 }}>
+                <div className="t-caption" style={{ color: "var(--dim)" }}>Est. time to block</div>
+                <div className="t-title" style={{ color: "var(--fg)", fontWeight: 600 }}>
                   {hasRoundEta ? formatDuration(roundEta) : "—"}
                 </div>
-                <div style={{ color: "var(--fainter)", fontSize: "11px" }}>at this pool&apos;s hashrate vs network difficulty</div>
+                <div className="t-caption" style={{ color: "var(--fainter)" }}>at this pool&apos;s hashrate vs network difficulty</div>
               </div>
             </div>
             <div className="mt-4 grid grid-cols-2 gap-4">
               <div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Shares this round</div>
-                <div style={{ color: "var(--fg)", fontSize: "18px", fontWeight: 600 }}>
+                <div className="t-caption" style={{ color: "var(--dim)" }}>Shares this round</div>
+                <div className="t-title" style={{ color: "var(--fg)", fontWeight: 600 }}>
                   {sharesThisRound.toLocaleString()}
                 </div>
               </div>
               <div>
-                <div style={{ color: "var(--dim)", fontSize: "12px" }}>Pending rewards</div>
-                <div style={{ color: "var(--accent)", fontSize: "18px", fontWeight: 600 }}>
+                <div className="t-caption" style={{ color: "var(--dim)" }}>Pending rewards</div>
+                <div className="t-title" style={{ color: "var(--accent)", fontWeight: 600 }}>
                   {formatSats(rewards?.pending_rewards_sats ?? 0)}
                 </div>
               </div>
@@ -495,8 +495,8 @@ export default function NodePoolPage() {
             action={
               bestHash?.network_hashrate ? (
                 <div className="text-right">
-                  <div style={{ color: "var(--dim)", fontSize: "11px" }}>Network hashrate</div>
-                  <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>
+                  <div className="t-caption" style={{ color: "var(--dim)" }}>Network hashrate</div>
+                  <div className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>
                     {formatHashrate(bestHash.network_hashrate, 0)}
                   </div>
                 </div>
@@ -530,19 +530,19 @@ export default function NodePoolPage() {
           />
           {meshRecords.length > 0 && (
             <div className="mt-5">
-              <div style={{ color: "var(--dim)", fontSize: "12px", marginBottom: "8px" }}>
+              <div className="t-caption" style={{ color: "var(--dim)", marginBottom: "8px" }}>
                 Mesh best-share records
               </div>
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 {meshRecords.map((r) => (
                   <div key={r.window}>
-                    <div style={{ color: "var(--dim)", fontSize: "11px", textTransform: "capitalize" }}>
+                    <div className="t-caption" style={{ color: "var(--dim)", textTransform: "capitalize" }}>
                       {r.window}
                     </div>
-                    <div style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 600 }}>
+                    <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 600 }}>
                       {formatDifficulty(r.difficulty)}
                     </div>
-                    <div style={{ color: "var(--fainter)", fontSize: "11px" }}>
+                    <div className="t-caption" style={{ color: "var(--fainter)" }}>
                       {r.leading_zero_bits} zero bits · {r.miner_id_redacted || "—"}
                     </div>
                   </div>
@@ -551,7 +551,7 @@ export default function NodePoolPage() {
             </div>
           )}
           {meshLeaderboard?.limit_note && (
-            <p style={{ color: "var(--fainter)", fontSize: "11px", marginTop: "12px" }}>
+            <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "12px" }}>
               {meshLeaderboard.limit_note}
             </p>
           )}
@@ -568,7 +568,7 @@ export default function NodePoolPage() {
             subtitle="Miners connected to this node's stratum port, ranked by hashrate"
           />
           {minersRedacted ? (
-            <div style={{ color: "var(--dim)", fontSize: "13px" }}>
+            <div className="t-label" style={{ color: "var(--dim)" }}>
               Per-miner detail is not available on this node (the miner list is redacted for unauthenticated
               access). Aggregate:{" "}
               <span style={{ color: "var(--fg)" }}>

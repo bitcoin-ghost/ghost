@@ -117,8 +117,8 @@ export default function GeoPage() {
           {regionCounts.map((r) => (
             <span
               key={r.region}
+              className="t-caption"
               style={{
-                fontSize: "12px",
                 color: "var(--dim)",
                 background: "var(--surface)",
                 border: "1px solid var(--rule)",
@@ -139,7 +139,7 @@ export default function GeoPage() {
           <CardHeader title="World map" subtitle={`${points.length} of ${rows.length} nodes plotted`} />
           <WorldMap points={points} self={self} hoveredId={hoveredId} onHover={setHoveredId} />
           {/* Legend */}
-          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4" style={{ fontSize: "12px", color: "var(--dim)" }}>
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4 t-caption" style={{ color: "var(--dim)" }}>
             <span className="inline-flex items-center gap-2">
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: "var(--green)", display: "inline-block" }} />
               Online node
@@ -167,7 +167,7 @@ export default function GeoPage() {
         }}
       >
         <Info size={16} strokeWidth={1.75} style={{ color: "var(--accent)", flexShrink: 0, marginTop: "1px" }} />
-        <p style={{ color: "var(--dim)", fontSize: "13px", lineHeight: 1.5 }}>
+        <p className="t-label" style={{ color: "var(--dim)", lineHeight: 1.5 }}>
           Locations are <strong style={{ color: "var(--fg)" }}>country-level</strong>, resolved entirely
           offline. The dashboard&apos;s CSP forbids external map tiles and geolocation lookups, so each node IP
           is matched against a small bundled IP&#8209;to&#8209;country table (DB&#8209;IP Lite, CC&#8209;BY 4.0)
@@ -189,12 +189,12 @@ export default function GeoPage() {
         <Card>
           <CardHeader title="Nodes" subtitle={`${rows.length} known`} />
           {rows.length === 0 ? (
-            <p style={{ color: "var(--dim)", fontSize: "14px", padding: "8px 0" }}>
+            <p className="t-body" style={{ color: "var(--dim)", padding: "8px 0" }}>
               {nodesLoading ? "Loading nodes…" : "No mesh nodes connected. Your node will discover peers automatically."}
             </p>
           ) : (
             <div style={{ overflowX: "auto" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", minWidth: "520px" }}>
+              <table className="t-label" style={{ width: "100%", borderCollapse: "collapse", minWidth: "520px" }}>
                 <thead>
                   <tr style={{ textAlign: "left", color: "var(--dim)" }}>
                     <th style={{ padding: "8px 10px", fontWeight: 500 }}>Address</th>
@@ -220,17 +220,17 @@ export default function GeoPage() {
                         <td style={{ padding: "8px 10px", fontFamily: "var(--font-mono)", color: "var(--fg)", whiteSpace: "nowrap" }}>
                           {r.host || "—"}
                           {r.isSelf && (
-                            <span style={{ marginLeft: 8, color: "var(--accent)", fontSize: "11px" }}>this node</span>
+                            <span className="t-caption" style={{ marginLeft: 8, color: "var(--accent)" }}>this node</span>
                           )}
                         </td>
                         <td style={{ padding: "8px 10px", color: r.geo.plottable ? "var(--fg)" : "var(--dim)" }}>
                           {flag && <span style={{ marginRight: 6 }}>{flag}</span>}
                           {r.geo.plottable ? r.geo.name : r.geo.label}
                           {r.geo.plottable && r.geo.code && (
-                            <span style={{ marginLeft: 6, color: "var(--fainter)", fontSize: "11px" }}>{r.geo.code}</span>
+                            <span className="t-caption" style={{ marginLeft: 6, color: "var(--fainter)" }}>{r.geo.code}</span>
                           )}
                           {!r.geo.plottable && (
-                            <span style={{ marginLeft: 8, color: "var(--fainter)", fontSize: "11px" }}>not plotted</span>
+                            <span className="t-caption" style={{ marginLeft: 8, color: "var(--fainter)" }}>not plotted</span>
                           )}
                         </td>
                         <td style={{ padding: "8px 10px", color: "var(--dim)" }}>

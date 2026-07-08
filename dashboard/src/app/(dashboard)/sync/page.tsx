@@ -144,7 +144,7 @@ export default function SyncPage() {
 
       {isError && (
         <Card>
-          <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+          <p className="t-body" style={{ color: "var(--dim)" }}>
             Failed to load sync status: {error instanceof Error ? error.message : "unknown error"}
           </p>
         </Card>
@@ -152,7 +152,7 @@ export default function SyncPage() {
 
       {unavailable && !isLoading && (
         <Card>
-          <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+          <p className="t-body" style={{ color: "var(--dim)" }}>
             The node&apos;s Bitcoin RPC is not reachable, so chain details are unavailable. Values
             below show <span className="font-mono">{DASH}</span> until the daemon responds.
           </p>
@@ -389,7 +389,7 @@ function ChainHealthSection({
       />
 
       {isError ? (
-        <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+        <p className="t-body" style={{ color: "var(--dim)" }}>
           Chain-health data is unavailable right now.
         </p>
       ) : isLoading ? (
@@ -435,17 +435,17 @@ function ChainHealthSection({
           >
             <div className="flex items-center gap-2" style={{ marginBottom: "6px" }}>
               <GitBranch size={15} strokeWidth={1.75} style={{ color: "var(--dim)" }} />
-              <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500 }}>
+              <span className="t-body" style={{ color: "var(--fg)", fontWeight: 500 }}>
                 Reorgs (last 24h)
               </span>
               <Badge variant={stable ? "success" : "warning"}>{formatCount(count24h)}</Badge>
             </div>
             {stable ? (
-              <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+              <p className="t-label" style={{ color: "var(--dim)" }}>
                 None in the last 24 hours — a stable, single chain is the normal, healthy state.
               </p>
             ) : (
-              <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+              <p className="t-label" style={{ color: "var(--dim)" }}>
                 {formatCount(count24h)} chain reorganisation{count24h === 1 ? "" : "s"} recorded in
                 the last 24 hours.
               </p>
@@ -463,7 +463,8 @@ function ChainHealthSection({
           {reorgs.length > 0 && (
             <div>
               <div
-                style={{ color: "var(--dim)", fontSize: "12px", marginBottom: "6px" }}
+                className="t-caption"
+                style={{ color: "var(--dim)", marginBottom: "6px" }}
               >
                 Recent reorgs
               </div>
@@ -471,8 +472,8 @@ function ChainHealthSection({
                 {reorgs.map((ev, i) => (
                   <li
                     key={`${ev.unix_time}-${ev.old_tip_hash}-${i}`}
-                    className="flex items-center gap-2 font-mono"
-                    style={{ color: "var(--fg)", fontSize: "13px" }}
+                    className="flex items-center gap-2 font-mono t-label"
+                    style={{ color: "var(--fg)" }}
                   >
                     <GitBranch size={13} strokeWidth={1.75} style={{ color: "var(--fainter)" }} />
                     <span>{reorgSummary(ev, now)}</span>
@@ -547,21 +548,21 @@ function Field({
   return (
     <div>
       <div
-        className="flex items-center gap-1.5"
-        style={{ color: "var(--dim)", fontSize: "12px", marginBottom: "3px" }}
+        className="flex items-center gap-1.5 t-caption"
+        style={{ color: "var(--dim)", marginBottom: "3px" }}
       >
         {icon}
         <span>{label}</span>
       </div>
       <div
-        className={mono ? "font-mono break-all" : ""}
-        style={{ color: "var(--fg)", fontSize: "14px" }}
+        className={mono ? "font-mono break-all t-body" : "t-body"}
+        style={{ color: "var(--fg)" }}
         title={title}
       >
         {value}
       </div>
       {(sub || sublabel) && (
-        <div style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "2px" }}>
+        <div className="t-caption" style={{ color: "var(--fainter)", marginTop: "2px" }}>
           {sub ?? sublabel}
         </div>
       )}
