@@ -66,14 +66,11 @@ export function CardHeader({ title, subtitle, action }: CardHeaderProps) {
   return (
     <div className="flex items-center justify-between mb-4">
       <div>
-        <h3
-          className="font-medium"
-          style={{ color: 'var(--fg)', fontSize: '16px' }}
-        >
+        <h3 className="t-title" style={{ color: 'var(--fg)' }}>
           {title}
         </h3>
         {subtitle && (
-          <p style={{ color: 'var(--dim)', fontSize: '13px', marginTop: '2px' }}>
+          <p className="t-lead" style={{ color: 'var(--dim)', marginTop: '4px' }}>
             {subtitle}
           </p>
         )}
