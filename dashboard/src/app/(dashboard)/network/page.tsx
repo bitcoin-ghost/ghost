@@ -4,6 +4,7 @@ import { useState } from "react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card } from "@/components/ui/Card";
 import { StatCard } from "@/components/ui/StatCard";
+import { Tooltip } from "@/components/ui/Tooltip";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
@@ -83,12 +84,21 @@ export default function NetworkPage() {
 
       <SectionErrorBoundary section="Exposure summary">
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-          <StatCard label="Outbound transport" value={torActive ? "Tor" : "clearnet"} />
-          <StatCard label="Connected peers" value={peerCount.toLocaleString()} />
+          <StatCard
+            label="Outbound transport"
+            value={torActive ? "Tor" : "clearnet"}
+            tooltip="Whether your node's outbound P2P connections run over clearnet or Tor."
+          />
+          <StatCard
+            label="Connected peers"
+            value={peerCount.toLocaleString()}
+            tooltip="Mesh peers currently connected to your node."
+          />
           <StatCard
             label="Onion address"
             value={onion ? "present" : "—"}
             valueColor={onion ? "var(--green)" : undefined}
+            tooltip="Your node's Tor onion service address, published when Tor mode is enabled."
           />
         </div>
 
@@ -178,17 +188,16 @@ function TorRow({
 
   return (
     <div style={{ padding: "16px 0", borderTop: "1px solid var(--rule)" }}>
-      <div className="flex items-start justify-between gap-6">
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="flex items-center gap-2 mb-1">
-            <span className="t-title" style={{ color: "var(--fg)" }}>Tor mode</span>
-            {enabled && <Badge variant="success">+anonymity</Badge>}
-          </div>
-          <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5", maxWidth: "60ch" }}>
-            When enabled, ghostd routes all outbound P2P through Tor (<code>-tormode=1</code>) and publishes an
-            onion service; clearnet address gossip is suppressed. This is a startup flag, so changing it
-            restarts ghostd and briefly bounces the pool.
-          </p>
+      <div className="flex items-center justify-between gap-6">
+        <div className="flex items-center gap-2">
+          <Tooltip content="Routes all outbound P2P through Tor and publishes an onion service. A ghostd startup flag — toggling restarts the node.">
+            <svg className="w-3.5 h-3.5 text-[color:var(--fainter)] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 16v-4M12 8h.01" />
+            </svg>
+          </Tooltip>
+          <span className="t-title" style={{ color: "var(--fg)" }}>Tor mode</span>
+          {enabled && <Badge variant="success">+anonymity</Badge>}
         </div>
         <button
           onClick={() => setTarget(!enabled)}
@@ -221,6 +230,12 @@ function TorRow({
           />
         </button>
       </div>
+
+      <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5", marginTop: "8px" }}>
+        When enabled, ghostd routes all outbound P2P through Tor (<code>-tormode=1</code>) and publishes an
+        onion service; clearnet address gossip is suppressed. This is a startup flag, so changing it
+        restarts ghostd and briefly bounces the pool.
+      </p>
 
       {target !== null && (
         <div
