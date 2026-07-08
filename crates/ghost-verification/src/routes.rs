@@ -2540,17 +2540,25 @@ async fn api_pool_recent_shares_handler(
 /// object. Self is shaped inline by the handler from local state, so this
 /// helper always renders a peer (`is_self = false`). Pulled out as a free
 /// function so the JSON contract is unit-testable without a live server.
-fn mesh_node_to_json(node: &MeshNodeInfo) -> serde_json::Value {
+///
+/// `is_registry_elder` is whether this node's `node_id` is present in the DB
+/// elder registry (the authoritative source the Elders & MPC page uses). A
+/// peer's own `elder`/`cap_elder` bits derive from its health-ping capability
+/// advertisement, which is `false` for peers whose elder status isn't gossiped
+/// (verification-gated), so the registry membership is OR-ed in — a genuine
+/// elder is never downgraded, and a registered elder is correctly reflected.
+fn mesh_node_to_json(node: &MeshNodeInfo, is_registry_elder: bool) -> serde_json::Value {
+    let elder = node.elder || is_registry_elder;
     serde_json::json!({
         "node_id": node.node_id,
         "address": node.address,
-        "elder": node.elder,
+        "elder": elder,
         "capabilities": {
             "archive": node.cap_archive,
             "ghost_pay": node.cap_ghost_pay,
             "public_mining": node.cap_public_mining,
             "reaper": node.cap_reaper,
-            "elder": node.cap_elder,
+            "elder": elder,
         },
         "hashrate_th": node.hashrate_th,
         "miner_count": node.miner_count,
@@ -2588,6 +2596,21 @@ async fn api_pool_mesh_nodes_handler(
 ) -> impl IntoResponse {
     let health = state.get_health().await;
 
+    // Authoritative elder set = the DB elder registry (`nodes.is_elder`), the
+    // same source the Elders & MPC page reads. A peer's health-ping `elder`
+    // capability bit is verification-gated and reads `false` for registered
+    // elders that haven't gossiped it, so it can't be trusted to render the
+    // role — the registry can. Fetched once per request; keyed by the hex
+    // `node_id` (both `get_elders()` and the mesh `node_id`s are the lowercase
+    // hex of the 32-byte id via `hex::encode`). Degrades to an empty set when
+    // no DB is attached, preserving the previous (health-ping-only) behaviour.
+    let elder_ids: std::collections::HashSet<String> = state
+        .database
+        .as_ref()
+        .and_then(|db| db.get_elders().ok())
+        .map(|elders| elders.into_iter().map(|e| e.node_id).collect())
+        .unwrap_or_default();
+
     // Self address: the operator-configured public host (+ HTTP port when a
     // bare host was configured). Falls back to an empty string — never fails.
     let self_address = {
@@ -2603,16 +2626,19 @@ async fn api_pool_mesh_nodes_handler(
     };
 
     let self_caps = &health.capabilities;
+    // Same registry-OR-bit resolution used for peers, so self's role reflects
+    // the elder registry too (not only its own advertised capability bit).
+    let self_elder = self_caps.elder_status || elder_ids.contains(&health.node_id);
     let self_node = serde_json::json!({
         "node_id": health.node_id,
         "address": self_address,
-        "elder": self_caps.elder_status,
+        "elder": self_elder,
         "capabilities": {
             "archive": self_caps.archive_mode,
             "ghost_pay": self_caps.ghost_pay,
             "public_mining": self_caps.public_mining,
             "reaper": self_caps.reaper,
-            "elder": self_caps.elder_status,
+            "elder": self_elder,
         },
         // This node's own realized hashrate (same windowed value it gossips);
         // 0.0 on deploys without the local-hashrate provider wired.
@@ -2638,7 +2664,8 @@ async fn api_pool_mesh_nodes_handler(
 
     for peer in state.mesh_nodes() {
         if seen.insert(peer.node_id.clone()) {
-            nodes.push(mesh_node_to_json(&peer));
+            let is_registry_elder = elder_ids.contains(&peer.node_id);
+            nodes.push(mesh_node_to_json(&peer, is_registry_elder));
         }
     }
 
@@ -12626,7 +12653,7 @@ mod tests {
             l2_height: Some(4_567),
         };
 
-        let v = mesh_node_to_json(&node);
+        let v = mesh_node_to_json(&node, false);
         assert_eq!(v["node_id"], "deadbeef");
         assert_eq!(v["address"], "1.2.3.4:8080");
         assert_eq!(v["elder"], true);
@@ -12675,7 +12702,7 @@ mod tests {
             l2_height: None,
         };
 
-        let v = mesh_node_to_json(&node);
+        let v = mesh_node_to_json(&node, false);
         assert_eq!(v["address"], "");
         assert_eq!(v["hashrate_th"], 0.0);
         assert_eq!(v["miner_count"], 0);
@@ -12689,6 +12716,46 @@ mod tests {
         assert!(v["peer_count"].is_null());
         assert!(v["l2_height"].is_null());
         assert!(v["capabilities"].is_object());
+    }
+
+    #[test]
+    fn test_mesh_node_to_json_registry_elder_promotes() {
+        // Reproduces the Geo/mesh-nodes role bug: a peer that IS a registered
+        // elder but whose health-ping elder bit reads `false` (verification-
+        // gated / not gossiped) must still render as an elder because the DB
+        // registry — the authoritative source — says so.
+        let node = MeshNodeInfo {
+            node_id: "aa".repeat(32),
+            address: "5.6.7.8:8080".to_string(),
+            elder: false,
+            cap_archive: false,
+            cap_ghost_pay: false,
+            cap_public_mining: true,
+            cap_reaper: false,
+            cap_elder: false,
+            hashrate_th: 1.0,
+            miner_count: 1,
+            deduped_miner_count: 1,
+            max_capacity: 100,
+            healthy: true,
+            l1_height: Some(1),
+            uptime_percent: Some(99.0),
+            peer_count: Some(2),
+            l2_height: None,
+        };
+
+        // Registry says this node_id is an elder → elder=true everywhere.
+        let promoted = mesh_node_to_json(&node, true);
+        assert_eq!(promoted["elder"], true);
+        assert_eq!(promoted["capabilities"]["elder"], true);
+        // Other capabilities are untouched.
+        assert_eq!(promoted["capabilities"]["public_mining"], true);
+        assert_eq!(promoted["capabilities"]["archive"], false);
+
+        // Not in the registry and no advertised bit → stays a plain node.
+        let not_elder = mesh_node_to_json(&node, false);
+        assert_eq!(not_elder["elder"], false);
+        assert_eq!(not_elder["capabilities"]["elder"], false);
     }
 
     #[test]
