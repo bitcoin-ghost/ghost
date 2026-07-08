@@ -81,11 +81,26 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
+    label: "privacy",
+    items: [
+      { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
+      { href: "/shroud", label: "Shroud", icon: <Eye {...ICON} /> },
+      { href: "/ghost-mode", label: "Ghost Mode", icon: <Ghost {...ICON} /> },
+    ],
+  },
+  {
     label: "tx filtering",
     items: [
       { href: "/filtering", label: "Overview", icon: <Filter {...ICON} /> },
       { href: "/filtering/basic", label: "Basic", icon: <Layers {...ICON} /> },
       { href: "/filtering/advanced", label: "Advanced", icon: <SlidersHorizontal {...ICON} /> },
+    ],
+  },
+  {
+    label: "node storage",
+    items: [
+      { href: "/storage", label: "Storage", icon: <HardDrive {...ICON} /> },
+      { href: "/haze", label: "Haze", icon: <Cloud {...ICON} /> },
     ],
   },
   {
@@ -102,21 +117,6 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/ghost-pay", label: "Ghost Pay Network", icon: <Crown {...ICON} /> },
       { href: "/wraith", label: "Wraith", icon: <Shield {...ICON} /> },
-    ],
-  },
-  {
-    label: "privacy",
-    items: [
-      { href: "/network", label: "Network", icon: <Globe {...ICON} /> },
-      { href: "/shroud", label: "Shroud", icon: <Eye {...ICON} /> },
-      { href: "/ghost-mode", label: "Ghost Mode", icon: <Ghost {...ICON} /> },
-    ],
-  },
-  {
-    label: "node storage",
-    items: [
-      { href: "/storage", label: "Storage", icon: <HardDrive {...ICON} /> },
-      { href: "/haze", label: "Haze", icon: <Cloud {...ICON} /> },
     ],
   },
   {
