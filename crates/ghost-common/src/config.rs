@@ -1057,6 +1057,17 @@ impl NodeConfig {
             file.sync_all()?; // Ensure data is on disk before rename
         }
 
+        // Config files may contain secrets; ghostd/ghost-pool refuse to start on
+        // mainnet unless the config is mode 0600 (H-11 security check). The temp
+        // file is created with the process umask (typically 0644), so restrict it
+        // to 0600 before the rename — otherwise every atomic save clobbers the
+        // original 0600 config with a 0644 one and bricks the node on next restart.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
         // Atomic rename (on POSIX systems, rename is atomic if same filesystem)
         std::fs::rename(&temp_path, path)?;
 
@@ -3136,6 +3147,24 @@ mod tests {
         let tls = TlsConfig::default();
         assert!(tls.cert_path.is_none());
         assert!(tls.key_path.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_atomic_persists_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+        // Pre-create a world-readable file so we prove save_atomic TIGHTENS it
+        // (regression: a 0644 save bricks the node via the H-11 mainnet check).
+        std::fs::write(&path, "# old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        NodeConfig::default().save_atomic(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "save_atomic must persist config as 0600, got {:o}", mode);
     }
 
     #[cfg(unix)]
