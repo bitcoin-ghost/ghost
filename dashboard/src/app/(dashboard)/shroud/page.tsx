@@ -1,16 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { StatusRow } from "@/components/ui/StatusRow";
 import { FlowDiagram } from "@/components/ui/FlowDiagram";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { StatCard } from "@/components/ui/StatCard";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import { StatusDot } from "@/components/ui/StatusDot";
-import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { SkeletonCard } from "@/components/ui/Skeleton";
 import { useShroudStatus } from "@/hooks/queries/useShroudQueries";
 import ShroudWizard from "../settings/wizards/ShroudWizard";
 
@@ -24,7 +20,7 @@ const TOOLTIPS = {
 };
 
 export default function ShroudPage() {
-  const { data: status, isLoading, error } = useShroudStatus({ refetchInterval: 10_000 });
+  const { data: status, isLoading } = useShroudStatus({ refetchInterval: 10_000 });
   const [wizardOpen, setWizardOpen] = useState(false);
 
   const showSkeleton = isLoading && !status;
@@ -111,54 +107,6 @@ export default function ShroudPage() {
         </div>
       </Card>
 
-      {/* 4. Primary Content — Status rows */}
-      <SectionErrorBoundary section="Shroud Status">
-        {showSkeleton ? (
-          <SkeletonCard />
-        ) : error ? (
-          <Card>
-            <CardHeader title="Status" />
-            <div className="p-4 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
-              <p className="text-[color:var(--red)] text-sm">
-                Unable to fetch Ghost Shroud status. Ensure Ghost Core is running and the Shroud module is enabled.
-              </p>
-            </div>
-          </Card>
-        ) : status ? (
-          <Card>
-            <CardHeader
-              title="Status"
-              subtitle="Current Shroud relay configuration"
-            />
-            <div className="divide-y divide-[var(--rule)]">
-              <StatusRow label="Shroud Enabled" tooltip={TOOLTIPS.enabled}>
-                <StatusDot
-                  status={status.enabled ? "online" : "offline"}
-                  label={status.enabled ? "Active" : "Inactive"}
-                  pulse={status.enabled}
-                />
-              </StatusRow>
-              <StatusRow label="Ghost Core Connection" tooltip={TOOLTIPS.ghost_core}>
-                <StatusDot
-                  status={status.ghost_core_connected ? "online" : "offline"}
-                  label={status.ghost_core_connected ? "Connected" : "Disconnected"}
-                  pulse={status.ghost_core_connected}
-                />
-              </StatusRow>
-              <StatusRow label="Max Delay" tooltip={TOOLTIPS.max_delay}>
-                <span className="text-[color:var(--fg)] font-mono text-sm">
-                  {(status.max_delay_ms ?? 0).toLocaleString()} ms
-                </span>
-              </StatusRow>
-              <StatusRow label="Avg Delay" tooltip={TOOLTIPS.avg_delay}>
-                <span className="text-[color:var(--fg)] font-mono text-sm">
-                  {(status.avg_delay_ms ?? 0).toLocaleString()} ms
-                </span>
-              </StatusRow>
-            </div>
-          </Card>
-        ) : null}
-      </SectionErrorBoundary>
 
       {/* 5. Technical Details — always-open reference section */}
       <Card>
