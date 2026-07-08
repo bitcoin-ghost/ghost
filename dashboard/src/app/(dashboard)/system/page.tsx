@@ -17,11 +17,7 @@ import {
   useStartUpdate,
   useRollbackUpdate,
   // Storage & Pruning
-  useFullConfig,
-  useNodeStatus,
   useL2PruningStatus,
-  useSetOperatorWindow,
-  useSetArchiveMode,
   useGhostPayStatus,
   // Backup & Restore
   useBackupHistory,
@@ -34,6 +30,7 @@ import { getBackupDownloadUrl } from "@/lib/api/backup";
 import { useToast } from "@/components/ui/Toast";
 import { AutoUpdateSection } from "@/components/settings/AutoUpdateSection";
 import { ScheduledBackupsCard } from "@/components/settings/ScheduledBackupsCard";
+import { StoragePruningCard } from "@/components/settings/StoragePruningCard";
 import type { UpdateStatus } from "@/lib/api/system";
 import type { VerifyBackupResponse } from "@/types/api";
 
@@ -65,16 +62,6 @@ function formatDate(dateStr: string): string {
 function formatTimestampDate(timestamp: number): string {
   if (!timestamp) return "—";
   return new Date(timestamp * 1000).toLocaleString();
-}
-
-function formatDuration(blocks: number): string {
-  const days = Math.round(blocks / 144);
-  if (days === 1) return "1 day";
-  if (days < 7) return `${days} days`;
-  if (days === 7) return "1 week";
-  if (days < 30) return `${Math.round(days / 7)} weeks`;
-  if (days < 60) return "1 month";
-  return `${Math.round(days / 30)} months`;
 }
 
 function formatTimestamp(ts: number): string {
@@ -118,16 +105,6 @@ function getStatusBadge(status: UpdateStatus["status"]): {
 }
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const OW_PRESETS = [
-  { blocks: 1008, label: "7 days", description: "Minimum recommended" },
-  { blocks: 2016, label: "14 days", description: "Default" },
-  { blocks: 4032, label: "30 days", description: "Extended retention" },
-];
-
-// ---------------------------------------------------------------------------
 // Page Component
 // ---------------------------------------------------------------------------
 
@@ -157,17 +134,13 @@ export default function SystemPage() {
   const updateInfo = updateCheck?.update_info;
   const hasUpdate = updateCheck?.update_available ?? false;
 
-  // -- Storage hooks --
-  const { data: fullConfig, isLoading: configLoading } = useFullConfig();
-  const { data: status } = useNodeStatus();
+  // -- Storage hooks (L1 pruning lives in the shared <StoragePruningCard/>) --
   const { data: l2Pruning, isLoading: l2Loading } = useL2PruningStatus();
   const { data: ghostPayStatus } = useGhostPayStatus();
 
-  const setOperatorWindow = useSetOperatorWindow();
-  const setArchiveMode = useSetArchiveMode();
-
-  const archiveMode = status?.archive_mode ?? false;
-  const ghostPayRunning = !!ghostPayStatus?.l2_height;
+  // Running-state from the explicit `sync_state` flag, not `l2_height` (0 is a
+  // valid running height and would wrongly show "Ghost Pay Not Running").
+  const ghostPayRunning = ghostPayStatus?.sync_state === "synced";
 
   // -- Backup hooks --
   const { data: historyData, isLoading: backupLoading } = useBackupHistory();
@@ -183,7 +156,8 @@ export default function SystemPage() {
   const [verifyResult, setVerifyResult] = useState<VerifyBackupResponse | null>(null);
   // Set after a successful import: the artifact is staged and a restart applies it.
   const [restartRequired, setRestartRequired] = useState(false);
-  const [confirmArchiveOpen, setConfirmArchiveOpen] = useState(false);
+  // Filename pending a delete confirmation (drives the shared <ConfirmDialog>).
+  const [deleteConfirmFile, setDeleteConfirmFile] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const backupHistory = historyData?.backups ?? [];
@@ -199,7 +173,6 @@ export default function SystemPage() {
     if (!updateStatus) return;
 
     if (updateStatus.status === "complete") {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsUpdating(false);
       success(
         "Update Complete",
@@ -257,43 +230,6 @@ export default function SystemPage() {
   };
 
   // -------------------------------------------------------------------------
-  // Storage handlers
-  // -------------------------------------------------------------------------
-
-  const handleOperatorWindowChange = async (blocks: number) => {
-    try {
-      await setOperatorWindow.mutateAsync(blocks);
-      success("Window Updated", `Operator window set to ${formatDuration(blocks)}`);
-    } catch (err) {
-      toastError("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
-  const applyArchiveMode = async (enabled: boolean) => {
-    try {
-      await setArchiveMode.mutateAsync(enabled);
-      success(
-        "Mode Changed",
-        enabled
-          ? "Archive Mode enabled — ghostd is restarting to stop pruning."
-          : "Archive Mode disabled.",
-      );
-    } catch (err) {
-      toastError("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
-
-  const handleArchiveModeToggle = async () => {
-    // Enabling restarts ghostd and, on a pruned node, kicks off a long reindex —
-    // confirm first. Disabling is safe, so apply directly.
-    if (!archiveMode) {
-      setConfirmArchiveOpen(true);
-    } else {
-      await applyArchiveMode(false);
-    }
-  };
-
-  // -------------------------------------------------------------------------
   // Backup handlers
   // -------------------------------------------------------------------------
 
@@ -307,8 +243,9 @@ export default function SystemPage() {
     document.body.removeChild(link);
   };
 
-  const handleDeleteBackup = async (filename: string) => {
-    if (!confirm(`Are you sure you want to delete ${filename}?`)) return;
+  const handleDeleteBackup = async () => {
+    const filename = deleteConfirmFile;
+    if (!filename) return;
 
     try {
       const result = await deleteBackupMutation.mutateAsync(filename);
@@ -320,6 +257,8 @@ export default function SystemPage() {
     } catch (err) {
       console.error("Delete error:", err);
       toastError("Delete Failed", err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeleteConfirmFile(null);
     }
   };
 
@@ -407,7 +346,7 @@ export default function SystemPage() {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="p-4 bg-[var(--surface)] rounded-lg">
                 <div className="text-sm text-[color:var(--dim)] mb-1">Version</div>
-                <div className="text-xl font-bold text-[color:var(--accent)]">
+                <div className="t-stat font-bold text-[color:var(--accent)]">
                   {version?.version ?? version?.node_version ?? "Unknown"}
                 </div>
               </div>
@@ -576,240 +515,107 @@ export default function SystemPage() {
       </SectionErrorBoundary>
 
       {/* ----------------------------------------------------------------- */}
-      {/* Storage & Pruning                                                  */}
+      {/* Storage & Pruning — L1 via the shared card (identical to /storage  */}
+      {/* and /settings/storage), L2 status alongside it.                    */}
       {/* ----------------------------------------------------------------- */}
       <SectionErrorBoundary section="Storage">
-        <Card collapsible>
+        <StoragePruningCard />
+      </SectionErrorBoundary>
+
+      <SectionErrorBoundary section="L2 Pruning">
+        <Card>
           <CardHeader
-            title="Storage & Pruning"
-            subtitle="L1/L2 pruning, archive mode, and operator window"
-            action={archiveMode ? <Badge variant="success">+5 Shares (Archive)</Badge> : undefined}
+            title="L2 Pruning (Ghost Pay)"
+            subtitle="Automatic pruning of old payments, attestations, and closed locks"
           />
-
-          {configLoading ? (
-            <SkeletonCard />
-          ) : (
-            <div className="space-y-6">
-              {/* ---------- L1 Pruning ---------- */}
-              <div className="space-y-6">
-                <h4 className="text-sm font-medium text-[color:var(--dim)] uppercase tracking-wider">L1 Pruning</h4>
-
-                {/* Archive Mode Toggle */}
-                <div className="p-4 bg-[var(--surface)] rounded-lg">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[color:var(--fg)] font-medium">Archive Mode</span>
-                        {archiveMode && <Badge variant="success">+5 Shares</Badge>}
-                      </div>
-                      <p className="text-sm text-[color:var(--dim)] mt-1">
-                        Store complete blockchain history. Disables all pruning and earns bonus shares.
-                      </p>
-                    </div>
-                    <Button
-                      variant={archiveMode ? "primary" : "secondary"}
-                      onClick={handleArchiveModeToggle}
-                      loading={setArchiveMode.isPending}
-                    >
-                      {archiveMode ? "Enabled" : "Disabled"}
-                    </Button>
-                  </div>
-
-                  {fullConfig?.pruning?.reindex_pending && (
-                    <div className="mt-3 flex items-start gap-2 p-3 rounded-lg bg-[color-mix(in_srgb,var(--yellow)_12%,transparent)] border border-[color:var(--yellow)]">
-                      <span
-                        className="mt-0.5 inline-block w-2 h-2 rounded-full bg-[color:var(--yellow)] animate-pulse"
-                        aria-hidden
-                      />
-                      <p className="text-xs text-[color:var(--dim)] leading-relaxed">
-                        <span className="text-[color:var(--fg)] font-medium">Re-indexing.</span>{" "}
-                        This node was pruned, so ghostd is rebuilding and re-downloading the full
-                        chain (a one-time <code>-reindex</code>). This can take hours; the flag
-                        clears itself once the resync completes.
-                      </p>
-                    </div>
-                  )}
+          <div className="space-y-4">
+            {!ghostPayRunning ? (
+              <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
+                <div className="flex items-center gap-2">
+                  <Badge variant="warning">Ghost Pay Not Running</Badge>
                 </div>
-
-                <ConfirmDialog
-                  isOpen={confirmArchiveOpen}
-                  onClose={() => setConfirmArchiveOpen(false)}
-                  onConfirm={async () => {
-                    setConfirmArchiveOpen(false);
-                    await applyArchiveMode(true);
-                  }}
-                  title="Enable Archive Mode?"
-                  message="This restarts ghostd with pruning disabled (-prune=0). If this node is currently pruned, it also triggers a one-time full reindex and re-download of the chain — a long resync that can take hours. The node keeps validating throughout. Continue?"
-                  confirmLabel="Enable & restart ghostd"
-                  loading={setArchiveMode.isPending}
-                />
-
-                {/* Window Visualization */}
-                <div className="grid grid-cols-3 gap-4">
-                  <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
-                    <div className="text-[color:var(--accent)] font-medium mb-2">Validator Window (VW)</div>
-                    <div className="text-2xl font-bold text-[color:var(--fg)]">{fullConfig?.pruning?.vw_blocks ?? 288} blocks</div>
-                    <div className="text-sm text-[color:var(--dim)] mt-1">~{formatDuration(fullConfig?.pruning?.vw_blocks ?? 288)}</div>
-                    <div className="mt-3 text-xs text-[color:var(--accent)]">
-                      Fixed - Bitcoin Core minimum for reorg safety
+                <p className="text-sm text-[color:var(--accent)] mt-2">
+                  Start ghost-pay-node to enable L2 functionality and see pruning status.
+                </p>
+              </div>
+            ) : l2Loading ? (
+              <SkeletonCard />
+            ) : l2Pruning ? (
+              <>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <div className="p-4 bg-[var(--surface)] rounded-lg">
+                    <div className="text-sm text-[color:var(--dim)]">Retention Period</div>
+                    <div className="t-stat font-bold text-[color:var(--fg)] mt-1">
+                      {l2Pruning.retention_days ?? 90} days
                     </div>
                   </div>
-
-                  <div className={`p-4 rounded-lg border ${archiveMode ? "bg-[var(--surface)] border-[var(--rule-strong)]" : "bg-[var(--surface)] border-[color:var(--accent)]"}`}>
-                    <div className={`font-medium mb-2 ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--accent)]"}`}>
-                      Operator Window (OW)
+                  <div className="p-4 bg-[var(--surface)] rounded-lg">
+                    <div className="text-sm text-[color:var(--dim)]">Auto Prune</div>
+                    <div className="mt-1">
+                      <Badge variant="success">Always On</Badge>
                     </div>
-                    <div className={`text-2xl font-bold ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--fg)]"}`}>
-                      {(fullConfig?.pruning?.ow_blocks ?? 0) > 0 ? `${fullConfig?.pruning?.ow_blocks} blocks` : "Keep all"}
-                    </div>
-                    <div className="text-sm text-[color:var(--dim)] mt-1">
-                      {(fullConfig?.pruning?.ow_blocks ?? 0) > 0 ? `~${formatDuration(fullConfig?.pruning?.ow_blocks ?? 0)}` : "No pruning depth set"}
-                    </div>
-                    <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--fainter)]" : "text-[color:var(--accent)]"}`}>
-                      {archiveMode ? "Disabled (Archive Mode)" : "Prune depth (prune_height)"}
+                    <div className="text-xs text-[color:var(--fainter)] mt-1">
+                      Every {l2Pruning.prune_interval_hours ?? 24}h
                     </div>
                   </div>
-
-                  <div className={`p-4 rounded-lg border ${archiveMode ? "bg-[var(--surface)] border-[color:var(--green)]" : "bg-[var(--surface)] border-[var(--rule-strong)]"}`}>
-                    <div className={`font-medium mb-2 ${archiveMode ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}`}>
-                      Archive Window (AW)
+                  <div className="p-4 bg-[var(--surface)] rounded-lg">
+                    <div className="text-sm text-[color:var(--dim)]">Last Prune</div>
+                    <div className="text-lg font-medium text-[color:var(--fg)] mt-1">
+                      {formatTimeAgo(l2Pruning.last_prune_timestamp ?? 0)}
                     </div>
-                    <div className={`text-2xl font-bold ${archiveMode ? "text-[color:var(--fg)]" : "text-[color:var(--fainter)]"}`}>
-                      {archiveMode ? "Infinite" : "Pruned"}
+                    <div className="text-xs text-[color:var(--fainter)] mt-1">
+                      {formatTimestamp(l2Pruning.last_prune_timestamp ?? 0)}
                     </div>
-                    <div className="text-sm text-[color:var(--dim)] mt-1">
-                      {archiveMode ? "All history retained" : "Data beyond OW is deleted"}
-                    </div>
-                    <div className={`mt-3 text-xs ${archiveMode ? "text-[color:var(--green)]" : "text-[color:var(--fainter)]"}`}>
-                      {archiveMode ? "Full chain storage enabled" : "Enable Archive Mode for +5 shares"}
+                  </div>
+                  <div className="p-4 bg-[var(--surface)] rounded-lg">
+                    <div className="text-sm text-[color:var(--dim)]">Last Run Stats</div>
+                    <div className="text-sm text-[color:var(--dim)] mt-2 space-y-1">
+                      <div>Payments: {l2Pruning.payments_pruned ?? 0}</div>
+                      <div>Attestations: {l2Pruning.attestations_pruned ?? 0}</div>
+                      <div>Locks: {l2Pruning.locks_pruned ?? 0}</div>
                     </div>
                   </div>
                 </div>
 
-                {/* Operator Window Selection */}
-                {!archiveMode && (
-                  <div className="space-y-3">
-                    <label className="text-sm font-medium text-[color:var(--dim)]">Operator Window Size</label>
-                    <p className="text-xs text-[color:var(--fainter)]">
-                      How many recent blocks to keep on disk (prune_height). Any non-zero depth is
-                      clamped up to the Validator Window floor.
-                    </p>
-                    <div className="grid grid-cols-3 gap-3">
-                      {OW_PRESETS.map((preset) => (
-                        <button
-                          key={preset.blocks}
-                          onClick={() => handleOperatorWindowChange(preset.blocks)}
-                          disabled={setOperatorWindow.isPending}
-                          className={`p-3 rounded-lg border transition-colors text-left ${
-                            fullConfig?.pruning?.ow_blocks === preset.blocks
-                              ? "bg-[var(--surface)] border-[color:var(--accent)] text-[color:var(--accent)]"
-                              : "bg-[var(--surface)] border-[var(--rule-strong)] text-[color:var(--dim)] hover:border-[var(--rule-strong)]"
-                          }`}
-                        >
-                          <div className="font-medium">{preset.label}</div>
-                          <div className="text-xs text-[color:var(--fainter)] mt-1">{preset.blocks} blocks</div>
-                          <div className="text-xs text-[color:var(--dim)] mt-1">{preset.description}</div>
-                        </button>
-                      ))}
-                    </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="p-4 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
+                    <h4 className="text-[color:var(--red)] font-medium mb-3">What Gets Pruned</h4>
+                    <ul className="text-sm text-[color:var(--red)] space-y-2">
+                      <li className="flex items-start gap-2">
+                        <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
+                        <span>Payments (with ZK proofs) older than {l2Pruning.retention_days ?? 90} days</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
+                        <span>Attestations older than {l2Pruning.retention_days ?? 90} days</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
+                        <span>Closed locks (reconciled or jumped) older than {l2Pruning.retention_days ?? 90} days</span>
+                      </li>
+                    </ul>
                   </div>
-                )}
+                  <div className="p-4 bg-[var(--surface)] border border-[color:var(--green)] rounded-lg">
+                    <h4 className="text-[color:var(--green)] font-medium mb-3">What is Never Pruned</h4>
+                    <ul className="text-sm text-[color:var(--green)] space-y-2">
+                      <li className="flex items-start gap-2">
+                        <span className="text-[color:var(--green)] mt-0.5">&bull;</span>
+                        <span>Active locks (regardless of age)</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-[color:var(--green)] mt-0.5">&bull;</span>
+                        <span>L2 block headers (contain state_root commitments)</span>
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="p-4 bg-[var(--surface)] rounded-lg text-[color:var(--dim)]">
+                Unable to fetch L2 pruning status. Ensure ghost-pay-node API is accessible.
               </div>
-
-              {/* ---------- L2 Pruning ---------- */}
-              <div className="space-y-4 pt-4 border-t border-[var(--rule)]">
-                <h4 className="text-sm font-medium text-[color:var(--dim)] uppercase tracking-wider">L2 Pruning (Ghost Pay)</h4>
-
-                {!ghostPayRunning ? (
-                  <div className="p-4 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
-                    <div className="flex items-center gap-2">
-                      <Badge variant="warning">Ghost Pay Not Running</Badge>
-                    </div>
-                    <p className="text-sm text-[color:var(--accent)] mt-2">
-                      Start ghost-pay-node to enable L2 functionality and see pruning status.
-                    </p>
-                  </div>
-                ) : l2Loading ? (
-                  <SkeletonCard />
-                ) : l2Pruning ? (
-                  <>
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                      <div className="p-4 bg-[var(--surface)] rounded-lg">
-                        <div className="text-sm text-[color:var(--dim)]">Retention Period</div>
-                        <div className="text-xl font-bold text-[color:var(--fg)] mt-1">
-                          {l2Pruning.retention_days} days
-                        </div>
-                      </div>
-                      <div className="p-4 bg-[var(--surface)] rounded-lg">
-                        <div className="text-sm text-[color:var(--dim)]">Auto Prune</div>
-                        <div className="mt-1">
-                          <Badge variant="success">Always On</Badge>
-                        </div>
-                        <div className="text-xs text-[color:var(--fainter)] mt-1">
-                          Every {l2Pruning.prune_interval_hours}h
-                        </div>
-                      </div>
-                      <div className="p-4 bg-[var(--surface)] rounded-lg">
-                        <div className="text-sm text-[color:var(--dim)]">Last Prune</div>
-                        <div className="text-lg font-medium text-[color:var(--fg)] mt-1">
-                          {formatTimeAgo(l2Pruning.last_prune_timestamp ?? 0)}
-                        </div>
-                        <div className="text-xs text-[color:var(--fainter)] mt-1">
-                          {formatTimestamp(l2Pruning.last_prune_timestamp ?? 0)}
-                        </div>
-                      </div>
-                      <div className="p-4 bg-[var(--surface)] rounded-lg">
-                        <div className="text-sm text-[color:var(--dim)]">Last Run Stats</div>
-                        <div className="text-sm text-[color:var(--dim)] mt-2 space-y-1">
-                          <div>Payments: {l2Pruning.payments_pruned}</div>
-                          <div>Attestations: {l2Pruning.attestations_pruned}</div>
-                          <div>Locks: {l2Pruning.locks_pruned}</div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="p-4 bg-[var(--surface)] border border-[color:var(--red)] rounded-lg">
-                        <h4 className="text-[color:var(--red)] font-medium mb-3">What Gets Pruned</h4>
-                        <ul className="text-sm text-[color:var(--red)] space-y-2">
-                          <li className="flex items-start gap-2">
-                            <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
-                            <span>Payments (with ZK proofs) older than {l2Pruning.retention_days} days</span>
-                          </li>
-                          <li className="flex items-start gap-2">
-                            <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
-                            <span>Attestations older than {l2Pruning.retention_days} days</span>
-                          </li>
-                          <li className="flex items-start gap-2">
-                            <span className="text-[color:var(--red)] mt-0.5">&bull;</span>
-                            <span>Closed locks (reconciled or jumped) older than {l2Pruning.retention_days} days</span>
-                          </li>
-                        </ul>
-                      </div>
-                      <div className="p-4 bg-[var(--surface)] border border-[color:var(--green)] rounded-lg">
-                        <h4 className="text-[color:var(--green)] font-medium mb-3">What is Never Pruned</h4>
-                        <ul className="text-sm text-[color:var(--green)] space-y-2">
-                          <li className="flex items-start gap-2">
-                            <span className="text-[color:var(--green)] mt-0.5">&bull;</span>
-                            <span>Active locks (regardless of age)</span>
-                          </li>
-                          <li className="flex items-start gap-2">
-                            <span className="text-[color:var(--green)] mt-0.5">&bull;</span>
-                            <span>L2 block headers (contain state_root commitments)</span>
-                          </li>
-                        </ul>
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="p-4 bg-[var(--surface)] rounded-lg text-[color:var(--dim)]">
-                    Unable to fetch L2 pruning status. Ensure ghost-pay-node API is accessible.
-                  </div>
-                )}
-              </div>
-
-            </div>
-          )}
+            )}
+          </div>
         </Card>
       </SectionErrorBoundary>
 
@@ -894,7 +700,7 @@ export default function SystemPage() {
                           <Button
                             variant="ghost"
                             size="sm"
-                            onClick={() => handleDeleteBackup(backup.filename)}
+                            onClick={() => setDeleteConfirmFile(backup.filename)}
                             disabled={deleteBackupMutation.isPending}
                           >
                             Delete
@@ -1186,6 +992,22 @@ export default function SystemPage() {
           </div>
         </div>
       </Dialog>
+
+      {/* Delete Backup Confirmation */}
+      <ConfirmDialog
+        isOpen={deleteConfirmFile !== null}
+        onClose={() => setDeleteConfirmFile(null)}
+        onConfirm={handleDeleteBackup}
+        title="Delete Backup"
+        message={
+          deleteConfirmFile
+            ? `Delete ${deleteConfirmFile}? This permanently removes the backup file from the node and cannot be undone.`
+            : ""
+        }
+        confirmLabel="Delete"
+        variant="danger"
+        loading={deleteBackupMutation.isPending}
+      />
     </div>
   );
 }

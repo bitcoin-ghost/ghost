@@ -11,16 +11,6 @@ import {
 } from "@/hooks/queries";
 import { StoragePruningCard } from "@/components/settings/StoragePruningCard";
 
-function formatDuration(blocks: number): string {
-  const days = Math.round(blocks / 144);
-  if (days === 1) return "1 day";
-  if (days < 7) return `${days} days`;
-  if (days === 7) return "1 week";
-  if (days < 30) return `${Math.round(days / 7)} weeks`;
-  if (days < 60) return "1 month";
-  return `${Math.round(days / 30)} months`;
-}
-
 function formatTimestamp(ts: number): string {
   if (!ts) return "Never";
   const date = new Date(ts * 1000);
@@ -38,7 +28,7 @@ function formatTimeAgo(ts: number): string {
 }
 
 export default function StoragePage() {
-  const { data: fullConfig, isLoading: configLoading } = useFullConfig();
+  const { isLoading: configLoading } = useFullConfig();
   const { data: status } = useNodeStatus();
   const { data: l2Pruning, isLoading: l2Loading } = useL2PruningStatus();
   const { data: ghostPayStatus } = useGhostPayStatus();
@@ -90,7 +80,7 @@ export default function StoragePage() {
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div className="p-4 bg-[var(--surface)] rounded-lg">
                       <div className="text-sm text-[color:var(--dim)]">Retention Period</div>
-                      <div className="text-xl font-bold text-[color:var(--fg)] mt-1">
+                      <div className="t-stat font-bold text-[color:var(--fg)] mt-1">
                         {l2Pruning.retention_days ?? 90} days
                       </div>
                     </div>

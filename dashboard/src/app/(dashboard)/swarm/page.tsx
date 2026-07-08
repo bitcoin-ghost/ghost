@@ -20,8 +20,8 @@ import {
   useUpdateSwarmNode,
   useRefreshSwarmNode,
   useNodeInfo,
+  useSetNickname,
 } from "@/hooks/queries";
-import { setNickname } from "@/lib/api/node";
 import { refreshSwarmNode, syncSwarm, restartSwarmNode, updateAllSwarmNodes } from "@/lib/api/swarm";
 import { useQueryClient } from "@tanstack/react-query";
 import { useToast } from "@/components/ui/Toast";
@@ -123,6 +123,7 @@ export default function SwarmPage() {
   const addNode = useAddSwarmNode();
   const removeNode = useRemoveSwarmNode();
   const updateNode = useUpdateSwarmNode();
+  const setNicknameMutation = useSetNickname();
   const refreshNode = useRefreshSwarmNode();
   const queryClient = useQueryClient();
   const { success, error } = useToast();
@@ -321,7 +322,10 @@ export default function SwarmPage() {
 
     const interval = setInterval(doRefresh, 30000);
     return () => clearInterval(interval);
-  }, [nodes.length, queryClient]); // Re-setup when node count changes
+    // Deliberately keyed on node COUNT (not the array identity) so the polling
+    // interval is only torn down/recreated when a node is added or removed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodes.length, queryClient]);
 
   const handleEditClick = (node: SwarmNode) => {
     setSelectedNode(node);
@@ -336,7 +340,7 @@ export default function SwarmPage() {
     // For localhost, only update the nickname
     if (selectedNode.address === "localhost") {
       try {
-        await setNickname(editNodeName.trim());
+        await setNicknameMutation.mutateAsync(editNodeName.trim());
         queryClient.invalidateQueries({ queryKey: swarmKeys.all });
         success("Node Updated", `Local node renamed to ${editNodeName}`);
         setEditDialogOpen(false);
@@ -911,7 +915,7 @@ export default function SwarmPage() {
               variant="primary"
               className="flex-1"
               onClick={handleEditNode}
-              loading={updateNode.isPending}
+              loading={updateNode.isPending || setNicknameMutation.isPending}
               disabled={!editNodeName.trim() || (selectedNode?.address !== "localhost" && !editNodeAddress.trim())}
             >
               Save Changes
