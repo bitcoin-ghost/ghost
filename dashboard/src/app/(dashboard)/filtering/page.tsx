@@ -50,10 +50,10 @@ function modeSummary(
     case "full_open":
       return { value: "Open", sublabel: "Mining every kind of transaction" };
     case "permissive":
-      return { value: "Standard", sublabel: "Dropping heavy data (T3)" };
+      return { value: "Standard", sublabel: "T3 not mined into your blocks" };
     case "bitcoin_pure":
     case "strict":
-      return { value: "Payments only", sublabel: "All data transactions dropped" };
+      return { value: "Strict", sublabel: "T2 + T3 not mined into your blocks" };
     case "custom":
       return dropped.length
         ? { value: "Custom", sublabel: `Dropping ${dropped.join(" + ")}` }

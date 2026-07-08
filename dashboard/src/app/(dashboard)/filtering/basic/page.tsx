@@ -131,7 +131,7 @@ export default function BasicFilteringPage() {
         <Card>
           <CardHeader
             title="Your mempool by class"
-            subtitle="What your node is holding right now, by share of sampled transactions."
+            subtitle="Every valid class you relay sits here — the tier policy only picks which of these your blocks mine. So T2/T3 can still appear in Strict; they just aren't mined by you."
           />
           <div className="space-y-3">
             {mempool?.message ? (
