@@ -44,8 +44,8 @@ export default function FilteringSettingsPage() {
       <Card>
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div style={{ color: "var(--fg)", fontSize: "15px", fontWeight: 600 }}>Enable advanced controls</div>
-            <div style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6", marginTop: "4px" }}>
+            <div className="t-title" style={{ color: "var(--fg)" }}>Enable advanced controls</div>
+            <div className="t-caption" style={{ color: "var(--dim)", marginTop: "4px" }}>
               Off by default. When on, the reaper vectors and custom mining policy below become editable.
               This switch is per-browser only — it does not change your node until you save a control below.
             </div>

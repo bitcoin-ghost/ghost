@@ -4,13 +4,16 @@ import Link from "next/link";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { AutoUpdateSection } from "@/components/settings/AutoUpdateSection";
+import { ScheduledBackupsCard } from "@/components/settings/ScheduledBackupsCard";
 
 /**
- * Settings › System — central mirror of the operator-adjustable system setting:
- * the automatic-updates opt-in. Reuses the same AutoUpdateSection component +
- * `useSetAutoUpdate` mutation as /system. Manual update install, rollback and
- * encrypted backups remain on /system (they are actions, not persisted
- * settings).
+ * Settings › System — central home for the operator-adjustable, persisted system
+ * settings: the automatic-updates opt-in and the scheduled-backups schedule.
+ * Reuses the same AutoUpdateSection (`useSetAutoUpdate`) and ScheduledBackupsCard
+ * (`useSetBackupSchedule`) components that /system renders, so the persisted
+ * settings have a Settings home consistent with the mirror pattern. Manual
+ * update install, rollback and one-off encrypted backups remain on /system
+ * (they are actions, not persisted settings).
  */
 export default function SystemSettingsPage() {
   return (
@@ -27,10 +30,14 @@ export default function SystemSettingsPage() {
         </Card>
       </SectionErrorBoundary>
 
+      <SectionErrorBoundary section="Scheduled backups">
+        <ScheduledBackupsCard />
+      </SectionErrorBoundary>
+
       <Card>
         <p className="text-sm text-[color:var(--dim)]">
-          Check for and install updates manually, roll back to a previous version, or manage encrypted
-          backups on{" "}
+          Check for and install updates manually, roll back to a previous version, or create a one-off
+          encrypted backup on{" "}
           <Link href="/system" className="text-[color:var(--accent)] hover:text-[color:var(--accent)] underline">
             System
           </Link>

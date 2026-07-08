@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import {
@@ -110,10 +111,16 @@ export default function PrivacySettingsPage() {
               )}
               {!status?.tor_mode && (
                 <div className="text-xs text-[color:var(--fainter)] mt-1">
-                  Configure via Ghost Core startup flags (-proxy, -torcontrol). Set at startup, read-only here.
+                  Read-only here — Tor mode is a ghostd startup flag. Toggle it on Network.
                 </div>
               )}
             </div>
+            <Link
+              href="/network"
+              className="flex-shrink-0 self-start rounded-lg border border-[color:var(--rule-strong)] px-3 py-1.5 t-label text-[color:var(--accent)] transition-colors hover:border-[color:var(--accent)]"
+            >
+              Manage on Network →
+            </Link>
           </div>
 
           {/* Ghost Shroud — configurable via the same wizard as Settings › Wizards */}
