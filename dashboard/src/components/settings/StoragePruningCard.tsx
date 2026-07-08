@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -12,14 +13,59 @@ import {
 } from "@/hooks/queries";
 import { useToast } from "@/components/ui/Toast";
 
-// Preset Operator Window depths (in blocks). Each writes the real
-// `storage.prune_height` (blocks to keep). The backend clamps any non-zero
-// depth up to the Validator Window floor.
-const OW_PRESETS = [
-  { blocks: 1008, label: "7 days", description: "Minimum recommended" },
-  { blocks: 2016, label: "14 days", description: "Default" },
-  { blocks: 4032, label: "30 days", description: "Extended retention" },
-];
+// ── Operator Window conversions ───────────────────────────────────────────
+// The canonical stored value is `storage.prune_height` — a BLOCK COUNT. The
+// picker lets an operator think in Time, Blocks or Size, but everything is
+// converted back to blocks before it is sent.
+const BLOCKS_PER_DAY = 144; // exact (10-min blocks)
+const MB_PER_BLOCK = 1.6; // rough average serialized block size
+const GB_PER_BLOCK = MB_PER_BLOCK / 1024;
+
+// 14 days — used when no prune depth is set yet (owBlocks === 0 / keep-all).
+const DEFAULT_TARGET_BLOCKS = 2016;
+
+type OwUnit = "time" | "blocks" | "size";
+
+const UNIT_META: Record<
+  OwUnit,
+  { label: string; min: number; max: number; step: number; suffix: string }
+> = {
+  // ~2 days floor up toward a 3-year / near-archive ceiling.
+  time: { label: "Time (days)", min: 2, max: 1095, step: 1, suffix: "days" },
+  blocks: { label: "Blocks", min: 288, max: 157_680, step: 144, suffix: "blocks" },
+  size: { label: "Size (GB)", min: 0.5, max: 250, step: 0.5, suffix: "GB" },
+};
+
+function blocksToUnit(blocks: number, unit: OwUnit): number {
+  if (unit === "time") return blocks / BLOCKS_PER_DAY;
+  if (unit === "size") return blocks * GB_PER_BLOCK;
+  return blocks;
+}
+
+function unitToBlocks(value: number, unit: OwUnit): number {
+  if (unit === "time") return Math.round(value * BLOCKS_PER_DAY);
+  if (unit === "size") return Math.round(value / GB_PER_BLOCK);
+  return Math.round(value);
+}
+
+// String value for the numeric input in the active unit.
+function formatUnitValue(blocks: number, unit: OwUnit): string {
+  const v = blocksToUnit(blocks, unit);
+  if (unit === "size") return (Math.round(v * 10) / 10).toString();
+  return Math.round(v).toString();
+}
+
+function formatDaysLabel(blocks: number): string {
+  const d = Math.round(blocks / BLOCKS_PER_DAY);
+  return `${d.toLocaleString()} day${d === 1 ? "" : "s"}`;
+}
+
+function formatSizeLabel(blocks: number): string {
+  const gb = blocks * GB_PER_BLOCK;
+  return gb < 10
+    ? `~${(Math.round(gb * 10) / 10).toFixed(1)} GB`
+    : `~${Math.round(gb).toLocaleString()} GB`;
+}
 
 function formatDuration(blocks: number): string {
   const days = Math.round(blocks / 144);
@@ -151,35 +197,219 @@ export function StoragePruningCard() {
           </div>
         </div>
 
-        {/* Operator Window Selection (only if not archive mode) */}
+        {/* Operator Window Size (only if not archive mode) */}
         {!archiveMode && (
-          <div className="space-y-3">
-            <label className="text-sm font-medium text-[color:var(--dim)]">Operator Window Size</label>
-            <p className="text-xs text-[color:var(--fainter)]">
-              How many recent blocks to keep on disk (prune_height). Any non-zero depth is
-              clamped up to the Validator Window floor.
-            </p>
-            <div className="grid grid-cols-3 gap-3">
-              {OW_PRESETS.map((preset) => (
-                <button
-                  key={preset.blocks}
-                  onClick={() => handleOperatorWindowChange(preset.blocks)}
-                  disabled={setOperatorWindow.isPending}
-                  className={`p-3 rounded-lg border transition-colors text-left cursor-pointer disabled:cursor-not-allowed ${
-                    owBlocks === preset.blocks
-                      ? "bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] border-[color:var(--accent)] text-[color:var(--accent)]"
-                      : "bg-[var(--surface)]/50 border-[color:var(--rule-strong)] text-[color:var(--dim)] hover:border-[color:var(--accent)] hover:text-[color:var(--fg)] hover:bg-[color-mix(in_srgb,var(--accent)_8%,transparent)]"
-                  }`}
-                >
-                  <div className="font-medium">{preset.label}</div>
-                  <div className="text-xs text-[color:var(--fainter)] mt-1">{preset.blocks} blocks</div>
-                  <div className="text-xs text-[color:var(--dim)] mt-1">{preset.description}</div>
-                </button>
-              ))}
-            </div>
-          </div>
+          <OperatorWindowPicker
+            owBlocks={owBlocks}
+            vwBlocks={vwBlocks}
+            isPending={setOperatorWindow.isPending}
+            onSet={handleOperatorWindowChange}
+          />
         )}
       </div>
     </Card>
+  );
+}
+
+/**
+ * Multi-unit Operator Window depth picker.
+ *
+ * The canonical value is `prune_height` in BLOCKS; the operator can dial it in
+ * whatever unit they think in (Time / Blocks / Size). Slider + numeric input
+ * stay in sync and only touch LOCAL state — the POST (which restarts the node)
+ * happens on the explicit Set button. The resulting depth is clamped UP to the
+ * Validator Window floor to mirror the backend.
+ */
+function OperatorWindowPicker({
+  owBlocks,
+  vwBlocks,
+  isPending,
+  onSet,
+}: {
+  owBlocks: number;
+  vwBlocks: number;
+  isPending: boolean;
+  onSet: (blocks: number) => void;
+}) {
+  const initialTarget = owBlocks > 0 ? owBlocks : DEFAULT_TARGET_BLOCKS;
+
+  const [unit, setUnit] = useState<OwUnit>("time");
+  const [targetBlocks, setTargetBlocks] = useState(initialTarget);
+  const [inputStr, setInputStr] = useState(() => formatUnitValue(initialTarget, "time"));
+
+  // Re-sync local state when the stored value changes (e.g. after a successful
+  // Set + config refetch). owBlocks only moves when the backend value moves, so
+  // this will not clobber in-progress edits.
+  useEffect(() => {
+    const next = owBlocks > 0 ? owBlocks : DEFAULT_TARGET_BLOCKS;
+    setTargetBlocks(next);
+    setInputStr(formatUnitValue(next, unit));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [owBlocks]);
+
+  const meta = UNIT_META[unit];
+
+  // Mirror the backend clamp: any non-zero depth is clamped UP to the VW floor.
+  const effectiveBlocks = Math.max(targetBlocks, vwBlocks);
+  const clampEngaged = targetBlocks < vwBlocks;
+  const isCurrent = effectiveBlocks === owBlocks;
+
+  const sliderValue = Math.min(
+    Math.max(blocksToUnit(targetBlocks, unit), meta.min),
+    meta.max,
+  );
+  const fillPct = ((sliderValue - meta.min) / (meta.max - meta.min)) * 100;
+
+  const switchUnit = (u: OwUnit) => {
+    setUnit(u);
+    setInputStr(formatUnitValue(targetBlocks, u));
+  };
+
+  const handleSlider = (raw: string) => {
+    const v = parseFloat(raw);
+    if (Number.isNaN(v)) return;
+    const blocks = Math.max(unitToBlocks(v, unit), 0);
+    setTargetBlocks(blocks);
+    setInputStr(formatUnitValue(blocks, unit));
+  };
+
+  const handleInput = (raw: string) => {
+    setInputStr(raw);
+    const v = parseFloat(raw);
+    if (!Number.isNaN(v) && v >= 0) {
+      setTargetBlocks(unitToBlocks(v, unit));
+    }
+  };
+
+  const applyChip = (blocks: number) => {
+    setTargetBlocks(blocks);
+    setInputStr(formatUnitValue(blocks, unit));
+  };
+
+  const chips = [
+    { label: "7d", blocks: 1008 },
+    { label: "30d", blocks: 4320 },
+    { label: "90d", blocks: 12960 },
+    { label: "1yr", blocks: 52560 },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <label className="text-sm font-medium text-[color:var(--dim)]">Operator Window Size</label>
+        <p className="text-xs text-[color:var(--fainter)] mt-1">
+          How much recent history to keep on disk (prune_height). Set it in whatever unit
+          you think in — the value is stored as a block count.
+        </p>
+      </div>
+
+      {/* Unit toggle */}
+      <div className="inline-flex rounded-lg border border-[color:var(--rule-strong)] bg-[var(--surface)]/50 p-0.5">
+        {(["time", "blocks", "size"] as OwUnit[]).map((u) => (
+          <button
+            key={u}
+            onClick={() => switchUnit(u)}
+            className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+              unit === u
+                ? "bg-[var(--accent)] text-white"
+                : "text-[color:var(--dim)] hover:text-[color:var(--fg)]"
+            }`}
+          >
+            {UNIT_META[u].label}
+          </button>
+        ))}
+      </div>
+
+      {/* Slider + numeric input (kept in sync) */}
+      <div className="flex items-center gap-4">
+        <input
+          type="range"
+          className="ow-range flex-1"
+          min={meta.min}
+          max={meta.max}
+          step={meta.step}
+          value={sliderValue}
+          onChange={(e) => handleSlider(e.target.value)}
+          disabled={isPending}
+          style={{
+            background: `linear-gradient(to right, var(--accent) ${fillPct}%, var(--rule-strong) ${fillPct}%)`,
+          }}
+        />
+        <div className="flex items-center gap-2 shrink-0">
+          <input
+            type="number"
+            inputMode="decimal"
+            min={meta.min}
+            step={meta.step}
+            value={inputStr}
+            onChange={(e) => handleInput(e.target.value)}
+            disabled={isPending}
+            className="w-24 px-2 py-1.5 text-sm rounded-lg border border-[color:var(--rule-strong)] bg-[var(--surface)] text-[color:var(--fg)] focus:outline-none focus:border-[color:var(--accent)]"
+          />
+          <span className="w-12 text-xs text-[color:var(--dim)]">{meta.suffix}</span>
+        </div>
+      </div>
+
+      {/* Quick chips */}
+      <div className="flex flex-wrap gap-2">
+        {chips.map((c) => (
+          <button
+            key={c.label}
+            onClick={() => applyChip(c.blocks)}
+            disabled={isPending}
+            className={`px-3 py-1 text-xs rounded-full border transition-colors cursor-pointer disabled:cursor-not-allowed ${
+              targetBlocks === c.blocks
+                ? "bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] border-[color:var(--accent)] text-[color:var(--accent)]"
+                : "bg-[var(--surface)]/50 border-[color:var(--rule-strong)] text-[color:var(--dim)] hover:border-[color:var(--accent)] hover:text-[color:var(--fg)]"
+            }`}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Live conversion readout */}
+      <div className="p-3 rounded-lg bg-[var(--surface)]/50 border border-[color:var(--rule-strong)] space-y-1">
+        <div className="text-sm text-[color:var(--fg)]">
+          ≈ {formatDaysLabel(effectiveBlocks)} · {effectiveBlocks.toLocaleString()} blocks ·{" "}
+          {formatSizeLabel(effectiveBlocks)}
+        </div>
+        <p className="text-xs text-[color:var(--fainter)]">
+          Size is an estimate — actual disk use depends on block sizes.
+        </p>
+        {clampEngaged && (
+          <p className="text-xs text-[color:var(--yellow)]">
+            Below the Validator Window floor — will be clamped up to{" "}
+            {vwBlocks.toLocaleString()} blocks (~{formatDuration(vwBlocks)}).
+          </p>
+        )}
+        <p className="text-xs text-[color:var(--fainter)]">
+          Validator Window floor: {vwBlocks.toLocaleString()} blocks / ~{formatDuration(vwBlocks)}.
+        </p>
+      </div>
+
+      {/* Apply */}
+      <div className="flex items-center gap-3">
+        <Button
+          variant="primary"
+          onClick={() => onSet(effectiveBlocks)}
+          loading={isPending}
+          disabled={isPending || isCurrent}
+        >
+          Set Operator Window
+        </Button>
+        {isCurrent ? (
+          <span className="text-xs text-[color:var(--green)]">Current setting</span>
+        ) : (
+          <span className="text-xs text-[color:var(--fainter)]">
+            Applying a new depth restarts the node.
+          </span>
+        )}
+      </div>
+
+      <p className="text-xs text-[color:var(--fainter)]">
+        For full history, use Archive Mode (above).
+      </p>
+    </div>
   );
 }
