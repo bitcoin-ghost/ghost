@@ -113,8 +113,18 @@ export async function setDaemonSettings(settings: DaemonSettings): Promise<Daemo
   });
 }
 
-export async function setArchiveMode(enabled: boolean): Promise<NodeConfig> {
-  return fetchApi<NodeConfig>('/api/v1/config/archive_mode', {
+// Archive un-prune (Group F). The POST persists storage.archive_mode, emits
+// ghostd -prune=0 via the managed drop-in and restarts ghostd; on a pruned node
+// it also arms a one-time -reindex (reported via `reindex_pending`).
+export interface ArchiveModeResponse {
+  success: boolean;
+  enabled: boolean;
+  reindex_pending: boolean;
+  message: string;
+}
+
+export async function setArchiveMode(enabled: boolean): Promise<ArchiveModeResponse> {
+  return fetchApi<ArchiveModeResponse>('/api/v1/config/archive_mode', {
     method: 'POST',
     body: JSON.stringify({ enabled }),
   });

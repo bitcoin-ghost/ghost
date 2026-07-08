@@ -1582,6 +1582,26 @@ pub struct StorageConfig {
     /// Ghost Haze storage mode
     #[serde(default)]
     pub haze_mode: HazeMode,
+    /// ONE-SHOT: emit ghostd `-reindex` for exactly the next drop-in apply.
+    ///
+    /// Armed when an already-PRUNED node is switched to archive mode — `-prune=0`
+    /// alone cannot recover blocks deleted while pruned, so a one-time reindex +
+    /// re-download is required. Cleared automatically by the reindex watcher once
+    /// the node has finished resyncing (so the flag is dropped from the drop-in).
+    /// `-reindex` must never persist in the drop-in or ghostd would reindex on
+    /// every restart.
+    #[serde(default)]
+    pub reindex_pending: bool,
+    /// ONE-SHOT: emit ghostd `-exorcist` for exactly the next drop-in apply.
+    ///
+    /// Armed when the operator converts an existing full archive to Hazed mode.
+    /// ghostd runs the retroactive `blk*.dat` → GSB conversion and then EXITS
+    /// (confirmed in ghost-core `init.cpp`: "-exorcist ... and exit"), so this
+    /// flag can NEVER persist in the drop-in (the node would run-and-exit on
+    /// every restart and never come up). Cleared automatically by the exorcist
+    /// watcher once the conversion finishes.
+    #[serde(default)]
+    pub exorcist_pending: bool,
 }
 
 impl Default for StorageConfig {
@@ -1592,7 +1612,64 @@ impl Default for StorageConfig {
             archive_mode: false,
             prune_height: 0,
             haze_mode: HazeMode::default(),
+            reindex_pending: false,
+            exorcist_pending: false,
         }
+    }
+}
+
+impl StorageConfig {
+    /// The ghostd (Bitcoin Core) CLI flags that mirror the storage-mode settings.
+    /// Only non-default values are emitted, so a standard (non-archive, non-hazed)
+    /// node adds nothing to ghostd's `ExecStart` and behaves exactly as before.
+    ///
+    /// Emitted via the same managed drop-in as the reaper / node-launch flags
+    /// (`ghostd_managed_dropin` in `setup.rs`). Every prefix here is listed in
+    /// `MANAGED_GHOSTD_FLAG_PREFIXES`, so stale copies are stripped on each
+    /// regeneration — which is what keeps the two one-shot flags below safe: a
+    /// one-shot flag only survives into the drop-in while its marker is set.
+    ///
+    /// All of these are read by ghostd only at startup, so a change needs a
+    /// ghostd restart to take effect.
+    pub fn ghostd_flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+
+        // Archive un-prune: an archival node must never prune, so force
+        // `-prune=0` (overriding any pruning configured elsewhere). When archive
+        // mode is off we emit nothing and leave ghostd's own configured prune
+        // behaviour intact.
+        if self.archive_mode {
+            flags.push("-prune=0".to_string());
+        }
+
+        // ONE-SHOT reindex — see `reindex_pending`. Rebuilds the block/chainstate
+        // indexes and re-downloads blocks deleted while pruned. ghostd keeps
+        // running after the reindex; the watcher clears the marker once resync
+        // completes so this flag is dropped from the drop-in.
+        if self.reindex_pending {
+            flags.push("-reindex".to_string());
+        }
+
+        // Ghost Haze: run in hazed mode. ghostd persists the choice to its
+        // datadir mode-lock on first launch and the lock takes precedence
+        // thereafter, so this flag is inert (a documented fallback) once the node
+        // is hazed. Suppressed while an `-exorcist` conversion is pending:
+        // selecting hazed on a node that still holds full `blk*.dat` files is a
+        // FATAL start error in ghostd (it requires the retroactive conversion to
+        // run first, which the exorcist flag performs).
+        if self.haze_mode == HazeMode::Hazed && !self.exorcist_pending {
+            flags.push("-hazemode=hazed".to_string());
+        }
+
+        // ONE-SHOT exorcist — see `exorcist_pending`. Converts the existing full
+        // archive to stripped GSB and exits; the watcher clears the marker and
+        // re-applies (dropping this flag, adding `-hazemode=hazed`) to bring the
+        // node back up hazed.
+        if self.exorcist_pending {
+            flags.push("-exorcist".to_string());
+        }
+
+        flags
     }
 }
 
@@ -2680,6 +2757,81 @@ mod tests {
         assert!(flags.contains(&"-ghostreaper-rejectrunestone=0".to_string()));
         assert!(flags.contains(&"-ghostreaper-rejectopreturn=0".to_string()));
         assert!(flags.contains(&"-ghostreaper-rejectinscription=1".to_string()));
+    }
+
+    #[test]
+    fn test_storage_ghostd_flags_default_emits_nothing() {
+        // A standard node (archive off, haze standard, no one-shots) must add
+        // nothing to ghostd's ExecStart — deploying the feature changes nothing
+        // until an operator opts in.
+        assert!(StorageConfig::default().ghostd_flags().is_empty());
+    }
+
+    #[test]
+    fn test_storage_ghostd_flags_prune_zero_iff_archive() {
+        let archive = StorageConfig { archive_mode: true, ..Default::default() };
+        assert!(archive.ghostd_flags().contains(&"-prune=0".to_string()));
+
+        // Archive OFF must NOT emit -prune=0 (leave ghostd's own prune config).
+        let off = StorageConfig { archive_mode: false, ..Default::default() };
+        assert!(!off.ghostd_flags().iter().any(|f| f.starts_with("-prune")));
+    }
+
+    #[test]
+    fn test_storage_ghostd_flags_reindex_oneshot_arm_and_clear() {
+        // Armed: archive + one-shot reindex emit both flags.
+        let armed = StorageConfig {
+            archive_mode: true,
+            reindex_pending: true,
+            ..Default::default()
+        };
+        let f = armed.ghostd_flags();
+        assert!(f.contains(&"-prune=0".to_string()));
+        assert!(f.contains(&"-reindex".to_string()));
+
+        // Cleared: -reindex gone, -prune=0 retained (still archival).
+        let cleared = StorageConfig {
+            archive_mode: true,
+            reindex_pending: false,
+            ..Default::default()
+        };
+        let f = cleared.ghostd_flags();
+        assert!(!f.contains(&"-reindex".to_string()));
+        assert!(f.contains(&"-prune=0".to_string()));
+    }
+
+    #[test]
+    fn test_storage_ghostd_flags_haze_and_exorcist_oneshot() {
+        // Standard/full-archive haze modes emit no -hazemode flag (default).
+        assert!(!StorageConfig { haze_mode: HazeMode::Standard, ..Default::default() }
+            .ghostd_flags()
+            .iter()
+            .any(|f| f.starts_with("-hazemode")));
+        assert!(!StorageConfig { haze_mode: HazeMode::FullArchive, ..Default::default() }
+            .ghostd_flags()
+            .iter()
+            .any(|f| f.starts_with("-hazemode")));
+
+        // Converting (exorcist pending): emit -exorcist, SUPPRESS -hazemode=hazed
+        // (fatal in ghostd while blk*.dat still present).
+        let converting = StorageConfig {
+            haze_mode: HazeMode::Hazed,
+            exorcist_pending: true,
+            ..Default::default()
+        };
+        let f = converting.ghostd_flags();
+        assert!(f.contains(&"-exorcist".to_string()));
+        assert!(!f.contains(&"-hazemode=hazed".to_string()));
+
+        // Converted (marker cleared): emit persistent -hazemode=hazed, no exorcist.
+        let hazed = StorageConfig {
+            haze_mode: HazeMode::Hazed,
+            exorcist_pending: false,
+            ..Default::default()
+        };
+        let f = hazed.ghostd_flags();
+        assert!(f.contains(&"-hazemode=hazed".to_string()));
+        assert!(!f.contains(&"-exorcist".to_string()));
     }
 
     #[test]

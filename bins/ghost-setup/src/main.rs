@@ -136,17 +136,23 @@ fn apply_reaper_to_ghostd(
     let config = NodeConfig::load(&pool_toml)?;
     let settings = &config.reaper;
     let launch = &config.node_launch;
+    let storage = &config.storage;
 
     println!(
         "Ghost-managed ghostd flags (from {}):",
         pool_toml.display()
     );
-    for f in settings.ghostd_flags().iter().chain(launch.ghostd_flags().iter()) {
+    for f in settings
+        .ghostd_flags()
+        .iter()
+        .chain(launch.ghostd_flags().iter())
+        .chain(storage.ghostd_flags().iter())
+    {
         println!("  {f}");
     }
 
     let exec_argv = read_ghostd_exec_argv()?;
-    let dropin = setup::ghostd_managed_dropin(&exec_argv, settings, launch);
+    let dropin = setup::ghostd_managed_dropin(&exec_argv, settings, launch, storage);
 
     if dry_run {
         println!("\n--- drop-in {DROPIN_PATH} (dry-run, not written) ---\n{dropin}");

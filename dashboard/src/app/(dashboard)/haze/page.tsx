@@ -1,8 +1,9 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { StatusRow } from "@/components/ui/StatusRow";
 import { Card, CardHeader } from "@/components/ui/Card";
+import { ConfirmDialog } from "@/components/ui/Dialog";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -213,8 +214,12 @@ export default function HazePage() {
     return { strippedBytes, structuralBytes, fullArchiveBytes, percentSmaller };
   }, [haze?.bytes_stripped, haze?.structural_archive_size_gb, haze?.chain_tip]);
 
-  const handleSetMode = async (target: "hazed" | "full_archive" | "standard") => {
-    if (target === mode) return;
+  // Selecting Hazed from a node that already holds blocks (standard / full
+  // archive) is a one-time, long, irreversible retroactive conversion — gate it
+  // behind an explicit confirmation.
+  const [confirmConvert, setConfirmConvert] = useState(false);
+
+  const doSetMode = async (target: "hazed" | "full_archive" | "standard") => {
     try {
       await configureHaze.mutateAsync(target);
       toast.success("Ghost Haze updated", `Storage mode set to ${getModeLabel(target)}`);
@@ -224,6 +229,17 @@ export default function HazePage() {
         e instanceof Error ? e.message : "Ghost Core did not accept the change.",
       );
     }
+  };
+
+  const handleSetMode = async (target: "hazed" | "full_archive" | "standard") => {
+    if (target === mode) return;
+    const retroactive =
+      target === "hazed" && (mode === "standard" || mode === "full_archive");
+    if (retroactive) {
+      setConfirmConvert(true);
+      return;
+    }
+    await doSetMode(target);
   };
 
   return (
@@ -854,6 +870,20 @@ export default function HazePage() {
           conversion runs as a background batch job and reports its progress above.
         </p>
       </Card>
+
+      <ConfirmDialog
+        isOpen={confirmConvert}
+        onClose={() => setConfirmConvert(false)}
+        onConfirm={async () => {
+          setConfirmConvert(false);
+          await doSetMode("hazed");
+        }}
+        title="Convert existing blocks to Hazed?"
+        message="This restarts ghostd to run the one-time Ghost Exorcist conversion of your existing block archive to stripped GSB format. It is a long, resumable batch job and is IRREVERSIBLE — witness, scriptSig, OP_RETURN and coinbase data are permanently stripped from local storage. The node comes back up hazed automatically once it finishes. Continue?"
+        confirmLabel="Convert & restart ghostd"
+        variant="danger"
+        loading={configureHaze.isPending}
+      />
     </div>
   );
 }

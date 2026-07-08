@@ -88,6 +88,10 @@ export interface PruningConfig {
   ow_blocks?: number;
   // Archive Window: storage.archive_mode (when true, pruning is disabled).
   archive_mode?: boolean;
+  // A one-time pruned→archive reindex/resync is still in flight (ghostd is
+  // rebuilding and re-downloading the full chain). Cleared automatically once
+  // the resync completes.
+  reindex_pending?: boolean;
 }
 
 export interface FullNodeConfig {

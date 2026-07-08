@@ -103,10 +103,13 @@ export function useConfig() {
   }, []);
 
   const setArchiveMode = useCallback(async (enabled: boolean) => {
-    const newConfig = await api.setArchiveMode(enabled);
-    setData(newConfig);
-    return newConfig;
-  }, []);
+    // The archive POST returns a status envelope (not a full NodeConfig) — it
+    // persists to pool.toml and restarts ghostd. Reload the authoritative config
+    // afterwards rather than storing the envelope.
+    const result = await api.setArchiveMode(enabled);
+    refresh();
+    return result;
+  }, [refresh]);
 
   return { data, loading, error, refresh, setGhostMode, setArchiveMode };
 }

@@ -152,6 +152,12 @@ fn get_system_resources(proc_paths_allowed: &[String]) -> (f64, f64, f64) {
 
 /// Create verification router
 pub fn create_router(state: Arc<VerificationState>) -> Router {
+    // Resume watching any one-shot ghostd flags (-reindex / -exorcist) that are
+    // still armed in pool.toml — e.g. ghost-pool restarted while a pruned→archive
+    // resync or a retroactive Haze conversion was in flight. This guarantees the
+    // one-shot flags are always eventually cleared from the drop-in.
+    resume_pending_ghostd_oneshots(&state);
+
     // Clone ws_state for the WebSocket handler
     let ws_state = Arc::clone(&state.ws_state);
 
@@ -5414,6 +5420,8 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
                     "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
                     "ow_blocks": cfg.storage.prune_height,
                     "archive_mode": cfg.storage.archive_mode,
+                    // One-shot pruned→archive resync still in flight.
+                    "reindex_pending": cfg.storage.reindex_pending,
                 }),
             )
         } else {
@@ -5431,6 +5439,7 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
                     "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
                     "ow_blocks": 0,
                     "archive_mode": config.archive_mode,
+                    "reindex_pending": false,
                 }),
             )
         };
@@ -5457,12 +5466,23 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
 }
 
 /// API v1 Config archive mode handler
+///
+/// Reads the persisted truth from pool.toml (`storage.archive_mode`) and
+/// surfaces whether a one-time reindex is still pending (the pruned→archive
+/// resync). Falls back to the live mirror when the full config isn't loaded.
 async fn api_config_archive_mode_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
+    let (enabled, reindex_pending) = match state.full_node_config {
+        Some(ref full) => {
+            let cfg = full.read();
+            (cfg.storage.archive_mode, cfg.storage.reindex_pending)
+        }
+        None => (state.dashboard_config.read().archive_mode, false),
+    };
     Json(serde_json::json!({
-        "enabled": config.archive_mode,
+        "enabled": enabled,
+        "reindex_pending": reindex_pending,
         "message": "Archive mode configuration"
     }))
 }
@@ -5628,18 +5648,144 @@ struct ToggleRequest {
     enabled: bool,
 }
 
-/// API v1 Config archive_mode POST handler
+/// API v1 Config archive_mode POST handler — Group F "archive un-prune".
+///
+/// Persists `storage.archive_mode` to pool.toml and reconfigures ghostd to
+/// actually stop pruning, via the same managed drop-in path as the reaper/tor
+/// settings: `StorageConfig::ghostd_flags()` now emits `-prune=0` while archive
+/// mode is on, and `spawn_ghostd_reaper_apply` regenerates the drop-in +
+/// restarts ghostd.
+///
+/// The reindex problem: enabling archive on a currently-PRUNED node cannot
+/// recover blocks already deleted by pruning — `-prune=0` alone is not enough.
+/// So when we detect (via `getblockchaininfo.pruned`) that the node is pruned,
+/// we arm a ONE-SHOT `-reindex` (`storage.reindex_pending`) that ghostd runs
+/// once to rebuild + re-download the chain. A background watcher clears the
+/// marker and drops `-reindex` from the drop-in once the resync completes, so it
+/// never reindexes on every restart.
 async fn api_config_archive_mode_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(payload): Json<ToggleRequest>,
 ) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.archive_mode = payload.enabled;
+    let enabled = payload.enabled;
+
+    // Require the full node config + a path to persist to; otherwise the change
+    // can't survive a restart, so fail-closed with SERVICE_UNAVAILABLE.
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    // Decide whether a one-time reindex is required. Only relevant when ENABLING
+    // archive on a node that is currently pruned (its historical blocks were
+    // deleted and must be rebuilt/re-downloaded). Query ghostd; if the RPC is
+    // unavailable we conservatively do NOT auto-arm a multi-hour reindex — the
+    // operator can re-toggle once ghostd is reachable, or the node may already
+    // be unpruned. (Do not hold any config lock across this await.)
+    let currently_pruned = if enabled {
+        match state.rpc {
+            Some(ref rpc) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    rpc.get_blockchain_info(),
+                )
+                .await
+                {
+                    Ok(Ok(info)) => info.pruned,
+                    Ok(Err(e)) => {
+                        warn!("archive_mode: getblockchaininfo failed ({e}); not arming reindex");
+                        false
+                    }
+                    Err(_) => {
+                        warn!("archive_mode: getblockchaininfo timed out; not arming reindex");
+                        false
+                    }
+                }
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    // Persist to pool.toml (storage.archive_mode + the one-shot reindex marker).
+    {
+        let mut cfg = full.write();
+        cfg.storage.archive_mode = enabled;
+        if enabled {
+            // Arm the one-shot only when we positively observed the node pruned.
+            if currently_pruned {
+                cfg.storage.reindex_pending = true;
+            }
+        } else {
+            // Turning archive off makes any pending reindex moot.
+            cfg.storage.reindex_pending = false;
+        }
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist archive mode");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist archive mode: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Keep the live status mirror in sync so GET /node/status reflects the change
+    // immediately (it is also re-seeded from pool.toml on restart).
+    state.dashboard_config.write().archive_mode = enabled;
+
+    let reindex_armed = enabled && currently_pruned;
+
+    // Regenerate the drop-in (now carrying -prune=0 [+ one-shot -reindex]) and
+    // restart ghostd, then bounce the pool.
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
+
+    // If a one-shot reindex was armed, watch for the resync to finish so we can
+    // clear the marker and drop -reindex from the drop-in.
+    if reindex_armed {
+        spawn_ghostd_oneshot_watcher(Arc::clone(&state), GhostdOneShot::Reindex);
+    }
+
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let message = if !enabled {
+        "Archive mode disabled. ghostd is restarting; the pool will bounce once it settles."
+    } else if reindex_armed {
+        "Archive mode enabled. This node is pruned, so ghostd is restarting with -prune=0 and a one-time -reindex to rebuild and re-download the full chain — this is a long resync. The dashboard will clear the reindex flag automatically once it completes."
+    } else {
+        "Archive mode enabled. ghostd is restarting with -prune=0 and will stop pruning; the pool will bounce once it settles."
+    };
     Json(serde_json::json!({
         "success": true,
-        "enabled": payload.enabled,
-        "message": "Archive mode updated"
+        "enabled": enabled,
+        "reindex_pending": reindex_armed,
+        "ghostd_apply": apply,
+        "message": message,
     }))
+    .into_response()
 }
 
 /// API v1 Config ghost_mode POST handler
@@ -5921,6 +6067,235 @@ fn spawn_ghostd_reaper_apply(state: Arc<VerificationState>) {
 /// type name everywhere.
 fn ghost_common_now(state: &str, message: impl Into<String>) -> crate::server::GhostdReaperApply {
     crate::server::GhostdReaperApply::now(state, message)
+}
+
+/// A one-shot ghostd maintenance flag the dashboard armed and must clear once the
+/// operation completes, so `-reindex` / `-exorcist` never linger in the drop-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GhostdOneShot {
+    /// `-reindex` after a pruned→archive transition. ghostd keeps running while
+    /// it rebuilds/re-downloads; complete when the resync finishes.
+    Reindex,
+    /// `-exorcist` retroactive Haze conversion. ghostd converts the existing
+    /// archive and then EXITS; with the service's `Restart=on-failure` a clean
+    /// exit(0) leaves the unit inactive, which is our completion signal.
+    Exorcist,
+}
+
+impl GhostdOneShot {
+    fn label(self) -> &'static str {
+        match self {
+            GhostdOneShot::Reindex => "reindex",
+            GhostdOneShot::Exorcist => "exorcist",
+        }
+    }
+}
+
+/// True when `systemctl is-active ghostd` reports the unit as running. Reads
+/// stdout (which carries "active"/"inactive"/"failed" regardless of exit code),
+/// so a non-zero exit for an inactive unit is handled correctly. No privilege
+/// required.
+fn ghostd_unit_is_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "ghostd"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false)
+}
+
+/// Clear a one-shot storage marker in pool.toml, then regenerate the drop-in
+/// (which now omits the one-shot flag) and restart ghostd, and bounce the pool.
+/// Runs the blocking apply off the async workers. Returns the terminal apply
+/// outcome for logging.
+async fn clear_oneshot_and_reapply(
+    state: &Arc<VerificationState>,
+    kind: GhostdOneShot,
+) -> Result<(), String> {
+    let Some(ref full) = state.full_node_config else {
+        return Err("full node config not loaded".into());
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return Err("no node config path configured".into());
+    };
+    {
+        let mut cfg = full.write();
+        match kind {
+            GhostdOneShot::Reindex => cfg.storage.reindex_pending = false,
+            GhostdOneShot::Exorcist => cfg.storage.exorcist_pending = false,
+        }
+        cfg.save_atomic(path)
+            .map_err(|e| format!("failed to persist cleared {} marker: {e}", kind.label()))?;
+    }
+
+    *state.ghostd_reaper_apply.write() = ghost_common_now(
+        "applying",
+        format!("Clearing one-shot {} flag and restarting ghostd…", kind.label()),
+    );
+    let outcome = match tokio::task::spawn_blocking(run_ghostd_apply_reaper).await {
+        Ok(Ok(msg)) => ghost_common_now("applied", msg),
+        Ok(Err(reason)) => ghost_common_now("failed", reason),
+        Err(join_err) => ghost_common_now("failed", format!("apply task panicked: {join_err}")),
+    };
+    let failed = outcome.state == "failed";
+    let detail = outcome.message.clone();
+    *state.ghostd_reaper_apply.write() = outcome;
+    state.request_restart();
+    if failed {
+        Err(detail)
+    } else {
+        Ok(())
+    }
+}
+
+/// Spawn the background lifecycle watcher for a one-shot ghostd flag. It polls
+/// for the operation to complete, then clears the marker and re-applies the
+/// drop-in so the one-shot flag is dropped (and, for the exorcist, the node is
+/// brought back up hazed). Resumed on startup for any marker still set in
+/// pool.toml, so it survives a ghost-pool restart mid-operation.
+fn spawn_ghostd_oneshot_watcher(state: Arc<VerificationState>, kind: GhostdOneShot) {
+    // Test hook: never poll systemd/RPC or shell out from unit tests.
+    if std::env::var("GHOST_REAPER_APPLY_TEST_MODE").is_ok() {
+        return;
+    }
+    // Can't clear the marker without a persisted config path — bail loudly rather
+    // than leaving a watcher that can never make progress.
+    if state.full_node_config.is_none() || state.full_node_config_path.is_none() {
+        error!(
+            oneshot = kind.label(),
+            "cannot watch one-shot ghostd flag: full node config/path unavailable"
+        );
+        return;
+    }
+
+    tokio::spawn(async move {
+        // Poll cadence and an upper bound so the task can't run forever. A resync
+        // or archive conversion can legitimately take many hours, so the cap is
+        // generous; on timeout we leave the marker set (a subsequent manual apply
+        // still carries the flag) and log for operator attention.
+        let (interval, max_polls, min_elapsed) = match kind {
+            // 60s × 2880 = 48h; ignore the first 2 min so a reindex has engaged.
+            GhostdOneShot::Reindex => (
+                std::time::Duration::from_secs(60),
+                2880u32,
+                std::time::Duration::from_secs(120),
+            ),
+            // 20s × 8640 = 48h; small grace so the unit has (re)started.
+            GhostdOneShot::Exorcist => (
+                std::time::Duration::from_secs(20),
+                8640u32,
+                std::time::Duration::from_secs(20),
+            ),
+        };
+        let started = std::time::Instant::now();
+        // For the exorcist we must first observe ghostd running the conversion
+        // before an "inactive" unit can mean "done" — otherwise a failed initial
+        // start (ghostd never came up) would be misread as completion and clear
+        // the marker without having converted.
+        let mut saw_active = false;
+        info!(oneshot = kind.label(), "watching one-shot ghostd flag to completion");
+
+        for _ in 0..max_polls {
+            tokio::time::sleep(interval).await;
+            if started.elapsed() < min_elapsed {
+                continue;
+            }
+
+            let complete = match kind {
+                GhostdOneShot::Reindex => {
+                    // ghostd stays up during a reindex; it's done once it is no
+                    // longer in initial-block-download and fully verified.
+                    match state.rpc {
+                        Some(ref rpc) => match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            rpc.get_blockchain_info(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(info)) => {
+                                !info.initialblockdownload
+                                    && info.verificationprogress > 0.9999
+                            }
+                            _ => false, // RPC down mid-reindex → keep waiting
+                        },
+                        None => false,
+                    }
+                }
+                GhostdOneShot::Exorcist => {
+                    // ghostd runs the conversion then exits(0); with
+                    // Restart=on-failure a clean exit leaves the unit inactive.
+                    // Require that we saw it running first so a failed start is
+                    // never misread as a completed conversion. A fallback RPC
+                    // check catches the case where ghostd was already brought back
+                    // up hazed by some other path.
+                    if ghostd_unit_is_active() {
+                        saw_active = true;
+                        false
+                    } else if saw_active {
+                        true
+                    } else {
+                        // Never observed the conversion running yet — probe the
+                        // RPC in case the node is already up and hazed.
+                        match state.rpc {
+                            Some(ref rpc) => matches!(
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    rpc.get_blockchain_info(),
+                                )
+                                .await,
+                                Ok(Ok(info)) if info.hazed
+                            ),
+                            None => false,
+                        }
+                    }
+                }
+            };
+
+            if complete {
+                info!(
+                    oneshot = kind.label(),
+                    "one-shot ghostd operation complete; clearing flag and re-applying"
+                );
+                match clear_oneshot_and_reapply(&state, kind).await {
+                    Ok(()) => info!(
+                        oneshot = kind.label(),
+                        "one-shot ghostd flag cleared and drop-in regenerated"
+                    ),
+                    Err(e) => error!(
+                        oneshot = kind.label(),
+                        error = %e,
+                        "failed to clear one-shot ghostd flag; marker left set for manual re-apply"
+                    ),
+                }
+                return;
+            }
+        }
+
+        error!(
+            oneshot = kind.label(),
+            "one-shot ghostd flag did not complete within the watch window; \
+             marker left set — re-apply from the dashboard once the node has settled"
+        );
+    });
+}
+
+/// On startup, resume watching any one-shot ghostd flags that are still armed in
+/// pool.toml (e.g. ghost-pool restarted while a reindex/conversion was running).
+fn resume_pending_ghostd_oneshots(state: &Arc<VerificationState>) {
+    let (reindex, exorcist) = match state.full_node_config {
+        Some(ref full) => {
+            let cfg = full.read();
+            (cfg.storage.reindex_pending, cfg.storage.exorcist_pending)
+        }
+        None => return,
+    };
+    if reindex {
+        info!("resuming reindex one-shot watcher (pool.toml marker still set)");
+        spawn_ghostd_oneshot_watcher(Arc::clone(state), GhostdOneShot::Reindex);
+    }
+    if exorcist {
+        info!("resuming exorcist one-shot watcher (pool.toml marker still set)");
+        spawn_ghostd_oneshot_watcher(Arc::clone(state), GhostdOneShot::Exorcist);
+    }
 }
 
 /// API v1 Config tor POST handler — toggles ghostd Tor mode (`-tormode`).
@@ -9250,16 +9625,26 @@ struct HazeConfigureRequest {
     mode: String,
 }
 
-/// POST /api/v1/haze/configure — Set Ghost Haze mode
+/// POST /api/v1/haze/configure — Set Ghost Haze storage mode.
 ///
-/// Changes the haze privacy mode for stripped blocks:
-/// - "standard": Normal block storage (no stripping)
-/// - "hazed": Strip witness/script data from stored blocks
-/// - "full_archive": Keep full blocks (archive node mode)
+/// Persists `storage.haze_mode` to pool.toml and reconfigures ghostd via the
+/// managed drop-in (the same path as the reaper/tor/archive settings):
+/// - "standard" / "full_archive": persist the mode; `full_archive` also enables
+///   `storage.archive_mode` (→ `-prune=0`). No conversion.
+/// - "hazed": select Hazed mode. On a node that still holds a full archive this
+///   requires a ONE-TIME retroactive conversion, so we arm `-exorcist`
+///   (`storage.exorcist_pending`). ghostd runs the `blk*.dat` → GSB conversion
+///   and EXITS (verified in ghost-core `init.cpp`); the exorcist watcher then
+///   clears the marker, drops `-exorcist`, adds the persistent `-hazemode=hazed`
+///   and brings the node back up hazed. `-hazemode=hazed` is deliberately NOT
+///   emitted while the conversion is pending — selecting hazed with `blk*.dat`
+///   still present is a fatal ghostd start error.
 async fn api_haze_configure_handler(
     State(state): State<Arc<VerificationState>>,
     Json(payload): Json<HazeConfigureRequest>,
 ) -> impl IntoResponse {
+    use ghost_common::config::HazeMode;
+
     let valid_modes = ["standard", "hazed", "full_archive"];
     if !valid_modes.contains(&payload.mode.as_str()) {
         return (
@@ -9268,50 +9653,129 @@ async fn api_haze_configure_handler(
                 "success": false,
                 "error": format!("Invalid mode '{}'. Must be one of: standard, hazed, full_archive", payload.mode)
             })),
-        );
+        )
+            .into_response();
     }
 
-    // Update archive_mode based on selected mode
-    let archive_mode = payload.mode == "full_archive";
-    {
-        let mut config = state.dashboard_config.write();
-        config.archive_mode = archive_mode;
-    }
+    // Require the full node config + a path to persist to (fail-closed).
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
 
-    // Try to sync with ghost-core via RPC if available
-    let rpc_synced = if let Some(ref rpc) = state.rpc {
-        match rpc.set_ghost_mode(payload.mode == "hazed").await {
-            Ok(_) => true,
-            Err(e) => {
-                warn!("Failed to sync haze mode with ghost-core: {}", e);
-                false
+    let haze_mode = match payload.mode.as_str() {
+        "hazed" => HazeMode::Hazed,
+        "full_archive" => HazeMode::FullArchive,
+        _ => HazeMode::Standard,
+    };
+    let archive_mode = haze_mode == HazeMode::FullArchive;
+
+    // For "hazed": decide whether a retroactive conversion is required. If the
+    // node already reports hazed we skip the conversion; otherwise (including
+    // when the RPC is unavailable) we arm the exorcist — that is the SAFE
+    // default, because emitting `-hazemode=hazed` on a node that still holds
+    // `blk*.dat` is a fatal ghostd start error, whereas `-exorcist` converts if
+    // there is an archive and cleanly no-ops-and-exits if the node is already
+    // hazed. (Do not hold any config lock across this await.)
+    let arm_exorcist = if haze_mode == HazeMode::Hazed {
+        match state.rpc {
+            Some(ref rpc) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    rpc.get_blockchain_info(),
+                )
+                .await
+                {
+                    Ok(Ok(info)) => !info.hazed, // already hazed → no conversion
+                    Ok(Err(e)) => {
+                        warn!("haze/configure: getblockchaininfo failed ({e}); arming exorcist");
+                        true
+                    }
+                    Err(_) => {
+                        warn!("haze/configure: getblockchaininfo timed out; arming exorcist");
+                        true
+                    }
+                }
             }
+            None => true,
         }
     } else {
         false
     };
 
-    // Persist to node config
+    // Persist to pool.toml.
     {
-        let node_config = state.node_config.write();
-        // ghost_mode is the closest persisted field; haze is a ghost-core setting
-        if let Some(ref path) = state.node_config_path {
-            if let Err(e) = node_config.save(path) {
-                error!("Failed to persist node config: {}", e);
-            }
+        let mut cfg = full.write();
+        cfg.storage.haze_mode = haze_mode;
+        cfg.storage.archive_mode = archive_mode;
+        cfg.storage.exorcist_pending = arm_exorcist;
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist haze mode");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist haze mode: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
         }
     }
 
+    // Keep the live status mirror in sync (also re-seeded from pool.toml on restart).
+    state.dashboard_config.write().archive_mode = archive_mode;
+
+    // Regenerate the drop-in and restart ghostd, then bounce the pool.
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
+
+    // Watch a pending retroactive conversion to completion (ghostd exits after
+    // converting; the watcher clears the marker and brings it back up hazed).
+    if arm_exorcist {
+        spawn_ghostd_oneshot_watcher(Arc::clone(&state), GhostdOneShot::Exorcist);
+    }
+
+    let apply = serde_json::to_value(&*state.ghostd_reaper_apply.read())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let message = if arm_exorcist {
+        "Ghost Haze set to Hazed. ghostd is restarting to run the one-time retroactive conversion of your existing block archive to stripped GSB format — this is a long batch job, after which the node comes back up hazed automatically."
+    } else if haze_mode == HazeMode::Hazed {
+        "Ghost Haze set to Hazed. ghostd is restarting with -hazemode=hazed; the pool will bounce once it settles."
+    } else if archive_mode {
+        "Ghost Haze set to Full Archive. ghostd is restarting with -prune=0 to keep the complete archive; the pool will bounce once it settles."
+    } else {
+        "Ghost Haze set to Standard. ghostd is restarting; the pool will bounce once it settles."
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "success": true,
             "mode": payload.mode,
             "archive_mode": archive_mode,
-            "rpc_synced": rpc_synced,
-            "message": format!("Haze mode set to '{}'", payload.mode)
+            "exorcist_pending": arm_exorcist,
+            "ghostd_apply": apply,
+            "message": message,
         })),
     )
+        .into_response()
 }
 
 /// Request body for shroud configuration
@@ -10890,8 +11354,27 @@ mod tests {
     /// CRIT-6: Test that config POST with valid auth succeeds
     #[tokio::test]
     async fn test_config_post_with_valid_auth_succeeds() {
-        let state = create_test_state_with_auth();
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        // The archive_mode POST persists to pool.toml + regenerates the ghostd
+        // drop-in, so it fail-closes without a loaded config. Provide one (and the
+        // apply test-hook) so a valid-auth POST exercises the real success path.
+        std::env::set_var("GHOST_REAPER_APPLY_TEST_MODE", "success");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
         let app = super::create_router(state);
 
         let body = r#"{"enabled": true}"#;
@@ -10920,6 +11403,7 @@ mod tests {
             StatusCode::OK,
             "Config POST with valid auth should succeed"
         );
+        std::env::remove_var("GHOST_REAPER_APPLY_TEST_MODE");
     }
 
     /// The wraith toggle POST must persist `[ghost_pay] wraith_enabled` to the
