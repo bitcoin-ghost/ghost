@@ -9,6 +9,10 @@ interface SidebarItemProps {
   icon: ReactNode;
   label: string;
   collapsed?: boolean;
+  /** When provided, the parent (Sidebar) has computed the single active item
+   *  via longest-prefix match, so nested routes highlight only their deepest
+   *  match (e.g. /filtering/advanced does NOT also light up /filtering). */
+  isActive?: boolean;
 }
 
 /**
@@ -19,9 +23,9 @@ interface SidebarItemProps {
  * Borders carry the meaning — matches the website's "no card chrome,
  * borders only where they signal something" rule.
  */
-export function SidebarItem({ href, icon, label, collapsed = false }: SidebarItemProps) {
+export function SidebarItem({ href, icon, label, collapsed = false, isActive: isActiveProp }: SidebarItemProps) {
   const pathname = usePathname();
-  const isActive = pathname === href || (href !== "/" && pathname.startsWith(href));
+  const isActive = isActiveProp ?? (pathname === href || (href !== "/" && pathname.startsWith(href)));
 
   return (
     <Link
