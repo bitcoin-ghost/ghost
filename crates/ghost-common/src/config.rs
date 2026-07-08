@@ -2175,6 +2175,31 @@ pub struct BackupRunStatus {
     pub last_error: Option<String>,
 }
 
+/// Block-priority lever — how the pool orders the ghostd-selected transaction
+/// set when it builds a block template.
+///
+/// This is a pure **permutation** of the already-selected, weight-bounded set
+/// ghostd hands the pool: it never adds or drops a transaction, so it is
+/// weight-safe by construction. It is a per-node economic *policy*, not a
+/// consensus rule — nodes running different values still interoperate (each
+/// simply orders its own blocks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockPriority {
+    /// Order strictly by package fee rate, descending — pure revenue
+    /// maximisation. This is the historical behaviour and the default; the set
+    /// ghostd hands us is already fee-rate optimal, so `max_fee` re-sorts toward
+    /// exactly that.
+    #[default]
+    MaxFee,
+    /// Seat BUDS **financial** transactions (T0/T1) ahead of **data**
+    /// transactions (T2/T3), each group still internally ordered by package fee
+    /// rate. A values lever that deliberately forgoes some fee revenue whenever
+    /// a high-fee data transaction would otherwise out-bid a payment for the
+    /// last slots of block weight.
+    PaymentsFirst,
+}
+
 /// Pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
@@ -2222,6 +2247,12 @@ pub struct PoolConfig {
     /// Prevents accidental dual-genesis if someone mistakenly runs --genesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_password: Option<String>,
+    /// Block-priority lever: `max_fee` (default) orders the block by package fee
+    /// rate; `payments_first` seats BUDS financial txs (T0/T1) ahead of data txs
+    /// (T2/T3). Additive with `#[serde(default)]` so existing pool.toml files
+    /// parse unchanged.
+    #[serde(default)]
+    pub block_priority: BlockPriority,
 }
 
 impl PoolConfig {
@@ -2266,6 +2297,7 @@ impl Default for PoolConfig {
             pool_name: None,
             coinbase_extra: None,
             genesis_password: None,
+            block_priority: BlockPriority::default(),
         }
     }
 }

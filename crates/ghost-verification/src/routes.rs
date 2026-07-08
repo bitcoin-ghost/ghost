@@ -481,6 +481,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_policy_profile_post_handler),
         )
         .route(
+            "/api/v1/config/block_priority",
+            post(api_config_block_priority_post_handler),
+        )
+        .route(
             "/api/v1/config/policy_custom",
             post(api_config_policy_custom_post_handler),
         )
@@ -5440,6 +5444,7 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
         "payout": payout,
         "pool_name": pool_name,
         "policy": policy,
+        "block_priority": block_priority_key(&state),
         "network": state.network.as_str(),
         "stratum_sv2_port": 4444,
         "stratum_sv1_port": 3333,
@@ -6322,6 +6327,116 @@ async fn api_config_policy_profile_post_handler(
         "restart_pending": true,
     }))
     .into_response()
+}
+
+/// Request body for the block-priority POST endpoint.
+#[derive(Debug, Deserialize)]
+struct BlockPriorityRequest {
+    /// One of `max_fee` (default) or `payments_first`.
+    block_priority: String,
+}
+
+/// API v1 Config block_priority POST handler.
+///
+/// Writes `[pool].block_priority` into the node config (pool.toml) via
+/// `save_atomic`, then requests a graceful ghost-pool restart. The lever is
+/// resolved once at startup into `TemplateConfig` (`main.rs`), so — like the
+/// tier policy — a restart is what actually applies the new ordering to block
+/// templates. This is a per-node economic policy, not a consensus rule.
+async fn api_config_block_priority_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<BlockPriorityRequest>,
+) -> impl IntoResponse {
+    use ghost_common::config::BlockPriority;
+
+    // Map the incoming string to the config enum; reject anything else 400.
+    let priority = match payload.block_priority.trim().to_ascii_lowercase().as_str() {
+        "max_fee" => BlockPriority::MaxFee,
+        "payments_first" => BlockPriority::PaymentsFirst,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Unknown block priority: {other}"),
+                    "code": "INVALID_BLOCK_PRIORITY",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // The canonical serialized name we echo back to the caller.
+    let priority_name = match priority {
+        BlockPriority::MaxFee => "max_fee",
+        BlockPriority::PaymentsFirst => "payments_first",
+    };
+
+    // Require the full node config + a path to persist to; otherwise the change
+    // can't survive a restart, so fail-closed with SERVICE_UNAVAILABLE.
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    {
+        let mut cfg = full.write();
+        cfg.pool.block_priority = priority;
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist block priority");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist block priority: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // The lever is resolved at startup, so a graceful restart applies it.
+    state.request_restart();
+
+    Json(serde_json::json!({
+        "success": true,
+        "block_priority": priority_name,
+        "restart_pending": true,
+    }))
+    .into_response()
+}
+
+/// Serialize the persisted block-priority lever to its wire key for config GETs.
+/// Returns `max_fee` when the full node config isn't loaded (test/minimal
+/// servers), matching the config default.
+fn block_priority_key(state: &Arc<VerificationState>) -> &'static str {
+    use ghost_common::config::BlockPriority;
+    let Some(ref full) = state.full_node_config else {
+        return "max_fee";
+    };
+    match full.read().pool.block_priority {
+        BlockPriority::MaxFee => "max_fee",
+        BlockPriority::PaymentsFirst => "payments_first",
+    }
 }
 
 /// Request body for the custom tier-policy POST endpoint. Carries the full set
@@ -10843,6 +10958,120 @@ mod tests {
             bad_resp.status(),
             StatusCode::BAD_REQUEST,
             "unknown policy profile must 400"
+        );
+    }
+
+    /// The block_priority POST is the real block-ordering lever: without HMAC it
+    /// must 401, and with a valid signature it must persist `[pool].block_priority`
+    /// to pool.toml and request a graceful restart. An unknown value must 400.
+    #[tokio::test]
+    async fn test_config_block_priority_post_persists_and_restarts() {
+        use ghost_common::config::BlockPriority;
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.toml");
+
+        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
+        let state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_internal_auth(auth.clone())
+            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+        );
+
+        // Default is MaxFee before any write.
+        assert_eq!(
+            FullNodeConfig::default().pool.block_priority,
+            BlockPriority::MaxFee
+        );
+
+        // Without auth → 401.
+        let unauth = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/block_priority")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"block_priority": "payments_first"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unauth.status(),
+            StatusCode::UNAUTHORIZED,
+            "block_priority POST without auth must 401"
+        );
+        assert!(!state.restart_requested());
+
+        // With valid HMAC → persists `payments_first` and requests restart.
+        let body = r#"{"block_priority": "payments_first"}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, body.as_bytes());
+        let response = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/block_priority")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["success"].as_bool(), Some(true));
+        assert_eq!(json["block_priority"].as_str(), Some("payments_first"));
+        assert_eq!(json["restart_pending"].as_bool(), Some(true));
+
+        // Persisted to disk as PaymentsFirst and restart requested.
+        let reloaded = FullNodeConfig::load(&path).unwrap();
+        assert_eq!(reloaded.pool.block_priority, BlockPriority::PaymentsFirst);
+        assert!(
+            state.restart_requested(),
+            "block_priority change must request a restart"
+        );
+
+        // Unknown value → 400.
+        let bad = r#"{"block_priority": "nonsense"}"#;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signature = auth.sign(timestamp, bad.as_bytes());
+        let bad_resp = super::create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config/block_priority")
+                    .header("Content-Type", "application/json")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bad_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unknown block priority must 400"
         );
     }
 

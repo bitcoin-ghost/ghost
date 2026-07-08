@@ -533,6 +533,7 @@ fn test_pool_config_validate_success() {
         pool_name: None,
         coinbase_extra: None,
         genesis_password: None,
+        block_priority: Default::default(),
     };
 
     let result = config.validate();

@@ -2645,6 +2645,9 @@ async fn main() -> Result<()> {
         coinbase_extra: coinbase_tag,
         min_fee_rate: template_min_fee_rate,
         enforce_custom_policy_fields,
+        // Block-priority lever (max_fee default | payments_first). Resolved once
+        // here at startup from pool.toml; the dashboard POST persists + restarts.
+        block_priority: config.pool.block_priority,
         ..Default::default()
     };
     let template_processor = Arc::new(

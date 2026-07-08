@@ -5,6 +5,7 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { Toggle } from "@/components/ui/Toggle";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { PolicyProfileSelector } from "@/components/filtering/PolicyProfileSelector";
+import { BlockPrioritySelector } from "@/components/filtering/BlockPrioritySelector";
 import { ReaperControls } from "@/components/filtering/ReaperControls";
 import { AdvancedPolicyPanel } from "@/components/filtering/AdvancedPolicyPanel";
 import { useAdvancedFilteringGate } from "@/hooks/useAdvancedFilteringGate";
@@ -55,6 +56,16 @@ export default function FilteringSettingsPage() {
 
       {advancedEnabled && (
         <>
+          <SectionErrorBoundary section="Block priority">
+            <Card>
+              <CardHeader
+                title="Block priority"
+                subtitle="Ordering only — which admitted transactions this node seats first. Max fee maximises revenue; Payments first prioritises payments (BUDS T0/T1) over data (T2/T3), forgoing some fee income. Changing it restarts the node."
+              />
+              <BlockPrioritySelector />
+            </Card>
+          </SectionErrorBoundary>
+
           <SectionErrorBoundary section="Reaper">
             <ReaperControls />
           </SectionErrorBoundary>

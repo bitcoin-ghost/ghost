@@ -58,8 +58,8 @@ use tracing::{debug, error, info, warn};
 
 use bitcoin::consensus::deserialize;
 use ghost_accounting::CoinbaseBuilder;
-use ghost_buds::BudsClassifier;
-use ghost_common::config::{BitcoinNetwork, MiningMode};
+use ghost_buds::{BudsClassifier, BudsTier};
+use ghost_common::config::{BitcoinNetwork, BlockPriority, MiningMode};
 use ghost_common::rpc::{BitcoinRpc, BlockTemplate, TemplateTransaction};
 use ghost_common::types::{PayoutProposal, PayoutType, TreasuryAddress};
 use ghost_policy::PolicyProfile;
@@ -146,6 +146,13 @@ pub struct TemplateConfig {
     /// fields are NOT enforced at block-build time, preserving the historical
     /// preset behaviour. Custom is the "Advanced" opt-in that turns them on.
     pub enforce_custom_policy_fields: bool,
+    /// Block-priority lever governing the template's transaction ordering.
+    ///
+    /// `MaxFee` (default) preserves the historical package-fee-rate ordering
+    /// byte-for-byte. `PaymentsFirst` seats BUDS financial txs (T0/T1) ahead of
+    /// data txs (T2/T3) — a pure permutation of the same tx set (weight-safe).
+    /// Resolved once at startup from `pool.block_priority`; applied on restart.
+    pub block_priority: BlockPriority,
 }
 
 impl Default for TemplateConfig {
@@ -161,6 +168,7 @@ impl Default for TemplateConfig {
             mining_mode: MiningMode::PublicPool,
             solo_payout_address: None,
             enforce_custom_policy_fields: false,
+            block_priority: BlockPriority::MaxFee,
         }
     }
 }
@@ -1894,6 +1902,10 @@ impl TemplateProcessor {
     ) -> (Vec<TemplateTransaction>, FilterStats) {
         let original_count = transactions.len();
         let mut kept = Vec::with_capacity(original_count);
+        // BUDS tier per kept tx, parallel to `kept` (kept_tiers[i] is the tier
+        // of kept[i]). Only consulted when `block_priority == PaymentsFirst`;
+        // under `MaxFee` it is built but never read, so ordering is unchanged.
+        let mut kept_tiers: Vec<BudsTier> = Vec::with_capacity(original_count);
         let mut removed_fees = 0u64;
         let mut reaped_count = 0usize;
         let mut reaped_dead_bytes = 0u64;
@@ -1994,6 +2006,10 @@ impl TemplateProcessor {
                         original_to_filtered.insert(idx, kept.len());
                         kept_indices.insert(idx);
                         kept.push(tx.clone());
+                        // Carry the already-computed BUDS tier so the
+                        // payments-first ordering can key on it without
+                        // re-classifying. Index stays aligned with `kept`.
+                        kept_tiers.push(tier);
                     } else {
                         // Dependency was filtered out, must reject this tx too
                         removed_fees += tx.fee;
@@ -2015,8 +2031,11 @@ impl TemplateProcessor {
             }
         }
 
-        // Sort by package fee rate while respecting dependencies
-        let kept = self.sort_by_package_fee_rate(kept, &original_to_filtered);
+        // Sort by package fee rate while respecting dependencies. Under
+        // `PaymentsFirst` the carried BUDS tiers additionally bias financial
+        // packages (T0/T1) ahead of data (T2/T3); under `MaxFee` the tiers are
+        // ignored and the ordering is byte-identical to the historical sort.
+        let kept = self.sort_by_package_fee_rate(kept, &kept_tiers, &original_to_filtered);
 
         let stats = FilterStats {
             original: original_count,
@@ -2047,18 +2066,51 @@ impl TemplateProcessor {
     /// 5. Sort clusters by package fee rate descending
     /// 6. Within each cluster, topological sort (parents before children)
     /// 7. Flatten into final transaction list
+    ///
+    /// `tiers` carries the BUDS tier of each input transaction (parallel to
+    /// `transactions`). It is only consulted when
+    /// `self.config.block_priority == PaymentsFirst`, where it adds a primary
+    /// sort key that seats **financial** packages (cluster-minimum tier ≤ T1)
+    /// ahead of **data** packages, each group still fee-rate-descending
+    /// internally. Under the default `MaxFee` the tiers are ignored and the
+    /// ordering is byte-identical to the historical package-fee-rate sort. This
+    /// is a permutation only — the tx set and total weight are invariant across
+    /// both modes, so no new weight accounting is needed.
     fn sort_by_package_fee_rate(
         &self,
         transactions: Vec<TemplateTransaction>,
+        tiers: &[BudsTier],
         original_to_filtered: &HashMap<usize, usize>,
     ) -> Vec<TemplateTransaction> {
         if transactions.len() <= 1 {
             return transactions;
         }
 
+        let payments_first = matches!(self.config.block_priority, BlockPriority::PaymentsFirst);
+
         // Fast path: if no transactions have dependencies, simple fee-rate sort
         let has_deps = transactions.iter().any(|tx| !tx.depends.is_empty());
         if !has_deps {
+            if payments_first {
+                // Pair each tx with a "financial" bit (BUDS tier ≤ T1) derived
+                // from its carried tier, then sort by (financial DESC, fee-rate
+                // DESC). No dependencies here, so every tx is its own package.
+                let mut paired: Vec<(TemplateTransaction, bool)> = transactions
+                    .into_iter()
+                    .zip(tiers.iter().copied())
+                    .map(|(tx, tier)| (tx, tier <= BudsTier::T1))
+                    .collect();
+                paired.sort_by(|a, b| {
+                    let rate_a = a.0.fee as f64 / (a.0.weight.max(1) as f64 / 4.0);
+                    let rate_b = b.0.fee as f64 / (b.0.weight.max(1) as f64 / 4.0);
+                    let fee_cmp = rate_b
+                        .partial_cmp(&rate_a)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    // financial (true) first, then fee rate descending.
+                    b.1.cmp(&a.1).then(fee_cmp)
+                });
+                return paired.into_iter().map(|(tx, _)| tx).collect();
+            }
             let mut sorted = transactions;
             sorted.sort_by(|a, b| {
                 let rate_a = a.fee as f64 / (a.weight.max(1) as f64 / 4.0);
@@ -2145,6 +2197,14 @@ impl TemplateProcessor {
             tx_indices: Vec<usize>, // Indices into filtered array, topological order
             total_fee: u64,
             total_weight: u64,
+            // Whether this package counts as "financial" for payments-first
+            // ordering. A CPFP package may mix tiers (a payment child bumping a
+            // data parent, or vice-versa); we classify by the cluster's MINIMUM
+            // (most-financial) member tier and collapse to ≤ T1. This keeps
+            // parents-with-children intact — a package is never split — and errs
+            // toward seating any package that contains a payment. Only consulted
+            // under PaymentsFirst.
+            is_financial: bool,
         }
 
         let mut clusters: Vec<TxCluster> = Vec::with_capacity(components.len());
@@ -2152,6 +2212,14 @@ impl TemplateProcessor {
         for members in components.values() {
             let total_fee: u64 = members.iter().map(|&i| transactions[i].fee).sum();
             let total_weight: u64 = members.iter().map(|&i| transactions[i].weight).sum();
+            // Cluster-minimum tier → financial iff ≤ T1. `members` is never
+            // empty (every component has at least its root), so `.min()` is safe.
+            let is_financial = members
+                .iter()
+                .map(|&i| tiers[i])
+                .min()
+                .map(|t| t <= BudsTier::T1)
+                .unwrap_or(false);
 
             if members.len() == 1 {
                 // Single-tx cluster, no topo sort needed
@@ -2159,6 +2227,7 @@ impl TemplateProcessor {
                     tx_indices: members.clone(),
                     total_fee,
                     total_weight,
+                    is_financial,
                 });
                 continue;
             }
@@ -2205,23 +2274,35 @@ impl TemplateProcessor {
                     tx_indices: fallback,
                     total_fee,
                     total_weight,
+                    is_financial,
                 });
             } else {
                 clusters.push(TxCluster {
                     tx_indices: topo_order,
                     total_fee,
                     total_weight,
+                    is_financial,
                 });
             }
         }
 
-        // Sort clusters by package fee rate (sat/vB) descending
+        // Sort clusters. Under MaxFee this is the historical single key:
+        // package fee rate (sat/vB) descending. Under PaymentsFirst a primary
+        // key seats financial packages first, then fee rate descending within
+        // each group. The comparator is stable and, for MaxFee, byte-identical
+        // to the pre-change sort.
         clusters.sort_by(|a, b| {
             let rate_a = a.total_fee as f64 / (a.total_weight.max(1) as f64 / 4.0);
             let rate_b = b.total_fee as f64 / (b.total_weight.max(1) as f64 / 4.0);
-            rate_b
+            let fee_cmp = rate_b
                 .partial_cmp(&rate_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if payments_first {
+                // financial (true) first, then fee rate descending.
+                b.is_financial.cmp(&a.is_financial).then(fee_cmp)
+            } else {
+                fee_cmp
+            }
         });
 
         // Flatten clusters into final transaction list
@@ -3963,6 +4044,26 @@ mod tests {
         )
     }
 
+    /// Helper to create a TemplateProcessor with an explicit block-priority mode.
+    fn test_processor_with_priority(block_priority: BlockPriority) -> TemplateProcessor {
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        TemplateProcessor::new(
+            TemplateConfig {
+                block_priority,
+                ..TemplateConfig::default()
+            },
+            rpc,
+            PolicyProfile::permissive(),
+            ReaperConfig::default(),
+        )
+    }
+
+    /// A tiers slice of `n` financial (T0) entries — used by the legacy sorting
+    /// tests, which exercise MaxFee where tiers are ignored.
+    fn t0_tiers(n: usize) -> Vec<BudsTier> {
+        vec![BudsTier::T0; n]
+    }
+
     /// Test that CPFP package with high package fee rate sorts above lower independent txs
     #[test]
     fn test_cpfp_package_sorted_by_package_fee_rate() {
@@ -3986,7 +4087,8 @@ mod tests {
         original_to_filtered.insert(2, 2);
 
         let txs = vec![tx_ind, tx_parent, tx_child];
-        let result = processor.sort_by_package_fee_rate(txs, &original_to_filtered);
+        let tiers = t0_tiers(txs.len());
+        let result = processor.sort_by_package_fee_rate(txs, &tiers, &original_to_filtered);
 
         // CPFP package (100 sat/vB) should come before independent tx (50 sat/vB)
         assert_eq!(result.len(), 3);
@@ -4018,7 +4120,8 @@ mod tests {
 
         let original_to_filtered = HashMap::new();
         let txs = vec![tx_a, tx_b, tx_c];
-        let result = processor.sort_by_package_fee_rate(txs, &original_to_filtered);
+        let tiers = t0_tiers(txs.len());
+        let result = processor.sort_by_package_fee_rate(txs, &tiers, &original_to_filtered);
 
         assert_eq!(result[0].txid, "b"); // 50 sat/vB
         assert_eq!(result[1].txid, "c"); // 30 sat/vB
@@ -4042,7 +4145,8 @@ mod tests {
         original_to_filtered.insert(2, 2);
 
         let txs = vec![tx_gp, tx_p, tx_c];
-        let result = processor.sort_by_package_fee_rate(txs, &original_to_filtered);
+        let tiers = t0_tiers(txs.len());
+        let result = processor.sort_by_package_fee_rate(txs, &tiers, &original_to_filtered);
 
         let gp_pos = result.iter().position(|t| t.txid == "grandparent").unwrap();
         let p_pos = result.iter().position(|t| t.txid == "parent").unwrap();
@@ -4071,7 +4175,8 @@ mod tests {
         original_to_filtered.insert(3, 3);
 
         let txs = vec![tx_ind1, tx_parent, tx_child, tx_ind2];
-        let result = processor.sort_by_package_fee_rate(txs, &original_to_filtered);
+        let tiers = t0_tiers(txs.len());
+        let result = processor.sort_by_package_fee_rate(txs, &tiers, &original_to_filtered);
 
         assert_eq!(result.len(), 4);
 
@@ -4090,7 +4195,7 @@ mod tests {
         let processor = test_processor();
         let tx = make_tx("only", 1000, 400, vec![]);
         let original_to_filtered = HashMap::new();
-        let result = processor.sort_by_package_fee_rate(vec![tx], &original_to_filtered);
+        let result = processor.sort_by_package_fee_rate(vec![tx], &t0_tiers(1), &original_to_filtered);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].txid, "only");
     }
@@ -4110,12 +4215,210 @@ mod tests {
         original_to_filtered.insert(1, 1);
 
         let txs = vec![tx_a, tx_b];
-        let result = processor.sort_by_package_fee_rate(txs, &original_to_filtered);
+        let tiers = t0_tiers(txs.len());
+        let result = processor.sort_by_package_fee_rate(txs, &tiers, &original_to_filtered);
 
         // They should form a package; A must come before B
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].txid, "a");
         assert_eq!(result[1].txid, "b");
+    }
+
+    // ------------------------------------------------------------------
+    // Block-priority lever: PaymentsFirst vs MaxFee
+    // ------------------------------------------------------------------
+
+    /// A controlled tiered mempool used by the block-priority tests.
+    ///
+    /// Returns `(txs, tiers, original_to_filtered)` for a mix of independent
+    /// financial + data txs and a CPFP package that SPANS tiers (a T3 data
+    /// parent CPFP-bumped by a T0 payment child), so the cluster-minimum-tier
+    /// classification is exercised. All txs are kept 1:1 (identity remap).
+    ///
+    /// | idx | txid   | tier | fee   | weight | vB  | sat/vB | note                    |
+    /// |-----|--------|------|-------|--------|-----|--------|-------------------------|
+    /// | 0   | payA   | T0   | 1000  | 400    | 100 | 10     | low-fee payment         |
+    /// | 1   | dataC  | T3   | 8000  | 400    | 100 | 80     | high-fee inscription    |
+    /// | 2   | dataP  | T3   | 100   | 400    | 100 | 1      | package parent (data)   |
+    /// | 3   | payQ   | T0   | 5000  | 200    | 50  | —      | package child (payment) |
+    /// | 4   | payB   | T1   | 2000  | 400    | 100 | 20     | payment                 |
+    /// | 5   | dataD  | T2   | 1200  | 400    | 100 | 12     | low-fee data            |
+    ///
+    /// Package {dataP,payQ}: fee=5100, weight=600, vB=150 => 34 sat/vB;
+    /// cluster-minimum tier = T0 (payQ) => classified FINANCIAL.
+    fn tiered_mempool() -> (Vec<TemplateTransaction>, Vec<BudsTier>, HashMap<usize, usize>) {
+        let txs = vec![
+            make_tx("payA", 1000, 400, vec![]),
+            make_tx("dataC", 8000, 400, vec![]),
+            make_tx("dataP", 100, 400, vec![]),
+            make_tx("payQ", 5000, 200, vec![3]), // depends on dataP (orig idx 2 => 1-indexed 3)
+            make_tx("payB", 2000, 400, vec![]),
+            make_tx("dataD", 1200, 400, vec![]),
+        ];
+        let tiers = vec![
+            BudsTier::T0, // payA
+            BudsTier::T3, // dataC
+            BudsTier::T3, // dataP
+            BudsTier::T0, // payQ
+            BudsTier::T1, // payB
+            BudsTier::T2, // dataD
+        ];
+        let mut original_to_filtered = HashMap::new();
+        for i in 0..txs.len() {
+            original_to_filtered.insert(i, i);
+        }
+        (txs, tiers, original_to_filtered)
+    }
+
+    fn pos(result: &[TemplateTransaction], txid: &str) -> usize {
+        result
+            .iter()
+            .position(|t| t.txid == txid)
+            .unwrap_or_else(|| panic!("txid {txid} missing from result"))
+    }
+
+    /// PaymentsFirst seats all financial packages (T0/T1, or a CPFP package
+    /// whose minimum tier is financial) ahead of all data packages (T2/T3),
+    /// each group still internally ordered by package fee rate, and never
+    /// splits or reorders a CPFP package.
+    #[test]
+    fn test_payments_first_seats_financial_ahead_respecting_cpfp() {
+        let processor = test_processor_with_priority(BlockPriority::PaymentsFirst);
+        let (txs, tiers, o2f) = tiered_mempool();
+        let result = processor.sort_by_package_fee_rate(txs, &tiers, &o2f);
+
+        assert_eq!(result.len(), 6, "permutation must preserve the tx set");
+
+        // Financial txs (payA, payB, and the min-financial package dataP+payQ)
+        // must all precede the data txs (dataC, dataD).
+        let last_financial = ["payA", "payB", "dataP", "payQ"]
+            .iter()
+            .map(|t| pos(&result, t))
+            .max()
+            .unwrap();
+        let first_data = ["dataC", "dataD"]
+            .iter()
+            .map(|t| pos(&result, t))
+            .min()
+            .unwrap();
+        assert!(
+            last_financial < first_data,
+            "every financial tx must be seated ahead of every data tx (got financial max {last_financial} >= data min {first_data}): {:?}",
+            result.iter().map(|t| &t.txid).collect::<Vec<_>>()
+        );
+
+        // The mixed-tier CPFP package is classified financial by cluster-min
+        // tier and stays intact with parent before child.
+        assert!(
+            pos(&result, "dataP") < pos(&result, "payQ"),
+            "CPFP parent (dataP) must precede its child (payQ)"
+        );
+
+        // Financial group internally fee-rate descending: package (34 sat/vB) >
+        // payB (20) > payA (10).
+        assert!(pos(&result, "dataP") < pos(&result, "payB"));
+        assert!(pos(&result, "payB") < pos(&result, "payA"));
+        // Data group internally fee-rate descending: dataC (80) > dataD (12).
+        assert!(pos(&result, "dataC") < pos(&result, "dataD"));
+
+        // Exact expected permutation.
+        let order: Vec<&str> = result.iter().map(|t| t.txid.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["dataP", "payQ", "payB", "payA", "dataC", "dataD"],
+        );
+    }
+
+    /// MaxFee (the default) ignores tiers entirely: the ordering is identical to
+    /// the historical package-fee-rate sort, regardless of the carried tiers.
+    #[test]
+    fn test_max_fee_identical_to_pre_change_default() {
+        let (txs, tiers, o2f) = tiered_mempool();
+
+        // Explicit MaxFee processor.
+        let max_fee = test_processor_with_priority(BlockPriority::MaxFee);
+        let result_max = max_fee.sort_by_package_fee_rate(txs.clone(), &tiers, &o2f);
+
+        // The default processor (no block_priority set => MaxFee) must produce
+        // byte-identical ordering, proving the default path is untouched.
+        let default_proc = test_processor();
+        let result_default =
+            default_proc.sort_by_package_fee_rate(txs.clone(), &tiers, &o2f);
+        let ids_max: Vec<&str> = result_max.iter().map(|t| t.txid.as_str()).collect();
+        let ids_default: Vec<&str> = result_default.iter().map(|t| t.txid.as_str()).collect();
+        assert_eq!(ids_max, ids_default, "explicit MaxFee == default config");
+
+        // And it must equal the pure fee-rate ordering (tiers make no
+        // difference under MaxFee): dataC(80) > pkg(34: dataP->payQ) > payB(20)
+        // > dataD(12) > payA(10).
+        assert_eq!(
+            ids_max,
+            vec!["dataC", "dataP", "payQ", "payB", "dataD", "payA"],
+        );
+    }
+
+    /// PaymentsFirst is a pure permutation: the tx set and total block weight
+    /// are invariant vs MaxFee — only the order changes. This is the property
+    /// that keeps the submit-time MAX_BLOCK_WEIGHT guard sufficient (no new
+    /// weight accounting).
+    #[test]
+    fn test_payments_first_is_weight_safe_permutation() {
+        let (txs, tiers, o2f) = tiered_mempool();
+
+        let max_fee = test_processor_with_priority(BlockPriority::MaxFee);
+        let pay_first = test_processor_with_priority(BlockPriority::PaymentsFirst);
+
+        let r_max = max_fee.sort_by_package_fee_rate(txs.clone(), &tiers, &o2f);
+        let r_pay = pay_first.sort_by_package_fee_rate(txs.clone(), &tiers, &o2f);
+
+        // Same count.
+        assert_eq!(r_max.len(), r_pay.len());
+        assert_eq!(r_pay.len(), txs.len());
+
+        // Same total weight (permutation, not re-selection).
+        let w_max: u64 = r_max.iter().map(|t| t.weight).sum();
+        let w_pay: u64 = r_pay.iter().map(|t| t.weight).sum();
+        assert_eq!(w_max, w_pay, "total weight must be invariant across modes");
+        // The submit-time consensus cap (BIP141). Since PaymentsFirst only
+        // permutes the ghostd-selected set, this guard remains sufficient.
+        const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+        assert!(w_pay < MAX_BLOCK_WEIGHT, "template stays under the weight cap");
+
+        // Same multiset of txids (nothing added or dropped).
+        let mut ids_max: Vec<&str> = r_max.iter().map(|t| t.txid.as_str()).collect();
+        let mut ids_pay: Vec<&str> = r_pay.iter().map(|t| t.txid.as_str()).collect();
+        ids_max.sort_unstable();
+        ids_pay.sort_unstable();
+        assert_eq!(ids_max, ids_pay, "tx set must be identical, only reordered");
+
+        // The two orders actually differ (the lever does something here).
+        let ord_max: Vec<&str> = r_max.iter().map(|t| t.txid.as_str()).collect();
+        let ord_pay: Vec<&str> = r_pay.iter().map(|t| t.txid.as_str()).collect();
+        assert_ne!(ord_max, ord_pay);
+    }
+
+    /// Under a strict tier policy that admits only financial tiers, all kept
+    /// txs are T0/T1, so PaymentsFirst is a no-op — its ordering matches MaxFee
+    /// exactly. (Here every tier is financial, mirroring a strict-policy set.)
+    #[test]
+    fn test_payments_first_noop_when_all_financial() {
+        // A mempool of only financial txs (as a strict policy would leave).
+        let txs = vec![
+            make_tx("p_lo", 1000, 400, vec![]), // 10 sat/vB
+            make_tx("p_hi", 5000, 400, vec![]), // 50 sat/vB
+            make_tx("p_mid", 3000, 400, vec![]), // 30 sat/vB
+        ];
+        let tiers = vec![BudsTier::T0, BudsTier::T1, BudsTier::T0];
+        let o2f = HashMap::new();
+
+        let max_fee = test_processor_with_priority(BlockPriority::MaxFee);
+        let pay_first = test_processor_with_priority(BlockPriority::PaymentsFirst);
+        let r_max = max_fee.sort_by_package_fee_rate(txs.clone(), &tiers, &o2f);
+        let r_pay = pay_first.sort_by_package_fee_rate(txs, &tiers, &o2f);
+
+        let ord_max: Vec<&str> = r_max.iter().map(|t| t.txid.as_str()).collect();
+        let ord_pay: Vec<&str> = r_pay.iter().map(|t| t.txid.as_str()).collect();
+        assert_eq!(ord_max, ord_pay, "no-op when nothing but financial txs present");
     }
 
     /// H-MINE-3-TEST-2: Test that runtime script_len validation works

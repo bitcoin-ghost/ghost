@@ -14,6 +14,8 @@ import {
   type DaemonSettings,
   setPolicyProfile,
   type PolicyProfileType,
+  setBlockPriority,
+  type BlockPriorityType,
   setOperatorWindow,
   getL2PruningStatus,
   setGhostPayPayoutAddress,
@@ -155,6 +157,21 @@ export function useSetPolicyProfile() {
 
   return useMutation({
     mutationFn: (profile: PolicyProfileType) => setPolicyProfile(profile),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: configKeys.all });
+    },
+  });
+}
+
+// Block-priority lever (pool.toml [pool].block_priority). Writing it persists to
+// pool.toml and triggers a graceful restart so the new template ORDERING is
+// resolved at startup. `max_fee` maximises revenue; `payments_first` seats BUDS
+// financial txs (T0/T1) ahead of data txs (T2/T3), forgoing some fee income.
+export function useSetBlockPriority() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (blockPriority: BlockPriorityType) => setBlockPriority(blockPriority),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: configKeys.all });
     },
