@@ -409,6 +409,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/mpc/votes/:position", get(api_mpc_votes_handler))
         // Ghost Haze & Shroud endpoints
         .route("/api/v1/haze/status", get(api_haze_status_handler))
+        .route("/api/v1/haze/legal-pack", get(api_haze_legal_pack_handler))
+        .route("/api/v1/haze/checkpoint", get(api_haze_checkpoint_handler))
         .route("/api/v1/shroud/status", get(api_shroud_status_handler))
         // Swarm endpoints
         .route("/api/v1/swarm/sync", get(api_swarm_sync_handler))
@@ -9062,6 +9064,41 @@ async fn api_haze_status_handler(State(state): State<Arc<VerificationState>>) ->
         None => (false, 0, 0, false, String::new(), "unknown"),
     };
 
+    // Surface the Exorcism storage metrics from `gethazestatus`. These are the
+    // headline "storage saved" numbers (`bytes_stripped`) that
+    // `getblockchaininfo` does not carry. Degrade gracefully to zeros if the
+    // node predates the Haze RPCs or the call fails.
+    let haze_rpc = match state.rpc {
+        Some(ref rpc) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_haze_status())
+                .await
+            {
+                Ok(Ok(status)) => Some(status),
+                Ok(Err(e)) => {
+                    warn!("Failed to get haze exorcism status from RPC: {}", e);
+                    None
+                }
+                Err(_) => {
+                    warn!("Haze exorcism status RPC timed out");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let (exorcism_active, blocks_stripped, bytes_stripped, chain_tip, structural_archive_size_gb) =
+        match haze_rpc {
+            Some(s) => (
+                s.exorcism_active,
+                s.blocks_stripped,
+                s.bytes_stripped,
+                s.chain_tip,
+                s.storage_gb,
+            ),
+            None => (false, 0, 0, blocks as i64, 0.0),
+        };
+
     Json(serde_json::json!({
         "hazed": hazed,
         "archive_mode": archive_mode,
@@ -9069,8 +9106,110 @@ async fn api_haze_status_handler(State(state): State<Arc<VerificationState>>) ->
         "blocks": blocks,
         "size_on_disk": size_on_disk,
         "pruned": pruned,
-        "chain": chain
+        "chain": chain,
+        "exorcism_active": exorcism_active,
+        "blocks_stripped": blocks_stripped,
+        "bytes_stripped": bytes_stripped,
+        "chain_tip": chain_tip,
+        "structural_archive_size_gb": structural_archive_size_gb
     }))
+}
+
+/// Ghost Haze legal-pack handler — court-ready proof the node persists no
+/// hazeable content.
+///
+/// Proxies ghostd's `getlegalpacket`. The RPC only succeeds on a hazed node;
+/// on Full Archive / non-hazed nodes (or an older ghostd) it errors, which we
+/// translate into a clean `{ available: false, reason }` shape rather than a
+/// 500 so the dashboard can render the "enable Haze" path.
+async fn api_haze_legal_pack_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let rpc = match state.rpc {
+        Some(ref rpc) => rpc,
+        None => {
+            return Json(serde_json::json!({
+                "available": false,
+                "reason": "Ghost Core RPC is not connected."
+            }));
+        }
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_legal_packet()).await {
+        Ok(Ok(mut packet)) => {
+            // Forward the court-ready packet verbatim, tagging it available so
+            // the dashboard can branch without inspecting individual fields.
+            if let Some(obj) = packet.as_object_mut() {
+                obj.insert("available".to_string(), serde_json::Value::Bool(true));
+            }
+            Json(packet)
+        }
+        Ok(Err(e)) => {
+            // Expected on non-hazed nodes: the packet is only generated in Hazed
+            // mode. Not an error condition for the dashboard.
+            Json(serde_json::json!({
+                "available": false,
+                "reason": e.to_string()
+            }))
+        }
+        Err(_) => {
+            warn!("Legal packet RPC timed out");
+            Json(serde_json::json!({
+                "available": false,
+                "reason": "Ghost Core timed out generating the Legal Compliance Packet."
+            }))
+        }
+    }
+}
+
+/// Ghost Haze checkpoint handler — signed-checkpoint trust anchor status.
+///
+/// Proxies ghostd's `getcheckpointstatus`. Always returns a `{ serving,
+/// downloading, ... }` shape; on RPC failure it degrades to a neither-state
+/// with `available: false` rather than a 500.
+async fn api_haze_checkpoint_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let rpc = match state.rpc {
+        Some(ref rpc) => rpc,
+        None => {
+            return Json(serde_json::json!({
+                "serving": false,
+                "downloading": false,
+                "available": false,
+                "reason": "Ghost Core RPC is not connected."
+            }));
+        }
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_checkpoint_status())
+        .await
+    {
+        Ok(Ok(mut status)) => {
+            if let Some(obj) = status.as_object_mut() {
+                obj.insert("available".to_string(), serde_json::Value::Bool(true));
+            }
+            Json(status)
+        }
+        Ok(Err(e)) => {
+            warn!("Failed to get checkpoint status from RPC: {}", e);
+            Json(serde_json::json!({
+                "serving": false,
+                "downloading": false,
+                "available": false,
+                "reason": e.to_string()
+            }))
+        }
+        Err(_) => {
+            warn!("Checkpoint status RPC timed out");
+            Json(serde_json::json!({
+                "serving": false,
+                "downloading": false,
+                "available": false,
+                "reason": "Ghost Core timed out returning checkpoint status."
+            }))
+        }
+    }
 }
 
 /// Ghost Shroud status handler — returns relay privacy configuration

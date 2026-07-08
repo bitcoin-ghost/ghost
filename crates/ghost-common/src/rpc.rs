@@ -1243,6 +1243,35 @@ impl BitcoinRpc {
     }
 
     // ============================================================
+    // Ghost Haze RPC Methods
+    // ============================================================
+
+    /// Get the current Ghost Haze operating status.
+    ///
+    /// Surfaces the Exorcism state and storage statistics — including
+    /// `bytes_stripped` (the arbitrary-content-kept-off-disk metric) and the
+    /// structural archive size — that `getblockchaininfo` does not expose.
+    pub async fn get_haze_status(&self) -> GhostResult<HazeRpcStatus> {
+        self.call("gethazestatus", vec![]).await
+    }
+
+    /// Generate the Legal Compliance Packet proving this node does not persist
+    /// hazeable content. Only available on hazed nodes; the RPC returns an error
+    /// on Full Archive / non-hazed nodes (surfaced here as `GhostError::Rpc`).
+    ///
+    /// Returned as a raw JSON value because the packet is a court-ready document
+    /// whose shape is defined by ghostd and forwarded verbatim to the dashboard.
+    pub async fn get_legal_packet(&self) -> GhostResult<Value> {
+        self.call("getlegalpacket", vec![]).await
+    }
+
+    /// Get the Ghost Haze signed-checkpoint status (serving / downloading /
+    /// neither), the trust anchor for a hazed node's UTXO snapshot.
+    pub async fn get_checkpoint_status(&self) -> GhostResult<Value> {
+        self.call("getcheckpointstatus", vec![]).await
+    }
+
+    // ============================================================
     // Ghost-Core Specific RPC Methods
     // ============================================================
 
@@ -1467,6 +1496,31 @@ pub struct BlockchainInfo {
     pub signet_challenge: Option<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// Ghost Haze operating status, as returned by ghostd's `gethazestatus` RPC.
+///
+/// Distinct from the dashboard-facing `HazeStatus` response (which merges these
+/// fields with `getblockchaininfo`); this mirrors ghostd's raw RPC contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HazeRpcStatus {
+    /// Operating mode: "hazed" or "full_archive".
+    pub mode: String,
+    /// Whether Ghost Exorcism is stripping incoming blocks.
+    #[serde(default)]
+    pub exorcism_active: bool,
+    /// Total blocks processed through Exorcism.
+    #[serde(default)]
+    pub blocks_stripped: i64,
+    /// Total bytes stripped from blocks (arbitrary content kept off disk).
+    #[serde(default)]
+    pub bytes_stripped: i64,
+    /// Current chain tip height.
+    #[serde(default)]
+    pub chain_tip: i64,
+    /// Approximate structural archive size in GB (sum of `.gsb` files).
+    #[serde(default)]
+    pub storage_gb: f64,
 }
 
 /// Block header

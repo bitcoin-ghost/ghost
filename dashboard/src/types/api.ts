@@ -1141,7 +1141,61 @@ export interface HazeStatus {
   size_on_disk: number;
   pruned: boolean;
   chain: string;
+  // Exorcism storage metrics (from ghostd `gethazestatus`)
+  exorcism_active: boolean;
+  /** Total blocks processed through Exorcism. */
+  blocks_stripped: number;
+  /** Total bytes of arbitrary content kept off disk — the headline savings. */
+  bytes_stripped: number;
+  /** Chain tip height, used to estimate a full-archive baseline. */
+  chain_tip: number;
+  /** Size of the structural (`.gsb`) archive actually on disk, in GB. */
+  structural_archive_size_gb: number;
   error?: string;
+}
+
+// Ghost Haze — Legal Compliance Packet (court-ready proof of non-persistence).
+// Proxied from ghostd `getlegalpacket`. On non-hazed nodes the RPC is
+// unavailable, so the backend returns `{ available: false, reason }` instead.
+export interface LegalPacket {
+  /** True when the packet was generated (node is in Hazed mode). */
+  available: boolean;
+  /** Human-readable reason when `available` is false. */
+  reason?: string;
+  ghost_core_version?: string;
+  specification_version?: string;
+  node_mode?: string;
+  exorcism_active?: boolean;
+  haze_status?: string;
+  blocks_stripped?: number;
+  chain_tip?: number;
+  structural_archive_size_gb?: number;
+  hazeable_content_on_disk?: boolean;
+  checkpoint_height?: number;
+  checkpoint_hash?: string;
+  conversion_method?: string;
+  conversion_date?: string;
+  legal_summary?: string;
+  generated_at?: string;
+}
+
+// Ghost Haze — signed-checkpoint status (trust anchor), from ghostd
+// `getcheckpointstatus`.
+export interface CheckpointStatus {
+  serving: boolean;
+  downloading: boolean;
+  /** False when the RPC could not be reached. */
+  available?: boolean;
+  reason?: string;
+  height?: number;
+  block_hash?: string;
+  utxo_count?: number;
+  total_chunks?: number;
+  signed?: boolean;
+  checkpoint_dir?: string;
+  chunks_received?: number;
+  chunks_total?: number;
+  percent_complete?: number;
 }
 
 // Ghost Shroud — relay privacy configuration
