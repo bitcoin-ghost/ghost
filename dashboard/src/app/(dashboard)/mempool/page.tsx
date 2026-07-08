@@ -161,7 +161,7 @@ export default function MempoolPage() {
       {rpcUnavailable ? (
         <Card>
           <div className="space-y-2">
-            <p className="t-lead" style={{ color: "var(--fg)" }}>
+            <p className="t-title" style={{ color: "var(--fg)" }}>
               Couldn&apos;t read the mempool from <code>ghostd</code> RPC.
             </p>
             <p className="t-label" style={{ color: "var(--dim)" }}>
@@ -267,7 +267,7 @@ function NodeMempoolExplorer() {
             padding: "16px 18px",
           }}
         >
-          <p className="t-body" style={{ color: "var(--fg)" }}>
+          <p className="t-title" style={{ color: "var(--fg)" }}>
             The embedded explorer couldn&apos;t load here.
           </p>
           <p className="t-label" style={{ color: "var(--dim)" }}>

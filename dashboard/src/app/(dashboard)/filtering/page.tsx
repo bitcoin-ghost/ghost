@@ -289,8 +289,8 @@ function StatusRow({ label, value, desc }: { label: string; value: string; desc:
       }}
     >
       <div className="flex items-center gap-2">
-        <span className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>{label}</span>
-        <span className="t-label" style={{ color: "var(--accent)", fontWeight: 600 }}>{value}</span>
+        <span className="t-body" style={{ color: "var(--dim)" }}>{label}</span>
+        <span className="t-body" style={{ color: "var(--fg)" }}>{value}</span>
       </div>
       <div className="t-label" style={{ color: "var(--dim)", marginTop: "2px" }}>{desc}</div>
     </div>
@@ -302,7 +302,7 @@ function NavCard({ href, title, desc }: { href: string; title: string; desc: str
     <Link href={href} className="bare">
       <Card>
         <div className="flex items-center justify-between gap-3" style={{ marginBottom: "4px" }}>
-          <span className="t-lead" style={{ color: "var(--fg)", fontWeight: 600 }}>{title}</span>
+          <span className="t-title" style={{ color: "var(--fg)" }}>{title}</span>
           <span className="t-label" style={{ color: "var(--accent)", whiteSpace: "nowrap" }}>Open →</span>
         </div>
         <div className="t-label" style={{ color: "var(--dim)", lineHeight: "1.6" }}>{desc}</div>

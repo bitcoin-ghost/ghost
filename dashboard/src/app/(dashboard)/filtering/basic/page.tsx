@@ -81,9 +81,8 @@ export default function BasicFilteringPage() {
       <SectionErrorBoundary section="Transaction classes">
         <Card>
           <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6", marginBottom: "16px" }}>
-            <strong style={{ color: "var(--fg)" }}>BUDS — Bitcoin Universal Data Specification.</strong>{" "}
-            We use BUDS to sort every transaction into a class (T0–T3), so filtering is one simple choice
-            instead of dozens of settings.
+            BUDS — Bitcoin Universal Data Specification. We use BUDS to sort every transaction into a
+            class (T0–T3), so filtering is one simple choice instead of dozens of settings.
           </p>
           <CardHeader
             title="The four classes"
@@ -103,7 +102,7 @@ export default function BasicFilteringPage() {
               >
                 <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
                   <span style={{ width: "10px", height: "10px", borderRadius: "2px", background: t.color, display: "inline-block" }} />
-                  <span className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>{t.name}</span>
+                  <span className="t-body" style={{ color: "var(--fg)" }}>{t.name}</span>
                   <span className="t-caption" style={{ color: "var(--dim)" }}>· {t.short}</span>
                 </div>
                 <div className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5" }}>{t.blurb}</div>
@@ -159,7 +158,7 @@ export default function BasicFilteringPage() {
                       <div key={t.key} style={{ padding: "10px 12px", border: "1px solid var(--rule)", borderRadius: "4px", background: "var(--bg)" }}>
                         <div className="flex items-center gap-2" style={{ marginBottom: "4px" }}>
                           <span style={{ width: "10px", height: "10px", borderRadius: "2px", background: t.color, display: "inline-block" }} />
-                          <span className="t-label" style={{ color: "var(--fg)", fontWeight: 500 }}>{t.name}</span>
+                          <span className="t-label" style={{ color: "var(--fg)" }}>{t.name}</span>
                         </div>
                         <div className="t-title" style={{ fontFamily: "var(--font-mono)", color: "var(--fg)" }}>{pct.toFixed(0)}%</div>
                         <div className="t-caption" style={{ color: "var(--dim)" }}>{count.toLocaleString()} sampled</div>
