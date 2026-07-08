@@ -246,7 +246,7 @@ export default function FilteringOverviewPage() {
               }
             />
             {pctFiltered !== null && (
-              <div style={{ color: "var(--fainter)", fontSize: "12px", lineHeight: "1.5" }}>
+              <div className="t-caption" style={{ color: "var(--fainter)", lineHeight: "1.5" }}>
                 {dropped.length
                   ? `${droppedCount.toLocaleString()} of ${sampled.toLocaleString()} sampled mempool transactions sit in the tiers this node drops (${droppedLabel}).`
                   : `All ${sampled.toLocaleString()} sampled mempool transactions fall in tiers this node mines — nothing is dropped by tier policy.`}{" "}
@@ -289,10 +289,10 @@ function StatusRow({ label, value, desc }: { label: string; value: string; desc:
       }}
     >
       <div className="flex items-center gap-2">
-        <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>{label}</span>
-        <span style={{ color: "var(--accent)", fontSize: "13px", fontWeight: 600 }}>{value}</span>
+        <span className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>{label}</span>
+        <span className="t-label" style={{ color: "var(--accent)", fontWeight: 600 }}>{value}</span>
       </div>
-      <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px" }}>{desc}</div>
+      <div className="t-label" style={{ color: "var(--dim)", marginTop: "2px" }}>{desc}</div>
     </div>
   );
 }
@@ -302,10 +302,10 @@ function NavCard({ href, title, desc }: { href: string; title: string; desc: str
     <Link href={href} className="bare">
       <Card>
         <div className="flex items-center justify-between gap-3" style={{ marginBottom: "4px" }}>
-          <span style={{ color: "var(--fg)", fontSize: "15px", fontWeight: 600 }}>{title}</span>
-          <span style={{ color: "var(--accent)", fontSize: "13px", whiteSpace: "nowrap" }}>Open →</span>
+          <span className="t-lead" style={{ color: "var(--fg)", fontWeight: 600 }}>{title}</span>
+          <span className="t-label" style={{ color: "var(--accent)", whiteSpace: "nowrap" }}>Open →</span>
         </div>
-        <div style={{ color: "var(--dim)", fontSize: "13px", lineHeight: "1.6" }}>{desc}</div>
+        <div className="t-label" style={{ color: "var(--dim)", lineHeight: "1.6" }}>{desc}</div>
       </Card>
     </Link>
   );

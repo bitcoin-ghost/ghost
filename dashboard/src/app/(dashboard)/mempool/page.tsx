@@ -161,10 +161,10 @@ export default function MempoolPage() {
       {rpcUnavailable ? (
         <Card>
           <div className="space-y-2">
-            <p style={{ color: "var(--fg)", fontSize: "15px" }}>
+            <p className="t-lead" style={{ color: "var(--fg)" }}>
               Couldn&apos;t read the mempool from <code>ghostd</code> RPC.
             </p>
-            <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+            <p className="t-label" style={{ color: "var(--dim)" }}>
               {mempool?.message ??
                 "The node API returned an error for /api/v1/buds/mempool. Check that ghostd is running and RPC credentials are configured in pool.toml."}
             </p>
@@ -243,8 +243,8 @@ function NodeMempoolExplorer() {
       href={NODE_MEMPOOL_APP_URL}
       target="_blank"
       rel="noreferrer"
-      className="bare"
-      style={{ color: "var(--accent)", fontSize: "13px", textDecoration: "underline" }}
+      className="bare t-label"
+      style={{ color: "var(--accent)", textDecoration: "underline" }}
     >
       open in a new tab ↗
     </a>
@@ -267,10 +267,10 @@ function NodeMempoolExplorer() {
             padding: "16px 18px",
           }}
         >
-          <p style={{ color: "var(--fg)", fontSize: "14px" }}>
+          <p className="t-body" style={{ color: "var(--fg)" }}>
             The embedded explorer couldn&apos;t load here.
           </p>
-          <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+          <p className="t-label" style={{ color: "var(--dim)" }}>
             The dashboard couldn&apos;t serve <code>/mempool-app/</code>, or the node&apos;s
             mempool backend on <code>127.0.0.1:8999</code> isn&apos;t responding. Check that the
             mempool service is running on this node, then reload. You can also open it
@@ -309,7 +309,7 @@ function NodeMempoolExplorer() {
         </div>
       )}
 
-      <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "12px" }}>
+      <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "12px" }}>
         Served same-origin from the dashboard at <code>/mempool-app/</code>, proxied to this
         node&apos;s own mempool backend. The lightweight RPC view and the Reaper strip
         breakdown are below.
@@ -419,7 +419,7 @@ function FeeDistribution({ mempool }: { mempool?: BudsMempool }) {
     return (
       <Card>
         <CardHeader title="Fee-rate distribution" subtitle="sat/vB across sampled transactions" />
-        <p style={{ color: "var(--dim)", fontSize: "14px" }}>
+        <p className="t-body" style={{ color: "var(--dim)" }}>
           No transactions in the sample to bucket right now.
         </p>
       </Card>
@@ -439,11 +439,11 @@ function FeeDistribution({ mempool }: { mempool?: BudsMempool }) {
           return (
             <div key={b.label} className="flex items-center gap-3">
               <span
+                className="t-caption"
                 style={{
                   width: "56px",
                   textAlign: "right",
                   fontFamily: "var(--font-mono)",
-                  fontSize: "12px",
                   color: "var(--dim)",
                 }}
               >
@@ -461,10 +461,10 @@ function FeeDistribution({ mempool }: { mempool?: BudsMempool }) {
                 />
               </div>
               <span
+                className="t-caption"
                 style={{
                   width: "44px",
                   fontFamily: "var(--font-mono)",
-                  fontSize: "12px",
                   color: c > 0 ? "var(--fg)" : "var(--fainter)",
                 }}
               >
@@ -474,7 +474,7 @@ function FeeDistribution({ mempool }: { mempool?: BudsMempool }) {
           );
         })}
       </div>
-      <p style={{ color: "var(--fainter)", fontSize: "12px", marginTop: "12px" }}>
+      <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "12px" }}>
         Buckets are computed in your browser from the transaction sample (fee ÷ vsize). The node does
         not expose a full server-side fee histogram, so this is a representative snapshot, not the
         whole mempool.

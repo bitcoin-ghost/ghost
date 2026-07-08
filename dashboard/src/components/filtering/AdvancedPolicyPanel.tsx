@@ -101,12 +101,12 @@ export function AdvancedPolicyPanel() {
   return (
     <div>
       <div className="flex items-center gap-2" style={{ marginBottom: "2px" }}>
-        <span style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 600 }}>Custom mining policy</span>
+        <span className="t-body" style={{ color: "var(--fg)", fontWeight: 600 }}>Custom mining policy</span>
         {isCustomActive && (
-          <span style={{ color: "var(--accent)", fontSize: "11px", fontWeight: 600 }}>· current</span>
+          <span className="t-caption" style={{ color: "var(--accent)", fontWeight: 600 }}>· current</span>
         )}
       </div>
-      <div style={{ color: "var(--dim)", fontSize: "13px", marginBottom: "12px" }}>
+      <div className="t-label" style={{ color: "var(--dim)", marginBottom: "12px" }}>
         Per-field control over which transaction classes, content and sizes this node mines. Saving writes{" "}
         <code>[policy].custom</code>, sets the profile to <code>custom</code>, and restarts the node.
       </div>
@@ -123,7 +123,7 @@ export function AdvancedPolicyPanel() {
           />
         ))}
         {noTiers && (
-          <div style={{ color: "var(--warn, #d29922)", fontSize: "12px", marginTop: "6px" }}>
+          <div className="t-caption" style={{ color: "var(--warn, #d29922)", marginTop: "6px" }}>
             No classes selected — the node would mine empty blocks (coinbase only).
           </div>
         )}
@@ -174,7 +174,7 @@ export function AdvancedPolicyPanel() {
             boxShadow: "0 -6px 20px -8px rgba(0, 0, 0, 0.35)",
           }}
         >
-          <div style={{ color: "var(--fg)", fontSize: "13px", marginBottom: "10px" }}>
+          <div className="t-label" style={{ color: "var(--fg)", marginBottom: "10px" }}>
             Apply this <strong>custom mining policy</strong>? This writes the config and{" "}
             <strong>restarts the node</strong> to apply.
           </div>
@@ -211,7 +211,7 @@ export function AdvancedPolicyPanel() {
 function PanelSection({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div style={{ marginBottom: "14px" }}>
-      <div style={{ color: "var(--fg)", fontSize: "13px", fontWeight: 600, marginBottom: "8px" }}>{title}</div>
+      <div className="t-label" style={{ color: "var(--fg)", fontWeight: 600, marginBottom: "8px" }}>{title}</div>
       <div className="space-y-2">{children}</div>
     </div>
   );
@@ -237,8 +237,8 @@ function CheckboxRow({
         style={{ marginTop: "3px" }}
       />
       <span>
-        <span style={{ color: "var(--fg)", fontSize: "13px", fontWeight: 500 }}>{label}</span>
-        <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5" }}>{desc}</div>
+        <span className="t-label" style={{ color: "var(--fg)", fontWeight: 500 }}>{label}</span>
+        <div className="t-caption" style={{ color: "var(--dim)", lineHeight: "1.5" }}>{desc}</div>
       </span>
     </label>
   );
@@ -262,8 +262,8 @@ function NumberRow({
   return (
     <div style={{ display: "flex", gap: "12px", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap" }}>
       <span style={{ flex: "1 1 240px" }}>
-        <span style={{ color: "var(--fg)", fontSize: "13px", fontWeight: 500 }}>{label}</span>
-        <div style={{ color: "var(--dim)", fontSize: "12px", lineHeight: "1.5" }}>{desc}</div>
+        <span className="t-label" style={{ color: "var(--fg)", fontWeight: 500 }}>{label}</span>
+        <div className="t-caption" style={{ color: "var(--dim)", lineHeight: "1.5" }}>{desc}</div>
       </span>
       <span className="flex items-center gap-2" style={{ flex: "0 0 auto" }}>
         <input
@@ -275,6 +275,7 @@ function NumberRow({
             const n = Number(e.target.value);
             onChange(Number.isFinite(n) && n >= 0 ? n : 0);
           }}
+          className="t-label"
           style={{
             width: "110px",
             padding: "6px 8px",
@@ -283,10 +284,9 @@ function NumberRow({
             background: "var(--bg)",
             color: "var(--fg)",
             fontFamily: "var(--font-mono)",
-            fontSize: "13px",
           }}
         />
-        <span style={{ color: "var(--dim)", fontSize: "12px", minWidth: "48px" }}>{unit}</span>
+        <span className="t-caption" style={{ color: "var(--dim)", minWidth: "48px" }}>{unit}</span>
       </span>
     </div>
   );
