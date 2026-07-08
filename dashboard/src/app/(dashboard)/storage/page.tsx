@@ -164,54 +164,6 @@ export default function StoragePage() {
             </div>
           </Card>
 
-          {/* Storage Summary */}
-          <Card>
-            <CardHeader title="Quick Reference" />
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-[color:var(--dim)] border-b border-[var(--rule)]">
-                    <th className="pb-3 font-medium">Layer</th>
-                    <th className="pb-3 font-medium">Window</th>
-                    <th className="pb-3 font-medium">Duration</th>
-                    <th className="pb-3 font-medium">Behavior</th>
-                  </tr>
-                </thead>
-                <tbody className="text-[color:var(--dim)]">
-                  <tr className="border-b border-[var(--rule)]">
-                    <td className="py-3">L1</td>
-                    <td className="py-3">Validator (VW)</td>
-                    <td className="py-3">{fullConfig?.pruning?.vw_blocks ?? 288} blocks (~{formatDuration(fullConfig?.pruning?.vw_blocks ?? 288)})</td>
-                    <td className="py-3">Full retention - Bitcoin Core minimum</td>
-                  </tr>
-                  <tr className="border-b border-[var(--rule)]">
-                    <td className="py-3">L1</td>
-                    <td className="py-3">Operator (OW)</td>
-                    <td className="py-3">
-                      {(fullConfig?.pruning?.ow_blocks ?? 0) > 0
-                        ? `${fullConfig?.pruning?.ow_blocks} blocks (~${formatDuration(fullConfig?.pruning?.ow_blocks ?? 0)})`
-                        : "Keep all"}
-                    </td>
-                    <td className="py-3">
-                      {archiveMode ? "Archive Mode - no pruning" : "Prune depth (prune_height)"}
-                    </td>
-                  </tr>
-                  <tr className="border-b border-[var(--rule)]">
-                    <td className="py-3">L1</td>
-                    <td className="py-3">Archive (AW)</td>
-                    <td className="py-3">{archiveMode ? "Infinite" : "N/A"}</td>
-                    <td className="py-3">{archiveMode ? "Full chain stored (+5 shares)" : "Data pruned beyond OW"}</td>
-                  </tr>
-                  <tr>
-                    <td className="py-3">L2</td>
-                    <td className="py-3">Retention</td>
-                    <td className="py-3">{l2Pruning?.retention_days ?? 90} days</td>
-                    <td className="py-3">Auto-prune payments, attestations, closed locks</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </Card>
         </>
       )}
     </div>
