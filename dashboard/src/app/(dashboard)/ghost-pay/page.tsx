@@ -6,7 +6,6 @@ import { StatCard } from "@/components/ui/StatCard";
 import { Badge } from "@/components/ui/Badge";
 import { Toggle } from "@/components/ui/Toggle";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { SkeletonCard } from "@/components/ui/Skeleton";
 import { EmptyState } from "@/components/ui/EmptyState";
 import {
   useGhostPayStatus,
@@ -18,7 +17,6 @@ import {
   useNodeStatus,
   useFullConfig,
   useSetGhostPay,
-  useL2PruningStatus,
 } from "@/hooks/queries";
 
 /**
@@ -108,7 +106,6 @@ export default function GhostPayPage() {
   const { data: shares } = useShares();
   const { data: nodeStatus } = useNodeStatus();
   const { data: fullConfig } = useFullConfig();
-  const { data: pruning } = useL2PruningStatus();
   const setGhostPay = useSetGhostPay();
 
   // Not reachable at all — ghost-pay service down / dashboard can't sign.
@@ -159,16 +156,11 @@ export default function GhostPayPage() {
   // Earnings.
   const capabilityClaimed = !!nodeStatus?.ghost_pay || !!fullConfig?.ghost_pay;
   const capabilityQualified = !!shares?.ghost_pay;
-  const treasuryBalance = feeContext?.treasury_balance_sats ?? 0;
   const ghostPayNodeCount = feeContext?.ghost_pay_nodes?.length ?? 0;
-  const thresholdReachedAt = feeContext?.threshold_reached_at ?? null;
   const payoutCount = payoutHistory?.total ?? payoutHistory?.payouts?.length ?? 0;
 
   // Config.
   const ghostPayOn = !!fullConfig?.ghost_pay;
-  const pruneEnabled = !!pruning?.enabled;
-  const pruneProfile = String(pruning?.profile ?? "none");
-  const pruneThreshold = Number(pruning?.threshold_sats ?? 0);
 
   return (
     <div className="space-y-6">
@@ -178,6 +170,32 @@ export default function GhostPayPage() {
         title="Your node's view of the L2."
         subtitle="Ghost Pay is Ghost's L2 for fast private payments. Sending lives in the wallet — this is your node's view of the L2 it helps run: is it alive, settling to L1, and earning."
       />
+
+      {/* 1b. Primary control — enable Ghost Pay, up top. Pruning of L2 state is
+           mandatory and automatic, so there is no pruning knob here. */}
+      <SectionErrorBoundary section="Ghost Pay">
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
+            <div>
+              <div style={{ color: "var(--fg)", fontSize: "15px", fontWeight: 500 }}>Ghost Pay L2</div>
+              <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px", lineHeight: 1.5 }}>
+                Run the L2 payments layer and earn the +4 capability share. L2 state pruning is mandatory and handled automatically.
+              </div>
+            </div>
+            <Toggle
+              label="Ghost Pay L2"
+              enabled={ghostPayOn}
+              disabled={setGhostPay.isPending}
+              onChange={(v) => setGhostPay.mutate(v)}
+            />
+          </div>
+          {setGhostPay.isError && (
+            <p style={{ color: "var(--red)", fontSize: "13px", marginTop: "8px" }}>
+              Failed to update Ghost Pay setting. Try again.
+            </p>
+          )}
+        </Card>
+      </SectionErrorBoundary>
 
       {/* 2. Status strip — is the L2 alive and busy. */}
       <SectionErrorBoundary section="L2 status">
@@ -261,8 +279,6 @@ export default function GhostPayPage() {
             <Field label="Capability">
               {capabilityQualified ? "Qualified (+4 shares)" : capabilityClaimed ? "Claimed, awaiting challenges" : "Off"}
             </Field>
-            <Field label="Treasury pool">{formatSats(treasuryBalance)}</Field>
-            <Field label="Threshold reached">{thresholdReachedAt ? formatWhen(thresholdReachedAt) : "not yet"}</Field>
             <Field label="Nodes sharing L2 fees">{ghostPayNodeCount}</Field>
             <Field label="Your payout records">{payoutCount}</Field>
           </div>
@@ -275,48 +291,6 @@ export default function GhostPayPage() {
               Capability detail →
             </a>
           </p>
-        </Card>
-      </SectionErrorBoundary>
-
-      {/* 5. Config — Ghost Pay on/off + L2 pruning. */}
-      <SectionErrorBoundary section="Configuration">
-        <Card>
-          <SectionTitle title="Configuration" subtitle="Whether this node runs the Ghost Pay L2, and how it prunes L2 state." />
-          {statusLoading ? (
-            <SkeletonCard />
-          ) : (
-            <div>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0", borderBottom: "1px solid var(--rule)" }}>
-                <div>
-                  <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500 }}>Ghost Pay L2</div>
-                  <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px" }}>
-                    Run the L2 payments layer and earn the +4 capability share.
-                  </div>
-                </div>
-                <Toggle
-                  label="Ghost Pay L2"
-                  enabled={ghostPayOn}
-                  disabled={setGhostPay.isPending}
-                  onChange={(v) => setGhostPay.mutate(v)}
-                />
-              </div>
-              <Field label="L2 pruning">{pruneEnabled ? `${pruneProfile} · below ${formatSats(pruneThreshold)}` : "disabled"}</Field>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0" }}>
-                <span style={labelStyle}>Prune profile</span>
-                <span style={valueStyle}>
-                  {pruneProfile}{" "}
-                  <a href="/storage" className="bare" style={{ color: "var(--accent)", textDecoration: "underline", textDecorationColor: "var(--rule-strong)", fontFamily: "var(--font-sans)" }}>
-                    edit →
-                  </a>
-                </span>
-              </div>
-              {setGhostPay.isError && (
-                <p style={{ color: "var(--red)", fontSize: "13px", marginTop: "8px" }}>
-                  Failed to update Ghost Pay setting. Try again.
-                </p>
-              )}
-            </div>
-          )}
         </Card>
       </SectionErrorBoundary>
     </div>
