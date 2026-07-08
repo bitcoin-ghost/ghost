@@ -33,13 +33,13 @@ interface Row {
 function StatusCell({ ok }: { ok: boolean }) {
   return (
     <span
+      className="t-label"
       style={{
         display: "inline-flex",
         alignItems: "center",
         gap: "8px",
         color: ok ? "var(--green)" : "var(--dim)",
         fontFamily: "var(--font-mono)",
-        fontSize: "13px",
       }}
     >
       <span
@@ -152,11 +152,11 @@ export default function CapabilitiesPage() {
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
               <thead>
                 <tr style={{ borderBottom: "1px solid var(--rule)" }}>
-                  <th style={thStyle}>Capability</th>
-                  <th style={thStyle}>Bonus</th>
-                  <th style={thStyle}>Claimed</th>
-                  <th style={thStyle}>Qualified</th>
-                  <th style={thStyle}>Configure</th>
+                  <th className="t-label-mono" style={thStyle}>Capability</th>
+                  <th className="t-label-mono" style={thStyle}>Bonus</th>
+                  <th className="t-label-mono" style={thStyle}>Claimed</th>
+                  <th className="t-label-mono" style={thStyle}>Qualified</th>
+                  <th className="t-label-mono" style={thStyle}>Configure</th>
                 </tr>
               </thead>
               <tbody>
@@ -178,10 +178,9 @@ export default function CapabilitiesPage() {
                       {row.configHref && (
                         <Link
                           href={row.configHref}
-                          className="bare"
+                          className="bare t-label"
                           style={{
                             color: "var(--dim)",
-                            fontSize: "13px",
                             textDecoration: "underline",
                             textDecorationColor: "var(--rule-strong)",
                           }}
@@ -201,7 +200,7 @@ export default function CapabilitiesPage() {
       {driftRows.length > 0 && (
         <SectionErrorBoundary section="Drift detail">
           <Card>
-            <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "12px" }}>
+            <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "12px" }}>
               {driftRows.length === 1 ? "1 capability not qualifying" : `${driftRows.length} capabilities not qualifying`}
             </h3>
             <div className="space-y-4">
@@ -210,7 +209,7 @@ export default function CapabilitiesPage() {
                   <div style={{ color: "var(--fg)", fontWeight: 500, marginBottom: "4px" }}>
                     {row.label} <span style={{ color: "var(--dim)", fontWeight: 400 }}>(+{row.bonus})</span>
                   </div>
-                  <p style={{ color: "var(--dim)", fontSize: "14px", lineHeight: "1.5" }}>{row.hint}</p>
+                  <p className="t-body" style={{ color: "var(--dim)" }}>{row.hint}</p>
                 </div>
               ))}
             </div>
@@ -218,7 +217,7 @@ export default function CapabilitiesPage() {
         </SectionErrorBoundary>
       )}
 
-      <p style={{ color: "var(--fainter)", fontSize: "13px" }}>
+      <p className="t-label" style={{ color: "var(--fainter)" }}>
         Qualification is calculated from peer-issued verification challenges over a 7-day rolling window. A capability counts at payout when ≥10 challenges have completed at ≥95% pass rate (≥90% for Ghost Pay) from at least 2 unique peers.
       </p>
     </div>
@@ -229,10 +228,7 @@ const thStyle: React.CSSProperties = {
   textAlign: "left",
   padding: "12px 16px",
   fontWeight: 500,
-  fontSize: "13px",
   color: "var(--dim)",
-  fontFamily: "var(--font-mono)",
-  textTransform: "uppercase",
   letterSpacing: "0.06em",
 };
 

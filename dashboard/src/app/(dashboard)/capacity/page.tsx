@@ -158,10 +158,10 @@ export default function CapacityPage() {
       <SectionErrorBoundary section="This node">
         <Card>
           <div style={{ marginBottom: "16px" }}>
-            <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+            <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
               This node
             </h3>
-            <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+            <p className="t-label" style={{ color: "var(--dim)" }}>
               Hardware-derived ceiling. Operator&apos;s <code>network.max_miners</code> can throttle this DOWN, never UP.
             </p>
           </div>
@@ -198,10 +198,10 @@ export default function CapacityPage() {
       <SectionErrorBoundary section="Peers">
         <Card>
           <div style={{ marginBottom: "16px" }}>
-            <h3 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500, marginBottom: "4px" }}>
+            <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
               Peer mesh
             </h3>
-            <p style={{ color: "var(--dim)", fontSize: "13px" }}>
+            <p className="t-label" style={{ color: "var(--dim)" }}>
               {nodes.length} {nodes.length === 1 ? "node" : "nodes"} across the mesh ·{" "}
               <strong style={{ color: "var(--fg)" }}>{distinctMiners}</strong> distinct active{" "}
               {distinctMiners === 1 ? "miner" : "miners"} (deduplicated). Each miner is owned by
@@ -237,7 +237,7 @@ export default function CapacityPage() {
         </Card>
       </SectionErrorBoundary>
 
-      <p style={{ color: "var(--fainter)", fontSize: "13px" }}>
+      <p className="t-label" style={{ color: "var(--fainter)" }}>
         Capacity is hardware-derived (
         <code>min(ram_mb / 3, cpu_cores * 500, fd_limit / 4)</code>) at startup. Operator&apos;s{" "}
         <code>network.max_miners</code> in <code>pool.toml</code> can throttle below the calculated value but cannot exceed
@@ -262,7 +262,7 @@ function MeshRow({ node }: { node: MeshNode }) {
       }}
     >
       <td style={tdStyle}>
-        <code style={{ color: "var(--fg)", fontSize: "13px" }}>{label}</code>
+        <code className="t-label" style={{ color: "var(--fg)" }}>{label}</code>
         {isSelf && (
           <Badge variant="info" className="ml-2">
             you
@@ -297,10 +297,8 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
   return (
     <div>
       <div
+        className="t-eyebrow"
         style={{
-          fontSize: "11px",
-          fontFamily: "var(--font-mono)",
-          textTransform: "uppercase",
           letterSpacing: "0.06em",
           color: "var(--dim)",
           marginBottom: "4px",
@@ -309,8 +307,8 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
         {label}
       </div>
       <div
+        className="t-stat"
         style={{
-          fontSize: "24px",
           fontWeight: 500,
           color: accent ?? "var(--fg)",
           fontFamily: "var(--font-mono)",

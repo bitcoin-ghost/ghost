@@ -178,8 +178,8 @@ export default function WatchdogPage() {
     <div className="space-y-6">
       <PageHeader
         eyebrow="watchdog"
-        title="Capability verification."
-        subtitle="Service health and resource monitoring"
+        title="Service health & resources."
+        subtitle="Live status of node services, components, and system resources."
         actions={
           status ? (
             <Badge variant={getHealthBadge(overallHealth).variant}>
