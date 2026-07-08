@@ -163,7 +163,7 @@ export default function GhostPayPage() {
         <Card>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
             <div>
-              <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>Ghost Pay L2</div>
+              <div className="t-title" style={{ color: "var(--fg)" }}>Ghost Pay L2</div>
               <div className="t-caption" style={{ color: "var(--dim)", marginTop: "2px" }}>
                 Run the L2 payments layer and earn the +4 capability share. L2 state pruning is mandatory and handled automatically.
               </div>

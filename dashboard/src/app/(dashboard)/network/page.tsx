@@ -182,7 +182,7 @@ function TorRow({
       <div className="flex items-start justify-between gap-6">
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="flex items-center gap-2 mb-1">
-            <span className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>Tor mode</span>
+            <span className="t-title" style={{ color: "var(--fg)" }}>Tor mode</span>
             {enabled && <Badge variant="success">+anonymity</Badge>}
           </div>
           <p className="t-label" style={{ color: "var(--dim)", lineHeight: "1.5", maxWidth: "60ch" }}>
@@ -234,8 +234,7 @@ function TorRow({
           }}
         >
           <div className="t-label" style={{ color: "var(--fg)", marginBottom: "10px" }}>
-            {target ? "Enable" : "Disable"} <strong>Tor mode</strong>? This writes the config and{" "}
-            <strong>restarts ghostd</strong> (then bounces the pool) to apply.
+            {target ? "Enable" : "Disable"} Tor mode? This writes the config and restarts ghostd (then bounces the pool) to apply.
           </div>
           <div className="flex items-center gap-2">
             <Button

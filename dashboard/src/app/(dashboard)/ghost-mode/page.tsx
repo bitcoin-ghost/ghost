@@ -156,8 +156,7 @@ export default function GhostModePage() {
               }}
             >
               <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
-                <span style={{ color: "var(--fg)", fontWeight: 600 }}>Public Mining is active.</span>{" "}
-                Ghost Mode would make your node build empty blocks and forfeit all fee income, so the
+                Public Mining is active. Ghost Mode would make your node build empty blocks and forfeit all fee income, so the
                 two can&apos;t run together — disable Public Mining first on the{" "}
                 <a
                   href="/settings/capabilities"
@@ -254,7 +253,7 @@ export default function GhostModePage() {
               }}
             >
               <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
-                <span style={{ color: "var(--fg)", fontWeight: 600 }}>Heads up:</span> broadcasting your
+                Heads up: broadcasting your
                 own transactions reveals them to the peers you announce to, which can tie a transaction to
                 your node&apos;s IP address. Enable{" "}
                 <a
@@ -282,10 +281,10 @@ export default function GhostModePage() {
           config with a friendly toggle. When <code>ghost_mode = true</code>:
         </p>
         <ul className="t-body" style={{ color: "var(--dim)", lineHeight: "1.7", paddingLeft: "18px", listStyle: "disc" }}>
-          <li><strong style={{ color: "var(--fg)" }}>Relay is suppressed.</strong> <code>RelayTransaction()</code> returns early — your node never pushes unconfirmed transactions to peers.</li>
-          <li><strong style={{ color: "var(--fg)" }}>getdata returns NOT_FOUND.</strong> A peer asking &quot;give me transaction X&quot; is answered <code>NOT_FOUND</code> regardless of whether X is in your mempool. Your mempool stops being a public lookup table.</li>
-          <li><strong style={{ color: "var(--fg)" }}>No INV announcements.</strong> Your node doesn&apos;t tell peers about unconfirmed transactions it has seen.</li>
-          <li><strong style={{ color: "var(--fg)" }}>Blocks are unaffected.</strong> You still receive, validate and forward blocks; the chain propagates through your node normally.</li>
+          <li>Relay is suppressed. <code>RelayTransaction()</code> returns early — your node never pushes unconfirmed transactions to peers.</li>
+          <li><code>getdata</code> returns <code>NOT_FOUND</code>. A peer asking &quot;give me transaction X&quot; is answered <code>NOT_FOUND</code> regardless of whether X is in your mempool. Your mempool stops being a public lookup table.</li>
+          <li>No <code>INV</code> announcements. Your node doesn&apos;t tell peers about unconfirmed transactions it has seen.</li>
+          <li>Blocks are unaffected. You still receive, validate and forward blocks; the chain propagates through your node normally.</li>
         </ul>
         <div
           style={{
@@ -297,7 +296,7 @@ export default function GhostModePage() {
           }}
         >
           <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
-            <span style={{ color: "var(--fg)", fontWeight: 600 }}>Trade-off:</span> Ghost Mode is a
+            Trade-off: Ghost Mode is a
             suppression of the standard relay path, not a replacement transport. Without local egress, a
             wallet on a Ghost Mode node must find another route to reach miners — an out-of-band relay over
             Tor, a separate broadcasting node, or a paid broadcast service — otherwise its transactions
@@ -313,7 +312,7 @@ export default function GhostModePage() {
           Does this affect my capability shares?
         </h3>
         <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6", marginBottom: "12px" }}>
-          <strong style={{ color: "var(--fg)", fontWeight: 600 }}>Not for most of them.</strong> Archive, Ghost Pay, Reaper
+          Not for most of them. Archive, Ghost Pay, Reaper
           and Elder are each verified by an HTTP challenge–response to your node&apos;s API (block
           retrieval, L2-block lookup, policy classification, registration order) — none of which rides the
           P2P transaction-relay path Ghost Mode suppresses, so those +5 / +4 / +2 / +1 shares are
@@ -331,8 +330,7 @@ export default function GhostModePage() {
           }}
         >
           <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
-            <span style={{ color: "var(--fg)", fontWeight: 600 }}>Public Mining is mutually exclusive.</span>{" "}
-            Ghost Mode rejects transactions from peers, so your mempool never fills with fee-paying
+            Public Mining is mutually exclusive. Ghost Mode rejects transactions from peers, so your mempool never fills with fee-paying
             transactions and the blocks your node builds are near-empty — coinbase subsidy only. Since the
             node operator keeps the transaction fees (miners are paid from the subsidy, less the pool fee),
             an empty block means zero fee income. So you
