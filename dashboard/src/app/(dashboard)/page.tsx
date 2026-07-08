@@ -219,9 +219,9 @@ function SharesSection() {
         subtitle="5-4-3-2-1 Reward System"
         action={
           <Tooltip content={TOOLTIPS.shares}>
-            <span className="text-2xl font-bold text-[color:var(--fg)]">
-              {shares.total}<span className="text-[color:var(--fainter)] text-lg"> / {shares.max_shares}</span>
+            <span className="text-2xl font-bold text-[color:var(--fg)] inline-flex items-center gap-1.5">
               <InfoIcon />
+              {shares.total}<span className="text-[color:var(--fainter)] text-lg"> / {shares.max_shares}</span>
             </span>
           </Tooltip>
         }
