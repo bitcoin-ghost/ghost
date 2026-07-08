@@ -203,7 +203,7 @@ export default function CapacityPage() {
             </h3>
             <p className="t-label" style={{ color: "var(--dim)" }}>
               {nodes.length} {nodes.length === 1 ? "node" : "nodes"} across the mesh ·{" "}
-              <strong style={{ color: "var(--fg)" }}>{distinctMiners}</strong> distinct active{" "}
+              {distinctMiners} distinct active{" "}
               {distinctMiners === 1 ? "miner" : "miners"} (deduplicated). Each miner is owned by
               exactly one node, so the per-node counts below sum to this total.
               {capacityUnknown > 0 && (
