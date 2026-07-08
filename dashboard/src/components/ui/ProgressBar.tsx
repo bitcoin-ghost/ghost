@@ -42,7 +42,7 @@ export function ProgressBar({
           {sublabel && <span className="text-sm text-[color:var(--dim)] font-mono">{sublabel}</span>}
         </div>
       )}
-      <div className={`bg-[var(--surface)] rounded-full overflow-hidden ${sizeClasses[size]}`}>
+      <div className={`bg-[var(--surface)] border border-[color:var(--rule-strong)] rounded-full overflow-hidden ${sizeClasses[size]}`}>
         <div
           className={`${colorClasses[color]} rounded-full transition-all duration-500 h-full`}
           style={{ width: `${percent}%` }}

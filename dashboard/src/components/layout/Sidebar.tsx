@@ -40,6 +40,7 @@ import { SidebarItem } from "./SidebarItem";
 import { GhostBrand } from "@/components/ui/GhostBrand";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { ThemeToggle } from "@/components/ui/ThemeToggle";
+import { usePathname } from "next/navigation";
 
 interface NavItem {
   href: string;
@@ -168,6 +169,16 @@ export function Sidebar() {
   const nickname = useConfigStore((s) => s.nickname);
   const isConnected = useNodeStore((s) => s.isConnected);
 
+  // Single active route = the nav item whose href is the LONGEST prefix (exact
+  // or `href/…`) of the current path. This stops a parent like `/filtering`
+  // lighting up when you're on `/filtering/advanced`, while still keeping e.g.
+  // `/settings` active across `/settings/*`. `/` matches only itself.
+  const pathname = usePathname();
+  const activeHref =
+    GROUPS.flatMap((g) => g.items.map((i) => i.href))
+      .filter((h) => pathname === h || pathname.startsWith(h + "/"))
+      .sort((a, b) => b.length - a.length)[0] ?? null;
+
   return (
     <>
       {/* Mobile hamburger button */}
@@ -277,6 +288,7 @@ export function Sidebar() {
                     icon={item.icon}
                     label={item.label}
                     collapsed={collapsed}
+                    isActive={item.href === activeHref}
                   />
                 ))}
               </div>
