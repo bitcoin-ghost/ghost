@@ -53,20 +53,6 @@ function formatWhen(ts?: number | null): string {
   return d.toLocaleString();
 }
 
-const labelStyle: React.CSSProperties = {
-  color: "var(--dim)",
-  fontSize: "13px",
-  fontFamily: "var(--font-mono)",
-  textTransform: "uppercase",
-  letterSpacing: "0.06em",
-};
-
-const valueStyle: React.CSSProperties = {
-  color: "var(--fg)",
-  fontSize: "14px",
-  fontFamily: "var(--font-mono)",
-};
-
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div
@@ -79,8 +65,8 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
         borderBottom: "1px solid var(--rule)",
       }}
     >
-      <span style={labelStyle}>{label}</span>
-      <span style={valueStyle}>{children}</span>
+      <span className="t-label-mono" style={{ color: "var(--dim)" }}>{label}</span>
+      <span className="t-body" style={{ color: "var(--fg)", fontFamily: "var(--font-mono)" }}>{children}</span>
     </div>
   );
 }
@@ -89,8 +75,8 @@ function SectionTitle({ title, subtitle, action }: { title: string; subtitle?: s
   return (
     <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "16px", marginBottom: "16px" }}>
       <div>
-        <h2 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500 }}>{title}</h2>
-        {subtitle && <p style={{ color: "var(--dim)", fontSize: "13px", marginTop: "4px", lineHeight: 1.5 }}>{subtitle}</p>}
+        <h2 className="t-title" style={{ color: "var(--fg)" }}>{title}</h2>
+        {subtitle && <p className="t-caption" style={{ color: "var(--dim)", marginTop: "4px" }}>{subtitle}</p>}
       </div>
       {action}
     </div>
@@ -127,7 +113,7 @@ export default function GhostPayPage() {
             title="Ghost Pay is not reachable"
             description="The ghost-pay service on this node isn't responding. Enable Ghost Pay in Settings, or check the ghost-pay daemon on port 8800."
             action={
-              <a href="/settings" className="bare" style={{ color: "var(--accent)", fontSize: "14px" }}>
+              <a href="/settings" className="bare t-body" style={{ color: "var(--accent)" }}>
                 Go to Settings →
               </a>
             }
@@ -177,8 +163,8 @@ export default function GhostPayPage() {
         <Card>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
             <div>
-              <div style={{ color: "var(--fg)", fontSize: "15px", fontWeight: 500 }}>Ghost Pay L2</div>
-              <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px", lineHeight: 1.5 }}>
+              <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>Ghost Pay L2</div>
+              <div className="t-caption" style={{ color: "var(--dim)", marginTop: "2px" }}>
                 Run the L2 payments layer and earn the +4 capability share. L2 state pruning is mandatory and handled automatically.
               </div>
             </div>
@@ -190,7 +176,7 @@ export default function GhostPayPage() {
             />
           </div>
           {setGhostPay.isError && (
-            <p style={{ color: "var(--red)", fontSize: "13px", marginTop: "8px" }}>
+            <p className="t-caption" style={{ color: "var(--red)", marginTop: "8px" }}>
               Failed to update Ghost Pay setting. Try again.
             </p>
           )}
@@ -249,12 +235,12 @@ export default function GhostPayPage() {
             <Field label="Last batch amount">{last ? formatSats(last.total_amount_sats) : "—"}</Field>
             <Field label="Last L1 txid">{last?.l1_txid ? shortId(last.l1_txid) : "—"}</Field>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0" }}>
-              <span style={labelStyle}>Last settled at</span>
-              <span style={valueStyle}>{formatWhen(last?.finalized_at)}</span>
+              <span className="t-label-mono" style={{ color: "var(--dim)" }}>Last settled at</span>
+              <span className="t-body" style={{ color: "var(--fg)", fontFamily: "var(--font-mono)" }}>{formatWhen(last?.finalized_at)}</span>
             </div>
           </div>
           {pendingSettlements === 0 && !last && (
-            <p style={{ color: "var(--fainter)", fontSize: "13px", marginTop: "4px", lineHeight: 1.5 }}>
+            <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "4px" }}>
               No settlement batches yet. Batches appear here once L2 activity is reconciled to L1.
             </p>
           )}
@@ -282,7 +268,7 @@ export default function GhostPayPage() {
             <Field label="Nodes sharing L2 fees">{ghostPayNodeCount}</Field>
             <Field label="Your payout records">{payoutCount}</Field>
           </div>
-          <p style={{ color: "var(--fainter)", fontSize: "13px", marginTop: "12px", lineHeight: 1.5 }}>
+          <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "12px" }}>
             {capabilityQualified
               ? "Your node is verified as Ghost Pay-capable and shares in L2 fee distribution. "
               : "The +4 share counts at payout only once peer challenges qualify the capability. "}

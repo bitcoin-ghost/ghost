@@ -114,7 +114,7 @@ function TreasuryDetails() {
                 <div className="flex flex-col items-center flex-1">
                   <div className={`w-3.5 h-3.5 rounded-full ${dotColor}`} />
                   <div className="text-xs text-[color:var(--fainter)] mt-1.5">{step.label}</div>
-                  <div className="text-[10px] text-[color:var(--fainter)] mt-0.5">
+                  <div className="t-caption text-[color:var(--fainter)] mt-0.5">
                     {(step.treasury * 100).toFixed(0)}% / {(step.nodePool * 100).toFixed(0)}%
                   </div>
                 </div>

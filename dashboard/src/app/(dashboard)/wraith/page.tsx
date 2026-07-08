@@ -22,20 +22,6 @@ import { useGhostPayStatus, useWraithStats, useSetWraith } from "@/hooks/queries
  * genuinely empty data say so honestly rather than rendering a misleading zero.
  */
 
-const labelStyle: React.CSSProperties = {
-  color: "var(--dim)",
-  fontSize: "13px",
-  fontFamily: "var(--font-mono)",
-  textTransform: "uppercase",
-  letterSpacing: "0.06em",
-};
-
-const valueStyle: React.CSSProperties = {
-  color: "var(--fg)",
-  fontSize: "14px",
-  fontFamily: "var(--font-mono)",
-};
-
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div
@@ -48,8 +34,8 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
         borderBottom: "1px solid var(--rule)",
       }}
     >
-      <span style={labelStyle}>{label}</span>
-      <span style={valueStyle}>{children}</span>
+      <span className="t-label-mono" style={{ color: "var(--dim)" }}>{label}</span>
+      <span className="t-body" style={{ color: "var(--fg)", fontFamily: "var(--font-mono)" }}>{children}</span>
     </div>
   );
 }
@@ -58,8 +44,8 @@ function SectionTitle({ title, subtitle, action }: { title: string; subtitle?: s
   return (
     <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "16px", marginBottom: "16px" }}>
       <div>
-        <h2 style={{ color: "var(--fg)", fontSize: "16px", fontWeight: 500 }}>{title}</h2>
-        {subtitle && <p style={{ color: "var(--dim)", fontSize: "13px", marginTop: "4px", lineHeight: 1.5 }}>{subtitle}</p>}
+        <h2 className="t-title" style={{ color: "var(--fg)" }}>{title}</h2>
+        {subtitle && <p className="t-caption" style={{ color: "var(--dim)", marginTop: "4px" }}>{subtitle}</p>}
       </div>
       {action}
     </div>
@@ -100,7 +86,7 @@ export default function WraithPage() {
             title="Wraith status is not reachable"
             description="The ghost-pay service on this node isn't responding, so mixing status is unavailable. Enable Ghost Pay in Settings, or check the ghost-pay daemon on port 8800."
             action={
-              <a href="/settings" className="bare" style={{ color: "var(--accent)", fontSize: "14px" }}>
+              <a href="/settings" className="bare t-body" style={{ color: "var(--accent)" }}>
                 Go to Settings →
               </a>
             }
@@ -136,6 +122,31 @@ export default function WraithPage() {
           ) : undefined
         }
       />
+
+      {/* 1b. Primary control — enable Wraith mixing, up top (mirrors Ghost Pay).
+           The enable switch is the lead card; telemetry follows below. */}
+      <SectionErrorBoundary section="Wraith">
+        <Card>
+          {statusLoading ? (
+            <SkeletonCard />
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
+              <div>
+                <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 500 }}>Wraith mixing</div>
+                <div className="t-caption" style={{ color: "var(--dim)", marginTop: "2px", maxWidth: "36rem" }}>
+                  When enabled, any L2 participant can initiate a CoinJoin session through this node. Off means the node won&apos;t coordinate mixing. A ghost-pool restart applies the change.
+                </div>
+              </div>
+              <Toggle
+                label="Wraith mixing"
+                enabled={wraithEnabled}
+                disabled={setWraith.isPending}
+                onChange={handleWraithToggle}
+              />
+            </div>
+          )}
+        </Card>
+      </SectionErrorBoundary>
 
       {/* 2. Status strip — is mixing enabled and busy on this node. */}
       <SectionErrorBoundary section="Wraith status">
@@ -184,44 +195,16 @@ export default function WraithPage() {
             <Field label="Completed">{sessionsCompleted.toLocaleString()}</Field>
             <Field label="Expired">{sessionsExpired.toLocaleString()}</Field>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0" }}>
-              <span style={labelStyle}>Participants served</span>
-              <span style={valueStyle}>{totalParticipants.toLocaleString()}</span>
+              <span className="t-label-mono" style={{ color: "var(--dim)" }}>Participants served</span>
+              <span className="t-body" style={{ color: "var(--fg)", fontFamily: "var(--font-mono)" }}>{totalParticipants.toLocaleString()}</span>
             </div>
           </div>
           {noActivity && (
-            <p style={{ color: "var(--fainter)", fontSize: "13px", marginTop: "4px", lineHeight: 1.5 }}>
+            <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "4px" }}>
               {wraithEnabled
                 ? "No mixing sessions yet. Sessions appear here once wallet participants begin mixing through this node."
-                : "Wraith mixing is disabled on this node, so it is not coordinating any sessions. Enable it below to participate."}
+                : "Wraith mixing is disabled on this node, so it is not coordinating any sessions. Enable it above to participate."}
             </p>
-          )}
-        </Card>
-      </SectionErrorBoundary>
-
-      {/* 4. Config — Wraith on/off. */}
-      <SectionErrorBoundary section="Configuration">
-        <Card>
-          <SectionTitle title="Configuration" subtitle="Whether this node participates in Wraith CoinJoin mixing for L2 wallet users." />
-          {statusLoading ? (
-            <SkeletonCard />
-          ) : (
-            <div>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0", borderBottom: "1px solid var(--rule)" }}>
-                <div>
-                  <div style={{ color: "var(--fg)", fontSize: "14px", fontWeight: 500 }}>Wraith mixing</div>
-                  <div style={{ color: "var(--dim)", fontSize: "13px", marginTop: "2px", maxWidth: "36rem" }}>
-                    When enabled, any L2 participant can initiate a CoinJoin session through this node. Off means the node won&apos;t coordinate mixing. A ghost-pool restart applies the change.
-                  </div>
-                </div>
-                <Toggle
-                  label="Wraith mixing"
-                  enabled={wraithEnabled}
-                  disabled={setWraith.isPending}
-                  onChange={handleWraithToggle}
-                />
-              </div>
-              <Field label="Currently hosting">{hostsMixing ? "yes" : "no"}</Field>
-            </div>
           )}
         </Card>
       </SectionErrorBoundary>
