@@ -133,6 +133,10 @@ export interface FullNodeConfig {
     min_payout: number;
     auto_payout: boolean;
   };
+  // Block-priority lever from pool.toml [pool].block_priority. Governs template
+  // ORDERING: `max_fee` (default, revenue) or `payments_first` (seat BUDS
+  // financial txs ahead of data txs). Permutation only — weight-safe.
+  block_priority?: 'max_fee' | 'payments_first';
   // Flat fields from backend
   ghost_mode?: boolean;
   ghost_mode_local_egress?: boolean;

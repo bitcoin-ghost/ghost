@@ -237,6 +237,28 @@ export async function setPolicyProfile(profile: PolicyProfileType): Promise<Poli
   });
 }
 
+// The block-priority lever (pool.toml [pool].block_priority). Governs how the
+// block template is ORDERED — either by max fee (revenue) or by seating BUDS
+// financial txs (T0/T1) ahead of data txs (T2/T3). It never adds or drops txs
+// (permutation only), so it is weight-safe. Writing it persists to pool.toml and
+// triggers a graceful restart to apply.
+export type BlockPriorityType = 'max_fee' | 'payments_first';
+
+export interface BlockPriorityResult {
+  success: boolean;
+  block_priority: BlockPriorityType;
+  restart_pending: boolean;
+}
+
+export async function setBlockPriority(
+  blockPriority: BlockPriorityType,
+): Promise<BlockPriorityResult> {
+  return fetchApi<BlockPriorityResult>('/api/v1/config/block_priority', {
+    method: 'POST',
+    body: JSON.stringify({ block_priority: blockPriority }),
+  });
+}
+
 // Map a setup-wizard's coarse mempool-policy choice onto the REAL tier-policy
 // profile. The wizards present simplified labels ("standard"/permissive vs
 // "strict"); anything more permissive than strict maps to `full_open`.
