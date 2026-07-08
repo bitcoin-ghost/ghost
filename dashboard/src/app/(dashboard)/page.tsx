@@ -63,9 +63,9 @@ function L1Card() {
   const isSyncing = syncStatus === false && syncHeight > 0 && blockHeight > 0;
 
   return (
-    <Card className="border-[color:var(--accent)]">
+    <Card>
       <CardHeader
-        title={<span className="text-[color:var(--accent)]">L1 &middot; Bitcoin</span>}
+        title={<span>L1 &middot; Bitcoin</span>}
         action={
           syncStatus != null && (
             <StatusDot
@@ -82,12 +82,12 @@ function L1Card() {
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Block Height</div>
             <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : isSyncing
-                ? <span>{syncHeight.toLocaleString()} <span className="text-xs text-[color:var(--accent)]">/ {blockHeight.toLocaleString()}</span></span>
+                ? <span>{syncHeight.toLocaleString()} <span className="text-xs text-[color:var(--fainter)]">/ {blockHeight.toLocaleString()}</span></span>
                 : syncHeight.toLocaleString()
               }
             </div>
             {isSyncing && (
-              <div className="text-xs text-[color:var(--accent)] mt-0.5">
+              <div className="text-xs text-[color:var(--dim)] mt-0.5">
                 IBD &middot; {blockHeight > 0 ? ((syncHeight / blockHeight) * 100).toFixed(1) : 0}%
               </div>
             )}
@@ -150,9 +150,9 @@ function L2Card() {
   const wraithLabel = isLoading ? "..." : wraithActive ? "Active" : isRunning ? "Not enabled" : "Offline";
 
   return (
-    <Card className="border-purple-600/30">
+    <Card>
       <CardHeader
-        title={<span className="text-purple-400">L2 &middot; Ghost Pay</span>}
+        title={<span>L2 &middot; Ghost Pay</span>}
         action={
           isRunning != null && (
             <StatusDot
@@ -165,20 +165,20 @@ function L2Card() {
       />
       <div className="grid grid-cols-2 gap-3">
         <Tooltip content={TOOLTIPS.l2_height}>
-          <div className="p-3 bg-purple-900/10 rounded-lg">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> L2 Height</div>
             <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-              {isLoading ? "..." : isSyncing ? <span className="text-purple-400">Syncing...</span> : height}
+              {isLoading ? "..." : isSyncing ? <span className="text-[color:var(--dim)]">Syncing...</span> : height}
             </div>
             {isSyncing && (
-              <div className="text-xs text-purple-400 mt-0.5">
+              <div className="text-xs text-[color:var(--dim)] mt-0.5">
                 {height}
               </div>
             )}
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.l2_peers}>
-          <div className="p-3 bg-purple-900/10 rounded-lg">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> L2 Peers</div>
             <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : `${gp?.peer_count ?? 0} connected`}
@@ -186,14 +186,14 @@ function L2Card() {
           </div>
         </Tooltip>
         <Tooltip content={TOOLTIPS.l2_wraith}>
-          <div className="p-3 bg-purple-900/10 rounded-lg">
+          <div className="p-3 bg-[var(--surface)] rounded-lg">
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Wraith</div>
             <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
               {isLoading ? "..." : wraithLabel}
             </div>
           </div>
         </Tooltip>
-        <div className="p-3 bg-purple-900/10 rounded-lg">
+        <div className="p-3 bg-[var(--surface)] rounded-lg">
           <div className="text-xs text-[color:var(--fainter)] mb-1">Status</div>
           <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
             {isLoading ? "..." : isRunning ? "Active" : "Not enabled"}
@@ -279,7 +279,7 @@ function HealthSection() {
   const statusColor = overallStatus === "healthy" ? "online" : overallStatus === "degraded" ? "warning" : "offline";
 
   return (
-    <Card className="border-[color:var(--green)]">
+    <Card>
       <CardHeader
         title="Health"
         action={
@@ -340,8 +340,8 @@ function PrivacySection() {
   const wraithActive = gpRunning && gp?.wraith_enabled;
 
   return (
-    <Card className="border-[color:var(--red)]">
-      <CardHeader title={<span className="text-[color:var(--red)]">Privacy Status</span>} />
+    <Card>
+      <CardHeader title="Privacy Status" />
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <Tooltip content={TOOLTIPS.ghost_mode}>
           <div className="p-3 bg-[var(--surface)] rounded-lg">

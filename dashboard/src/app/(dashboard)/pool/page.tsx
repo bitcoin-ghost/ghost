@@ -116,7 +116,7 @@ function ChartCard({
     <Card>
       <div className="mb-3 flex items-start justify-between gap-2">
         <div>
-          <h3 className="font-medium t-lead" style={{ color: "var(--fg)" }}>
+          <h3 className="t-title" style={{ color: "var(--fg)" }}>
             {title}
           </h3>
           {subtitle && (
@@ -571,7 +571,7 @@ export default function NodePoolPage() {
             <div className="t-label" style={{ color: "var(--dim)" }}>
               Per-miner detail is not available on this node (the miner list is redacted for unauthenticated
               access). Aggregate:{" "}
-              <span style={{ color: "var(--fg)" }}>
+              <span>
                 {minersData?.total ?? minersData?.total_miners ?? minersNow} miner
                 {(minersData?.total ?? minersData?.total_miners ?? minersNow) === 1 ? "" : "s"}
               </span>
@@ -611,7 +611,7 @@ export default function NodePoolPage() {
           connected-miners chart is always a session buffer. */}
       <div
         className="rounded-lg p-3 text-sm"
-        style={{ background: "var(--accent-weak)", border: "1px solid var(--rule)", color: "var(--dim)" }}
+        style={{ background: "var(--surface)", border: "1px solid var(--rule)", color: "var(--dim)" }}
       >
         {series.serverBacked ? (
           <>

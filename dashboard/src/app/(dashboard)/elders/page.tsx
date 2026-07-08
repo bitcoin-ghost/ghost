@@ -283,11 +283,11 @@ export default function EldersPage() {
 
               {/* Downtime warning */}
               {elder?.downtime_warning && (
-                <div className="p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded-lg">
-                  <p className="text-[color:var(--accent)] text-sm font-medium">
+                <div className="p-3 bg-[var(--surface)] border border-[color:var(--yellow)] rounded-lg">
+                  <p className="text-[color:var(--yellow)] text-sm font-medium">
                     Downtime Warning
                   </p>
-                  <p className="text-[color:var(--accent)] text-sm mt-1">
+                  <p className="text-[color:var(--yellow)] text-sm mt-1">
                     {elder.consecutive_downtime_days} consecutive days of downtime detected.
                     Elder status requires 95% uptime over a trailing 7-day window.
                   </p>
@@ -327,14 +327,14 @@ export default function EldersPage() {
 
       {/* ZK Proof Info (Collapsible) */}
       <SectionErrorBoundary section="ZK Proof Info">
-        <Card collapsible defaultCollapsed>
+        <Card>
           <CardHeader
             title="Zero-Knowledge Proof Info"
             subtitle="How the MPC ceremony secures the network"
           />
           <div className="space-y-4 text-sm text-[color:var(--dim)] leading-relaxed">
             <div>
-              <h4 className="text-[color:var(--fg)] font-medium mb-1">What is the MPC Ceremony?</h4>
+              <h4 className="t-title mb-1" style={{ color: "var(--fg)" }}>What is the MPC Ceremony?</h4>
               <p>
                 The Multi-Party Computation (MPC) ceremony generates trusted setup parameters
                 for Groth16 zero-knowledge proofs. Each of the 101 contributors adds a layer of
@@ -343,7 +343,7 @@ export default function EldersPage() {
               </p>
             </div>
             <div>
-              <h4 className="text-[color:var(--fg)] font-medium mb-1">Why Groth16?</h4>
+              <h4 className="t-title mb-1" style={{ color: "var(--fg)" }}>Why Groth16?</h4>
               <p>
                 Groth16 produces the smallest proofs (just 3 group elements, ~128 bytes) with the
                 fastest verification time of any general-purpose ZK proof system. The tradeoff is
@@ -351,7 +351,7 @@ export default function EldersPage() {
               </p>
             </div>
             <div>
-              <h4 className="text-[color:var(--fg)] font-medium mb-1">Elder Status</h4>
+              <h4 className="t-title mb-1" style={{ color: "var(--fg)" }}>Elder Status</h4>
               <p>
                 Nodes that contribute to the MPC ceremony earn permanent Elder status, granting +1
                 share in the 5-4-3-2-1 capability system. The first 101 nodes to contribute claim
@@ -360,7 +360,7 @@ export default function EldersPage() {
               </p>
             </div>
             <div>
-              <h4 className="text-[color:var(--fg)] font-medium mb-1">Ossification</h4>
+              <h4 className="t-title mb-1" style={{ color: "var(--fg)" }}>Ossification</h4>
               <p>
                 Once all 101 slots are filled, the ceremony is ossified. No new contributions
                 can be accepted and the parameters are finalized. The ceremony cannot be restarted
