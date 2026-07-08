@@ -23,32 +23,17 @@ export function PageHeader({ eyebrow, title, subtitle, subtitleFullWidth = true,
     <div className={`flex items-start justify-between gap-4 mb-8 ${className}`}>
       <div className="flex-1 min-w-0">
         {eyebrow && (
-          <div
-            className="font-mono uppercase mb-2"
-            style={{
-              color: 'var(--accent)',
-              fontSize: '11px',
-              letterSpacing: '0.18em',
-            }}
-          >
+          <div className="t-eyebrow mb-2" style={{ color: 'var(--accent)' }}>
             {eyebrow}
           </div>
         )}
-        <h1
-          className="font-normal"
-          style={{
-            color: 'var(--fg)',
-            fontSize: '32px',
-            lineHeight: '1.15',
-            letterSpacing: '-0.01em',
-          }}
-        >
+        <h1 className="t-display" style={{ color: 'var(--fg)' }}>
           {title}
         </h1>
         {subtitle && (
           <p
-            className="mt-2"
-            style={{ color: 'var(--dim)', fontSize: '15px', maxWidth: subtitleFullWidth ? 'none' : '60ch' }}
+            className="t-lead mt-2"
+            style={{ color: 'var(--dim)', maxWidth: subtitleFullWidth ? 'none' : '60ch' }}
           >
             {subtitle}
           </p>

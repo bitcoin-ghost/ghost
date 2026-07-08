@@ -108,6 +108,25 @@ body {
 
 img, svg { display: block; }
 
+/* ── Canonical type scale ──────────────────────────────────────────────────
+   ONE system for every page. Reach for the semantic role, not a pixel value.
+   Kills the drift from ad-hoc inline `fontSize` and off-scale Tailwind sizes.
+   Steps (px): display 32 · stat 24 · title 18 · lead 15 · body 14 · label 13
+               · caption 12 · eyebrow 11.
+   Note: Tailwind text-xs/sm/lg/2xl already map to 12/14/18/24 and are fine to
+   keep; these classes give semantic names AND absorb the off-scale sizes
+   (13/15/16/20/22) that caused the drift. */
+.t-display  { font-size: 32px; line-height: 1.15; font-weight: 400; letter-spacing: -0.01em; }
+.t-stat     { font-size: 24px; line-height: 1.2;  font-weight: 600; letter-spacing: -0.01em; }
+.t-title    { font-size: 18px; line-height: 1.3;  font-weight: 500; }
+.t-lead     { font-size: 15px; line-height: 1.5;  font-weight: 400; }
+.t-body     { font-size: 14px; line-height: 1.5;  font-weight: 400; }
+.t-label    { font-size: 13px; line-height: 1.4;  font-weight: 400; }
+.t-caption  { font-size: 12px; line-height: 1.4;  font-weight: 400; }
+.t-eyebrow  { font-size: 11px; line-height: 1;    font-weight: 500; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.18em; }
+/* Mono uppercase field label (replaces the per-page `labelStyle` objects). */
+.t-label-mono { font-size: 13px; line-height: 1.4; font-weight: 400; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; }
+
 /* Anchor styling matches website: subtle bottom-rule underline, accent on hover.
    Components using `class="bare"` or nav anchors opt out via .bare. */
 a:not(.bare):not([class*="text-"]):not(button) {
