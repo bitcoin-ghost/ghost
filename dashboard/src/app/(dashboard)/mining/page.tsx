@@ -93,7 +93,7 @@ function EndpointField({ label, value }: { label: string; value: string }) {
     <div className="flex items-center justify-between gap-2 p-2 bg-[var(--surface)] rounded">
       <div className="min-w-0">
         <div className="text-xs text-[color:var(--fainter)]">{label}</div>
-        <code className="text-[color:var(--accent)] text-sm block truncate">{value}</code>
+        <code className="text-[color:var(--fg)] text-sm block truncate">{value}</code>
       </div>
       <CopyButton text={value} />
     </div>
@@ -108,7 +108,7 @@ function BestHashCard({ title, entry }: { title: string; entry: BestHashEntry | 
       <div className="text-xs text-[color:var(--dim)] mb-1">{title}</div>
       {hasData ? (
         <>
-          <div className="text-lg font-semibold text-[color:var(--accent)]">{formatDifficulty(diff)}</div>
+          <div className="text-lg text-[color:var(--fg)]">{formatDifficulty(diff)}</div>
           <div className="font-mono text-xs text-[color:var(--dim)] truncate">{entry.hash}</div>
           <div className="text-xs text-[color:var(--fainter)] mt-0.5">{calculateLeadingZeros(diff)} leading zeros</div>
           <div className="flex justify-between items-center mt-1">
@@ -248,36 +248,34 @@ export default function MiningPage() {
       {showSelfCheckBanner && (
         <div
           role="alert"
-          className="rounded-lg border border-[color:var(--accent)] bg-[var(--surface)] p-4"
+          className="rounded-lg border border-[color:var(--yellow)] bg-[var(--surface)] p-4"
         >
           <div className="flex items-start gap-3">
-            <span aria-hidden className="text-[color:var(--accent)] text-lg leading-none mt-0.5">⚠</span>
+            <span aria-hidden className="text-[color:var(--yellow)] text-lg leading-none mt-0.5">⚠</span>
             <div className="flex-1 min-w-0 space-y-2">
-              <div className="text-sm font-semibold text-[color:var(--accent)]">
+              <div className="text-sm text-[color:var(--yellow)]">
                 Capability prerequisite missing
               </div>
               <ul className="space-y-2">
                 {selfCheckFailureList.map((f) => (
-                  <li key={f.capability} className="text-sm text-[color:var(--accent)] leading-relaxed">
+                  <li key={f.capability} className="text-sm text-[color:var(--dim)] leading-relaxed">
                     {f.capability === "public_mining" ? (
                       <>
-                        You&apos;ve enabled <span className="font-medium">Public Mining</span>, but no stratum
-                        server is responding on this node (port {status?.stratum_v1_port || 3333}). Miners
-                        can&apos;t connect and you are{" "}
-                        <span className="font-semibold">NOT earning the +3 Public Mining shares</span>. Start
-                        the stratum stack (sri-translator/sri-pool) or change your mining mode.
+                        You&apos;ve enabled Public Mining, but no stratum server is responding on this
+                        node (port {status?.stratum_v1_port || 3333}). Miners can&apos;t connect and you
+                        are not earning the +3 Public Mining shares. Start the stratum stack
+                        (sri-translator/sri-pool) or change your mining mode.
                       </>
                     ) : (
                       <>
-                        You&apos;ve enabled{" "}
-                        <span className="font-medium">{CAPABILITY_LABELS[f.capability]}</span>, but its
-                        prerequisite isn&apos;t satisfied on this node, so you are not earning its shares.
+                        You&apos;ve enabled {CAPABILITY_LABELS[f.capability]}, but its prerequisite
+                        isn&apos;t satisfied on this node, so you are not earning its shares.
                       </>
                     )}
                     {/* Exact reason straight from the node probe (true port,
                         remediation hint) so the friendly copy above stays
                         correct even when the configured port differs. */}
-                    <div className="text-xs text-[color:var(--accent)] mt-1">{f.reason}</div>
+                    <div className="text-xs text-[color:var(--dim)] mt-1">{f.reason}</div>
                   </li>
                 ))}
               </ul>
@@ -285,7 +283,7 @@ export default function MiningPage() {
             <button
               type="button"
               onClick={() => setSelfCheckDismissed(true)}
-              className="text-[color:var(--accent)] hover:text-[color:var(--accent)] text-sm shrink-0"
+              className="text-[color:var(--dim)] hover:text-[color:var(--fg)] text-sm shrink-0"
               aria-label="Dismiss warning"
             >
               Dismiss
@@ -398,19 +396,19 @@ export default function MiningPage() {
             <div className="space-y-4">
               {showPrivateEndpoints && (
                 <div className="p-4 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
-                  <div className="text-sm text-[color:var(--dim)] font-medium mb-3">Your Stratum Endpoints</div>
+                  <div className="text-sm text-[color:var(--dim)] mb-3">Your Stratum Endpoints</div>
                   <div className="space-y-2">
                     <div className="flex items-center justify-between p-2 bg-[var(--surface)] rounded">
                       <div>
                         <div className="text-xs text-[color:var(--fainter)]">Stratum V1</div>
-                        <code className="text-[color:var(--accent)] text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v1_port || 3333}</code>
+                        <code className="text-[color:var(--fg)] text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v1_port || 3333}</code>
                       </div>
                       <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v1_port || 3333}`} />
                     </div>
                     <div className="flex items-center justify-between p-2 bg-[var(--surface)] rounded">
                       <div>
                         <div className="text-xs text-[color:var(--fainter)]">Stratum V2</div>
-                        <code className="text-[color:var(--accent)] text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v2_port || 34255}</code>
+                        <code className="text-[color:var(--fg)] text-sm">stratum+tcp://{nodeHost}:{status?.stratum_v2_port || 34255}</code>
                       </div>
                       <CopyButton text={`stratum+tcp://${nodeHost}:${status?.stratum_v2_port || 34255}`} />
                     </div>
@@ -420,7 +418,7 @@ export default function MiningPage() {
 
               {showPublicEndpoints && (
                 <div className="p-4 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
-                  <div className="text-sm text-[color:var(--dim)] font-medium mb-3">Public Pool Endpoints</div>
+                  <div className="text-sm text-[color:var(--dim)] mb-3">Public Pool Endpoints</div>
 
                   {/* Two side-by-side stratum columns: SV1 left, SV2 right.
                       Stacks on narrow screens. Every field is individually
@@ -428,7 +426,7 @@ export default function MiningPage() {
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {/* SV1 */}
                     <div className="p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
-                      <div className="text-sm text-[color:var(--dim)] font-medium mb-2">Stratum V1</div>
+                      <div className="text-sm text-[color:var(--dim)] mb-2">Stratum V1</div>
                       <div className="space-y-1.5">
                         <EndpointField label="Host" value={PUBLIC_POOL_HOST} />
                         <EndpointField label="Port" value={String(status?.stratum_v1_port || 3333)} />
@@ -442,7 +440,7 @@ export default function MiningPage() {
 
                     {/* SV2 */}
                     <div className="p-3 bg-[var(--surface)] rounded-lg border border-[var(--rule-strong)]">
-                      <div className="text-sm text-[color:var(--dim)] font-medium mb-2">Stratum V2 (native)</div>
+                      <div className="text-sm text-[color:var(--dim)] mb-2">Stratum V2 (native)</div>
                       <div className="space-y-1.5">
                         <EndpointField label="Host" value={PUBLIC_POOL_HOST} />
                         <EndpointField label="Port" value={String(status?.stratum_v2_port || 34255)} />
@@ -459,22 +457,20 @@ export default function MiningPage() {
                   </div>
 
                   {/* Shared row — the authorize rule applies to BOTH stratums. */}
-                  <div className="mt-4 p-3 bg-[var(--surface)] border border-[color:var(--accent)] rounded">
-                    <div className="text-sm text-[color:var(--accent)] font-medium mb-1">Username rule — SV1 and SV2</div>
+                  <div className="mt-4 p-3 bg-[var(--surface)] border border-[var(--rule-strong)] rounded">
+                    <div className="text-sm text-[color:var(--fg)] mb-1">Username rule — SV1 and SV2</div>
                     <p className="text-xs text-[color:var(--dim)] leading-relaxed">
-                      Set your miner&apos;s username to your{" "}
-                      <span className="text-[color:var(--dim)] font-medium">bech32 payout address</span> followed by a
+                      Set your miner&apos;s username to your bech32 payout address followed by a
                       worker suffix:
                     </p>
-                    <code className="text-[color:var(--accent)] text-xs block my-1.5">
+                    <code className="text-[color:var(--fg)] text-xs block my-1.5">
                       &lt;your-payout-address&gt;.&lt;worker&gt;
                       <span className="text-[color:var(--fainter)]"> — e.g. bc1q….worker1</span>
                     </code>
                     <p className="text-xs text-[color:var(--dim)] leading-relaxed">
                       This is how block rewards are routed to you. Bare worker names (no{" "}
-                      <code className="text-[color:var(--dim)]">.</code> separator, no address) are{" "}
-                      <span className="text-[color:var(--dim)]">rejected</span> — the miner would mine for nobody. The
-                      password field is ignored.
+                      <code className="text-[color:var(--dim)]">.</code> separator, no address) are
+                      rejected — the miner would mine for nobody. The password field is ignored.
                     </p>
                   </div>
                 </div>

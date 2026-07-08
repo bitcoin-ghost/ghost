@@ -59,7 +59,7 @@ function ReaperLiveContext() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Mempool make-up right now, by BUDS class */}
         <div>
-          <div className="t-label" style={{ color: "var(--fg)", fontWeight: 600, marginBottom: "6px" }}>
+          <div className="t-label" style={{ color: "var(--fg)", marginBottom: "6px" }}>
             Mempool by class
           </div>
           {hasSample ? (
@@ -91,7 +91,7 @@ function ReaperLiveContext() {
 
         {/* What the Reaper has been stripping */}
         <div>
-          <div className="t-label" style={{ color: "var(--fg)", fontWeight: 600, marginBottom: "6px" }}>
+          <div className="t-label" style={{ color: "var(--fg)", marginBottom: "6px" }}>
             Recently reaped
           </div>
           <div className="flex items-baseline gap-2">
@@ -135,7 +135,7 @@ export default function AdvancedFilteringPage() {
       <Card>
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 600 }}>Enable advanced controls</div>
+            <div className="t-title" style={{ color: "var(--fg)" }}>Enable advanced controls</div>
             <div className="t-label" style={{ color: "var(--dim)", lineHeight: "1.6", marginTop: "4px" }}>
               Off by default. When on, the reaper vectors and custom mining policy below become editable.
               This switch is per-browser only — it does not change your node until you save a control below.
