@@ -165,10 +165,10 @@ export function StoragePruningCard() {
                   key={preset.blocks}
                   onClick={() => handleOperatorWindowChange(preset.blocks)}
                   disabled={setOperatorWindow.isPending}
-                  className={`p-3 rounded-lg border transition-colors text-left ${
+                  className={`p-3 rounded-lg border transition-colors text-left cursor-pointer disabled:cursor-not-allowed ${
                     owBlocks === preset.blocks
                       ? "bg-[color-mix(in_srgb,var(--accent)_16%,transparent)] border-[color:var(--accent)] text-[color:var(--accent)]"
-                      : "bg-[var(--surface)]/50 border-[color:var(--rule-strong)] text-[color:var(--dim)] hover:border-[color:var(--rule-strong)]"
+                      : "bg-[var(--surface)]/50 border-[color:var(--rule-strong)] text-[color:var(--dim)] hover:border-[color:var(--accent)] hover:text-[color:var(--fg)] hover:bg-[color-mix(in_srgb,var(--accent)_8%,transparent)]"
                   }`}
                 >
                   <div className="font-medium">{preset.label}</div>
