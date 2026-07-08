@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { ConfirmDialog } from "@/components/ui/Dialog";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import {
   useFullConfig,
@@ -100,6 +101,10 @@ export function StoragePruningCard() {
   const archiveMode = status?.archive_mode ?? false;
   const vwBlocks = fullConfig?.pruning?.vw_blocks ?? 288;
   const owBlocks = fullConfig?.pruning?.ow_blocks ?? 0;
+  // A one-time pruned→archive resync (ghostd -reindex) is still running.
+  const reindexPending = fullConfig?.pruning?.reindex_pending ?? false;
+
+  const [confirmArchive, setConfirmArchive] = useState(false);
 
   const handleOperatorWindowChange = async (blocks: number) => {
     try {
@@ -110,12 +115,27 @@ export function StoragePruningCard() {
     }
   };
 
-  const handleArchiveModeToggle = async () => {
+  const applyArchiveMode = async (enabled: boolean) => {
     try {
-      await setArchiveMode.mutateAsync(!archiveMode);
-      success("Mode Changed", `Archive Mode ${!archiveMode ? "enabled" : "disabled"}`);
+      await setArchiveMode.mutateAsync(enabled);
+      success(
+        "Mode Changed",
+        enabled
+          ? "Archive Mode enabled — ghostd is restarting to stop pruning."
+          : "Archive Mode disabled.",
+      );
     } catch (err) {
       error("Failed", err instanceof Error ? err.message : "Unknown error");
+    }
+  };
+
+  const handleArchiveModeToggle = async () => {
+    // Enabling archive restarts ghostd and, on a pruned node, kicks off a long
+    // reindex/resync — confirm first. Disabling is safe, so apply directly.
+    if (!archiveMode) {
+      setConfirmArchive(true);
+    } else {
+      await applyArchiveMode(false);
     }
   };
 
@@ -150,7 +170,36 @@ export function StoragePruningCard() {
               {archiveMode ? "Enabled" : "Disabled"}
             </Button>
           </div>
+
+          {/* One-time pruned→archive resync in flight */}
+          {reindexPending && (
+            <div className="mt-3 flex items-start gap-2 p-3 rounded-lg bg-[color-mix(in_srgb,var(--yellow)_12%,transparent)] border border-[color:var(--yellow)]">
+              <span
+                className="mt-0.5 inline-block w-2 h-2 rounded-full bg-[color:var(--yellow)] animate-pulse"
+                aria-hidden
+              />
+              <p className="text-xs text-[color:var(--dim)] leading-relaxed">
+                <span className="text-[color:var(--fg)] font-medium">Re-indexing.</span>{" "}
+                This node was pruned, so ghostd is rebuilding and re-downloading the full
+                chain (a one-time <code>-reindex</code>). This can take hours; the flag clears
+                itself automatically once the resync completes.
+              </p>
+            </div>
+          )}
         </div>
+
+        <ConfirmDialog
+          isOpen={confirmArchive}
+          onClose={() => setConfirmArchive(false)}
+          onConfirm={async () => {
+            setConfirmArchive(false);
+            await applyArchiveMode(true);
+          }}
+          title="Enable Archive Mode?"
+          message="This restarts ghostd with pruning disabled (-prune=0). If this node is currently pruned, it also triggers a one-time full reindex and re-download of the chain — a long resync that can take hours. The node keeps validating throughout. Continue?"
+          confirmLabel="Enable & restart ghostd"
+          loading={setArchiveMode.isPending}
+        />
 
         {/* Window Visualization */}
         <div className="grid grid-cols-3 gap-4">

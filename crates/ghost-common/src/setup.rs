@@ -296,6 +296,14 @@ const MANAGED_GHOSTD_FLAG_PREFIXES: &[&str] = &[
     "-onlynet",
     "-i2psam",
     "-i2pacceptincoming",
+    // Storage mode (StorageConfig): archive un-prune + Ghost Haze. `-reindex`
+    // and `-exorcist` are ONE-SHOTs — listing their prefixes here guarantees a
+    // stale copy is stripped on every regeneration, so a one-shot flag can only
+    // ever be present while its `*_pending` marker is set.
+    "-prune",
+    "-reindex",
+    "-hazemode",
+    "-exorcist",
 ];
 
 /// True when `tok` is a ghostd flag that this codebase manages via the drop-in,
@@ -312,7 +320,7 @@ fn is_managed_ghostd_flag(tok: &str) -> bool {
 ///
 /// `exec_argv` is the daemon's resolved command line (e.g. the `argv[]` from
 /// `systemctl show ghostd -p ExecStart --value`). Any existing managed flags
-/// (`-ghostreaper*`, `-tormode`, and the daemon flags in
+/// (`-ghostreaper*`, `-tormode`, the daemon flags, and the storage-mode flags in
 /// `MANAGED_GHOSTD_FLAG_PREFIXES`) are stripped and the current set is appended,
 /// wrapped in a drop-in that resets and replaces `ExecStart` (the systemd
 /// override idiom: an empty `ExecStart=` clears the inherited value before the
@@ -322,6 +330,7 @@ pub fn ghostd_managed_dropin(
     exec_argv: &str,
     reaper: &crate::config::ReaperSettings,
     launch: &crate::config::NodeLaunchConfig,
+    storage: &crate::config::StorageConfig,
 ) -> String {
     let base: Vec<&str> = exec_argv
         .split_whitespace()
@@ -329,9 +338,10 @@ pub fn ghostd_managed_dropin(
         .collect();
     let mut flags = reaper.ghostd_flags();
     flags.extend(launch.ghostd_flags());
+    flags.extend(storage.ghostd_flags());
     format!(
-        "# Managed by `ghost-setup apply-reaper` — Ghost Reaper + node launch flags.\n\
-         # Do not edit by hand; regenerate from pool.toml [reaper]/[node_launch].\n\
+        "# Managed by `ghost-setup apply-reaper` — Ghost Reaper + node launch + storage flags.\n\
+         # Do not edit by hand; regenerate from pool.toml [reaper]/[node_launch]/[storage].\n\
          [Service]\n\
          ExecStart=\n\
          ExecStart={} {}\n",
@@ -424,7 +434,7 @@ pub fn apply_mempool_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{NodeLaunchConfig, ReaperSettings};
+    use crate::config::{HazeMode, NodeLaunchConfig, ReaperSettings, StorageConfig};
 
     #[test]
     fn test_ghostd_managed_dropin_strips_and_appends() {
@@ -434,7 +444,8 @@ mod tests {
             ..Default::default()
         };
         let launch = NodeLaunchConfig::default();
-        let dropin = ghostd_managed_dropin(exec, &s, &launch);
+        let storage = StorageConfig::default();
+        let dropin = ghostd_managed_dropin(exec, &s, &launch, &storage);
 
         // resets ExecStart then re-emits the base (minus any managed flags)
         assert!(dropin.contains("[Service]\nExecStart=\nExecStart="));
@@ -450,6 +461,11 @@ mod tests {
         assert!(dropin.contains("-ghostreaper-dustfloodthreshold=330"));
         // Tor off by default → no -tormode flag emitted.
         assert!(!dropin.contains("-tormode"));
+        // Default storage (standard, non-archive) → no storage flags emitted.
+        assert!(!dropin.contains("-prune"));
+        assert!(!dropin.contains("-reindex"));
+        assert!(!dropin.contains("-hazemode"));
+        assert!(!dropin.contains("-exorcist"));
     }
 
     #[test]
@@ -460,10 +476,12 @@ mod tests {
         let exec = "/opt/ghost/bin/ghostd -signet -tormode=1 -ghostreaper=enabled";
         let reaper = ReaperSettings::default();
 
+        let storage = StorageConfig::default();
         let on = ghostd_managed_dropin(
             exec,
             &reaper,
             &NodeLaunchConfig { tor_mode: true, ..Default::default() },
+            &storage,
         );
         assert_eq!(on.matches("-tormode=1").count(), 1);
 
@@ -471,6 +489,7 @@ mod tests {
             exec,
             &reaper,
             &NodeLaunchConfig { tor_mode: false, ..Default::default() },
+            &storage,
         );
         assert!(!off.contains("-tormode"));
     }
@@ -499,7 +518,8 @@ mod tests {
             i2p_accept_incoming: Some(true),
         };
 
-        let dropin = ghostd_managed_dropin(exec, &reaper, &launch);
+        let storage = StorageConfig::default();
+        let dropin = ghostd_managed_dropin(exec, &reaper, &launch, &storage);
 
         // Base non-managed args survive.
         assert!(dropin.contains("/opt/ghost/bin/ghostd"));
@@ -540,9 +560,89 @@ mod tests {
             .find(|l| l.starts_with("ExecStart=/"))
             .unwrap()
             .trim_start_matches("ExecStart=");
-        let dropin2 = ghostd_managed_dropin(regen_exec, &reaper, &launch);
+        let dropin2 = ghostd_managed_dropin(regen_exec, &reaper, &launch, &storage);
         assert_eq!(dropin2.matches("-maxmempool=").count(), 1);
         assert_eq!(dropin2.matches("-onlynet=").count(), 2);
         assert_eq!(dropin2.matches("-tormode=1").count(), 1);
+    }
+
+    #[test]
+    fn test_ghostd_managed_dropin_archive_emits_prune_zero() {
+        // Archive mode ON → -prune=0 emitted so ghostd stops pruning. Archive
+        // OFF emits nothing (leaves ghostd's own configured prune behaviour).
+        let exec = "/opt/ghost/bin/ghostd -signet -datadir=/var/lib/bitcoin";
+        let reaper = ReaperSettings::default();
+        let launch = NodeLaunchConfig::default();
+
+        let on = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &launch,
+            &StorageConfig { archive_mode: true, ..Default::default() },
+        );
+        assert!(on.contains("-prune=0"));
+        // No reindex unless explicitly armed.
+        assert!(!on.contains("-reindex"));
+
+        let off = ghostd_managed_dropin(exec, &reaper, &launch, &StorageConfig::default());
+        assert!(!off.contains("-prune"));
+    }
+
+    #[test]
+    fn test_ghostd_managed_dropin_reindex_oneshot_strips_stale() {
+        // A prior drop-in armed the one-shot -reindex + -prune=0. Regenerating
+        // once the marker has been cleared must strip the stale -reindex, leaving
+        // -prune=0 (archive still on) with no reindex.
+        let exec = "/opt/ghost/bin/ghostd -signet -prune=0 -reindex";
+        let reaper = ReaperSettings::default();
+        let launch = NodeLaunchConfig::default();
+
+        let armed = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &launch,
+            &StorageConfig { archive_mode: true, reindex_pending: true, ..Default::default() },
+        );
+        assert_eq!(armed.matches("-reindex").count(), 1);
+        assert_eq!(armed.matches("-prune=0").count(), 1);
+
+        // Marker cleared: -reindex must be gone; -prune=0 retained.
+        let cleared = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &launch,
+            &StorageConfig { archive_mode: true, reindex_pending: false, ..Default::default() },
+        );
+        assert!(!cleared.contains("-reindex"));
+        assert_eq!(cleared.matches("-prune=0").count(), 1);
+    }
+
+    #[test]
+    fn test_ghostd_managed_dropin_haze_hazed_and_exorcist_oneshot() {
+        // While a retroactive conversion is pending, emit -exorcist and SUPPRESS
+        // -hazemode=hazed (selecting hazed with blk*.dat present is fatal in
+        // ghostd until the conversion runs). Once the marker clears, emit the
+        // persistent -hazemode=hazed and drop -exorcist.
+        let exec = "/opt/ghost/bin/ghostd -signet -hazemode=hazed -exorcist";
+        let reaper = ReaperSettings::default();
+        let launch = NodeLaunchConfig::default();
+
+        let converting = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &launch,
+            &StorageConfig { haze_mode: HazeMode::Hazed, exorcist_pending: true, ..Default::default() },
+        );
+        assert_eq!(converting.matches("-exorcist").count(), 1);
+        assert!(!converting.contains("-hazemode=hazed"));
+
+        let converted = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &launch,
+            &StorageConfig { haze_mode: HazeMode::Hazed, exorcist_pending: false, ..Default::default() },
+        );
+        assert!(!converted.contains("-exorcist"));
+        assert_eq!(converted.matches("-hazemode=hazed").count(), 1);
     }
 }
