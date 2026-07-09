@@ -888,7 +888,7 @@ RPCHelpMan rescanblockchain()
     case CWallet::ScanResult::SUCCESS:
         break;
     case CWallet::ScanResult::FAILURE:
-        throw JSONRPCError(RPC_MISC_ERROR, "Rescan failed. Potentially corrupted data files.");
+        throw JSONRPCError(RPC_MISC_ERROR, "Rescan failed to read block data. On a hazed or pruned node the historical blocks are not kept on disk, so a full rescan of that range is not possible — use the address index (-addressindex) for balance and history, or restrict the rescan to the retained recent window. If this node keeps full blocks, the data files may be corrupted (consider -reindex).");
     case CWallet::ScanResult::USER_ABORT:
         throw JSONRPCError(RPC_MISC_ERROR, "Rescan aborted.");
         // no default case, so the compiler can warn about missing cases
