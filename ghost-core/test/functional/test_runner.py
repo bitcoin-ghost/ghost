@@ -237,6 +237,7 @@ BASE_SCRIPTS = [
     'rpc_setban.py --v2transport',
     'p2p_blocksonly.py',
     'feature_ghost_mode_local_egress.py',
+    'feature_ghost_tier_policy.py',
     'mining_prioritisetransaction.py',
     'p2p_invalid_locator.py',
     'p2p_invalid_block.py --v1transport',

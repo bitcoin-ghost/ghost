@@ -46,6 +46,7 @@ add_executable(test_ghost
   fs_tests.cpp
   getarg_tests.cpp
   ghost_reaper_tests.cpp
+  ghost_tier_tests.cpp
   gsp_tests.cpp
   hash_tests.cpp
   haze_tests.cpp

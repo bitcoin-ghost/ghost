@@ -136,6 +136,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   outputtype.cpp
   policy/feerate.cpp
   policy/ghost_reaper.cpp
+  policy/ghost_tier.cpp
   policy/policy.cpp
   pow.cpp
   protocol.cpp

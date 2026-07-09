@@ -34,6 +34,7 @@
 #include <node/utxo_snapshot.h>
 #include <policy/ephemeral_policy.h>
 #include <policy/ghost_reaper.h>
+#include <policy/ghost_tier.h>
 #include <policy/policy.h>
 #include <policy/rbf.h>
 #include <policy/settings.h>
@@ -920,6 +921,19 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         std::string reaper_reason;
         if (!IsGhostReaperClean(tx, m_pool.m_opts.ghost_reaper, reaper_reason)) {
             return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reaper_reason);
+        }
+    }
+
+    // Ghost BUDS tier/policy gate: reject transactions whose classified tier is
+    // not in the operator's allowed-tier set, or that violate a configured
+    // content toggle / per-field limit. This makes ghostd's mempool the same set
+    // ghost-pool would keep at block-template time. The gate is a fast no-op
+    // when the policy is inert (the default full_open profile), so a node with
+    // no -ghostpolicy-* flags behaves exactly as before.
+    if (!m_pool.m_opts.ghost_tier_policy.IsInert()) {
+        std::string tier_reason;
+        if (!IsGhostTierPolicyClean(tx, m_pool.m_opts.ghost_tier_policy, ws.m_base_fees, tier_reason)) {
+            return state.Invalid(TxValidationResult::TX_NOT_STANDARD, tier_reason);
         }
     }
 

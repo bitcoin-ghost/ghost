@@ -8,6 +8,7 @@
 
 #include <policy/feerate.h>
 #include <policy/ghost_reaper.h>
+#include <policy/ghost_tier.h>
 #include <policy/policy.h>
 
 #include <chrono>
@@ -67,6 +68,10 @@ struct MemPoolOptions {
     bool persist_v1_dat{DEFAULT_PERSIST_V1_DAT};
     /** Ghost Reaper dead-code mempool filter configuration */
     GhostReaperConfig ghost_reaper{};
+    /** Ghost BUDS tier/policy mempool-acceptance configuration. Default is
+     *  fully permissive (full_open): every tier and content type allowed, no
+     *  custom limits — inert, so the gate is a no-op unless configured. */
+    GhostTierPolicyConfig ghost_tier_policy{};
     MemPoolLimits limits{};
 
     ValidationSignals* signals{nullptr};
