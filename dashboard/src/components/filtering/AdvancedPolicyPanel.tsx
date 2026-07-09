@@ -24,17 +24,17 @@ const TIER_TOGGLES: { key: keyof PolicyCustomConfig; label: string; desc: string
 ];
 
 const CONTENT_TOGGLES: { key: keyof PolicyCustomConfig; label: string; desc: string }[] = [
-  { key: "allow_inscriptions", label: "Inscriptions", desc: "Mine Ordinals inscription transactions." },
-  { key: "allow_runes", label: "Runes", desc: "Mine Runes runestone transactions." },
-  { key: "allow_brc20", label: "BRC-20", desc: "Mine BRC-20 token-transfer transactions." },
+  { key: "allow_inscriptions", label: "Inscriptions", desc: "Accept Ordinals inscription transactions." },
+  { key: "allow_runes", label: "Runes", desc: "Accept Runes runestone transactions." },
+  { key: "allow_brc20", label: "BRC-20", desc: "Accept BRC-20 token-transfer transactions." },
 ];
 
 const NUMERIC_FIELDS: { key: keyof PolicyCustomConfig; label: string; unit: string; desc: string; step?: number }[] = [
-  { key: "max_op_return_size", label: "Max OP_RETURN size", unit: "bytes", desc: "Largest OP_RETURN payload to mine. 0 drops every OP_RETURN transaction." },
+  { key: "max_op_return_size", label: "Max OP_RETURN size", unit: "bytes", desc: "Largest OP_RETURN payload to accept. 0 drops every OP_RETURN transaction." },
   { key: "max_witness_per_input", label: "Max witness / input", unit: "bytes", desc: "Largest witness per input. Low values block inscription-style witness stuffing." },
-  { key: "max_tx_outputs", label: "Max tx outputs", unit: "outputs", desc: "Most outputs a transaction may have to be eligible for a block." },
-  { key: "max_tx_size", label: "Max tx size", unit: "vB", desc: "Largest transaction to mine, in virtual bytes." },
-  { key: "min_fee_rate", label: "Min fee rate", unit: "sat/vB", desc: "Lowest fee rate to mine. 0 means no minimum.", step: 0.1 },
+  { key: "max_tx_outputs", label: "Max tx outputs", unit: "outputs", desc: "Most outputs a transaction may have to be accepted." },
+  { key: "max_tx_size", label: "Max tx size", unit: "vB", desc: "Largest transaction to accept, in virtual bytes." },
+  { key: "min_fee_rate", label: "Min fee rate", unit: "sat/vB", desc: "Lowest fee rate to accept. 0 means no minimum.", step: 0.1 },
 ];
 
 export function AdvancedPolicyPanel() {
@@ -107,12 +107,12 @@ export function AdvancedPolicyPanel() {
         )}
       </div>
       <div className="t-label" style={{ color: "var(--dim)", marginBottom: "12px" }}>
-        Per-field control over which transaction classes, content and sizes this node mines. Saving writes{" "}
+        Per-field control over which transaction classes, content and sizes this node accepts. Saving writes{" "}
         <code>[policy].custom</code>, sets the profile to <code>custom</code>, and restarts the node.
       </div>
 
       {/* Tiers */}
-      <PanelSection title="Transaction classes to mine">
+      <PanelSection title="Transaction classes to accept">
         {TIER_TOGGLES.map((t) => (
           <CheckboxRow
             key={t.key}

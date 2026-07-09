@@ -257,6 +257,12 @@ function NodeMempoolExplorer() {
         {openLink}
       </div>
 
+      <p className="t-label" style={{ color: "var(--dim)", marginBottom: "12px", lineHeight: 1.6 }}>
+        Your node&apos;s own mempool — which now equals the set your blocks build from. Filtered classes
+        never enter it, so this one view is your block builder: what you see here is exactly what your
+        blocks mine.
+      </p>
+
       {state === "blocked" ? (
         <div
           className="space-y-2"

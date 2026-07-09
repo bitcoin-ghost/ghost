@@ -48,18 +48,18 @@ function modeSummary(
 ): { value: string; sublabel: string } {
   switch (profile) {
     case "full_open":
-      return { value: "Open", sublabel: "Mining every kind of transaction" };
+      return { value: "Open", sublabel: "Accepting every kind of transaction" };
     case "permissive":
-      return { value: "Standard", sublabel: "T3 not mined into your blocks" };
+      return { value: "Standard", sublabel: "T3 not accepted" };
     case "bitcoin_pure":
     case "strict":
-      return { value: "Strict", sublabel: "T2 + T3 not mined into your blocks" };
+      return { value: "Strict", sublabel: "T2 + T3 not accepted" };
     case "custom":
       return dropped.length
-        ? { value: "Custom", sublabel: `Dropping ${dropped.join(" + ")}` }
-        : { value: "Custom", sublabel: "Mining every tier" };
+        ? { value: "Custom", sublabel: `Rejecting ${dropped.join(" + ")}` }
+        : { value: "Custom", sublabel: "Accepting every tier" };
     default:
-      return { value: modeLabel(profile), sublabel: "The tier policy this node mines under" };
+      return { value: modeLabel(profile), sublabel: "The tier policy this node accepts under" };
   }
 }
 
@@ -147,7 +147,7 @@ export default function FilteringOverviewPage() {
       <PageHeader
         eyebrow="filtering"
         title="Filtering."
-        subtitle="Two layers keep your blocks clean — the Reaper filters spam, and a tier policy picks which transaction classes you mine. Set it in Basic; fine-tune both in Advanced."
+        subtitle="Two layers keep your mempool clean — the Reaper rejects spam, and a tier policy picks which transaction classes your node accepts. Filtered transactions never enter your mempool, so they are not relayed or mined. Set it in Basic; fine-tune both in Advanced."
         subtitleFullWidth
       />
 
@@ -158,7 +158,7 @@ export default function FilteringOverviewPage() {
           label="Mode"
           value={fullConfig ? mode.value : "—"}
           sublabel={fullConfig ? mode.sublabel : undefined}
-          tooltip="What your node mines, in plain English. This is the tier policy — which kinds of transaction end up in the blocks you build."
+          tooltip="What your node accepts, in plain English. This is the tier policy — which classes enter your mempool, and therefore the blocks you build."
         />
         <StatCard
           label="Mempool right now"
@@ -176,7 +176,7 @@ export default function FilteringOverviewPage() {
           sublabel={
             dropped.length
               ? `${droppedCount} of ${sampled} in ${droppedLabel}`
-              : "You mine every tier"
+              : "You accept every tier"
           }
           tooltip="Share of that same live sample sitting in the tiers your policy drops. 0% means your node currently mines everything in the mempool — that's expected on Open mode, not a fault. (This is tier policy only — the Reaper still strips dead-code spam on top of it.)"
         />
@@ -213,26 +213,29 @@ export default function FilteringOverviewPage() {
               The Reaper — your junk filter
             </div>
             <p className="t-body" style={{ color: "var(--dim)", lineHeight: 1.6 }}>
-              It recognises known spam patterns — inscription stuffing, dust floods, oversized data — and
-              throws them out of your mempool and your blocks entirely. Junk it catches is never relayed on.
-              The Reaper runs all the time on a sensible default; tune its individual detectors in Advanced.
+              It rejects specific spam patterns — inscription stuffing, dust floods, oversized data —
+              regardless of class, at your mempool. Transactions it catches are never accepted, relayed, or
+              mined. The Reaper runs all the time on a sensible default; tune its individual detectors in
+              Advanced.
             </p>
           </div>
           <div>
             <div className="t-lead" style={{ color: "var(--fg)", fontWeight: 500, marginBottom: "4px" }}>
-              Tier policy (BUDS) — what your blocks mine
+              Tier policy (BUDS) — which classes your node accepts
             </div>
             <p className="t-body" style={{ color: "var(--dim)", lineHeight: 1.6 }}>
               Legitimate transactions come in classes, from ordinary payments (T0) up to heavy data (T3).
-              This is your choice of which classes earn space in the blocks you mine. It does not block relay —
-              valid transactions still flow through your node to the network; you are only deciding what goes
-              in your block. Set it in Basic, customise it in Advanced.
+              This is your choice of which classes your node accepts — and therefore relays and mines.
+              Filtered classes are rejected at your mempool, exactly like Bitcoin Core or Knots: they never
+              enter it, so they are not relayed on and never appear in the blocks you build. Set it in Basic,
+              customise it in Advanced.
             </p>
           </div>
           <div style={{ borderTop: "1px solid var(--rule)", paddingTop: "12px" }}>
             <p className="t-body" style={{ color: "var(--dim)", lineHeight: 1.6 }}>
-              In one line: the Reaper is the bouncer that keeps junk out; the tier policy is the menu deciding
-              which of the legitimate rest you mine. Basic sets the menu; Advanced tunes both.
+              In one line: the Reaper is the bouncer that rejects junk at the door; the tier policy is the
+              menu deciding which classes your node accepts. Whatever gets in is what you relay and mine — your
+              mempool is your block-building set. Basic sets the menu; Advanced tunes both.
             </p>
           </div>
         </div>
@@ -251,10 +254,10 @@ export default function FilteringOverviewPage() {
               value={modeLabel(profile)}
               desc={
                 dropped.length
-                  ? `Drops ${droppedLabel} — mines everything else.`
+                  ? `Rejects ${droppedLabel} — accepts everything else.`
                   : profile === "full_open"
-                    ? "Mines every class, including heavy data (T3)."
-                    : "The tier policy this node mines under."
+                    ? "Accepts every class, including heavy data (T3)."
+                    : "The tier policy this node accepts under."
               }
             />
             <StatusRow
