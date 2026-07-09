@@ -775,8 +775,12 @@ void BlockManager::UnlinkPrunedFiles(const std::set<int>& setFilesToPrune) const
         FlatFilePos pos(*it, 0);
         const bool removed_blockfile{fs::remove(m_block_file_seq.FileName(pos), ec)};
         const bool removed_undofile{fs::remove(m_undo_file_seq.FileName(pos), ec)};
-        if (removed_blockfile || removed_undofile) {
-            LogDebug(BCLog::BLOCKSTORAGE, "Prune: %s deleted blk/rev (%05u)\n", __func__, *it);
+        // Hazed nodes store stripped blocks in gsb?????.dat, numbered in the same
+        // file sequence as blk files. Prune them too — otherwise a pruned hazed
+        // node never actually frees its stripped archive (pruned-hazed mode).
+        const bool removed_gsbfile{fs::remove(m_gsb_file_seq.FileName(pos), ec)};
+        if (removed_blockfile || removed_undofile || removed_gsbfile) {
+            LogDebug(BCLog::BLOCKSTORAGE, "Prune: %s deleted blk/rev/gsb (%05u)\n", __func__, *it);
         }
     }
 }
