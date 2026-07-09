@@ -4,13 +4,12 @@ import type { CSSProperties, ReactNode } from "react";
 import Link from "next/link";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
+import { StatCard } from "@/components/ui/StatCard";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
+import { MempoolMetrics } from "@/components/filtering/MempoolMetrics";
 import { useConfig, useFullConfig } from "@/hooks/queries/useConfigQueries";
 import { useFilteringActivity } from "@/hooks/queries/useFilteringQueries";
 import { useAdvancedFilteringGate } from "@/hooks/useAdvancedFilteringGate";
-import type { FullNodeConfig } from "@/types/api";
-
-type TierKey = "T0" | "T1" | "T2" | "T3";
 
 // Plain-English preset name for the stored [policy].profile, normalising the
 // legacy `bitcoin_pure` alias to Strict. Returns "Custom" for the custom policy.
@@ -30,36 +29,6 @@ function modeLabel(profile?: string): string {
   }
 }
 
-// Which BUDS tiers this node's policy drops (does not mine). Presets map to a
-// fixed set; a custom policy drops any tier whose allow flag is false.
-function droppedTiers(
-  profile: string | undefined,
-  custom?: FullPolicyCustom,
-): TierKey[] {
-  switch (profile) {
-    case "bitcoin_pure":
-    case "strict":
-      return ["T2", "T3"];
-    case "permissive":
-      return ["T3"];
-    case "full_open":
-      return [];
-    case "custom": {
-      if (!custom) return [];
-      const dropped: TierKey[] = [];
-      if (!custom.allow_t0) dropped.push("T0");
-      if (!custom.allow_t1) dropped.push("T1");
-      if (!custom.allow_t2) dropped.push("T2");
-      if (!custom.allow_t3) dropped.push("T3");
-      return dropped;
-    }
-    default:
-      return [];
-  }
-}
-
-type FullPolicyCustom = NonNullable<FullNodeConfig["policy"]>["custom"];
-
 export default function FilteringOverviewPage() {
   const { data: config } = useConfig();
   const { data: fullConfig } = useFullConfig();
@@ -67,8 +36,6 @@ export default function FilteringOverviewPage() {
 
   const reaperOn = config?.reaper ?? false;
   const profile = fullConfig?.policy?.profile;
-  const dropped = droppedTiers(profile, fullConfig?.policy?.custom);
-  const droppedLabel = dropped.length ? dropped.join(" + ") : "none";
 
   return (
     <div className="space-y-6">
@@ -77,47 +44,6 @@ export default function FilteringOverviewPage() {
         title="Filtering."
         subtitle="What your node filters. Set it in Basic, fine-tune in Advanced."
       />
-
-      {/* Status readout — which settings are active */}
-      <SectionErrorBoundary section="Active settings">
-        <Card>
-          <CardHeader
-            title="What's active"
-            subtitle="The filtering your node is running right now."
-          />
-          <div className="space-y-3">
-            <StatusRow
-              label="Mode"
-              value={modeLabel(profile)}
-              desc={
-                dropped.length
-                  ? `Rejects ${droppedLabel} — accepts everything else.`
-                  : profile === "full_open"
-                    ? "Accepts every class, including heavy data (T3)."
-                    : "The tier policy this node accepts under."
-              }
-            />
-            <StatusRow
-              label="Reaper"
-              value={reaperOn ? "On" : "Off"}
-              desc={
-                reaperOn
-                  ? "Strips dead-code spam from your mempool relay and block templates."
-                  : "Not removing dead-code spam."
-              }
-            />
-            <StatusRow
-              label="Advanced controls"
-              value={advancedEnabled ? "Enabled" : "Disabled"}
-              desc={
-                advancedEnabled
-                  ? "Per-vector reaper + custom policy controls are unlocked in Advanced."
-                  : "Basic presets only. Unlock per-vector controls in Advanced."
-              }
-            />
-          </div>
-        </Card>
-      </SectionErrorBoundary>
 
       {/* How filtering works — short two-line explainer for newcomers */}
       <Card>
@@ -133,6 +59,26 @@ export default function FilteringOverviewPage() {
           </p>
         </div>
       </Card>
+
+      {/* Status readout — which settings are active. Compact tiles: label + value. */}
+      <SectionErrorBoundary section="Active settings">
+        <Card>
+          <CardHeader
+            title="What's active"
+            subtitle="The filtering your node is running right now."
+          />
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <StatCard label="Mode" value={modeLabel(profile)} />
+            <StatCard label="Reaper" value={reaperOn ? "On" : "Off"} />
+            <StatCard label="Advanced controls" value={advancedEnabled ? "Enabled" : "Disabled"} />
+          </div>
+        </Card>
+      </SectionErrorBoundary>
+
+      {/* Mempool tx-count tiles + over-time graph */}
+      <SectionErrorBoundary section="Mempool metrics">
+        <MempoolMetrics />
+      </SectionErrorBoundary>
 
       {/* What the node has actually rejected, and where */}
       <SectionErrorBoundary section="Filtering activity">
@@ -154,25 +100,6 @@ export default function FilteringOverviewPage() {
           />
         </div>
       </SectionErrorBoundary>
-    </div>
-  );
-}
-
-function StatusRow({ label, value, desc }: { label: string; value: string; desc: string }) {
-  return (
-    <div
-      style={{
-        padding: "12px 14px",
-        border: "1px solid var(--rule)",
-        borderRadius: "6px",
-        background: "var(--bg)",
-      }}
-    >
-      <div className="flex items-center gap-2">
-        <span className="t-body" style={{ color: "var(--dim)" }}>{label}</span>
-        <span className="t-body" style={{ color: "var(--fg)" }}>{value}</span>
-      </div>
-      <div className="t-label" style={{ color: "var(--dim)", marginTop: "2px" }}>{desc}</div>
     </div>
   );
 }
@@ -232,7 +159,7 @@ function FilteringActivityCard() {
     <Card>
       <CardHeader
         title="Filtering activity"
-        subtitle="What your node has rejected, and where — since it started."
+        subtitle="Transactions your node has rejected, by stage — cumulative since your node last started."
       />
 
       {isLoading && !haveData ? (
@@ -245,6 +172,10 @@ function FilteringActivityCard() {
             <SummaryTile label="Stripped from your block" value={count(stripped)} />
             <SummaryTile label="Total rejected" value={count(totalRejected)} />
           </div>
+
+          <p className="t-caption" style={{ color: "var(--fainter)" }}>
+            Running totals since your node last started — they reset to zero on a node restart.
+          </p>
 
           {(nothingYet || !haveData) && (
             <p className="t-label" style={{ color: "var(--dim)" }}>
