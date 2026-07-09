@@ -75,7 +75,7 @@ export default function FilteringOverviewPage() {
     <div className="space-y-6">
       <PageHeader
         eyebrow="filtering"
-        title="Filtering."
+        title="Overview"
         subtitle="What your node filters. Set it in Basic, fine-tune in Advanced."
       />
 

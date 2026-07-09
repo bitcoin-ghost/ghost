@@ -10,6 +10,7 @@ import {
   useGhostPayStatus,
 } from "@/hooks/queries";
 import { StoragePruningCard } from "@/components/settings/StoragePruningCard";
+import { PageHeader } from "@/components/ui/PageHeader";
 
 function formatTimestamp(ts: number): string {
   if (!ts) return "Never";
@@ -41,10 +42,12 @@ export default function StoragePage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-[color:var(--fg)]">Storage & Pruning</h1>
-        {archiveMode && <Badge variant="success">+5 Shares (Archive)</Badge>}
-      </div>
+      <PageHeader
+        eyebrow="storage"
+        title="Storage & Pruning"
+        subtitle="Block-storage pruning for this node — how much recent chain history to keep on disk."
+        actions={archiveMode ? <Badge variant="success">+5 Shares (Archive)</Badge> : undefined}
+      />
 
       {isLoading ? (
         <>
