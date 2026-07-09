@@ -16,10 +16,15 @@
 #include <policy/policy.h>
 #include <tinyformat.h>
 #include <util/moneystr.h>
+#include <util/strencodings.h>
+#include <util/string.h>
 #include <util/translation.h>
 
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
+#include <string>
 
 using common::AmountErrMsg;
 using kernel::MemPoolLimits;
@@ -137,6 +142,69 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
         }
         if (argsman.IsArgSet("-ghostreaper-dustfloodthreshold")) {
             reaper.dust_flood_threshold = argsman.GetIntArg("-ghostreaper-dustfloodthreshold", 330);
+        }
+    }
+
+    // Ghost BUDS tier/policy configuration.
+    //
+    // Every flag defaults to the fully permissive "full_open" profile: all four
+    // tiers allowed, every content type allowed, and no custom per-field limits.
+    // In that state GhostTierPolicyConfig::IsInert() is true and the mempool
+    // gate is a no-op, so a node with no -ghostpolicy-* flags behaves exactly as
+    // it did before this feature existed. ghost-setup wires these flags through
+    // the managed systemd drop-in (see MANAGED_GHOSTD_FLAG_PREFIXES).
+    {
+        auto& tier = mempool_opts.ghost_tier_policy;
+
+        if (argsman.IsArgSet("-ghostpolicy-allowtiers")) {
+            // CSV of tier numbers, e.g. "0,1,2,3". Listed tiers are allowed;
+            // any tier not listed is rejected at mempool acceptance.
+            tier.allow_t0 = false;
+            tier.allow_t1 = false;
+            tier.allow_t2 = false;
+            tier.allow_t3 = false;
+            const std::string csv = argsman.GetArg("-ghostpolicy-allowtiers", "");
+            for (const auto& part : util::SplitString(csv, ',')) {
+                const std::string trimmed = util::TrimString(part);
+                if (trimmed.empty()) continue;
+                const auto n = ToIntegral<int>(trimmed);
+                if (!n || *n < 0 || *n > 3) {
+                    return util::Error{Untranslated(strprintf("Invalid tier '%s' in -ghostpolicy-allowtiers (expected values 0-3)", trimmed))};
+                }
+                switch (*n) {
+                case 0: tier.allow_t0 = true; break;
+                case 1: tier.allow_t1 = true; break;
+                case 2: tier.allow_t2 = true; break;
+                case 3: tier.allow_t3 = true; break;
+                }
+            }
+        }
+
+        tier.allow_inscriptions = argsman.GetBoolArg("-ghostpolicy-allowinscriptions", true);
+        tier.allow_runes        = argsman.GetBoolArg("-ghostpolicy-allowrunes", true);
+        tier.allow_brc20        = argsman.GetBoolArg("-ghostpolicy-allowbrc20", true);
+
+        if (argsman.IsArgSet("-ghostpolicy-maxopreturn")) {
+            tier.max_op_return_size = static_cast<unsigned int>(argsman.GetIntArg("-ghostpolicy-maxopreturn", 0));
+        }
+        if (argsman.IsArgSet("-ghostpolicy-maxwitness")) {
+            tier.max_witness_per_input = static_cast<unsigned int>(argsman.GetIntArg("-ghostpolicy-maxwitness", 0));
+        }
+        if (argsman.IsArgSet("-ghostpolicy-maxtxoutputs")) {
+            tier.max_tx_outputs = static_cast<unsigned int>(argsman.GetIntArg("-ghostpolicy-maxtxoutputs", 0));
+        }
+        if (argsman.IsArgSet("-ghostpolicy-maxtxsize")) {
+            tier.max_tx_size = static_cast<unsigned int>(argsman.GetIntArg("-ghostpolicy-maxtxsize", 0));
+        }
+        if (argsman.IsArgSet("-ghostpolicy-minfeerate")) {
+            const std::string raw = argsman.GetArg("-ghostpolicy-minfeerate", "");
+            errno = 0;
+            char* end = nullptr;
+            const double val = std::strtod(raw.c_str(), &end);
+            if (raw.empty() || end != raw.c_str() + raw.size() || errno != 0 || val < 0) {
+                return util::Error{Untranslated(strprintf("Invalid -ghostpolicy-minfeerate '%s' (expected a non-negative sat/vB value)", raw))};
+            }
+            tier.min_fee_rate = val;
         }
     }
 

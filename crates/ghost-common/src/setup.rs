@@ -283,6 +283,10 @@ pub fn apply_reaper(
 const MANAGED_GHOSTD_FLAG_PREFIXES: &[&str] = &[
     // Reaper (per-vector) + Tor.
     "-ghostreaper",
+    // BUDS tier/policy mempool-acceptance gate (allowed-tier set, content
+    // toggles, custom per-field limits). ghostd already accepts these flags;
+    // Phase 2 emits them from PolicyConfig::ghostd_flags through this drop-in.
+    "-ghostpolicy",
     "-tormode",
     // Daemon / node launch settings (NodeLaunchConfig).
     "-maxmempool",
