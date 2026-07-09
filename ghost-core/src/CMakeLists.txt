@@ -211,6 +211,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   index/base.cpp
   index/blockfilterindex.cpp
   index/coinstatsindex.cpp
+  index/addressindex.cpp
   index/txindex.cpp
   init.cpp
   kernel/chain.cpp
@@ -263,6 +264,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   policy/settings.cpp
   policy/truc_policy.cpp
   rest.cpp
+  rpc/addressindex.cpp
   rpc/blockchain.cpp
   rpc/external_signer.cpp
   rpc/fees.cpp
