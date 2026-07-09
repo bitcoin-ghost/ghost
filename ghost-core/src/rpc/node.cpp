@@ -7,6 +7,7 @@
 
 #include <chainparams.h>
 #include <httpserver.h>
+#include <index/addressindex.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <index/txindex.h>
@@ -393,6 +394,10 @@ static RPCHelpMan getindexinfo()
 
     if (g_coin_stats_index) {
         result.pushKVs(SummaryToJSON(g_coin_stats_index->GetSummary(), index_name));
+    }
+
+    if (g_addressindex) {
+        result.pushKVs(SummaryToJSON(g_addressindex->GetSummary(), index_name));
     }
 
     ForEachBlockFilterIndex([&result, &index_name](const BlockFilterIndex& index) {
