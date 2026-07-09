@@ -1210,6 +1210,34 @@ export interface ShroudStatus {
   avg_delay_ms: number;
 }
 
+// Filtering activity (GET /api/v1/filtering/activity) — per-stage counts of the
+// transactions this node has rejected since it started. Two stages: Stage 1 is
+// the mempool (Reaper spam-strip + the tier/BUDS policy), Stage 2 is the block
+// template (the Reaper strips dead weight when the block is built). All counts
+// are cumulative since node start. The endpoint may 404 during rollout, so the
+// hook degrades to null and the UI shows a "no rejections yet" state.
+export interface FilteringStageCount {
+  /** Transactions rejected by this filter at this stage. */
+  txs: number;
+  /** Virtual bytes those rejected transactions accounted for. */
+  vbytes: number;
+}
+
+export interface FilteringActivity {
+  // Stage 1 — your mempool: never kept, relayed, or mined.
+  stage1_mempool: {
+    reaper: FilteringStageCount;
+    tier: FilteringStageCount;
+  };
+  // Stage 2 — your block: stripped when the block template is built.
+  stage2_block: {
+    reaper: FilteringStageCount;
+  };
+  totals: {
+    rejected_txs: number;
+  };
+}
+
 // Tor mode status from gettormode RPC
 export interface TorModeStatus {
   enabled: boolean;

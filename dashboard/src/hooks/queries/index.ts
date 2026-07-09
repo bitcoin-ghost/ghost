@@ -55,6 +55,9 @@ export * from './useShroudQueries';
 // Reaper queries
 export * from './useReaperQueries';
 
+// Filtering-activity queries
+export * from './useFilteringQueries';
+
 // Capability self-check queries
 export * from './useSelfCheckQueries';
 
