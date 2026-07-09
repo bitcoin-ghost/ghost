@@ -7,6 +7,7 @@ import { ConfirmDialog } from "@/components/ui/Dialog";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { Toggle } from "@/components/ui/Toggle";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { SkeletonCard } from "@/components/ui/Skeleton";
@@ -214,12 +215,14 @@ export default function HazePage() {
     return { strippedBytes, structuralBytes, fullArchiveBytes, percentSmaller };
   }, [haze?.bytes_stripped, haze?.structural_archive_size_gb, haze?.chain_tip]);
 
-  // Selecting Hazed from a node that already holds blocks (standard / full
-  // archive) is a one-time, long, irreversible retroactive conversion — gate it
-  // behind an explicit confirmation.
-  const [confirmConvert, setConfirmConvert] = useState(false);
+  // Every mode change restarts ghostd, so each one is gated behind an explicit
+  // confirmation. The dialog copy adapts to the target. Switching to Hazed from a
+  // node that already holds blocks is a one-time, long, IRREVERSIBLE retroactive
+  // conversion — flagged as danger.
+  type HazeMode = "hazed" | "full_archive" | "standard";
+  const [pendingMode, setPendingMode] = useState<HazeMode | null>(null);
 
-  const doSetMode = async (target: "hazed" | "full_archive" | "standard") => {
+  const doSetMode = async (target: HazeMode) => {
     try {
       await configureHaze.mutateAsync(target);
       toast.success("Ghost Haze updated", `Storage mode set to ${getModeLabel(target)}`);
@@ -231,24 +234,62 @@ export default function HazePage() {
     }
   };
 
-  const handleSetMode = async (target: "hazed" | "full_archive" | "standard") => {
+  // Open the confirmation for any real change; the dialog copy is derived below.
+  const handleSetMode = (target: HazeMode) => {
     if (target === mode) return;
-    const retroactive =
-      target === "hazed" && (mode === "standard" || mode === "full_archive");
-    if (retroactive) {
-      setConfirmConvert(true);
-      return;
-    }
-    await doSetMode(target);
+    setPendingMode(target);
   };
+
+  const pendingIsRetroactive =
+    pendingMode === "hazed" && (mode === "standard" || mode === "full_archive");
+
+  const confirmCopy: {
+    title: string;
+    message: string;
+    confirmLabel: string;
+    variant: "default" | "danger";
+  } | null =
+    pendingMode === "hazed"
+      ? pendingIsRetroactive
+        ? {
+            title: "Convert existing blocks to Hazed?",
+            message:
+              "This restarts ghostd to run the one-time Ghost Exorcist conversion of your existing block archive to stripped GSB format. It is a long, resumable batch job and is IRREVERSIBLE — witness, scriptSig, OP_RETURN and coinbase data are permanently stripped from local storage. The node comes back up hazed automatically once it finishes. Continue?",
+            confirmLabel: "Convert & restart ghostd",
+            variant: "danger",
+          }
+        : {
+            title: "Enable Hazed mode?",
+            message:
+              "This restarts ghostd. From now on every block is stripped of non-consensus data before it is written to disk — no embedded content is ever persisted — while full validation and UTXO integrity are preserved.",
+            confirmLabel: "Enable & restart ghostd",
+            variant: "default",
+          }
+      : pendingMode === "full_archive"
+        ? {
+            title: "Switch to Full Archive?",
+            message:
+              "This restarts ghostd. The node will keep complete, unstripped blocks going forward for maximum data availability — no haze stripping is applied.",
+            confirmLabel: "Switch & restart ghostd",
+            variant: "default",
+          }
+        : pendingMode === "standard"
+          ? {
+              title: "Switch to Standard?",
+              message:
+                "This restarts ghostd and turns off haze stripping. The node behaves as a normal Bitcoin Core node — full blocks, no haze metadata. Any blocks already stripped are not restored.",
+              confirmLabel: "Switch & restart ghostd",
+              variant: "danger",
+            }
+          : null;
 
   return (
     <div className="space-y-6">
       {/* Page Header */}
       <PageHeader
         eyebrow="haze"
-        title="Storage privacy layer."
-        subtitle="Strip arbitrary embedded content before it ever touches your disk — while keeping full validation and UTXO integrity."
+        title="Block content protection"
+        subtitle="Strip arbitrary embedded content out of blocks before it's written to disk — so your node never stores or hosts it, with full validation and UTXO integrity intact."
         actions={
           haze && (
             <div className="flex items-center gap-2">
@@ -262,6 +303,152 @@ export default function HazePage() {
           )
         }
       />
+
+      {/* Storage mode — primary control, at the top. Every change restarts ghostd. */}
+      <Card>
+        <CardHeader
+          title="Storage mode"
+          subtitle="Choose how this node stores block data"
+          action={
+            haze && <Badge variant={getModeBadgeVariant(mode)}>{getModeLabel(mode)}</Badge>
+          }
+        />
+
+        {/* Explain the two ways to become hazed */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
+          <div className="p-3 rounded-lg bg-[var(--bg)] border border-[color:var(--rule-strong)]">
+            <div className="text-[color:var(--fg)] text-sm font-medium mb-1">
+              Forward — haze from genesis
+            </div>
+            <p className="text-[color:var(--dim)] text-xs leading-relaxed">
+              A fresh node can start hazed and strip
+              every block as it syncs. Nothing arbitrary is ever written — no conversion needed.
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-[var(--bg)] border border-[color:var(--rule-strong)]">
+            <div className="text-[color:var(--fg)] text-sm font-medium mb-1">
+              Retroactive — convert existing blocks
+            </div>
+            <p className="text-[color:var(--dim)] text-xs leading-relaxed">
+              An already-synced full or pruned node
+              cannot simply flip to hazed — it must run a one-time, resumable conversion that strips
+              the blocks it already holds. This is the only path to haze later.
+            </p>
+          </div>
+        </div>
+
+        {/* Mode options */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {(() => {
+            // From a non-hazed node with blocks already on disk, selecting Hazed
+            // means a retroactive conversion — not an instant flip.
+            const retroactive = mode === "standard" || mode === "full_archive";
+            const options = [
+              {
+                key: "hazed" as const,
+                label: "Hazed",
+                action: retroactive ? "Convert existing blocks (retroactive)" : undefined,
+                desc: retroactive
+                  ? "Run the one-time Exorcist conversion to strip existing blocks. Smallest footprint; resumable; no embedded content left on disk."
+                  : "Strip non-consensus fields before storage. Smallest footprint, no embedded content on disk.",
+              },
+              {
+                key: "full_archive" as const,
+                label: "Full Archive",
+                action: undefined,
+                desc: "Keep the full archive — complete, unstripped blocks. Maximum data availability for archival serving.",
+              },
+              {
+                key: "standard" as const,
+                label: "Standard",
+                action: undefined,
+                desc: "A normal Bitcoin Core node — full blocks, no stripping and no haze metadata.",
+              },
+            ];
+            return options.map((opt) => {
+              const selected = mode === opt.key;
+              return (
+                <button
+                  key={opt.key}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  disabled={configureHaze.isPending}
+                  onClick={() => handleSetMode(opt.key)}
+                  className={`group flex flex-col text-left rounded-lg p-4 border-2 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent)] ${
+                    selected
+                      ? "border-[color:var(--accent)] cursor-default"
+                      : "border-[color:var(--rule-strong)] cursor-pointer hover:border-[color:var(--accent)]"
+                  } ${configureHaze.isPending ? "opacity-60 cursor-wait" : ""}`}
+                  style={{
+                    background: selected
+                      ? "color-mix(in srgb, var(--accent) 12%, var(--surface))"
+                      : "var(--surface)",
+                  }}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[color:var(--fg)] text-sm font-medium">{opt.label}</span>
+                    {selected ? (
+                      <Badge variant={getModeBadgeVariant(opt.key)}>Active</Badge>
+                    ) : (
+                      <span
+                        aria-hidden
+                        className="h-4 w-4 shrink-0 rounded-full border-2 border-[color:var(--rule-strong)] transition-colors group-hover:border-[color:var(--accent)]"
+                      />
+                    )}
+                  </div>
+                  <p className="text-[color:var(--dim)] text-xs leading-relaxed flex-1">{opt.desc}</p>
+                  {opt.action && !selected && (
+                    <span className="mt-2 inline-block t-caption font-medium text-[color:var(--accent)]">
+                      {opt.action} →
+                    </span>
+                  )}
+                </button>
+              );
+            });
+          })()}
+        </div>
+        <p className="text-[color:var(--fainter)] text-xs mt-3">
+          Every mode change restarts ghostd to take effect. A retroactive conversion then runs
+          as a background batch job and reports its progress below.
+        </p>
+      </Card>
+
+      {/* Retroactive conversion progress — shows under the control while running */}
+      {conversionInProgress && (
+        <Card>
+          <CardHeader
+            title="Retroactive conversion in progress"
+            subtitle="The Exorcist is stripping the blocks this node already holds"
+            action={<Badge variant="warning">IN_PROGRESS</Badge>}
+          />
+          <div className="space-y-3">
+            <div className="flex items-baseline justify-between">
+              <span className="text-2xl font-bold text-[color:var(--fg)]">
+                {convPercent != null ? `${convPercent.toFixed(1)}%` : "--"}
+              </span>
+              <span className="font-mono text-sm text-[color:var(--dim)]">
+                {convBlocks.toLocaleString()} / {convTip.toLocaleString()} blocks
+              </span>
+            </div>
+            <div className="h-2.5 w-full rounded-full bg-[var(--rule-strong)] overflow-hidden">
+              <div
+                className="h-full rounded-full transition-[width] duration-500"
+                style={{
+                  width: `${convPercent ?? 0}%`,
+                  background: "var(--accent)",
+                }}
+              />
+            </div>
+            <p className="text-[color:var(--dim)] text-xs leading-relaxed">
+              This is a one-time batch job that rewrites existing block files into stripped
+              structural blocks. It is resumable —
+              if the node restarts, conversion continues from where it left off. Your Legal Pack
+              is finalised once it reads <code>COMPLETE</code>.
+            </p>
+          </div>
+        </Card>
+      )}
 
       {/* 1. HERO — Storage saved */}
       <SectionErrorBoundary section="Storage Savings">
@@ -277,14 +464,7 @@ export default function HazePage() {
             </div>
           </Card>
         ) : active ? (
-          <div
-            className="rounded-lg p-8 border"
-            style={{
-              borderColor: "color-mix(in srgb, var(--green) 40%, transparent)",
-              background:
-                "linear-gradient(135deg, color-mix(in srgb, var(--green) 12%, var(--surface)) 0%, var(--surface) 70%)",
-            }}
-          >
+          <Card>
             <div className="text-xs uppercase tracking-wider text-[color:var(--green)] font-semibold mb-2">
               Arbitrary data kept off your disk
             </div>
@@ -297,13 +477,13 @@ export default function HazePage() {
               spam and data-carrier payloads that never reached your disk.
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6">
-              <div className="rounded-lg p-4 bg-[var(--surface)] border border-[color:var(--rule)]">
+              <div className="rounded-lg p-4 bg-[var(--bg)] border border-[color:var(--rule)]">
                 <div className="text-xs text-[color:var(--dim)] mb-1">Structural archive on disk</div>
                 <div className="text-2xl font-bold text-[color:var(--fg)]">
                   {formatBytes(savings.structuralBytes)}
                 </div>
               </div>
-              <div className="rounded-lg p-4 bg-[var(--surface)] border border-[color:var(--rule)]">
+              <div className="rounded-lg p-4 bg-[var(--bg)] border border-[color:var(--rule)]">
                 <div className="text-xs text-[color:var(--dim)] mb-1">Full-archive estimate</div>
                 <div className="text-2xl font-bold text-[color:var(--fg)]">
                   {savings.fullArchiveBytes > 0 ? formatBytes(savings.fullArchiveBytes) : "--"}
@@ -312,7 +492,7 @@ export default function HazePage() {
                   {(haze?.chain_tip ?? 0).toLocaleString()} blocks × ~1.6 MB
                 </div>
               </div>
-              <div className="rounded-lg p-4 bg-[var(--surface)] border border-[color:var(--rule)]">
+              <div className="rounded-lg p-4 bg-[var(--bg)] border border-[color:var(--rule)]">
                 <div className="text-xs text-[color:var(--dim)] mb-1">Chain footprint</div>
                 <div className="text-2xl font-bold text-[color:var(--green)]">
                   {savings.percentSmaller != null
@@ -321,39 +501,30 @@ export default function HazePage() {
                 </div>
               </div>
             </div>
-          </div>
+          </Card>
         ) : (
-          // Inactive: value proposition + enable path (no fabricated numbers).
-          <div
-            className="rounded-lg p-8 border"
-            style={{
-              borderColor: "color-mix(in srgb, var(--accent) 35%, transparent)",
-              background:
-                "linear-gradient(135deg, color-mix(in srgb, var(--accent) 10%, var(--surface)) 0%, var(--surface) 70%)",
-            }}
-          >
-            <div className="text-xs uppercase tracking-wider text-[color:var(--accent)] font-semibold mb-2">
-              Haze is not active on this node
+          // Inactive: calm, full-width enable row — same typography as the rest of the app.
+          <Card>
+            <div className="flex items-center justify-between gap-6">
+              <div className="flex-1">
+                <div className="text-[color:var(--fg)] font-medium">
+                  Keep inscriptions, spam and arbitrary payloads off your disk
+                </div>
+                <p className="text-sm text-[color:var(--dim)] mt-1 leading-relaxed">
+                  In Hazed mode, Ghost Exorcism strips non-consensus fields from every block
+                  before it is written — you keep full validation and UTXO integrity while
+                  shrinking your on-disk footprint and never persisting embedded content.
+                  Enabling it starts measuring your savings and generates a court-ready Legal Pack.
+                </p>
+              </div>
+              <Toggle
+                enabled={active}
+                onChange={() => handleSetMode("hazed")}
+                label="Enable Haze"
+                disabled={configureHaze.isPending}
+              />
             </div>
-            <div className="text-3xl md:text-4xl font-bold text-[color:var(--fg)] leading-tight max-w-3xl">
-              Keep inscriptions, spam and arbitrary payloads off your disk.
-            </div>
-            <p className="text-[color:var(--dim)] text-sm mt-3 max-w-2xl leading-relaxed">
-              In Hazed mode, Ghost Exorcism strips non-consensus fields from every block
-              before it is written — you keep full validation and UTXO integrity while
-              shrinking your on-disk footprint and never persisting embedded content. Enable
-              it to start measuring your savings and generate a court-ready Legal Pack.
-            </p>
-            <div className="mt-6">
-              <Button
-                variant="primary"
-                onClick={() => handleSetMode("hazed")}
-                loading={configureHaze.isPending}
-              >
-                Enable Haze
-              </Button>
-            </div>
-          </div>
+          </Card>
         )}
       </SectionErrorBoundary>
 
@@ -729,151 +900,18 @@ export default function HazePage() {
         </div>
       </Card>
 
-      {/* 6a. Retroactive conversion progress — prominent while running */}
-      {conversionInProgress && (
-        <Card>
-          <CardHeader
-            title="Retroactive conversion in progress"
-            subtitle="The Exorcist is stripping the blocks this node already holds"
-            action={<Badge variant="warning">IN_PROGRESS</Badge>}
-          />
-          <div className="space-y-3">
-            <div className="flex items-baseline justify-between">
-              <span className="text-2xl font-bold text-[color:var(--fg)]">
-                {convPercent != null ? `${convPercent.toFixed(1)}%` : "--"}
-              </span>
-              <span className="font-mono text-sm text-[color:var(--dim)]">
-                {convBlocks.toLocaleString()} / {convTip.toLocaleString()} blocks
-              </span>
-            </div>
-            <div className="h-2.5 w-full rounded-full bg-[var(--rule-strong)] overflow-hidden">
-              <div
-                className="h-full rounded-full transition-[width] duration-500"
-                style={{
-                  width: `${convPercent ?? 0}%`,
-                  background: "var(--accent)",
-                }}
-              />
-            </div>
-            <p className="text-[color:var(--dim)] text-xs leading-relaxed">
-              This is a one-time batch job that rewrites existing block files into stripped
-              structural blocks. It is resumable —
-              if the node restarts, conversion continues from where it left off. Your Legal Pack
-              is finalised once it reads <code>COMPLETE</code>.
-            </p>
-          </div>
-        </Card>
-      )}
-
-      {/* 6b. Mode control — two programmes: forward vs retroactive */}
-      <Card>
-        <CardHeader
-          title="Storage mode"
-          subtitle="Choose how this node stores block data"
-          action={
-            haze && <Badge variant={getModeBadgeVariant(mode)}>{getModeLabel(mode)}</Badge>
-          }
-        />
-
-        {/* Explain the two ways to become hazed */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
-          <div className="p-3 rounded-lg bg-[var(--surface)] border border-[color:var(--rule-strong)]">
-            <div className="text-[color:var(--fg)] text-sm font-medium mb-1">
-              Forward — haze from genesis
-            </div>
-            <p className="text-[color:var(--dim)] text-xs leading-relaxed">
-              A fresh node can start hazed and strip
-              every block as it syncs. Nothing arbitrary is ever written — no conversion needed.
-            </p>
-          </div>
-          <div className="p-3 rounded-lg bg-[var(--surface)] border border-[color:var(--rule-strong)]">
-            <div className="text-[color:var(--fg)] text-sm font-medium mb-1">
-              Retroactive — convert existing blocks
-            </div>
-            <p className="text-[color:var(--dim)] text-xs leading-relaxed">
-              An already-synced full or pruned node
-              cannot simply flip to hazed — it must run a one-time, resumable conversion that strips
-              the blocks it already holds. This is the only path to haze later.
-            </p>
-          </div>
-        </div>
-
-        {/* Mode options */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          {(() => {
-            // From a non-hazed node with blocks already on disk, selecting Hazed
-            // means a retroactive conversion — not an instant flip.
-            const retroactive = mode === "standard" || mode === "full_archive";
-            const options = [
-              {
-                key: "hazed" as const,
-                label: "Hazed",
-                action: retroactive ? "Convert existing blocks (retroactive)" : undefined,
-                desc: retroactive
-                  ? "Run the one-time Exorcist conversion to strip existing blocks. Smallest footprint; resumable; no embedded content left on disk."
-                  : "Strip non-consensus fields before storage. Smallest footprint, no embedded content on disk.",
-              },
-              {
-                key: "full_archive" as const,
-                label: "Full Archive",
-                action: undefined,
-                desc: "Keep the full archive — complete, unstripped blocks. Maximum data availability for archival serving.",
-              },
-              {
-                key: "standard" as const,
-                label: "Standard",
-                action: undefined,
-                desc: "A normal Bitcoin Core node — full blocks, no stripping and no haze metadata.",
-              },
-            ];
-            return options.map((opt) => {
-              const selected = mode === opt.key;
-              return (
-                <button
-                  key={opt.key}
-                  type="button"
-                  disabled={configureHaze.isPending || selected}
-                  onClick={() => handleSetMode(opt.key)}
-                  className="text-left rounded-lg p-4 border transition-colors disabled:cursor-default flex flex-col"
-                  style={{
-                    background: selected
-                      ? "color-mix(in srgb, var(--accent) 12%, var(--surface))"
-                      : "var(--surface)",
-                    borderColor: selected ? "var(--accent)" : "var(--rule-strong)",
-                  }}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[color:var(--fg)] text-sm font-medium">{opt.label}</span>
-                    {selected && <Badge variant={getModeBadgeVariant(opt.key)}>Active</Badge>}
-                  </div>
-                  <p className="text-[color:var(--dim)] text-xs leading-relaxed flex-1">{opt.desc}</p>
-                  {opt.action && !selected && (
-                    <span className="mt-2 inline-block t-caption font-medium text-[color:var(--accent)]">
-                      {opt.action} →
-                    </span>
-                  )}
-                </button>
-              );
-            });
-          })()}
-        </div>
-        <p className="text-[color:var(--fainter)] text-xs mt-3">
-          Forward hazing and Full Archive take effect on the next node start. A retroactive
-          conversion runs as a background batch job and reports its progress above.
-        </p>
-      </Card>
-
       <ConfirmDialog
-        isOpen={confirmConvert}
-        onClose={() => setConfirmConvert(false)}
+        isOpen={pendingMode !== null}
+        onClose={() => setPendingMode(null)}
         onConfirm={async () => {
-          setConfirmConvert(false);
-          await doSetMode("hazed");
+          const target = pendingMode;
+          setPendingMode(null);
+          if (target) await doSetMode(target);
         }}
-        title="Convert existing blocks to Hazed?"
-        message="This restarts ghostd to run the one-time Ghost Exorcist conversion of your existing block archive to stripped GSB format. It is a long, resumable batch job and is IRREVERSIBLE — witness, scriptSig, OP_RETURN and coinbase data are permanently stripped from local storage. The node comes back up hazed automatically once it finishes. Continue?"
-        confirmLabel="Convert & restart ghostd"
-        variant="danger"
+        title={confirmCopy?.title ?? ""}
+        message={confirmCopy?.message ?? ""}
+        confirmLabel={confirmCopy?.confirmLabel ?? "Confirm"}
+        variant={confirmCopy?.variant ?? "default"}
         loading={configureHaze.isPending}
       />
     </div>

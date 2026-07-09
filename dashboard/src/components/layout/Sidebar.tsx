@@ -102,6 +102,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/storage", label: "Storage", icon: <HardDrive {...ICON} /> },
       { href: "/haze", label: "Haze", icon: <Cloud {...ICON} /> },
+      { href: "/zero-sync", label: "Zero-Sync", icon: <Gauge {...ICON} /> },
     ],
   },
   {

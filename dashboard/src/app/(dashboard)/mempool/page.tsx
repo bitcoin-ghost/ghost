@@ -8,9 +8,6 @@ import { Badge } from "@/components/ui/Badge";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { StatCard } from "@/components/ui/StatCard";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { useConfig } from "@/hooks/queries/useConfigQueries";
-import { useReaperStatus } from "@/hooks/queries";
-import { type ReaperStats } from "@/lib/api/reaper";
 import { fetchApi } from "@/lib/api/client";
 
 /**
@@ -114,7 +111,6 @@ const FEE_BUCKETS = [
 // ─── page ───────────────────────────────────────────────────────────────────
 
 export default function MempoolPage() {
-  const { data: config } = useConfig();
   const {
     data: mempool,
     isLoading,
@@ -124,10 +120,6 @@ export default function MempoolPage() {
     queryFn: fetchBudsMempool,
     refetchInterval: 15_000,
   });
-
-  const { data: reaperStats } = useReaperStatus();
-
-  const reaperEnabled = config?.reaper ?? false;
 
   if (isLoading) {
     return (
@@ -172,7 +164,7 @@ export default function MempoolPage() {
         </Card>
       ) : (
         <>
-          <LiveStats mempool={mempool} reaperStats={reaperStats} reaperEnabled={reaperEnabled} />
+          <LiveStats mempool={mempool} />
           <SectionErrorBoundary section="Fee distribution">
             <FeeDistribution mempool={mempool} />
           </SectionErrorBoundary>
@@ -317,7 +309,7 @@ function NodeMempoolExplorer() {
 
       <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "12px" }}>
         Served same-origin from the dashboard at <code>/mempool-app/</code>, proxied to this
-        node&apos;s own mempool backend. The lightweight RPC view and the Reaper strip
+        node&apos;s own mempool backend. The lightweight RPC view and fee-rate
         breakdown are below.
       </p>
     </Card>
@@ -326,15 +318,7 @@ function NodeMempoolExplorer() {
 
 // ─── live RPC stats row ─────────────────────────────────────────────────────
 
-function LiveStats({
-  mempool,
-  reaperStats,
-  reaperEnabled,
-}: {
-  mempool?: BudsMempool;
-  reaperStats?: ReaperStats | null;
-  reaperEnabled: boolean;
-}) {
+function LiveStats({ mempool }: { mempool?: BudsMempool }) {
   // maxmempool caps memory USAGE, not the summed vsize (`bytes`), so the "how
   // full" ratio must be usage/maxmempool — matching mempool.space's Memory
   // Usage / 300 MB. Dividing bytes by maxmempool understated it ~4x.
@@ -344,37 +328,14 @@ function LiveStats({
       : "—";
   const minFee = btcPerKvbToSatVb(mempool?.min_fee);
 
-  // The "Reaper — kept out" tile only appears when this node runs the reaper
-  // (opt-in +2 capability). It reports the Reaper's cumulative total — how much
-  // junk this node has kept out over time — not a per-block snapshot. Note this
-  // counts the Reaper only; BUDS tier-policy rejections aren't tallied here yet.
-  const showReaped = reaperEnabled;
-  const hasReaperData = !!reaperStats;
-  // Five tiles need a wider track; four keep the original layout.
-  const gridCols = showReaped
-    ? "grid-cols-2 md:grid-cols-3 xl:grid-cols-5"
-    : "grid-cols-2 md:grid-cols-4";
-
   return (
-    <div className={`grid ${gridCols} gap-4`}>
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
       <StatCard
         label="Transactions"
         value={formatCount(mempool?.total)}
         sublabel="in your mempool now"
         tooltip="getmempoolinfo.size — count of transactions your node currently holds in its mempool."
       />
-      {showReaped && (
-        <StatCard
-          label="Reaper — kept out"
-          value={hasReaperData ? reaperStats!.txs_reaped.toLocaleString() : "—"}
-          sublabel={
-            hasReaperData
-              ? `${formatBytes(reaperStats!.dead_bytes_total)} dead weight · cumulative`
-              : "no data yet"
-          }
-          tooltip="The Reaper's cumulative total — every dead-code / spam transaction this node has kept out of its mempool and blocks over time. Reaper only for now: BUDS tier-policy rejections aren't included here yet (a node-level tier-rejection counter is coming). Per-vector detail is on the Reaper page."
-        />
-      )}
       <StatCard
         label="Mempool size"
         value={formatBytes(mempool?.bytes)}

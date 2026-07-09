@@ -309,8 +309,8 @@ export default function NodePoolPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="ghost pool"
-        title="Node Pool"
+        eyebrow="node pool"
+        title="Pool statistics"
         subtitle="Live pool stats and graphs for this node and the Ghost mesh — hashrate, miners, shares, best shares, round progress and payouts."
       />
 

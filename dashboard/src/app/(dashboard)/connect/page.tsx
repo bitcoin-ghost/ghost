@@ -97,9 +97,9 @@ export default function ConnectPage() {
   return (
     <div>
       <PageHeader
-        eyebrow="pairing"
-        title="Connect Wallet"
-        subtitle="Connection strings and QR codes for pairing wallets and other nodes to this node. Scan a code or copy a string into your wallet. QR codes are generated locally in your browser — nothing leaves this page."
+        eyebrow="connect wallet"
+        title="Pair wallets & nodes"
+        subtitle="Connection strings and QR codes to pair wallets and other nodes to this one. Scan a code or copy a string into your wallet — QR codes are generated locally in your browser, nothing leaves this page."
       />
 
       {!hostKnown && (
