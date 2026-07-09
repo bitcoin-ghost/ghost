@@ -514,7 +514,10 @@ fn test_318_large_op_return_with_payment() {
 fn test_319_bitcoin_pure_policy() {
     let policy = PolicyPreset::bitcoin_pure();
 
-    assert_eq!(policy.name, "bitcoin_pure");
+    // The preset's canonical name was renamed to "strict" (with "bitcoin_pure"
+    // kept as a serde alias / constructor for back-compat) during the
+    // tier-filtering work; the constructor name is unchanged.
+    assert_eq!(policy.name, "strict");
     assert!(policy.allowed_tiers.contains(&BudsTier::T0));
     assert!(policy.allowed_tiers.contains(&BudsTier::T1));
     assert!(!policy.allowed_tiers.contains(&BudsTier::T2));
