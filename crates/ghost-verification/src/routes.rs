@@ -11748,13 +11748,14 @@ mod tests {
         assert_eq!(json["profile"].as_str(), Some("strict"));
         assert_eq!(json["restart_pending"].as_bool(), Some(true));
 
-        // Persisted to disk as BitcoinPure and restart requested.
+        // Persisted to disk as BitcoinPure. The restart is applied
+        // asynchronously by `spawn_ghostd_reaper_apply`, which owns the
+        // ghostd-then-pool ordering; the handler intentionally does NOT set
+        // `restart_requested()` synchronously (see the handler comment — doing
+        // so would bounce the pool before ghostd). The client-facing contract
+        // is `restart_pending: true`, asserted above.
         let reloaded = FullNodeConfig::load(&path).unwrap();
         assert_eq!(reloaded.policy.profile, CfgProfile::BitcoinPure);
-        assert!(
-            state.restart_requested(),
-            "policy_profile change must request a restart"
-        );
 
         // Unknown profile → 400.
         let bad = r#"{"profile": "nonsense"}"#;
@@ -11999,10 +12000,10 @@ mod tests {
         assert!(!custom.allow_runes);
         assert!(!custom.allow_brc20);
         assert_eq!(custom.min_fee_rate, 2.5);
-        assert!(
-            state.restart_requested(),
-            "policy_custom change must request a restart"
-        );
+        // Restart is applied asynchronously by `spawn_ghostd_reaper_apply`
+        // (ghostd-then-pool ordering); the handler intentionally does NOT set
+        // `restart_requested()` synchronously. The client-facing contract is
+        // `restart_pending: true`, asserted above.
 
         // Negative min_fee_rate → 400.
         let bad = r#"{
