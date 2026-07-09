@@ -6,10 +6,12 @@
 
 #include <consensus/validation.h>
 #include <logging.h>
+#include <policy/policy.h>
 #include <script/script.h>
 #include <tinyformat.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -317,7 +319,16 @@ GhostTier ClassifyTransactionTier(const CTransaction& tx)
 // Mempool-acceptance gate.
 // ---------------------------------------------------------------------------
 
-bool IsGhostTierPolicyClean(const CTransaction& tx, const GhostTierPolicyConfig& config, CAmount base_fees, std::string& reason)
+namespace {
+//! Cumulative-since-start rejection counters for the tier/policy gate. Stats
+//! only, so relaxed ordering suffices (no cross-thread invariant rides on them).
+std::atomic<uint64_t> g_tier_rejected_txs{0};
+std::atomic<uint64_t> g_tier_rejected_vbytes{0};
+
+//! Core tier/policy predicate. Returns true if admissible, false (with `reason`
+//! filled) on the single reject decision. Kept side-effect-free so the public
+//! wrapper can bump the observability counters exactly once per rejected tx.
+bool TierPolicyCheck(const CTransaction& tx, const GhostTierPolicyConfig& config, CAmount base_fees, std::string& reason)
 {
     const GhostTierAnalysis a = AnalyzeTransactionTier(tx);
 
@@ -406,4 +417,28 @@ bool IsGhostTierPolicyClean(const CTransaction& tx, const GhostTierPolicyConfig&
     }
 
     return true;
+}
+} // anonymous namespace
+
+bool IsGhostTierPolicyClean(const CTransaction& tx, const GhostTierPolicyConfig& config, CAmount base_fees, std::string& reason)
+{
+    if (TierPolicyCheck(tx, config, base_fees, reason)) {
+        return true;
+    }
+    // Rejected: count exactly once. TierPolicyCheck returns from a single reject
+    // site per call, so a tx is tallied once regardless of which rule bit it.
+    g_tier_rejected_txs.fetch_add(1, std::memory_order_relaxed);
+    g_tier_rejected_vbytes.fetch_add(static_cast<uint64_t>(GetVirtualTransactionSize(tx)),
+                                     std::memory_order_relaxed);
+    return false;
+}
+
+uint64_t GhostTierRejectedTxs()
+{
+    return g_tier_rejected_txs.load(std::memory_order_relaxed);
+}
+
+uint64_t GhostTierRejectedVbytes()
+{
+    return g_tier_rejected_vbytes.load(std::memory_order_relaxed);
 }
