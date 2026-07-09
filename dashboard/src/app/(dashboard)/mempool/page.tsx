@@ -344,12 +344,12 @@ function LiveStats({
       : "—";
   const minFee = btcPerKvbToSatVb(mempool?.min_fee);
 
-  // The "Reaped this block" tile only appears when this node runs the reaper
-  // (opt-in +2 capability). It reports the block currently being built — the
-  // most recent template snapshot — not cumulative history; lifetime totals
-  // live on the Reaper page.
+  // The "Reaper — kept out" tile only appears when this node runs the reaper
+  // (opt-in +2 capability). It reports the Reaper's cumulative total — how much
+  // junk this node has kept out over time — not a per-block snapshot. Note this
+  // counts the Reaper only; BUDS tier-policy rejections aren't tallied here yet.
   const showReaped = reaperEnabled;
-  const hasBlock = !!reaperStats && reaperStats.last_block_unix != null;
+  const hasReaperData = !!reaperStats;
   // Five tiles need a wider track; four keep the original layout.
   const gridCols = showReaped
     ? "grid-cols-2 md:grid-cols-3 xl:grid-cols-5"
@@ -365,14 +365,14 @@ function LiveStats({
       />
       {showReaped && (
         <StatCard
-          label="Reaped this block"
-          value={hasBlock ? reaperStats!.last_block_reaped.toLocaleString() : "—"}
+          label="Reaper — kept out"
+          value={hasReaperData ? reaperStats!.txs_reaped.toLocaleString() : "—"}
           sublabel={
-            hasBlock
-              ? `${formatBytes(reaperStats!.last_block_dead_bytes)} dead weight · ${formatRelative(reaperStats!.last_block_unix)}`
-              : "no block built yet"
+            hasReaperData
+              ? `${formatBytes(reaperStats!.dead_bytes_total)} dead weight · cumulative`
+              : "no data yet"
           }
-          tooltip="Transactions the pool template-builder reaper dropped from the block currently being built (dead code detected). A per-block snapshot, not cumulative — lifetime totals and per-vector detail are on the Reaper page."
+          tooltip="The Reaper's cumulative total — every dead-code / spam transaction this node has kept out of its mempool and blocks over time. Reaper only for now: BUDS tier-policy rejections aren't included here yet (a node-level tier-rejection counter is coming). Per-vector detail is on the Reaper page."
         />
       )}
       <StatCard
@@ -395,17 +395,6 @@ function LiveStats({
       />
     </div>
   );
-}
-
-// ─── reaper helpers (feed the "Reaped this block" stat tile) ─────────────────
-
-function formatRelative(unixSecs: number | null): string {
-  if (!unixSecs) return "never";
-  const secs = Math.max(0, Math.floor(Date.now() / 1000) - unixSecs);
-  if (secs < 60) return `${secs}s ago`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
-  return `${Math.floor(secs / 86400)}d ago`;
 }
 
 // ─── fee-rate distribution (computed client-side from the tx sample) ─────────
