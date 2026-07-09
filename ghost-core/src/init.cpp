@@ -2254,6 +2254,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
                 chainstate->PruneAndFlush();
             }
         }
+    } else if (chainman.m_blockman.m_ghost_exorcism.IsActive()) {
+        // Hazed nodes strip blocks and cannot serve full historical data, so they
+        // must NOT advertise NODE_NETWORK. The removal done earlier in AppInitMain
+        // is otherwise clobbered here for a non-pruned hazed node (haze is not the
+        // same as prune mode). Mirrors the guard in the snapshot-completed callback.
+        LogInfo("Hazed mode: not advertising NODE_NETWORK (cannot serve full historical blocks)");
     } else {
         // Prior to setting NODE_NETWORK, check if we can provide historical blocks.
         if (!WITH_LOCK(chainman.GetMutex(), return chainman.BackgroundSyncInProgress())) {
