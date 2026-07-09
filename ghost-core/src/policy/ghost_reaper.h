@@ -7,6 +7,7 @@
 
 #include <primitives/transaction.h>
 
+#include <cstdint>
 #include <string>
 
 /** Configuration for Ghost Reaper mempool filter.
@@ -101,5 +102,17 @@ bool CheckRunestone(const CTransaction& tx, std::string& reason);
  * @param[in] threshold  Sole-output value (sats) at/below which the tx is flooded
  */
 bool CheckDustFlood(const CTransaction& tx, CAmount threshold, std::string& reason);
+
+/**
+ * Observability counters for the Ghost Reaper mempool filter. Cumulative since
+ * process start (reset on restart); the dashboard presents them as "since node
+ * start". Incremented exactly once per transaction the Reaper rejects — a tx
+ * tripping two detectors still counts once. Purely observational: reading or
+ * writing them never affects acceptance.
+ */
+//! Number of transactions rejected by the Reaper since start.
+uint64_t GhostReaperRejectedTxs();
+//! Summed virtual size (vbytes) of transactions rejected by the Reaper since start.
+uint64_t GhostReaperRejectedVbytes();
 
 #endif // BITCOIN_POLICY_GHOST_REAPER_H

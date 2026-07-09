@@ -5,8 +5,11 @@
 #include <policy/ghost_reaper.h>
 
 #include <logging.h>
+#include <policy/policy.h>
 #include <script/script.h>
 
+#include <atomic>
+#include <cstdint>
 #include <vector>
 
 // Helper: scan a single witness element for OP_FALSE OP_IF ... OP_ENDIF envelopes.
@@ -319,7 +322,17 @@ bool CheckDustFlood(const CTransaction& tx, CAmount threshold, std::string& reas
     return true;
 }
 
-bool IsGhostReaperClean(const CTransaction& tx, const GhostReaperConfig& config, std::string& reason)
+namespace {
+//! Cumulative-since-start rejection counters for the Reaper filter. Stats only,
+//! so relaxed ordering suffices (no cross-thread invariant rides on them).
+std::atomic<uint64_t> g_reaper_rejected_txs{0};
+std::atomic<uint64_t> g_reaper_rejected_vbytes{0};
+
+//! Core Reaper predicate. Returns true if clean, false (with `reason` filled) at
+//! the first detector that fires. Side-effect-free so the public wrapper can
+//! bump the observability counters exactly once, even when a tx would trip
+//! multiple detectors (only the first is reached before returning).
+bool ReaperCheck(const CTransaction& tx, const GhostReaperConfig& config, std::string& reason)
 {
     // Each detector runs only when its per-vector toggle is enabled.
     // Order: cheapest checks first.
@@ -353,4 +366,28 @@ bool IsGhostReaperClean(const CTransaction& tx, const GhostReaperConfig& config,
     }
 
     return true;
+}
+} // anonymous namespace
+
+bool IsGhostReaperClean(const CTransaction& tx, const GhostReaperConfig& config, std::string& reason)
+{
+    if (ReaperCheck(tx, config, reason)) {
+        return true;
+    }
+    // Rejected: count exactly once. ReaperCheck returns at the first detector to
+    // fire, so a tx that would trip several detectors is still tallied once.
+    g_reaper_rejected_txs.fetch_add(1, std::memory_order_relaxed);
+    g_reaper_rejected_vbytes.fetch_add(static_cast<uint64_t>(GetVirtualTransactionSize(tx)),
+                                       std::memory_order_relaxed);
+    return false;
+}
+
+uint64_t GhostReaperRejectedTxs()
+{
+    return g_reaper_rejected_txs.load(std::memory_order_relaxed);
+}
+
+uint64_t GhostReaperRejectedVbytes()
+{
+    return g_reaper_rejected_vbytes.load(std::memory_order_relaxed);
 }

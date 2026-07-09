@@ -14,6 +14,8 @@
 #include <net_processing.h>
 #include <node/mempool_persist_args.h>
 #include <node/types.h>
+#include <policy/ghost_reaper.h>
+#include <policy/ghost_tier.h>
 #include <policy/rbf.h>
 #include <policy/settings.h>
 #include <primitives/transaction.h>
@@ -727,6 +729,37 @@ static RPCHelpMan getmempoolinfo()
     };
 }
 
+static RPCHelpMan getmempoolfilterstats()
+{
+    return RPCHelpMan{"getmempoolfilterstats",
+        "Returns cumulative counts of transactions rejected by Ghost's mempool filters\n"
+        "(the BUDS tier/policy gate and the Ghost Reaper) since this node started.\n"
+        "Counters are observational only and reset to zero on restart.",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "tier_rejected_txs", "Transactions rejected by the tier/policy gate since node start"},
+                {RPCResult::Type::NUM, "tier_rejected_vbytes", "Summed virtual size (vbytes) of transactions rejected by the tier/policy gate since node start"},
+                {RPCResult::Type::NUM, "reaper_rejected_txs", "Transactions rejected by the Ghost Reaper since node start"},
+                {RPCResult::Type::NUM, "reaper_rejected_vbytes", "Summed virtual size (vbytes) of transactions rejected by the Ghost Reaper since node start"},
+            }},
+        RPCExamples{
+            HelpExampleCli("getmempoolfilterstats", "")
+            + HelpExampleRpc("getmempoolfilterstats", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("tier_rejected_txs", GhostTierRejectedTxs());
+    ret.pushKV("tier_rejected_vbytes", GhostTierRejectedVbytes());
+    ret.pushKV("reaper_rejected_txs", GhostReaperRejectedTxs());
+    ret.pushKV("reaper_rejected_vbytes", GhostReaperRejectedVbytes());
+    return ret;
+},
+    };
+}
+
 static RPCHelpMan importmempool()
 {
     return RPCHelpMan{
@@ -1140,6 +1173,7 @@ void RegisterMempoolRPCCommands(CRPCTable& t)
         {"blockchain", &getmempoolentry},
         {"blockchain", &gettxspendingprevout},
         {"blockchain", &getmempoolinfo},
+        {"blockchain", &getmempoolfilterstats},
         {"blockchain", &getrawmempool},
         {"blockchain", &importmempool},
         {"blockchain", &savemempool},

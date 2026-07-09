@@ -151,4 +151,15 @@ struct GhostTierPolicyConfig {
  */
 bool IsGhostTierPolicyClean(const CTransaction& tx, const GhostTierPolicyConfig& config, CAmount base_fees, std::string& reason);
 
+/**
+ * Observability counters for the tier/policy gate. Cumulative since process
+ * start (reset on restart); the dashboard presents them as "since node start".
+ * Incremented exactly once per transaction the gate rejects. Purely
+ * observational — reading or writing them never affects acceptance.
+ */
+//! Number of transactions rejected by the tier/policy gate since start.
+uint64_t GhostTierRejectedTxs();
+//! Summed virtual size (vbytes) of transactions rejected by the tier/policy gate since start.
+uint64_t GhostTierRejectedVbytes();
+
 #endif // BITCOIN_POLICY_GHOST_TIER_H
