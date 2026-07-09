@@ -1576,11 +1576,8 @@ async fn api_node_blockchain_handler(
 
     let info = match state.rpc {
         Some(ref rpc) => {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                rpc.get_blockchain_info(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_blockchain_info())
+                .await
             {
                 Ok(Ok(info)) => Some(info),
                 Ok(Err(e)) => {
@@ -3421,7 +3418,9 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
     // (getmininginfo) — the round manager's copy is a static default, so we
     // read the live value here, mirroring the network-hashrate field on the
     // mining-status endpoint. `null` when either input is unavailable.
-    let pool_hashrate_th = state.mesh_total_hashrate().or_else(|| state.local_hashrate());
+    let pool_hashrate_th = state
+        .mesh_total_hashrate()
+        .or_else(|| state.local_hashrate());
     let network_difficulty = if let Some(ref rpc) = state.rpc {
         tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_mining_info())
             .await
@@ -6020,7 +6019,9 @@ fn run_ghostd_apply_reaper() -> Result<String, String> {
         return if mode == "success" {
             Ok("test-mode: apply-reaper simulated success".to_string())
         } else {
-            Err(format!("test-mode: apply-reaper simulated failure ({mode})"))
+            Err(format!(
+                "test-mode: apply-reaper simulated failure ({mode})"
+            ))
         };
     }
 
@@ -6161,7 +6162,10 @@ async fn clear_oneshot_and_reapply(
 
     *state.ghostd_reaper_apply.write() = ghost_common_now(
         "applying",
-        format!("Clearing one-shot {} flag and restarting ghostd…", kind.label()),
+        format!(
+            "Clearing one-shot {} flag and restarting ghostd…",
+            kind.label()
+        ),
     );
     let outcome = match tokio::task::spawn_blocking(run_ghostd_apply_reaper).await {
         Ok(Ok(msg)) => ghost_common_now("applied", msg),
@@ -6224,7 +6228,10 @@ fn spawn_ghostd_oneshot_watcher(state: Arc<VerificationState>, kind: GhostdOneSh
         // start (ghostd never came up) would be misread as completion and clear
         // the marker without having converted.
         let mut saw_active = false;
-        info!(oneshot = kind.label(), "watching one-shot ghostd flag to completion");
+        info!(
+            oneshot = kind.label(),
+            "watching one-shot ghostd flag to completion"
+        );
 
         for _ in 0..max_polls {
             tokio::time::sleep(interval).await;
@@ -6244,8 +6251,7 @@ fn spawn_ghostd_oneshot_watcher(state: Arc<VerificationState>, kind: GhostdOneSh
                         .await
                         {
                             Ok(Ok(info)) => {
-                                !info.initialblockdownload
-                                    && info.verificationprogress > 0.9999
+                                !info.initialblockdownload && info.verificationprogress > 0.9999
                             }
                             _ => false, // RPC down mid-reindex → keep waiting
                         },
@@ -6513,7 +6519,9 @@ fn validate_daemon_settings(req: &DaemonSettingsRequest) -> Result<(), String> {
             .rsplit_once(':')
             .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
         if !ok {
-            return Err(format!("i2p_sam must be host:port with a numeric port (got {sam:?})"));
+            return Err(format!(
+                "i2p_sam must be host:port with a numeric port (got {sam:?})"
+            ));
         }
     }
     if req.i2p_accept_incoming == Some(true) && req.i2p_sam.is_none() {
@@ -7146,7 +7154,10 @@ fn alerts_response_json(cfg: &ghost_common::config::AlertsConfig) -> serde_json:
             .remove("bot_token")
             .and_then(|t| t.as_str().map(|s| !s.is_empty()))
             .unwrap_or(false);
-        tg.insert("bot_token_set".to_string(), serde_json::Value::Bool(has_token));
+        tg.insert(
+            "bot_token_set".to_string(),
+            serde_json::Value::Bool(has_token),
+        );
     }
     v
 }
@@ -7193,8 +7204,7 @@ async fn api_config_alerts_post_handler(
             .unwrap_or("")
             .is_empty()
         {
-            saved.channels.telegram.bot_token =
-                cfg.alerts.channels.telegram.bot_token.clone();
+            saved.channels.telegram.bot_token = cfg.alerts.channels.telegram.bot_token.clone();
         }
         cfg.alerts = saved.clone();
         if let Some(ref path) = state.full_node_config_path {
@@ -7363,8 +7373,7 @@ async fn api_alerts_test_post_handler(
 /// edge-triggers (it only signals when its failure counter first crosses the
 /// threshold within the window), so this is a defensive second layer against a
 /// burst of signals — at most one `FailedLogin` alert per this interval.
-const FAILED_LOGIN_ALERT_MIN_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(5 * 60);
+const FAILED_LOGIN_ALERT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Body of the internal failed-login signal from the dashboard login route.
 /// Carries only the failed-attempt count (and the window it was measured over) —
@@ -7680,10 +7689,12 @@ async fn api_ghostpay_pruning_handler(
 async fn api_settings_ghostpay_payout_address_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let address = state
-        .full_node_config
-        .as_ref()
-        .and_then(|c| c.read().ghost_pay.as_ref().and_then(|gp| gp.payout_address.clone()));
+    let address = state.full_node_config.as_ref().and_then(|c| {
+        c.read()
+            .ghost_pay
+            .as_ref()
+            .and_then(|gp| gp.payout_address.clone())
+    });
 
     let message = if address.is_some() {
         "Ghost Pay payout address"
@@ -7862,10 +7873,12 @@ fn backup_allowed_bases() -> [std::path::PathBuf; 4] {
 
 /// Whether a canonical directory sits within an allowed base (M-15).
 fn backup_dir_within_allowed(canonical: &std::path::Path) -> bool {
-    backup_allowed_bases().iter().any(|base| match base.canonicalize() {
-        Ok(canonical_base) => canonical.starts_with(&canonical_base),
-        Err(_) => canonical.starts_with(base),
-    })
+    backup_allowed_bases()
+        .iter()
+        .any(|base| match base.canonicalize() {
+            Ok(canonical_base) => canonical.starts_with(&canonical_base),
+            Err(_) => canonical.starts_with(base),
+        })
 }
 
 /// Resolve + validate the configured backup directory. Enforces the same M-15
@@ -7947,7 +7960,12 @@ fn artifact_temp_path(db_path: &str, tag: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    parent.join(format!(".ghost-{}-{}-{}.tmp", tag, std::process::id(), nanos))
+    parent.join(format!(
+        ".ghost-{}-{}-{}.tmp",
+        tag,
+        std::process::id(),
+        nanos
+    ))
 }
 
 /// Write uploaded artifact bytes to `path` with restrictive (0600) permissions.
@@ -8176,7 +8194,9 @@ async fn api_backup_import_handler(
 
     if !v.valid {
         let _ = std::fs::remove_file(&tmp);
-        let detail = v.detail.unwrap_or_else(|| "failed verification".to_string());
+        let detail = v
+            .detail
+            .unwrap_or_else(|| "failed verification".to_string());
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -8395,8 +8415,12 @@ where
     };
     let mut cfg = full.write();
     mutate(&mut cfg);
-    cfg.save_atomic(path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to persist config: {e}")))
+    cfg.save_atomic(path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist config: {e}"),
+        )
+    })
 }
 
 /// Apply a public-mining on/off request to the REAL `network.mining_mode`.
@@ -9599,8 +9623,11 @@ async fn api_haze_checkpoint_handler(
         }
     };
 
-    match tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_checkpoint_status())
-        .await
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rpc.get_checkpoint_status(),
+    )
+    .await
     {
         Ok(Ok(mut status)) => {
             if let Some(obj) = status.as_object_mut() {
@@ -9993,9 +10020,7 @@ async fn api_logs_handler(
 /// serve, so the dashboard builds its selector from what is actually allowlisted
 /// AND present on this host. ghost-pool is always available (ring buffer); other
 /// units report `available` from their systemd `LoadState`.
-async fn api_logs_units_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
+async fn api_logs_units_handler(State(_state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let mut units = Vec::with_capacity(crate::journal::ALLOWLIST.len());
     for u in crate::journal::ALLOWLIST {
         units.push(serde_json::json!({
@@ -10054,7 +10079,9 @@ async fn api_nickname_post_handler(
                 error!(error = %e, "Failed to persist node nickname");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Failed to persist nickname: {}", e)})),
+                    Json(
+                        serde_json::json!({"error": format!("Failed to persist nickname: {}", e)}),
+                    ),
                 )
                     .into_response();
             }
@@ -10303,14 +10330,12 @@ async fn api_settings_ghostpay_payout_address_post_handler(
 
     // Persist to pool.toml. GhostPayConfig is optional; create a default when the
     // operator sets an address before ghost-pay is otherwise configured.
-    let persist = persist_full_config(&state, |cfg| {
-        match cfg.ghost_pay {
-            Some(ref mut gp) => gp.payout_address = new_address.clone(),
-            None => {
-                let mut gp = ghost_common::config::GhostPayConfig::default();
-                gp.payout_address = new_address.clone();
-                cfg.ghost_pay = Some(gp);
-            }
+    let persist = persist_full_config(&state, |cfg| match cfg.ghost_pay {
+        Some(ref mut gp) => gp.payout_address = new_address.clone(),
+        None => {
+            let mut gp = ghost_common::config::GhostPayConfig::default();
+            gp.payout_address = new_address.clone();
+            cfg.ghost_pay = Some(gp);
         }
     });
     if let Err((code, msg)) = persist {
@@ -10479,7 +10504,10 @@ async fn api_mining_pool_name_post_handler(
                     Json(serde_json::json!({"error": "Pool name must be 30 characters or fewer"})),
                 )
                     .into_response();
-            } else if !trimmed.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+            } else if !trimmed
+                .chars()
+                .all(|c| c.is_ascii() && !c.is_ascii_control())
+            {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"error": "Pool name must be ASCII printable characters only"})),
@@ -10808,9 +10836,7 @@ fn filtering_activity_json(
 /// listening on port 3333), so they don't silently fail to earn its shares.
 /// Read-only: hands back the last snapshot; no probing happens in the request
 /// path. Returns `null` on older deploys where the provider isn't wired.
-async fn api_self_check_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
+async fn api_self_check_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     Json(state.self_check())
 }
 
@@ -11468,7 +11494,10 @@ mod tests {
         assert_eq!(resp["persisted"].as_bool(), Some(true));
         assert_eq!(settle(&state).await, "failed");
         let msg = state.ghostd_reaper_apply.read().message.clone();
-        assert!(msg.contains("not found"), "reason should explain the miss: {msg}");
+        assert!(
+            msg.contains("not found"),
+            "reason should explain the miss: {msg}"
+        );
         assert!(
             state.restart_requested(),
             "pool side must still apply even when ghostd apply fails"
@@ -12412,7 +12441,10 @@ mod tests {
         // A comfortable depth above the floor persists verbatim.
         let ok = post(r#"{"blocks": 2016}"#).await;
         assert_eq!(ok.status(), StatusCode::OK);
-        assert_eq!(FullNodeConfig::load(&path).unwrap().storage.prune_height, 2016);
+        assert_eq!(
+            FullNodeConfig::load(&path).unwrap().storage.prune_height,
+            2016
+        );
 
         // A non-zero depth below the VW floor is clamped up to it.
         let clamped = post(r#"{"blocks": 10}"#).await;
@@ -12489,7 +12521,10 @@ mod tests {
             MiningMode::PublicPool
         ));
         assert!(!state.restart_requested());
-        assert!(!path.exists(), "an invalid transition must not write pool.toml");
+        assert!(
+            !path.exists(),
+            "an invalid transition must not write pool.toml"
+        );
     }
 
     /// Group B: Public Mining POST preserves the Ghost-Mode mutual exclusion.

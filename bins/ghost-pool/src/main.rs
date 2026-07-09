@@ -2623,8 +2623,10 @@ async fn main() -> Result<()> {
     // content) is the "Advanced" Custom profile only. The three "Basic" presets
     // stay tier-gate-only, so their baked-in field limits are NOT enforced at
     // block-build time — preserving the historical preset behaviour.
-    let enforce_custom_policy_fields =
-        matches!(config.policy.profile, ghost_common::config::PolicyProfile::Custom);
+    let enforce_custom_policy_fields = matches!(
+        config.policy.profile,
+        ghost_common::config::PolicyProfile::Custom
+    );
 
     // The template's minimum fee-rate floor. Presets keep the historical
     // TemplateConfig default (unchanged behaviour); the Custom profile lets the
@@ -6913,7 +6915,10 @@ async fn main() -> Result<()> {
                 alert_dispatcher_for_restart
                     .fire(
                         ghost_verification::alerts::AlertEvent::RestartNeeded,
-                        &format!("Node {} is restarting to apply a configuration change.", &restart_node_id[..8.min(restart_node_id.len())]),
+                        &format!(
+                            "Node {} is restarting to apply a configuration change.",
+                            &restart_node_id[..8.min(restart_node_id.len())]
+                        ),
                     )
                     .await;
                 let _ = shutdown_tx_for_restart.send(());
@@ -7485,8 +7490,7 @@ async fn main() -> Result<()> {
             // runs a backup once the configured period has elapsed. 60s keeps the
             // task off any hot path while still honouring hourly custom periods.
             const CHECK_SECS: u64 = 60;
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(CHECK_SECS));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(CHECK_SECS));
             // Let the node finish starting before the first check/run.
             interval.tick().await;
             loop {
@@ -7720,9 +7724,10 @@ async fn main() -> Result<()> {
     // Pass the alert dispatcher so the self-check loop fires CapabilityDrift
     // (a claimed capability's prerequisite regressing pass→fail) and LowDisk
     // (data partition crossing the low-free threshold) as edge-triggered alerts.
-    self_check
-        .clone()
-        .spawn_loop(Arc::new(config.clone()), Some(Arc::clone(&alert_dispatcher)));
+    self_check.clone().spawn_loop(
+        Arc::new(config.clone()),
+        Some(Arc::clone(&alert_dispatcher)),
+    );
     info!("Capability self-check loop started (30s interval)");
 
     // Subscribe to template events BEFORE starting the processor to avoid race condition
@@ -8621,9 +8626,7 @@ fn expand_path(path: &std::path::Path) -> Result<PathBuf> {
 /// `[policy].custom` config block. This is the source of truth the template
 /// builder enforces per-field (tiers, content toggles, size limits) when the
 /// operator selects the `Custom` profile.
-fn policy_profile_from_custom(
-    custom: &ghost_common::config::CustomPolicyConfig,
-) -> PolicyProfile {
+fn policy_profile_from_custom(custom: &ghost_common::config::CustomPolicyConfig) -> PolicyProfile {
     // Map the config-crate BudsTier enum onto the ghost_buds tier the policy
     // engine/classifier use.
     let allowed_tiers = custom

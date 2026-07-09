@@ -2540,11 +2540,26 @@ mod tests {
         assert_eq!(BackupInterval::Weekly.as_wire(), "weekly");
         assert_eq!(BackupInterval::Hours(6).as_wire(), "6h");
         // Aliases + hour equivalents normalise back.
-        assert_eq!(BackupInterval::parse_wire("daily").unwrap(), BackupInterval::Daily);
-        assert_eq!(BackupInterval::parse_wire("WEEK").unwrap(), BackupInterval::Weekly);
-        assert_eq!(BackupInterval::parse_wire("24h").unwrap(), BackupInterval::Daily);
-        assert_eq!(BackupInterval::parse_wire("168").unwrap(), BackupInterval::Weekly);
-        assert_eq!(BackupInterval::parse_wire("12h").unwrap(), BackupInterval::Hours(12));
+        assert_eq!(
+            BackupInterval::parse_wire("daily").unwrap(),
+            BackupInterval::Daily
+        );
+        assert_eq!(
+            BackupInterval::parse_wire("WEEK").unwrap(),
+            BackupInterval::Weekly
+        );
+        assert_eq!(
+            BackupInterval::parse_wire("24h").unwrap(),
+            BackupInterval::Daily
+        );
+        assert_eq!(
+            BackupInterval::parse_wire("168").unwrap(),
+            BackupInterval::Weekly
+        );
+        assert_eq!(
+            BackupInterval::parse_wire("12h").unwrap(),
+            BackupInterval::Hours(12)
+        );
         assert!(BackupInterval::parse_wire("nonsense").is_err());
     }
 
@@ -2560,12 +2575,16 @@ mod tests {
     #[test]
     fn backup_is_due_next_run_computation() {
         let period = BackupInterval::Daily.period_secs(); // 86_400
-        // Never run this process → due immediately.
+                                                          // Never run this process → due immediately.
         assert!(backup_is_due(None, 1_000_000, period));
         // Exactly a full period elapsed → due.
         assert!(backup_is_due(Some(1_000_000), 1_000_000 + period, period));
         // Just short of a period → not due.
-        assert!(!backup_is_due(Some(1_000_000), 1_000_000 + period - 1, period));
+        assert!(!backup_is_due(
+            Some(1_000_000),
+            1_000_000 + period - 1,
+            period
+        ));
         // Clock skew backwards → not due (saturating subtraction).
         assert!(!backup_is_due(Some(2_000_000), 1_000_000, period));
     }
@@ -2850,11 +2869,17 @@ mod tests {
 
     #[test]
     fn test_storage_ghostd_flags_prune_zero_iff_archive() {
-        let archive = StorageConfig { archive_mode: true, ..Default::default() };
+        let archive = StorageConfig {
+            archive_mode: true,
+            ..Default::default()
+        };
         assert!(archive.ghostd_flags().contains(&"-prune=0".to_string()));
 
         // Archive OFF must NOT emit -prune=0 (leave ghostd's own prune config).
-        let off = StorageConfig { archive_mode: false, ..Default::default() };
+        let off = StorageConfig {
+            archive_mode: false,
+            ..Default::default()
+        };
         assert!(!off.ghostd_flags().iter().any(|f| f.starts_with("-prune")));
     }
 
@@ -2884,14 +2909,20 @@ mod tests {
     #[test]
     fn test_storage_ghostd_flags_haze_and_exorcist_oneshot() {
         // Standard/full-archive haze modes emit no -hazemode flag (default).
-        assert!(!StorageConfig { haze_mode: HazeMode::Standard, ..Default::default() }
-            .ghostd_flags()
-            .iter()
-            .any(|f| f.starts_with("-hazemode")));
-        assert!(!StorageConfig { haze_mode: HazeMode::FullArchive, ..Default::default() }
-            .ghostd_flags()
-            .iter()
-            .any(|f| f.starts_with("-hazemode")));
+        assert!(!StorageConfig {
+            haze_mode: HazeMode::Standard,
+            ..Default::default()
+        }
+        .ghostd_flags()
+        .iter()
+        .any(|f| f.starts_with("-hazemode")));
+        assert!(!StorageConfig {
+            haze_mode: HazeMode::FullArchive,
+            ..Default::default()
+        }
+        .ghostd_flags()
+        .iter()
+        .any(|f| f.starts_with("-hazemode")));
 
         // Converting (exorcist pending): emit -exorcist, SUPPRESS -hazemode=hazed
         // (fatal in ghostd while blk*.dat still present).
@@ -3073,7 +3104,10 @@ mod tests {
         let warning = config.reconcile_ghost_mode_mining_exclusion();
 
         assert!(warning.is_none(), "no conflict without Public Mining");
-        assert!(config.network.ghost_mode, "Ghost Mode must be preserved when it is safe");
+        assert!(
+            config.network.ghost_mode,
+            "Ghost Mode must be preserved when it is safe"
+        );
     }
 
     #[test]
@@ -3509,7 +3543,11 @@ mod tests {
         NodeConfig::default().save_atomic(&path).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "save_atomic must persist config as 0600, got {:o}", mode);
+        assert_eq!(
+            mode, 0o600,
+            "save_atomic must persist config as 0600, got {:o}",
+            mode
+        );
     }
 
     #[cfg(unix)]
@@ -3627,13 +3665,19 @@ mod tests {
         // default and must add nothing to ExecStart.
         let none = NodeLaunchConfig::default();
         assert_eq!(none.full_rbf, None);
-        assert!(!none.ghostd_flags().iter().any(|f| f.starts_with("-mempoolfullrbf")));
+        assert!(!none
+            .ghostd_flags()
+            .iter()
+            .any(|f| f.starts_with("-mempoolfullrbf")));
 
         let on = NodeLaunchConfig {
             full_rbf: Some(true),
             ..Default::default()
         };
-        assert!(!on.ghostd_flags().iter().any(|f| f.starts_with("-mempoolfullrbf")));
+        assert!(!on
+            .ghostd_flags()
+            .iter()
+            .any(|f| f.starts_with("-mempoolfullrbf")));
 
         let off = NodeLaunchConfig {
             full_rbf: Some(false),

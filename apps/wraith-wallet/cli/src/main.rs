@@ -1358,7 +1358,11 @@ mod client {
                 println!("network:    {}", s.network);
                 println!(
                     "ghost-pay:  {}{}",
-                    if s.ghost_pay_reachable { "reachable" } else { "unreachable" },
+                    if s.ghost_pay_reachable {
+                        "reachable"
+                    } else {
+                        "unreachable"
+                    },
                     s.ghost_pay_version
                         .as_deref()
                         .map(|v| format!(" (v{v})"))

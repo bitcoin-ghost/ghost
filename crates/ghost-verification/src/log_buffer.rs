@@ -112,8 +112,18 @@ mod tests {
     fn captures_message_target_and_level_and_filters() {
         clear();
         push(1_000, "info", "ghost-pool".into(), "started up".into());
-        push(2_000, "warn", "ghost-pool::mesh".into(), "peer dropped".into());
-        push(3_000, "error", "ghost-pool::rpc".into(), "rpc timeout".into());
+        push(
+            2_000,
+            "warn",
+            "ghost-pool::mesh".into(),
+            "peer dropped".into(),
+        );
+        push(
+            3_000,
+            "error",
+            "ghost-pool::rpc".into(),
+            "rpc timeout".into(),
+        );
 
         // No filter returns all three, oldest-first, each with a real message.
         let all = recent(100, None);
@@ -123,7 +133,9 @@ mod tests {
         assert_eq!(all[0]["target"], "ghost-pool");
         assert_eq!(all[0]["timestamp"], 1_000);
         // Crucially, no entry has an empty message (the #246 regression).
-        assert!(all.iter().all(|e| !e["message"].as_str().unwrap().is_empty()));
+        assert!(all
+            .iter()
+            .all(|e| !e["message"].as_str().unwrap().is_empty()));
 
         // "warn" filter yields warn + error (more severe), not info.
         let warn = recent(100, Some("warn"));

@@ -500,7 +500,10 @@ mod tests {
         let on = ghostd_managed_dropin(
             exec,
             &reaper,
-            &NodeLaunchConfig { tor_mode: true, ..Default::default() },
+            &NodeLaunchConfig {
+                tor_mode: true,
+                ..Default::default()
+            },
             &storage,
             &inert_policy(),
         );
@@ -509,7 +512,10 @@ mod tests {
         let off = ghostd_managed_dropin(
             exec,
             &reaper,
-            &NodeLaunchConfig { tor_mode: false, ..Default::default() },
+            &NodeLaunchConfig {
+                tor_mode: false,
+                ..Default::default()
+            },
             &storage,
             &inert_policy(),
         );
@@ -582,7 +588,8 @@ mod tests {
             .find(|l| l.starts_with("ExecStart=/"))
             .unwrap()
             .trim_start_matches("ExecStart=");
-        let dropin2 = ghostd_managed_dropin(regen_exec, &reaper, &launch, &storage, &inert_policy());
+        let dropin2 =
+            ghostd_managed_dropin(regen_exec, &reaper, &launch, &storage, &inert_policy());
         assert_eq!(dropin2.matches("-maxmempool=").count(), 1);
         assert_eq!(dropin2.matches("-onlynet=").count(), 2);
         assert_eq!(dropin2.matches("-tormode=1").count(), 1);
@@ -600,15 +607,23 @@ mod tests {
             exec,
             &reaper,
             &launch,
-            &StorageConfig { archive_mode: true, ..Default::default() },
+            &StorageConfig {
+                archive_mode: true,
+                ..Default::default()
+            },
             &inert_policy(),
         );
         assert!(on.contains("-prune=0"));
         // No reindex unless explicitly armed.
         assert!(!on.contains("-reindex"));
 
-        let off =
-            ghostd_managed_dropin(exec, &reaper, &launch, &StorageConfig::default(), &inert_policy());
+        let off = ghostd_managed_dropin(
+            exec,
+            &reaper,
+            &launch,
+            &StorageConfig::default(),
+            &inert_policy(),
+        );
         assert!(!off.contains("-prune"));
     }
 
@@ -625,7 +640,11 @@ mod tests {
             exec,
             &reaper,
             &launch,
-            &StorageConfig { archive_mode: true, reindex_pending: true, ..Default::default() },
+            &StorageConfig {
+                archive_mode: true,
+                reindex_pending: true,
+                ..Default::default()
+            },
             &inert_policy(),
         );
         assert_eq!(armed.matches("-reindex").count(), 1);
@@ -636,7 +655,11 @@ mod tests {
             exec,
             &reaper,
             &launch,
-            &StorageConfig { archive_mode: true, reindex_pending: false, ..Default::default() },
+            &StorageConfig {
+                archive_mode: true,
+                reindex_pending: false,
+                ..Default::default()
+            },
             &inert_policy(),
         );
         assert!(!cleared.contains("-reindex"));
@@ -657,7 +680,11 @@ mod tests {
             exec,
             &reaper,
             &launch,
-            &StorageConfig { haze_mode: HazeMode::Hazed, exorcist_pending: true, ..Default::default() },
+            &StorageConfig {
+                haze_mode: HazeMode::Hazed,
+                exorcist_pending: true,
+                ..Default::default()
+            },
             &inert_policy(),
         );
         assert_eq!(converting.matches("-exorcist").count(), 1);
@@ -667,7 +694,11 @@ mod tests {
             exec,
             &reaper,
             &launch,
-            &StorageConfig { haze_mode: HazeMode::Hazed, exorcist_pending: false, ..Default::default() },
+            &StorageConfig {
+                haze_mode: HazeMode::Hazed,
+                exorcist_pending: false,
+                ..Default::default()
+            },
             &inert_policy(),
         );
         assert!(!converted.contains("-exorcist"));

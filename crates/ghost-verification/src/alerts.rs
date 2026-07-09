@@ -119,7 +119,11 @@ pub struct AlertMessage {
 impl AlertMessage {
     /// Build a message for an event with an operator-facing detail line.
     pub fn for_event(event: AlertEvent, node_id: &str, detail: &str) -> Self {
-        let short = if node_id.len() > 12 { &node_id[..12] } else { node_id };
+        let short = if node_id.len() > 12 {
+            &node_id[..12]
+        } else {
+            node_id
+        };
         let title = format!("[Ghost {short}] {}", event.title());
         let body = if detail.is_empty() {
             format!("{} on node {node_id}.", event.title())
@@ -142,13 +146,28 @@ pub struct ChannelResult {
 
 impl ChannelResult {
     fn skipped(channel: &'static str, why: &str) -> Self {
-        Self { channel, attempted: false, success: false, detail: why.to_string() }
+        Self {
+            channel,
+            attempted: false,
+            success: false,
+            detail: why.to_string(),
+        }
     }
     fn ok(channel: &'static str) -> Self {
-        Self { channel, attempted: true, success: true, detail: "delivered".to_string() }
+        Self {
+            channel,
+            attempted: true,
+            success: true,
+            detail: "delivered".to_string(),
+        }
     }
     fn fail(channel: &'static str, why: String) -> Self {
-        Self { channel, attempted: true, success: false, detail: why }
+        Self {
+            channel,
+            attempted: true,
+            success: false,
+            detail: why,
+        }
     }
 }
 
@@ -225,10 +244,7 @@ impl AlertDispatcher {
     /// Build a dispatcher for this node. `config` is called on every dispatch
     /// to read the current `[alerts]` config (wire it to the live
     /// `full_node_config` so operator edits apply without a restart).
-    pub fn new(
-        node_id: String,
-        config: impl Fn() -> AlertsConfig + Send + Sync + 'static,
-    ) -> Self {
+    pub fn new(node_id: String, config: impl Fn() -> AlertsConfig + Send + Sync + 'static) -> Self {
         Self {
             node_id,
             config: Box::new(config),
@@ -462,7 +478,11 @@ mod tests {
     #[tokio::test]
     async fn disabled_channels_are_skipped_not_attempted() {
         let cfg = base(); // all channels default-disabled
-        let results = deliver(&cfg, &AlertMessage::for_event(AlertEvent::BlockFound, "n", "d")).await;
+        let results = deliver(
+            &cfg,
+            &AlertMessage::for_event(AlertEvent::BlockFound, "n", "d"),
+        )
+        .await;
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|r| !r.attempted));
     }
@@ -470,8 +490,16 @@ mod tests {
     #[tokio::test]
     async fn telegram_without_token_is_skipped() {
         let mut cfg = base();
-        cfg.channels.telegram = TelegramChannel { enabled: true, bot_token: None, chat_id: Some("1".into()) };
-        let results = deliver(&cfg, &AlertMessage::for_event(AlertEvent::BlockFound, "n", "d")).await;
+        cfg.channels.telegram = TelegramChannel {
+            enabled: true,
+            bot_token: None,
+            chat_id: Some("1".into()),
+        };
+        let results = deliver(
+            &cfg,
+            &AlertMessage::for_event(AlertEvent::BlockFound, "n", "d"),
+        )
+        .await;
         let tg = results.iter().find(|r| r.channel == "telegram").unwrap();
         assert!(!tg.attempted);
         assert!(tg.detail.contains("token"));
@@ -529,10 +557,19 @@ mod tests {
     async fn edge_keys_are_independent() {
         let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.node_offline = true));
         // Two different peers offline -> two independent alerts.
-        assert!(d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d").await);
-        assert!(d.fire_edge(AlertEvent::NodeOffline, "peerB", true, "d").await);
+        assert!(
+            d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d")
+                .await
+        );
+        assert!(
+            d.fire_edge(AlertEvent::NodeOffline, "peerB", true, "d")
+                .await
+        );
         // Re-reporting peerA -> suppressed.
-        assert!(!d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d").await);
+        assert!(
+            !d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -610,13 +647,21 @@ mod tests {
     async fn failed_login_respects_enable_flag() {
         let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.failed_login = true));
         assert!(
-            d.fire_rate_limited(AlertEvent::FailedLogin, Duration::from_secs(60), "5 attempts")
-                .await
+            d.fire_rate_limited(
+                AlertEvent::FailedLogin,
+                Duration::from_secs(60),
+                "5 attempts"
+            )
+            .await
         );
         let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.node_offline = true));
         assert!(
-            !d.fire_rate_limited(AlertEvent::FailedLogin, Duration::from_secs(60), "5 attempts")
-                .await
+            !d.fire_rate_limited(
+                AlertEvent::FailedLogin,
+                Duration::from_secs(60),
+                "5 attempts"
+            )
+            .await
         );
     }
 

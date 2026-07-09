@@ -442,9 +442,7 @@ pub fn evaluate_fee_spike(
         ));
     }
     if let Some(base) = baseline_sat_vb {
-        if base > 0.0
-            && current_sat_vb >= jump_floor_sat_vb
-            && current_sat_vb >= base * jump_factor
+        if base > 0.0 && current_sat_vb >= jump_floor_sat_vb && current_sat_vb >= base * jump_factor
         {
             return Some(format!(
                 "Next-block fee rate jumped to {current_sat_vb:.1} sat/vB, {:.1}x the \
@@ -532,8 +530,14 @@ mod tests {
     #[test]
     fn behind_tip_none_when_no_peer_height() {
         // best_peer == 0 means "unknown" — never alert.
-        assert!(evaluate_behind_tip(0, 0, 999_999, BEHIND_TIP_LAG_BLOCKS, BEHIND_TIP_MAX_AGE_SECS)
-            .is_none());
+        assert!(evaluate_behind_tip(
+            0,
+            0,
+            999_999,
+            BEHIND_TIP_LAG_BLOCKS,
+            BEHIND_TIP_MAX_AGE_SECS
+        )
+        .is_none());
         assert!(evaluate_behind_tip(
             100,
             0,
@@ -565,7 +569,13 @@ mod tests {
     fn behind_tip_fires_on_stalled_tip_while_peer_ahead() {
         // Only 1 block behind (within K) but the tip has been stale > max age
         // and a peer is ahead → stalled alert.
-        let d = evaluate_behind_tip(100, 101, BEHIND_TIP_MAX_AGE_SECS + 1, 3, BEHIND_TIP_MAX_AGE_SECS);
+        let d = evaluate_behind_tip(
+            100,
+            101,
+            BEHIND_TIP_MAX_AGE_SECS + 1,
+            3,
+            BEHIND_TIP_MAX_AGE_SECS,
+        );
         assert!(d.is_some());
         assert!(d.unwrap().contains("No new block"));
     }

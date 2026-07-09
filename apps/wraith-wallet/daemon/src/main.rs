@@ -61,19 +61,18 @@ mod server {
     use wraith_wallet_core::signer::{Signer, SoftwareSigner};
     use wraith_wallet_ipc::{
         ChainStatusResponse, CheckForUpdateResponse, ConnectionStatusResponse, DaemonEnvResponse,
-        DetectedPaymentEntry,
-        DoctorCheck, DoctorResponse, Envelope, ErrorResponse, GlyphClaimResult, GlyphInfo,
-        GspAuthResponse, GspPingResponse, GspSessionStatusResponse, HealthResponse,
-        LightBalanceResponse, LightDetectedResponse, LightHistoryEntry, LightHistoryResponse,
-        LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse, LightSentResponse,
-        LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse, LocksJumpedResponse,
-        LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse, NodeEndpointsResponse,
-        PsbtBroadcastResponse,
-        PsbtBumpFeeResponse, PsbtInputSummary, PsbtInspectResponse, PsbtOutputSummary,
-        PsbtSignResponse, ReleaseManifest, Request, Response, SignerInfoIpc,
-        WalletAuthInfoResponse, WalletCreateResponse, WalletDeriveResponse, WalletGhostIdResponse,
-        WalletListEntry, WalletListResponse, WalletShowMnemonicResponse, WalletStatusResponse,
-        WalletXpubResponse, WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
+        DetectedPaymentEntry, DoctorCheck, DoctorResponse, Envelope, ErrorResponse,
+        GlyphClaimResult, GlyphInfo, GspAuthResponse, GspPingResponse, GspSessionStatusResponse,
+        HealthResponse, LightBalanceResponse, LightDetectedResponse, LightHistoryEntry,
+        LightHistoryResponse, LightL1UtxoEntry, LightL1UtxosResponse, LightReceiveResponse,
+        LightSentResponse, LightUtxoEntry, LightUtxosResponse, LockEntry, LocksConfirmedResponse,
+        LocksJumpedResponse, LocksListResponse, LocksPreparedResponse, LocksRecoveredResponse,
+        NodeEndpointsResponse, PsbtBroadcastResponse, PsbtBumpFeeResponse, PsbtInputSummary,
+        PsbtInspectResponse, PsbtOutputSummary, PsbtSignResponse, ReleaseManifest, Request,
+        Response, SignerInfoIpc, WalletAuthInfoResponse, WalletCreateResponse,
+        WalletDeriveResponse, WalletGhostIdResponse, WalletListEntry, WalletListResponse,
+        WalletShowMnemonicResponse, WalletStatusResponse, WalletXpubResponse,
+        WraithDiscoverResponse, WraithDiscoverTier, WraithMixCompletedResponse,
         WraithMixPreparedResponse,
     };
 
@@ -408,7 +407,9 @@ mod server {
         }
         for u in &gsp {
             if !(u.starts_with("ws://") || u.starts_with("wss://")) {
-                return Err(format!("GSP URL must start with ws:// or wss:// — got '{u}'"));
+                return Err(format!(
+                    "GSP URL must start with ws:// or wss:// — got '{u}'"
+                ));
             }
         }
         Ok((pay, gsp))
@@ -454,12 +455,10 @@ mod server {
             gsp_url: Option<String>,
         ) -> Result<NodeEndpointsResponse, String> {
             if self.ghost_pay_env_override || self.gsp_env_override {
-                return Err(
-                    "node endpoints are pinned by environment variables \
+                return Err("node endpoints are pinned by environment variables \
                      (WRAITHD_GHOST_PAY / WRAITHD_GSP); unset them to manage the \
                      node from the wallet"
-                        .to_string(),
-                );
+                    .to_string());
             }
             let (ghost_pay_urls, gsp_urls, preset_label) = match preset {
                 PRESET_PUBLIC => (
@@ -2701,7 +2700,10 @@ mod server {
                 preset,
                 ghost_pay_url,
                 gsp_url,
-            } => match state.set_node_endpoints(&preset, ghost_pay_url, gsp_url).await {
+            } => match state
+                .set_node_endpoints(&preset, ghost_pay_url, gsp_url)
+                .await
+            {
                 Ok(applied) => Response::NodeEndpointsSet(applied),
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
@@ -3621,20 +3623,22 @@ mod server {
                 }
                 Err(message) => Response::Error(ErrorResponse { message }),
             },
-            Request::WalletGlyphClaim { ghost_id, pixels } => match build_ghost_pay_client(state).await {
-                Ok(client) => match client.claim_glyph(&ghost_id, &pixels).await {
-                    Ok(v) => match serde_json::from_value::<GlyphClaimResult>(v) {
-                        Ok(r) => Response::WalletGlyphClaimed(r),
+            Request::WalletGlyphClaim { ghost_id, pixels } => {
+                match build_ghost_pay_client(state).await {
+                    Ok(client) => match client.claim_glyph(&ghost_id, &pixels).await {
+                        Ok(v) => match serde_json::from_value::<GlyphClaimResult>(v) {
+                            Ok(r) => Response::WalletGlyphClaimed(r),
+                            Err(e) => Response::Error(ErrorResponse {
+                                message: format!("glyph claim parse: {e}"),
+                            }),
+                        },
                         Err(e) => Response::Error(ErrorResponse {
-                            message: format!("glyph claim parse: {e}"),
+                            message: format!("glyph claim: {e}"),
                         }),
                     },
-                    Err(e) => Response::Error(ErrorResponse {
-                        message: format!("glyph claim: {e}"),
-                    }),
-                },
-                Err(message) => Response::Error(ErrorResponse { message }),
-            },
+                    Err(message) => Response::Error(ErrorResponse { message }),
+                }
+            }
             Request::WalletAuthInfo => {
                 match with_active_wallet(state, |_, ks| {
                     let kp = auth::auth_keypair(ks).map_err(|e| format!("auth-info: {e}"))?;
@@ -4818,8 +4822,7 @@ mod server {
             assert!(state.active.read().await.is_none());
 
             // No longer surfaced by WalletList.
-            let list =
-                serde_json::to_string(&Envelope::new(3, Request::WalletList)).unwrap();
+            let list = serde_json::to_string(&Envelope::new(3, Request::WalletList)).unwrap();
             let resp = super::dispatch(&list, &state).await;
             match resp.payload {
                 Response::WalletList(l) => assert!(
@@ -4851,14 +4854,26 @@ mod server {
             let resp = super::dispatch(&req, &state).await;
             match resp.payload {
                 Response::ConnectionStatus(s) => {
-                    assert_eq!(s.network, "regtest", "network is read from config, not the backend");
-                    assert!(!s.ghost_pay_reachable, "RejectChain stub must read as unreachable");
-                    assert!(s.ghost_pay_error.is_some(), "an unreachable backend should carry an error hint");
+                    assert_eq!(
+                        s.network, "regtest",
+                        "network is read from config, not the backend"
+                    );
+                    assert!(
+                        !s.ghost_pay_reachable,
+                        "RejectChain stub must read as unreachable"
+                    );
+                    assert!(
+                        s.ghost_pay_error.is_some(),
+                        "an unreachable backend should carry an error hint"
+                    );
                     assert!(s.ghost_pay_version.is_none());
                     assert!(!s.gsp_have_token, "no session configured in this test");
                     assert!(!s.gsp_connected);
                     assert!(s.gsp_phase.is_none());
-                    assert!(!s.chain_synced, "cannot be synced while ghost-pay is unreachable");
+                    assert!(
+                        !s.chain_synced,
+                        "cannot be synced while ghost-pay is unreachable"
+                    );
                     assert!(s.chain_height.is_none());
                 }
                 other => panic!("expected ConnectionStatus, got {other:?}"),
@@ -4896,7 +4911,10 @@ mod server {
             let persisted =
                 super::load_node_config(&state.node_config_path).expect("node.json written");
             assert_eq!(persisted.preset, "custom");
-            assert_eq!(persisted.ghost_pay_urls, vec!["https://pay.example.com:8800"]);
+            assert_eq!(
+                persisted.ghost_pay_urls,
+                vec!["https://pay.example.com:8800"]
+            );
 
             // Live state reflects it via the accessors + DaemonEnv.
             assert_eq!(

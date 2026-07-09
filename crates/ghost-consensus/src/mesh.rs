@@ -1197,10 +1197,7 @@ impl MeshNetwork {
     /// Set a callback providing this node's own trailing-7-day uptime percentage
     /// (0-100), gossiped in health pings so peers render it on the Swarm page.
     /// Returns `None` when there are no samples yet.
-    pub fn set_uptime_percent_provider(
-        &mut self,
-        f: Arc<dyn Fn() -> Option<f64> + Send + Sync>,
-    ) {
+    pub fn set_uptime_percent_provider(&mut self, f: Arc<dyn Fn() -> Option<f64> + Send + Sync>) {
         self.uptime_percent_fn = Some(f);
     }
 

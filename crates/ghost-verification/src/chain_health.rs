@@ -246,10 +246,19 @@ mod tests {
 
     #[test]
     fn derive_at_tip_when_caught_up_or_ahead() {
-        assert_eq!(derive_tip_status(100, 100, 5, 3, 1800).status, TipStatusKind::AtTip);
-        assert_eq!(derive_tip_status(105, 100, 5, 3, 1800).status, TipStatusKind::AtTip);
+        assert_eq!(
+            derive_tip_status(100, 100, 5, 3, 1800).status,
+            TipStatusKind::AtTip
+        );
+        assert_eq!(
+            derive_tip_status(105, 100, 5, 3, 1800).status,
+            TipStatusKind::AtTip
+        );
         // lag exactly K is not "more than K".
-        assert_eq!(derive_tip_status(100, 103, 5, 3, 1800).status, TipStatusKind::AtTip);
+        assert_eq!(
+            derive_tip_status(100, 103, 5, 3, 1800).status,
+            TipStatusKind::AtTip
+        );
     }
 
     #[test]

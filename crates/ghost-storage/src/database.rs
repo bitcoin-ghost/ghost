@@ -240,7 +240,10 @@ impl BackupVerification {
             encrypted: false,
             schema_version: 0,
             tables_present: Vec::new(),
-            missing_tables: REQUIRED_BACKUP_TABLES.iter().map(|t| t.to_string()).collect(),
+            missing_tables: REQUIRED_BACKUP_TABLES
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
             table_count: 0,
             miner_count: 0,
             size_bytes,
@@ -324,8 +327,9 @@ pub fn apply_pending_restore(db_path: &Path) -> GhostResult<bool> {
     }
 
     // Atomic swap (staged is adjacent to db_path → same filesystem).
-    std::fs::rename(&staged, db_path)
-        .map_err(|e| GhostError::Database(format!("failed to move staged restore into place: {}", e)))?;
+    std::fs::rename(&staged, db_path).map_err(|e| {
+        GhostError::Database(format!("failed to move staged restore into place: {}", e))
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1907,8 +1911,11 @@ mod tests {
     #[test]
     fn test_verify_rejects_corrupt_artifact() {
         let corrupt = temp_db_path("corrupt");
-        std::fs::write(&corrupt, b"this is definitely not a sqlite database\x00\x01\x02")
-            .expect("write corrupt file");
+        std::fs::write(
+            &corrupt,
+            b"this is definitely not a sqlite database\x00\x01\x02",
+        )
+        .expect("write corrupt file");
 
         // A key-less handle (in-memory) cannot open garbage as SQLite.
         let db = Database::in_memory().expect("in-memory db");
