@@ -36,6 +36,7 @@ use tracing::{debug, error, info, warn};
 
 use ghost_buds::{BudsClassifier, BudsTier};
 use ghost_common::constants::{SV1_STRATUM_PORT, SV2_AUTHORITY_PUBLIC_KEY, SV2_STRATUM_PORT};
+use ghost_common::rpc::MempoolFilterStats;
 
 use crate::auth::{verify_internal_auth, InternalAuth};
 use crate::challenge::*;
@@ -311,6 +312,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/system/mempool", get(api_system_mempool_handler))
         .route("/api/v1/system/self-check", get(api_self_check_handler))
         .route("/api/v1/reaper/status", get(api_reaper_status_handler))
+        .route(
+            "/api/v1/filtering/activity",
+            get(api_filtering_activity_handler),
+        )
         .route("/api/v1/payments", get(api_payments_handler))
         .route("/api/v1/backup/history", get(api_backup_history_handler))
         .route("/api/v1/wraith/sessions", get(api_wraith_sessions_handler))
@@ -10699,6 +10704,103 @@ async fn api_reaper_status_handler(
     Json(state.reaper_stats())
 }
 
+/// Return per-stage transaction-rejection counters across the two filtering
+/// stages, for the dashboard `/filtering` activity view.
+///
+/// Stage 1 (mempool admission) numbers come from ghostd's
+/// `getmempoolfilterstats` RPC — the tier fee-policy and mempool-Reaper
+/// rejection totals, cumulative since ghostd start. If ghostd's RPC is
+/// unavailable (no client wired, call errors, or a 5s timeout — e.g. an older
+/// node without the RPC, or ghostd down), Stage 1 degrades gracefully to all
+/// zeros rather than failing the request.
+///
+/// Stage 2 (block-template Reaper) numbers come from the pool's own
+/// `reaper_stats()` snapshot: `txs_reaped` and `dead_bytes_total`. These read
+/// as zero when the Reaper-stats callback is not wired (older deploy, JSON
+/// `null`).
+///
+/// `totals.rejected_txs` is the sum of the three tx counts (stage1 reaper +
+/// stage1 tier + stage2 reaper). Counters are process-lived on both stages and
+/// reset on the respective daemon restart.
+async fn api_filtering_activity_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    // Stage 1: ghostd mempool filtering counters, degrading to zeros.
+    let stage1 = match state.rpc {
+        Some(ref rpc) => {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rpc.get_mempool_filter_stats(),
+            )
+            .await
+            {
+                Ok(Ok(stats)) => stats,
+                Ok(Err(e)) => {
+                    warn!("Failed to get mempool filter stats from RPC: {}", e);
+                    Default::default()
+                }
+                Err(_) => {
+                    warn!("Mempool filter stats RPC timed out");
+                    Default::default()
+                }
+            }
+        }
+        None => Default::default(),
+    };
+
+    // Stage 2: pool block-template Reaper counters from the local snapshot.
+    let reaper = state.reaper_stats();
+    let stage2_txs = reaper
+        .get("txs_reaped")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let stage2_vbytes = reaper
+        .get("dead_bytes_total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    Json(filtering_activity_json(&stage1, stage2_txs, stage2_vbytes))
+}
+
+/// Build the `/api/v1/filtering/activity` response body from the Stage-1
+/// mempool counters and the Stage-2 block-template Reaper counters.
+///
+/// Pure and side-effect-free so the response shape can be unit-tested without
+/// standing up a full `VerificationState`/RPC client. `totals.rejected_txs` is
+/// the saturating sum of the three tx counts.
+fn filtering_activity_json(
+    stage1: &MempoolFilterStats,
+    stage2_txs: u64,
+    stage2_vbytes: u64,
+) -> serde_json::Value {
+    let total_rejected_txs = stage1
+        .reaper_rejected_txs
+        .saturating_add(stage1.tier_rejected_txs)
+        .saturating_add(stage2_txs);
+
+    serde_json::json!({
+        "stage1_mempool": {
+            "reaper": {
+                "txs": stage1.reaper_rejected_txs,
+                "vbytes": stage1.reaper_rejected_vbytes,
+            },
+            "tier": {
+                "txs": stage1.tier_rejected_txs,
+                "vbytes": stage1.tier_rejected_vbytes,
+            },
+        },
+        "stage2_block": {
+            "reaper": {
+                "txs": stage2_txs,
+                "vbytes": stage2_vbytes,
+            },
+        },
+        "totals": {
+            "rejected_txs": total_rejected_txs,
+        },
+    })
+}
+
 /// Return the capability self-check snapshot (per-capability
 /// claimed/passed/reason) computed by the background loop in ghost-pool. The
 /// dashboard reads this to warn an operator when they have CLAIMED a capability
@@ -10783,6 +10885,37 @@ async fn api_system_mempool_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_filtering_activity_json_shape_and_totals() {
+        let stage1 = MempoolFilterStats {
+            reaper_rejected_txs: 3,
+            reaper_rejected_vbytes: 300,
+            tier_rejected_txs: 5,
+            tier_rejected_vbytes: 500,
+        };
+        let body = filtering_activity_json(&stage1, 7, 700);
+
+        assert_eq!(body["stage1_mempool"]["reaper"]["txs"], 3);
+        assert_eq!(body["stage1_mempool"]["reaper"]["vbytes"], 300);
+        assert_eq!(body["stage1_mempool"]["tier"]["txs"], 5);
+        assert_eq!(body["stage1_mempool"]["tier"]["vbytes"], 500);
+        assert_eq!(body["stage2_block"]["reaper"]["txs"], 7);
+        assert_eq!(body["stage2_block"]["reaper"]["vbytes"], 700);
+        // totals.rejected_txs = 3 + 5 + 7 (stage2 vbytes not counted).
+        assert_eq!(body["totals"]["rejected_txs"], 15);
+    }
+
+    #[test]
+    fn test_filtering_activity_json_degrades_to_zeros() {
+        // ghostd RPC unavailable → Stage-1 is Default (all zeros); Stage-2
+        // callback unwired → zeros. Response is well-formed, totals are 0.
+        let body = filtering_activity_json(&MempoolFilterStats::default(), 0, 0);
+        assert_eq!(body["stage1_mempool"]["reaper"]["txs"], 0);
+        assert_eq!(body["stage1_mempool"]["tier"]["vbytes"], 0);
+        assert_eq!(body["stage2_block"]["reaper"]["txs"], 0);
+        assert_eq!(body["totals"]["rejected_txs"], 0);
+    }
 
     #[test]
     fn test_estimated_time_to_block_secs_known_values() {
