@@ -5,8 +5,8 @@
 //! event-driven trigger site:
 //!
 //! * **Behind-tip** — the node has fallen behind the network: either its local
-//!   height lags the best connected peer by more than [`BEHIND_TIP_LAG_BLOCKS`],
-//!   or no new block has arrived for [`BEHIND_TIP_MAX_AGE_SECS`] while a peer is
+//!   height lags the best connected peer by more than `BEHIND_TIP_LAG_BLOCKS`,
+//!   or no new block has arrived for `BEHIND_TIP_MAX_AGE_SECS` while a peer is
 //!   ahead. Edge-triggered: one alert on entering the behind state, re-armed on
 //!   recovery.
 //! * **Update-available** — a newer node release than the one installed is
@@ -15,11 +15,11 @@
 //!   status file). Rate-limited to at most once per day.
 //! * **Mempool-congestion** — ghostd's mempool `usage` is near its `maxmempool`
 //!   ceiling (from `getmempoolinfo`). Edge-triggered with hysteresis: fires when
-//!   usage crosses [`MEMPOOL_CONGESTION_HIGH_PCT`], re-arms once it falls back
-//!   below [`MEMPOOL_CONGESTION_REARM_PCT`].
+//!   usage crosses `MEMPOOL_CONGESTION_HIGH_PCT`, re-arms once it falls back
+//!   below `MEMPOOL_CONGESTION_REARM_PCT`.
 //! * **Fee-spike** — the next-block fee rate (from `estimatesmartfee`) crosses
-//!   [`FEE_SPIKE_ABS_SAT_VB`] or jumps to [`FEE_SPIKE_JUMP_FACTOR`]× a rolling
-//!   baseline. Rate-limited to [`FEE_SPIKE_ALERT_MIN_INTERVAL`] so sustained
+//!   `FEE_SPIKE_ABS_SAT_VB` or jumps to `FEE_SPIKE_JUMP_FACTOR`× a rolling
+//!   baseline. Rate-limited to `FEE_SPIKE_ALERT_MIN_INTERVAL` so sustained
 //!   high fees don't spam.
 //!
 //! All dispatch off the hot path (their own spawned tasks) and honour the
@@ -47,7 +47,7 @@ pub const BEHIND_TIP_MAX_AGE_SECS: u64 = 30 * 60;
 pub const BEHIND_TIP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Cadence of the update-available check. The alert itself is separately
-/// rate-limited to [`UPDATE_ALERT_MIN_INTERVAL`], so this only bounds freshness.
+/// rate-limited to `UPDATE_ALERT_MIN_INTERVAL`, so this only bounds freshness.
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 
 /// Minimum interval between update-available alerts — at most once per day while
@@ -271,7 +271,7 @@ pub fn spawn_update_available_monitor(
 pub const MEMPOOL_CONGESTION_HIGH_PCT: f64 = 90.0;
 
 /// Usage % the mempool must fall back below before the alert re-arms. The gap to
-/// [`MEMPOOL_CONGESTION_HIGH_PCT`] is hysteresis: it stops a mempool hovering
+/// `MEMPOOL_CONGESTION_HIGH_PCT` is hysteresis: it stops a mempool hovering
 /// right at the threshold from flapping the alert on every check.
 pub const MEMPOOL_CONGESTION_REARM_PCT: f64 = 80.0;
 
@@ -313,8 +313,8 @@ pub fn evaluate_mempool_congestion(
 
 /// Spawn the mempool-congestion monitor. Reads ghostd `getmempoolinfo` via the
 /// pool's shared RPC client and fires an edge-triggered [`AlertEvent::MempoolCongestion`]
-/// when `usage` crosses [`MEMPOOL_CONGESTION_HIGH_PCT`] of `maxmempool`, re-arming
-/// once it falls back below [`MEMPOOL_CONGESTION_REARM_PCT`] (hysteresis).
+/// when `usage` crosses `MEMPOOL_CONGESTION_HIGH_PCT` of `maxmempool`, re-arming
+/// once it falls back below `MEMPOOL_CONGESTION_REARM_PCT` (hysteresis).
 /// Delivery + the enable flag are handled inside the dispatcher. Runs until
 /// `shutdown` fires.
 pub fn spawn_mempool_congestion_monitor(
@@ -466,7 +466,7 @@ pub fn update_fee_baseline(baseline: Option<f64>, sample_sat_vb: f64) -> f64 {
 /// Spawn the fee-spike monitor. Reads ghostd `estimatesmartfee` (next-block
 /// target) via the pool's shared RPC client, maintains a rolling baseline, and
 /// fires a rate-limited [`AlertEvent::FeeSpike`] when the rate crosses
-/// [`FEE_SPIKE_ABS_SAT_VB`] or jumps to [`FEE_SPIKE_JUMP_FACTOR`]× the baseline.
+/// `FEE_SPIKE_ABS_SAT_VB` or jumps to `FEE_SPIKE_JUMP_FACTOR`× the baseline.
 /// Delivery + the enable flag are handled inside the dispatcher. Runs until
 /// `shutdown` fires.
 pub fn spawn_fee_spike_monitor(
