@@ -2,14 +2,34 @@
 
 import type { CSSProperties, ReactNode } from "react";
 import Link from "next/link";
+import { useQuery } from "@tanstack/react-query";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { StatCard } from "@/components/ui/StatCard";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { MempoolMetrics } from "@/components/filtering/MempoolMetrics";
+import { MempoolChart } from "@/components/filtering/MempoolChart";
 import { useConfig, useFullConfig } from "@/hooks/queries/useConfigQueries";
 import { useFilteringActivity } from "@/hooks/queries/useFilteringQueries";
 import { useAdvancedFilteringGate } from "@/hooks/useAdvancedFilteringGate";
+import { useMempoolSeries } from "@/hooks/useMempoolSeries";
+import { fetchApi } from "@/lib/api/client";
+
+// Live getmempoolinfo.size snapshot. Owned here (the filtering overview) under
+// the shared ["buds-mempool"] query key so useMempoolSeries can sample it for
+// its live session buffer — the same key the other filtering pages poll.
+interface BudsMempoolSummary {
+  total?: number; // getmempoolinfo.size
+  message?: string; // present when RPC unavailable
+}
+
+function fetchBudsMempool(): Promise<BudsMempoolSummary> {
+  return fetchApi<BudsMempoolSummary>("/api/v1/buds/mempool");
+}
+
+// A transaction count, or "—" when we have no reading to stand behind it.
+function formatCount(n: number | undefined | null): string {
+  return n === undefined || n === null ? "—" : n.toLocaleString();
+}
 
 // Plain-English preset name for the stored [policy].profile, normalising the
 // legacy `bitcoin_pure` alias to Strict. Returns "Custom" for the custom policy.
@@ -36,6 +56,20 @@ export default function FilteringOverviewPage() {
 
   const reaperOn = config?.reaper ?? false;
   const profile = fullConfig?.policy?.profile;
+
+  // Own the buds/mempool poll (shared query key so useMempoolSeries can sample
+  // it for the live session buffer that also backs the graph below).
+  const { data: mempool } = useQuery<BudsMempoolSummary>({
+    queryKey: ["buds-mempool"],
+    queryFn: fetchBudsMempool,
+    refetchInterval: 15_000,
+  });
+  const series = useMempoolSeries();
+
+  // Mempool tile: live getmempoolinfo.size when we have it, else newest sample.
+  const mempoolNow = mempool?.total ?? series.latestMempoolTxs ?? undefined;
+  // This-block tile: server-ring only (the RPC view has no block-template count).
+  const blockNow = series.latestBlockTxs ?? undefined;
 
   return (
     <div className="space-y-6">
@@ -67,17 +101,27 @@ export default function FilteringOverviewPage() {
             title="What's active"
             subtitle="The filtering your node is running right now."
           />
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
             <StatCard label="Mode" value={modeLabel(profile)} />
             <StatCard label="Reaper" value={reaperOn ? "On" : "Off"} />
             <StatCard label="Advanced controls" value={advancedEnabled ? "Enabled" : "Disabled"} />
+            <StatCard
+              label="Mempool"
+              value={formatCount(mempoolNow)}
+              tooltip="getmempoolinfo.size — transactions your node currently holds"
+            />
+            <StatCard
+              label="This block"
+              value={formatCount(blockNow)}
+              tooltip="transactions in the block template your node is currently building"
+            />
           </div>
         </Card>
       </SectionErrorBoundary>
 
-      {/* Mempool tx-count tiles + over-time graph */}
-      <SectionErrorBoundary section="Mempool metrics">
-        <MempoolMetrics />
+      {/* Mempool tx-count over time */}
+      <SectionErrorBoundary section="Mempool over time">
+        <MempoolChart />
       </SectionErrorBoundary>
 
       {/* What the node has actually rejected, and where */}
