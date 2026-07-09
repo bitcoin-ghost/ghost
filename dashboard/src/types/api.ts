@@ -347,6 +347,12 @@ export interface PoolSeriesSample {
   local_hashrate_th: number;
   /** Mesh-wide deduplicated connected-miner count. */
   miners: number;
+  /** Transactions in this node's mempool at sample time (getmempoolinfo.size).
+   *  Optional: absent on nodes whose `/pool/series` ring predates this field. */
+  mempool_txs?: number;
+  /** Transactions in the block template this node was building at sample time.
+   *  Optional: absent on nodes whose `/pool/series` ring predates this field. */
+  block_txs?: number;
 }
 
 export interface PoolSeriesResponse {
