@@ -164,8 +164,8 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
             tier.allow_t2 = false;
             tier.allow_t3 = false;
             const std::string csv = argsman.GetArg("-ghostpolicy-allowtiers", "");
-            for (const auto& part : SplitString(csv, ',')) {
-                const std::string trimmed = TrimString(part);
+            for (const auto& part : util::SplitString(csv, ',')) {
+                const std::string trimmed = util::TrimString(part);
                 if (trimmed.empty()) continue;
                 const auto n = ToIntegral<int>(trimmed);
                 if (!n || *n < 0 || *n > 3) {
