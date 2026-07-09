@@ -811,6 +811,16 @@ impl BitcoinRpc {
         self.call("getbestblockhash", vec![]).await
     }
 
+    /// Get Stage-1 mempool filtering counters (cumulative since ghostd start).
+    ///
+    /// Surfaces the tier-policy and mempool-reaper rejection totals that
+    /// `getmempoolinfo` does not carry. Available only on ghostd builds that
+    /// expose the `getmempoolfilterstats` RPC; callers should degrade
+    /// gracefully to zeros when the call errors on older nodes.
+    pub async fn get_mempool_filter_stats(&self) -> GhostResult<MempoolFilterStats> {
+        self.call("getmempoolfilterstats", vec![]).await
+    }
+
     /// Get block by hash
     pub async fn get_block(&self, hash: &str, verbosity: u8) -> GhostResult<Value> {
         self.call("getblock", vec![json!(hash), json!(verbosity)])
@@ -1496,6 +1506,25 @@ pub struct BlockchainInfo {
     pub signet_challenge: Option<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// Stage-1 mempool filtering counters, as returned by ghostd's
+/// `getmempoolfilterstats` RPC. All counts are cumulative since ghostd start
+/// and reset on daemon restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MempoolFilterStats {
+    /// Transactions rejected by the mempool Reaper (dead-code detection).
+    #[serde(default)]
+    pub reaper_rejected_txs: u64,
+    /// Total vbytes of transactions rejected by the mempool Reaper.
+    #[serde(default)]
+    pub reaper_rejected_vbytes: u64,
+    /// Transactions rejected by tier fee-policy enforcement.
+    #[serde(default)]
+    pub tier_rejected_txs: u64,
+    /// Total vbytes of transactions rejected by tier fee-policy enforcement.
+    #[serde(default)]
+    pub tier_rejected_vbytes: u64,
 }
 
 /// Ghost Haze operating status, as returned by ghostd's `gethazestatus` RPC.
