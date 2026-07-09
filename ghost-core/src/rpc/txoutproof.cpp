@@ -6,6 +6,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
+#include <haze/stripped_block.h>
 #include <index/txindex.h>
 #include <merkleblock.h>
 #include <node/blockstorage.h>
@@ -103,22 +104,50 @@ static RPCHelpMan gettxoutproof()
                 CheckBlockDataAvailability(chainman.m_blockman, *pblockindex, /*check_for_undo=*/false);
             }
             CBlock block;
-            if (!chainman.m_blockman.ReadBlock(block, *pblockindex)) {
+            CMerkleBlock mb;
+            if (chainman.m_blockman.ReadBlock(block, *pblockindex)) {
+                // Full block on disk (Standard / Full Archive) — build directly.
+                unsigned int ntxFound = 0;
+                for (const auto& tx : block.vtx) {
+                    if (setTxids.count(tx->GetHash())) {
+                        ntxFound++;
+                    }
+                }
+                if (ntxFound != setTxids.size()) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Not all transactions found in specified or retrieved block");
+                }
+                mb = CMerkleBlock(block, setTxids);
+            } else if (chainman.m_blockman.IsHazeMode()) {
+                // Hazed node: the full block is stripped, but a merkle inclusion
+                // proof only needs the block's ordered txids, which the stripped
+                // block retains. Build the partial merkle tree from those txids so
+                // hazed nodes can still serve SPV/merkle proofs to light clients.
+                haze::CStrippedBlock stripped;
+                if (!chainman.m_blockman.ReadStrippedBlock(stripped, *pblockindex)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Can't read stripped block from disk");
+                }
+                std::vector<Txid> vTxid;
+                std::vector<bool> vMatch;
+                vTxid.reserve(stripped.GetTxCount());
+                vMatch.reserve(stripped.GetTxCount());
+                unsigned int ntxFound = 0;
+                for (size_t i = 0; i < stripped.GetTxCount(); ++i) {
+                    const Txid txid = Txid::FromUint256(stripped.GetTxid(i));
+                    const bool matched = setTxids.count(txid) > 0;
+                    vTxid.push_back(txid);
+                    vMatch.push_back(matched);
+                    if (matched) ntxFound++;
+                }
+                if (ntxFound != setTxids.size()) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Not all transactions found in specified or retrieved block");
+                }
+                mb.header = pblockindex->GetBlockHeader();
+                mb.txn = CPartialMerkleTree(vTxid, vMatch);
+            } else {
                 throw JSONRPCError(RPC_INTERNAL_ERROR, "Can't read block from disk");
             }
 
-            unsigned int ntxFound = 0;
-            for (const auto& tx : block.vtx) {
-                if (setTxids.count(tx->GetHash())) {
-                    ntxFound++;
-                }
-            }
-            if (ntxFound != setTxids.size()) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Not all transactions found in specified or retrieved block");
-            }
-
             DataStream ssMB{};
-            CMerkleBlock mb(block, setTxids);
             ssMB << mb;
             std::string strHex = HexStr(ssMB);
             return strHex;
