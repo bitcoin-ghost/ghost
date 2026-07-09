@@ -12,11 +12,11 @@
 //! sampler task and the route handler share one instance.
 
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// One periodic sample of pool-wide metrics.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolSample {
     /// Unix timestamp (seconds) the sample was taken.
     pub t: i64,
@@ -26,6 +26,14 @@ pub struct PoolSample {
     pub local_hashrate_th: f64,
     /// Mesh-wide deduplicated connected-miner count.
     pub miners: u32,
+    /// Local ghostd mempool transaction count at sample time (`getmempoolinfo.size`).
+    /// `#[serde(default)]` so samples serialised before this field deserialise as 0.
+    #[serde(default)]
+    pub mempool_txs: u64,
+    /// Transaction count of the current block template (including coinbase).
+    /// `#[serde(default)]` so samples serialised before this field deserialise as 0.
+    #[serde(default)]
+    pub block_txs: u64,
 }
 
 /// Bounded FIFO ring of [`PoolSample`], shared between the sampler task and the
@@ -87,6 +95,8 @@ mod tests {
             mesh_hashrate_th: t as f64,
             local_hashrate_th: 0.0,
             miners: 1,
+            mempool_txs: t as u64,
+            block_txs: (t as u64) + 1,
         }
     }
 
@@ -117,5 +127,35 @@ mod tests {
         let s = PoolSeries::new(10);
         assert!(s.is_empty());
         assert!(s.since(0).is_empty());
+    }
+
+    #[test]
+    fn mempool_and_block_txs_survive_push_and_since() {
+        let s = PoolSeries::new(10);
+        s.push(sample(5));
+        let out = s.since(i64::MIN);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mempool_txs, 5);
+        assert_eq!(out[0].block_txs, 6);
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_new_fields() {
+        let json = serde_json::to_string(&sample(42)).unwrap();
+        let back: PoolSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.t, 42);
+        assert_eq!(back.mempool_txs, 42);
+        assert_eq!(back.block_txs, 43);
+    }
+
+    #[test]
+    fn old_samples_without_new_fields_default_to_zero() {
+        // A payload serialised before mempool_txs/block_txs existed.
+        let legacy = r#"{"t":100,"mesh_hashrate_th":1.5,"local_hashrate_th":0.5,"miners":3}"#;
+        let s: PoolSample = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.t, 100);
+        assert_eq!(s.miners, 3);
+        assert_eq!(s.mempool_txs, 0);
+        assert_eq!(s.block_txs, 0);
     }
 }

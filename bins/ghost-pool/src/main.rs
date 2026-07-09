@@ -7039,6 +7039,8 @@ async fn main() -> Result<()> {
     // serve real server-side history instead of a client-side session buffer.
     {
         let state_for_series = Arc::clone(&verification_state);
+        let rpc_for_series = Arc::clone(&rpc);
+        let tp_for_series = Arc::clone(&template_processor);
         let mut series_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -7049,11 +7051,26 @@ async fn main() -> Result<()> {
                             .mesh_total_hashrate()
                             .or_else(|| state_for_series.local_hashrate())
                             .unwrap_or(0.0);
+                        // Local ghostd mempool tx count via the shared RPC client
+                        // (0 if the RPC is briefly unavailable).
+                        let mempool_txs = rpc_for_series
+                            .get_mempool_info()
+                            .await
+                            .map(|i| i.size)
+                            .unwrap_or(0);
+                        // Current block template tx count (incl. coinbase); 0 before
+                        // the first template is built.
+                        let block_txs = tp_for_series
+                            .current_work()
+                            .map(|w| w.tx_count as u64)
+                            .unwrap_or(0);
                         let sample = ghost_verification::pool_series::PoolSample {
                             t: chrono::Utc::now().timestamp(),
                             mesh_hashrate_th,
                             local_hashrate_th: state_for_series.local_hashrate().unwrap_or(0.0),
                             miners: state_for_series.mesh_active_miners().unwrap_or(0),
+                            mempool_txs,
+                            block_txs,
                         };
                         state_for_series.pool_series.push(sample);
                     }
