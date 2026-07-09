@@ -1472,6 +1472,74 @@ impl Default for PolicyConfig {
     }
 }
 
+impl PolicyConfig {
+    /// The ghostd (Bitcoin Core) CLI flags that carry this policy profile to the
+    /// node's mempool-acceptance path (`-ghostpolicy-*`, parsed in ghost-core).
+    /// This is the node-mempool twin of ghost-pool's block-template tier gate:
+    /// the same profile now enforces at BOTH layers.
+    ///
+    /// Only *restrictive* flags are emitted. ghostd's inert default is
+    /// all-tiers-allowed / all-content-allowed / no-limits, so a `full_open`
+    /// profile emits NOTHING and the node behaves exactly as it did before this
+    /// policy existed. The built-in tier presets emit only their tier set;
+    /// `custom` emits its tier set plus every per-field limit verbatim (a custom
+    /// profile is by definition an explicit, non-inert configuration).
+    ///
+    /// Emitted through the same managed drop-in as the reaper / node-launch /
+    /// storage flags (`ghostd_managed_dropin` in `setup.rs`); every prefix here
+    /// (`-ghostpolicy`) is listed in `MANAGED_GHOSTD_FLAG_PREFIXES` so stale
+    /// copies are stripped on each regeneration. Read by ghostd only at startup,
+    /// so a change needs a ghostd restart to take effect.
+    pub fn ghostd_flags(&self) -> Vec<String> {
+        // Render a tier set as the ascending, de-duplicated CSV ghostd expects
+        // (`-ghostpolicy-allowtiers=0,1,2`).
+        fn tier_csv(tiers: &[BudsTier]) -> String {
+            let mut idx: Vec<u8> = tiers.iter().map(|t| t.as_index()).collect();
+            idx.sort_unstable();
+            idx.dedup();
+            idx.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        match self.profile {
+            // Inert: all tiers, all content, no size/fee limits. Emit nothing so
+            // a default/open node stays exactly as it was before this feature.
+            PolicyProfile::FullOpen => Vec::new(),
+            PolicyProfile::BitcoinPure => {
+                vec![format!(
+                    "-ghostpolicy-allowtiers={}",
+                    tier_csv(&[BudsTier::T0, BudsTier::T1])
+                )]
+            }
+            PolicyProfile::Permissive => {
+                vec![format!(
+                    "-ghostpolicy-allowtiers={}",
+                    tier_csv(&[BudsTier::T0, BudsTier::T1, BudsTier::T2])
+                )]
+            }
+            PolicyProfile::Custom => {
+                let c = self.custom.clone().unwrap_or_default();
+                vec![
+                    format!("-ghostpolicy-allowtiers={}", tier_csv(&c.allowed_tiers)),
+                    format!(
+                        "-ghostpolicy-allowinscriptions={}",
+                        u8::from(c.allow_inscriptions)
+                    ),
+                    format!("-ghostpolicy-allowrunes={}", u8::from(c.allow_runes)),
+                    format!("-ghostpolicy-allowbrc20={}", u8::from(c.allow_brc20)),
+                    format!("-ghostpolicy-maxopreturn={}", c.max_op_return_size),
+                    format!("-ghostpolicy-maxwitness={}", c.max_witness_per_input),
+                    format!("-ghostpolicy-maxtxoutputs={}", c.max_tx_outputs),
+                    format!("-ghostpolicy-maxtxsize={}", c.max_tx_size),
+                    format!("-ghostpolicy-minfeerate={}", c.min_fee_rate),
+                ]
+            }
+        }
+    }
+}
+
 /// Built-in policy profiles
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1548,6 +1616,19 @@ pub enum BudsTier {
     T2,
     /// Heavy data (inscriptions, large witness)
     T3,
+}
+
+impl BudsTier {
+    /// The numeric tier index (T0..T3 → 0..3) used by the BUDS classifier and by
+    /// the `-ghostpolicy-allowtiers` CSV that carries the allowed set to ghostd.
+    pub fn as_index(self) -> u8 {
+        match self {
+            BudsTier::T0 => 0,
+            BudsTier::T1 => 1,
+            BudsTier::T2 => 2,
+            BudsTier::T3 => 3,
+        }
+    }
 }
 
 /// Ghost Haze storage mode
@@ -2847,6 +2928,118 @@ mod tests {
             custom: None,
         };
         assert_eq!(config.profile, PolicyProfile::BitcoinPure);
+    }
+
+    // --- PolicyConfig::ghostd_flags emission ------------------------------
+
+    #[test]
+    fn test_policy_ghostd_flags_full_open_is_inert() {
+        // The whole safety property: an open/default node emits ZERO
+        // `-ghostpolicy` flags, so deploying this feature changes nothing until
+        // an operator picks a stricter profile.
+        let cfg = PolicyConfig {
+            profile: PolicyProfile::FullOpen,
+            custom: None,
+        };
+        assert!(
+            cfg.ghostd_flags().is_empty(),
+            "full_open must be inert, got: {:?}",
+            cfg.ghostd_flags()
+        );
+    }
+
+    #[test]
+    fn test_policy_ghostd_flags_strict_tiers() {
+        let cfg = PolicyConfig {
+            profile: PolicyProfile::BitcoinPure,
+            custom: None,
+        };
+        assert_eq!(
+            cfg.ghostd_flags(),
+            vec!["-ghostpolicy-allowtiers=0,1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_policy_ghostd_flags_permissive_tiers() {
+        let cfg = PolicyConfig {
+            profile: PolicyProfile::Permissive,
+            custom: None,
+        };
+        assert_eq!(
+            cfg.ghostd_flags(),
+            vec!["-ghostpolicy-allowtiers=0,1,2".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_policy_ghostd_flags_custom_emits_tiers_and_limits() {
+        let cfg = PolicyConfig {
+            profile: PolicyProfile::Custom,
+            custom: Some(CustomPolicyConfig {
+                allowed_tiers: vec![BudsTier::T0, BudsTier::T1, BudsTier::T2, BudsTier::T3],
+                max_op_return_size: 80,
+                max_witness_per_input: 400,
+                max_tx_outputs: 50,
+                max_tx_size: 100_000,
+                allow_inscriptions: false,
+                allow_runes: true,
+                allow_brc20: false,
+                min_fee_rate: 2.5,
+            }),
+        };
+        assert_eq!(
+            cfg.ghostd_flags(),
+            vec![
+                "-ghostpolicy-allowtiers=0,1,2,3".to_string(),
+                "-ghostpolicy-allowinscriptions=0".to_string(),
+                "-ghostpolicy-allowrunes=1".to_string(),
+                "-ghostpolicy-allowbrc20=0".to_string(),
+                "-ghostpolicy-maxopreturn=80".to_string(),
+                "-ghostpolicy-maxwitness=400".to_string(),
+                "-ghostpolicy-maxtxoutputs=50".to_string(),
+                "-ghostpolicy-maxtxsize=100000".to_string(),
+                "-ghostpolicy-minfeerate=2.5".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_policy_ghostd_flags_custom_tiers_sorted_and_deduped() {
+        // Out-of-order / duplicate tiers from a hand-edited config still produce
+        // a clean ascending CSV.
+        let cfg = PolicyConfig {
+            profile: PolicyProfile::Custom,
+            custom: Some(CustomPolicyConfig {
+                allowed_tiers: vec![BudsTier::T2, BudsTier::T0, BudsTier::T0, BudsTier::T1],
+                ..CustomPolicyConfig::default()
+            }),
+        };
+        assert_eq!(
+            cfg.ghostd_flags()[0],
+            "-ghostpolicy-allowtiers=0,1,2".to_string()
+        );
+    }
+
+    #[test]
+    fn test_policy_ghostd_flags_custom_missing_block_uses_defaults() {
+        // Profile says custom but no [policy.custom] block persisted: fall back
+        // to the safe defaults rather than panicking, and still emit a full set.
+        let cfg = PolicyConfig {
+            profile: PolicyProfile::Custom,
+            custom: None,
+        };
+        let flags = cfg.ghostd_flags();
+        assert!(flags[0].starts_with("-ghostpolicy-allowtiers="));
+        assert_eq!(flags.len(), 9);
+    }
+
+    #[test]
+    fn test_buds_tier_as_index() {
+        assert_eq!(BudsTier::T0.as_index(), 0);
+        assert_eq!(BudsTier::T1.as_index(), 1);
+        assert_eq!(BudsTier::T2.as_index(), 2);
+        assert_eq!(BudsTier::T3.as_index(), 3);
     }
 
     #[test]

@@ -6722,8 +6722,13 @@ async fn api_config_policy_profile_post_handler(
         }
     }
 
-    // The profile is resolved at startup, so a graceful restart applies it.
-    state.request_restart();
+    // Apply the new profile at BOTH layers: ghost-pool (block template) and
+    // ghostd (mempool acceptance). `spawn_ghostd_reaper_apply` regenerates the
+    // combined managed drop-in — which now includes the `-ghostpolicy-*` flags
+    // from `PolicyConfig::ghostd_flags()` — restarts ghostd, then bounces the
+    // pool afterwards (it owns the ordering, so we must NOT also call
+    // `request_restart()` here or the pool would bounce before ghostd).
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
 
     Json(serde_json::json!({
         "success": true,
@@ -6989,8 +6994,13 @@ async fn api_config_policy_custom_post_handler(
         }
     }
 
-    // The custom profile is resolved at startup, so a graceful restart applies it.
-    state.request_restart();
+    // Apply the custom policy at BOTH layers: ghost-pool (block template) and
+    // ghostd (mempool acceptance). `spawn_ghostd_reaper_apply` regenerates the
+    // combined managed drop-in — which now includes the `-ghostpolicy-*` flags
+    // (allowed tiers + per-field limits) from `PolicyConfig::ghostd_flags()` —
+    // restarts ghostd, then bounces the pool afterwards (it owns the ordering,
+    // so we must NOT also call `request_restart()` here).
+    spawn_ghostd_reaper_apply(Arc::clone(&state));
 
     Json(serde_json::json!({
         "success": true,

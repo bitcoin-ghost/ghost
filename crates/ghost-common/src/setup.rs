@@ -284,6 +284,8 @@ const MANAGED_GHOSTD_FLAG_PREFIXES: &[&str] = &[
     // Reaper (per-vector) + Tor.
     "-ghostreaper",
     "-tormode",
+    // Mempool tier/content policy (PolicyConfig): allowed tiers + custom limits.
+    "-ghostpolicy",
     // Daemon / node launch settings (NodeLaunchConfig).
     "-maxmempool",
     "-mempoolexpiry",
@@ -316,7 +318,8 @@ fn is_managed_ghostd_flag(tok: &str) -> bool {
 }
 
 /// Render a systemd drop-in for ghostd that applies the per-vector reaper
-/// settings AND the node launch flags (e.g. Tor mode) to the daemon.
+/// settings, the node launch flags (e.g. Tor mode), the storage-mode flags AND
+/// the mempool tier/content policy flags to the daemon.
 ///
 /// `exec_argv` is the daemon's resolved command line (e.g. the `argv[]` from
 /// `systemctl show ghostd -p ExecStart --value`). Any existing managed flags
@@ -331,6 +334,7 @@ pub fn ghostd_managed_dropin(
     reaper: &crate::config::ReaperSettings,
     launch: &crate::config::NodeLaunchConfig,
     storage: &crate::config::StorageConfig,
+    policy: &crate::config::PolicyConfig,
 ) -> String {
     let base: Vec<&str> = exec_argv
         .split_whitespace()
@@ -339,6 +343,7 @@ pub fn ghostd_managed_dropin(
     let mut flags = reaper.ghostd_flags();
     flags.extend(launch.ghostd_flags());
     flags.extend(storage.ghostd_flags());
+    flags.extend(policy.ghostd_flags());
     format!(
         "# Managed by `ghost-setup apply-reaper` — Ghost Reaper + node launch + storage flags.\n\
          # Do not edit by hand; regenerate from pool.toml [reaper]/[node_launch]/[storage].\n\
@@ -434,7 +439,18 @@ pub fn apply_mempool_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HazeMode, NodeLaunchConfig, ReaperSettings, StorageConfig};
+    use crate::config::{
+        HazeMode, NodeLaunchConfig, PolicyConfig, PolicyProfile, ReaperSettings, StorageConfig,
+    };
+
+    /// An inert (`full_open`) policy that emits no `-ghostpolicy` flags, so the
+    /// reaper/launch/storage-focused drop-in tests below stay uncluttered.
+    fn inert_policy() -> PolicyConfig {
+        PolicyConfig {
+            profile: PolicyProfile::FullOpen,
+            custom: None,
+        }
+    }
 
     #[test]
     fn test_ghostd_managed_dropin_strips_and_appends() {
@@ -445,7 +461,7 @@ mod tests {
         };
         let launch = NodeLaunchConfig::default();
         let storage = StorageConfig::default();
-        let dropin = ghostd_managed_dropin(exec, &s, &launch, &storage);
+        let dropin = ghostd_managed_dropin(exec, &s, &launch, &storage, &inert_policy());
 
         // resets ExecStart then re-emits the base (minus any managed flags)
         assert!(dropin.contains("[Service]\nExecStart=\nExecStart="));
@@ -482,6 +498,7 @@ mod tests {
             &reaper,
             &NodeLaunchConfig { tor_mode: true, ..Default::default() },
             &storage,
+            &inert_policy(),
         );
         assert_eq!(on.matches("-tormode=1").count(), 1);
 
@@ -490,6 +507,7 @@ mod tests {
             &reaper,
             &NodeLaunchConfig { tor_mode: false, ..Default::default() },
             &storage,
+            &inert_policy(),
         );
         assert!(!off.contains("-tormode"));
     }
@@ -519,7 +537,7 @@ mod tests {
         };
 
         let storage = StorageConfig::default();
-        let dropin = ghostd_managed_dropin(exec, &reaper, &launch, &storage);
+        let dropin = ghostd_managed_dropin(exec, &reaper, &launch, &storage, &inert_policy());
 
         // Base non-managed args survive.
         assert!(dropin.contains("/opt/ghost/bin/ghostd"));
@@ -560,7 +578,7 @@ mod tests {
             .find(|l| l.starts_with("ExecStart=/"))
             .unwrap()
             .trim_start_matches("ExecStart=");
-        let dropin2 = ghostd_managed_dropin(regen_exec, &reaper, &launch, &storage);
+        let dropin2 = ghostd_managed_dropin(regen_exec, &reaper, &launch, &storage, &inert_policy());
         assert_eq!(dropin2.matches("-maxmempool=").count(), 1);
         assert_eq!(dropin2.matches("-onlynet=").count(), 2);
         assert_eq!(dropin2.matches("-tormode=1").count(), 1);
@@ -579,12 +597,14 @@ mod tests {
             &reaper,
             &launch,
             &StorageConfig { archive_mode: true, ..Default::default() },
+            &inert_policy(),
         );
         assert!(on.contains("-prune=0"));
         // No reindex unless explicitly armed.
         assert!(!on.contains("-reindex"));
 
-        let off = ghostd_managed_dropin(exec, &reaper, &launch, &StorageConfig::default());
+        let off =
+            ghostd_managed_dropin(exec, &reaper, &launch, &StorageConfig::default(), &inert_policy());
         assert!(!off.contains("-prune"));
     }
 
@@ -602,6 +622,7 @@ mod tests {
             &reaper,
             &launch,
             &StorageConfig { archive_mode: true, reindex_pending: true, ..Default::default() },
+            &inert_policy(),
         );
         assert_eq!(armed.matches("-reindex").count(), 1);
         assert_eq!(armed.matches("-prune=0").count(), 1);
@@ -612,6 +633,7 @@ mod tests {
             &reaper,
             &launch,
             &StorageConfig { archive_mode: true, reindex_pending: false, ..Default::default() },
+            &inert_policy(),
         );
         assert!(!cleared.contains("-reindex"));
         assert_eq!(cleared.matches("-prune=0").count(), 1);
@@ -632,6 +654,7 @@ mod tests {
             &reaper,
             &launch,
             &StorageConfig { haze_mode: HazeMode::Hazed, exorcist_pending: true, ..Default::default() },
+            &inert_policy(),
         );
         assert_eq!(converting.matches("-exorcist").count(), 1);
         assert!(!converting.contains("-hazemode=hazed"));
@@ -641,8 +664,35 @@ mod tests {
             &reaper,
             &launch,
             &StorageConfig { haze_mode: HazeMode::Hazed, exorcist_pending: false, ..Default::default() },
+            &inert_policy(),
         );
         assert!(!converted.contains("-exorcist"));
         assert_eq!(converted.matches("-hazemode=hazed").count(), 1);
+    }
+
+    #[test]
+    fn test_ghostd_managed_dropin_policy_flags_present_and_idempotent() {
+        // A stricter profile threads its `-ghostpolicy-*` flags into the drop-in,
+        // and re-applying (with a stale copy in the inherited ExecStart) strips
+        // and re-emits them exactly once — the managed-prefix idempotence that
+        // keeps regeneration stable.
+        let exec =
+            "/opt/ghost/bin/ghostd -signet -ghostpolicy-allowtiers=0,1,2,3 -ghostreaper=enabled";
+        let reaper = ReaperSettings::default();
+        let launch = NodeLaunchConfig::default();
+        let storage = StorageConfig::default();
+        let strict = PolicyConfig {
+            profile: PolicyProfile::BitcoinPure,
+            custom: None,
+        };
+
+        let dropin = ghostd_managed_dropin(exec, &reaper, &launch, &storage, &strict);
+        assert_eq!(dropin.matches("-ghostpolicy-allowtiers=").count(), 1);
+        assert!(dropin.contains("-ghostpolicy-allowtiers=0,1"));
+        assert!(!dropin.contains("-ghostpolicy-allowtiers=0,1,2,3"));
+
+        // full_open leaves ExecStart free of any policy flag (inert).
+        let open = ghostd_managed_dropin(exec, &reaper, &launch, &storage, &inert_policy());
+        assert!(!open.contains("-ghostpolicy"));
     }
 }
