@@ -10911,6 +10911,7 @@ async fn api_system_mempool_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_filtering_activity_json_shape_and_totals() {
@@ -11392,6 +11393,7 @@ mod tests {
     /// hooks. Runs both cases in one test so the process-global env vars can't
     /// race a parallel test.
     #[tokio::test]
+    #[serial]
     async fn test_config_reaper_post_auto_applies_ghostd() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::types::NodeCapabilities;
@@ -11679,6 +11681,7 @@ mod tests {
     /// HMAC it must 401, and with a valid signature it must persist
     /// `[policy].profile` to pool.toml and request a graceful restart.
     #[tokio::test]
+    #[serial]
     async fn test_config_policy_profile_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::PolicyProfile as CfgProfile;
@@ -11903,6 +11906,7 @@ mod tests {
     /// custom`, persist the full `[policy].custom` block to pool.toml and request
     /// a graceful restart. It must also reject a negative min_fee_rate with 400.
     #[tokio::test]
+    #[serial]
     async fn test_config_policy_custom_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::{BudsTier, PolicyProfile as CfgProfile};
