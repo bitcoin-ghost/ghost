@@ -147,7 +147,7 @@ export default function PayoutsPage() {
   if (payoutLoading && !payoutHistory) {
     return (
       <div className="space-y-6">
-        <PageHeader eyebrow="payouts" title="Block reward distributions." subtitle="Transparent record of all block reward distributions" />
+        <PageHeader eyebrow="payouts" title="Network Payouts" subtitle="Transparent record of all block reward distributions" />
         <PageLoader message="Loading payout data..." />
       </div>
     );
@@ -156,6 +156,7 @@ export default function PayoutsPage() {
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow="payouts"
         title="Network Payouts"
         subtitle="Transparent record of all block reward distributions"
       />

@@ -60,11 +60,6 @@ export default function LogsPage() {
   // denied) — returned with HTTP 200 so the selector stays usable.
   const structuredError = data?.error ?? null;
 
-  const activeUnit = units.find((u) => u.key === unit);
-  const subtitle = activeUnit
-    ? `Recent logs for ${activeUnit.label}. ${activeUnit.description}.`
-    : "Recent node logs. Select a binary to inspect its output.";
-
   const copyAll = () => {
     const text = entries
       .map((e) => `${formatTs(e.timestamp)} ${e.level.toUpperCase().padEnd(5)} ${e.target}  ${e.message}`)
@@ -74,7 +69,12 @@ export default function LogsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader eyebrow="system" title="Logs." subtitle={subtitle} subtitleFullWidth />
+      <PageHeader
+        eyebrow="logs"
+        title="Node logs"
+        subtitle="Live output from this node's services — select a binary to inspect its recent logs."
+        subtitleFullWidth
+      />
 
       <SectionErrorBoundary section="Logs">
         <Card>

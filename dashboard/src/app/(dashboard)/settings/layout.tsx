@@ -113,7 +113,11 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Settings" subtitle="Node configuration and preferences" />
+      <PageHeader
+        eyebrow="settings"
+        title="Node Settings"
+        subtitle="Your node's settings in one place"
+      />
 
       <div className="flex flex-col lg:flex-row gap-6">
         {/* Sidebar */}
