@@ -136,8 +136,8 @@ export default function SyncPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="node"
-        title="Sync"
+        eyebrow="sync"
+        title="Node Synchronisation"
         subtitle="Chain and synchronisation status for this node, straight from ghostd's getblockchaininfo."
         actions={<SyncBadge isLoading={isLoading} unavailable={unavailable} view={view} />}
       />
