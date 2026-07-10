@@ -1,0 +1,28 @@
+//! # ghost-zerosync — recursive validity proof for Ghost
+//!
+//! Goal: a recursive **Nova/folding** proof attesting that the UTXO-set
+//! commitment `C_H` is the correct result of validating every block from
+//! genesis to height `H` — replacing the single-signer checkpoint signature
+//! (`haze/checkpoint_signing`) with math, and unlocking the proof-backed hazed
+//! wallet ([`ghost-web/docs/hazedproof.md`]). Full plan:
+//! `ghost-web/docs/zero-sync-proof.md`.
+//!
+//! ## Proving system
+//! **Nova folding** (IVC): step `n`'s proof folds in step `n-1`'s, so we prove
+//! "one more block" cheaply and never re-verify history. This is a *new* stack,
+//! distinct from the shielded pool's Groth16 (`ghost-zkp`), which cannot recurse.
+//!
+//! ## Phases (this crate grows through them)
+//! - **Phase 1** — recursive cumulative-PoW over the header chain (no UTXO yet).
+//!   Stands up the IVC machinery and gives real prove/verify numbers. → [`cumulative_pow`]
+//! - Phase 2 — UTXO accumulator (Utreexo) folded in-circuit.
+//! - Phase 3 — script/tx validation in-circuit (the multi-month body).
+//! - Phase 4 — prove-then-strip at the tip (wire to SwiftSync/checkpoint).
+//! - Phase 5 — historical backfill + elder-quorum-proved tie-in.
+
+pub mod cumulative_pow;
+
+/// A 256-bit value (block hash / target), big-endian, as it appears on the wire
+/// after the double-SHA256. Kept as raw bytes so the native spec and the future
+/// in-circuit encoding agree byte-for-byte.
+pub type U256 = [u8; 32];

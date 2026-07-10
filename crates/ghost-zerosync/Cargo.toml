@@ -1,0 +1,26 @@
+[package]
+name = "ghost-zerosync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Zero-Sync validity proof — recursive (Nova/folding) proof that the UTXO set is
+# the correct result of validating the chain. See ghost-web/docs/zero-sync-proof.md.
+#
+# Phase 1 = fold N Ghost headers into one recursive cumulative-PoW proof. The
+# native step logic below (cumulative_pow) is the SPEC the in-circuit step must
+# match byte-for-byte; the Nova StepCircuit encodes it.
+
+[dependencies]
+# Folding-scheme recursion (IVC). Chosen over the shielded-pool Groth16 stack
+# because Groth16 does not recurse.
+nova-snark = "0.38"
+# Circuit-building primitives (Nova synthesizes through bellpepper).
+bellpepper-core = "0.4"
+ff = "0.13"
+# Reference (native, non-circuit) hashing for the spec + tests.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
