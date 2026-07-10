@@ -427,9 +427,17 @@ bool IsGhostTierPolicyClean(const CTransaction& tx, const GhostTierPolicyConfig&
     }
     // Rejected: count exactly once. TierPolicyCheck returns from a single reject
     // site per call, so a tx is tallied once regardless of which rule bit it.
-    g_tier_rejected_txs.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t rejected = g_tier_rejected_txs.fetch_add(1, std::memory_order_relaxed) + 1;
     g_tier_rejected_vbytes.fetch_add(static_cast<uint64_t>(GetVirtualTransactionSize(tx)),
                                      std::memory_order_relaxed);
+    // Per-tx detail stays at Debug (BCLog::MEMPOOLREJ) to avoid spam. Emit a
+    // periodic aggregate at the default log level so an operator sees that tier
+    // filtering is active in debug.log without enabling a debug category — the
+    // exact counts remain available via getmempoolfilterstats.
+    if (rejected == 1 || rejected % 1000 == 0) {
+        LogInfo("Tier policy: %d transactions rejected cumulatively (%d vbytes)",
+                rejected, g_tier_rejected_vbytes.load(std::memory_order_relaxed));
+    }
     return false;
 }
 
