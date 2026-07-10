@@ -28,7 +28,7 @@ use nova_snark::traits::circuit::StepCircuit;
 /// position mux keyed on the exponent) is the documented hardening — until then
 /// this proves PoW for a fixed difficulty. `header_bits` = 640 header bits;
 /// `hash_bits` = 256 sha256d output bits (internal order).
-fn enforce_pow_fixed_exp32<F, CS>(
+pub(crate) fn enforce_pow_fixed_exp32<F, CS>(
     mut cs: CS,
     header_bits: &[Boolean],
     hash_bits: &[Boolean],
