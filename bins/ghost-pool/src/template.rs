@@ -1970,8 +1970,13 @@ impl TemplateProcessor {
             let result = self.classifier.classify(&btc_tx);
             let tier = result.tier;
 
-            // Check if tier is allowed by policy
-            if self.policy.allows_tier(tier) {
+            // Tier gate REMOVED (redundant): ghostd now enforces the BUDS tier
+            // policy at mempool acceptance (-ghostpolicy-allowtiers), so the
+            // mempool this template is built from already excludes disallowed
+            // tiers. classify() is kept because `tier` still feeds kept_tiers for
+            // payments-first ordering, and the fee-rate / dependency / Custom
+            // per-field checks below remain the pool's own concern.
+            {
                 // Full per-field policy enforcement — Custom profile ONLY. The
                 // tier gate above is the whole story for the three "Basic"
                 // presets (strict/permissive/full_open), which stay
@@ -2021,13 +2026,6 @@ impl TemplateProcessor {
                 } else {
                     removed_fees += tx.fee;
                 }
-            } else {
-                removed_fees += tx.fee;
-                debug!(
-                    txid = %tx.txid,
-                    tier = ?tier,
-                    "Transaction filtered by policy"
-                );
             }
         }
 
