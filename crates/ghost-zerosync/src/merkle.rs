@@ -105,7 +105,7 @@ mod tests {
     use super::*;
     use crate::sha256d_gadget::{bits_to_bytes, bytes_to_bits};
     use nova_snark::frontend::solver::SatisfyingAssignment;
-    use nova_snark::frontend::{AllocatedBit, Boolean, ConstraintSystem as _};
+    use nova_snark::frontend::{AllocatedBit, Boolean};
     use nova_snark::provider::PallasEngine;
 
     fn alloc_bit<CS: ConstraintSystem<<PallasEngine as nova_snark::traits::Engine>::Scalar>>(

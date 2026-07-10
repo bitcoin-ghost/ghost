@@ -36,7 +36,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_snark::frontend::{AllocatedBit, ConstraintSystem as _};
+    use nova_snark::frontend::AllocatedBit;
     use nova_snark::frontend::solver::SatisfyingAssignment;
     use nova_snark::provider::PallasEngine;
     use nova_snark::traits::Engine;
