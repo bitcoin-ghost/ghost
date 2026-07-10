@@ -6,10 +6,12 @@
 //! 2. runs `sha256d` over the header bits and packs the result into the new tip
 //!    limbs — so the tip is *computed*, not witnessed.
 //!
-//! What's still missing for a full PoW proof: the target comparison
-//! (`hash_be <= target(nBits)`), which is the final 1c gadget. Until then this
-//! proves *a correctly-hashed, correctly-linked chain* — everything but the
-//! difficulty check.
+//! 3. enforces real PoW `hash_be <= target(nBits)` for the actual, **variable**
+//!    nBits ([`expand_target_be`] reconstructs the 256-bit target from the
+//!    compact bits at any exponent), and accumulates work.
+//!
+//! So a valid fold proves *a correctly-hashed, correctly-linked chain with
+//! sufficient proof-of-work at its real difficulty*.
 //!
 //! `z = [tip_hi, tip_lo, cumwork]`.
 
@@ -17,18 +19,99 @@ use crate::compare::leq_be;
 use crate::sha256d_gadget::{bytes_to_bits, hash_bits_to_limbs, pack_be, sha256d_bits};
 use ff::PrimeField;
 use nova_snark::frontend::num::AllocatedNum;
-use nova_snark::frontend::{Boolean, ConstraintSystem, SynthesisError};
+use nova_snark::frontend::{AllocatedBit, Boolean, ConstraintSystem, SynthesisError, Variable};
 use nova_snark::traits::circuit::StepCircuit;
 
-/// Enforce real PoW: `hash_be <= target(nBits)`.
+/// Expand the compact nBits into the full 256-bit big-endian target, in-circuit,
+/// for exponent ∈ [4, 32] (every real block). `target = mantissa · 256^(exp−3)`;
+/// the mantissa's most-significant byte lands at big-endian index `32 − exp`,
+/// matching [`crate::cumulative_pow::target_from_bits`]. A one-hot over the
+/// exponent selects the byte placement; exponents outside [4, 32] make the
+/// one-hot unsatisfiable (rejected — sub-3 exponents never occur on real chains).
 ///
-/// SPIKE simplification: assumes the compact exponent is `0x20` (regtest / the
-/// 3-mantissa-bytes-at-the-front case), which it *enforces*, so the target is
-/// just `mantissa_bytes ++ zeros`. Variable-exponent nBits expansion (a byte-
-/// position mux keyed on the exponent) is the documented hardening — until then
-/// this proves PoW for a fixed difficulty. `header_bits` = 640 header bits;
-/// `hash_bits` = 256 sha256d output bits (internal order).
-pub(crate) fn enforce_pow_fixed_exp32<F, CS>(
+/// nBits is header bytes 72..76 (LE u32): byte 72 = mantissa LSB, byte 74 =
+/// mantissa MSB, byte 75 = exponent. `header_bits` is MSB-first per byte.
+pub(crate) fn expand_target_be<F, CS>(
+    mut cs: CS,
+    header_bits: &[Boolean],
+) -> Result<Vec<Boolean>, SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    let m_msb = &header_bits[592..600]; // byte 74 (mantissa MSB)
+    let m_mid = &header_bits[584..592]; // byte 73
+    let m_lsb = &header_bits[576..584]; // byte 72 (mantissa LSB)
+    let exp_num = pack_be(cs.namespace(|| "exp_val"), &header_bits[600..608])?;
+
+    // Concrete exponent (when a witness is present) to allocate the one-hot.
+    let exp_concrete: Option<u64> = {
+        let mut acc = 0u64;
+        let mut known = true;
+        for (i, b) in header_bits[600..608].iter().enumerate() {
+            match b.get_value() {
+                Some(v) => {
+                    if v {
+                        acc |= 1 << (7 - i);
+                    }
+                }
+                None => known = false,
+            }
+        }
+        known.then_some(acc)
+    };
+
+    // One-hot indicator over exponent e ∈ [4, 32].
+    let mut onehot: Vec<AllocatedBit> = Vec::with_capacity(29);
+    for e in 4u64..=32 {
+        let is = exp_concrete.map(|x| x == e);
+        onehot.push(AllocatedBit::alloc(cs.namespace(|| format!("oh_{e}")), is)?);
+    }
+    // Exactly one indicator is set.
+    let oh_vars: Vec<Variable> = onehot.iter().map(|b| b.get_variable()).collect();
+    {
+        let vs = oh_vars.clone();
+        cs.enforce(
+            || "onehot sum == 1",
+            |lc| vs.iter().fold(lc, |acc, v| acc + *v),
+            |lc| lc + CS::one(),
+            |lc| lc + CS::one(),
+        );
+    }
+    // The selected index equals the header's exponent.
+    {
+        let ws: Vec<(F, Variable)> = (4u64..=32).map(|e| (F::from(e), onehot[(e - 4) as usize].get_variable())).collect();
+        cs.enforce(
+            || "onehot matches exponent",
+            |lc| ws.iter().fold(lc, |acc, (c, v)| acc + (*c, *v)),
+            |lc| lc + CS::one(),
+            |lc| lc + exp_num.get_variable(),
+        );
+    }
+
+    // target byte k (BE) = mantissa MSB if k == 32−e, mid if 33−e, LSB if 34−e.
+    let mut target = Vec::with_capacity(256);
+    for k in 0..32i64 {
+        for b in 0..8usize {
+            let mut acc = Boolean::constant(false);
+            for (e, mant) in [(32 - k, m_msb), (33 - k, m_mid), (34 - k, m_lsb)] {
+                if !(4..=32).contains(&e) {
+                    continue;
+                }
+                let sel = Boolean::from(onehot[(e - 4) as usize].clone());
+                let term = Boolean::and(cs.namespace(|| format!("and_{k}_{b}_{e}")), &sel, &mant[b])?;
+                acc = Boolean::or(cs.namespace(|| format!("or_{k}_{b}_{e}")), &acc, &term)?;
+            }
+            target.push(acc);
+        }
+    }
+    Ok(target)
+}
+
+/// Enforce real PoW: `hash_be <= target(nBits)` for the actual, variable nBits.
+/// `header_bits` = 640 header bits; `hash_bits` = 256 sha256d output bits
+/// (internal little-endian byte order, reversed here to a big-endian number).
+pub(crate) fn enforce_pow<F, CS>(
     mut cs: CS,
     header_bits: &[Boolean],
     hash_bits: &[Boolean],
@@ -37,31 +120,13 @@ where
     F: PrimeField,
     CS: ConstraintSystem<F>,
 {
-    // nBits is header bytes 72..76 (LE u32): exponent = byte 75, mantissa =
-    // bytes 72..75. Enforce exponent bits (600..608) == 0x20 = 0b0010_0000.
-    let exp_expected = [false, false, true, false, false, false, false, false];
-    for (i, &e) in exp_expected.iter().enumerate() {
-        Boolean::enforce_equal(
-            cs.namespace(|| format!("exp_bit_{i}")),
-            &header_bits[600 + i],
-            &Boolean::constant(e),
-        )?;
-    }
+    let target = expand_target_be(cs.namespace(|| "target"), header_bits)?;
 
-    // target_be = mantissa big-endian bytes (byte74,73,72) then 232 zero bits.
-    let mut target = Vec::with_capacity(256);
-    target.extend_from_slice(&header_bits[592..600]); // byte 74 (mantissa MSB)
-    target.extend_from_slice(&header_bits[584..592]); // byte 73
-    target.extend_from_slice(&header_bits[576..584]); // byte 72 (mantissa LSB)
-    target.resize(256, Boolean::constant(false));
-
-    // hash_be = reverse the 32 output bytes (internal LE -> big-endian number).
     let mut hash_be = Vec::with_capacity(256);
     for byte in (0..32).rev() {
         hash_be.extend_from_slice(&hash_bits[byte * 8..byte * 8 + 8]);
     }
 
-    // Enforce hash_be <= target.
     let leq = leq_be(cs.namespace(|| "pow_leq"), &hash_be, &target)?;
     Boolean::enforce_equal(cs.namespace(|| "pow_holds"), &leq, &Boolean::constant(true))
 }
@@ -107,7 +172,7 @@ impl<F: PrimeField> StepCircuit<F> for HashedPowStep<F> {
         let (new_hi, new_lo) = hash_bits_to_limbs(cs.namespace(|| "tip"), &hash_bits)?;
 
         // Enforce real PoW: hash_be <= target(nBits).
-        enforce_pow_fixed_exp32(cs.namespace(|| "pow"), &bits, &hash_bits)?;
+        enforce_pow(cs.namespace(|| "pow"), &bits, &hash_bits)?;
 
         // Work accumulation.
         let work = AllocatedNum::alloc(cs.namespace(|| "work"), || Ok(self.work))?;
@@ -217,5 +282,48 @@ mod tests {
         }));
         let rejected = matches!(result, Err(_) | Ok(Err(_)));
         assert!(rejected, "a header with insufficient PoW must not produce a valid proof");
+    }
+
+    /// The in-circuit target expansion must equal the native oracle across a
+    /// range of exponents (fast — no folding, just the gadget).
+    #[test]
+    fn target_expansion_matches_native() {
+        use crate::cumulative_pow::target_from_bits;
+        use crate::sha256d_gadget::{bits_to_bytes, bytes_to_bits};
+        use nova_snark::frontend::solver::SatisfyingAssignment;
+        use nova_snark::frontend::ConstraintSystem as _;
+
+        for bits in [0x207f_ffffu32, 0x1f7f_ffff, 0x1d00_ffff, 0x1b04_04cb, 0x1a44_b9f2, 0x1803_4567, 0x1707_a429] {
+            let h = BlockHeader { version: 1, prev_hash: [0u8; 32], merkle_root: [7u8; 32], time: 1, bits, nonce: 0 };
+            let bytes = h.serialize();
+            let mut cs = SatisfyingAssignment::<PallasEngine>::new();
+            let hbits = bytes_to_bits(cs.namespace(|| "h"), &bytes).unwrap();
+            let target = expand_target_be(cs.namespace(|| "t"), &hbits).unwrap();
+            assert_eq!(bits_to_bytes(&target), target_from_bits(bits), "nBits {bits:#010x}");
+        }
+    }
+
+    /// Fold a header mined against a **non-`0x20`** exponent (0x1f7fffff, exp 31)
+    /// — proves the variable-nBits PoW gadget accepts real difficulty, end to end.
+    #[test]
+    fn valid_pow_nonstandard_exponent_folds() {
+        let bits = 0x1f7f_ffffu32; // target ~2^247: harder than regtest, still mineable
+        let genesis = [0u8; 32];
+        let mut header = None;
+        for nonce in 0..2_000_000u32 {
+            let h = BlockHeader { version: 1, prev_hash: genesis, merkle_root: [7u8; 32], time: 1_700_000_000, bits, nonce };
+            if crate::cumulative_pow::fold_header(genesis, 0, &h).is_ok() {
+                header = Some(h);
+                break;
+            }
+        }
+        let h = header.expect("mine a valid nonce at exp 31");
+
+        let steps = vec![HashedPowStep { header: h.serialize(), work: S1::from(1u64) }];
+        let (g_hi, g_lo) = hash_to_limbs::<S1>(&genesis);
+        let zn = run(&steps, [g_hi, g_lo, S1::from(0u64)]).expect("verify");
+        let (t_hi, t_lo) = hash_to_limbs::<S1>(&h.hash());
+        assert_eq!(zn[0], t_hi, "tip_hi");
+        assert_eq!(zn[1], t_lo, "tip_lo");
     }
 }

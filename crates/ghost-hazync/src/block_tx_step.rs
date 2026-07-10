@@ -15,7 +15,7 @@
 //! creating its output.* SPIKE: exactly one input + one output per block; real
 //! variable tx fan-out (fixed-max + padding for uniform R1CS) is the follow-on.
 
-use crate::hashed_step::enforce_pow_fixed_exp32;
+use crate::hashed_step::enforce_pow;
 use crate::merkle::PathElem;
 use crate::sha256d_gadget::{bytes_to_bits, hash_bits_to_limbs, pack_be, sha256d_bits};
 use crate::smt_update::{enforce_transition, EMPTY_LEAF};
@@ -61,7 +61,7 @@ impl<F: PrimeField> StepCircuit<F> for BlockTxStep<F> {
 
         let hash_bits = sha256d_bits(cs.namespace(|| "hdr_hash"), &bits)?;
         let (new_tip_hi, new_tip_lo) = hash_bits_to_limbs(cs.namespace(|| "tip"), &hash_bits)?;
-        enforce_pow_fixed_exp32(cs.namespace(|| "pow"), &bits, &hash_bits)?;
+        enforce_pow(cs.namespace(|| "pow"), &bits, &hash_bits)?;
 
         let work = AllocatedNum::alloc(cs.namespace(|| "work"), || Ok(self.work))?;
         let cumwork = AllocatedNum::alloc(cs.namespace(|| "cumwork'"), || {

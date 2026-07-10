@@ -16,7 +16,7 @@
 //! representative UTXO per block (the coinbase output) — a real block adds every
 //! tx output and spends its inputs (variable fan-out), the next increment.
 
-use crate::hashed_step::enforce_pow_fixed_exp32;
+use crate::hashed_step::enforce_pow;
 use crate::sha256d_gadget::{bytes_to_bits, hash_bits_to_limbs, pack_be, sha256d_bits};
 use ff::PrimeField;
 use nova_snark::frontend::num::AllocatedNum;
@@ -55,7 +55,7 @@ impl<F: PrimeField> StepCircuit<F> for BlockStep<F> {
 
         let hash_bits = sha256d_bits(cs.namespace(|| "hdr_hash"), &bits)?;
         let (new_tip_hi, new_tip_lo) = hash_bits_to_limbs(cs.namespace(|| "tip"), &hash_bits)?;
-        enforce_pow_fixed_exp32(cs.namespace(|| "pow"), &bits, &hash_bits)?;
+        enforce_pow(cs.namespace(|| "pow"), &bits, &hash_bits)?;
 
         let work = AllocatedNum::alloc(cs.namespace(|| "work"), || Ok(self.work))?;
         let cumwork = AllocatedNum::alloc(cs.namespace(|| "cumwork'"), || {
