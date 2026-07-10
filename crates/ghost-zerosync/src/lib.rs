@@ -26,6 +26,7 @@ pub mod sha256d_gadget;
 pub mod hashed_step;
 pub mod compare;
 pub mod merkle;
+pub mod accumulator;
 
 /// A 256-bit value (block hash / target), big-endian, as it appears on the wire
 /// after the double-SHA256. Kept as raw bytes so the native spec and the future
