@@ -16,7 +16,7 @@ use nova_snark::frontend::{
 };
 
 /// `2^k` in the field, by repeated doubling (k may exceed 64).
-fn pow2<F: PrimeField>(k: usize) -> F {
+pub(crate) fn pow2<F: PrimeField>(k: usize) -> F {
     let mut r = F::ONE;
     for _ in 0..k {
         r = r.double();

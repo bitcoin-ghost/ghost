@@ -18,11 +18,11 @@
 //! the same commitment on the `old_leaf` side — the next increment.
 
 use crate::merkle::PathElem;
-use crate::sha256d_gadget::{bytes_to_bits, hash_bits_to_limbs, sha256d_bits};
+use crate::sha256d_gadget::{bytes_to_bits, hash_bits_to_limbs, pow2, sha256d_bits};
 use crate::smt_update::{enforce_transition_bits, EMPTY_LEAF};
 use ff::PrimeField;
 use nova_snark::frontend::num::AllocatedNum;
-use nova_snark::frontend::{Boolean, ConstraintSystem, SynthesisError};
+use nova_snark::frontend::{Boolean, ConstraintSystem, LinearCombination, SynthesisError};
 use nova_snark::traits::circuit::StepCircuit;
 
 /// A UTXO's committed fields.
@@ -62,6 +62,41 @@ where
     let bytes = coin.serialize();
     let bits = bytes_to_bits(cs.namespace(|| format!("{tag}_ser")), &bytes)?;
     sha256d_bits(cs.namespace(|| format!("{tag}_leaf")), &bits)
+}
+
+/// Derive the coin's leaf bits **and** its `amount` as a field element, with the
+/// amount provably equal to the little-endian `amount` field committed inside the
+/// leaf preimage — so value checks operate on the *committed* amount, not a
+/// free-floating witness. Amount occupies serialization bytes 36..44 (LE u64).
+pub fn coin_commit<F, CS>(
+    cs: &mut CS,
+    tag: &str,
+    coin: &Coin,
+) -> Result<(Vec<Boolean>, AllocatedNum<F>), SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    let bytes = coin.serialize();
+    let bits = bytes_to_bits(cs.namespace(|| format!("{tag}_ser")), &bytes)?;
+    let leaf = sha256d_bits(cs.namespace(|| format!("{tag}_leaf")), &bits)?;
+
+    let amount = AllocatedNum::alloc(cs.namespace(|| format!("{tag}_amt")), || Ok(F::from(coin.amount)))?;
+    // Bind: amount == Σ committed-bit · 2^(8·i + 7 − j), byte i∈0..8 (LE), bit j∈0..8 (MSB-first).
+    let mut packed = LinearCombination::<F>::zero();
+    for i in 0..8 {
+        for j in 0..8 {
+            let bit = &bits[(36 + i) * 8 + j];
+            packed = packed + &bit.lc(CS::one(), pow2::<F>(8 * i + 7 - j));
+        }
+    }
+    cs.enforce(
+        || format!("{tag}_amount_bound"),
+        |_| packed,
+        |lc| lc + CS::one(),
+        |lc| lc + amount.get_variable(),
+    );
+    Ok((leaf, amount))
 }
 
 #[derive(Clone, Debug)]
