@@ -34,8 +34,8 @@ const TOOLTIPS = {
 
 // Mirrors `formatDifficulty` on the public pool.html so the dashboard and the
 // pool website render identical numbers.
-function formatDifficulty(d: number): string {
-  if (!isFinite(d) || d <= 0) return "—";
+function formatDifficulty(d: number | null | undefined): string {
+  if (d == null || !isFinite(d) || d <= 0) return "—";
   if (d < 1e3) return d.toFixed(2);
   if (d < 1e6) return (d / 1e3).toFixed(2) + "K";
   if (d < 1e9) return (d / 1e6).toFixed(2) + "M";
@@ -150,7 +150,11 @@ export default function NodePoolPage() {
   const rejected = status?.shares_rejected ?? Math.max(0, submitted - accepted);
   const acceptRate = submitted > 0 ? (accepted / submitted) * 100 : 100;
 
-  const networkDifficulty = status?.difficulty ?? bestHash?.best_difficulty ?? 0;
+  // Network difficulty comes from ghostd's getblockchaininfo via the mining
+  // status endpoint. Do NOT fall back to `best_difficulty` — that is the pool
+  // SHARE/vardiff difficulty (~1.0), not the chain difficulty, and rendered a
+  // misleading "1.00" tile. Null → formatDifficulty shows "—".
+  const networkDifficulty = status?.difficulty ?? null;
 
   // Round progress: elapsed vs estimated time to next block, when the node
   // surfaces both. Falls back to a shares-this-round readout otherwise.
@@ -304,7 +308,21 @@ export default function NodePoolPage() {
     [],
   );
 
-  const payoutRows = payouts ?? [];
+  // "Recent payouts" must honour the 7-day window even though the
+  // `/rewards/node-history` endpoint currently returns the full node reward
+  // ledger regardless of `time_filter`. Guard client-side: drop rows whose most-
+  // recent activity is older than 7 days (or have no usable timestamp), so a node
+  // last credited months ago no longer surfaces under "recent". (Backend TODO:
+  // make node-history respect time_filter, or point this at the payout-events
+  // endpoint rather than the per-node balance ledger.)
+  const SEVEN_DAYS_SEC = 7 * 24 * 60 * 60;
+  const nowSec = Date.now() / 1000;
+  const payoutRows = (payouts ?? []).filter((p) => {
+    const raw = p.timestamp ?? p.updated_at ?? p.created_at ?? 0;
+    if (!raw) return false;
+    const ts = raw > 1e12 ? raw / 1000 : raw; // normalise ms → s
+    return nowSec - ts <= SEVEN_DAYS_SEC;
+  });
 
   return (
     <div className="space-y-6">
@@ -558,14 +576,18 @@ export default function NodePoolPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* This node's miners: the per-miner detail this node can see locally.
-          A true mesh-wide per-miner leaderboard needs client fan-out to every
-          node (see the mesh leaderboard note above). */}
-      <SectionErrorBoundary section="This Node's Miners">
+      {/* Pool miners: the per-miner detail recorded in THIS node's database.
+          Because shares are gossiped across the mesh for payout consensus, this
+          set spans miners on every node (deduplicated), not only those on this
+          node's stratum port — hence the pool-wide label. `local_connected_miners`
+          on /mining/status is the strictly-local count. A true per-node split of
+          the detail list would need a local-connection origin flag on records
+          (backend TODO). */}
+      <SectionErrorBoundary section="Pool Miners">
         <Card>
           <CardHeader
-            title="This Node's Miners"
-            subtitle="Miners connected to this node's stratum port, ranked by hashrate"
+            title="Pool Miners"
+            subtitle="Per-miner detail recorded by this node across the mesh (shares are gossiped pool-wide), ranked by hashrate"
           />
           {minersRedacted ? (
             <div className="t-label" style={{ color: "var(--dim)" }}>

@@ -1660,6 +1660,21 @@ async fn api_mining_status_handler(
         None
     };
 
+    // Real network difficulty from ghostd (getblockchaininfo). Previously this
+    // field was hardcoded to 1.0, which the dashboard rendered as a "1.00"
+    // network-difficulty tile. Sourced here (with a short timeout) so it degrades
+    // to null — dashboard shows "—" — rather than a misleading value if RPC fails.
+    let network_difficulty: Option<f64> = if let Some(ref rpc) = state.rpc {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_blockchain_info())
+            .await
+        {
+            Ok(Ok(info)) => Some(info.difficulty),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let config = state.dashboard_config.read();
 
     // Aggregate hashrate across all miners. Use the miner's actual elapsed
@@ -1759,7 +1774,7 @@ async fn api_mining_status_handler(
         "miner_count": health.miner_count,
         "total_hashrate": mesh_hashrate_th,
         "shares_this_round": health.capabilities.total_shares,
-        "difficulty": 1.0,
+        "difficulty": network_difficulty,
         "best_hash": null,
         "is_synced": true,
         // Dashboard-compatible aliases

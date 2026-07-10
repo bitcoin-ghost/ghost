@@ -49,12 +49,17 @@ const peerColumns: ColumnDef<PeerInfo>[] = [
     },
   },
   {
+    // The backend `synced` flag is a HEARTBEAT-freshness signal (peer seen in
+    // the last 60s), NOT a chain-sync state. Labelling a stale-heartbeat peer
+    // "Syncing" was misleading — a fully-synced mesh node whose gossip lagged
+    // past 60s would read as if it were still downloading the chain. Label it
+    // by what the flag actually means: Active (recent heartbeat) / Stale.
     accessorKey: "synced",
-    header: "Status",
+    header: "Heartbeat",
     cell: ({ row }) => (
       <StatusDot
         status={row.original.synced ? "online" : "warning"}
-        label={row.original.synced ? "Synced" : "Syncing"}
+        label={row.original.synced ? "Active" : "Stale"}
         size="sm"
       />
     ),
