@@ -24,6 +24,7 @@ pub mod cumulative_pow;
 pub mod pow_step_circuit;
 pub mod sha256d_gadget;
 pub mod hashed_step;
+pub mod compare;
 
 /// A 256-bit value (block hash / target), big-endian, as it appears on the wire
 /// after the double-SHA256. Kept as raw bytes so the native spec and the future
