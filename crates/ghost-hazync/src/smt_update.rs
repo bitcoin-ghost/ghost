@@ -62,9 +62,34 @@ where
     Ok(())
 }
 
-/// Enforce one SMT leaf transition along `path`: `old_leaf` opens to
-/// `old_root_bits` and `new_leaf` opens to `new_root_bits` under the *same* path.
-/// The root bit-slices are concrete witnessed roots (compared, never packed here).
+/// Enforce one SMT leaf transition from **already-computed leaf bits**: the old
+/// leaf opens to `old_root_bits` and the new leaf opens to `new_root_bits` under
+/// the *same* path. Lets a caller feed a leaf derived in-circuit (e.g. a coin
+/// commitment) rather than a raw byte value. The root bit-slices are concrete
+/// witnessed roots (compared, never packed here).
+pub(crate) fn enforce_transition_bits<F, CS>(
+    cs: &mut CS,
+    tag: &str,
+    old_root_bits: &[Boolean],
+    new_root_bits: &[Boolean],
+    old_leaf_bits: &[Boolean],
+    new_leaf_bits: &[Boolean],
+    path: &[PathElem],
+) -> Result<(), SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    let cpath = circuit_path(cs, tag, path)?;
+    let computed_old = merkle_root(cs.namespace(|| format!("{tag}_old_mr")), old_leaf_bits, &cpath)?;
+    enforce_bits_equal(cs, &format!("{tag}_old_open"), &computed_old, old_root_bits)?;
+    let computed_new = merkle_root(cs.namespace(|| format!("{tag}_new_mr")), new_leaf_bits, &cpath)?;
+    enforce_bits_equal(cs, &format!("{tag}_new_open"), &computed_new, new_root_bits)?;
+    Ok(())
+}
+
+/// Enforce one SMT leaf transition along `path` from raw leaf byte values:
+/// `old_leaf` opens to `old_root_bits` and `new_leaf` opens to `new_root_bits`.
 pub(crate) fn enforce_transition<F, CS>(
     cs: &mut CS,
     tag: &str,
@@ -78,14 +103,9 @@ where
     F: PrimeField,
     CS: ConstraintSystem<F>,
 {
-    let cpath = circuit_path(cs, tag, path)?;
     let old_leaf_bits = bytes_to_bits(cs.namespace(|| format!("{tag}_old_leaf")), old_leaf)?;
-    let computed_old = merkle_root(cs.namespace(|| format!("{tag}_old_mr")), &old_leaf_bits, &cpath)?;
-    enforce_bits_equal(cs, &format!("{tag}_old_open"), &computed_old, old_root_bits)?;
     let new_leaf_bits = bytes_to_bits(cs.namespace(|| format!("{tag}_new_leaf")), new_leaf)?;
-    let computed_new = merkle_root(cs.namespace(|| format!("{tag}_new_mr")), &new_leaf_bits, &cpath)?;
-    enforce_bits_equal(cs, &format!("{tag}_new_open"), &computed_new, new_root_bits)?;
-    Ok(())
+    enforce_transition_bits(cs, tag, old_root_bits, new_root_bits, &old_leaf_bits, &new_leaf_bits, path)
 }
 
 #[derive(Clone, Debug)]
