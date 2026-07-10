@@ -10742,7 +10742,8 @@ mod tests {
             subsidy_sats: Some(312_500_000),
             tx_fees_sats: Some(1_234),
         };
-        db.upsert_round(&payout_record).expect("upsert payout details");
+        db.upsert_round(&payout_record)
+            .expect("upsert payout details");
 
         let round = db.get_round(7).expect("get round").unwrap();
         assert_eq!(round.block_height, 956_695);

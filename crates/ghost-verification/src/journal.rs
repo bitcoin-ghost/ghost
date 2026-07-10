@@ -360,7 +360,10 @@ mod tests {
     #[test]
     fn strip_ansi_removes_colour_and_keeps_text() {
         // SGR colour codes (ghost-pay style) are removed, text preserved.
-        assert_eq!(strip_ansi("\u{1b}[32mINFO\u{1b}[0m started"), "INFO started");
+        assert_eq!(
+            strip_ansi("\u{1b}[32mINFO\u{1b}[0m started"),
+            "INFO started"
+        );
         assert_eq!(strip_ansi("\u{1b}[1;31merror!\u{1b}[0m"), "error!");
         // Plain text is untouched.
         assert_eq!(strip_ansi("no escapes here"), "no escapes here");

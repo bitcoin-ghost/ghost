@@ -1986,11 +1986,17 @@ impl VerificationState {
                             );
                         }
                         Err(e) => {
-                            warn!("Failed to sync ghost mode local egress to ghost-core: {}", e);
+                            warn!(
+                                "Failed to sync ghost mode local egress to ghost-core: {}",
+                                e
+                            );
                         }
                     }
                 } else {
-                    debug!("Ghost mode local egress already in sync: {}", local_local_egress);
+                    debug!(
+                        "Ghost mode local egress already in sync: {}",
+                        local_local_egress
+                    );
                 }
 
                 // Sync dashboard config

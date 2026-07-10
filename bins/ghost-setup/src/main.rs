@@ -139,10 +139,7 @@ fn apply_reaper_to_ghostd(
     let storage = &config.storage;
     let policy = &config.policy;
 
-    println!(
-        "Ghost-managed ghostd flags (from {}):",
-        pool_toml.display()
-    );
+    println!("Ghost-managed ghostd flags (from {}):", pool_toml.display());
     for f in settings
         .ghostd_flags()
         .iter()

@@ -750,7 +750,10 @@ mod tests {
 
         // Sum equals the union size (deduped total).
         let total: u32 = counts.values().sum();
-        assert_eq!(total, 5, "deduped per-node counts must sum to the union size");
+        assert_eq!(
+            total, 5,
+            "deduped per-node counts must sum to the union size"
+        );
 
         // Freshest node (A, t=300) owns all three of its hashes (1,2,3).
         assert_eq!(counts.get(&node_a).copied().unwrap_or(0), 3);

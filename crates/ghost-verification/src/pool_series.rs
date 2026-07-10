@@ -119,7 +119,10 @@ mod tests {
             s.push(sample(t));
         }
         let recent = s.since(7);
-        assert_eq!(recent.iter().map(|x| x.t).collect::<Vec<_>>(), vec![7, 8, 9]);
+        assert_eq!(
+            recent.iter().map(|x| x.t).collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
     }
 
     #[test]

@@ -343,11 +343,7 @@ impl ReorgHandler {
                 "Bitcoin chain reorg detected: block {hash_display} disconnected from the tip (depth {reorg_depth})."
             );
             alerts
-                .fire_rate_limited(
-                    AlertEvent::ReorgDetected,
-                    REORG_ALERT_MIN_INTERVAL,
-                    &detail,
-                )
+                .fire_rate_limited(AlertEvent::ReorgDetected, REORG_ALERT_MIN_INTERVAL, &detail)
                 .await;
         }
 

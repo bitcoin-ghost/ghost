@@ -1117,6 +1117,16 @@ mod client {
                 }
                 std::process::ExitCode::SUCCESS
             }
+            Ok(Response::NodeEndpointsSet(r)) => {
+                println!("node endpoints updated (preset: {})", r.preset);
+                if !r.ghost_pay_urls.is_empty() {
+                    println!("  ghost-pay: {}", r.ghost_pay_urls.join(", "));
+                }
+                if !r.gsp_urls.is_empty() {
+                    println!("  gsp:       {}", r.gsp_urls.join(", "));
+                }
+                std::process::ExitCode::SUCCESS
+            }
             Ok(Response::WalletCreate(c)) => {
                 println!("wallet '{}' created at {}", c.name, c.path);
                 println!("\nWrite these 24 words down somewhere safe.");
@@ -1358,7 +1368,11 @@ mod client {
                 println!("network:    {}", s.network);
                 println!(
                     "ghost-pay:  {}{}",
-                    if s.ghost_pay_reachable { "reachable" } else { "unreachable" },
+                    if s.ghost_pay_reachable {
+                        "reachable"
+                    } else {
+                        "unreachable"
+                    },
                     s.ghost_pay_version
                         .as_deref()
                         .map(|v| format!(" (v{v})"))

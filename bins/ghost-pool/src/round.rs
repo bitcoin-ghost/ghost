@@ -1379,7 +1379,10 @@ mod tests {
         assert_eq!(elapsed_secs_between(start, now), 4);
         // `now` before `start` (should never happen with a monotonic clock, but
         // must never underflow/panic) → saturates to 0.
-        assert_eq!(elapsed_secs_between(start + Duration::from_secs(10), start), 0);
+        assert_eq!(
+            elapsed_secs_between(start + Duration::from_secs(10), start),
+            0
+        );
     }
 
     #[test]

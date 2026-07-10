@@ -4195,7 +4195,8 @@ mod tests {
         let processor = test_processor();
         let tx = make_tx("only", 1000, 400, vec![]);
         let original_to_filtered = HashMap::new();
-        let result = processor.sort_by_package_fee_rate(vec![tx], &t0_tiers(1), &original_to_filtered);
+        let result =
+            processor.sort_by_package_fee_rate(vec![tx], &t0_tiers(1), &original_to_filtered);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].txid, "only");
     }
@@ -4246,7 +4247,11 @@ mod tests {
     ///
     /// Package {dataP,payQ}: fee=5100, weight=600, vB=150 => 34 sat/vB;
     /// cluster-minimum tier = T0 (payQ) => classified FINANCIAL.
-    fn tiered_mempool() -> (Vec<TemplateTransaction>, Vec<BudsTier>, HashMap<usize, usize>) {
+    fn tiered_mempool() -> (
+        Vec<TemplateTransaction>,
+        Vec<BudsTier>,
+        HashMap<usize, usize>,
+    ) {
         let txs = vec![
             make_tx("payA", 1000, 400, vec![]),
             make_tx("dataC", 8000, 400, vec![]),
@@ -4342,8 +4347,7 @@ mod tests {
         // The default processor (no block_priority set => MaxFee) must produce
         // byte-identical ordering, proving the default path is untouched.
         let default_proc = test_processor();
-        let result_default =
-            default_proc.sort_by_package_fee_rate(txs.clone(), &tiers, &o2f);
+        let result_default = default_proc.sort_by_package_fee_rate(txs.clone(), &tiers, &o2f);
         let ids_max: Vec<&str> = result_max.iter().map(|t| t.txid.as_str()).collect();
         let ids_default: Vec<&str> = result_default.iter().map(|t| t.txid.as_str()).collect();
         assert_eq!(ids_max, ids_default, "explicit MaxFee == default config");
@@ -4382,7 +4386,10 @@ mod tests {
         // The submit-time consensus cap (BIP141). Since PaymentsFirst only
         // permutes the ghostd-selected set, this guard remains sufficient.
         const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
-        assert!(w_pay < MAX_BLOCK_WEIGHT, "template stays under the weight cap");
+        assert!(
+            w_pay < MAX_BLOCK_WEIGHT,
+            "template stays under the weight cap"
+        );
 
         // Same multiset of txids (nothing added or dropped).
         let mut ids_max: Vec<&str> = r_max.iter().map(|t| t.txid.as_str()).collect();
@@ -4404,8 +4411,8 @@ mod tests {
     fn test_payments_first_noop_when_all_financial() {
         // A mempool of only financial txs (as a strict policy would leave).
         let txs = vec![
-            make_tx("p_lo", 1000, 400, vec![]), // 10 sat/vB
-            make_tx("p_hi", 5000, 400, vec![]), // 50 sat/vB
+            make_tx("p_lo", 1000, 400, vec![]),  // 10 sat/vB
+            make_tx("p_hi", 5000, 400, vec![]),  // 50 sat/vB
             make_tx("p_mid", 3000, 400, vec![]), // 30 sat/vB
         ];
         let tiers = vec![BudsTier::T0, BudsTier::T1, BudsTier::T0];
@@ -4418,7 +4425,10 @@ mod tests {
 
         let ord_max: Vec<&str> = r_max.iter().map(|t| t.txid.as_str()).collect();
         let ord_pay: Vec<&str> = r_pay.iter().map(|t| t.txid.as_str()).collect();
-        assert_eq!(ord_max, ord_pay, "no-op when nothing but financial txs present");
+        assert_eq!(
+            ord_max, ord_pay,
+            "no-op when nothing but financial txs present"
+        );
     }
 
     /// H-MINE-3-TEST-2: Test that runtime script_len validation works
@@ -4699,7 +4709,10 @@ mod tests {
         let mut strict = PolicyProfile::full_open();
         strict.max_tx_outputs = 5;
         let (kept, _) = make_processor(strict).filter_transactions(&[tx.clone()]);
-        assert!(kept.is_empty(), "tx exceeding max_tx_outputs must be dropped");
+        assert!(
+            kept.is_empty(),
+            "tx exceeding max_tx_outputs must be dropped"
+        );
 
         let mut loose = PolicyProfile::full_open();
         loose.max_tx_outputs = 20;
@@ -4872,8 +4885,7 @@ mod tests {
 
         // Sanity: the classifier must flag this as an inscription, else the test
         // proves nothing.
-        let btc_tx: bitcoin::Transaction =
-            deserialize(&hex::decode(&ttx.data).unwrap()).unwrap();
+        let btc_tx: bitcoin::Transaction = deserialize(&hex::decode(&ttx.data).unwrap()).unwrap();
         let classification = BudsClassifier::new().classify(&btc_tx);
         assert!(
             classification
@@ -4887,7 +4899,10 @@ mod tests {
         let mut strict = PolicyProfile::full_open();
         strict.allow_inscriptions = false;
         let (kept, _) = make_processor(strict).filter_transactions(&[ttx.clone()]);
-        assert!(kept.is_empty(), "inscription must be dropped when disallowed");
+        assert!(
+            kept.is_empty(),
+            "inscription must be dropped when disallowed"
+        );
 
         // allow_inscriptions = true → kept.
         let loose = PolicyProfile::full_open(); // already allows inscriptions
