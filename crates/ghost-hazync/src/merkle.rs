@@ -42,7 +42,7 @@ pub fn merkle_root_native(leaf: U256, path: &[PathElem]) -> U256 {
 }
 
 /// `cond ? t : f` for a single `Boolean` (mutually-exclusive OR of the arms).
-fn bool_select<F, CS>(
+pub(crate) fn bool_select<F, CS>(
     mut cs: CS,
     cond: &Boolean,
     t: &Boolean,
@@ -56,6 +56,24 @@ where
     let not_cond = cond.not();
     let b = Boolean::and(cs.namespace(|| "!cond&f"), &not_cond, f)?;
     Boolean::or(cs.namespace(|| "or"), &a, &b)
+}
+
+/// Per-bit `cond ? t : f` over equal-length bit vectors.
+pub(crate) fn select_bits<F, CS>(
+    mut cs: CS,
+    cond: &Boolean,
+    t: &[Boolean],
+    f: &[Boolean],
+) -> Result<Vec<Boolean>, SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    t.iter()
+        .zip(f.iter())
+        .enumerate()
+        .map(|(i, (ti, fi))| bool_select(cs.namespace(|| format!("sel_{i}")), cond, ti, fi))
+        .collect()
 }
 
 /// If `cond`, return `(y, x)`, else `(x, y)` — per-bit.
