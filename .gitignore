@@ -85,3 +85,4 @@ fuzz/artifacts/
 # Wraith Wallet Tauri sidecars — staged at build time from freshly-built
 # wraithd binaries (target-triple-suffixed), never committed.
 apps/wraith-wallet/gui/src-tauri/binaries/
+build/
