@@ -72,9 +72,8 @@ where
     Ok((hi, lo))
 }
 
-/// Witness `bytes` as SHA256-input bits (MSB-first per byte) and return
-/// `SHA256(SHA256(bytes))` as 256 `Boolean`s.
-pub fn sha256d<Scalar, CS>(mut cs: CS, bytes: &[u8]) -> Result<Vec<Boolean>, SynthesisError>
+/// Witness `bytes` as SHA256-input bits (MSB-first per byte).
+pub fn bytes_to_bits<Scalar, CS>(mut cs: CS, bytes: &[u8]) -> Result<Vec<Boolean>, SynthesisError>
 where
     Scalar: PrimeField,
     CS: ConstraintSystem<Scalar>,
@@ -83,13 +82,33 @@ where
     for (i, byte) in bytes.iter().enumerate() {
         for j in (0..8).rev() {
             let b = (byte >> j) & 1 == 1;
-            let bit = AllocatedBit::alloc(cs.namespace(|| format!("in_bit_{i}_{j}")), Some(b))?;
+            let bit = AllocatedBit::alloc(cs.namespace(|| format!("byte_{i}_bit_{j}")), Some(b))?;
             bits.push(Boolean::from(bit));
         }
     }
-    let first = sha256(cs.namespace(|| "sha256_1"), &bits)?;
+    Ok(bits)
+}
+
+/// `SHA256(SHA256(bits))` over already-allocated input bits — lets a caller both
+/// hash the header and extract fields (prev_hash, nBits) from the same bits.
+pub fn sha256d_bits<Scalar, CS>(mut cs: CS, bits: &[Boolean]) -> Result<Vec<Boolean>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let first = sha256(cs.namespace(|| "sha256_1"), bits)?;
     let second = sha256(cs.namespace(|| "sha256_2"), &first)?;
     Ok(second)
+}
+
+/// Witness `bytes` as bits and return `SHA256(SHA256(bytes))` (256 `Boolean`s).
+pub fn sha256d<Scalar, CS>(mut cs: CS, bytes: &[u8]) -> Result<Vec<Boolean>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let bits = bytes_to_bits(cs.namespace(|| "bytes"), bytes)?;
+    sha256d_bits(cs.namespace(|| "hash"), &bits)
 }
 
 /// Read the concrete byte value out of 256 output `Boolean`s (MSB-first).
