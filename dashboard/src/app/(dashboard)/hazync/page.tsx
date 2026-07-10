@@ -55,7 +55,7 @@ function roleOf(mode: string, pruned: boolean): { label: string; variant: "succe
   }
 }
 
-export default function ZeroSyncPage() {
+export default function HazyncPage() {
   const { data: haze, isLoading: hazeLoading, error: hazeError } = useHazeStatus();
   const { data: ckpt, isLoading: ckptLoading } = useCheckpointStatus();
 
@@ -83,7 +83,7 @@ export default function ZeroSyncPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="zero-sync"
+        eyebrow="hazync"
         title="Fast sync & serve"
         subtitle="Bootstrap a node in minutes from a signed UTXO snapshot, and see what this node can serve to peers and wallets — witness-free."
         actions={
@@ -100,7 +100,7 @@ export default function ZeroSyncPage() {
         }
       />
 
-      {/* Snapshot bootstrap — the zero-sync core */}
+      {/* Snapshot bootstrap — the Hazync core */}
       <SectionErrorBoundary section="Snapshot bootstrap">
         {ckptLoading || hazeLoading ? (
           <SkeletonCard />

@@ -1,5 +1,5 @@
 //! Phase 3 (integration) — the **block step**: one fold step advances the chain
-//! *and* the UTXO set together, which is the actual shape of the zero-sync
+//! *and* the UTXO set together, which is the actual shape of the Hazync
 //! recursion.
 //!
 //! `z = [tip_hi, tip_lo, cumwork, acc_hi, acc_lo, count]`. Per folded block:

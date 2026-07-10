@@ -1,12 +1,12 @@
 [package]
-name = "ghost-zerosync"
+name = "ghost-hazync"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Zero-Sync validity proof — recursive (Nova/folding) proof that the UTXO set is
-# the correct result of validating the chain. See ghost-web/docs/zero-sync-proof.md.
+# Hazync — recursive (Nova/folding) validity proof that the UTXO set is the
+# correct result of validating the chain. See ghost-web/docs/hazync.md.
 #
 # Phase 1 = fold N Ghost headers into one recursive cumulative-PoW proof. The
 # native step logic below (cumulative_pow) is the SPEC the in-circuit step must

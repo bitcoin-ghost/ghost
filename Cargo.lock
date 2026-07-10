@@ -3409,6 +3409,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-hazync"
+version = "1.10.22"
+dependencies = [
+ "ff",
+ "hex",
+ "nova-snark",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "ghost-keys"
 version = "1.10.22"
 dependencies = [
@@ -3833,16 +3843,6 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
-]
-
-[[package]]
-name = "ghost-zerosync"
-version = "1.10.22"
-dependencies = [
- "ff",
- "hex",
- "nova-snark",
- "sha2 0.10.9",
 ]
 
 [[package]]

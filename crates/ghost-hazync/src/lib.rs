@@ -1,11 +1,11 @@
-//! # ghost-zerosync — recursive validity proof for Ghost
+//! # ghost-hazync — Hazync: recursive validity proof for Ghost
 //!
-//! Goal: a recursive **Nova/folding** proof attesting that the UTXO-set
-//! commitment `C_H` is the correct result of validating every block from
-//! genesis to height `H` — replacing the single-signer checkpoint signature
-//! (`haze/checkpoint_signing`) with math, and unlocking the proof-backed hazed
-//! wallet ([`ghost-web/docs/hazedproof.md`]). Full plan:
-//! `ghost-web/docs/zero-sync-proof.md`.
+//! Hazync (Haze + sync) is the trustless fast-sync backbone of the Haze family
+//! ([`ghost-web/docs/hazedproof.md`]): a recursive **Nova/folding** proof
+//! attesting that the UTXO-set commitment `C_H` is the correct result of
+//! validating every block from genesis to height `H` — replacing the
+//! single-signer checkpoint signature (`haze/checkpoint_signing`) with math, and
+//! unlocking the proof-backed hazed wallet. Full plan: `ghost-web/docs/hazync.md`.
 //!
 //! ## Proving system
 //! **Nova folding** (IVC): step `n`'s proof folds in step `n-1`'s, so we prove

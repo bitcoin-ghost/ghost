@@ -41,8 +41,8 @@ members = [
     # ZK-BFT Infrastructure
     "crates/ghost-zkp",
     "crates/ghost-mpc",
-    # Zero-Sync validity proof (Nova/folding recursive chain-validity proof)
-    "crates/ghost-zerosync",
+    # Hazync — recursive (Nova/folding) chain-validity proof
+    "crates/ghost-hazync",
     # Cross-process MPC ceremony contribution harness (test-only, feature-gated)
     "crates/mpc-xproc-harness",
     # Visual Identity

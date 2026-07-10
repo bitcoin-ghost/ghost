@@ -1,4 +1,6 @@
-# Zero-Sync Validity Proof — workstream plan
+# Hazync — recursive validity proof (workstream plan)
+
+*Hazync (Haze + sync) is the Haze family's trustless fast-sync backbone. (Named to avoid collision with the unrelated external **ZeroSync** project, which is cited below only as a proving-system comparison.)*
 
 *The recursive ZK proof that attests the UTXO set is the correct result of validating the chain — replacing checkpoint **trust** with **math**, and unlocking the proof-backed hazed wallet.*
 
@@ -13,7 +15,7 @@ The existing `ghost-zkp` is **Groth16 (bellperson)** — great for fixed shielde
 - **Nova / SuperNova (folding)** — cheapest recursion, no per-step trusted setup; the natural fit for "fold one block into the running proof." **Recommended default.**
 - **Halo2 (accumulation, cycle of curves)** — also viable; heavier.
 - **STARK route (à la ZeroSync)** — transparent, but a different stack.
-So the proving system for zero-sync is a **new choice**, not a reuse of the shielded-pool Groth16 — that's the first real decision.
+So the proving system for Hazync is a **new choice**, not a reuse of the shielded-pool Groth16 — that's the first real decision.
 
 ## The statement to prove
 > *Applying every valid block from genesis to height H, starting from the empty UTXO set, yields UTXO-set commitment C_H — and the header chain to H has valid PoW.*
@@ -31,4 +33,4 @@ Recursive step (folded per block): given `(prev_commitment C_{h-1}, block_h)`, p
 Then the **proof-backed UTXO wallet path** ([hazedproof.md](hazedproof.md)) lands on top: the wallet spends coins whose inclusion is verified against the proof's committed UTXO root — closing the legacy/coinbase gap and finishing v23.
 
 ## Immediate next step
-**Phase 1 spike:** a standalone crate (`crates/ghost-zerosync` or a `ghast-bench`-style prototype) that folds N Ghost block headers into one recursive proof of cumulative PoW, using a folding scheme. Small, self-contained, and it forces the proving-system decision with real numbers (proof size, prove/verify time) before we commit to the heavy circuit work.
+**Phase 1 spike:** a standalone crate (`crates/ghost-hazync` or a `ghast-bench`-style prototype) that folds N Ghost block headers into one recursive proof of cumulative PoW, using a folding scheme. Small, self-contained, and it forces the proving-system decision with real numbers (proof size, prove/verify time) before we commit to the heavy circuit work.
