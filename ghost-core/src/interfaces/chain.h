@@ -62,6 +62,19 @@ public:
     //! Read block data from disk. If the block exists but doesn't have data
     //! (for example due to pruning), the CBlock variable will be set to null.
     FoundBlock& data(CBlock& data) { m_data = &data; return *this; }
+    //! Read a reconstructed partial block from the stripped (.gsb) archive on a
+    //! hazed node, paired with the authoritative txid of each transaction (the
+    //! stripped block stores/derives correct txids). The reconstruction omits
+    //! witness and scriptSig, so a caller must trust a reconstructed transaction
+    //! only when its GetHash() equals the paired authoritative txid — true for
+    //! native-segwit txs, false for the coinbase and any legacy scriptSig tx.
+    //! Both variables are set to empty if no stripped block is available.
+    FoundBlock& strippedBlock(CBlock& data, std::vector<uint256>& txids)
+    {
+        m_stripped_data = &data;
+        m_stripped_txids = &txids;
+        return *this;
+    }
 
     uint256* m_hash = nullptr;
     int* m_height = nullptr;
@@ -72,6 +85,8 @@ public:
     CBlockLocator* m_locator = nullptr;
     const FoundBlock* m_next_block = nullptr;
     CBlock* m_data = nullptr;
+    CBlock* m_stripped_data = nullptr;
+    std::vector<uint256>* m_stripped_txids = nullptr;
     mutable bool found = false;
 };
 

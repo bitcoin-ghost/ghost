@@ -656,6 +656,12 @@ public:
         //! status is SUCCESS, and may or may not be set if status is
         //! USER_ABORT.
         uint256 last_failed_block;
+
+        //! Count of transactions skipped while scanning reconstructed blocks on a
+        //! hazed node: the coinbase and any legacy scriptSig transaction cannot
+        //! have their identity reconstructed from stripped data, so they are not
+        //! matched. Non-zero means the rescan of hazed history was partial.
+        int64_t unreconstructed_hazed_txs{0};
     };
     ScanResult ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress);
 

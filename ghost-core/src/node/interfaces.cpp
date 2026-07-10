@@ -4,7 +4,9 @@
 
 #include <addrdb.h>
 #include <banman.h>
+#include <haze/block_reconstruct.h>
 #include <haze/mode_selector.h>
+#include <haze/stripped_block.h>
 #include <blockfilter.h>
 #include <chain.h>
 #include <chainparams.h>
@@ -459,9 +461,34 @@ bool FillBlock(const CBlockIndex* index, const FoundBlock& block, UniqueLock<Rec
     if (block.m_in_active_chain) *block.m_in_active_chain = active[index->nHeight] == index;
     if (block.m_locator) { *block.m_locator = GetLocator(index); }
     if (block.m_next_block) FillBlock(active[index->nHeight] == index ? active[index->nHeight + 1] : nullptr, *block.m_next_block, lock, active, blockman);
-    if (block.m_data) {
+    if (block.m_data || block.m_stripped_data) {
         REVERSE_LOCK(lock, cs_main);
-        if (!blockman.ReadBlock(*block.m_data, *index)) block.m_data->SetNull();
+        bool full_available = false;
+        if (block.m_data) {
+            if (blockman.ReadBlock(*block.m_data, *index)) full_available = true;
+            else block.m_data->SetNull();
+        }
+        if (block.m_stripped_data) {
+            block.m_stripped_data->SetNull();
+            if (block.m_stripped_txids) block.m_stripped_txids->clear();
+            // On a hazed node the full block is gone; reconstruct the structural
+            // block from the stripped (.gsb) archive and hand back the
+            // authoritative per-tx txids so the caller can tell which
+            // reconstructed txs are exact. Skipped when the full block is
+            // available, to avoid a wasted archive read per block on a full node.
+            if (!full_available) {
+                haze::CStrippedBlock stripped;
+                if (blockman.ReadStrippedBlock(stripped, *index)) {
+                    *block.m_stripped_data = haze::ReconstructPartialBlock(stripped);
+                    if (block.m_stripped_txids) {
+                        block.m_stripped_txids->reserve(stripped.GetTxCount());
+                        for (size_t i = 0; i < stripped.GetTxCount(); ++i) {
+                            block.m_stripped_txids->push_back(stripped.GetTxid(i));
+                        }
+                    }
+                }
+            }
+        }
     }
     block.found = true;
     return true;

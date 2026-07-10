@@ -1926,12 +1926,22 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
             // Read block data and locator if needed (the locator is usually null unless we need to save progress)
             CBlock block;
             CBlockLocator loc;
+            // On a hazed node the full block is absent; also request the
+            // reconstructed stripped block + its authoritative per-tx txids so
+            // we can still scan structural data (see below).
+            CBlock stripped_block;
+            std::vector<uint256> stripped_txids;
             // Find block
-            FoundBlock found_block{FoundBlock().data(block)};
+            FoundBlock found_block{FoundBlock().data(block).strippedBlock(stripped_block, stripped_txids)};
             if (save_progress && next_interval) found_block.locator(loc);
             chain().findBlock(block_hash, found_block);
 
-            if (!block.IsNull()) {
+            // Prefer the full block; fall back to the reconstructed stripped
+            // block on a hazed node where the full block was pruned in memory.
+            const bool have_full{!block.IsNull()};
+            const bool have_stripped{!have_full && !stripped_block.IsNull()};
+
+            if (have_full || have_stripped) {
                 LOCK(cs_wallet);
                 if (!block_still_active) {
                     // Abort scan if current block is no longer active, to prevent
@@ -1940,8 +1950,21 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     result.status = ScanResult::FAILURE;
                     break;
                 }
-                for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
-                    SyncTransaction(block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)}, fUpdate, /*rescanning_old_block=*/true);
+                const CBlock& scan_block{have_full ? block : stripped_block};
+                for (size_t posInBlock = 0; posInBlock < scan_block.vtx.size(); ++posInBlock) {
+                    if (have_stripped) {
+                        // A reconstructed tx omits witness/scriptSig, so its
+                        // GetHash() only equals the original txid for native
+                        // segwit txs. Trust it only when it round-trips against
+                        // the authoritative stripped txid; otherwise (coinbase,
+                        // legacy scriptSig) skip it rather than mis-record it.
+                        if (posInBlock >= stripped_txids.size() ||
+                            scan_block.vtx[posInBlock]->GetHash().ToUint256() != stripped_txids[posInBlock]) {
+                            ++result.unreconstructed_hazed_txs;
+                            continue;
+                        }
+                    }
+                    SyncTransaction(scan_block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)}, fUpdate, /*rescanning_old_block=*/true);
                 }
                 // scan succeeded, record block as most recent successfully scanned
                 result.last_scanned_block = block_hash;

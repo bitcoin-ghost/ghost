@@ -888,7 +888,7 @@ RPCHelpMan rescanblockchain()
     case CWallet::ScanResult::SUCCESS:
         break;
     case CWallet::ScanResult::FAILURE:
-        throw JSONRPCError(RPC_MISC_ERROR, "Rescan failed to read block data. On a hazed or pruned node the historical blocks are not kept on disk, so a full rescan of that range is not possible — use the address index (-addressindex) for balance and history, or restrict the rescan to the retained recent window. If this node keeps full blocks, the data files may be corrupted (consider -reindex).");
+        throw JSONRPCError(RPC_MISC_ERROR, "Rescan failed to read block data. A hazed node scans reconstructed blocks from its stripped archive, so this failure means neither the full nor the stripped block is on disk (for example a pruned-hazed node past its prune height) — use the address index (-addressindex / scanaddressindex) for balance and history over the pruned range, or restrict the rescan to the retained window. If this node keeps full blocks, the data files may be corrupted (consider -reindex).");
     case CWallet::ScanResult::USER_ABORT:
         throw JSONRPCError(RPC_MISC_ERROR, "Rescan aborted.");
         // no default case, so the compiler can warn about missing cases
@@ -896,6 +896,13 @@ RPCHelpMan rescanblockchain()
     UniValue response(UniValue::VOBJ);
     response.pushKV("start_height", start_height);
     response.pushKV("stop_height", result.last_scanned_height ? *result.last_scanned_height : UniValue());
+    // On a hazed node the coinbase and any legacy scriptSig tx cannot be
+    // reconstructed from stripped data, so they are not matched. Surface the
+    // count so a partial rescan is never mistaken for a complete one.
+    if (result.unreconstructed_hazed_txs > 0) {
+        response.pushKV("unreconstructed_hazed_txs", result.unreconstructed_hazed_txs);
+        response.pushKV("warning", strprintf("%d transaction(s) in scanned hazed blocks could not be reconstructed from stripped data (the coinbase and legacy scriptSig transactions) and were not matched; use the address index (scanaddressindex) if you expect receives from such transactions.", result.unreconstructed_hazed_txs));
+    }
     return response;
 },
     };
