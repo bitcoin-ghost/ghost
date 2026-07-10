@@ -29,6 +29,7 @@ pub mod merkle;
 pub mod accumulator;
 pub mod accumulator_add;
 pub mod block_step;
+pub mod smt_update;
 
 /// A 256-bit value (block hash / target), big-endian, as it appears on the wire
 /// after the double-SHA256. Kept as raw bytes so the native spec and the future
