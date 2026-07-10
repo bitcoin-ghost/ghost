@@ -6,6 +6,7 @@
 
 #include <common/args.h>
 #include <common/system.h>
+#include <index/addressindex.h>
 #include <index/txindex.h>
 #include <kernel/caches.h>
 #include <logging.h>
@@ -44,6 +45,11 @@ CacheSizes CalculateCacheSizes(const ArgsManager& args, size_t n_indexes)
     IndexCacheSizes index_sizes;
     index_sizes.tx_index = std::min(total_cache / 8, args.GetBoolArg("-txindex", DEFAULT_TXINDEX) ? MAX_TX_INDEX_CACHE : 0);
     total_cache -= index_sizes.tx_index;
+    // The address index is a leveldb like the tx index, so give it its own slice
+    // (a leveldb cache measurably helps random-access index reads) rather than
+    // borrowing the tx-index figure.
+    index_sizes.address_index = std::min(total_cache / 8, args.GetBoolArg("-addressindex", DEFAULT_ADDRESSINDEX) ? MAX_TX_INDEX_CACHE : 0);
+    total_cache -= index_sizes.address_index;
     if (n_indexes > 0) {
         size_t max_cache = std::min(total_cache / 8, MAX_FILTER_INDEX_CACHE);
         index_sizes.filter_index = max_cache / n_indexes;

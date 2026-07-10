@@ -580,7 +580,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-shutdownnotify=<cmd>", "Execute command immediately before beginning shutdown. The need for shutdown may be urgent, so be careful not to delay it long (if the command doesn't require interaction with the server, consider having it fork into the background).", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-txindex", strprintf("Maintain a full transaction index, used by the getrawtransaction rpc call (default: %u)", DEFAULT_TXINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-addressindex", strprintf("Maintain an index of address (scriptPubKey) outputs, balances and history, used by the getaddressbalance/getaddressutxos/getaddresstxids RPCs. Built from structural block data, so it works on pruned and hazed nodes. (default: %u)", DEFAULT_ADDRESSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-addressindex", strprintf("Maintain an index of address (scriptPubKey) outputs, balances and history, used by the getaddressbalance/getaddressutxos/getaddresstxids/scanaddressindex RPCs. Built from structural block data, so it works on pruned and hazed nodes. On a node that is already pruned when the index is first enabled, only blocks still on disk can be back-indexed — coverage below the prune height is unavailable; enable it before pruning (or alongside a full/hazed archive) for complete history. (default: %u)", DEFAULT_ADDRESSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blockfilterindex=<type>",
                  strprintf("Maintain an index of compact filters by block (default: %s, values: %s).", DEFAULT_BLOCKFILTERINDEX, ListBlockFilterTypes()) +
                  " If <type> is not supplied or if <type> = 1, indexes for all known types are enabled.",
@@ -1954,6 +1954,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (args.GetBoolArg("-txindex", DEFAULT_TXINDEX)) {
         LogInfo("* Using %.1f MiB for transaction index database", index_cache_sizes.tx_index * (1.0 / 1024 / 1024));
     }
+    if (args.GetBoolArg("-addressindex", DEFAULT_ADDRESSINDEX)) {
+        LogInfo("* Using %.1f MiB for address index database", index_cache_sizes.address_index * (1.0 / 1024 / 1024));
+    }
     for (BlockFilterType filter_type : g_enabled_filter_types) {
         LogInfo("* Using %.1f MiB for %s block filter index database",
                   index_cache_sizes.filter_index * (1.0 / 1024 / 1024), BlockFilterTypeName(filter_type));
@@ -2226,7 +2229,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     if (args.GetBoolArg("-addressindex", DEFAULT_ADDRESSINDEX)) {
-        g_addressindex = std::make_unique<AddressIndex>(interfaces::MakeChain(node), index_cache_sizes.tx_index, false, do_reindex);
+        g_addressindex = std::make_unique<AddressIndex>(interfaces::MakeChain(node), index_cache_sizes.address_index, false, do_reindex);
         node.indexes.emplace_back(g_addressindex.get());
     }
 

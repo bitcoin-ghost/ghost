@@ -171,7 +171,11 @@ private:
      * The nAddSize argument passed to this function should include not just the size of the serialized CBlock, but also the size of
      * separator fields (STORAGE_HEADER_BYTES).
      */
-    [[nodiscard]] FlatFilePos FindNextBlockPos(unsigned int nAddSize, unsigned int nHeight, uint64_t nTime);
+    //! Reserve space for the next block. When `stripped` is true the node is
+    //! hazed and the payload is written to the `gsb` file sequence, so the
+    //! preallocation must target that sequence — otherwise a matching `blk`
+    //! chunk would be preallocated and left empty, wasting disk on hazed nodes.
+    [[nodiscard]] FlatFilePos FindNextBlockPos(unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool stripped = false);
     [[nodiscard]] bool FlushChainstateBlockFile(int tip_height);
     bool FindUndoPos(BlockValidationState& state, int nFile, FlatFilePos& pos, unsigned int nAddSize);
 

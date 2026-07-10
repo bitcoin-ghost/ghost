@@ -807,7 +807,7 @@ fs::path BlockManager::GetBlockPosFilename(const FlatFilePos& pos) const
     return m_block_file_seq.FileName(pos);
 }
 
-FlatFilePos BlockManager::FindNextBlockPos(unsigned int nAddSize, unsigned int nHeight, uint64_t nTime)
+FlatFilePos BlockManager::FindNextBlockPos(unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool stripped)
 {
     LOCK(cs_LastBlockFile);
 
@@ -884,7 +884,10 @@ FlatFilePos BlockManager::FindNextBlockPos(unsigned int nAddSize, unsigned int n
     m_blockfile_info[nFile].nSize += nAddSize;
 
     bool out_of_space;
-    size_t bytes_allocated = m_block_file_seq.Allocate(pos, nAddSize, out_of_space);
+    // On a hazed node the payload lands in the gsb sequence, so preallocate there
+    // and leave the blk sequence untouched (no empty blk chunk on disk).
+    const FlatFileSeq& payload_seq = stripped ? m_gsb_file_seq : m_block_file_seq;
+    size_t bytes_allocated = payload_seq.Allocate(pos, nAddSize, out_of_space);
     if (out_of_space) {
         m_opts.notifications.fatalError(_("Disk space is too low!"));
         return {};
@@ -1200,7 +1203,7 @@ FlatFilePos BlockManager::WriteStrippedBlock(const CBlock& block, int nHeight)
     const unsigned int block_size{static_cast<unsigned int>(GetSerializeSize(strip_result.stripped_block))};
 
     // Find position in the file sequence (shared with blk files for numbering)
-    FlatFilePos pos{FindNextBlockPos(block_size + STORAGE_HEADER_BYTES, nHeight, block.GetBlockTime())};
+    FlatFilePos pos{FindNextBlockPos(block_size + STORAGE_HEADER_BYTES, nHeight, block.GetBlockTime(), /*stripped=*/true)};
     if (pos.IsNull()) {
         LogError("FindNextBlockPos failed for %s while writing stripped block", pos.ToString());
         return FlatFilePos();
@@ -1248,7 +1251,7 @@ FlatFilePos BlockManager::WriteReceivedStrippedBlock(const haze::CStrippedBlock&
 {
     const unsigned int block_size{static_cast<unsigned int>(GetSerializeSize(stripped))};
 
-    FlatFilePos pos{FindNextBlockPos(block_size + STORAGE_HEADER_BYTES, nHeight, stripped.m_header.GetBlockTime())};
+    FlatFilePos pos{FindNextBlockPos(block_size + STORAGE_HEADER_BYTES, nHeight, stripped.m_header.GetBlockTime(), /*stripped=*/true)};
     if (pos.IsNull()) {
         LogError("FindNextBlockPos failed for %s while writing received stripped block", pos.ToString());
         return FlatFilePos();
