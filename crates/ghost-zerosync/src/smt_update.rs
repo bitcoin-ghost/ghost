@@ -31,6 +31,63 @@ use nova_snark::traits::circuit::StepCircuit;
 /// The empty-leaf sentinel (an unoccupied UTXO slot).
 pub const EMPTY_LEAF: crate::U256 = [0u8; 32];
 
+/// Witness an authentication path as `(sibling_bits, direction)` pairs. `tag`
+/// keeps namespaces unique when several paths are opened in one step.
+pub(crate) fn circuit_path<F, CS>(
+    cs: &mut CS,
+    tag: &str,
+    path: &[PathElem],
+) -> Result<Vec<(Vec<Boolean>, Boolean)>, SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    let mut out = Vec::with_capacity(path.len());
+    for (i, e) in path.iter().enumerate() {
+        let sib = bytes_to_bits(cs.namespace(|| format!("{tag}_sib_{i}")), &e.sibling)?;
+        let dir = Boolean::from(AllocatedBit::alloc(cs.namespace(|| format!("{tag}_dir_{i}")), Some(e.is_right))?);
+        out.push((sib, dir));
+    }
+    Ok(out)
+}
+
+pub(crate) fn enforce_bits_equal<F, CS>(cs: &mut CS, tag: &str, a: &[Boolean], b: &[Boolean]) -> Result<(), SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        Boolean::enforce_equal(cs.namespace(|| format!("{tag}_{i}")), x, y)?;
+    }
+    Ok(())
+}
+
+/// Enforce one SMT leaf transition along `path`: `old_leaf` opens to
+/// `old_root_bits` and `new_leaf` opens to `new_root_bits` under the *same* path.
+/// The root bit-slices are concrete witnessed roots (compared, never packed here).
+pub(crate) fn enforce_transition<F, CS>(
+    cs: &mut CS,
+    tag: &str,
+    old_root_bits: &[Boolean],
+    new_root_bits: &[Boolean],
+    old_leaf: &crate::U256,
+    new_leaf: &crate::U256,
+    path: &[PathElem],
+) -> Result<(), SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    let cpath = circuit_path(cs, tag, path)?;
+    let old_leaf_bits = bytes_to_bits(cs.namespace(|| format!("{tag}_old_leaf")), old_leaf)?;
+    let computed_old = merkle_root(cs.namespace(|| format!("{tag}_old_mr")), &old_leaf_bits, &cpath)?;
+    enforce_bits_equal(cs, &format!("{tag}_old_open"), &computed_old, old_root_bits)?;
+    let new_leaf_bits = bytes_to_bits(cs.namespace(|| format!("{tag}_new_leaf")), new_leaf)?;
+    let computed_new = merkle_root(cs.namespace(|| format!("{tag}_new_mr")), &new_leaf_bits, &cpath)?;
+    enforce_bits_equal(cs, &format!("{tag}_new_open"), &computed_new, new_root_bits)?;
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct SmtUpdateStep<F: PrimeField> {
     pub old_root: crate::U256,
@@ -41,34 +98,6 @@ pub struct SmtUpdateStep<F: PrimeField> {
     pub path: Vec<PathElem>,
     /// +1 to add, -1 to spend.
     pub size_delta: F,
-}
-
-fn circuit_path<F, CS>(
-    cs: &mut CS,
-    path: &[PathElem],
-) -> Result<Vec<(Vec<Boolean>, Boolean)>, SynthesisError>
-where
-    F: PrimeField,
-    CS: ConstraintSystem<F>,
-{
-    let mut out = Vec::with_capacity(path.len());
-    for (i, e) in path.iter().enumerate() {
-        let sib = bytes_to_bits(cs.namespace(|| format!("sib_{i}")), &e.sibling)?;
-        let dir = Boolean::from(AllocatedBit::alloc(cs.namespace(|| format!("dir_{i}")), Some(e.is_right))?);
-        out.push((sib, dir));
-    }
-    Ok(out)
-}
-
-fn enforce_bits_equal<F, CS>(cs: &mut CS, tag: &str, a: &[Boolean], b: &[Boolean]) -> Result<(), SynthesisError>
-where
-    F: PrimeField,
-    CS: ConstraintSystem<F>,
-{
-    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        Boolean::enforce_equal(cs.namespace(|| format!("{tag}_{i}")), x, y)?;
-    }
-    Ok(())
 }
 
 impl<F: PrimeField> StepCircuit<F> for SmtUpdateStep<F> {
@@ -90,18 +119,8 @@ impl<F: PrimeField> StepCircuit<F> for SmtUpdateStep<F> {
         cs.enforce(|| "old_hi == z[0]", |lc| lc + old_hi.get_variable() - z[0].get_variable(), |lc| lc + CS::one(), |lc| lc);
         cs.enforce(|| "old_lo == z[1]", |lc| lc + old_lo.get_variable() - z[1].get_variable(), |lc| lc + CS::one(), |lc| lc);
 
-        // Shared authentication path.
-        let path = circuit_path(cs, &self.path)?;
-
-        // (b) old_leaf opens to old_root.
-        let old_leaf_bits = bytes_to_bits(cs.namespace(|| "old_leaf"), &self.old_leaf)?;
-        let computed_old = merkle_root(cs.namespace(|| "old_mr"), &old_leaf_bits, &path)?;
-        enforce_bits_equal(cs, "old_open", &computed_old, &old_root_bits)?;
-
-        // (c) new_leaf opens to new_root under the SAME path.
-        let new_leaf_bits = bytes_to_bits(cs.namespace(|| "new_leaf"), &self.new_leaf)?;
-        let computed_new = merkle_root(cs.namespace(|| "new_mr"), &new_leaf_bits, &path)?;
-        enforce_bits_equal(cs, "new_open", &computed_new, &new_root_bits)?;
+        // (b,c) old_leaf opens to old_root and new_leaf opens to new_root, same path.
+        enforce_transition(cs, "upd", &old_root_bits, &new_root_bits, &self.old_leaf, &self.new_leaf, &self.path)?;
 
         // (d) new_root becomes z'. Pack concrete new_root bits — safe.
         let (new_hi, new_lo) = hash_bits_to_limbs(cs.namespace(|| "new_limbs"), &new_root_bits)?;
@@ -123,8 +142,43 @@ impl<F: PrimeField> StepCircuit<F> for SmtUpdateStep<F> {
     }
 }
 
+/// Shared test helpers for the depth-2 UTXO tree (used here and by `block_tx_step`).
+#[cfg(test)]
+pub(crate) mod tests_util {
+    use super::PathElem;
+    use crate::cumulative_pow::double_sha256;
+
+    pub fn h2(a: &crate::U256, b: &crate::U256) -> crate::U256 {
+        let mut buf = [0u8; 64];
+        buf[0..32].copy_from_slice(a);
+        buf[32..64].copy_from_slice(b);
+        double_sha256(&buf)
+    }
+    /// Root of a depth-2 tree over 4 leaves.
+    pub fn root_of(leaves: &[crate::U256; 4]) -> crate::U256 {
+        h2(&h2(&leaves[0], &leaves[1]), &h2(&leaves[2], &leaves[3]))
+    }
+    /// Path for leaf `idx`: `[sibling-leaf, sibling-subtree]`.
+    pub fn path_of(leaves: &[crate::U256; 4], idx: usize) -> Vec<PathElem> {
+        let (sib_leaf, leaf_is_right) = match idx {
+            0 => (leaves[1], false),
+            1 => (leaves[0], true),
+            2 => (leaves[3], false),
+            _ => (leaves[2], true),
+        };
+        let n01 = h2(&leaves[0], &leaves[1]);
+        let n23 = h2(&leaves[2], &leaves[3]);
+        let (sib_sub, sub_is_right) = if idx < 2 { (n23, false) } else { (n01, true) };
+        vec![
+            PathElem { sibling: sib_leaf, is_right: leaf_is_right },
+            PathElem { sibling: sib_sub, is_right: sub_is_right },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::tests_util::{path_of, root_of};
     use super::*;
     use crate::cumulative_pow::double_sha256;
     use crate::pow_step_circuit::hash_to_limbs;
@@ -140,33 +194,6 @@ mod tests {
     type S2 = <E2 as Engine>::Scalar;
     type C1 = SmtUpdateStep<S1>;
     type C2 = TrivialCircuit<S2>;
-
-    fn h2(a: &crate::U256, b: &crate::U256) -> crate::U256 {
-        let mut buf = [0u8; 64];
-        buf[0..32].copy_from_slice(a);
-        buf[32..64].copy_from_slice(b);
-        double_sha256(&buf)
-    }
-    // Depth-2 tree over 4 leaves.
-    fn root_of(leaves: &[crate::U256; 4]) -> crate::U256 {
-        h2(&h2(&leaves[0], &leaves[1]), &h2(&leaves[2], &leaves[3]))
-    }
-    // Path for leaf `idx`: [sibling-leaf, sibling-subtree].
-    fn path_of(leaves: &[crate::U256; 4], idx: usize) -> Vec<PathElem> {
-        let (sib_leaf, leaf_is_right) = match idx {
-            0 => (leaves[1], false),
-            1 => (leaves[0], true),
-            2 => (leaves[3], false),
-            _ => (leaves[2], true),
-        };
-        let n01 = h2(&leaves[0], &leaves[1]);
-        let n23 = h2(&leaves[2], &leaves[3]);
-        let (sib_sub, sub_is_right) = if idx < 2 { (n23, false) } else { (n01, true) };
-        vec![
-            PathElem { sibling: sib_leaf, is_right: leaf_is_right },
-            PathElem { sibling: sib_sub, is_right: sub_is_right },
-        ]
-    }
 
     fn run(steps: &[C1], z0: [S1; 3]) -> Result<Vec<S1>, nova_snark::errors::NovaError> {
         let c2 = C2::default();
@@ -186,7 +213,6 @@ mod tests {
         let u0 = double_sha256(b"utxo-0");
         let u1 = double_sha256(b"utxo-1");
 
-        // State 0: empty. Add u0@0, add u1@1, spend u0@0.
         let s0 = [e, e, e, e];
         let s1 = [u0, e, e, e];
         let s2 = [u0, u1, e, e];
@@ -212,7 +238,6 @@ mod tests {
         let u0 = double_sha256(b"utxo-0");
         let s0 = [e, e, e, e];
         let s1 = [e, e, e, e];
-        // Claims to spend u0@0 but the slot is empty → old_leaf u0 does not open to old_root.
         let steps = vec![SmtUpdateStep { old_root: root_of(&s0), new_root: root_of(&s1), old_leaf: u0, new_leaf: e, path: path_of(&s0, 0), size_delta: -S1::from(1u64) }];
         let (h0, l0) = hash_to_limbs::<S1>(&root_of(&s0));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&steps, [h0, l0, S1::from(0u64)])));
