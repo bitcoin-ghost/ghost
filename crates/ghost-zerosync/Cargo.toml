@@ -17,7 +17,6 @@ repository.workspace = true
 # because Groth16 does not recurse.
 nova-snark = "0.38"
 # Circuit-building primitives (Nova synthesizes through bellpepper).
-bellpepper-core = "0.4"
 ff = "0.13"
 # Reference (native, non-circuit) hashing for the spec + tests.
 sha2 = { workspace = true }

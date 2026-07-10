@@ -21,6 +21,7 @@
 //! - Phase 5 — historical backfill + elder-quorum-proved tie-in.
 
 pub mod cumulative_pow;
+pub mod pow_step_circuit;
 
 /// A 256-bit value (block hash / target), big-endian, as it appears on the wire
 /// after the double-SHA256. Kept as raw bytes so the native spec and the future

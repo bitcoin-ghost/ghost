@@ -709,25 +709,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "bellpepper-core"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d8abb418570756396d722841b19edfec21d4e89e1cf8990610663040ecb1aea"
-dependencies = [
- "blake2s_simd",
- "byteorder",
- "ff",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "bellperson"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c41bd83b8437856d267eb311de13dcd9bff9077cc5ba35c7ec886070dea8a45"
 dependencies = [
- "bellpepper-core 0.2.1",
+ "bellpepper-core",
  "bincode",
  "blake2s_simd",
  "blstrs",
@@ -3852,7 +3839,6 @@ dependencies = [
 name = "ghost-zerosync"
 version = "1.10.22"
 dependencies = [
- "bellpepper-core 0.4.0",
  "ff",
  "hex",
  "nova-snark",
