@@ -10,7 +10,67 @@
 //! order. Both the input and the 256-bit output follow this.
 
 use ff::PrimeField;
-use nova_snark::frontend::{sha256, AllocatedBit, Boolean, ConstraintSystem, SynthesisError};
+use nova_snark::frontend::num::AllocatedNum;
+use nova_snark::frontend::{
+    sha256, AllocatedBit, Boolean, ConstraintSystem, LinearCombination, SynthesisError,
+};
+
+/// `2^k` in the field, by repeated doubling (k may exceed 64).
+fn pow2<F: PrimeField>(k: usize) -> F {
+    let mut r = F::ONE;
+    for _ in 0..k {
+        r = r.double();
+    }
+    r
+}
+
+/// Pack `bits` (MSB-first) into an `AllocatedNum` equal to
+/// `Σ bit[i]·2^(n-1-i)`, with an R1CS constraint pinning it. `bits.len()` must
+/// not exceed the field capacity (used here for 128-bit limbs).
+pub fn pack_be<F, CS>(mut cs: CS, bits: &[Boolean]) -> Result<AllocatedNum<F>, SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    let n = bits.len();
+    let value = {
+        let mut acc = F::ZERO;
+        for (i, bit) in bits.iter().enumerate() {
+            if bit.get_value().ok_or(SynthesisError::AssignmentMissing)? {
+                acc += pow2::<F>(n - 1 - i);
+            }
+        }
+        acc
+    };
+    let num = AllocatedNum::alloc(cs.namespace(|| "packed"), || Ok(value))?;
+    // packed == Σ bit[i]·2^(n-1-i)
+    let mut packing = LinearCombination::<F>::zero();
+    for (i, bit) in bits.iter().enumerate() {
+        packing = packing + &bit.lc(CS::one(), pow2::<F>(n - 1 - i));
+    }
+    cs.enforce(
+        || "packed == weighted bit sum",
+        |lc| lc + num.get_variable(),
+        |lc| lc + CS::one(),
+        |_| packing,
+    );
+    Ok(num)
+}
+
+/// Split 256 hash `Boolean`s (MSB-first) into the two 128-bit field limbs
+/// `(hi, lo)` — the in-circuit twin of [`crate::pow_step_circuit::hash_to_limbs`].
+pub fn hash_bits_to_limbs<F, CS>(
+    mut cs: CS,
+    bits: &[Boolean],
+) -> Result<(AllocatedNum<F>, AllocatedNum<F>), SynthesisError>
+where
+    F: PrimeField,
+    CS: ConstraintSystem<F>,
+{
+    let hi = pack_be(cs.namespace(|| "hi"), &bits[0..128])?;
+    let lo = pack_be(cs.namespace(|| "lo"), &bits[128..256])?;
+    Ok((hi, lo))
+}
 
 /// Witness `bytes` as SHA256-input bits (MSB-first per byte) and return
 /// `SHA256(SHA256(bytes))` as 256 `Boolean`s.
@@ -51,8 +111,36 @@ pub fn bits_to_bytes(bits: &[Boolean]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::cumulative_pow::{double_sha256, BlockHeader};
+    use crate::pow_step_circuit::hash_to_limbs;
     use nova_snark::frontend::solver::SatisfyingAssignment;
     use nova_snark::provider::PallasEngine;
+    use nova_snark::traits::Engine;
+
+    type Scalar = <PallasEngine as Engine>::Scalar;
+
+    fn sample_header() -> BlockHeader {
+        BlockHeader {
+            version: 1,
+            prev_hash: [0u8; 32],
+            merkle_root: [7u8; 32],
+            time: 1_700_000_000,
+            bits: 0x207f_ffff,
+            nonce: 42,
+        }
+    }
+
+    #[test]
+    fn in_circuit_limbs_match_native_hash_to_limbs() {
+        let bytes = sample_header().serialize();
+        let native_hash = double_sha256(&bytes);
+        let (exp_hi, exp_lo) = hash_to_limbs::<Scalar>(&native_hash);
+
+        let mut cs = SatisfyingAssignment::<PallasEngine>::new();
+        let out = sha256d(&mut cs, &bytes).unwrap();
+        let (hi, lo) = hash_bits_to_limbs(&mut cs, &out).unwrap();
+        assert_eq!(hi.get_value().unwrap(), exp_hi, "hi limb mismatch");
+        assert_eq!(lo.get_value().unwrap(), exp_lo, "lo limb mismatch");
+    }
 
     // Witness-generating CS: synthesizes + computes assignments, so the output
     // Booleans carry the concrete hash. (Constraint *satisfaction* is proven by
