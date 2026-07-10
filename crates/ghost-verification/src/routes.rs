@@ -422,6 +422,11 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/haze/status", get(api_haze_status_handler))
         .route("/api/v1/haze/legal-pack", get(api_haze_legal_pack_handler))
         .route("/api/v1/haze/checkpoint", get(api_haze_checkpoint_handler))
+        // Address index (trusted-mode wallet/explorer serving; needs -addressindex).
+        // The static `scan` route must sit before the `:address` param route so it
+        // is not swallowed as an address lookup.
+        .route("/api/v1/address/scan", post(api_address_scan_handler))
+        .route("/api/v1/address/:address", get(api_address_handler))
         .route("/api/v1/shroud/status", get(api_shroud_status_handler))
         // Swarm endpoints
         .route("/api/v1/swarm/sync", get(api_swarm_sync_handler))
@@ -9428,6 +9433,145 @@ async fn api_mpc_votes_handler(
             "vote_count": votes.len(),
         })),
     )
+}
+
+// =============================================================================
+// Address index endpoint handlers (trusted-mode wallet/explorer serving)
+// =============================================================================
+
+/// Look up a single address in the node's address index: balance, total
+/// received, current UTXOs and the txids that touched it. Sourced from ghostd's
+/// `getaddressbalance`/`getaddressutxos`/`getaddresstxids` RPCs, which work on
+/// pruned and hazed nodes because the index is built from structural data only.
+///
+/// Always resolves: when the index is disabled, the RPC is unavailable, or the
+/// address is invalid, it returns `{ "available": false, "reason": ... }` so the
+/// dashboard can render a clear message instead of erroring.
+async fn api_address_handler(
+    State(state): State<Arc<VerificationState>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref rpc) = state.rpc else {
+        return Json(serde_json::json!({
+            "available": false,
+            "reason": "Node RPC is unavailable",
+        }));
+    };
+
+    // getaddressbalance drives availability: it is the call that fails with
+    // "Address index is not enabled" (index off) or "Invalid address".
+    let balance = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rpc.get_address_balance(&address),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let reason = if msg.contains("Address index is not enabled") {
+                "Address index is not enabled on this node. Restart ghostd with -addressindex."
+                    .to_string()
+            } else if msg.contains("still syncing") {
+                "Address index is still syncing. Try again shortly.".to_string()
+            } else {
+                msg
+            };
+            return Json(serde_json::json!({ "available": false, "reason": reason }));
+        }
+        Err(_) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "reason": "Address query timed out",
+            }));
+        }
+    };
+
+    // Balance succeeded, so the index is live; the follow-up calls degrade to
+    // empty rather than failing the whole lookup.
+    let utxos = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rpc.get_address_utxos(&address),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        _ => serde_json::json!([]),
+    };
+    let txids = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rpc.get_address_txids(&address),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        _ => serde_json::json!([]),
+    };
+
+    Json(serde_json::json!({
+        "available": true,
+        "address": address,
+        "balance": balance.get("balance").cloned(),
+        "received": balance.get("received").cloned(),
+        "utxos": utxos,
+        "txids": txids,
+    }))
+}
+
+/// Request body for a descriptor/xpub scan.
+#[derive(Debug, Deserialize)]
+struct AddressScanRequest {
+    /// Output descriptor, ranged for an xpub sweep, e.g. `wpkh(xpub.../0/*)`.
+    descriptor: String,
+    /// Optional child-index range: a single number or `[begin, end]`.
+    #[serde(default)]
+    range: Option<serde_json::Value>,
+}
+
+/// Scan a descriptor/xpub against the address index (`scanaddressindex`),
+/// aggregating balance, UTXOs and history across every derived address — the
+/// trusted-mode equivalent of an xpub rescan. Always resolves; a disabled index
+/// or bad descriptor returns `{ "available": false, "reason": ... }`.
+async fn api_address_scan_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(req): Json<AddressScanRequest>,
+) -> impl IntoResponse {
+    let Some(ref rpc) = state.rpc else {
+        return Json(serde_json::json!({
+            "available": false,
+            "reason": "Node RPC is unavailable",
+        }));
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rpc.scan_address_index(&req.descriptor, req.range.clone()),
+    )
+    .await
+    {
+        Ok(Ok(mut v)) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("available".to_string(), serde_json::json!(true));
+            }
+            Json(v)
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let reason = if msg.contains("Address index is not enabled") {
+                "Address index is not enabled on this node. Restart ghostd with -addressindex."
+                    .to_string()
+            } else if msg.contains("still syncing") {
+                "Address index is still syncing. Try again shortly.".to_string()
+            } else {
+                msg
+            };
+            Json(serde_json::json!({ "available": false, "reason": reason }))
+        }
+        Err(_) => Json(serde_json::json!({
+            "available": false,
+            "reason": "Descriptor scan timed out",
+        })),
+    }
 }
 
 // =============================================================================

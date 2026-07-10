@@ -27,6 +27,7 @@ import {
   Banknote,
   Smartphone,
   HardDrive,
+  Search,
   Cpu,
   Settings,
   ChevronLeft,
@@ -102,6 +103,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/storage", label: "Storage", icon: <HardDrive {...ICON} /> },
       { href: "/haze", label: "Haze", icon: <Cloud {...ICON} /> },
+      { href: "/address", label: "Address Lookup", icon: <Search {...ICON} /> },
     ],
   },
   {

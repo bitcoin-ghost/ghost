@@ -827,6 +827,38 @@ impl BitcoinRpc {
             .await
     }
 
+    /// Address-index balance for a single address (`getaddressbalance`).
+    /// Only available on nodes running with `-addressindex`; callers should
+    /// surface the RPC error as "index not enabled" rather than a hard failure.
+    pub async fn get_address_balance(&self, address: &str) -> GhostResult<Value> {
+        self.call("getaddressbalance", vec![json!(address)]).await
+    }
+
+    /// Address-index UTXOs for a single address (`getaddressutxos`).
+    pub async fn get_address_utxos(&self, address: &str) -> GhostResult<Value> {
+        self.call("getaddressutxos", vec![json!(address)]).await
+    }
+
+    /// Address-index txids touching a single address (`getaddresstxids`).
+    pub async fn get_address_txids(&self, address: &str) -> GhostResult<Value> {
+        self.call("getaddresstxids", vec![json!(address)]).await
+    }
+
+    /// Scan a descriptor/xpub against the address index (`scanaddressindex`),
+    /// aggregating balance, UTXOs and history across every derived address.
+    /// `range` is an optional single number or `[begin, end]` gap limit.
+    pub async fn scan_address_index(
+        &self,
+        descriptor: &str,
+        range: Option<Value>,
+    ) -> GhostResult<Value> {
+        let mut params = vec![json!(descriptor)];
+        if let Some(r) = range {
+            params.push(r);
+        }
+        self.call("scanaddressindex", params).await
+    }
+
     /// Get block header
     pub async fn get_block_header(&self, hash: &str) -> GhostResult<BlockHeader> {
         self.call("getblockheader", vec![json!(hash), json!(true)])
