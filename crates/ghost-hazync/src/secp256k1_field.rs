@@ -25,16 +25,93 @@ pub fn secp256k1_p() -> BigInt {
     (BigInt::from(1) << 256u32) - (BigInt::from(1) << 32u32) - BigInt::from(977)
 }
 
-/// Allocate a base-field element from its integer value, range-checked to
-/// `4 × 64-bit` limbs (well-formed). The value should already be reduced mod p.
-pub fn alloc_fp<Scalar, CS>(mut cs: CS, value: BigInt) -> Result<BigNat<Scalar>, SynthesisError>
+/// Allocate a base-field element from a value-closure, range-checked to
+/// `4 × 64-bit` limbs (well-formed). The closure returns `AssignmentMissing`
+/// during shape synthesis; the value should already be reduced mod p.
+pub fn alloc_fp_from<Scalar, CS, F>(mut cs: CS, f: F) -> Result<BigNat<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+    F: FnOnce() -> Result<BigInt, SynthesisError>,
+{
+    let n = BigNat::alloc_from_nat(cs.namespace(|| "limbs"), f, LIMB_WIDTH, N_LIMBS)?;
+    n.assert_well_formed(cs.namespace(|| "well_formed"))?;
+    Ok(n)
+}
+
+/// Allocate a base-field element from a concrete (reduced) integer value.
+pub fn alloc_fp<Scalar, CS>(cs: CS, value: BigInt) -> Result<BigNat<Scalar>, SynthesisError>
 where
     Scalar: PrimeField,
     CS: ConstraintSystem<Scalar>,
 {
-    let n = BigNat::alloc_from_nat(cs.namespace(|| "limbs"), || Ok(value), LIMB_WIDTH, N_LIMBS)?;
-    n.assert_well_formed(cs.namespace(|| "well_formed"))?;
-    Ok(n)
+    alloc_fp_from(cs, || Ok(value))
+}
+
+/// Enforce two reduced field elements equal.
+pub fn enforce_equal<Scalar, CS>(
+    cs: CS,
+    a: &BigNat<Scalar>,
+    b: &BigNat<Scalar>,
+) -> Result<(), SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    a.equal_when_carried_regroup(cs, b)
+}
+
+/// `z = (x − y) mod p`. Witnesses the difference and constrains `z + y ≡ x`.
+pub fn sub_mod<Scalar, CS>(
+    mut cs: CS,
+    x: &BigNat<Scalar>,
+    y: &BigNat<Scalar>,
+) -> Result<BigNat<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let diff = alloc_fp_from(cs.namespace(|| "diff"), || {
+        let p = secp256k1_p();
+        let xv = x.value.clone().ok_or(SynthesisError::AssignmentMissing)?;
+        let yv = y.value.clone().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok(((xv - yv) % &p + &p) % &p)
+    })?;
+    let check = add_mod(cs.namespace(|| "diff+y"), &diff, y)?;
+    enforce_equal(cs.namespace(|| "diff+y==x"), &check, x)?;
+    Ok(diff)
+}
+
+/// `z = x⁻¹ mod p`. Witnesses the inverse (Fermat: `x^(p−2)`) and constrains
+/// `x · z ≡ 1`. (x must be non-zero — a zero input makes this unsatisfiable.)
+pub fn inverse<Scalar, CS>(mut cs: CS, x: &BigNat<Scalar>) -> Result<BigNat<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let inv = alloc_fp_from(cs.namespace(|| "inv"), || {
+        let p = secp256k1_p();
+        let xv = x.value.clone().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok(xv.modpow(&(&p - BigInt::from(2)), &p))
+    })?;
+    let prod = mul_mod(cs.namespace(|| "x*inv"), x, &inv)?;
+    let one = alloc_fp(cs.namespace(|| "one"), BigInt::from(1))?;
+    enforce_equal(cs.namespace(|| "x*inv==1"), &prod, &one)?;
+    Ok(inv)
+}
+
+/// `z = (x / y) mod p = x · y⁻¹`.
+pub fn div_mod<Scalar, CS>(
+    mut cs: CS,
+    x: &BigNat<Scalar>,
+    y: &BigNat<Scalar>,
+) -> Result<BigNat<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let yinv = inverse(cs.namespace(|| "yinv"), y)?;
+    mul_mod(cs.namespace(|| "x*yinv"), x, &yinv)
 }
 
 /// The modulus `p` as a BigNat (allocated in `cs`).

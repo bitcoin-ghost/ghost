@@ -39,6 +39,7 @@ pub mod sighash;
 #[allow(dead_code)]
 pub mod nonnative;
 pub mod secp256k1_field;
+pub mod secp256k1_ec;
 #[cfg(test)]
 mod test_cs;
 
