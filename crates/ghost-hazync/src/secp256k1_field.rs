@@ -13,8 +13,9 @@
 //! room for BigNat's carried intermediates.
 
 use crate::nonnative::bignat::BigNat;
+use crate::sha256d_gadget::pow2;
 use ff::PrimeField;
-use nova_snark::frontend::{ConstraintSystem, SynthesisError};
+use nova_snark::frontend::{AllocatedBit, Boolean, ConstraintSystem, SynthesisError, Variable};
 use num_bigint::BigInt;
 
 pub const LIMB_WIDTH: usize = 64;
@@ -59,6 +60,36 @@ where
     CS: ConstraintSystem<Scalar>,
 {
     a.equal_when_carried_regroup(cs, b)
+}
+
+/// Constrained little-endian bit decomposition into 256 bits (LSB first):
+/// witnesses the bits and enforces each 64-bit limb equals the weighted bit-sum
+/// of its 64 bits. `bits[0]` is the LSB (parity). Used to feed scalars to
+/// `scalar_mul` and to read a coordinate's parity for pubkey decompression.
+pub fn to_bits_le<Scalar, CS>(mut cs: CS, x: &BigNat<Scalar>) -> Result<Vec<Boolean>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let total = LIMB_WIDTH * N_LIMBS;
+    let mut bits: Vec<AllocatedBit> = Vec::with_capacity(total);
+    for i in 0..total {
+        let b = x.value.as_ref().map(|v| v.bit(i as u64));
+        bits.push(AllocatedBit::alloc(cs.namespace(|| format!("bit_{i}")), b)?);
+    }
+    for l in 0..N_LIMBS {
+        let limb = x.limbs[l].clone();
+        let terms: Vec<(Scalar, Variable)> = (0..LIMB_WIDTH)
+            .map(|k| (pow2::<Scalar>(k), bits[l * LIMB_WIDTH + k].get_variable()))
+            .collect();
+        cs.enforce(
+            || format!("limb_{l}_recompose"),
+            |lc| terms.iter().fold(lc, |acc, (c, v)| acc + (*c, *v)),
+            |lc| lc + CS::one(),
+            |_| limb,
+        );
+    }
+    Ok(bits.into_iter().map(Boolean::from).collect())
 }
 
 /// `z = (x − y) mod p`. Witnesses the difference and constrains `z + y ≡ x`.
