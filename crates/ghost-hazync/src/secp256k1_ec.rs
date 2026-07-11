@@ -12,14 +12,96 @@
 //! addition hardening is a follow-on.
 
 use crate::nonnative::bignat::BigNat;
-use crate::secp256k1_field::{add_mod, div_mod, mul_mod, sub_mod};
-use ff::PrimeField;
-use nova_snark::frontend::{ConstraintSystem, SynthesisError};
+use crate::secp256k1_field::{add_mod, alloc_fp_from, div_mod, mul_mod, sub_mod, N_LIMBS};
+use ff::{Field, PrimeField};
+use nova_snark::frontend::{Boolean, ConstraintSystem, SynthesisError};
 
 /// An affine secp256k1 point.
 pub struct Point<Scalar: PrimeField> {
     pub x: BigNat<Scalar>,
     pub y: BigNat<Scalar>,
+}
+
+impl<Scalar: PrimeField> Point<Scalar> {
+    fn clone_ref(&self) -> Point<Scalar> {
+        Point { x: self.x.clone(), y: self.y.clone() }
+    }
+}
+
+/// Select `cond ? a : b` over a base-field element, limb by limb: allocate the
+/// selected value and constrain `sel_limb − b_limb = cond·(a_limb − b_limb)` for
+/// each limb (`cond` is a Boolean, so this is one R1CS constraint per limb).
+fn bignat_select<Scalar, CS>(
+    mut cs: CS,
+    cond: &Boolean,
+    a: &BigNat<Scalar>,
+    b: &BigNat<Scalar>,
+) -> Result<BigNat<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let selected = alloc_fp_from(cs.namespace(|| "sel"), || {
+        if cond.get_value().ok_or(SynthesisError::AssignmentMissing)? {
+            a.value.clone().ok_or(SynthesisError::AssignmentMissing)
+        } else {
+            b.value.clone().ok_or(SynthesisError::AssignmentMissing)
+        }
+    })?;
+    for i in 0..N_LIMBS {
+        let cond_lc = cond.lc(CS::one(), Scalar::ONE);
+        let a_i = a.limbs[i].clone();
+        let b_i = b.limbs[i].clone();
+        let b_i2 = b_i.clone();
+        let sel_i = selected.limbs[i].clone();
+        cs.enforce(
+            || format!("select_limb_{i}"),
+            |_| cond_lc,
+            |lc| lc + &a_i - &b_i,
+            |lc| lc + &sel_i - &b_i2,
+        );
+    }
+    Ok(selected)
+}
+
+/// Select `cond ? a : b` over an affine point.
+pub fn point_select<Scalar, CS>(
+    mut cs: CS,
+    cond: &Boolean,
+    a: &Point<Scalar>,
+    b: &Point<Scalar>,
+) -> Result<Point<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    Ok(Point {
+        x: bignat_select(cs.namespace(|| "x"), cond, &a.x, &b.x)?,
+        y: bignat_select(cs.namespace(|| "y"), cond, &a.y, &b.y)?,
+    })
+}
+
+/// `k · P` by left-to-right double-and-add. `bits` is the scalar most-significant
+/// bit first, and its top bit is assumed set (so the accumulator starts at `P` —
+/// no identity element is represented). Each step doubles, computes `acc + P`,
+/// and selects it in iff the bit is set. SPIKE: relies on the incomplete-addition
+/// assumption holding along the ladder (true for well-formed ECDSA inputs).
+pub fn scalar_mul<Scalar, CS>(
+    mut cs: CS,
+    bits: &[Boolean],
+    p: &Point<Scalar>,
+) -> Result<Point<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let mut acc = p.clone_ref();
+    for (i, bit) in bits.iter().enumerate().skip(1) {
+        let doubled = point_double(cs.namespace(|| format!("dbl_{i}")), &acc)?;
+        let added = point_add(cs.namespace(|| format!("add_{i}")), &doubled, p)?;
+        acc = point_select(cs.namespace(|| format!("sel_{i}")), bit, &added, &doubled)?;
+    }
+    Ok(acc)
 }
 
 /// `P + Q` for distinct affine points (`P ≠ ±Q`).
@@ -125,6 +207,39 @@ mod tests {
         let (ex, ey) = three_g();
         assert_eq!(sum.x.value, Some(ex), "3G.x");
         assert_eq!(sum.y.value, Some(ey), "3G.y");
+        assert!(cs.is_satisfied(), "unsat: {:?}", cs.which_is_unsatisfied());
+    }
+
+    // Scalar bits MSB-first (top bit set): k=2 -> [1,0], k=3 -> [1,1].
+    fn alloc_bits(cs: &mut TestConstraintSystem<Scalar>, vals: &[bool]) -> Vec<Boolean> {
+        use nova_snark::frontend::AllocatedBit;
+        vals.iter()
+            .enumerate()
+            .map(|(i, &b)| Boolean::from(AllocatedBit::alloc(cs.namespace(|| format!("bit_{i}")), Some(b)).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn scalar_mul_2_equals_2g() {
+        let mut cs = TestConstraintSystem::<Scalar>::new();
+        let gp = alloc_point(&mut cs, "G", &g());
+        let bits = alloc_bits(&mut cs, &[true, false]); // 2
+        let r = scalar_mul(cs.namespace(|| "2G"), &bits, &gp).unwrap();
+        let (ex, ey) = two_g();
+        assert_eq!(r.x.value, Some(ex), "2G.x");
+        assert_eq!(r.y.value, Some(ey), "2G.y");
+        assert!(cs.is_satisfied(), "unsat: {:?}", cs.which_is_unsatisfied());
+    }
+
+    #[test]
+    fn scalar_mul_3_equals_3g() {
+        let mut cs = TestConstraintSystem::<Scalar>::new();
+        let gp = alloc_point(&mut cs, "G", &g());
+        let bits = alloc_bits(&mut cs, &[true, true]); // 3
+        let r = scalar_mul(cs.namespace(|| "3G"), &bits, &gp).unwrap();
+        let (ex, ey) = three_g();
+        assert_eq!(r.x.value, Some(ex), "3G.x");
+        assert_eq!(r.y.value, Some(ey), "3G.y");
         assert!(cs.is_satisfied(), "unsat: {:?}", cs.which_is_unsatisfied());
     }
 }

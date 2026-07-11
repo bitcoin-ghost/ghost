@@ -166,7 +166,6 @@ mod tests {
     use super::*;
     use crate::sha256d_gadget::bits_to_bytes;
     use nova_snark::frontend::solver::SatisfyingAssignment;
-    use nova_snark::frontend::ConstraintSystem as _;
     use nova_snark::provider::PallasEngine;
 
     fn arr32(hex_str: &str) -> [u8; 32] {
