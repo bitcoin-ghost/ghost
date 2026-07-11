@@ -12,10 +12,12 @@
 //! (M3) are built from. `4 × 64-bit` limbs (256-bit) fit the Pallas capacity with
 //! room for BigNat's carried intermediates.
 
-use crate::nonnative::bignat::BigNat;
+use crate::nonnative::bignat::{nat_to_limbs, BigNat, BigNatParams};
 use crate::sha256d_gadget::pow2;
 use ff::PrimeField;
-use nova_snark::frontend::{AllocatedBit, Boolean, ConstraintSystem, SynthesisError, Variable};
+use nova_snark::frontend::{
+    AllocatedBit, Boolean, ConstraintSystem, LinearCombination, SynthesisError, Variable,
+};
 use num_bigint::BigInt;
 
 pub const LIMB_WIDTH: usize = 64;
@@ -24,6 +26,46 @@ pub const N_LIMBS: usize = 4;
 /// The secp256k1 base-field prime `p = 2^256 − 2^32 − 977`.
 pub fn secp256k1_p() -> BigInt {
     (BigInt::from(1) << 256u32) - (BigInt::from(1) << 32u32) - BigInt::from(977)
+}
+
+/// Build a fixed `value` as a **circuit constant** `BigNat`: each limb is a
+/// coefficient on the `ONE` wire (no witness variables, no range-check — a
+/// constant is well-formed by construction), with a tight `min_bits` so that the
+/// quotient sizing in `mult_mod`/`red_mod` is correct instead of doubled.
+///
+/// Using this for a modulus is strictly better than `alloc_fp`: it (1) skips the
+/// pointless well-formedness range-check on a known constant, (2) sets `min_bits`
+/// so the witnessed quotient is 5 limbs (mul) / 1 limb (add) rather than 8 / 5,
+/// and (3) **pins** the modulus into the circuit — as an `alloc_fp` witness the
+/// modulus limbs were only range-checked, never bound to `p`, so a malicious
+/// prover could have reduced against a different modulus. `value` must be
+/// non-zero and fit in `N_LIMBS` limbs.
+pub(crate) fn const_bignat<Scalar, CS>(value: BigInt) -> BigNat<Scalar>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let limb_scalars: Vec<Scalar> =
+        nat_to_limbs(&value, LIMB_WIDTH, N_LIMBS).expect("constant fits in N_LIMBS limbs");
+    let one = CS::one();
+    let limbs: Vec<LinearCombination<Scalar>> = limb_scalars
+        .iter()
+        .map(|s| LinearCombination::zero() + (*s, one))
+        .collect();
+    // A tight lower bound on the value's bit length (p, n are both ≥ 2^255).
+    let min_bits = (value.bits() as usize).saturating_sub(1);
+    let max_word = (BigInt::from(1) << LIMB_WIDTH as u32) - BigInt::from(1);
+    BigNat {
+        limbs,
+        limb_values: Some(limb_scalars),
+        value: Some(value),
+        params: BigNatParams {
+            min_bits,
+            max_word,
+            limb_width: LIMB_WIDTH,
+            n_limbs: N_LIMBS,
+        },
+    }
 }
 
 /// Allocate a base-field element from a value-closure, range-checked to
@@ -164,7 +206,7 @@ where
     Scalar: PrimeField,
     CS: ConstraintSystem<Scalar>,
 {
-    let p = modulus(cs.namespace(|| "p"))?;
+    let p = const_bignat::<Scalar, CS>(secp256k1_p());
     let (_quotient, remainder) = x.mult_mod(cs.namespace(|| "mult_mod"), y, &p)?;
     Ok(remainder)
 }
@@ -179,7 +221,7 @@ where
     Scalar: PrimeField,
     CS: ConstraintSystem<Scalar>,
 {
-    let p = modulus(cs.namespace(|| "p"))?;
+    let p = const_bignat::<Scalar, CS>(secp256k1_p());
     let sum = x.add(y)?; // un-reduced (may exceed p)
     sum.red_mod(cs.namespace(|| "reduce"), &p)
 }

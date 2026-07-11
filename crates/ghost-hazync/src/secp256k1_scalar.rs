@@ -9,7 +9,7 @@
 //! the field module's allocation helpers — only the modulus differs.
 
 use crate::nonnative::bignat::BigNat;
-use crate::secp256k1_field::{alloc_fp, alloc_fp_from, enforce_equal};
+use crate::secp256k1_field::{alloc_fp, alloc_fp_from, const_bignat, enforce_equal};
 use ff::PrimeField;
 use nova_snark::frontend::{ConstraintSystem, SynthesisError};
 use num_bigint::BigInt;
@@ -33,7 +33,7 @@ where
     Scalar: PrimeField,
     CS: ConstraintSystem<Scalar>,
 {
-    let n = alloc_fp(cs.namespace(|| "n"), secp256k1_n())?;
+    let n = const_bignat::<Scalar, CS>(secp256k1_n());
     let (_q, r) = x.mult_mod(cs.namespace(|| "mult_mod"), y, &n)?;
     Ok(r)
 }
@@ -48,7 +48,7 @@ where
     Scalar: PrimeField,
     CS: ConstraintSystem<Scalar>,
 {
-    let n = alloc_fp(cs.namespace(|| "n"), secp256k1_n())?;
+    let n = const_bignat::<Scalar, CS>(secp256k1_n());
     let sum = x.add(y)?;
     sum.red_mod(cs.namespace(|| "reduce"), &n)
 }
