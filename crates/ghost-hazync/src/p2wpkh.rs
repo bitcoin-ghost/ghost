@@ -16,7 +16,6 @@ use crate::nonnative::bignat::BigNat;
 use crate::pubkey::decompress;
 use crate::ripemd160::hash160_bits;
 use crate::secp256k1_ec::Point;
-use crate::secp256k1_field::to_bits_le;
 use ff::PrimeField;
 use nova_snark::frontend::{Boolean, ConstraintSystem, SynthesisError};
 
@@ -60,12 +59,7 @@ where
 {
     let q = verify_key(cs.namespace(|| "key"), pubkey_bits, committed_program, x, y_is_odd)?;
     let (u1, u2) = derive_u1_u2(cs.namespace(|| "u1u2"), z, r, s)?;
-    // scalar_mul wants MSB-first bits; to_bits_le is LSB-first.
-    let mut u1_bits = to_bits_le(cs.namespace(|| "u1_bits"), &u1)?;
-    u1_bits.reverse();
-    let mut u2_bits = to_bits_le(cs.namespace(|| "u2_bits"), &u2)?;
-    u2_bits.reverse();
-    ecdsa_verify(cs.namespace(|| "ecdsa"), g, &q, r, &u1_bits, &u2_bits)
+    ecdsa_verify(cs.namespace(|| "ecdsa"), g, &q, r, &u1, &u2)
 }
 
 #[cfg(test)]

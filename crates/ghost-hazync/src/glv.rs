@@ -13,8 +13,16 @@
 //! and that the decomposition is both valid (`k1 + k2·λ ≡ k`) and small
 //! (`|k1|, |k2| < 2^128`). The in-circuit gadgets build on these.
 
-use crate::secp256k1_field::secp256k1_p;
-use crate::secp256k1_scalar::secp256k1_n;
+use crate::nonnative::bignat::BigNat;
+use crate::secp256k1_ec::{
+    bignat_select, complete_add, identity, mux_table, to_affine, to_proj, Point,
+};
+use crate::secp256k1_field::{
+    alloc_fp_from, const_bignat, enforce_equal, mul_mod, sub_mod, to_bits_le, N_LIMBS,
+};
+use crate::secp256k1_scalar::{self, secp256k1_n};
+use ff::PrimeField;
+use nova_snark::frontend::{AllocatedBit, Boolean, ConstraintSystem, SynthesisError};
 use num_bigint::BigInt;
 use num_traits::Signed;
 
@@ -66,10 +74,200 @@ pub(crate) fn glv_decompose(k: &BigInt) -> (BigInt, BigInt) {
     (k1, k2)
 }
 
+// ===================== in-circuit GLV =====================
+
+/// In-circuit endomorphism `φ(P) = (β·x mod p, y) = λ·P`.
+pub(crate) fn phi<Scalar, CS>(mut cs: CS, p: &Point<Scalar>) -> Result<Point<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let beta = const_bignat::<Scalar, CS>(secp256k1_beta());
+    let x = mul_mod(cs.namespace(|| "beta*x"), &beta, &p.x)?;
+    Ok(Point { x, y: p.y.clone() })
+}
+
+/// Conditional point negation: `sign ? (x, p−y) : (x, y)`.
+pub(crate) fn conditional_negate<Scalar, CS>(
+    mut cs: CS,
+    p: &Point<Scalar>,
+    sign: &Boolean,
+) -> Result<Point<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let zero = const_bignat::<Scalar, CS>(BigInt::from(0));
+    let neg_y = sub_mod(cs.namespace(|| "p-y"), &zero, &p.y)?; // (0 − y) mod p
+    let y = bignat_select(cs.namespace(|| "sel_y"), sign, &neg_y, &p.y)?;
+    Ok(Point {
+        x: p.x.clone(),
+        y,
+    })
+}
+
+/// Conditional negation mod n: `sign ? (−m mod n) : m`. `neg` is pinned to `−m`
+/// by `m + neg ≡ 0 (mod n)`, so any well-formed witness is bound to the right
+/// residue (everything downstream is reduced mod n).
+fn condneg_modn<Scalar, CS>(
+    mut cs: CS,
+    m: &BigNat<Scalar>,
+    sign: &Boolean,
+) -> Result<BigNat<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let neg = alloc_fp_from(cs.namespace(|| "neg"), || {
+        let n = secp256k1_n();
+        let mv = m.value.clone().ok_or(SynthesisError::AssignmentMissing)?;
+        Ok(((&n - (mv % &n)) % &n + &n) % &n)
+    })?;
+    let sum = secp256k1_scalar::add_mod(cs.namespace(|| "m+neg"), m, &neg)?;
+    let zero = const_bignat::<Scalar, CS>(BigInt::from(0));
+    enforce_equal(cs.namespace(|| "m+neg==0"), &sum, &zero)?;
+    bignat_select(cs.namespace(|| "sel"), sign, &neg, m)
+}
+
+/// Enforce the GLV relation `k ≡ σ1·k1 + σ2·(k2·λ) (mod n)`, σᵢ = −1 iff `sᵢ`.
+/// `k1, k2` are the positive magnitudes (each proven `< 2^128` by the caller).
+pub(crate) fn enforce_glv_decomposition<Scalar, CS>(
+    mut cs: CS,
+    k: &BigNat<Scalar>,
+    k1: &BigNat<Scalar>,
+    s1: &Boolean,
+    k2: &BigNat<Scalar>,
+    s2: &Boolean,
+) -> Result<(), SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let lambda = const_bignat::<Scalar, CS>(secp256k1_lambda());
+    let t2 = secp256k1_scalar::mul_mod(cs.namespace(|| "k2*lam"), k2, &lambda)?;
+    let u1 = condneg_modn(cs.namespace(|| "u1"), k1, s1)?;
+    let u2 = condneg_modn(cs.namespace(|| "u2"), &t2, s2)?;
+    let sum = secp256k1_scalar::add_mod(cs.namespace(|| "u1+u2"), &u1, &u2)?;
+    enforce_equal(cs.namespace(|| "==k"), &sum, k)
+}
+
+/// Constrain the top `N_LIMBS − 2` limbs to zero → value `< 2^128`.
+fn enforce_128bit<Scalar, CS>(mut cs: CS, m: &BigNat<Scalar>)
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    for i in 2..N_LIMBS {
+        let limb = m.limbs[i].clone();
+        cs.enforce(|| format!("hi{i}==0"), |lc| lc, |lc| lc, |lc| lc + &limb);
+    }
+}
+
+/// Windowed (w=2) Shamir/Straus simultaneous multiply `k1·P1 + k2·P2`. `k1_bits`,
+/// `k2_bits` are equal-length, MSB-first, and a whole number of 2-bit windows. A
+/// 16-entry table `T[4i+j] = i·P1 + j·P2` feeds a 15-`proj_select` mux per window;
+/// each window costs 2 doublings + 1 add — half the doublings of two separate muls.
+pub(crate) fn straus_dual<Scalar, CS>(
+    mut cs: CS,
+    k1_bits: &[Boolean],
+    p1: &Point<Scalar>,
+    k2_bits: &[Boolean],
+    p2: &Point<Scalar>,
+) -> Result<Point<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let p1p = to_proj(cs.namespace(|| "p1"), p1)?;
+    let p2p = to_proj(cs.namespace(|| "p2"), p2)?;
+    let mut m1 = vec![identity(cs.namespace(|| "m1_0"))?, p1p.clone()];
+    m1.push(complete_add(cs.namespace(|| "m1_2"), &m1[1], &p1p)?);
+    m1.push(complete_add(cs.namespace(|| "m1_3"), &m1[2], &p1p)?);
+    let mut m2 = vec![identity(cs.namespace(|| "m2_0"))?, p2p.clone()];
+    m2.push(complete_add(cs.namespace(|| "m2_2"), &m2[1], &p2p)?);
+    m2.push(complete_add(cs.namespace(|| "m2_3"), &m2[2], &p2p)?);
+    let mut table = Vec::with_capacity(16);
+    for i in 0..4 {
+        for j in 0..4 {
+            table.push(complete_add(cs.namespace(|| format!("t{i}{j}")), &m1[i], &m2[j])?);
+        }
+    }
+
+    let mut acc = identity(cs.namespace(|| "acc0"))?;
+    let n_windows = k1_bits.len() / 2;
+    for wi in 0..n_windows {
+        acc = complete_add(cs.namespace(|| format!("d{wi}a")), &acc, &acc)?;
+        acc = complete_add(cs.namespace(|| format!("d{wi}b")), &acc, &acc)?;
+        // MSB-first selector: [k1 hi, k1 lo, k2 hi, k2 lo] → idx = 4·(k1 window) + (k2 window).
+        let sel = vec![
+            k1_bits[2 * wi].clone(),
+            k1_bits[2 * wi + 1].clone(),
+            k2_bits[2 * wi].clone(),
+            k2_bits[2 * wi + 1].clone(),
+        ];
+        let add = mux_table(cs.namespace(|| format!("mux{wi}")), &sel, &table)?;
+        acc = complete_add(cs.namespace(|| format!("a{wi}")), &acc, &add)?;
+    }
+    to_affine(cs.namespace(|| "affine"), &acc)
+}
+
+/// `k·P` via GLV: decompose `k = k1 + k2·λ (mod n)` (witnessed, enforced, each
+/// half `< 2^128`), then `k1·P1 + k2·φ(P)` with the signs applied to the points
+/// (`P1 = ±P`, `P2 = ±φ(P)`) and a windowed Straus over the 128-bit halves —
+/// half the doublings of a plain 256-bit `scalar_mul`.
+pub fn glv_scalar_mul<Scalar, CS>(
+    mut cs: CS,
+    k: &BigNat<Scalar>,
+    p: &Point<Scalar>,
+) -> Result<Point<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let decomp = k.value.as_ref().map(glv_decompose);
+    let k1_val = decomp.as_ref().map(|(a, _)| a.abs());
+    let s1_val = decomp.as_ref().map(|(a, _)| a.is_negative());
+    let k2_val = decomp.as_ref().map(|(_, b)| b.abs());
+    let s2_val = decomp.as_ref().map(|(_, b)| b.is_negative());
+
+    let k1 = alloc_fp_from(cs.namespace(|| "k1"), || {
+        k1_val.clone().ok_or(SynthesisError::AssignmentMissing)
+    })?;
+    let k2 = alloc_fp_from(cs.namespace(|| "k2"), || {
+        k2_val.clone().ok_or(SynthesisError::AssignmentMissing)
+    })?;
+    enforce_128bit(cs.namespace(|| "k1<2^128"), &k1);
+    enforce_128bit(cs.namespace(|| "k2<2^128"), &k2);
+    let s1 = Boolean::from(AllocatedBit::alloc(cs.namespace(|| "s1"), s1_val)?);
+    let s2 = Boolean::from(AllocatedBit::alloc(cs.namespace(|| "s2"), s2_val)?);
+
+    enforce_glv_decomposition(cs.namespace(|| "decomp"), k, &k1, &s1, &k2, &s2)?;
+
+    let p1 = conditional_negate(cs.namespace(|| "P1"), p, &s1)?;
+    let phip = phi(cs.namespace(|| "phi"), p)?;
+    let p2 = conditional_negate(cs.namespace(|| "P2"), &phip, &s2)?;
+
+    let mut b1 = to_bits_le(cs.namespace(|| "k1bits"), &k1)?;
+    b1.truncate(128);
+    b1.reverse(); // MSB-first
+    let mut b2 = to_bits_le(cs.namespace(|| "k2bits"), &k2)?;
+    b2.truncate(128);
+    b2.reverse();
+
+    straus_dual(cs.namespace(|| "straus"), &b1, &p1, &b2, &p2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secp256k1_ec::Point;
+    use crate::secp256k1_field::{alloc_fp, secp256k1_p};
+    use crate::test_cs::TestConstraintSystem;
+    use nova_snark::provider::PallasEngine;
+    use nova_snark::traits::Engine;
     use num_traits::One;
+
+    type S = <PallasEngine as Engine>::Scalar;
 
     fn n() -> BigInt {
         secp256k1_n()
@@ -182,6 +380,29 @@ mod tests {
             assert_eq!(recon, modp(&kv, &n), "k1 + k2·λ ≡ k (mod n)");
             assert!(k1.abs() < bound, "|k1| < 2^128 (got {} bits)", k1.abs().bits());
             assert!(k2.abs() < bound, "|k2| < 2^128 (got {} bits)", k2.abs().bits());
+        }
+    }
+
+    // End-to-end: the in-circuit GLV multiply equals native k·G (exercises
+    // decomposition + signs + φ + Straus). ~5M constraints, so kept to two scalars.
+    #[test]
+    fn glv_scalar_mul_matches_native() {
+        for kv in [
+            h("deadbeefcafef00dfeedface0123456789abcdef0123456789abcdef01234567"),
+            h("7fa9f1e2d3c4b5a6978869504132231445566778899aabbccddeeff0011223344"),
+        ] {
+            let kmod = modp(&kv, &n());
+            let expected = ec_mul(&kmod, &Some((gx(), gy()))).unwrap();
+            let mut cs = TestConstraintSystem::<S>::new();
+            let k = alloc_fp(cs.namespace(|| "k"), kmod).unwrap();
+            let g = Point {
+                x: alloc_fp(cs.namespace(|| "gx"), gx()).unwrap(),
+                y: alloc_fp(cs.namespace(|| "gy"), gy()).unwrap(),
+            };
+            let r = glv_scalar_mul(cs.namespace(|| "kG"), &k, &g).unwrap();
+            assert_eq!(r.x.value, Some(expected.0), "kG.x");
+            assert_eq!(r.y.value, Some(expected.1), "kG.y");
+            assert!(cs.is_satisfied(), "unsat: {:?}", cs.which_is_unsatisfied());
         }
     }
 }

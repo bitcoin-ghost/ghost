@@ -153,6 +153,16 @@ fn measure_counts() {
     let sm256 = (fixed + per_window * n_windows(256) as f64).round() as i64;
     let per_bit = per_window / WINDOW as f64;
 
+    // ---- GLV scalar_mul (the path ECDSA actually uses): a single fixed cost. ----
+    let glv = count(|cs| {
+        let k = alloc_fp(cs.namespace(|| "k"), gx() % n()).unwrap();
+        let gp = Point {
+            x: alloc_fp(cs.namespace(|| "gx"), gx()).unwrap(),
+            y: alloc_fp(cs.namespace(|| "gy"), gy()).unwrap(),
+        };
+        let _ = crate::glv::glv_scalar_mul(cs.namespace(|| "kG"), &k, &gp).unwrap();
+    });
+
     // ---- ECDSA assembly components ----
     let ec_derive = count(|cs| {
         let z = alloc_fp(cs.namespace(|| "z"), gx() % n()).unwrap();
@@ -166,9 +176,12 @@ fn measure_counts() {
         let _ = enforce_rx_equals_r(cs.namespace(|| "chk"), &rx, &r);
     });
 
-    // verify_full = derive_u1_u2 + 2·to_bits_le + 2·scalar_mul(256) + point_add + rx-check
+    // Non-GLV reference: derive_u1_u2 + 2·to_bits_le + 2·scalar_mul(256) + point_add + rx.
     let sig256: i64 =
         ec_derive.0 as i64 + 2 * f_bits.0 as i64 + 2 * sm256 + ec_padd.0 as i64 + ec_rxchk.0 as i64;
+    // Actual path: verify = derive_u1_u2 + 2·glv_scalar_mul + point_add + rx-check.
+    let sig_glv: i64 =
+        ec_derive.0 as i64 + 2 * glv.0 as i64 + ec_padd.0 as i64 + ec_rxchk.0 as i64;
 
     let row = |name: &str, c: usize, a: usize| {
         println!("  {name:<34} {c:>12} {a:>12}");
@@ -199,16 +212,18 @@ fn measure_counts() {
         n_windows(256)
     );
     println!("  scalar_mul per-bit (eff.) : {:>12.0} constraints/bit", per_bit);
-    println!("  scalar_mul(256) [computed]: {sm256:>12}");
+    println!("  scalar_mul(256) [non-GLV] : {sm256:>12}");
+    row("glv_scalar_mul (GLV path)", glv.0, glv.1);
     println!("  ---------------------------------------------------------------------");
-    println!("  ONE ECDSA SIG (verify_full, computed): {sig256:>12} constraints");
-    println!("  = derive_u1_u2 + 2·to_bits_le + 2·scalar_mul(256) + point_add + rx-check");
+    println!("  ECDSA SIG, non-GLV windowed : {sig256:>12} constraints");
+    println!("  ECDSA SIG, GLV path (ACTUAL): {sig_glv:>12} constraints");
+    println!("  = derive_u1_u2 + 2·glv_scalar_mul + point_add + rx-check");
     println!("======================================================================");
     // Rough working-set guides (measured constraint count × observed ~1-1.5 GB/M).
-    let gb_lo = sig256 as f64 * 1.0 / 1_000_000.0;
-    let gb_hi = sig256 as f64 * 1.5 / 1_000_000.0;
+    let gb_lo = sig_glv as f64 * 1.0 / 1_000_000.0;
+    let gb_hi = sig_glv as f64 * 1.5 / 1_000_000.0;
     println!(
         "  Implied single-sig prover RAM (rough): ~{gb_lo:.0}-{gb_hi:.0} GB   (WSL2 ceiling ~5M constraints)"
     );
-    println!("  Full block ~5,000 sigs: ~{} constraints\n", 5000i64 * sig256);
+    println!("  Full block ~5,000 sigs: ~{} constraints\n", 5000i64 * sig_glv);
 }

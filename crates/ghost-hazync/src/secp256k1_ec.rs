@@ -126,7 +126,7 @@ where
 }
 
 /// Select `cond ? a : b` over a base-field element, limb by limb.
-fn bignat_select<Scalar, CS>(
+pub(crate) fn bignat_select<Scalar, CS>(
     mut cs: CS,
     cond: &Boolean,
     a: &BigNat<Scalar>,
@@ -185,7 +185,7 @@ pub(crate) const WINDOW: usize = 4;
 
 /// Select `table[idx]` where `idx` is the `WINDOW`-bit value `bits` (MSB first),
 /// via a binary mux tree — `2^WINDOW − 1` `proj_select`s, collapsing from the LSB.
-fn mux_table<Scalar, CS>(
+pub(crate) fn mux_table<Scalar, CS>(
     mut cs: CS,
     bits: &[Boolean],
     table: &[ProjPoint<Scalar>],

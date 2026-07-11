@@ -18,19 +18,19 @@
 //! * [`derive_u1_u2`] — the scalar step (`s⁻¹`, `u1`, `u2`), and
 //! * [`enforce_rx_equals_r`] — the final acceptance check (`R.x mod n == r`).
 //!
-//! [`verify`] wires them together with the two `scalar_mul`s and the point add.
-//! Its two 256-bit scalar multiplications make the *monolithic* circuit ~1–2M
-//! constraints — beyond the in-memory test CS — so it is validated by its tested
-//! constituents here and exercised end-to-end when folded into a spend step (M4)
-//! under the real Nova prover. The scalar glue and the final check below ARE
-//! directly tested.
+//! [`verify`] wires them together with the two scalar multiplications (via
+//! [`crate::glv::glv_scalar_mul`] — GLV halves the doublings) and the point add.
+//! The full verify is prover-scale (millions of constraints), so it is validated
+//! by its individually-tested constituents — `derive_u1_u2` and the `R.x == r`
+//! check here, and `glv_scalar_mul` against native `k·G` in [`crate::glv`].
 
+use crate::glv::glv_scalar_mul;
 use crate::nonnative::bignat::BigNat;
-use crate::secp256k1_ec::{point_add, scalar_mul, Point};
-use crate::secp256k1_field::{enforce_equal, to_bits_le};
+use crate::secp256k1_ec::{point_add, Point};
+use crate::secp256k1_field::enforce_equal;
 use crate::secp256k1_scalar::{self, secp256k1_n};
 use ff::PrimeField;
-use nova_snark::frontend::{Boolean, ConstraintSystem, SynthesisError};
+use nova_snark::frontend::{ConstraintSystem, SynthesisError};
 
 /// The scalar step: `s⁻¹`, then `u1 = z·s⁻¹ mod n` and `u2 = r·s⁻¹ mod n`.
 pub fn derive_u1_u2<Scalar, CS>(
@@ -66,23 +66,22 @@ where
 }
 
 /// Full ECDSA verify: enforces the signature `(r, s)` is valid for hash `z` under
-/// key `Q`. `u1_bits`/`u2_bits` are the (constrained) bit decompositions of u1/u2
-/// most-significant-bit first, and `g` is the generator. See the module note on
-/// why the monolithic form is prover-scale.
+/// key `Q`. `u1`, `u2` are the derived scalars (mod n) and `g` is the generator;
+/// the two scalar multiplications use GLV ([`crate::glv::glv_scalar_mul`]).
 pub fn verify<Scalar, CS>(
     mut cs: CS,
     g: &Point<Scalar>,
     q: &Point<Scalar>,
     r: &BigNat<Scalar>,
-    u1_bits: &[Boolean],
-    u2_bits: &[Boolean],
+    u1: &BigNat<Scalar>,
+    u2: &BigNat<Scalar>,
 ) -> Result<(), SynthesisError>
 where
     Scalar: PrimeField,
     CS: ConstraintSystem<Scalar>,
 {
-    let p1 = scalar_mul(cs.namespace(|| "u1*G"), u1_bits, g)?;
-    let p2 = scalar_mul(cs.namespace(|| "u2*Q"), u2_bits, q)?;
+    let p1 = glv_scalar_mul(cs.namespace(|| "u1*G"), u1, g)?;
+    let p2 = glv_scalar_mul(cs.namespace(|| "u2*Q"), u2, q)?;
     let rpoint = point_add(cs.namespace(|| "u1G+u2Q"), &p1, &p2)?;
     enforce_rx_equals_r(cs.namespace(|| "R.x==r"), &rpoint.x, r)
 }
@@ -104,11 +103,7 @@ where
     CS: ConstraintSystem<Scalar>,
 {
     let (u1, u2) = derive_u1_u2(cs.namespace(|| "u1u2"), z, r, s)?;
-    let mut u1_bits = to_bits_le(cs.namespace(|| "u1_bits"), &u1)?;
-    u1_bits.reverse(); // to_bits_le is LSB-first; scalar_mul wants MSB-first
-    let mut u2_bits = to_bits_le(cs.namespace(|| "u2_bits"), &u2)?;
-    u2_bits.reverse();
-    verify(cs.namespace(|| "verify"), g, q, r, &u1_bits, &u2_bits)
+    verify(cs.namespace(|| "verify"), g, q, r, &u1, &u2)
 }
 
 #[cfg(test)]
