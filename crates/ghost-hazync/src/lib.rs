@@ -41,6 +41,7 @@ pub mod nonnative;
 pub mod secp256k1_field;
 pub mod secp256k1_ec;
 pub mod secp256k1_scalar;
+pub mod ecdsa;
 #[cfg(test)]
 mod test_cs;
 
