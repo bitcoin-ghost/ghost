@@ -40,6 +40,7 @@ pub mod sighash;
 pub mod nonnative;
 pub mod secp256k1_field;
 pub mod secp256k1_ec;
+pub mod secp256k1_scalar;
 #[cfg(test)]
 mod test_cs;
 
