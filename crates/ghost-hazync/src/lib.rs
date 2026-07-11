@@ -35,6 +35,12 @@ pub mod coin;
 pub mod coin_tx;
 pub mod coin_tx_fanout;
 pub mod sighash;
+// Vendored foreign-field arithmetic (see src/nonnative/mod.rs).
+#[allow(dead_code)]
+pub mod nonnative;
+pub mod secp256k1_field;
+#[cfg(test)]
+mod test_cs;
 
 /// A 256-bit value (block hash / target), big-endian, as it appears on the wire
 /// after the double-SHA256. Kept as raw bytes so the native spec and the future

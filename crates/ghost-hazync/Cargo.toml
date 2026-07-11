@@ -20,6 +20,12 @@ nova-snark = "0.38"
 ff = "0.13"
 # Reference (native, non-circuit) hashing for the spec + tests.
 sha2 = { workspace = true }
+# Foreign-field (non-native) arithmetic gadget — vendored from nova's crate-
+# private `gadgets::nonnative` (bellman-bignat, MIT) into `src/nonnative/` because
+# nova does not export it. Powers secp256k1 base-field math for signature checks.
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+byteorder = "1"
 
 [dev-dependencies]
 hex = { workspace = true }

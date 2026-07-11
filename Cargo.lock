@@ -3412,9 +3412,12 @@ dependencies = [
 name = "ghost-hazync"
 version = "1.10.22"
 dependencies = [
+ "byteorder",
  "ff",
  "hex",
  "nova-snark",
+ "num-bigint 0.4.6",
+ "num-traits",
  "sha2 0.10.9",
 ]
 
