@@ -355,6 +355,9 @@ pub struct TemplateProcessor {
     event_tx: broadcast::Sender<TemplateEvent>,
     /// Running state
     running: RwLock<bool>,
+    /// Live refresh cadence (ms), read each `start()` loop iteration so the
+    /// dashboard can retune it without restarting the pool. Clamped to [10s,60s].
+    refresh_interval_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Approved payout proposal hash (from consensus)
     approved_payout: RwLock<Option<[u8; 32]>>,
     /// Cached payout proposals (hash -> proposal)
@@ -386,6 +389,7 @@ impl TemplateProcessor {
     ) -> Self {
         let (event_tx, _) = broadcast::channel(100);
         let (block_submitted_tx, block_submitted_rx) = mpsc::unbounded_channel();
+        let init_refresh_ms = config.refresh_interval_ms.clamp(10_000, 60_000);
 
         Self {
             config,
@@ -399,6 +403,7 @@ impl TemplateProcessor {
             job_counter: RwLock::new(0),
             event_tx,
             running: RwLock::new(false),
+            refresh_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(init_refresh_ms)),
             approved_payout: RwLock::new(None),
             payout_proposals: RwLock::new(HashMap::new()),
             coinbase_verifier: CoinbaseVerifier::new(),
@@ -1697,12 +1702,14 @@ impl TemplateProcessor {
         *self.running.write() = true;
         info!("Template processor started");
 
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            self.config.refresh_interval_ms,
-        ));
-
+        // Sleep for the CURRENT cadence each iteration (read live from the atomic)
+        // so the dashboard can retune it without restarting the pool.
         while *self.running.read() {
-            interval.tick().await;
+            let ms = self
+                .refresh_interval_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .clamp(10_000, 60_000);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 
             if let Err(e) = self.refresh_template().await {
                 error!(error = %e, "Failed to refresh template");
@@ -1718,6 +1725,19 @@ impl TemplateProcessor {
     /// Stop the processor
     pub fn stop(&self) {
         *self.running.write() = false;
+    }
+
+    /// Shared handle to the live refresh cadence (ms), so callers (the dashboard
+    /// API) can retune it without a restart. Clamped to [10s, 60s] on every set.
+    pub fn refresh_interval_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.refresh_interval_ms)
+    }
+
+    /// Current refresh cadence in whole seconds (for display).
+    pub fn refresh_interval_secs(&self) -> u64 {
+        self.refresh_interval_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / 1000
     }
 
     /// Refresh the block template

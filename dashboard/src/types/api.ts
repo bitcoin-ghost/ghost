@@ -146,6 +146,9 @@ export interface FullNodeConfig {
   // ORDERING: `max_fee` (default, revenue) or `payments_first` (seat BUDS
   // financial txs ahead of data txs). Permutation only — weight-safe.
   block_priority?: 'max_fee' | 'payments_first';
+  // Block-template refresh cadence in seconds (pool.toml [pool].template_refresh_secs),
+  // clamped [10, 60]. How often the template is rebuilt for fresh mempool fees.
+  template_refresh_secs?: number;
   // Flat fields from backend
   ghost_mode?: boolean;
   ghost_mode_local_egress?: boolean;

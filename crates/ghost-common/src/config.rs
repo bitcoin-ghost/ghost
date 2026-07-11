@@ -2426,6 +2426,23 @@ pub struct PoolConfig {
     /// parse unchanged.
     #[serde(default)]
     pub block_priority: BlockPriority,
+
+    /// Block-template refresh cadence in seconds — how often the pool rebuilds
+    /// the template from the mempool to pick up fresh fee-paying transactions
+    /// (between blocks; tip changes are handled instantly via an empty template
+    /// regardless). Operator-tunable via the dashboard, clamped to [10, 60].
+    /// `None` uses the built-in 30s default. Additive `#[serde(default)]` so
+    /// existing pool.toml files parse unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_refresh_secs: Option<u64>,
+}
+
+impl PoolConfig {
+    /// The effective template refresh cadence in milliseconds, clamped to the
+    /// supported [10s, 60s] range (default 30s when unset).
+    pub fn template_refresh_ms(&self) -> u64 {
+        self.template_refresh_secs.unwrap_or(30).clamp(10, 60) * 1000
+    }
 }
 
 impl PoolConfig {
@@ -2471,6 +2488,7 @@ impl Default for PoolConfig {
             coinbase_extra: None,
             genesis_password: None,
             block_priority: BlockPriority::default(),
+            template_refresh_secs: None,
         }
     }
 }

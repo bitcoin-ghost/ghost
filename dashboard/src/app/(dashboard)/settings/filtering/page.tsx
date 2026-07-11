@@ -6,6 +6,7 @@ import { Toggle } from "@/components/ui/Toggle";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { PolicyProfileSelector } from "@/components/filtering/PolicyProfileSelector";
 import { BlockPrioritySelector } from "@/components/filtering/BlockPrioritySelector";
+import { TemplateRefreshSlider } from "@/components/filtering/TemplateRefreshSlider";
 import { ReaperControls } from "@/components/filtering/ReaperControls";
 import { AdvancedPolicyPanel } from "@/components/filtering/AdvancedPolicyPanel";
 import { useAdvancedFilteringGate } from "@/hooks/useAdvancedFilteringGate";
@@ -63,6 +64,16 @@ export default function FilteringSettingsPage() {
                 subtitle="Ordering only — which admitted transactions this node seats first. Max fee maximises revenue; Payments first prioritises payments (BUDS T0/T1) over data (T2/T3), forgoing some fee income. Changing it restarts the node."
               />
               <BlockPrioritySelector />
+            </Card>
+          </SectionErrorBoundary>
+
+          <SectionErrorBoundary section="Template refresh cadence">
+            <Card>
+              <CardHeader
+                title="Template refresh cadence"
+                subtitle="How often this node rebuilds the block template from the mempool to pick up fresh fee-paying transactions between blocks. Applied live — no restart."
+              />
+              <TemplateRefreshSlider />
             </Card>
           </SectionErrorBoundary>
 

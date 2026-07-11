@@ -2650,6 +2650,9 @@ async fn main() -> Result<()> {
         // Block-priority lever (max_fee default | payments_first). Resolved once
         // here at startup from pool.toml; the dashboard POST persists + restarts.
         block_priority: config.pool.block_priority,
+        // Template refresh cadence (ms) from pool.toml, clamped to [10s,60s].
+        // The dashboard retunes it live via the atomic handle (no restart).
+        refresh_interval_ms: config.pool.template_refresh_ms(),
         ..Default::default()
     };
     let template_processor = Arc::new(
@@ -6050,6 +6053,10 @@ async fn main() -> Result<()> {
     // (shares stored under our `received_by`), so "This Node's Miners" and the
     // /miners/full peer feed are local — not the mesh-wide gossiped set.
     verification_state = verification_state.with_local_received_by(self_received_by.clone());
+    // Live handle to the template refresh cadence so the dashboard can retune it
+    // (10–60s) without restarting the pool.
+    verification_state =
+        verification_state.with_template_refresh(template_processor.refresh_interval_handle());
 
     // Seconds elapsed working the current template, surfaced as
     // `current_round_duration_secs` on the pool-status endpoint so the

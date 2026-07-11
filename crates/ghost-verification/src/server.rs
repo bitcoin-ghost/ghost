@@ -1311,6 +1311,9 @@ pub struct VerificationState {
     /// local shares are stored under. Scopes the detailed miner list to
     /// locally-connected miners (vs mesh-gossiped ones).
     local_received_by: Option<String>,
+    /// Live handle to the template processor's refresh cadence (ms), so the
+    /// dashboard can retune it (10–60s) without restarting the pool.
+    template_refresh_ms: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Seconds elapsed in the current mining round (time working the current
     /// template), from the round manager's `current_round_elapsed_secs`.
     /// Surfaced as `current_round_duration_secs` on the pool-status endpoint so
@@ -1540,6 +1543,7 @@ impl VerificationState {
             get_mesh_total_hashrate: None,
             get_local_hashrate: None,
             local_received_by: None,
+            template_refresh_ms: None,
             get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
@@ -2192,6 +2196,33 @@ impl VerificationState {
     /// This node's `received_by` key, if wired — scopes the miner list to local.
     pub fn local_received_by(&self) -> Option<&str> {
         self.local_received_by.as_deref()
+    }
+
+    /// Wire the live template-refresh-cadence handle (ms atomic).
+    pub fn with_template_refresh(
+        mut self,
+        handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.template_refresh_ms = Some(handle);
+        self
+    }
+
+    /// Current template refresh cadence in whole seconds (default 30 if unwired).
+    pub fn template_refresh_secs(&self) -> u64 {
+        self.template_refresh_ms
+            .as_ref()
+            .map(|h| h.load(std::sync::atomic::Ordering::Relaxed) / 1000)
+            .unwrap_or(30)
+    }
+
+    /// Retune the template refresh cadence live (seconds, clamped to [10, 60]).
+    /// Returns the applied value in seconds, or `None` if no handle is wired.
+    pub fn set_template_refresh_secs(&self, secs: u64) -> Option<u64> {
+        let clamped = secs.clamp(10, 60);
+        self.template_refresh_ms.as_ref().map(|h| {
+            h.store(clamped * 1000, std::sync::atomic::Ordering::Relaxed);
+            clamped
+        })
     }
 
     /// Set the current-round-elapsed-seconds callback (from the round manager).

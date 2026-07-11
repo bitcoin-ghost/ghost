@@ -503,6 +503,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_config_block_priority_post_handler),
         )
         .route(
+            "/api/v1/config/template_refresh",
+            post(api_config_template_refresh_post_handler),
+        )
+        .route(
             "/api/v1/config/policy_custom",
             post(api_config_policy_custom_post_handler),
         )
@@ -5530,6 +5534,7 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
         "pool_name": pool_name,
         "policy": policy,
         "block_priority": block_priority_key(&state),
+        "template_refresh_secs": state.template_refresh_secs(),
         "network": state.network.as_str(),
         "stratum_sv2_port": 4444,
         "stratum_sv1_port": 3333,
@@ -6847,6 +6852,74 @@ struct BlockPriorityRequest {
 /// resolved once at startup into `TemplateConfig` (`main.rs`), so — like the
 /// tier policy — a restart is what actually applies the new ordering to block
 /// templates. This is a per-node economic policy, not a consensus rule.
+/// `{ "secs": 10..=60 }` — retune the block-template refresh cadence.
+#[derive(Debug, Deserialize)]
+struct TemplateRefreshRequest {
+    secs: u64,
+}
+
+/// Set the block-template refresh cadence (seconds, clamped to [10, 60]).
+/// Applied LIVE via the shared atomic handle (no pool restart) and persisted to
+/// pool.toml so it survives one. Cadence controls how often the template is
+/// rebuilt from the mempool for fresh fees between blocks; tip changes are
+/// instant regardless (empty template).
+async fn api_config_template_refresh_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    Json(payload): Json<TemplateRefreshRequest>,
+) -> impl IntoResponse {
+    let clamped = payload.secs.clamp(10, 60);
+
+    let Some(ref full) = state.full_node_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: full node config not loaded",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+    let Some(ref path) = state.full_node_config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Config update API not available: no node config path configured",
+                "code": "CONFIG_NOT_LOADED",
+            })),
+        )
+            .into_response();
+    };
+
+    {
+        let mut cfg = full.write();
+        cfg.pool.template_refresh_secs = Some(clamped);
+        if let Err(e) = cfg.save_atomic(path) {
+            error!(error = %e, "Failed to persist template refresh cadence");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to persist template refresh cadence: {e}"),
+                    "code": "PERSIST_FAILED",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Apply immediately via the live handle — no restart.
+    let applied_live = state.set_template_refresh_secs(clamped).is_some();
+
+    Json(serde_json::json!({
+        "success": true,
+        "template_refresh_secs": clamped,
+        "applied_live": applied_live,
+    }))
+    .into_response()
+}
+
 async fn api_config_block_priority_post_handler(
     State(state): State<Arc<VerificationState>>,
     Json(payload): Json<BlockPriorityRequest>,

@@ -269,6 +269,24 @@ export async function setBlockPriority(
   });
 }
 
+// Block-template refresh cadence (pool.toml [pool].template_refresh_secs). How
+// often the template is rebuilt from the mempool for fresh fees between blocks
+// (tip changes are instant regardless). Applied live — no node restart.
+export interface TemplateRefreshResult {
+  success: boolean;
+  template_refresh_secs: number;
+  applied_live: boolean;
+}
+
+export async function setTemplateRefresh(secs: number): Promise<TemplateRefreshResult> {
+  // Clamp client-side to match the server bounds [10, 60].
+  const clamped = Math.max(10, Math.min(60, Math.round(secs)));
+  return fetchApi<TemplateRefreshResult>('/api/v1/config/template_refresh', {
+    method: 'POST',
+    body: JSON.stringify({ secs: clamped }),
+  });
+}
+
 // Map a setup-wizard's coarse mempool-policy choice onto the REAL tier-policy
 // profile. The wizards present simplified labels ("standard"/permissive vs
 // "strict"); anything more permissive than strict maps to `full_open`.
