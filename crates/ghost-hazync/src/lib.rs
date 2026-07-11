@@ -47,6 +47,7 @@ pub mod ecdsa;
 pub mod ripemd160;
 pub mod pubkey;
 pub mod p2wpkh;
+pub mod ecdsa_step;
 #[cfg(test)]
 mod test_cs;
 

@@ -27,7 +27,7 @@
 
 use crate::nonnative::bignat::BigNat;
 use crate::secp256k1_ec::{point_add, scalar_mul, Point};
-use crate::secp256k1_field::enforce_equal;
+use crate::secp256k1_field::{enforce_equal, to_bits_le};
 use crate::secp256k1_scalar::{self, secp256k1_n};
 use ff::PrimeField;
 use nova_snark::frontend::{Boolean, ConstraintSystem, SynthesisError};
@@ -85,6 +85,30 @@ where
     let p2 = scalar_mul(cs.namespace(|| "u2*Q"), u2_bits, q)?;
     let rpoint = point_add(cs.namespace(|| "u1G+u2Q"), &p1, &p2)?;
     enforce_rx_equals_r(cs.namespace(|| "R.x==r"), &rpoint.x, r)
+}
+
+/// Full ECDSA verification from `(z, r, s)` + key `Q`: derives `u1, u2`, decomposes
+/// them to (MSB-first) scalar bits, and runs [`verify`]. This is the whole check
+/// meant to run under the Nova prover (via a StepCircuit) — its two 256-bit
+/// scalar multiplications are why it is prover-scale.
+pub fn verify_full<Scalar, CS>(
+    mut cs: CS,
+    g: &Point<Scalar>,
+    q: &Point<Scalar>,
+    z: &BigNat<Scalar>,
+    r: &BigNat<Scalar>,
+    s: &BigNat<Scalar>,
+) -> Result<(), SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let (u1, u2) = derive_u1_u2(cs.namespace(|| "u1u2"), z, r, s)?;
+    let mut u1_bits = to_bits_le(cs.namespace(|| "u1_bits"), &u1)?;
+    u1_bits.reverse(); // to_bits_le is LSB-first; scalar_mul wants MSB-first
+    let mut u2_bits = to_bits_le(cs.namespace(|| "u2_bits"), &u2)?;
+    u2_bits.reverse();
+    verify(cs.namespace(|| "verify"), g, q, r, &u1_bits, &u2_bits)
 }
 
 #[cfg(test)]
