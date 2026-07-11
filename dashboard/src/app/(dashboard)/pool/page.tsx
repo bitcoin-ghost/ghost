@@ -576,18 +576,15 @@ export default function NodePoolPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* Pool miners: the per-miner detail recorded in THIS node's database.
-          Because shares are gossiped across the mesh for payout consensus, this
-          set spans miners on every node (deduplicated), not only those on this
-          node's stratum port — hence the pool-wide label. `local_connected_miners`
-          on /mining/status is the strictly-local count. A true per-node split of
-          the detail list would need a local-connection origin flag on records
-          (backend TODO). */}
-      <SectionErrorBoundary section="Pool Miners">
+      {/* This node's miners: the backend now scopes this list to miners whose
+          shares THIS node received directly (`received_by` = our own node key,
+          via get_local_miners_stats), not the mesh-wide gossiped set. So the
+          label is accurate again. */}
+      <SectionErrorBoundary section="This Node's Miners">
         <Card>
           <CardHeader
-            title="Pool Miners"
-            subtitle="Per-miner detail recorded by this node across the mesh (shares are gossiped pool-wide), ranked by hashrate"
+            title="This Node's Miners"
+            subtitle="Miners connected to this node's stratum port, ranked by hashrate"
           />
           {minersRedacted ? (
             <div className="t-label" style={{ color: "var(--dim)" }}>

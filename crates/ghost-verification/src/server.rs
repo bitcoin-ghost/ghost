@@ -1307,6 +1307,10 @@ pub struct VerificationState {
     /// exact term it contributes to `get_mesh_total_hashrate`. Surfaced as
     /// `local_hashrate_th` so the per-node and mesh figures reconcile.
     get_local_hashrate: Option<Box<dyn Fn() -> f64 + Send + Sync>>,
+    /// This node's own `received_by` key — `hex(node_id[..8])`, the same key
+    /// local shares are stored under. Scopes the detailed miner list to
+    /// locally-connected miners (vs mesh-gossiped ones).
+    local_received_by: Option<String>,
     /// Seconds elapsed in the current mining round (time working the current
     /// template), from the round manager's `current_round_elapsed_secs`.
     /// Surfaced as `current_round_duration_secs` on the pool-status endpoint so
@@ -1535,6 +1539,7 @@ impl VerificationState {
             get_self_deduped_miners: None,
             get_mesh_total_hashrate: None,
             get_local_hashrate: None,
+            local_received_by: None,
             get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
@@ -2176,6 +2181,17 @@ impl VerificationState {
     /// the mesh total — or None if no callback has been wired up.
     pub fn local_hashrate(&self) -> Option<f64> {
         self.get_local_hashrate.as_ref().map(|f| f())
+    }
+
+    /// Set this node's own `received_by` key (`hex(node_id[..8])`).
+    pub fn with_local_received_by(mut self, received_by: String) -> Self {
+        self.local_received_by = Some(received_by);
+        self
+    }
+
+    /// This node's `received_by` key, if wired — scopes the miner list to local.
+    pub fn local_received_by(&self) -> Option<&str> {
+        self.local_received_by.as_deref()
     }
 
     /// Set the current-round-elapsed-seconds callback (from the round manager).

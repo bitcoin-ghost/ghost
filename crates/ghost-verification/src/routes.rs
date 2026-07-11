@@ -5381,10 +5381,32 @@ async fn api_ghostpay_payout_history_handler(
 }
 
 /// API v1 Rewards node history handler
+/// Optional `?time_filter=7d|30d|all` window for history endpoints.
+#[derive(Debug, Deserialize)]
+struct TimeFilterQuery {
+    time_filter: Option<String>,
+}
+
 async fn api_rewards_node_history_handler(
     State(state): State<Arc<VerificationState>>,
+    Query(query): Query<TimeFilterQuery>,
 ) -> impl IntoResponse {
     let health = state.get_health().await;
+
+    // Honour the requested time window (default 7d; `all` disables). Previously
+    // this was ignored, so a node last credited months ago still surfaced under
+    // the dashboard's "recent payouts (last 7 days)" table.
+    let cutoff: Option<i64> = match query.time_filter.as_deref().unwrap_or("7d") {
+        "all" | "" => None,
+        f => {
+            let days: i64 = f.trim_end_matches('d').parse().unwrap_or(7);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            Some(now - days.max(0) * 86_400)
+        }
+    };
 
     // Get all nodes with rewards and their history
     let (history, total) = if let Some(ref db) = state.database {
@@ -5392,6 +5414,7 @@ async fn api_rewards_node_history_handler(
         let nodes = db.get_nodes_with_balance(0).unwrap_or_default();
         let history_json: Vec<_> = nodes
             .iter()
+            .filter(|n| cutoff.map_or(true, |c| n.updated_at as i64 >= c))
             .map(|n| {
                 serde_json::json!({
                     "node_id": n.node_id,
@@ -10814,8 +10837,20 @@ fn build_detailed_miner_list(state: &VerificationState) -> Vec<serde_json::Value
     let Some(ref db) = state.database else {
         return Vec::new();
     };
-    let Ok(miner_stats) = db.get_all_miners_stats() else {
-        return Vec::new();
+    // Scope to THIS node's locally-connected miners (shares stored under our own
+    // `received_by`), not the mesh-wide set every node accumulates via gossip for
+    // payout consensus. Falls back to the pool-wide query only if the local key
+    // was never wired (older deploys) — never on an empty local result, which
+    // legitimately means "no miners on this node".
+    let miner_stats = match state.local_received_by() {
+        Some(rx) => match db.get_local_miners_stats(rx) {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        },
+        None => match db.get_all_miners_stats() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        },
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

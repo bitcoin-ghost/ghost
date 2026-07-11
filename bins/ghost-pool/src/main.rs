@@ -6046,6 +6046,10 @@ async fn main() -> Result<()> {
             .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_route)
             .unwrap_or(0.0)
     });
+    // Scope the operator/peer detailed miner list to this node's own miners
+    // (shares stored under our `received_by`), so "This Node's Miners" and the
+    // /miners/full peer feed are local — not the mesh-wide gossiped set.
+    verification_state = verification_state.with_local_received_by(self_received_by.clone());
 
     // Seconds elapsed working the current template, surfaced as
     // `current_round_duration_secs` on the pool-status endpoint so the
