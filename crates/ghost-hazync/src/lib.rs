@@ -46,6 +46,7 @@ pub mod secp256k1_scalar;
 pub mod ecdsa;
 pub mod ripemd160;
 pub mod pubkey;
+pub mod p2wpkh;
 #[cfg(test)]
 mod test_cs;
 
