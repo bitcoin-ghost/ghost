@@ -38,10 +38,13 @@ pub mod sighash;
 // Vendored foreign-field arithmetic (see src/nonnative/mod.rs).
 #[allow(dead_code)]
 pub mod nonnative;
+#[allow(dead_code)]
+mod u32;
 pub mod secp256k1_field;
 pub mod secp256k1_ec;
 pub mod secp256k1_scalar;
 pub mod ecdsa;
+pub mod ripemd160;
 #[cfg(test)]
 mod test_cs;
 

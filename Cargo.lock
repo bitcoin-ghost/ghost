@@ -3418,6 +3418,7 @@ dependencies = [
  "nova-snark",
  "num-bigint 0.4.6",
  "num-traits",
+ "ripemd",
  "sha2 0.10.9",
 ]
 

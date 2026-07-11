@@ -29,3 +29,4 @@ byteorder = "1"
 
 [dev-dependencies]
 hex = { workspace = true }
+ripemd = "0.1"
