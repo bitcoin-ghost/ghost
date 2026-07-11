@@ -8131,9 +8131,17 @@ async fn main() -> Result<()> {
                     );
                 }
 
-                // Refresh template (starts new round)
-                if let Err(e) = tp.refresh_template().await {
-                    error!(error = %e, "Failed to refresh template on new block");
+                // Fast changeover: publish a coinbase-only (empty) template for
+                // the new tip immediately so SV1/SV2 miners start hashing the new
+                // block with zero transaction-assembly latency, then build and
+                // swap in the full template. A block found in the sub-second gap
+                // is a valid empty block (subsidy only).
+                if let Err(e) = tp.publish_empty_template().await {
+                    warn!(error = %e, "Failed to publish empty template on new block");
+                }
+                // Full template (forced — the empty one already bumped the height).
+                if let Err(e) = tp.refresh_template_forced().await {
+                    error!(error = %e, "Failed to refresh full template on new block");
                 }
             }
         });

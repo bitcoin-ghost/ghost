@@ -1722,6 +1722,28 @@ impl TemplateProcessor {
 
     /// Refresh the block template
     pub async fn refresh_template(&self) -> anyhow::Result<()> {
+        self.refresh_template_inner(false, false).await
+    }
+
+    /// Force a full template rebuild even when the height is unchanged — used to
+    /// swap the full template in right after an empty (coinbase-only) template
+    /// was published on a new-block event (the empty one already bumped
+    /// `current_work` to the new height, so the normal dedup guard would skip it).
+    pub async fn refresh_template_forced(&self) -> anyhow::Result<()> {
+        self.refresh_template_inner(true, false).await
+    }
+
+    /// Publish a coinbase-only (empty) template for the current tip immediately.
+    /// On a new-block ZMQ event this hands miners work on the NEW tip with zero
+    /// transaction-assembly latency (no BUDS filtering, no merkle over the tx
+    /// set); the full template follows via [`refresh_template_forced`]. A block
+    /// found against it is a valid empty block (subsidy only) — the rare sub-
+    /// second window before the full template arrives.
+    pub async fn publish_empty_template(&self) -> anyhow::Result<()> {
+        self.refresh_template_inner(false, true).await
+    }
+
+    async fn refresh_template_inner(&self, force: bool, empty: bool) -> anyhow::Result<()> {
         // Build rules based on network
         let rules: Vec<&str> = match self.config.network {
             BitcoinNetwork::Signet => vec!["segwit", "signet"],
@@ -1737,8 +1759,10 @@ impl TemplateProcessor {
             .await
             .map_err(|e| anyhow::anyhow!("RPC error: {}", e))?;
 
-        // Check if template changed (height or significant curtime drift)
-        let should_update = {
+        // Check if template changed (height or significant curtime drift).
+        // `force` bypasses this so a full rebuild can follow an empty template
+        // at the same height.
+        let should_update = force || {
             let current = self.current_work.read();
             current
                 .as_ref()
@@ -1756,24 +1780,34 @@ impl TemplateProcessor {
             return Ok(());
         }
 
-        // Apply BUDS filtering
-        let (filtered_txs, filter_stats) = self.filter_transactions(&template.transactions);
+        // Apply BUDS filtering. Skipped for an empty/coinbase-only template —
+        // there are no transactions to filter, and skipping the filter + merkle
+        // is exactly what makes the empty path fast enough to publish instantly
+        // on a tip change.
+        let (filtered_txs, filter_stats) = if empty {
+            (Vec::new(), None)
+        } else {
+            let (txs, stats) = self.filter_transactions(&template.transactions);
+            (txs, Some(stats))
+        };
 
-        if filter_stats.removed > 0 {
-            let _ = self.event_tx.send(TemplateEvent::TransactionsFiltered {
-                original_count: filter_stats.original,
-                filtered_count: filter_stats.kept,
-                removed_fees: filter_stats.removed_fees,
-            });
+        if let Some(ref filter_stats) = filter_stats {
+            if filter_stats.removed > 0 {
+                let _ = self.event_tx.send(TemplateEvent::TransactionsFiltered {
+                    original_count: filter_stats.original,
+                    filtered_count: filter_stats.kept,
+                    removed_fees: filter_stats.removed_fees,
+                });
 
-            info!(
-                original = filter_stats.original,
-                kept = filter_stats.kept,
-                removed = filter_stats.removed,
-                reaped = filter_stats.reaped,
-                removed_fees = filter_stats.removed_fees,
-                "Filtered transactions by policy"
-            );
+                info!(
+                    original = filter_stats.original,
+                    kept = filter_stats.kept,
+                    removed = filter_stats.removed,
+                    reaped = filter_stats.reaped,
+                    removed_fees = filter_stats.removed_fees,
+                    "Filtered transactions by policy"
+                );
+            }
         }
 
         // Calculate total fees and weight
@@ -1880,7 +1914,7 @@ impl TemplateProcessor {
 
         debug!(
             height = template.height,
-            txs = filter_stats.kept,
+            empty = empty,
             fees = total_fees,
             "New block template"
         );
