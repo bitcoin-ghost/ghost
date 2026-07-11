@@ -6179,6 +6179,45 @@ fn ghostd_unit_is_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Read the tier policy ghostd is ACTUALLY enforcing, by parsing the resolved
+/// systemd `ExecStart` for `-ghostpolicy-allowtiers=<csv>`, and return the
+/// profile NAME it implies. Ghostd reads the flag only at startup and exposes no
+/// policy RPC, so its `ExecStart` is the ground truth for what's enforced — the
+/// counterpart to the pool.toml `[policy]` profile (intent). Surfacing both lets
+/// the dashboard show reality and flag drift, so a mismatch can't hide silently.
+///
+/// No `-ghostpolicy-allowtiers` flag ⇒ ghostd is inert ⇒ all tiers ⇒ `full_open`.
+/// Returns `None` only if ghostd's unit can't be read at all.
+fn read_ghostd_enforced_profile() -> Option<String> {
+    let out = std::process::Command::new("systemctl")
+        .args(["show", "ghostd", "-p", "ExecStart", "--value"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let exec = String::from_utf8_lossy(&out.stdout);
+    let tiers: Option<Vec<u8>> = exec
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("-ghostpolicy-allowtiers="))
+        .map(|csv| {
+            let mut v: Vec<u8> = csv
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u8>().ok())
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        });
+    Some(match tiers.as_deref() {
+        None => "full_open".to_string(),
+        Some([0, 1]) => "strict".to_string(),
+        Some([0, 1, 2]) => "permissive".to_string(),
+        Some([0, 1, 2, 3]) => "full_open".to_string(),
+        Some(_) => "custom".to_string(),
+    })
+}
+
 /// Clear a one-shot storage marker in pool.toml, then regenerate the drop-in
 /// (which now omits the one-shot flag) and restart ghostd, and bounce the pool.
 /// Runs the blocking apply off the async workers. Returns the terminal apply
@@ -7089,8 +7128,22 @@ fn policy_json(state: &Arc<VerificationState>) -> serde_json::Value {
 
     let custom: CustomPolicyConfig = cfg.policy.custom.clone().unwrap_or_default();
 
+    // Ground truth: what ghostd is ACTUALLY enforcing (parsed from its systemd
+    // ExecStart), vs `profile` which is only what pool.toml intends. `drift` is
+    // true when they disagree — the dashboard surfaces enforced as the real
+    // policy and warns on drift so a silent mismatch (as happened fleet-wide)
+    // can't recur. Applying a profile from the dashboard rewrites both, so the
+    // fix for any drift is a one-click re-apply of the intended profile.
+    let enforced_profile = read_ghostd_enforced_profile();
+    let drift = enforced_profile
+        .as_deref()
+        .map(|e| e != profile_name)
+        .unwrap_or(false);
+
     serde_json::json!({
         "profile": profile_name,
+        "enforced_profile": enforced_profile,
+        "drift": drift,
         "custom": {
             "allow_t0": custom.allowed_tiers.contains(&ghost_common::config::BudsTier::T0),
             "allow_t1": custom.allowed_tiers.contains(&ghost_common::config::BudsTier::T1),

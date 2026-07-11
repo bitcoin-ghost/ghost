@@ -116,6 +116,11 @@ export interface FullNodeConfig {
   // `custom` carries the resolved per-field values for the advanced panel.
   policy?: {
     profile?: string;
+    /** What ghostd is ACTUALLY enforcing (parsed from its systemd ExecStart),
+     * vs `profile` which is only what pool.toml intends. */
+    enforced_profile?: string;
+    /** True when enforced_profile disagrees with the configured profile. */
+    drift?: boolean;
     custom?: {
       allow_t0: boolean;
       allow_t1: boolean;

@@ -49,8 +49,10 @@ struct Args {
     /// Enable Reaper
     #[arg(long, default_value = "true")]
     reaper: bool,
-    /// Mempool profile: permissive (0), bitcoin_pure (1), full_open (2)
-    #[arg(long, default_value = "permissive")]
+    /// Mempool profile: permissive (0), bitcoin_pure/strict (1), full_open/open (2).
+    /// New installs default to full_open (inert) — the operator opts into a
+    /// restrictive tier policy deliberately.
+    #[arg(long, default_value = "full_open")]
     mempool_profile: String,
     /// Config directory
     #[arg(long, default_value = "/etc/ghost")]
@@ -103,8 +105,8 @@ fn main() {
     fields.insert("reaper".to_string(), FieldValue::Bool(args.reaper));
 
     let profile_idx = match args.mempool_profile.as_str() {
-        "bitcoin_pure" => 1,
-        "full_open" => 2,
+        "bitcoin_pure" | "strict" => 1,
+        "full_open" | "open" => 2,
         _ => 0, // permissive
     };
     fields.insert(
@@ -117,6 +119,15 @@ fn main() {
             println!("Setup complete!");
             println!("  Node ID: {}", result.node_id_hex);
             println!("  Config:  {}", result.config_path.display());
+            // Close the historic drift where a fresh install wrote pool.toml but
+            // never pushed the tier/reaper policy into ghostd's managed drop-in,
+            // leaving ghostd inert regardless of the chosen profile. Apply it now
+            // (best-effort: if ghostd isn't installed/manageable yet, warn rather
+            // than fail — the operator can re-run `ghost-setup apply-reaper`).
+            if let Err(e) = apply_reaper_to_ghostd(&args.config_dir, false, false) {
+                eprintln!("Warning: could not sync policy into ghostd now ({e}).");
+                eprintln!("         Run `ghost-setup apply-reaper` once ghostd is running.");
+            }
         }
         Err(e) => {
             eprintln!("Setup failed: {e}");

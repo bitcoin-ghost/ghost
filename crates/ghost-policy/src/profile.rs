@@ -173,7 +173,9 @@ impl PolicyProfile {
 
 impl Default for PolicyProfile {
     fn default() -> Self {
-        Self::permissive()
+        // Matches PolicyConfig's default (full_open / inert): a node with no
+        // explicit policy behaves as stock Core until the operator opts in.
+        Self::full_open()
     }
 }
 

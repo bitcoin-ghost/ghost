@@ -1466,7 +1466,11 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            profile: PolicyProfile::Permissive,
+            // New installations default to `full_open` (inert / all tiers) — the
+            // node behaves exactly as stock Bitcoin Core until the operator opts
+            // into a restrictive tier policy. Operators tighten to strict/permissive
+            // deliberately via the dashboard or ghost-setup.
+            profile: PolicyProfile::FullOpen,
             custom: None,
         }
     }

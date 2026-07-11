@@ -94,6 +94,25 @@ export function PolicyProfileSelector() {
 
   return (
     <div>
+      {fullConfig?.policy?.drift && (
+        <div
+          role="alert"
+          style={{
+            marginBottom: "12px",
+            padding: "10px 12px",
+            borderRadius: "6px",
+            border: "1px solid var(--warning, #b45309)",
+            background: "var(--warning-weak, rgba(180,83,9,0.12))",
+            fontSize: "13px",
+            color: "var(--fg)",
+          }}
+        >
+          <strong>Policy drift.</strong> ghostd is actually enforcing{" "}
+          <code>{fullConfig.policy.enforced_profile}</code>, but this node is configured for{" "}
+          <code>{current ?? fullConfig.policy.profile}</code>. Re-apply the configured profile below to sync
+          ghostd (the node restarts), or pick the policy you actually want.
+        </div>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {POLICY_PRESETS.map((p) => {
           const isCurrent = current === p.value;
