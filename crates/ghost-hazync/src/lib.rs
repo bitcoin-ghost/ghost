@@ -34,6 +34,7 @@ pub mod block_tx_step;
 pub mod coin;
 pub mod coin_tx;
 pub mod coin_tx_fanout;
+pub mod sighash;
 
 /// A 256-bit value (block hash / target), big-endian, as it appears on the wire
 /// after the double-SHA256. Kept as raw bytes so the native spec and the future
