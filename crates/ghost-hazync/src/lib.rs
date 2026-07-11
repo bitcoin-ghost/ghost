@@ -42,6 +42,8 @@ pub mod nonnative;
 mod u32;
 pub mod secp256k1_field;
 pub mod secp256k1_ec;
+#[allow(dead_code)]
+pub mod glv;
 pub mod secp256k1_scalar;
 pub mod ecdsa;
 pub mod ripemd160;
