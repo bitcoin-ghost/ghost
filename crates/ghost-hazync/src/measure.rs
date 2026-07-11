@@ -140,15 +140,18 @@ fn measure_counts() {
         let _ = point_add(cs.namespace(|| "padd"), &p, &q).unwrap();
     });
 
-    // ---- scalar_mul: linear fit over small widths ----
-    let widths = [2usize, 4, 8, 16];
+    // ---- scalar_mul: per-WINDOW model (it is windowed/chunked, not linear per
+    // bit — cost ∝ ceil(bits/WINDOW) windows + a fixed table/init/affine term). ----
+    use crate::secp256k1_ec::WINDOW;
+    let n_windows = |w: usize| w.div_ceil(WINDOW);
+    let widths = [WINDOW, 2 * WINDOW, 3 * WINDOW, 4 * WINDOW]; // 1..4 windows
     let sm: Vec<(usize, usize)> = widths.iter().map(|&w| scalar_mul_width(w)).collect();
-    // slope (constraints per scalar bit) from the two extreme measured widths.
-    let (c_lo, w_lo) = (sm[0].0 as f64, widths[0] as f64);
-    let (c_hi, w_hi) = (sm[3].0 as f64, widths[3] as f64);
-    let per_bit = (c_hi - c_lo) / (w_hi - w_lo);
-    let intercept = c_lo - per_bit * w_lo;
-    let sm256 = (intercept + per_bit * 256.0).round() as i64;
+    let (c_lo, n_lo) = (sm[0].0 as f64, n_windows(widths[0]) as f64);
+    let (c_hi, n_hi) = (sm[3].0 as f64, n_windows(widths[3]) as f64);
+    let per_window = (c_hi - c_lo) / (n_hi - n_lo);
+    let fixed = c_lo - per_window * n_lo; // one-off table precompute + init + to_affine
+    let sm256 = (fixed + per_window * n_windows(256) as f64).round() as i64;
+    let per_bit = per_window / WINDOW as f64;
 
     // ---- ECDSA assembly components ----
     let ec_derive = count(|cs| {
@@ -190,7 +193,12 @@ fn measure_counts() {
     row("derive_u1_u2", ec_derive.0, ec_derive.1);
     row("enforce_rx_equals_r", ec_rxchk.0, ec_rxchk.1);
     println!("  {:-<34} {:-<12} {:-<12}", "", "", "");
-    println!("  scalar_mul per-bit cost   : {:>12.0} constraints/bit", per_bit);
+    println!(
+        "  scalar_mul per-window     : {:>12.0} constraints  ({} windows for 256b)",
+        per_window,
+        n_windows(256)
+    );
+    println!("  scalar_mul per-bit (eff.) : {:>12.0} constraints/bit", per_bit);
     println!("  scalar_mul(256) [computed]: {sm256:>12}");
     println!("  ---------------------------------------------------------------------");
     println!("  ONE ECDSA SIG (verify_full, computed): {sig256:>12} constraints");

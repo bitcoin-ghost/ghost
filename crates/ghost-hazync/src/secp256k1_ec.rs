@@ -24,6 +24,7 @@ pub struct Point<Scalar: PrimeField> {
 }
 
 /// A projective secp256k1 point `(X:Y:Z)`; the identity is `(0:1:0)`.
+#[derive(Clone)]
 pub struct ProjPoint<Scalar: PrimeField> {
     pub x: BigNat<Scalar>,
     pub y: BigNat<Scalar>,
@@ -176,10 +177,47 @@ where
     })
 }
 
-/// `k · P` (affine) by complete double-and-add from the identity. `bits` is the
-/// scalar most-significant-bit first; ANY bit pattern is valid (leading zeros
-/// included) because the accumulator starts at the identity and the addition is
-/// complete. The result is returned in affine coordinates (so `k ≠ 0`).
+/// Fixed window width for [`scalar_mul`]. `w=4` minimises total point additions
+/// for a 256-bit scalar: the additions drop from one-per-bit to one-per-window
+/// (≈ /4), while the 16-entry table costs a one-off precompute and a cheap
+/// 15-`proj_select` mux per window (a select is ~26× cheaper than a point add).
+pub(crate) const WINDOW: usize = 4;
+
+/// Select `table[idx]` where `idx` is the `WINDOW`-bit value `bits` (MSB first),
+/// via a binary mux tree — `2^WINDOW − 1` `proj_select`s, collapsing from the LSB.
+fn mux_table<Scalar, CS>(
+    mut cs: CS,
+    bits: &[Boolean],
+    table: &[ProjPoint<Scalar>],
+) -> Result<ProjPoint<Scalar>, SynthesisError>
+where
+    Scalar: PrimeField,
+    CS: ConstraintSystem<Scalar>,
+{
+    let mut layer: Vec<ProjPoint<Scalar>> = table.to_vec();
+    for level in 0..WINDOW {
+        // Collapse on the least-significant remaining selector bit first.
+        let sel = &bits[WINDOW - 1 - level];
+        let mut next = Vec::with_capacity(layer.len() / 2);
+        for i in 0..layer.len() / 2 {
+            next.push(proj_select(
+                cs.namespace(|| format!("l{level}_{i}")),
+                sel,
+                &layer[2 * i + 1], // bit set → odd index
+                &layer[2 * i],     // bit clear → even index
+            )?);
+        }
+        layer = next;
+    }
+    Ok(layer.into_iter().next().unwrap())
+}
+
+/// `k · P` (affine) by complete fixed-window double-and-add from the identity.
+/// `bits` is the scalar most-significant-bit first; ANY bit pattern is valid
+/// (leading zeros included) — the accumulator starts at the identity, the
+/// addition is complete, and the scalar is front-padded with zero bits to a whole
+/// number of windows (leading zeros do not change the value). The result is
+/// returned in affine coordinates (so `k ≠ 0`).
 pub fn scalar_mul<Scalar, CS>(
     mut cs: CS,
     bits: &[Boolean],
@@ -190,11 +228,39 @@ where
     CS: ConstraintSystem<Scalar>,
 {
     let pp = to_proj(cs.namespace(|| "P->proj"), p)?;
-    let mut acc = identity(cs.namespace(|| "id"))?;
-    for (i, bit) in bits.iter().enumerate() {
-        let doubled = complete_add(cs.namespace(|| format!("dbl_{i}")), &acc, &acc)?;
-        let added = complete_add(cs.namespace(|| format!("add_{i}")), &doubled, &pp)?;
-        acc = proj_select(cs.namespace(|| format!("sel_{i}")), bit, &added, &doubled)?;
+
+    // Precompute table[j] = j·P for j in 0..2^WINDOW (table[0] = identity).
+    let mut table: Vec<ProjPoint<Scalar>> = Vec::with_capacity(1 << WINDOW);
+    table.push(identity(cs.namespace(|| "t0"))?);
+    table.push(pp.clone()); // 1·P
+    for j in 2..(1 << WINDOW) {
+        let next = complete_add(cs.namespace(|| format!("t{j}")), &table[j - 1], &pp)?;
+        table.push(next);
+    }
+
+    // Front-pad to a whole number of windows (MSB side; zero bits are inert).
+    let pad = (WINDOW - bits.len() % WINDOW) % WINDOW;
+    let n_windows = (bits.len() + pad) / WINDOW;
+
+    let mut acc = identity(cs.namespace(|| "acc0"))?;
+    for wi in 0..n_windows {
+        // acc = 2^WINDOW · acc
+        for d in 0..WINDOW {
+            acc = complete_add(cs.namespace(|| format!("dbl_{wi}_{d}")), &acc, &acc)?;
+        }
+        // This window's WINDOW bits (MSB first); padded positions are constant 0.
+        let wbits: Vec<Boolean> = (0..WINDOW)
+            .map(|b| {
+                let k = wi * WINDOW + b;
+                if k < pad {
+                    Boolean::Constant(false)
+                } else {
+                    bits[k - pad].clone()
+                }
+            })
+            .collect();
+        let sel = mux_table(cs.namespace(|| format!("mux_{wi}")), &wbits, &table)?;
+        acc = complete_add(cs.namespace(|| format!("add_{wi}")), &acc, &sel)?;
     }
     to_affine(cs.namespace(|| "acc->affine"), &acc)
 }
@@ -324,6 +390,61 @@ mod tests {
         let (ex, ey) = five_g();
         assert_eq!(r.x.value, Some(ex), "5G.x");
         assert_eq!(r.y.value, Some(ey), "5G.y");
+        assert!(cs.is_satisfied(), "unsat: {:?}", cs.which_is_unsatisfied());
+    }
+
+    // Native affine reference (point at infinity = None) for a full multi-window check.
+    fn n_add(a: &Option<(BigInt, BigInt)>, b: &Option<(BigInt, BigInt)>) -> Option<(BigInt, BigInt)> {
+        let p = secp256k1_p();
+        let modp = |v: BigInt| ((v % &p) + &p) % &p;
+        let inv = |v: &BigInt| v.modpow(&(&p - BigInt::from(2)), &p);
+        match (a, b) {
+            (None, _) => b.clone(),
+            (_, None) => a.clone(),
+            (Some((x1, y1)), Some((x2, y2))) => {
+                if x1 == x2 && (y1 + y2) % &p == BigInt::from(0) {
+                    return None;
+                }
+                let lam = if x1 == x2 && y1 == y2 {
+                    modp((BigInt::from(3) * x1 * x1) * inv(&modp(BigInt::from(2) * y1)))
+                } else {
+                    modp((y2 - y1) * inv(&modp(x2 - x1)))
+                };
+                let x3 = modp(&lam * &lam - x1 - x2);
+                let y3 = modp(&lam * (x1 - &x3) - y1);
+                Some((x3, y3))
+            }
+        }
+    }
+    fn n_mul(k: u64) -> (BigInt, BigInt) {
+        let base = Some(g());
+        let mut acc: Option<(BigInt, BigInt)> = None;
+        let mut cur = base;
+        let mut kk = k;
+        while kk > 0 {
+            if kk & 1 == 1 {
+                acc = n_add(&acc, &cur);
+            }
+            cur = n_add(&cur, &cur);
+            kk >>= 1;
+        }
+        acc.unwrap()
+    }
+
+    // Multi-window (w=4) with a non-zero top window and front padding: k = 363
+    // is 9 bits → padded to 12 → 3 windows, top window = 0b0001.
+    #[test]
+    fn scalar_mul_matches_native_multiwindow() {
+        let k: u64 = 0b1_0110_1011; // 363
+        let width = 9;
+        let mut cs = TestConstraintSystem::<Scalar>::new();
+        let gp = aff(&mut cs, "G", &g());
+        let msb_first: Vec<bool> = (0..width).rev().map(|i| (k >> i) & 1 == 1).collect();
+        let bits = alloc_bits(&mut cs, &msb_first);
+        let r = scalar_mul(cs.namespace(|| "kG"), &bits, &gp).unwrap();
+        let (ex, ey) = n_mul(k);
+        assert_eq!(r.x.value, Some(ex), "kG.x");
+        assert_eq!(r.y.value, Some(ey), "kG.y");
         assert!(cs.is_satisfied(), "unsat: {:?}", cs.which_is_unsatisfied());
     }
 }
