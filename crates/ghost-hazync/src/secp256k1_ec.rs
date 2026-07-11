@@ -13,7 +13,7 @@
 
 use crate::nonnative::bignat::BigNat;
 use crate::secp256k1_field::{add_mod, alloc_fp_from, div_mod, mul_mod, sub_mod, N_LIMBS};
-use ff::{Field, PrimeField};
+use ff::PrimeField;
 use nova_snark::frontend::{Boolean, ConstraintSystem, SynthesisError};
 
 /// An affine secp256k1 point.
