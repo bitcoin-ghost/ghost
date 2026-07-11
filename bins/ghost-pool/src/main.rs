@@ -6057,6 +6057,11 @@ async fn main() -> Result<()> {
     // (10–60s) without restarting the pool.
     verification_state =
         verification_state.with_template_refresh(template_processor.refresh_interval_handle());
+    // Current-template snapshot provider for the dashboard visualiser (reads the
+    // summary fields under the lock without cloning the full tx set).
+    let tp_for_snapshot = Arc::clone(&template_processor);
+    verification_state = verification_state
+        .with_template_snapshot(move || tp_for_snapshot.current_template_summary());
 
     // Seconds elapsed working the current template, surfaced as
     // `current_round_duration_secs` on the pool-status endpoint so the

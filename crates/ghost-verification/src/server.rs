@@ -1314,6 +1314,12 @@ pub struct VerificationState {
     /// Live handle to the template processor's refresh cadence (ms), so the
     /// dashboard can retune it (10–60s) without restarting the pool.
     template_refresh_ms: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Provider returning a JSON snapshot of the pool's current block template
+    /// (height, tx count, fees, subsidy, weight, ntime) for the dashboard
+    /// visualiser. A closure so this crate needn't depend on ghost-pool's
+    /// `WorkState` type. `None` (or a `None` result) means no template yet.
+    #[allow(clippy::type_complexity)]
+    template_snapshot: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
     /// Seconds elapsed in the current mining round (time working the current
     /// template), from the round manager's `current_round_elapsed_secs`.
     /// Surfaced as `current_round_duration_secs` on the pool-status endpoint so
@@ -1544,6 +1550,7 @@ impl VerificationState {
             get_local_hashrate: None,
             local_received_by: None,
             template_refresh_ms: None,
+            template_snapshot: None,
             get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
@@ -2223,6 +2230,20 @@ impl VerificationState {
             h.store(clamped * 1000, std::sync::atomic::Ordering::Relaxed);
             clamped
         })
+    }
+
+    /// Wire the current-block-template snapshot provider.
+    pub fn with_template_snapshot(
+        mut self,
+        f: impl Fn() -> Option<serde_json::Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.template_snapshot = Some(Box::new(f));
+        self
+    }
+
+    /// The current block-template snapshot, or `None` if unwired / no template yet.
+    pub fn template_snapshot(&self) -> Option<serde_json::Value> {
+        self.template_snapshot.as_ref().and_then(|f| f())
     }
 
     /// Set the current-round-elapsed-seconds callback (from the round manager).

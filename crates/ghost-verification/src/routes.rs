@@ -192,6 +192,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/node/blockchain", get(api_node_blockchain_handler))
         .route("/api/v1/node/shares", get(api_node_shares_handler))
         .route("/api/v1/mining/status", get(api_mining_status_handler))
+        .route("/api/v1/mining/template", get(api_mining_template_handler))
         .route("/api/v1/mining/miners", get(api_miners_handler))
         .route("/api/v1/miners/search", get(api_miners_search_handler))
         // Public self-lookup endpoint — exact-match only, requires the full
@@ -1639,6 +1640,18 @@ async fn api_node_blockchain_handler(
             "chainwork": serde_json::Value::Null,
             "warnings": serde_json::Value::Null,
         })),
+    }
+}
+
+/// Current block-template snapshot for the dashboard visualiser (height, tx
+/// count, fees, subsidy, coinbase value, weight, template age). `available:
+/// false` before the first template is built.
+async fn api_mining_template_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    match state.template_snapshot() {
+        Some(template) => Json(serde_json::json!({ "available": true, "template": template })),
+        None => Json(serde_json::json!({ "available": false, "template": serde_json::Value::Null })),
     }
 }
 

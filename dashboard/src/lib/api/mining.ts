@@ -12,6 +12,29 @@ export async function getMiningStatus(): Promise<MiningStatus> {
   return fetchApi<MiningStatus>('/api/v1/mining/status');
 }
 
+// Snapshot of the block template this node is currently building.
+export interface BlockTemplateSnapshot {
+  height: number;
+  job_id: string;
+  prev_hash: string;
+  tx_count: number; // includes coinbase
+  total_fees_sat: number;
+  subsidy_sat: number;
+  coinbase_value_sat: number; // subsidy + fees
+  total_weight: number; // weight units (max 4,000,000)
+  ntime: number; // template time (Unix seconds)
+  nbits: string;
+  version: number;
+  refresh_secs: number;
+}
+export interface MiningTemplateResponse {
+  available: boolean;
+  template: BlockTemplateSnapshot | null;
+}
+export async function getMiningTemplate(): Promise<MiningTemplateResponse> {
+  return fetchApi<MiningTemplateResponse>('/api/v1/mining/template');
+}
+
 // Rolling server-side time-series of pool hashrate + connected miners.
 // `window` is '1h' or '24h'. Empty samples until the node has been up long
 // enough to accumulate history (the pool page falls back to its session buffer).

@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMiningStatus, getMiners, getBestHash, getPublicMiningNodes, setPrivateMining, setPublicMining, setPayoutAddress, getPoolSeries, getPoolMeshLeaderboard } from '@/lib/api/mining';
+import { getMiningStatus, getMiningTemplate, getMiners, getBestHash, getPublicMiningNodes, setPrivateMining, setPublicMining, setPayoutAddress, getPoolSeries, getPoolMeshLeaderboard } from '@/lib/api/mining';
 
 export const miningKeys = {
   all: ['mining'] as const,
@@ -29,6 +29,14 @@ export function usePoolMeshLeaderboard(options?: { refetchInterval?: number }) {
     queryKey: miningKeys.meshLeaderboard(),
     queryFn: getPoolMeshLeaderboard,
     refetchInterval: options?.refetchInterval ?? 15_000,
+  });
+}
+
+export function useMiningTemplate(options?: { refetchInterval?: number }) {
+  return useQuery({
+    queryKey: ["mining", "template"],
+    queryFn: getMiningTemplate,
+    refetchInterval: options?.refetchInterval ?? 5_000,
   });
 }
 

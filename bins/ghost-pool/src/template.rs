@@ -2791,6 +2791,30 @@ impl TemplateProcessor {
         self.current_work.read().clone()
     }
 
+    /// A lightweight JSON snapshot of the current template for the dashboard
+    /// visualiser — reads the summary fields under the lock WITHOUT cloning the
+    /// full transaction set that `current_work()` copies (so it's cheap to poll).
+    /// `total_weight` is block weight units (max 4,000,000); `tx_count` includes
+    /// the coinbase; `ntime` is the template time (Unix seconds) for an age readout.
+    pub fn current_template_summary(&self) -> Option<serde_json::Value> {
+        self.current_work.read().as_ref().map(|w| {
+            serde_json::json!({
+                "height": w.height,
+                "job_id": w.job_id,
+                "prev_hash": w.prev_hash,
+                "tx_count": w.tx_count,
+                "total_fees_sat": w.total_fees,
+                "subsidy_sat": w.subsidy,
+                "coinbase_value_sat": w.subsidy.saturating_add(w.total_fees),
+                "total_weight": w.total_weight,
+                "ntime": w.ntime,
+                "nbits": w.nbits,
+                "version": w.version,
+                "refresh_secs": self.refresh_interval_secs(),
+            })
+        })
+    }
+
     /// Store work state by template_id (for SubmitSolution lookup)
     pub fn store_work_state(&self, template_id: u64, work_state: WorkState) {
         let mut states = self.work_states.write();
