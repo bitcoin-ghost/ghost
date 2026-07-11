@@ -50,6 +50,8 @@ pub mod p2wpkh;
 pub mod ecdsa_step;
 #[cfg(test)]
 mod test_cs;
+#[cfg(test)]
+mod measure;
 
 /// A 256-bit value (block hash / target), big-endian, as it appears on the wire
 /// after the double-SHA256. Kept as raw bytes so the native spec and the future

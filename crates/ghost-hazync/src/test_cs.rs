@@ -90,6 +90,23 @@ impl<Scalar: PrimeField> TestConstraintSystem<Scalar> {
     Default::default()
   }
 
+  /// Number of R1CS constraints accumulated so far (the cost metric that
+  /// drives both prover memory and proving time).
+  pub fn num_constraints(&self) -> usize {
+    self.constraints.len()
+  }
+
+  /// Number of witness (auxiliary) variables allocated.
+  pub fn num_aux(&self) -> usize {
+    self.aux.len()
+  }
+
+  /// Number of input variables allocated (includes the constant ONE).
+  #[allow(dead_code)]
+  pub fn num_inputs(&self) -> usize {
+    self.inputs.len()
+  }
+
   /// Get path which is unsatisfied
   pub fn which_is_unsatisfied(&self) -> Option<&str> {
     for (a, b, c, path) in &self.constraints {
