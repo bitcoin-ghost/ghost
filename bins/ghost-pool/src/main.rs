@@ -80,26 +80,21 @@ use ghost_pool::treasury::TreasuryState;
 /// Used when config is updated via API and requires restart to apply
 const EXIT_CODE_RESTART: i32 = 100;
 
-/// Block height at which the payout proposal switches from per-`miner_id`
-/// grouping to per-`payout_address` grouping.
+/// Block height at which the payout proposal switches from per-`miner_id` grouping to
+/// per-`payout_address` grouping.
 ///
-/// Below this height: a user running N workers under one address takes
-/// N coinbase output slots. At/above this height: their unpaid work is
-/// summed across workers and they take ONE slot — freeing the rest for
-/// other miners.
+/// Below this height: a user running N workers under one address takes N coinbase output
+/// slots. At/above this height: their unpaid work is summed across workers and they take
+/// ONE slot — freeing the rest for other miners.
 ///
-/// This is a BFT-voted payout calculation. If any node uses a different
-/// algorithm than its peers, its proposal diverges and never reaches the
-/// 67 % supermajority. Baking the activation as a block-height gate (not
-/// a feature flag) means every node — old binary or new — makes the same
-/// decision at the same block. Mixed-version mesh stays compatible
-/// because both code paths exist in the new code; old binaries keep
-/// running their original logic until they're replaced.
+/// This is a BFT-voted payout calculation. If any node uses a different algorithm than its
+/// peers, its proposal diverges and never reaches the 67 % supermajority. Baking the
+/// activation as a block-height gate (not a feature flag) means every node makes the same
+/// decision at the same block. See `tasks/plan_payout_address_grouping.md` for the rollout.
 ///
-/// Pick a value comfortably past the deploy window (≈24 h ≈ 144 blocks)
-/// so all 4 VMs cohort the new binary before the chain crosses the gate.
-/// See `tasks/plan_payout_address_grouping.md` for the full rollout.
-pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
+/// Defined in the library so that the proposer and the GHOST-02 validator — which must
+/// group the ledger identically — cannot drift apart. Re-exported here for the binary.
+use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
 
 /// Trailing window for the per-node realized hashrate gossiped in health pings
 /// and summed into the mesh-wide pool total. 10 minutes smooths small-miner
@@ -5839,43 +5834,10 @@ async fn main() -> Result<()> {
     // only if its split matches what THIS node recomputes from its own converged
     // share ledger (GHOST-03) and converged payout addresses (Option A).
     {
-        let ph = Arc::clone(&payout_handler);
-        let rm = Arc::clone(&round_manager);
-        let db_for_validator = Arc::clone(&db);
-        let validator: ghost_consensus::vote_handler::ProposalValidateFn = Arc::new(
-            move |proposal: &ghost_common::types::PayoutProposal| {
-                let local_work = rm.get_miner_work_scaled(proposal.round_id);
-                let treasury_state = match db_for_validator.get_treasury_balance() {
-                    Ok(balance) => {
-                        let threshold_ts = db_for_validator
-                            .get_treasury_threshold_reached()
-                            .ok()
-                            .flatten()
-                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-                            .map(|dt| dt.with_timezone(&chrono::Utc));
-                        TreasuryState::from_stored(balance, threshold_ts)
-                    }
-                    Err(_) => TreasuryState::new(),
-                };
-                let result = ph.validate_proposal_split(proposal, &local_work, &treasury_state);
-                // GATED on CLUSTER_ENFORCEMENT_HEIGHT: pre-activation the fleet's
-                // ledgers/addresses haven't fully converged (old nodes don't sign
-                // or converge), so a recompute mismatch is expected and must NOT
-                // block consensus. We still recompute and log it for visibility,
-                // and only enforce (reject) once the gate fires fleet-wide.
-                if proposal.block_height >= ghost_pool::CLUSTER_ENFORCEMENT_HEIGHT {
-                    result
-                } else {
-                    if let Err(reason) = &result {
-                        tracing::warn!(
-                            reason = %reason,
-                            height = proposal.block_height,
-                            "GHOST-02 (pre-gate): split mismatch — would reject after CLUSTER_ENFORCEMENT_HEIGHT"
-                        );
-                    }
-                    Ok(())
-                }
-            },
+        let validator = ghost_pool::payout::make_proposal_validator(
+            Arc::clone(&payout_handler),
+            Arc::clone(&db),
+            ghost_pool::CLUSTER_ENFORCEMENT_HEIGHT,
         );
         vote_handler.set_proposal_validator(validator);
     }
@@ -6580,85 +6542,44 @@ async fn main() -> Result<()> {
                 // Pool mode: ledger-style proportional distribution.
                 //
                 // Unpaid shares accumulate across rounds on each miner's
-                // ledger. When a block is found we take the top 1000
-                // unpaid contributors, iteratively dust-filter them so
-                // every coinbase output is ≥546 sats, and commit the
-                // survivors to the next block's coinbase. Miners below
-                // the dust line (or outside the 1000 cap) keep their
-                // ledger intact and compete again next block.
-                let miner_work = {
-                    use ghost_accounting::shares::WORK_SCALE;
-                    // Cutoff = now, expressed in Unix seconds. Shares
-                    // arriving after this moment belong to the next
-                    // block's ledger and aren't swept.
-                    let cutoff_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                    const LEDGER_CAP: u32 = 1000;
-                    const DUST_SATS: u64 = 546;
+                // ledger. When a block is found we sweep the whole unpaid
+                // ledger up to `cutoff_ts` — top 1000 contributors,
+                // iteratively dust-filtered so every coinbase output is
+                // ≥546 sats — and commit the survivors to the next block's
+                // coinbase. Miners below the dust line (or outside the
+                // 1000 cap) keep their ledger and compete again next block.
+                //
+                // GHOST-02: this MUST go through `select_ledger_miner_work`,
+                // the same function every validator recomputes with. The
+                // cutoff travels on the proposal (as its timestamp) so that
+                // validators reproduce this exact window; a split either side
+                // derives any other way is rejected on exact-equality.
+                //
+                // Shares arriving after this moment belong to the next
+                // block's ledger and aren't swept.
+                let cutoff_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
 
-                    // Below PAYOUT_ADDRESS_GROUPING_HEIGHT we group by
-                    // miner_id (per-worker, legacy). At/above the gate we
-                    // group by payout_address so a multi-rig user takes
-                    // one slot instead of N. Both paths feed the same
-                    // (String, f64) tuple list into the dust filter
-                    // below — the String is just a miner_id pre-gate or
-                    // an address post-gate. The downstream proposal
-                    // handler treats the string as the payout target
-                    // either way (a miner_id is `<addr>.<worker>`, the
-                    // address derives from there; an address is itself).
-                    let raw: Vec<(String, f64)> =
-                        if height >= PAYOUT_ADDRESS_GROUPING_HEIGHT {
-                            db_for_bf
-                                .get_top_unpaid_addresses(cutoff_ts, LEDGER_CAP)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|(addr, work, _ids)| (addr, work))
-                                .collect()
-                        } else {
-                            db_for_bf
-                                .get_top_unpaid_miners(cutoff_ts, LEDGER_CAP)
-                                .unwrap_or_default()
-                        };
-
-                    if raw.is_empty() {
-                        warn!(
+                // No round-tracker fallback here, deliberately: a validator has no
+                // way to know the proposer fell back, so it would recompute from the
+                // ledger and reject the split. An empty ledger means nobody is owed —
+                // `handle_block_found` then skips submission and the shares (if any
+                // are merely late to persist) are swept by the next block instead.
+                let miner_work = match ghost_pool::payout::select_ledger_miner_work(
+                    &db_for_bf, cutoff_ts, height, subsidy,
+                ) {
+                    Ok(work) => work,
+                    Err(e) => {
+                        error!(
                             round = round_id,
                             cutoff_ts,
-                            "No unpaid ledger entries at block-found; falling back to in-memory round tracker"
+                            error = %e,
+                            "Failed to read unpaid ledger at block-found; no miner payout \
+                             this block — unpaid shares roll forward to the next"
                         );
-                        rm_for_bf.get_miner_work_scaled(round_id)
-                    } else {
-                        // Iteratively drop miners whose projected payout
-                        // would fall below dust. Each drop increases the
-                        // per-sat share for everyone remaining, which can
-                        // pull someone else above the dust line, hence
-                        // the loop. Terminates because each iteration
-                        // strictly reduces the candidate set.
-                        let miner_pool_estimate =
-                            (subsidy as u128).saturating_mul(9900) / 10000; // 99% of subsidy
-                        let mut surviving: Vec<(String, f64)> = raw;
-                        loop {
-                            let total_work: f64 = surviving.iter().map(|(_, w)| *w).sum();
-                            if total_work <= 0.0 {
-                                break;
-                            }
-                            let pre_len = surviving.len();
-                            surviving.retain(|(_, work)| {
-                                let projected =
-                                    (miner_pool_estimate as f64 * work / total_work) as u64;
-                                projected >= DUST_SATS
-                            });
-                            if surviving.len() == pre_len {
-                                break;
-                            }
-                        }
-
-                        surviving
-                            .into_iter()
-                            .map(|(id, w)| (id, (w * WORK_SCALE as f64) as u128))
-                            .collect()
+                        Vec::new()
                     }
                 };
 
@@ -6667,6 +6588,7 @@ async fn main() -> Result<()> {
 
                 let block_data = BlockFoundData {
                     round_id,
+                    ledger_cutoff_ts: cutoff_ts,
                     block_hash,
                     block_height: height,
                     block_timestamp: chrono::Utc::now(),
@@ -6797,29 +6719,31 @@ async fn main() -> Result<()> {
                         }
                     }
                 } else {
-                    // Pool mode: proportional distribution to all miners
-                    let miner_work = {
-                        use ghost_accounting::shares::WORK_SCALE;
-                        let db_work = db_for_block.get_round_miners(round_id).unwrap_or_default();
-                        let db_work = if db_work.is_empty() && round_id > 0 {
-                            db_for_block
-                                .get_round_miners(round_id - 1)
-                                .unwrap_or_default()
-                        } else {
-                            db_work
-                        };
-                        if db_work.is_empty() {
-                            warn!(
+                    // Pool mode: ledger-style proportional distribution.
+                    //
+                    // GHOST-02: the unpaid ledger, NOT this round's work. Every proposal
+                    // path must derive its split the same way the validators recompute it
+                    // (`select_ledger_miner_work`), or the fleet rejects its own payout.
+                    let cutoff_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let miner_work = match ghost_pool::payout::select_ledger_miner_work(
+                        &db_for_block,
+                        cutoff_ts,
+                        height,
+                        subsidy,
+                    ) {
+                        Ok(work) => work,
+                        Err(e) => {
+                            error!(
                                 round = round_id,
-                                "No miner work in DB, falling back to in-memory data"
+                                cutoff_ts,
+                                error = %e,
+                                "Failed to read unpaid ledger at block-found; no miner payout \
+                                 this block — unpaid shares roll forward to the next"
                             );
-                            rm_for_block.get_miner_work_scaled(round_id)
-                        } else {
-                            db_work
-                                .into_iter()
-                                .take(200)
-                                .map(|(id, w)| (id, (w * WORK_SCALE as f64) as u128))
-                                .collect()
+                            Vec::new()
                         }
                     };
 
@@ -6828,6 +6752,7 @@ async fn main() -> Result<()> {
 
                     let block_data = BlockFoundData {
                         round_id,
+                        ledger_cutoff_ts: cutoff_ts,
                         block_hash: info.block_hash,
                         block_height: height,
                         block_timestamp: chrono::Utc::now(),
@@ -8354,31 +8279,33 @@ async fn main() -> Result<()> {
                             }
                         }
                     } else {
-                        // Pool mode: proportional distribution to all miners
-                        // Query miner work from database (source of truth, not ephemeral memory)
+                        // Pool mode: ledger-style proportional distribution.
+                        // Shares arriving after this moment belong to the next block's ledger.
+                        let cutoff_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
                         let miner_work = {
-                            use ghost_accounting::shares::WORK_SCALE;
-                            let db_work =
-                                db_for_events.get_round_miners(round_id).unwrap_or_default();
-                            let db_work = if db_work.is_empty() && round_id > 0 {
-                                db_for_events
-                                    .get_round_miners(round_id - 1)
-                                    .unwrap_or_default()
-                            } else {
-                                db_work
-                            };
-                            if db_work.is_empty() {
-                                warn!(
-                                    round = round_id,
-                                    "No miner work in DB, falling back to in-memory data"
-                                );
-                                rm_for_events.get_miner_work_scaled(round_id)
-                            } else {
-                                db_work
-                                    .into_iter()
-                                    .take(200)
-                                    .map(|(id, w)| (id, (w * WORK_SCALE as f64) as u128))
-                                    .collect()
+                            // GHOST-02: the unpaid ledger, NOT this round's work. Every
+                            // proposal path must derive its split the same way validators
+                            // recompute it, or the fleet rejects its own payout.
+                            match ghost_pool::payout::select_ledger_miner_work(
+                                &db_for_events,
+                                cutoff_ts,
+                                height,
+                                subsidy,
+                            ) {
+                                Ok(work) => work,
+                                Err(e) => {
+                                    error!(
+                                        round = round_id,
+                                        cutoff_ts,
+                                        error = %e,
+                                        "Failed to read unpaid ledger at block-found; no miner \
+                                         payout this block — unpaid shares roll forward"
+                                    );
+                                    Vec::new()
+                                }
                             }
                         };
                         let winning_node_id = identity_for_events.node_id();
@@ -8389,6 +8316,7 @@ async fn main() -> Result<()> {
 
                         let block_data = BlockFoundData {
                             round_id,
+                            ledger_cutoff_ts: cutoff_ts,
                             block_hash,
                             block_height: height,
                             block_timestamp: chrono::Utc::now(),

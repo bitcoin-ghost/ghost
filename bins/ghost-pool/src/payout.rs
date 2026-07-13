@@ -105,11 +105,148 @@ impl PayoutConfig {
     }
 }
 
+/// Maximum number of unpaid contributors swept into a single block's payout.
+pub const LEDGER_CAP: u32 = 1000;
+
+/// Projected payouts below this are dropped and redirected to the node reward pool.
+pub const LEDGER_DUST_SATS: u64 = 546;
+
+/// Select the miner work set that a block's payout is computed from.
+///
+/// GHOST-02: this is the SINGLE SOURCE OF TRUTH for "which shares does this block pay?".
+/// The proposer calls it at block-found; every validating node calls it again to recompute
+/// the split. Both MUST derive the identical set, because `validate_proposal_split` compares
+/// the resulting address→amount maps for exact equality — so any divergence between the two
+/// call sites is a consensus rejection, not a rounding difference.
+///
+/// That is why the cutoff is a parameter rather than `now`: the validator recomputes long
+/// after the proposer did, and must reproduce the proposer's exact window. It is carried on
+/// the proposal as `PayoutProposal::timestamp` (set from `BlockFoundData::ledger_cutoff_ts`).
+///
+/// Payout is ledger-style, not round-style: unpaid shares accumulate across job-rounds, and
+/// a block sweeps the whole unpaid ledger up to `cutoff_ts` — NOT merely the shares of the
+/// ~90s round the block happened to land in. Miners dropped by the cap or the dust filter
+/// keep their unpaid work and compete again on the next block.
+pub fn select_ledger_miner_work(
+    db: &ghost_storage::Database,
+    cutoff_ts: i64,
+    block_height: u64,
+    subsidy_sats: u64,
+) -> GhostResult<Vec<(String, u128)>> {
+    use ghost_accounting::shares::WORK_SCALE;
+
+    // Below the grouping gate the ledger keys on miner_id (per-worker, legacy); at and above
+    // it keys on payout_address. The string is a miner_id pre-gate and an address post-gate;
+    // `get_miner_address` resolves either.
+    let raw: Vec<(String, f64)> = if block_height >= crate::PAYOUT_ADDRESS_GROUPING_HEIGHT {
+        db.get_top_unpaid_addresses(cutoff_ts, LEDGER_CAP)?
+            .into_iter()
+            .map(|(addr, work, _ids)| (addr, work))
+            .collect()
+    } else {
+        db.get_top_unpaid_miners(cutoff_ts, LEDGER_CAP)?
+    };
+
+    // Iteratively drop miners whose projected payout would fall below dust. Each drop raises
+    // the per-sat share of everyone remaining, which can pull someone else above the dust
+    // line — hence the loop. It terminates because each pass strictly shrinks the set.
+    let miner_pool_estimate = (subsidy_sats as u128).saturating_mul(9900) / 10000; // 99% of subsidy
+    let mut surviving = raw;
+    loop {
+        let total_work: f64 = surviving.iter().map(|(_, w)| *w).sum();
+        if total_work <= 0.0 {
+            break;
+        }
+        let pre_len = surviving.len();
+        surviving.retain(|(_, work)| {
+            let projected = (miner_pool_estimate as f64 * work / total_work) as u64;
+            projected >= LEDGER_DUST_SATS
+        });
+        if surviving.len() == pre_len {
+            break;
+        }
+    }
+
+    Ok(surviving
+        .into_iter()
+        .map(|(id, w)| (id, (w * WORK_SCALE as f64) as u128))
+        .collect())
+}
+
+/// Build the GHOST-02 proposal validator that every node installs on its vote handler.
+///
+/// A peer's payout proposal is vote-approved only if its split matches what THIS node
+/// recomputes from its own converged share ledger (GHOST-03) and payout addresses.
+///
+/// This lives in the library, not in `main.rs`, ON PURPOSE. It is the only thing standing
+/// between an honest proposal and a rejected payout, and it previously recomputed from
+/// `RoundManager::get_miner_work_scaled(proposal.round_id)` — the work of the single ~90s
+/// job-round the block landed in — while the proposer built the split from the cross-round
+/// unpaid ledger. The two could never match, so the fleet would have rejected its own payout
+/// on the first block it won. That bug was invisible for exactly one reason: as an inline
+/// closure in a binary, no test could reach it. Keep it here, and keep it tested.
+///
+/// `enforcement_height` gates rejection (see `CLUSTER_ENFORCEMENT_HEIGHT`): below it a
+/// mismatch is logged but tolerated, because a mixed-version fleet has not converged yet.
+pub fn make_proposal_validator(
+    handler: Arc<PayoutHandler>,
+    db: Arc<ghost_storage::Database>,
+    enforcement_height: u64,
+) -> ghost_consensus::vote_handler::ProposalValidateFn {
+    Arc::new(move |proposal: &PayoutProposal| {
+        // Recompute from the UNPAID LEDGER, over the proposer's exact window — the same
+        // source and cutoff the proposer used. The cutoff rides on `proposal.timestamp`.
+        let local_work = match select_ledger_miner_work(
+            &db,
+            proposal.timestamp as i64,
+            proposal.block_height,
+            proposal.subsidy,
+        ) {
+            Ok(work) => work,
+            Err(e) => return Err(format!("GHOST-02: local ledger recompute failed: {e}")),
+        };
+
+        let treasury_state = match db.get_treasury_balance() {
+            Ok(balance) => {
+                let threshold_ts = db
+                    .get_treasury_threshold_reached()
+                    .ok()
+                    .flatten()
+                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                TreasuryState::from_stored(balance, threshold_ts)
+            }
+            Err(_) => TreasuryState::new(),
+        };
+
+        let result = handler.validate_proposal_split(proposal, &local_work, &treasury_state);
+
+        if proposal.block_height >= enforcement_height {
+            result
+        } else {
+            if let Err(reason) = &result {
+                warn!(
+                    reason = %reason,
+                    height = proposal.block_height,
+                    "GHOST-02 (pre-gate): split mismatch — would reject after enforcement height"
+                );
+            }
+            Ok(())
+        }
+    })
+}
+
 /// Data needed to create a payout proposal
 #[derive(Debug, Clone)]
 pub struct BlockFoundData {
     /// Round ID
     pub round_id: RoundId,
+    /// GHOST-02: the unpaid-ledger cutoff this proposal's split was computed against.
+    ///
+    /// Carried onto the proposal as `PayoutProposal::timestamp` so that validators
+    /// recompute over the proposer's exact window. Deriving it afresh (`now`) on either
+    /// side would sweep in shares the other never saw and fail the exact-equality check.
+    pub ledger_cutoff_ts: i64,
     /// Block hash (from the found share)
     pub block_hash: [u8; 32],
     /// Block height
@@ -257,7 +394,12 @@ impl PayoutProposalCreator {
             data.tx_fees_sats,
         )?;
 
-        let now = chrono::Utc::now().timestamp() as u64;
+        // GHOST-02: stamp the proposal with the ledger cutoff its split was actually computed
+        // against — NOT `now`. Validators recompute the split from this timestamp, so it must
+        // name the proposer's exact window. Re-deriving `now` here would place the stamp after
+        // the cutoff (the ledger query and dust filter take time), letting validators sweep in
+        // shares the proposer never counted and fail the exact-equality check.
+        let now = data.ledger_cutoff_ts as u64;
 
         // Calculate fee distribution using treasury decay schedule
         // M-5 SECURITY: Use block_timestamp for deterministic decay calculation
@@ -1618,6 +1760,231 @@ mod tests {
         );
     }
 
+    // ---- GHOST-02: the proposer and the validator must agree on WHICH shares pay ----
+    //
+    // The proposer (main.rs block-found) builds the miner split from the cross-round
+    // UNPAID LEDGER (`get_top_unpaid_addresses`, cap 1000, dust-filtered). The GHOST-02
+    // validator recomputes it from `rm.get_miner_work_scaled(proposal.round_id)` — the
+    // in-memory work of the single ~90s job-round the block happened to land in.
+    //
+    // Rounds rotate per template refresh, so a round holds a sliver of the ledger. The two
+    // sets cannot be equal, and `validate_proposal_split` demands exact equality — so an
+    // honest proposal from an honest proposer is rejected by every honest validator. Past
+    // CLUSTER_ENFORCEMENT_HEIGHT that rejection is enforced, not merely logged.
+
+    const LEDGER_ROUNDS: u64 = 5;
+    const SHARES_PER_ROUND: usize = 4;
+
+    /// A real, checksum-valid P2WPKH address, derived deterministically from `seed`.
+    /// Regtest, to satisfy the C-02 `require_network` check against the test config.
+    fn payout_addr(seed: u8) -> String {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("secret key");
+        let pk = bitcoin::PublicKey::new(sk.public_key(&secp));
+        let cpk = bitcoin::CompressedPublicKey::try_from(pk).expect("compressed pubkey");
+        bitcoin::Address::p2wpkh(&cpk, bitcoin::Network::Regtest).to_string()
+    }
+
+    /// A spendable P2WPKH scriptPubKey: OP_0 PUSH20 <hash160>.
+    fn treasury_script() -> Vec<u8> {
+        let mut script = vec![0x00, 0x14];
+        script.extend_from_slice(&[0x11u8; 20]);
+        script
+    }
+
+    fn ledger_creator() -> (PayoutProposalCreator, Arc<ghost_storage::Database>) {
+        let config = PayoutConfig {
+            treasury_address: Some(treasury_script()),
+            network: ghost_common::config::BitcoinNetwork::Regtest,
+            ..Default::default()
+        };
+        let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
+        let creator = PayoutProposalCreator::new(test_identity(), config, Arc::clone(&db))
+            .expect("creator");
+        (creator, db)
+    }
+
+    /// The per-miner shape of a realistic unpaid ledger: `(work_per_share, last_round)`.
+    ///
+    /// This mirrors production, where the `miners` table holds far more miners than are
+    /// active in any single ~90s round. `carol` has the largest unpaid balance but has
+    /// submitted nothing recently — she is absent from the winning round entirely, while
+    /// still being owed by the ledger. `alice` and `bob` also carry different per-round
+    /// weights than their ledger weights, so the proportions diverge too.
+    const LEDGER_MINERS: [(f64, u64); 3] = [
+        (1_000.0, LEDGER_ROUNDS), // alice — still hashing in the winning round
+        (2_000.0, LEDGER_ROUNDS), // bob   — still hashing in the winning round
+        (5_000.0, 3),             // carol — went idle after round 3, still owed
+    ];
+
+    /// Seeds miners whose unpaid shares span several job-rounds. Returns their addresses.
+    fn seed_unpaid_ledger(db: &ghost_storage::Database, now: i64) -> Vec<String> {
+        let addrs: Vec<String> = (1..=3u8).map(payout_addr).collect();
+        for (i, addr) in addrs.iter().enumerate() {
+            let (work, last_round) = LEDGER_MINERS[i];
+            let miner_id = format!("{addr}.w{}", i + 1);
+            db.upsert_miner(&ghost_storage::MinerRecord {
+                miner_id: miner_id.clone(),
+                payout_address: addr.clone(),
+                first_seen: now - 1_000,
+                last_seen: now,
+                connected_node: None,
+                total_shares: 0,
+                total_work: 0.0,
+                blocks_won: 0,
+                total_payouts_sats: 0,
+                avg_hashrate_ths: 0.0,
+            })
+            .expect("upsert miner");
+
+            for round_id in 1..=last_round {
+                for k in 0..SHARES_PER_ROUND {
+                    db.insert_share(&ghost_storage::ShareRecord {
+                        id: None,
+                        round_id,
+                        miner_id: miner_id.clone(),
+                        difficulty: work,
+                        work,
+                        share_hash: format!("share-{i}-{round_id}-{k}"),
+                        timestamp: now - 600 + (round_id as i64 * 90) + k as i64,
+                        received_by: "node-a".to_string(),
+                        valid: true,
+                    })
+                    .expect("insert share");
+                }
+            }
+        }
+        addrs
+    }
+
+    /// What `RoundManager::get_miner_work_scaled(round_id)` holds for the winning round:
+    /// only the miners who submitted a share *in that ~90s round*, keyed by miner_id.
+    fn winning_round_work(addrs: &[String]) -> Vec<(String, u128)> {
+        use ghost_accounting::shares::WORK_SCALE;
+        addrs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| LEDGER_MINERS[*i].1 >= LEDGER_ROUNDS)
+            .map(|(i, addr)| {
+                let miner_id = format!("{addr}.w{}", i + 1);
+                let work = LEDGER_MINERS[i].0 * SHARES_PER_ROUND as f64;
+                (miner_id, (work * WORK_SCALE as f64) as u128)
+            })
+            .collect()
+    }
+
+    /// Post-grouping-gate height, as production is.
+    const LEDGER_TEST_HEIGHT: u64 = 957_896;
+    const LEDGER_TEST_SUBSIDY: u64 = 312_500_000;
+
+    /// Builds the proposal exactly as the proposer does at block-found: split derived from
+    /// the unpaid ledger via `select_ledger_miner_work`, cutoff carried onto the proposal.
+    fn ledger_proposal(
+        creator: &PayoutProposalCreator,
+        db: &ghost_storage::Database,
+        addrs: &[String],
+        cutoff_ts: i64,
+    ) -> PayoutProposal {
+        let miner_work =
+            select_ledger_miner_work(db, cutoff_ts, LEDGER_TEST_HEIGHT, LEDGER_TEST_SUBSIDY)
+                .expect("ledger work");
+        assert_eq!(
+            miner_work.len(),
+            3,
+            "all three miners carry unpaid work across rounds"
+        );
+
+        creator
+            .create_proposal(BlockFoundData {
+                round_id: LEDGER_ROUNDS,
+                ledger_cutoff_ts: cutoff_ts,
+                block_hash: [7u8; 32],
+                block_height: LEDGER_TEST_HEIGHT,
+                block_timestamp: chrono::DateTime::from_timestamp(cutoff_ts, 0).expect("ts"),
+                winning_miner_id: "pool".to_string(),
+                winning_miner_payout_address: Some(addrs[0].to_string()),
+                treasury_address_snapshot: Some(treasury_script()),
+                winning_node_id: [9u8; 32],
+                subsidy_sats: LEDGER_TEST_SUBSIDY,
+                tx_fees_sats: 0,
+                miner_work,
+                node_shares: vec![],
+                treasury_state: TreasuryState::new(),
+            })
+            .expect("create proposal")
+    }
+
+    /// The fix: a validator recomputing from the unpaid ledger — over the cutoff the
+    /// proposal carries — reproduces the proposer's split exactly and approves it.
+    #[test]
+    fn ghost02_ledger_proposal_survives_validator_recompute() {
+        let (creator, db) = ledger_creator();
+        let now = 1_800_000_000i64;
+        let addrs = seed_unpaid_ledger(&db, now);
+
+        let proposal = ledger_proposal(&creator, &db, &addrs, now);
+        assert!(
+            !proposal.miner_payouts.is_empty(),
+            "the ledger-built proposal pays the miners"
+        );
+        assert_eq!(
+            proposal.timestamp as i64, now,
+            "the proposal must carry the ledger cutoff its split was computed against, \
+             so validators can reproduce the proposer's exact window"
+        );
+
+        // What a validating node recomputes (main.rs GHOST-02 validator): same function,
+        // same source, cutoff taken from the proposal.
+        let local_work = select_ledger_miner_work(
+            &db,
+            proposal.timestamp as i64,
+            proposal.block_height,
+            proposal.subsidy,
+        )
+        .expect("validator recompute");
+
+        let ts = TreasuryState::new();
+        assert!(
+            creator
+                .validate_proposal_split(&proposal, &local_work, &ts)
+                .is_ok(),
+            "GHOST-02: an honest ledger-built proposal must survive an honest node's \
+             recompute — if this fails, the fleet rejects its own payout and the coinbase \
+             falls back to paying pool_payout_address alone"
+        );
+    }
+
+    /// Regression pin: recomputing from the winning job-round — what the validator used to
+    /// do — rejects the pool's own honest proposal. This is the bug the fix removes; if a
+    /// future change reintroduces a round-scoped recompute, this test starts failing.
+    #[test]
+    fn ghost02_round_scoped_recompute_rejects_honest_ledger_proposal() {
+        let (creator, db) = ledger_creator();
+        let now = 1_800_000_000i64;
+        let addrs = seed_unpaid_ledger(&db, now);
+
+        let proposal = ledger_proposal(&creator, &db, &addrs, now);
+
+        // `rm.get_miner_work_scaled(proposal.round_id)`: only the winning ~90s round.
+        // Carol is owed by the ledger but idle during that round, so she vanishes here.
+        let round_work = winning_round_work(&addrs);
+        assert_eq!(
+            round_work.len(),
+            2,
+            "the winning round only saw the two still-active miners"
+        );
+
+        let ts = TreasuryState::new();
+        assert!(
+            creator
+                .validate_proposal_split(&proposal, &round_work, &ts)
+                .is_err(),
+            "a round-scoped recompute cannot reproduce a ledger-built split — this is \
+             precisely why the validator must not use the round"
+        );
+    }
+
     #[test]
     fn test_payout_config_default() {
         let config = PayoutConfig::default();
@@ -1678,6 +2045,7 @@ mod tests {
     fn test_block_found_data() {
         let data = BlockFoundData {
             round_id: 1,
+            ledger_cutoff_ts: 1_800_000_000,
             block_hash: [0u8; 32],
             block_height: 800_000,
             block_timestamp: chrono::Utc::now(),
@@ -1713,6 +2081,7 @@ mod tests {
 
         let data = BlockFoundData {
             round_id: 1,
+            ledger_cutoff_ts: now.timestamp(),
             block_hash: [0u8; 32],
             block_height: 800_000,
             block_timestamp: now,

@@ -103,6 +103,14 @@ pub mod convergence;
 /// and rebuild — the binary must reach every VM while still below the gate.
 pub const CLUSTER_ENFORCEMENT_HEIGHT: u64 = 955_200;
 
+/// At and above this height the payout ledger is grouped by payout address rather
+/// than by miner_id, so a multi-rig operator takes one coinbase output instead of N.
+///
+/// This lives here, not in `main.rs`, because BOTH the proposer (block-found) and the
+/// GHOST-02 validator must group the ledger the same way. A validator that grouped
+/// differently from the proposer would reject an honest split.
+pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
+
 /// GhostGlyph P2P handler for visual identity registration.
 pub mod glyph_handler;
 
