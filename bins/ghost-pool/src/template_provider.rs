@@ -895,6 +895,9 @@ async fn handle_submit_solution(
     template_processor.notify_block_submitted(crate::template::BlockSubmittedInfo {
         block_hash: block_hash_display,
         height: work_state.height,
+        // The payout this block's coinbase actually pays — the snapshot the template was built
+        // against, not whatever happens to be approved by the time the notification lands.
+        payout_snapshot: work_state.payout_snapshot,
     });
 
     info!(

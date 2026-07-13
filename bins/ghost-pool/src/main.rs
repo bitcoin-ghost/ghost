@@ -2839,7 +2839,6 @@ async fn main() -> Result<()> {
 
     // Create execute callback for consensus decisions
     let tp_for_execute = Arc::clone(&template_processor);
-    let db_for_execute = Arc::clone(&db);
     let execute_fn: ExecuteFn = Arc::new(move |result: ConsensusResult| {
         match result {
             ConsensusResult::Approved {
@@ -2856,128 +2855,14 @@ async fn main() -> Result<()> {
                 // Store approved payout for coinbase construction
                 tp_for_execute.set_approved_payout(proposal_hash);
 
-                // Ledger mark-paid: every consensus-approving node updates
-                // its local shares table so paid miners' unpaid work stops
-                // counting toward the next block's payout. recipient_id in
-                // the proposal is SHA-256(miner_id), so we reverse-lookup
-                // by hashing each locally-known unpaid miner_id and
-                // matching against the proposal's recipient set. Keeps
-                // all nodes' ledgers in sync without changing the
-                // PayoutProposal wire format.
-                if let Some(proposal) = tp_for_execute.get_proposal(&proposal_hash) {
-                    let db_mark = Arc::clone(&db_for_execute);
-                    let cutoff_ts = proposal.timestamp as i64;
-                    let wanted: std::collections::HashSet<[u8; 32]> = proposal
-                        .miner_payouts
-                        .iter()
-                        .map(|e| e.recipient_id)
-                        .collect();
-                    let treasury_amount = proposal.treasury_amount;
-                    // Use the proposal's block height as the gate input so
-                    // every approving node makes the same pre/post-gate
-                    // decision regardless of when the consensus message
-                    // arrives. (We can't trust local tip height — it
-                    // races with mesh-relayed proposals.)
-                    let proposal_height = proposal.block_height;
-                    tokio::spawn(async move {
-                        // (a) Mark paid: reverse-resolve each PayoutEntry's
-                        // recipient_id hash back to local miner_id strings.
-                        //
-                        // Pre-PAYOUT_ADDRESS_GROUPING_HEIGHT — recipient_id
-                        // is sha256(miner_id), one entry per worker. Match
-                        // unpaid miner_ids by hash and pass directly to
-                        // mark_miners_paid.
-                        //
-                        // Post-gate — recipient_id is sha256(payout_address),
-                        // one entry per address. We have to fan out: hash
-                        // every distinct unpaid miner's address, match
-                        // against the proposal's hash set, then resolve
-                        // those addresses back to ALL their miner_ids so
-                        // the per-share UPDATE catches every worker
-                        // belonging to a paid address.
-                        let matched: Vec<String> = if proposal_height
-                            >= PAYOUT_ADDRESS_GROUPING_HEIGHT
-                        {
-                            // Pull (addr, _, miner_ids) for every unpaid
-                            // address. u32::MAX limit because we want
-                            // the full unpaid set, not the top-1000 cut.
-                            let groups = match db_mark.get_top_unpaid_addresses(cutoff_ts, u32::MAX)
-                            {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Failed to list unpaid addresses for mark-paid");
-                                    return;
-                                }
-                            };
-                            let mut acc = Vec::new();
-                            for (addr, _work, miner_ids) in groups {
-                                let h = ghost_common::identity::hash_message(addr.as_bytes());
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(&h);
-                                if wanted.contains(&arr) {
-                                    acc.extend(miner_ids);
-                                }
-                            }
-                            acc
-                        } else {
-                            let distinct = match db_mark.get_distinct_unpaid_miner_ids(cutoff_ts) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Failed to list unpaid miners for mark-paid");
-                                    return;
-                                }
-                            };
-                            distinct
-                                .into_iter()
-                                .filter(|id| {
-                                    let h = ghost_common::identity::hash_message(id.as_bytes());
-                                    let mut arr = [0u8; 32];
-                                    arr.copy_from_slice(&h);
-                                    wanted.contains(&arr)
-                                })
-                                .collect()
-                        };
-                        match db_mark.mark_miners_paid(&proposal_hash, &matched, cutoff_ts) {
-                            Ok(n) => tracing::info!(
-                                shares_marked = n,
-                                miners = matched.len(),
-                                grouping = if proposal_height >= PAYOUT_ADDRESS_GROUPING_HEIGHT {
-                                    "address"
-                                } else {
-                                    "miner_id"
-                                },
-                                "Ledger: marked paid shares for approved proposal"
-                            ),
-                            Err(e) => tracing::error!(error = %e, "Ledger mark-paid failed"),
-                        }
-
-                        // (b) Bump treasury running total. Every approving
-                        // node applies the same delta against its local
-                        // kv_store so treasury balance stays in sync
-                        // across the mesh without needing extra gossip.
-                        if treasury_amount > 0 {
-                            match db_mark.add_treasury_funds(
-                                treasury_amount,
-                                ghost_reconciliation::fee_distribution::TREASURY_THRESHOLD_SATS,
-                            ) {
-                                Ok(crossed) => tracing::info!(
-                                    amount_sats = treasury_amount,
-                                    threshold_crossed = crossed,
-                                    "Treasury balance bumped from approved L1 payout"
-                                ),
-                                Err(e) => tracing::error!(
-                                    error = %e,
-                                    "Failed to bump treasury balance after payout approval"
-                                ),
-                            }
-                        }
-                    });
-                } else {
-                    tracing::warn!(
-                        hash = %hex::encode(&proposal_hash[..8]),
-                        "Approved proposal not found in local store; cannot mark shares paid"
-                    );
-                }
+                // NOTE: settling the ledger (mark-paid + treasury) deliberately does NOT
+                // happen here. Approval only ARMS the coinbase — the coins do not exist until a
+                // block carrying this snapshot is actually mined and accepted. Settling on
+                // approval marked a miner's work paid before a satoshi had moved, and if the
+                // pool never won again that work stayed marked paid and never paid.
+                //
+                // The ledger is settled in the block-accepted path, keyed on the winning block's
+                // `payout_snapshot`, via `payout::settle_paid_block`.
 
                 // Refresh template to include approved payout in coinbase
                 // This is the "1 block behind" fix: when consensus approves the payout
@@ -6661,6 +6546,45 @@ async fn main() -> Result<()> {
                     solo_mode = is_solo_mode,
                     "Block submitted to Ghost Core, creating payout proposal..."
                 );
+
+                // SETTLE THE LEDGER — the coins now exist.
+                //
+                // This block's coinbase carries the payout named by the snapshot its template
+                // was built against, so THIS is the moment the miners in that payout are
+                // genuinely paid, and the only safe moment to mark their shares paid.
+                //
+                // Settling used to happen on consensus approval, which merely arms the coinbase
+                // of some future block. A `None` snapshot means this block paid the fallback
+                // coinbase and settles nothing.
+                if let Some(snapshot) = info.payout_snapshot {
+                    match tp_for_block.get_proposal(&snapshot) {
+                        Some(paid) => {
+                            if let Err(e) = ghost_pool::payout::settle_paid_block(
+                                &db_for_block,
+                                &paid,
+                                PAYOUT_ADDRESS_GROUPING_HEIGHT,
+                            ) {
+                                error!(
+                                    error = %e,
+                                    hash = %hex::encode(&snapshot[..8]),
+                                    "Failed to settle the ledger for a PAID block — its miners' \
+                                     shares remain unpaid and will be swept again next block"
+                                );
+                            }
+                        }
+                        None => error!(
+                            hash = %hex::encode(&snapshot[..8]),
+                            "Block paid a payout proposal we no longer hold; cannot settle the \
+                             ledger — those shares will be paid twice unless reconciled"
+                        ),
+                    }
+                } else {
+                    warn!(
+                        height = info.height,
+                        "Block carried the FALLBACK coinbase (no approved payout was armed when \
+                         its template was built) — the miners were not paid from this block"
+                    );
+                }
 
                 // Gather data for payout proposal
                 let node_shares = rm_for_block.get_node_shares(round_id);

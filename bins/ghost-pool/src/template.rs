@@ -101,6 +101,13 @@ pub struct BlockSubmittedInfo {
     pub block_hash: [u8; 32],
     /// Block height
     pub height: u64,
+    /// The approved payout whose outputs this block's coinbase actually carries, captured from
+    /// the WorkState the block was mined against.
+    ///
+    /// This is the ONLY safe trigger for settling the ledger. A payout is settled when the coins
+    /// exist — not when consensus approved it, because approval merely arms the coinbase of some
+    /// FUTURE block. `None` means this block paid the fallback coinbase and settles nothing.
+    pub payout_snapshot: Option<[u8; 32]>,
 }
 
 /// Type alias for coinbase build result:

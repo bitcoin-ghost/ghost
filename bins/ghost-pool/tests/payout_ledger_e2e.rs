@@ -43,6 +43,7 @@ use ghost_pool::payout::{
     make_proposal_validator, select_ledger_miner_work, BlockFoundData, PayoutConfig, PayoutHandler,
 };
 use ghost_pool::template::{TemplateConfig, TemplateProcessor};
+use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
 use ghost_pool::treasury::TreasuryState;
 use ghost_storage::{Database, MinerRecord, ShareRecord};
 use ghost_verification::qualification::QualifiedCapabilityProvider;
@@ -481,26 +482,30 @@ fn block_win_is_ratified_and_pays_every_miner_the_ledger_owes() {
         "coinbase value must equal subsidy + fees exactly"
     );
 
-    // --- The ledger advances: the shares just paid are marked, and nothing is left owing.
-    // This mirrors the execute_fn path taken on ConsensusResult::Approved.
-    let all_miner_ids: Vec<String> = miner_addrs()
-        .iter()
-        .enumerate()
-        .map(|(i, a)| format!("{a}.w{}", i + 1))
-        .collect();
-    node.db
-        .mark_miners_paid(
-            &proposal.proposal_hash,
-            &all_miner_ids,
-            proposal.timestamp as i64,
-        )
-        .expect("mark shares paid");
+    // --- Ratification alone must NOT settle the ledger.
+    //
+    // Approval only arms the coinbase; the coins appear when a block carrying this snapshot is
+    // won. Settling here would mark the miners' work paid before a satoshi had moved — and with
+    // payouts ratified at every tip, it would wipe the ledger every ~10 minutes while paying
+    // nobody. The shares must still be owed at this point.
+    let owed_after_ratification =
+        select_ledger_miner_work(&node.db, now, BLOCK_HEIGHT, SUBSIDY_SATS).expect("ledger");
+    assert_eq!(
+        owed_after_ratification.len(),
+        MINERS.len(),
+        "an approved-but-unpaid proposal must leave every share still owed — the ledger is \
+         settled when a block PAYS it, not when consensus approves it"
+    );
+
+    // --- The block is mined and accepted; its coinbase carries this payout. NOW settle.
+    ghost_pool::payout::settle_paid_block(&node.db, &proposal, PAYOUT_ADDRESS_GROUPING_HEIGHT)
+        .expect("settle the paid block");
 
     let still_unpaid =
         select_ledger_miner_work(&node.db, now, BLOCK_HEIGHT, SUBSIDY_SATS).expect("ledger");
     assert!(
         still_unpaid.is_empty(),
-        "every share swept into the payout must be marked paid — otherwise the next block \
+        "every share the accepted block paid must be marked paid — otherwise the next block \
          pays for the same work twice"
     );
 }
@@ -562,19 +567,12 @@ fn share_arriving_after_the_cutoff_does_not_break_ratification() {
     }
 
     // And the late share is still owed after this block is paid out.
-    let all_miner_ids: Vec<String> = miner_addrs()
-        .iter()
-        .enumerate()
-        .map(|(i, a)| format!("{a}.w{}", i + 1))
-        .collect();
-    nodes[0]
-        .db
-        .mark_miners_paid(
-            &proposal.proposal_hash,
-            &all_miner_ids,
-            proposal.timestamp as i64,
-        )
-        .expect("mark shares paid");
+    ghost_pool::payout::settle_paid_block(
+        &nodes[0].db,
+        &proposal,
+        PAYOUT_ADDRESS_GROUPING_HEIGHT,
+    )
+    .expect("settle the paid block");
 
     let still_owed = select_ledger_miner_work(&nodes[0].db, now + 60, BLOCK_HEIGHT, SUBSIDY_SATS)
         .expect("ledger");

@@ -236,6 +236,85 @@ pub fn make_proposal_validator(
     })
 }
 
+/// Settle a payout: mark its shares paid and bump the treasury.
+///
+/// CALL THIS ONLY WHEN THE COINS EXIST — i.e. when a block WE mined has been accepted and its
+/// coinbase carries `proposal`. It must never run merely because a proposal was approved.
+///
+/// Approval only ARMS the coinbase (`set_approved_payout`); the coins do not appear until a
+/// later block is actually won carrying that snapshot. Settling at approval time therefore
+/// marks a miner's work paid before a single satoshi has moved — and if the pool never wins
+/// again, that work is marked paid and never paid. With payouts ratified at every tip, settling
+/// on approval would wipe the ledger every ~10 minutes while paying nobody at all.
+///
+/// Returns the number of share rows marked paid.
+pub fn settle_paid_block(
+    db: &ghost_storage::Database,
+    proposal: &PayoutProposal,
+    grouping_height: u64,
+) -> GhostResult<usize> {
+    let cutoff_ts = proposal.timestamp as i64;
+    let wanted: std::collections::HashSet<[u8; 32]> = proposal
+        .miner_payouts
+        .iter()
+        .map(|e| e.recipient_id)
+        .collect();
+
+    // Reverse-resolve each PayoutEntry's recipient_id hash back to local miner_id strings.
+    //
+    // Pre-gate, recipient_id is sha256(miner_id) — one entry per worker, matched directly.
+    // Post-gate it is sha256(payout_address) — one entry per address, so we hash every unpaid
+    // miner's address, match against the proposal's set, then resolve those addresses back to
+    // ALL their miner_ids so the per-share UPDATE catches every worker under a paid address.
+    let matched: Vec<String> = if proposal.block_height >= grouping_height {
+        let groups = db.get_top_unpaid_addresses(cutoff_ts, u32::MAX)?;
+        let mut acc = Vec::new();
+        for (addr, _work, miner_ids) in groups {
+            let h = ghost_common::identity::hash_message(addr.as_bytes());
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&h);
+            if wanted.contains(&arr) {
+                acc.extend(miner_ids);
+            }
+        }
+        acc
+    } else {
+        db.get_distinct_unpaid_miner_ids(cutoff_ts)?
+            .into_iter()
+            .filter(|id| {
+                let h = ghost_common::identity::hash_message(id.as_bytes());
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&h);
+                wanted.contains(&arr)
+            })
+            .collect()
+    };
+
+    let marked = db.mark_miners_paid(&proposal.proposal_hash, &matched, cutoff_ts)?;
+
+    if proposal.treasury_amount > 0 {
+        match db.add_treasury_funds(
+            proposal.treasury_amount,
+            ghost_reconciliation::fee_distribution::TREASURY_THRESHOLD_SATS,
+        ) {
+            Ok(crossed) => info!(
+                amount_sats = proposal.treasury_amount,
+                threshold_crossed = crossed,
+                "Treasury balance bumped from a PAID block"
+            ),
+            Err(e) => error!(error = %e, "Failed to bump treasury balance after payment"),
+        }
+    }
+
+    info!(
+        shares_marked = marked,
+        miners = matched.len(),
+        height = proposal.block_height,
+        "Ledger settled: shares marked paid because a block carrying this payout was accepted"
+    );
+    Ok(marked)
+}
+
 /// Data needed to create a payout proposal
 #[derive(Debug, Clone)]
 pub struct BlockFoundData {
