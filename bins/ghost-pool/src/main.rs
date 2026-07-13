@@ -3220,12 +3220,42 @@ async fn main() -> Result<()> {
         let conv_tx = conv_tx.clone();
         tokio::spawn(async move {
             const CONVERGENCE_INTERVAL_SECS: u64 = 30;
+
+            // GHOST-03 ledger sweep. The round-scoped exchange only ever repairs the round in
+            // flight, and rounds rotate every ~90s with signed proofs pruned after 10 of them —
+            // so anything dropped outside a ~15-minute window was unrecoverable and the ledgers
+            // diverged permanently. Since the payout is computed from the unpaid ledger and
+            // GHOST-02 compares the split for EXACT equality, that divergence means every node
+            // rejects every payout with nothing able to repair it.
+            //
+            // So we also sweep the unpaid ledger in bounded windows, one bucket per tick,
+            // rotating back through `LEDGER_SWEEP_SPAN_SECS`. Bucketing keeps each advertisement
+            // a sane size; the rotation covers the whole span.
+            const LEDGER_BUCKET_SECS: i64 = 1_800; // 30 min per advertisement
+            const LEDGER_SWEEP_SPAN_SECS: i64 = 86_400; // sweep the last 24h
+            const LEDGER_BUCKETS: i64 = LEDGER_SWEEP_SPAN_SECS / LEDGER_BUCKET_SECS;
+
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
+            let mut bucket: i64 = 0;
+
             loop {
                 ticker.tick().await;
+
+                // Repair the round in flight (fast path for a share dropped seconds ago).
                 let round_id = rm_for_conv.current_round_id();
                 if let Ok(bytes) = conv_handler.request_bytes(round_id) {
+                    let _ = conv_tx.send(bytes).await;
+                }
+
+                // Repair one window of the unpaid ledger (the slow path that actually keeps the
+                // ledgers converged). A full sweep of the span takes LEDGER_BUCKETS ticks.
+                let now = chrono::Utc::now().timestamp();
+                let until = now - bucket * LEDGER_BUCKET_SECS;
+                let since = until - LEDGER_BUCKET_SECS;
+                bucket = (bucket + 1) % LEDGER_BUCKETS;
+
+                if let Ok(bytes) = conv_handler.ledger_request_bytes(since, until) {
                     let _ = conv_tx.send(bytes).await;
                 }
             }

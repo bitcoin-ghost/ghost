@@ -417,17 +417,18 @@ impl Database {
     /// This is what a node ADVERTISES during ledger convergence. Peers reply with the proofs
     /// for anything they hold that is absent from this list. Scoped to unpaid shares because
     /// those are precisely the ones a payout will be computed from.
-    pub fn unpaid_share_hashes_since(&self, since_ts: i64) -> GhostResult<Vec<String>> {
+    pub fn unpaid_share_hashes_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT share_hash FROM shares
-                     WHERE paid_in_proposal_hash IS NULL AND valid = 1 AND timestamp >= ?1
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                       AND timestamp >= ?1 AND timestamp < ?2
                      ORDER BY timestamp",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             let rows = stmt
-                .query_map(params![since_ts], |r| r.get::<_, String>(0))
+                .query_map(params![since_ts, until_ts], |r| r.get::<_, String>(0))
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             let mut out = Vec::new();
             for r in rows {
@@ -446,6 +447,7 @@ impl Database {
     pub fn unpaid_proofs_missing_from(
         &self,
         since_ts: i64,
+        until_ts: i64,
         theirs: &std::collections::HashSet<String>,
         limit: usize,
     ) -> GhostResult<(Vec<Vec<u8>>, usize)> {
@@ -453,12 +455,13 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT share_hash, proof FROM shares
-                     WHERE paid_in_proposal_hash IS NULL AND valid = 1 AND timestamp >= ?1
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                       AND timestamp >= ?1 AND timestamp < ?2
                      ORDER BY timestamp",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             let rows = stmt
-                .query_map(params![since_ts], |r| {
+                .query_map(params![since_ts, until_ts], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
                 })
                 .map_err(|e| GhostError::Database(e.to_string()))?;
