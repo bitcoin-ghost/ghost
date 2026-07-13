@@ -482,11 +482,12 @@ impl PayoutProposalCreator {
 
         // Calculate fee distribution using treasury decay schedule
         // M-5 SECURITY: Use block_timestamp for deterministic decay calculation
-        let fee_dist = FeeDistribution::calculate(
+        let fee_dist = FeeDistribution::calculate_at_height(
             data.subsidy_sats,
             data.tx_fees_sats,
             &data.treasury_state,
             data.block_timestamp,
+            data.block_height,
         );
 
         info!(
@@ -996,11 +997,12 @@ impl PayoutProposalCreator {
         let block_time =
             chrono::DateTime::<chrono::Utc>::from_timestamp(proposal.timestamp as i64, 0)
                 .unwrap_or_else(chrono::Utc::now);
-        let fee_dist = FeeDistribution::calculate(
+        let fee_dist = FeeDistribution::calculate_at_height(
             proposal.subsidy,
             proposal.tx_fees,
             treasury_state,
             block_time,
+            proposal.block_height,
         );
         let (expected, _dust) = self
             .calculate_miner_payouts(local_miner_work, fee_dist.miner_pool)

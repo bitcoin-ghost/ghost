@@ -584,6 +584,87 @@ fn share_arriving_after_the_cutoff_does_not_break_ratification() {
     assert!(paid_before > 0, "this block still paid the miners it owed");
 }
 
+/// Tip-change arming: the coinbase is ratified BEFORE a block is won, so the FIRST block the
+/// pool ever wins pays its miners.
+///
+/// A block's coinbase is fixed when its template is built, so it can only pay a payout that was
+/// already approved. Proposals used to be created only on block-found, so `approved_payout`
+/// always lagged one win behind — and starting from `None`, with the pool never having won, every
+/// template carried the fallback coinbase. The first block would have paid its whole subsidy to
+/// `pool_payout_address` and the miners nothing.
+///
+/// Two properties make tip-change ratification safe, and both are asserted here:
+///   * exactly ONE node proposes per tip (a deterministic rotation over the elder set), and
+///   * ratifying does NOT settle the ledger — the shares stay owed until a block pays them.
+#[test]
+fn tip_change_arms_the_coinbase_and_leaves_the_ledger_owed() {
+    let Some(rpc) = regtest_rpc() else {
+        eprintln!("SKIP: no regtest ghostd on 127.0.0.1:18443");
+        return;
+    };
+    let now = block_found_at();
+    let nodes = build_mesh(rpc, now, MESH_NODES);
+
+    // Every node computes the same proposer for a given height, with no coordination.
+    let elders_of = |n: &Node| -> Vec<[u8; 32]> {
+        let mut e: Vec<[u8; 32]> = n
+            .db
+            .get_mpc_elder_node_ids()
+            .expect("elders")
+            .into_iter()
+            .collect();
+        e.sort_unstable();
+        e
+    };
+    let reference = elders_of(&nodes[0]);
+    for n in &nodes {
+        assert_eq!(
+            elders_of(n),
+            reference,
+            "every node must derive the same elder ordering, or they disagree on who proposes"
+        );
+    }
+    assert_eq!(reference.len(), MESH_NODES);
+
+    // Exactly one node's turn per height, and the turn rotates.
+    let proposer_at = |h: u64| reference[(h as usize) % reference.len()];
+    let mut seen = std::collections::HashSet::new();
+    for h in BLOCK_HEIGHT..BLOCK_HEIGHT + MESH_NODES as u64 {
+        seen.insert(proposer_at(h));
+    }
+    assert_eq!(
+        seen.len(),
+        MESH_NODES,
+        "the proposer must rotate across the elder set, not pin to one node"
+    );
+
+    // The elected proposer arms the coinbase from the unpaid ledger, before any block is won.
+    //
+    // Rotating over the ELDER set is a determinism choice, not an authorisation one: any node may
+    // submit a proposal (`handle_proposal` does not check the sender). But the elder set is the
+    // only node list every node derives identically, so it is the only set they can agree a turn
+    // order over. Rotate over a set they disagree about and you get zero proposers, or eight.
+    let proposer_idx = reference
+        .iter()
+        .position(|e| *e == proposer_at(BLOCK_HEIGHT))
+        .expect("the elected proposer must be in the set it was drawn from");
+    let proposal = propose(&nodes[proposer_idx], now);
+    assert!(
+        !proposal.miner_payouts.is_empty(),
+        "the armed coinbase must pay the miners the ledger owes"
+    );
+
+    // And the ledger is untouched: nothing is settled until a block actually pays it. If this
+    // regressed, ratifying at every tip would wipe the ledger every ~10 minutes, paying no one.
+    let still_owed =
+        select_ledger_miner_work(&nodes[0].db, now, BLOCK_HEIGHT, SUBSIDY_SATS).expect("ledger");
+    assert_eq!(
+        still_owed.len(),
+        MINERS.len(),
+        "arming the coinbase must not settle the ledger — the coins do not exist yet"
+    );
+}
+
 /// Discrimination check: the OLD round-scoped recompute REJECTS this same honest proposal.
 ///
 /// This is what makes the test above meaningful. If this ever starts passing, the scenario has

@@ -8036,13 +8036,150 @@ async fn main() -> Result<()> {
     // runs the coordinator (and a node that lost its seat stops). `None` when
     // role activation is off.
     let supervisor_for_events = coordinator_supervisor.clone();
+    // Tip-change payout proposal: arms the coinbase BEFORE a block is won.
+    let payout_for_tips = Arc::clone(&payout_handler);
+    let identity_for_tips = Arc::clone(&identity);
 
     tokio::spawn(async move {
+        // The last chain height we proposed a payout for. `NewWork` fires on every template
+        // refresh (~30s), but the tip only moves on a new block, and a payout is per-block.
+        let mut last_proposed_height: u64 = 0;
+
         while let Ok(event) = template_events_early.recv().await {
             match event {
                 TemplateEvent::NewWork { job_id: _, height } => {
                     // Start new round (SRI gets jobs via TDP automatically)
                     let round_id = rm_notify.start_round(height);
+
+                    // TIP-CHANGE PAYOUT: propose and ratify the coinbase for the block being
+                    // worked on, BEFORE anyone wins it.
+                    //
+                    // A block's coinbase is fixed when its template is built — the header
+                    // commits to it — so it can only pay a payout that was already approved.
+                    // Proposals were previously created ONLY on block-found, which means the
+                    // approved payout always lagged one win behind. With `approved_payout`
+                    // starting at None and the pool never yet having won, EVERY template carried
+                    // the fallback coinbase: the first block Ghost ever won would have paid its
+                    // entire subsidy to `pool_payout_address` and its miners nothing.
+                    //
+                    // Ratifying at each tip keeps a fresh, mesh-agreed split armed at all times,
+                    // built from the unpaid ledger as of this tip. Safe only because the ledger
+                    // is settled when a block PAYS (see `payout::settle_paid_block`), not when a
+                    // proposal is approved — otherwise this would wipe the ledger every tip while
+                    // paying nobody.
+                    // Gated on FEE_TO_NODE_POOL_HEIGHT, and it must be: below that gate the
+                    // coinbase still carries a TX-fee output addressed to the block FINDER, and
+                    // at tip change nobody has found the block yet. A pre-gate tip proposal would
+                    // have to name a finder it cannot know, handing that block's fees to whichever
+                    // node's turn it happened to be. Routing fees to the node reward pool is what
+                    // removes the last unknown from the coinbase and makes it ratifiable early.
+                    if height >= ghost_pool::FEE_TO_NODE_POOL_HEIGHT && height > last_proposed_height
+                    {
+                        last_proposed_height = height;
+
+                        // Deterministic proposer: every node computes the same answer from the
+                        // MPC elder set with no coordination, and the load rotates. Without this,
+                        // all 8 nodes would propose the same payout at every tip.
+                        let mut elders: Vec<[u8; 32]> = db_for_rounds
+                            .get_mpc_elder_node_ids()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect();
+                        elders.sort_unstable();
+
+                        let me = identity_for_tips.node_id();
+                        let my_turn = !elders.is_empty()
+                            && elders[(height as usize) % elders.len()] == me;
+
+                        if my_turn {
+                            // The tip we are building on. Every node agrees on it, and
+                            // PO4-M1 rejects a zero block hash — there is no block hash yet
+                            // because the block does not exist, so the tip identifies the
+                            // payout instead.
+                            match rm_notify.current_template_id() {
+                                Some(tip) => {
+                                    let cutoff_ts = chrono::Utc::now().timestamp();
+                                    // `None` matches what `validate_block_data` uses to compute
+                                    // the expected subsidy — pass anything else and the proposal
+                                    // fails its own validation.
+                                    let subsidy =
+                                        ghost_common::rpc::calculate_block_subsidy(height, None);
+
+                                    match ghost_pool::payout::select_ledger_miner_work(
+                                        &db_for_rounds,
+                                        cutoff_ts,
+                                        height,
+                                        subsidy,
+                                    ) {
+                                        Ok(miner_work) if !miner_work.is_empty() => {
+                                            let (_, fees, _) =
+                                                tp_for_template_events.get_current_block_info();
+                                            let treasury_state = TreasuryState::from_stored(
+                                                db_for_rounds
+                                                    .get_treasury_balance()
+                                                    .unwrap_or_default(),
+                                                None,
+                                            );
+                                            let treasury_address_snapshot =
+                                                payout_for_tips.get_treasury_address_snapshot();
+
+                                            let data = BlockFoundData {
+                                                round_id,
+                                                ledger_cutoff_ts: cutoff_ts,
+                                                block_hash: tip,
+                                                block_height: height,
+                                                block_timestamp: chrono::Utc::now(),
+                                                winning_miner_id: "pool".to_string(),
+                                                winning_miner_payout_address: None,
+                                                treasury_address_snapshot,
+                                                // Post-gate there is no block-finder fee output,
+                                                // so this identifies the proposer for bookkeeping
+                                                // only — it receives nothing on account of it.
+                                                winning_node_id: me,
+                                                subsidy_sats: subsidy,
+                                                tx_fees_sats: fees,
+                                                miner_work,
+                                                node_shares: rm_notify.get_node_shares(round_id),
+                                                treasury_state,
+                                            };
+
+                                            match payout_for_tips.handle_block_found(data) {
+                                                Ok(hash) if hash != [0u8; 32] => info!(
+                                                    height,
+                                                    hash = %hex::encode(&hash[..8]),
+                                                    "Tip-change payout proposed: arming the coinbase for this block"
+                                                ),
+                                                Ok(_) => debug!(
+                                                    height,
+                                                    "Tip-change payout produced no miner outputs"
+                                                ),
+                                                Err(e) => error!(
+                                                    height,
+                                                    error = %e,
+                                                    "Tip-change payout proposal failed — this block's \
+                                                     coinbase will fall back to the pool address and \
+                                                     pay the miners nothing"
+                                                ),
+                                            }
+                                        }
+                                        Ok(_) => debug!(
+                                            height,
+                                            "No unpaid ledger at tip change; nothing to arm"
+                                        ),
+                                        Err(e) => error!(
+                                            height,
+                                            error = %e,
+                                            "Failed to read the unpaid ledger at tip change"
+                                        ),
+                                    }
+                                }
+                                None => debug!(
+                                    height,
+                                    "No template id (tip) yet; cannot arm a payout this tip"
+                                ),
+                            }
+                        }
+                    }
 
                     // Persist the round (round_id → block_height) so the
                     // best-hash per-window join can resolve a share's block

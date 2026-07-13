@@ -1021,6 +1021,71 @@ impl TemplateProcessor {
             let original_fees = prop.tx_fees;
 
             if available_fees != original_fees {
+                // POST-GATE: there is no block finder. The fees were already shared into the
+                // node reward pool when the mesh ratified this payout at tip change — that is
+                // precisely what makes the coinbase determinable before the block is won.
+                //
+                // What remains is DRIFT: the gap between the fees the mesh ratified and the fees
+                // actually available in THIS node's template. The mempool moves, RBF replaces
+                // transactions, and each node's Reaper/BUDS filtering drops a different set — so
+                // every node sees slightly different fees, and the coinbase must still spend
+                // exactly subsidy + its own available fees.
+                //
+                // The drift lands on the TREASURY (GHOST-13 precedent: tx-fee dust already goes
+                // there), which keeps the miner split and the node split untouched.
+                if prop.block_height >= crate::FEE_TO_NODE_POOL_HEIGHT {
+                    if available_fees > original_fees {
+                        let extra = available_fees - original_fees;
+                        prop.treasury_amount = prop.treasury_amount.saturating_add(extra);
+                    } else {
+                        let mut shortfall = original_fees - available_fees;
+
+                        // 1) Treasury absorbs what it can.
+                        let from_treasury = shortfall.min(prop.treasury_amount);
+                        prop.treasury_amount -= from_treasury;
+                        shortfall -= from_treasury;
+
+                        // 2) Under the decay schedule the treasury's share eventually reaches
+                        //    ZERO, so it cannot be relied on to cover a shortfall. Fall back to
+                        //    the node pool — largest entry first, ties broken by address, so
+                        //    every node reduces the same entries in the same order.
+                        if shortfall > 0 {
+                            prop.node_payouts.sort_by(|a, b| {
+                                b.amount.cmp(&a.amount).then(a.address.cmp(&b.address))
+                            });
+                            for entry in &mut prop.node_payouts {
+                                if shortfall == 0 {
+                                    break;
+                                }
+                                let take = shortfall.min(entry.amount);
+                                entry.amount -= take;
+                                shortfall -= take;
+                            }
+                            prop.node_payouts.retain(|e| e.amount > 0);
+                        }
+
+                        // 3) Still short: the coinbase cannot balance. Fall back rather than
+                        //    build a block the network would reject.
+                        if shortfall > 0 {
+                            warn!(
+                                shortfall,
+                                height,
+                                "Fee drift exceeds treasury + node pool — using fallback coinbase"
+                            );
+                            return None;
+                        }
+                    }
+
+                    prop.tx_fees = available_fees;
+                    info!(
+                        original_fees,
+                        available_fees,
+                        height,
+                        "Adjusted payout: fee drift absorbed by the treasury (no block finder)"
+                    );
+                    return Some(prop);
+                }
+
                 if available_fees < original_fees {
                     // FEES DECREASED: reduce block finder's fee portion
                     let excess = original_fees - available_fees;

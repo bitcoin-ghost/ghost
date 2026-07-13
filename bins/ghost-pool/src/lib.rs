@@ -111,6 +111,30 @@ pub const CLUSTER_ENFORCEMENT_HEIGHT: u64 = 955_200;
 /// differently from the proposer would reject an honest split.
 pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 
+/// At and above this height, TX fees go to the NODE REWARD POOL (shared out by 5-4-3-2-1
+/// capability shares) instead of 100% to the block finder.
+///
+/// This is what makes a block's coinbase fully determined BEFORE the block is found, and so it
+/// is what makes tip-change payout ratification possible at all.
+///
+/// Every other part of the coinbase — the miner split (unpaid ledger) and the node reward split
+/// (verified capabilities) — is already fixed by state that exists at tip change. The block
+/// finder was the single unknown, and it existed only to receive the fees. Remove it and the
+/// mesh can ratify the whole coinbase in advance, which is the only way a block can pay miners:
+/// a block's coinbase is fixed when its template is built, so it can only ever pay a payout that
+/// was already approved.
+///
+/// Fees remain NODE income and never touch the miner pool; only *which* nodes changes. Which
+/// node "finds" a block is luck — it is whichever node the load balancer routed the winning
+/// miner to — whereas capability shares reflect actual contribution.
+///
+/// Coinbase construction is consensus-visible, so this is a height gate, not a feature flag: a
+/// mixed-version fleet must not split on how the coinbase is built. Both code paths exist in the
+/// new binary; every node switches at the same block.
+///
+/// SET THIS BEFORE DEPLOY — comfortably past the roll window (~144 blocks/day).
+pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
+
 /// GhostGlyph P2P handler for visual identity registration.
 pub mod glyph_handler;
 
