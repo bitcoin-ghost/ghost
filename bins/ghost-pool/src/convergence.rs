@@ -22,6 +22,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use tracing::warn;
+
 use ghost_common::error::GhostResult;
 use ghost_common::types::RoundId;
 use ghost_consensus::mesh::MessageHandler;
@@ -118,13 +120,74 @@ impl ConvergenceHandler {
             if !proof.has_valid_received_by_signature() {
                 continue; // GHOST-09: never credit an unsigned/forged backfill
             }
+
+            let miner_hex = hex::encode(&proof.miner_id[..8]);
+            let from_node = hex::encode(&proof.received_by[..4]);
+            let share_hash = hex::encode(proof.share_hash);
+            let round_id = proof.round_id;
+            let work = proof.work;
+            let timestamp = proof.timestamp as i64;
+
             if self.round_manager.handle_share_proof(proof.clone()).is_ok() {
                 applied += 1;
-                // GHOST-02 / Option A: adopt the backfilled proof's signed payout
-                // address (first-writer-wins) so addresses converge here too.
-                if let (Some(db), Some(addr)) = (&self.db, &proof.payout_address) {
-                    let miner_hex = hex::encode(&proof.miner_id[..8]);
-                    let _ = db.adopt_miner_address(&miner_hex, addr);
+
+                if let Some(db) = &self.db {
+                    // GHOST-03: persist the backfilled share to the `shares` TABLE.
+                    //
+                    // This is the whole point of convergence and it was missing. Share gossip
+                    // is fire-and-forget (dropped on channel overflow); this protocol exists to
+                    // repair those drops. Feeding the RoundManager alone repaired only the
+                    // in-memory round view — node-share credit and dedup — while the `shares`
+                    // table stayed short. And the `shares` table is the ONLY thing the payout
+                    // ledger reads (`select_ledger_miner_work` -> `get_top_unpaid_*`).
+                    //
+                    // The consequence was permanent, compounding ledger divergence: every node
+                    // summed a different share set, so every node computed a different miner
+                    // split, so the GHOST-02 exact-equality check rejected every proposal — and
+                    // nothing in the system ever repaired it. Safety held; liveness did not.
+                    //
+                    // Mirrors the live-gossip insert in `share_handler.rs` exactly, so a share
+                    // backfilled here is byte-identical to one that arrived first time. The
+                    // UNIQUE constraint on `share_hash` makes this idempotent.
+                    let share_record = ghost_storage::models::ShareRecord {
+                        id: None,
+                        round_id,
+                        miner_id: miner_hex.clone(),
+                        difficulty: work,
+                        work,
+                        share_hash,
+                        timestamp,
+                        received_by: from_node,
+                        valid: true,
+                    };
+
+                    match db.insert_share(&share_record) {
+                        Ok(_) => {
+                            if let Err(e) = db.increment_miner_stats(&miner_hex, 1, work) {
+                                warn!(
+                                    miner = %miner_hex,
+                                    error = %e,
+                                    "GHOST-03: failed to increment backfilled miner stats"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // Already had it — the UNIQUE constraint is our dedup.
+                            if !e.to_string().contains("UNIQUE") {
+                                warn!(
+                                    miner = %miner_hex,
+                                    error = %e,
+                                    "GHOST-03: failed to persist backfilled share"
+                                );
+                            }
+                        }
+                    }
+
+                    // GHOST-02 / Option A: adopt the backfilled proof's signed payout
+                    // address (first-writer-wins) so addresses converge here too.
+                    if let Some(addr) = &proof.payout_address {
+                        let _ = db.adopt_miner_address(&miner_hex, addr);
+                    }
                 }
             }
         }
@@ -214,6 +277,85 @@ mod tests {
         };
         p.sign(signer);
         p
+    }
+
+    /// The `shares` row a proof becomes — mirrors `share_handler.rs` and `apply_response`.
+    fn ledger_row(p: &ShareProof) -> ghost_storage::ShareRecord {
+        ghost_storage::ShareRecord {
+            id: None,
+            round_id: p.round_id,
+            miner_id: hex::encode(&p.miner_id[..8]),
+            difficulty: p.work,
+            work: p.work,
+            share_hash: hex::encode(p.share_hash),
+            timestamp: p.timestamp as i64,
+            received_by: hex::encode(&p.received_by[..4]),
+            valid: true,
+        }
+    }
+
+    /// GHOST-03 must repair the `shares` TABLE, not merely the in-memory round view.
+    ///
+    /// The payout ledger reads that table and nothing else. Backfilling only the RoundManager
+    /// left every node summing a different share set — so every node computed a different miner
+    /// split, and the GHOST-02 exact-equality check rejected every payout proposal, permanently,
+    /// with nothing in the system able to repair it.
+    ///
+    /// `convergence_backfills_a_missing_share` (below) asserts only `round_share_hashes`. That
+    /// is exactly the blind spot the bug lived in: convergence looked healthy in memory while
+    /// the ledger it exists to protect silently diverged.
+    #[test]
+    fn convergence_backfills_the_payout_ledger_not_just_memory() {
+        let producer = NodeIdentity::generate();
+        let rm_a = round_manager();
+        let rm_b = round_manager();
+        let db_a = Arc::new(ghost_storage::Database::in_memory().expect("db a"));
+        let db_b = Arc::new(ghost_storage::Database::in_memory().expect("db b"));
+
+        let ch_a = ConvergenceHandler::new(Arc::clone(&rm_a)).with_db(Arc::clone(&db_a));
+        let ch_b = ConvergenceHandler::new(Arc::clone(&rm_b)).with_db(Arc::clone(&db_b));
+
+        // A received three shares and persisted them. B's gossip dropped two — the fire-and-
+        // forget broadcast overflowed, exactly as it does in production.
+        let shares: Vec<ShareProof> = (1..=3).map(|n| signed_share(&producer, n)).collect();
+        for s in &shares {
+            rm_a.handle_share_proof(s.clone()).expect("A accepts");
+            db_a.insert_share(&ledger_row(s)).expect("A persists");
+        }
+        rm_b.handle_share_proof(shares[0].clone()).expect("B accepts the one it got");
+        db_b.insert_share(&ledger_row(&shares[0])).expect("B persists the one it got");
+
+        // What a payout would actually be computed from on each node.
+        let unpaid_work = |db: &ghost_storage::Database| -> f64 {
+            db.get_top_unpaid_miners(i64::MAX, 100)
+                .expect("ledger")
+                .iter()
+                .map(|(_, w)| *w)
+                .sum()
+        };
+        assert_eq!(unpaid_work(&db_a), 3.0);
+        assert_eq!(unpaid_work(&db_b), 1.0, "B starts with a short ledger");
+
+        // B advertises what it holds; A replies with the proofs B is missing; B applies them.
+        let req = ch_b.build_request(1);
+        let resp = ch_a.handle_request(&req);
+        let applied = ch_b.apply_response(&resp);
+        assert_eq!(applied, 2, "both dropped shares must be backfilled");
+
+        assert_eq!(
+            unpaid_work(&db_b),
+            unpaid_work(&db_a),
+            "after convergence B's PAYOUT LEDGER must equal A's — if it does not, the two nodes \
+             compute different miner splits and GHOST-02 rejects the payout forever"
+        );
+
+        // And it must be idempotent: re-applying cannot double-credit the work.
+        ch_b.apply_response(&resp);
+        assert_eq!(
+            unpaid_work(&db_b),
+            3.0,
+            "re-applying a convergence response must not double-count shares"
+        );
     }
 
     #[test]
