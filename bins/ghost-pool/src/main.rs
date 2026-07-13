@@ -6297,6 +6297,56 @@ async fn main() -> Result<()> {
             .record_share(&share.miner_id, share.work, identity_for_shares.node_id())
             .map_err(|e| ghost_common::GhostError::Internal(e.to_string()))?;
 
+        // The SV2/SRI layer reports share_hash in big-endian DISPLAY order (PoW leading zeros
+        // at the front). The pool's difficulty machinery and the ShareProof both use INTERNAL
+        // (little-endian) order, zeros at the high-index end.
+        //
+        // CANONICAL STORAGE IS INTERNAL ORDER. This row used to be written in display order
+        // while every gossiped copy of the SAME share was written internal, so one share had
+        // two different `share_hash` strings depending on which node stored it. Nothing
+        // double-counted only because a node skips gossip of its own shares — but it makes
+        // share_hash useless as a cross-node identity, and any ledger reconciliation keyed on
+        // it would serve a node its own shares back under the other spelling, where the UNIQUE
+        // constraint would not recognise them and the work would be counted TWICE.
+        let mut share_hash_bytes = [0u8; 32];
+        if let Ok(decoded) = hex::decode(&share.share_hash) {
+            if decoded.len() == 32 {
+                for (i, b) in decoded.iter().rev().enumerate() {
+                    share_hash_bytes[i] = *b; // display (big-endian) -> internal (little-endian)
+                }
+            } else {
+                let len = decoded.len().min(32);
+                share_hash_bytes[..len].copy_from_slice(&decoded[..len]);
+            }
+        }
+        let canonical_share_hash = hex::encode(share_hash_bytes);
+
+        // Uses SHA256(miner_id) as the 32-byte miner identifier for the proof.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(share.miner_id.as_bytes());
+        let miner_hash: [u8; 32] = hasher.finalize().into();
+
+        let mut proof = ghost_common::types::ShareProof {
+            round_id,
+            miner_id: miner_hash,
+            difficulty: share.work,
+            work: share.work,
+            share_hash: share_hash_bytes,
+            timestamp: share.timestamp,
+            received_by: identity_for_shares.node_id(),
+            template_id: rm_for_shares.current_template_id(),
+            payout_address: share.payout_address.clone(),
+            signature: None,
+        };
+        // GHOST-09: sign as the receiving node so peers can authenticate the
+        // node-reward credit and reject relayed/forged `received_by`.
+        proof.sign(identity_for_shares.as_ref());
+
+        // GHOST-03 (schema v41): store the signed proof with the share so this node can serve a
+        // backfill of it to any peer that dropped the broadcast, at any age.
+        let proof_blob = serde_json::to_vec(&proof).unwrap_or_default();
+
         // Persist share to database for historical tracking and auditing
         let share_record = ghost_storage::models::ShareRecord {
             id: None,
@@ -6304,13 +6354,13 @@ async fn main() -> Result<()> {
             miner_id: share.miner_id.clone(),
             difficulty: share.work, // SRI reports work as difficulty-adjusted value
             work: share.work,
-            share_hash: share.share_hash.clone(),
+            share_hash: canonical_share_hash,
             timestamp: share.timestamp as i64,
             received_by: hex::encode(&identity_for_shares.node_id()[..8]),
             valid: true, // Already validated by SRI Pool
         };
 
-        match db_for_shares.insert_share(&share_record) {
+        match db_for_shares.insert_share_with_proof(&share_record, &proof_blob) {
             Ok(_) => {
                 // Share inserted successfully — update miner cumulative stats
                 if let Err(e) = db_for_shares.increment_miner_stats(&share.miner_id, 1, share.work)
@@ -6356,48 +6406,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Broadcast share proof to other nodes via P2P
-        // Uses SHA256(miner_id) as the 32-byte miner identifier for the proof
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(share.miner_id.as_bytes());
-        let miner_hash: [u8; 32] = hasher.finalize().into();
-
-        // The SV2/SRI layer reports share_hash in big-endian DISPLAY order (PoW
-        // leading zeros at the front). The pool's difficulty machinery
-        // (DifficultyCalculator::difficulty_from_hash / C4) and the in-process
-        // harness both read the hash in INTERNAL (little-endian) order, with the
-        // leading zeros at the HIGH-index end. Store it internal so cross-node C4
-        // validation on the elders reads the real difficulty instead of a
-        // near-zero one (which made them reject every gossiped share).
-        let mut share_hash_bytes = [0u8; 32];
-        if let Ok(decoded) = hex::decode(&share.share_hash) {
-            if decoded.len() == 32 {
-                for (i, b) in decoded.iter().rev().enumerate() {
-                    share_hash_bytes[i] = *b; // display (big-endian) -> internal (little-endian)
-                }
-            } else {
-                let len = decoded.len().min(32);
-                share_hash_bytes[..len].copy_from_slice(&decoded[..len]);
-            }
-        }
-
-        let mut proof = ghost_common::types::ShareProof {
-            round_id,
-            miner_id: miner_hash,
-            difficulty: share.work,
-            work: share.work,
-            share_hash: share_hash_bytes,
-            timestamp: share.timestamp,
-            received_by: identity_for_shares.node_id(),
-            template_id: rm_for_shares.current_template_id(),
-            payout_address: share.payout_address.clone(),
-            signature: None,
-        };
-        // GHOST-09: sign as the receiving node so peers can authenticate the
-        // node-reward credit and reject relayed/forged `received_by`.
-        proof.sign(identity_for_shares.as_ref());
-
+        // Broadcast the signed share proof to other nodes via P2P.
         if let Err(e) = share_broadcast_tx.try_send(proof) {
             tracing::warn!(error = %e, "Share broadcast channel full or closed");
         }

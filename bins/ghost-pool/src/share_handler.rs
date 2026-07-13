@@ -126,6 +126,12 @@ impl ShareProofHandler {
         let work = proof.work;
         let timestamp = proof.timestamp;
 
+        // GHOST-03 (schema v41): keep the signed proof so THIS node can later serve a backfill
+        // of this share to a peer that dropped it. Without it, reconciliation is only possible
+        // while the proof is still in RoundManager's 10-round window, and the ledger diverges
+        // permanently after that.
+        let proof_blob = serde_json::to_vec(&proof).unwrap_or_default();
+
         // Delegate all validation to handle_share_proof:
         // C4 (crypto), C5 (dedup), L-7 (tolerance), M-6 (template), M-29 (persistent exploiter)
         match self.round_manager.handle_share_proof(proof) {
@@ -143,7 +149,7 @@ impl ShareProofHandler {
                     valid: true,
                 };
 
-                match self.db.insert_share(&share_record) {
+                match self.db.insert_share_with_proof(&share_record, &proof_blob) {
                     Ok(_) => {
                         // Share inserted — update miner cumulative stats
                         if let Err(e) = self.db.increment_miner_stats(&miner_hex, 1, work) {

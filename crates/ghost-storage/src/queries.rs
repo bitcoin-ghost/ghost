@@ -379,6 +379,110 @@ impl Database {
         })
     }
 
+    /// Insert a share together with its signed `ShareProof` (schema v41).
+    ///
+    /// GHOST-03: the proof is what lets ANY node serve — and any node verify — a backfill of
+    /// this share later. Without it, a share can only be reconciled while it is still in
+    /// `RoundManager::recent_proofs` (10 rounds, ~15 min); after that the ledger diverges
+    /// permanently, every node sums a different set, and the GHOST-02 exact-equality recompute
+    /// rejects the payout forever.
+    ///
+    /// `proof` is the canonical JSON of `ghost_common::types::ShareProof`. Idempotent: the
+    /// UNIQUE constraint on `share_hash` is the dedup.
+    pub fn insert_share_with_proof(&self, share: &ShareRecord, proof: &[u8]) -> GhostResult<i64> {
+        self.with_connection_retry("insert_share_with_proof", |conn| {
+            conn.execute(
+                "INSERT INTO shares (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid, proof)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    share.round_id,
+                    share.miner_id,
+                    share.difficulty,
+                    share.work,
+                    share.share_hash,
+                    share.timestamp,
+                    share.received_by,
+                    share.valid,
+                    proof,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// GHOST-03: the share hashes this node holds in the unpaid ledger at/after `since_ts`.
+    ///
+    /// This is what a node ADVERTISES during ledger convergence. Peers reply with the proofs
+    /// for anything they hold that is absent from this list. Scoped to unpaid shares because
+    /// those are precisely the ones a payout will be computed from.
+    pub fn unpaid_share_hashes_since(&self, since_ts: i64) -> GhostResult<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT share_hash FROM shares
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1 AND timestamp >= ?1
+                     ORDER BY timestamp",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_ts], |r| r.get::<_, String>(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// GHOST-03: the stored proofs for unpaid shares at/after `since_ts` that the requester
+    /// does NOT hold. This is what a node SERVES during ledger convergence.
+    ///
+    /// Rows whose `proof` is NULL predate schema v41 and cannot be served: their signatures no
+    /// longer exist anywhere, so no peer could verify them. They are skipped, and the caller is
+    /// told how many, because that count is exactly the un-reconcilable backlog.
+    pub fn unpaid_proofs_missing_from(
+        &self,
+        since_ts: i64,
+        theirs: &std::collections::HashSet<String>,
+        limit: usize,
+    ) -> GhostResult<(Vec<Vec<u8>>, usize)> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT share_hash, proof FROM shares
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1 AND timestamp >= ?1
+                     ORDER BY timestamp",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_ts], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let mut proofs = Vec::new();
+            let mut unservable = 0usize;
+            for row in rows {
+                let (hash, proof) = row.map_err(|e| GhostError::Database(e.to_string()))?;
+                if theirs.contains(&hash) {
+                    continue;
+                }
+                match proof {
+                    Some(p) => {
+                        if proofs.len() < limit {
+                            proofs.push(p);
+                        }
+                    }
+                    None => unservable += 1,
+                }
+            }
+            Ok((proofs, unservable))
+        })
+    }
+
     /// Maximum rows returned by unbounded queries (H-7: OOM prevention)
     pub const MAX_QUERY_RESULTS: u32 = 10000;
 
