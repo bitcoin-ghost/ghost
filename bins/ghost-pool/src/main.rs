@@ -655,6 +655,27 @@ struct Args {
     /// Disable native stratum server (use when running with SRI pool via TDP)
     #[arg(long)]
     no_stratum: bool,
+
+    /// ONE-TIME LEDGER RECONCILIATION: export this node's unpaid shares to a JSON file.
+    ///
+    /// Shares predating schema v41 carry no signed proof, so no node can serve or verify them
+    /// and GHOST-03 convergence cannot repair the divergence they cause. The fleet can only be
+    /// made to agree on that backlog by taking the UNION across the operator's own nodes.
+    #[arg(long, value_name = "FILE")]
+    ledger_export: Option<PathBuf>,
+
+    /// ONE-TIME LEDGER RECONCILIATION: import unpaid shares this node is missing.
+    ///
+    /// Never deletes and never overwrites — dedup is UNIQUE(share_hash) and a miner row is only
+    /// created if absent, so it is safe to re-run. Each miner's payout address is re-encrypted
+    /// with THIS node's key (the DB key is per-node), without which the payout query's
+    /// INNER JOIN would drop the share and the miner would silently lose the work.
+    #[arg(long, value_name = "FILE")]
+    ledger_import: Option<PathBuf>,
+
+    /// With --ledger-import: report what WOULD change and write nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Pool state shared across components
@@ -2410,6 +2431,54 @@ async fn main() -> Result<()> {
         db.set_encryption_key(key);
         // Zeroize local copies
         key.fill(0);
+    }
+
+    // ONE-TIME LEDGER RECONCILIATION (runs after DB encryption is configured, and exits).
+    //
+    // Shares predating schema v41 carry no signed proof — their GHOST-09 signatures exist
+    // nowhere — so no node can serve or verify them, and GHOST-03 convergence cannot repair the
+    // divergence they cause. Every node sums a different unpaid ledger, so every node computes a
+    // different miner split, so GHOST-02's exact-equality check rejects every payout.
+    //
+    // The only way to make the fleet agree on that backlog is to take the UNION across the
+    // operator's own nodes. That is sound because the divergence is nodes MISSING shares, never
+    // nodes holding fabricated ones — each node's set is a subset of the truth. It is trusted
+    // rather than verified, and it is only defensible because every node in the mesh belongs to
+    // the same operator. New shares (v41 onward) carry their proof and converge verifiably.
+    if let Some(path) = &args.ledger_export {
+        let shares = db.export_unpaid_shares()?;
+        let total_work: f64 = shares.iter().map(|s| s.work).sum();
+        let no_address = shares.iter().filter(|s| s.payout_address.is_none()).count();
+        std::fs::write(path, serde_json::to_vec(&shares)?)?;
+        info!(
+            shares = shares.len(),
+            total_work,
+            no_address,
+            file = %path.display(),
+            "Ledger export complete"
+        );
+        if no_address > 0 {
+            warn!(
+                no_address,
+                "Shares with no resolvable payout address will be dropped by the payout query's \
+                 INNER JOIN on `miners` — they cannot be credited to anyone"
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(path) = &args.ledger_import {
+        let raw = std::fs::read(path)?;
+        let shares: Vec<ghost_storage::queries::UnpaidShareExport> = serde_json::from_slice(&raw)?;
+        let (inserted, miners) = db.import_unpaid_shares(&shares, args.dry_run)?;
+        info!(
+            offered = shares.len(),
+            inserted,
+            miners_created = miners,
+            dry_run = args.dry_run,
+            "Ledger import complete"
+        );
+        return Ok(());
     }
 
     // Setup policy profile
