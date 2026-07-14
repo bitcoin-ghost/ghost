@@ -135,6 +135,67 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// SET THIS BEFORE DEPLOY — comfortably past the roll window (~144 blocks/day).
 pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
 
+/// Activation heights, resolved once at startup.
+///
+/// A regtest chain is ~100 blocks tall, so every mainnet gate is dormant there and a regtest
+/// rehearsal silently exercises the PRE-gate paths — proving nothing about the behaviour being
+/// shipped. The previous way round that was to patch the constants and rebuild, which means the
+/// binary under test was not the binary deployed. That is how a 4-node regtest run produced 24
+/// green enforcement coinbases on 2026-06-21 while the bug it was meant to catch was live.
+///
+/// So the gates are overridable from the environment — but NEVER on mainnet, where the constants
+/// above are the only truth. A test cluster runs the real shipping binary with the gates pulled
+/// down, rather than a different binary built for the occasion.
+mod gates {
+    use ghost_common::config::BitcoinNetwork;
+    use std::sync::OnceLock;
+
+    pub(super) static CLUSTER_ENFORCEMENT: OnceLock<u64> = OnceLock::new();
+    pub(super) static FEE_TO_NODE_POOL: OnceLock<u64> = OnceLock::new();
+
+    pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
+        if matches!(network, BitcoinNetwork::Mainnet) {
+            return default; // mainnet gates are not negotiable
+        }
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+}
+
+/// Resolve the activation gates for this run. Call once, at startup, before anything reads them.
+pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
+    let enforcement = gates::from_env(
+        "GHOST_CLUSTER_ENFORCEMENT_HEIGHT",
+        network,
+        CLUSTER_ENFORCEMENT_HEIGHT,
+    );
+    let fee = gates::from_env("GHOST_FEE_TO_NODE_POOL_HEIGHT", network, FEE_TO_NODE_POOL_HEIGHT);
+    let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
+    let _ = gates::FEE_TO_NODE_POOL.set(fee);
+
+    if enforcement != CLUSTER_ENFORCEMENT_HEIGHT || fee != FEE_TO_NODE_POOL_HEIGHT {
+        tracing::warn!(
+            cluster_enforcement_height = enforcement,
+            fee_to_node_pool_height = fee,
+            network = ?network,
+            "Activation heights OVERRIDDEN from the environment — non-mainnet only"
+        );
+    }
+}
+
+/// The height at which GHOST-02 split mismatches become a rejection rather than a warning.
+pub fn cluster_enforcement_height() -> u64 {
+    *gates::CLUSTER_ENFORCEMENT.get_or_init(|| CLUSTER_ENFORCEMENT_HEIGHT)
+}
+
+/// The height at which TX fees move to the node reward pool and the coinbase becomes ratifiable
+/// at tip change.
+pub fn fee_to_node_pool_height() -> u64 {
+    *gates::FEE_TO_NODE_POOL.get_or_init(|| FEE_TO_NODE_POOL_HEIGHT)
+}
+
 /// GhostGlyph P2P handler for visual identity registration.
 pub mod glyph_handler;
 

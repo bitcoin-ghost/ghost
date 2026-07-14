@@ -2411,6 +2411,12 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Resolve the activation gates for this run BEFORE anything reads them. On mainnet these are
+    // the compiled-in constants and nothing can move them; elsewhere they may be pulled down from
+    // the environment so a regtest cluster exercises the POST-gate paths using the real shipping
+    // binary, rather than a specially-patched one that is not what gets deployed.
+    ghost_pool::init_activation_heights(&config.bitcoin.network);
+
     let db = Arc::new(Database::open(&db_path)?);
     info!("Database opened: {}", db_path.display());
 
@@ -5821,7 +5827,7 @@ async fn main() -> Result<()> {
         let validator = ghost_pool::payout::make_proposal_validator(
             Arc::clone(&payout_handler),
             Arc::clone(&db),
-            ghost_pool::CLUSTER_ENFORCEMENT_HEIGHT,
+            ghost_pool::cluster_enforcement_height(),
         );
         vote_handler.set_proposal_validator(validator);
     }
@@ -8172,7 +8178,7 @@ async fn main() -> Result<()> {
                     // have to name a finder it cannot know, handing that block's fees to whichever
                     // node's turn it happened to be. Routing fees to the node reward pool is what
                     // removes the last unknown from the coinbase and makes it ratifiable early.
-                    if height >= ghost_pool::FEE_TO_NODE_POOL_HEIGHT && height > last_proposed_height
+                    if height >= ghost_pool::fee_to_node_pool_height() && height > last_proposed_height
                     {
                         last_proposed_height = height;
 

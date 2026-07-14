@@ -1033,7 +1033,7 @@ impl TemplateProcessor {
                 //
                 // The drift lands on the TREASURY (GHOST-13 precedent: tx-fee dust already goes
                 // there), which keeps the miner split and the node split untouched.
-                if prop.block_height >= crate::FEE_TO_NODE_POOL_HEIGHT {
+                if prop.block_height >= crate::fee_to_node_pool_height() {
                     if available_fees > original_fees {
                         let extra = available_fees - original_fees;
                         prop.treasury_amount = prop.treasury_amount.saturating_add(extra);

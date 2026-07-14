@@ -85,7 +85,7 @@ impl ShareProofHandler {
         // ledger. Until the gate height we therefore accept them; nodes already
         // sign their own shares (always-on) so the converged state is primed for
         // the moment the gate fires fleet-wide.
-        if self.round_manager.current_height() >= crate::CLUSTER_ENFORCEMENT_HEIGHT
+        if self.round_manager.current_height() >= crate::cluster_enforcement_height()
             && !proof.has_valid_received_by_signature()
         {
             warn!(

@@ -76,7 +76,7 @@ impl FeeDistribution {
         block_timestamp: DateTime<Utc>,
         block_height: u64,
     ) -> Self {
-        let fees_to_node_pool = block_height >= crate::FEE_TO_NODE_POOL_HEIGHT;
+        let fees_to_node_pool = block_height >= crate::fee_to_node_pool_height();
         let tx_fees_to_block_finder = if fees_to_node_pool { 0 } else { tx_fees_sats };
 
         // Pool fee is 1% of subsidy only (not TX fees)
@@ -252,14 +252,14 @@ mod tests {
             fees,
             &state,
             now,
-            crate::FEE_TO_NODE_POOL_HEIGHT - 1,
+            crate::fee_to_node_pool_height() - 1,
         );
         let at = FeeDistribution::calculate_at_height(
             subsidy,
             fees,
             &state,
             now,
-            crate::FEE_TO_NODE_POOL_HEIGHT,
+            crate::fee_to_node_pool_height(),
         );
 
         assert_eq!(below.tx_fees_to_block_finder, fees, "still the finder's below");
