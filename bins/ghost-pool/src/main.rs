@@ -8172,6 +8172,10 @@ async fn main() -> Result<()> {
     // Tip-change payout proposal: arms the coinbase BEFORE a block is won.
     let payout_for_tips = Arc::clone(&payout_handler);
     let identity_for_tips = Arc::clone(&identity);
+    // The vote handler validates a payout proposal's block height against the current tip
+    // (a +/-1000 block window). It needs to be told the tip advances, or that check runs
+    // against height 0 and falls back to a permissive default — see below.
+    let vote_handler_for_tips = Arc::clone(&vote_handler);
 
     tokio::spawn(async move {
         // The last chain height we proposed a payout for. `NewWork` fires on every template
@@ -8183,6 +8187,11 @@ async fn main() -> Result<()> {
                 TemplateEvent::NewWork { job_id: _, height } => {
                     // Start new round (SRI gets jobs via TDP automatically)
                     let round_id = rm_notify.start_round(height);
+
+                    // Tell the vote handler the chain has advanced — feeds the payout-proposal
+                    // height window (`known_best_height +/- 1000`); it was never called, so the
+                    // handler's height sat at 0 and the window check never constrained anything.
+                    vote_handler_for_tips.update_block_height(height);
 
                     // TIP-CHANGE PAYOUT: propose and ratify the coinbase for the block being
                     // worked on, BEFORE anyone wins it.
