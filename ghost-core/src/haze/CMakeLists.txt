@@ -28,6 +28,8 @@ add_library(bitcoin_haze STATIC EXCLUDE_FROM_ALL
   block_reconstruct.cpp
   legal_packet.cpp
   haze_p2p.cpp
+  # Hazync: archive-node bridge (per-block zkVM prover witness emitter)
+  hazync_witness.cpp
 )
 
 target_include_directories(bitcoin_haze

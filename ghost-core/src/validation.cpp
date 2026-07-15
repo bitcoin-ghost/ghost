@@ -20,6 +20,7 @@
 #include <cuckoocache.h>
 #include <flatfile.h>
 #include <hash.h>
+#include <haze/hazync_witness.h>
 #include <kernel/chain.h>
 #include <kernel/chainparams.h>
 #include <kernel/coinstats.h>
@@ -2618,6 +2619,16 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
+
+    // Hazync witness (archive-node bridge): when -hazyncwitness is set, gather each spent coin's
+    // metadata as we go (while it is still in the view, before UpdateCoins consumes it) and emit a
+    // per-block witness file for the external zkVM prover once the block has connected. Enabling it
+    // also forces the full UpdateCoins path below (SwiftSync's ephemeral coins are not in the view),
+    // so the emitter always sees complete coin data. Purely observational; no consensus effect.
+    const bool hazync_emit{m_chainman.m_hazync_emitter != nullptr};
+    std::vector<std::vector<haze::HazyncWitnessEmitter::InputMeta>> hazync_spent;
+    if (hazync_emit) hazync_spent.resize(block.vtx.size());
+
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -2690,13 +2701,35 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             }
         }
 
+        // Hazync: capture each spent coin (value, scriptPubKey, creation height, coinbase flag, and
+        // the creating block's timestamp) before UpdateCoins spends it. GetAncestor(nHeight) yields the
+        // creating block on pindex's own chain — for a coin created earlier in THIS block it returns
+        // pindex (reorg-safe, unlike indexing m_chain). coin_mtp = the creating block's nTime: this is
+        // the exact value the prover commits into the accumulator leaf when it adds the output, so it
+        // MUST match here or the spent coin won't be found in the accumulator. (Prover uses header
+        // nTime for created-coin leaves; BIP68-time uses this as its time reference.)
+        if (hazync_emit && !tx.IsCoinBase()) {
+            std::vector<haze::HazyncWitnessEmitter::InputMeta>& metas = hazync_spent[i];
+            metas.reserve(tx.vin.size());
+            for (const CTxIn& txin : tx.vin) {
+                const Coin& coin = view.AccessCoin(txin.prevout);
+                uint32_t coin_mtp = 0;
+                if (const CBlockIndex* anc = pindex->GetAncestor(coin.nHeight)) {
+                    coin_mtp = static_cast<uint32_t>(anc->GetBlockTime());
+                }
+                metas.push_back({coin.out.nValue, coin.out.scriptPubKey,
+                                 static_cast<int32_t>(coin.nHeight), coin.IsCoinBase(), coin_mtp});
+            }
+        }
+
         CTxUndo undoDummy;
         if (i > 0) {
             blockundo.vtxundo.emplace_back();
         }
-        // SwiftSync: use Bloom-filter-aware coin update during accelerated IBD
+        // SwiftSync: use Bloom-filter-aware coin update during accelerated IBD. Disabled when emitting
+        // Hazync witnesses — the emitter needs every spent coin in the view (full validation).
         if (m_chainman.m_swiftsync && m_chainman.m_swiftsync->IsActive() &&
-            pindex->nHeight < m_chainman.m_swiftsync->CheckpointHeight()) {
+            pindex->nHeight < m_chainman.m_swiftsync->CheckpointHeight() && !hazync_emit) {
             haze::SwiftSyncUpdateCoins(tx, view, *m_chainman.m_swiftsync,
                                        i == 0 ? undoDummy : blockundo.vtxundo.back(),
                                        pindex->nHeight);
@@ -2743,6 +2776,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
     if (fJustCheck) {
         return true;
+    }
+
+    // Hazync: the block passed all consensus checks and is being connected — emit its witness file.
+    if (hazync_emit) {
+        m_chainman.m_hazync_emitter->WriteBlock(block, *pindex, hazync_spent);
     }
 
     if (!m_blockman.WriteBlockUndo(blockundo, state, *pindex)) {

@@ -68,6 +68,9 @@ struct Params;
 namespace util {
 class SignalInterrupt;
 } // namespace util
+namespace haze {
+class HazyncWitnessEmitter;
+} // namespace haze
 
 /** Block files containing a block-height within MIN_BLOCKS_TO_KEEP of ActiveChain().Tip() will not be pruned. */
 static const unsigned int MIN_BLOCKS_TO_KEEP = 288;
@@ -1099,6 +1102,11 @@ public:
     //! When active, UTXOs not expected to survive to checkpoint are tracked
     //! in memory instead of being written to LevelDB, reducing IBD time by ~10x.
     std::unique_ptr<haze::SwiftSyncController> m_swiftsync;
+
+    //! Hazync witness emitter (the archive-node bridge). When set (via -hazyncwitness=<dir>), writes
+    //! one JSON witness file per connected block for the external Hazync zkVM prover. Purely
+    //! observational — reads the coin view before spends and writes files; no consensus effect.
+    std::unique_ptr<haze::HazyncWitnessEmitter> m_hazync_emitter;
 
     //! Instantiate a new chainstate.
     //!
