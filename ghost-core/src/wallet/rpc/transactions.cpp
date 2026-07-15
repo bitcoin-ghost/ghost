@@ -821,6 +821,8 @@ RPCHelpMan rescanblockchain()
                     {
                         {RPCResult::Type::NUM, "start_height", "The block height where the rescan started (the requested height or 0)"},
                         {RPCResult::Type::NUM, "stop_height", "The height of the last rescanned block. May be null in rare cases if there was a reorg and the call didn't scan any blocks because they were already scanned in the background."},
+                        {RPCResult::Type::NUM, "unreconstructed_hazed_txs", /*optional=*/true, "On a hazed node: the number of transactions in scanned stripped blocks (coinbase and legacy scriptSig transactions) that could not be reconstructed and so were not matched. Only present when greater than zero."},
+                        {RPCResult::Type::STR, "warning", /*optional=*/true, "On a hazed node: a human-readable warning, present only alongside unreconstructed_hazed_txs, pointing at the address index (scanaddressindex) for history over the affected range."},
                     }
                 },
                 RPCExamples{
