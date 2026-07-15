@@ -22,13 +22,13 @@
 
 //! Database migrations
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use tracing::{debug, info, warn};
 
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 40;
+const SCHEMA_VERSION: u32 = 41;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -96,6 +96,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (38, migrate_v38),
         (39, migrate_v39),
         (40, migrate_v40),
+        (41, migrate_v41),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2080,10 +2081,215 @@ fn migrate_v40(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// Migration v41: persist the signed `ShareProof` alongside each share.
+///
+/// The payout ledger is computed from the `shares` table, and every node must sum an
+/// IDENTICAL share set or the GHOST-02 exact-equality recompute rejects the payout. Share
+/// gossip is fire-and-forget, so drops happen; GHOST-03 anti-entropy exists to repair them.
+///
+/// But a node can only serve a backfill if it can hand over the *signed proof* — and the
+/// proof was only ever held in `RoundManager::recent_proofs`, pruned after 10 rounds. The
+/// `shares` table could not stand in for it: `miner_id` and `received_by` are stored TRUNCATED
+/// (8- and 4-byte hex prefixes), and `template_id`, `payout_address` and the GHOST-09 signature
+/// are not stored at all. So beyond a ~15 minute window there was nothing to reconcile from,
+/// and divergence became permanent.
+///
+/// This column stores the canonical JSON of the full `ShareProof`, so any node can serve — and
+/// any node can signature-verify — a backfill for a share of any age.
+///
+/// Additive and idempotent. Existing rows get NULL: those shares predate the column and their
+/// proofs are gone for good, so they cannot be served or verified. Reconciling that backlog is
+/// a one-time operation, not something this migration can do.
+fn migrate_v41(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v41: Add shares.proof (signed ShareProof for ledger convergence)");
+
+    // A real pool DB always has `shares` (v1). Some partial-schema fixtures do not, and a
+    // ledger-less database has nothing to migrate.
+    let has_shares: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shares'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_shares {
+        debug!("v41: no `shares` table — nothing to migrate");
+        return Ok(());
+    }
+
+    conn.execute_batch("ALTER TABLE shares ADD COLUMN proof BLOB;")
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    // Convergence serves by (round, share) and backfills by share_hash; the existing
+    // idx_shares_round / UNIQUE(share_hash) cover both, so no new index is needed.
+    info!("v41: Added shares.proof column");
+
+    normalise_legacy_share_hash_byte_order(conn)?;
+    Ok(())
+}
+
+/// v41: rewrite legacy locally-received shares into canonical INTERNAL byte order.
+///
+/// The SV1/SV2 layer reports `share_hash` in big-endian DISPLAY order (PoW zeros at the front).
+/// The locally-received path stored that verbatim, while every GOSSIPED copy of the same share
+/// was stored in INTERNAL order (zeros at the high-index end), matching the signed `ShareProof`.
+/// So one physical share carried two different `share_hash` spellings depending on which node
+/// wrote it, and `share_hash` was useless as a cross-node identity.
+///
+/// That was survivable only because a node skips gossip of its own shares, so nothing ever
+/// re-inserted the other spelling. The moment ledger convergence reconciles on `share_hash`, a
+/// peer would serve a node its OWN shares back under the internal spelling, the UNIQUE
+/// constraint would not recognise them, and the work would be counted TWICE.
+///
+/// Detection is unambiguous in practice: a share meets a difficulty target, so its display form
+/// begins with a run of zeros and its internal form ends with one. We rewrite only rows that
+/// look display-shaped and NOT internal-shaped, so an ambiguous hash is left alone rather than
+/// guessed at.
+///
+/// A UNIQUE collision during the rewrite means the node genuinely held BOTH spellings of one
+/// share — a real double-count — so the duplicate is deleted rather than kept.
+fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, share_hash FROM shares
+             WHERE share_hash LIKE '00000000%' AND share_hash NOT LIKE '%00000000'",
+        )
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| GhostError::Migration(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    drop(stmt);
+
+    let (mut rewritten, mut deduped, mut skipped) = (0usize, 0usize, 0usize);
+    for (id, display_hex) in rows {
+        let Ok(bytes) = hex::decode(&display_hex) else {
+            skipped += 1;
+            continue;
+        };
+        if bytes.len() != 32 {
+            skipped += 1;
+            continue;
+        }
+        let internal: Vec<u8> = bytes.iter().rev().copied().collect();
+        let internal_hex = hex::encode(internal);
+
+        match conn.execute(
+            "UPDATE shares SET share_hash = ?1 WHERE id = ?2",
+            params![internal_hex, id],
+        ) {
+            Ok(_) => rewritten += 1,
+            Err(e) if e.to_string().contains("UNIQUE") => {
+                // Both spellings of the same share were present — a genuine double-count.
+                conn.execute("DELETE FROM shares WHERE id = ?1", params![id])
+                    .map_err(|e| GhostError::Migration(e.to_string()))?;
+                deduped += 1;
+            }
+            Err(e) => return Err(GhostError::Migration(e.to_string())),
+        }
+    }
+
+    info!(
+        rewritten,
+        deduped, skipped, "v41: normalised legacy share_hash byte order to internal"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// v41 must rewrite display-order share hashes into canonical internal order, leave
+    /// already-internal rows alone, and delete a row that collides (a genuine double-count).
+    #[test]
+    fn v41_normalises_share_hash_byte_order() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+
+        // A share as the LOCAL path used to write it: display order, zeros at the front.
+        let display =
+            "000000000000001625f43a1854a8cf2237e634e76068ffaf1eaf2c8e23c534e5".to_string();
+        let internal: String = {
+            let b = hex::decode(&display).expect("hex");
+            hex::encode(b.iter().rev().copied().collect::<Vec<u8>>())
+        };
+
+        // A share as the GOSSIP path writes it: already internal, zeros at the end.
+        let already_internal =
+            "7b0ad875c4e9bc1301680b41a5bf47fdb69996795b56ede5fc280d0000000000".to_string();
+
+        let insert = |hash: &str, node: &str| {
+            conn.execute(
+                "INSERT INTO shares (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
+                 VALUES (1, 'm', 1.0, 1.0, ?1, 100, ?2, 1)",
+                params![hash, node],
+            )
+            .expect("insert");
+        };
+        insert(&display, "self");
+        insert(&already_internal, "peer");
+
+        normalise_legacy_share_hash_byte_order(&conn).expect("normalise");
+
+        let hashes: Vec<String> = conn
+            .prepare("SELECT share_hash FROM shares ORDER BY share_hash")
+            .expect("prep")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+
+        assert!(
+            hashes.contains(&internal),
+            "the display-order row must be rewritten to internal order"
+        );
+        assert!(
+            !hashes.contains(&display),
+            "no display-order row may survive — share_hash must be a cross-node identity"
+        );
+        assert!(
+            hashes.contains(&already_internal),
+            "an already-internal row must be left untouched"
+        );
+        assert_eq!(hashes.len(), 2, "no rows invented or lost");
+    }
+
+    /// If a node holds BOTH spellings of one share, that is a live double-count: the same work
+    /// summed twice into the payout ledger. The rewrite must collapse it, not preserve it.
+    #[test]
+    fn v41_deletes_a_double_counted_share() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+
+        let display = "000000000000001625f43a1854a8cf2237e634e76068ffaf1eaf2c8e23c534e5";
+        let internal: String = {
+            let b = hex::decode(display).expect("hex");
+            hex::encode(b.iter().rev().copied().collect::<Vec<u8>>())
+        };
+
+        for (hash, node) in [(display, "self"), (internal.as_str(), "peer")] {
+            conn.execute(
+                "INSERT INTO shares (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
+                 VALUES (1, 'm', 1.0, 1.0, ?1, 100, ?2, 1)",
+                params![hash, node],
+            )
+            .expect("insert");
+        }
+
+        normalise_legacy_share_hash_byte_order(&conn).expect("normalise");
+
+        let (count, work): (i64, f64) = conn
+            .query_row("SELECT COUNT(*), COALESCE(SUM(work),0) FROM shares", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("count");
+        assert_eq!(count, 1, "the duplicate spelling must be deleted");
+        assert_eq!(work, 1.0, "the work must be counted once, not twice");
+    }
 
     #[test]
     fn test_migrations() {

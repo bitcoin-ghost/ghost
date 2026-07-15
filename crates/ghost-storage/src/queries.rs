@@ -379,6 +379,254 @@ impl Database {
         })
     }
 
+    /// Insert a share together with its signed `ShareProof` (schema v41).
+    ///
+    /// GHOST-03: the proof is what lets ANY node serve — and any node verify — a backfill of
+    /// this share later. Without it, a share can only be reconciled while it is still in
+    /// `RoundManager::recent_proofs` (10 rounds, ~15 min); after that the ledger diverges
+    /// permanently, every node sums a different set, and the GHOST-02 exact-equality recompute
+    /// rejects the payout forever.
+    ///
+    /// `proof` is the canonical JSON of `ghost_common::types::ShareProof`. Idempotent: the
+    /// UNIQUE constraint on `share_hash` is the dedup.
+    pub fn insert_share_with_proof(&self, share: &ShareRecord, proof: &[u8]) -> GhostResult<i64> {
+        self.with_connection_retry("insert_share_with_proof", |conn| {
+            conn.execute(
+                "INSERT INTO shares (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid, proof)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    share.round_id,
+                    share.miner_id,
+                    share.difficulty,
+                    share.work,
+                    share.share_hash,
+                    share.timestamp,
+                    share.received_by,
+                    share.valid,
+                    proof,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    /// GHOST-03: the share hashes this node holds in the unpaid ledger at/after `since_ts`.
+    ///
+    /// This is what a node ADVERTISES during ledger convergence. Peers reply with the proofs
+    /// for anything they hold that is absent from this list. Scoped to unpaid shares because
+    /// those are precisely the ones a payout will be computed from.
+    pub fn unpaid_share_hashes_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT share_hash FROM shares
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                       AND timestamp >= ?1 AND timestamp < ?2
+                     ORDER BY timestamp",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_ts, until_ts], |r| r.get::<_, String>(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// GHOST-03: the stored proofs for unpaid shares at/after `since_ts` that the requester
+    /// does NOT hold. This is what a node SERVES during ledger convergence.
+    ///
+    /// Rows whose `proof` is NULL predate schema v41 and cannot be served: their signatures no
+    /// longer exist anywhere, so no peer could verify them. They are skipped, and the caller is
+    /// told how many, because that count is exactly the un-reconcilable backlog.
+    pub fn unpaid_proofs_missing_from(
+        &self,
+        since_ts: i64,
+        until_ts: i64,
+        theirs: &std::collections::HashSet<String>,
+        limit: usize,
+    ) -> GhostResult<(Vec<Vec<u8>>, usize)> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT share_hash, proof FROM shares
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                       AND timestamp >= ?1 AND timestamp < ?2
+                     ORDER BY timestamp",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_ts, until_ts], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let mut proofs = Vec::new();
+            let mut unservable = 0usize;
+            for row in rows {
+                let (hash, proof) = row.map_err(|e| GhostError::Database(e.to_string()))?;
+                if theirs.contains(&hash) {
+                    continue;
+                }
+                match proof {
+                    Some(p) => {
+                        if proofs.len() < limit {
+                            proofs.push(p);
+                        }
+                    }
+                    None => unservable += 1,
+                }
+            }
+            Ok((proofs, unservable))
+        })
+    }
+
+    /// Export every unpaid share, with its miner's payout address DECRYPTED.
+    ///
+    /// One-time ledger reconciliation only. Shares predating schema v41 carry no signed proof —
+    /// their GHOST-09 signatures are gone — so no node can serve or verify them and the ledger
+    /// convergence protocol cannot repair the divergence they cause. The only way to make the
+    /// fleet agree on that backlog is to take the union across the operator's own nodes.
+    ///
+    /// The payout address is decrypted here (and re-encrypted on import) because the DB key is
+    /// PER-NODE (`GHOST_ENCRYPTION_KEY`): copying rows between databases verbatim would leave the
+    /// address undecryptable on the target, the `INNER JOIN miners` in `get_top_unpaid_addresses`
+    /// would drop the share, and the miner would silently lose that work.
+    pub fn export_unpaid_shares(&self) -> GhostResult<Vec<UnpaidShareExport>> {
+        let rows: Vec<(u64, String, f64, f64, String, i64, String)> = self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT round_id, miner_id, difficulty, work, share_hash, timestamp, received_by
+                     FROM shares
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                     ORDER BY timestamp",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let it = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in it {
+                out.push(row.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
+        })?;
+
+        // Resolve each miner's address once, not per share.
+        let mut addr_cache: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by) in rows {
+            let payout_address = match addr_cache.get(&miner_id) {
+                Some(a) => a.clone(),
+                None => {
+                    let a = self.get_miner_payout_address(&miner_id).unwrap_or(None);
+                    addr_cache.insert(miner_id.clone(), a.clone());
+                    a
+                }
+            };
+            out.push(UnpaidShareExport {
+                round_id,
+                miner_id,
+                difficulty,
+                work,
+                share_hash,
+                timestamp,
+                received_by,
+                payout_address,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Import unpaid shares this node is missing, re-encrypting each miner's address with THIS
+    /// node's key. Returns (shares_inserted, miners_created).
+    ///
+    /// Never deletes, never overwrites: `INSERT` relies on UNIQUE(share_hash) for dedup, and a
+    /// miner row is only created if absent. Safe to re-run.
+    pub fn import_unpaid_shares(
+        &self,
+        shares: &[UnpaidShareExport],
+        dry_run: bool,
+    ) -> GhostResult<(usize, usize)> {
+        let mut inserted = 0usize;
+        let mut miners_created = 0usize;
+
+        for s in shares {
+            // The share is dropped from every payout by the INNER JOIN unless its miner exists.
+            if let Some(addr) = &s.payout_address {
+                if self.get_miner_payout_address(&s.miner_id)?.is_none() {
+                    if !dry_run {
+                        self.upsert_miner(&crate::models::MinerRecord {
+                            miner_id: s.miner_id.clone(),
+                            payout_address: addr.clone(),
+                            first_seen: s.timestamp,
+                            last_seen: s.timestamp,
+                            connected_node: None,
+                            total_shares: 0,
+                            total_work: 0.0,
+                            blocks_won: 0,
+                            total_payouts_sats: 0,
+                            avg_hashrate_ths: 0.0,
+                        })?;
+                    }
+                    miners_created += 1;
+                }
+            }
+
+            let record = crate::models::ShareRecord {
+                id: None,
+                round_id: s.round_id,
+                miner_id: s.miner_id.clone(),
+                difficulty: s.difficulty,
+                work: s.work,
+                share_hash: s.share_hash.clone(),
+                timestamp: s.timestamp,
+                received_by: s.received_by.clone(),
+                valid: true,
+            };
+
+            if dry_run {
+                let have: bool = self
+                    .with_connection(|conn| {
+                        conn.query_row(
+                            "SELECT 1 FROM shares WHERE share_hash = ?1",
+                            params![s.share_hash],
+                            |_| Ok(true),
+                        )
+                        .or(Ok(false))
+                    })
+                    .unwrap_or(false);
+                if !have {
+                    inserted += 1;
+                }
+                continue;
+            }
+
+            match self.insert_share(&record) {
+                Ok(_) => inserted += 1,
+                Err(e) if e.to_string().contains("UNIQUE") => {} // already had it
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((inserted, miners_created))
+    }
+
     /// Maximum rows returned by unbounded queries (H-7: OOM prevention)
     pub const MAX_QUERY_RESULTS: u32 = 10000;
 
@@ -6144,6 +6392,24 @@ pub struct MpcCeremonyState {
     /// refuses to null it (a one-way latch at the storage layer), and it drives
     /// the self-activating `OssifiedPinned` startup mode with no operator action.
     pub ossified_file_hash: Option<[u8; 32]>,
+}
+
+/// One unpaid share, with its miner's payout address in PLAINTEXT, for one-time ledger
+/// reconciliation across the operator's own nodes.
+///
+/// The DB encryption key is per-node, so the address must cross node boundaries decrypted and be
+/// re-encrypted on import — otherwise the `INNER JOIN miners` in the payout query silently drops
+/// the share and the miner loses that work.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnpaidShareExport {
+    pub round_id: u64,
+    pub miner_id: String,
+    pub difficulty: f64,
+    pub work: f64,
+    pub share_hash: String,
+    pub timestamp: i64,
+    pub received_by: String,
+    pub payout_address: Option<String>,
 }
 
 /// MPC contribution record
@@ -12213,5 +12479,132 @@ mod tests {
         assert_eq!(loaded.status, "archived");
         assert_eq!(loaded.end_height, Some(800));
         assert_eq!(loaded.final_root, Some([0x22; 32]));
+    }
+}
+
+#[cfg(test)]
+mod ledger_reconciliation_tests {
+    use super::*;
+    use crate::models::{MinerRecord, ShareRecord};
+
+    fn share(hash: &str, miner: &str, work: f64, ts: i64) -> ShareRecord {
+        ShareRecord {
+            id: None,
+            round_id: 1,
+            miner_id: miner.to_string(),
+            difficulty: work,
+            work,
+            share_hash: hash.to_string(),
+            timestamp: ts,
+            received_by: "node-a".to_string(),
+            valid: true,
+        }
+    }
+
+    fn miner(id: &str, addr: &str) -> MinerRecord {
+        MinerRecord {
+            miner_id: id.to_string(),
+            payout_address: addr.to_string(),
+            first_seen: 0,
+            last_seen: 0,
+            connected_node: None,
+            total_shares: 0,
+            total_work: 0.0,
+            blocks_won: 0,
+            total_payouts_sats: 0,
+            avg_hashrate_ths: 0.0,
+        }
+    }
+
+    /// The one-time union must converge two divergent ledgers, carry the miner across (or the
+    /// payout query's INNER JOIN silently drops the share and the work is lost), and be safe to
+    /// re-run without double-counting.
+    #[test]
+    fn reconciliation_converges_divergent_ledgers_and_is_idempotent() {
+        let a = Database::in_memory().expect("db a");
+        let b = Database::in_memory().expect("db b");
+
+        // A holds three unpaid shares from one miner; B dropped two of them and has never even
+        // heard of the miner.
+        a.upsert_miner(&miner("m1", "bc1qexampleaddressaaaaaaaaaaaaaaaaaaaaaaaa"))
+            .expect("miner");
+        for (i, h) in ["h1", "h2", "h3"].iter().enumerate() {
+            a.insert_share(&share(h, "m1", 1_000.0, 100 + i as i64))
+                .expect("A share");
+        }
+        b.upsert_miner(&miner("m1", "bc1qexampleaddressaaaaaaaaaaaaaaaaaaaaaaaa"))
+            .expect("miner");
+        b.insert_share(&share("h1", "m1", 1_000.0, 100)).expect("B share");
+
+        let unpaid = |db: &Database| -> f64 {
+            db.get_top_unpaid_miners(i64::MAX, 100)
+                .expect("ledger")
+                .iter()
+                .map(|(_, w)| *w)
+                .sum()
+        };
+        assert_eq!(unpaid(&a), 3_000.0);
+        assert_eq!(unpaid(&b), 1_000.0, "B's ledger is short");
+
+        let exported = a.export_unpaid_shares().expect("export");
+        assert_eq!(exported.len(), 3);
+        assert!(
+            exported.iter().all(|s| s.payout_address.is_some()),
+            "the address must be exported in plaintext — the DB key is per-node, so a raw copy \
+             would be undecryptable on the target and the share would be dropped by the JOIN"
+        );
+
+        // Dry run changes nothing.
+        let (would_insert, _) = b.import_unpaid_shares(&exported, true).expect("dry run");
+        assert_eq!(would_insert, 2);
+        assert_eq!(unpaid(&b), 1_000.0, "a dry run must write nothing");
+
+        let (inserted, _) = b.import_unpaid_shares(&exported, false).expect("import");
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            unpaid(&b),
+            unpaid(&a),
+            "the ledgers must now agree — otherwise the nodes compute different payout splits \
+             and GHOST-02 rejects the payout forever"
+        );
+
+        // Re-running must not double-count: the whole point is that it is safe to repeat.
+        let (again, _) = b.import_unpaid_shares(&exported, false).expect("re-import");
+        assert_eq!(again, 0);
+        assert_eq!(unpaid(&b), 3_000.0, "re-running must not double-count work");
+    }
+
+    /// A share whose miner is unknown to the target must bring its miner row with it, or the
+    /// payout query's INNER JOIN drops it and the miner silently loses the work.
+    #[test]
+    fn reconciliation_creates_the_missing_miner_row() {
+        let a = Database::in_memory().expect("db a");
+        let b = Database::in_memory().expect("db b");
+
+        a.upsert_miner(&miner("m2", "bc1qanotheraddressbbbbbbbbbbbbbbbbbbbbbbbb"))
+            .expect("miner");
+        a.insert_share(&share("x1", "m2", 500.0, 10)).expect("share");
+
+        // B has never seen this miner at all.
+        assert!(b.get_miner_payout_address("m2").expect("lookup").is_none());
+
+        let exported = a.export_unpaid_shares().expect("export");
+        let (inserted, miners_created) = b.import_unpaid_shares(&exported, false).expect("import");
+
+        assert_eq!(inserted, 1);
+        assert_eq!(miners_created, 1, "the miner row must be created on the target");
+        assert_eq!(
+            b.get_miner_payout_address("m2").expect("lookup").as_deref(),
+            Some("bc1qanotheraddressbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "and re-encrypted with THIS node's key, so it decrypts here"
+        );
+
+        let credited: f64 = b
+            .get_top_unpaid_miners(i64::MAX, 100)
+            .expect("ledger")
+            .iter()
+            .map(|(_, w)| *w)
+            .sum();
+        assert_eq!(credited, 500.0, "the imported work must be credited, not dropped");
     }
 }

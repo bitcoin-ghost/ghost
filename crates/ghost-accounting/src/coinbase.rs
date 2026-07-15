@@ -74,19 +74,32 @@ impl CoinbaseBuilder {
 
     /// Build coinbase script sig (BIP34 compliant)
     fn build_script_sig(&self) -> ScriptBuf {
-        // BIP34: Block height in script sig
-        let height_bytes = self.block_height.to_le_bytes();
-        let height_len = height_bytes
+        // BIP34: the height is pushed as a minimally-encoded CScriptNum — a SIGNED
+        // little-endian integer. If the most-significant byte has its high bit set, a zero
+        // sign byte must be appended, or the height decodes as NEGATIVE and the block is
+        // rejected with `bad-cb-height`.
+        //
+        // Heights where this bites: 128..=255, 32768..=65535, 8_388_608.. — i.e. whenever the
+        // top byte of the minimal encoding is >= 0x80. Mainnet is unaffected at present
+        // (957_896 -> [0x48, 0x9D, 0x0E], top byte 0x0E) and this produces byte-identical
+        // output for every height below 8_388_608, so the fix is inert on the live chain —
+        // but a regtest/signet chain in the 128..=255 band produces blocks the node rejects.
+        let le = self.block_height.to_le_bytes();
+        let len = le
             .iter()
             .rposition(|&b| b != 0)
             .map(|i| i + 1)
             .unwrap_or(1);
+        let mut height_bytes = le[..len].to_vec();
+        if height_bytes.last().is_some_and(|&b| b & 0x80 != 0) {
+            height_bytes.push(0x00);
+        }
 
         let mut script_data = Vec::new();
 
         // Push height (variable length)
-        script_data.push(height_len as u8);
-        script_data.extend_from_slice(&height_bytes[..height_len]);
+        script_data.push(height_bytes.len() as u8);
+        script_data.extend_from_slice(&height_bytes);
 
         // Extra nonce placeholder
         script_data.extend(vec![0u8; self.extra_nonce_size]);
@@ -244,6 +257,48 @@ impl CoinbaseAllocation {
 mod tests {
     use super::*;
 
+    /// BIP34 encodes the height as a CScriptNum — a SIGNED little-endian integer. When the
+    /// most-significant byte has its high bit set, a zero sign byte is required, or the height
+    /// decodes as negative and the node rejects the block with `bad-cb-height`.
+    ///
+    /// This was a live bug: a regtest chain at height 203 (0xCB) produced blocks ghostd
+    /// refused. Mainnet is unaffected only because current heights encode with a top byte
+    /// below 0x80 — it would have broken at height 8_388_608.
+    #[test]
+    fn bip34_height_is_a_signed_scriptnum() {
+        // Reads the pushed height back out of the scriptSig: [len][height bytes...]
+        fn pushed_height(height: u64) -> Vec<u8> {
+            let script = CoinbaseBuilder::new(height).build_script_sig();
+            let bytes = script.as_bytes();
+            let len = bytes[0] as usize;
+            bytes[1..1 + len].to_vec()
+        }
+
+        // High bit clear — no sign byte needed.
+        assert_eq!(pushed_height(102), vec![0x66]);
+        assert_eq!(pushed_height(127), vec![0x7f]);
+        // Mainnet today: top byte 0x0E, unchanged by the fix.
+        assert_eq!(pushed_height(957_896), vec![0xc8, 0x9d, 0x0e]);
+
+        // High bit SET — a zero sign byte must be appended, or these read as negative.
+        assert_eq!(pushed_height(128), vec![0x80, 0x00]);
+        assert_eq!(pushed_height(203), vec![0xcb, 0x00]);
+        assert_eq!(pushed_height(255), vec![0xff, 0x00]);
+        assert_eq!(pushed_height(32_768), vec![0x00, 0x80, 0x00]);
+        // The height mainnet would have broken at.
+        assert_eq!(pushed_height(8_388_608), vec![0x00, 0x00, 0x80, 0x00]);
+
+        // No encoding may ever end in a byte with the high bit set.
+        for h in [1u64, 127, 128, 203, 255, 256, 32_768, 946_743, 957_896, 8_388_608] {
+            let last = *pushed_height(h).last().expect("non-empty height push");
+            assert_eq!(
+                last & 0x80,
+                0,
+                "height {h} encodes as a negative CScriptNum — the node will reject the block"
+            );
+        }
+    }
+
     #[test]
     fn test_coinbase_builder() {
         let builder = CoinbaseBuilder::new(100)
@@ -331,10 +386,16 @@ mod tests {
             .with_pool_tag(Vec::new());
         let script = builder.build_script_sig();
         let bytes = script.as_bytes();
-        // 0xFFFFFFFF → LE bytes: [0xFF, 0xFF, 0xFF, 0xFF]
-        assert_eq!(bytes[0], 4, "height length byte should be 4 for u32::MAX");
-        assert_eq!(&bytes[1..5], &[0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(bytes.len(), 5);
+        // 0xFFFFFFFF → LE bytes [0xFF, 0xFF, 0xFF, 0xFF], whose top byte has the high bit set.
+        // BIP34 heights are CScriptNums (signed), so a zero sign byte is required — without it
+        // this decodes as a NEGATIVE height and the node rejects the block (`bad-cb-height`).
+        // This test previously asserted the unsigned 4-byte form, codifying that bug.
+        assert_eq!(
+            bytes[0], 5,
+            "u32::MAX needs a 5th sign byte to stay a positive CScriptNum"
+        );
+        assert_eq!(&bytes[1..6], &[0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        assert_eq!(bytes.len(), 6);
     }
 
     // ── P2TR quantum-safety rejection tests ──────────────────────────────
