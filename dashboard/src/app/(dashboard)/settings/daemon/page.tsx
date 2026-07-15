@@ -140,6 +140,109 @@ function FieldRow({
   );
 }
 
+// ghostd reserves a fixed outbound set (8 full-relay + 2 block-relay + 1 feeler)
+// for eclipse/partition resistance — these are protocol constants, not knobs.
+// Only the total (`-maxconnections`) is tunable; inbound capacity is whatever is
+// left after the reserved outbound. This control sets the total and shows the
+// fixed-outbound / variable-inbound split as a two-tone bar.
+const OUTBOUND_RESERVED = 11;
+const MAXCONN_DEFAULT = 125; // ghostd DEFAULT_MAX_PEER_CONNECTIONS
+const MAXCONN_SLIDER_MIN = 11;
+const MAXCONN_SLIDER_MAX = 1000;
+
+function PeerConnectionsField({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  disabled?: boolean;
+}) {
+  const isDefault = value.trim() === "";
+  const parsed = parseInt(value, 10);
+  const total = isDefault || Number.isNaN(parsed) ? MAXCONN_DEFAULT : Math.max(1, parsed);
+  const outbound = Math.min(OUTBOUND_RESERVED, total);
+  const inbound = Math.max(0, total - outbound);
+  const sliderVal = Math.min(MAXCONN_SLIDER_MAX, Math.max(MAXCONN_SLIDER_MIN, total));
+  // Gradient segments across the slider track (0..MAXCONN_SLIDER_MAX):
+  // reserved outbound (muted) → inbound (accent) → unused track.
+  const outPct = (Math.min(outbound, MAXCONN_SLIDER_MAX) / MAXCONN_SLIDER_MAX) * 100;
+  const totPct = (sliderVal / MAXCONN_SLIDER_MAX) * 100;
+
+  return (
+    <div className="p-3 bg-[var(--surface)]/50 rounded-lg space-y-3">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex-1 min-w-0">
+          <div className="text-[color:var(--fg)] font-medium">Peer connections</div>
+          <div className="text-sm text-[color:var(--dim)]">
+            Total automatic peers (<code>-maxconnections</code>). Outbound is
+            protocol-fixed at {OUTBOUND_RESERVED}; the remainder is inbound capacity.
+            Blank = ghostd default ({MAXCONN_DEFAULT}).
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <Input
+            type="number"
+            inputMode="numeric"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={String(MAXCONN_DEFAULT)}
+            className="w-24 text-right"
+            disabled={disabled}
+          />
+        </div>
+      </div>
+
+      <input
+        type="range"
+        className="ow-range w-full"
+        min={MAXCONN_SLIDER_MIN}
+        max={MAXCONN_SLIDER_MAX}
+        step={1}
+        value={sliderVal}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        aria-label="Maximum peer connections"
+        style={{
+          background: `linear-gradient(to right, var(--dim) 0%, var(--dim) ${outPct}%, var(--accent) ${outPct}%, var(--accent) ${totPct}%, var(--rule-strong) ${totPct}%, var(--rule-strong) 100%)`,
+        }}
+      />
+
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+        <span className="text-[color:var(--fg)]">
+          Total <b>{total}</b>
+          {isDefault && <span className="text-[color:var(--dim)]"> (default)</span>}
+        </span>
+        <span className="text-[color:var(--dim)]">
+          <span
+            className="inline-block w-2 h-2 rounded-sm align-middle mr-1"
+            style={{ background: "var(--accent)" }}
+          />
+          Inbound {inbound}
+        </span>
+        <span className="text-[color:var(--dim)]">
+          <span
+            className="inline-block w-2 h-2 rounded-sm align-middle mr-1"
+            style={{ background: "var(--dim)" }}
+          />
+          Outbound {outbound} (reserved)
+        </span>
+        {!isDefault && (
+          <button
+            type="button"
+            onClick={() => onChange("")}
+            disabled={disabled}
+            className="ml-auto text-[color:var(--dim)] hover:text-[color:var(--fg)] underline underline-offset-2 cursor-pointer disabled:cursor-not-allowed"
+          >
+            Reset to default
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ToggleFieldRow({
   label,
   description,
@@ -292,13 +395,9 @@ export default function DaemonSettingsPage() {
           <Card>
             <CardHeader title="Connectivity" subtitle="Peer connection and upload limits (-maxconnections / -maxuploadtarget)." />
             <div className="space-y-3">
-              <FieldRow
-                label="Max connections"
-                description="Maximum automatic peer connections (8–10000). Blank = ghostd default."
+              <PeerConnectionsField
                 value={form.maxConnections}
                 onChange={(v) => patch({ maxConnections: v })}
-                type="number"
-                inputMode="numeric"
               />
               <FieldRow
                 label="Max upload target / 24h"
