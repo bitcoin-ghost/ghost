@@ -834,10 +834,12 @@ impl Database {
     /// no shares match. Used to power public pool records (best hash per
     /// window).
     ///
-    /// Correctness: SHA256 hashes rendered as zero-padded 64-char hex
-    /// sort lexicographically in the same order as the underlying integer
-    /// value, so `ORDER BY share_hash ASC LIMIT 1` gives the share closest
-    /// to the all-zero target.
+    /// Correctness: `share_hash` is stored INTERNAL byte order (schema v41 —
+    /// PoW zeros at the back), so its raw lexicographic order does NOT match
+    /// rarity. `reverse_hex(s.share_hash)` yields the DISPLAY-order value
+    /// (zeros at the front), which sorts in the same order as the underlying
+    /// integer, so `ORDER BY reverse_hex(s.share_hash) ASC LIMIT 1` gives the
+    /// share closest to the all-zero target.
     pub fn get_best_share_since(
         &self,
         since_ts: i64,
@@ -854,7 +856,7 @@ impl Database {
                      FROM shares s
                      LEFT JOIN rounds r ON r.round_id = s.round_id
                      WHERE s.timestamp >= ?1 AND s.valid = 1 AND instr(s.miner_id, '.') > 0
-                     ORDER BY s.share_hash ASC
+                     ORDER BY reverse_hex(s.share_hash) ASC
                      LIMIT 1",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -886,7 +888,7 @@ impl Database {
                      FROM shares s
                      LEFT JOIN rounds r ON r.round_id = s.round_id
                      WHERE s.round_id = ?1 AND s.valid = 1 AND instr(s.miner_id, '.') > 0
-                     ORDER BY s.share_hash ASC
+                     ORDER BY reverse_hex(s.share_hash) ASC
                      LIMIT 1",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -920,9 +922,10 @@ impl Database {
         limit: u32,
     ) -> GhostResult<Vec<(String, String, i64, f64)>> {
         // Returns (miner_id, best_share_hash, timestamp, difficulty).
-        // Finding each miner's MIN(share_hash) then re-sorting is cheap
-        // at our volume; if this becomes hot we can keep a materialised
-        // per-miner-per-day rollup.
+        // `share_hash` is stored INTERNAL byte order, so rarity is ranked by
+        // `reverse_hex(share_hash)` (DISPLAY order, zeros at the front), not the
+        // raw column. A window function picks each miner's rarest share (rn = 1)
+        // and the outer ORDER BY ranks miners against each other by the same key.
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
@@ -932,15 +935,17 @@ impl Database {
                     // (no '.'); without this they appear as phantom leaderboard
                     // rows — the same miner duplicated under its gossip hash.
                     "SELECT s.miner_id, s.share_hash, s.timestamp, s.difficulty
-                     FROM shares s
-                     INNER JOIN (
-                         SELECT miner_id, MIN(share_hash) AS best_hash
+                     FROM (
+                         SELECT miner_id, share_hash, timestamp, difficulty,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY miner_id
+                                    ORDER BY reverse_hex(share_hash) ASC
+                                ) AS rn
                          FROM shares
                          WHERE timestamp >= ?1 AND valid = 1 AND instr(miner_id, '.') > 0
-                         GROUP BY miner_id
-                     ) b ON s.miner_id = b.miner_id AND s.share_hash = b.best_hash
-                     WHERE s.timestamp >= ?1 AND s.valid = 1
-                     ORDER BY s.share_hash ASC
+                     ) s
+                     WHERE s.rn = 1
+                     ORDER BY reverse_hex(s.share_hash) ASC
                      LIMIT ?2",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -9806,6 +9811,104 @@ mod tests {
             .expect("LOW-STOR-8: Failed to get shares by round");
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].miner_id, "abc123");
+    }
+
+    #[test]
+    fn test_reverse_hex_sql_function() {
+        let db = Database::in_memory().expect("create in-memory db");
+        // Byte-wise reverse of 00 11 22 33 -> 33 22 11 00.
+        let out: String = db
+            .with_connection(|conn| {
+                conn.query_row("SELECT reverse_hex(?1)", params!["00112233"], |r| r.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("reverse_hex query");
+        assert_eq!(out, "33221100");
+
+        // Non-hex / odd-length input is returned unchanged (never aborts a query).
+        let bad: String = db
+            .with_connection(|conn| {
+                conn.query_row("SELECT reverse_hex(?1)", params!["xyz"], |r| r.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("reverse_hex query");
+        assert_eq!(bad, "xyz");
+    }
+
+    #[test]
+    fn test_get_best_share_since_ranks_by_display_order() {
+        // `share_hash` is stored INTERNAL byte order (schema v41: PoW zeros at the
+        // BACK). Rarity = the DISPLAY-order value (zeros at the front). The best
+        // share must be the one with the most DISPLAY leading zeros, NOT the raw
+        // internal-lexicographic minimum.
+        let db = Database::in_memory().expect("create in-memory db");
+
+        // Build the INTERNAL-order 64-hex storage form from a readable DISPLAY
+        // (big-endian) hash by reversing the 32 bytes.
+        let to_internal = |display_hex: &str| -> String {
+            let mut bytes = hex::decode(display_hex).expect("32-byte display hex");
+            assert_eq!(bytes.len(), 32);
+            bytes.reverse();
+            hex::encode(bytes)
+        };
+
+        // DISPLAY value 1 (all zeros but the last byte) — the genuinely rarest.
+        let winner_display =
+            "0000000000000000000000000000000000000000000000000000000000000001";
+        // DISPLAY value with a high leading byte — common.
+        let common_display =
+            "ff00000000000000000000000000000000000000000000000000000000000000";
+        // DISPLAY value with a mid leading byte — common.
+        let mid_display =
+            "0000ff0000000000000000000000000000000000000000000000000000000000";
+
+        let mk = |hash: String, miner: &str| ShareRecord {
+            id: None,
+            round_id: 1,
+            miner_id: miner.to_string(),
+            difficulty: 1000.0,
+            work: 1000.0,
+            share_hash: hash,
+            timestamp: 1_000,
+            received_by: "node1".to_string(),
+            valid: true,
+        };
+
+        db.insert_share(&mk(to_internal(common_display), "addr1.w"))
+            .unwrap();
+        db.insert_share(&mk(to_internal(winner_display), "addr2.w"))
+            .unwrap();
+        db.insert_share(&mk(to_internal(mid_display), "addr3.w"))
+            .unwrap();
+
+        let best = db
+            .get_best_share_since(0)
+            .expect("query best share")
+            .expect("a best share exists");
+
+        // The rarest DISPLAY value (1) wins, stored in its INTERNAL form.
+        assert_eq!(best.share_hash, to_internal(winner_display));
+        assert_eq!(best.miner_id, "addr2.w");
+
+        // Sanity: a naive raw-lexicographic MIN(share_hash) does NOT pick the
+        // winner — its internal form starts with "01" while the common/mid shares'
+        // internal forms start with "00", so they sort first. This is exactly the
+        // bug reverse_hex fixes.
+        let naive_min: String = db
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT MIN(share_hash) FROM shares WHERE valid = 1 AND instr(miner_id,'.') > 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .unwrap();
+        assert_ne!(
+            naive_min,
+            to_internal(winner_display),
+            "internal-lex MIN must differ from the true rarest — proves the fix matters"
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ description = "SQLite storage layer for Bitcoin Ghost"
 
 [dependencies]
 ghost-common = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
