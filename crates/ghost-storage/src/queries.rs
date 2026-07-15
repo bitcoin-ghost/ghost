@@ -2409,27 +2409,64 @@ impl Database {
                     )
                     .map_err(|e| GhostError::Database(e.to_string()))?;
 
-                // If we have room for more elders, promote by node_id order (deterministic)
-                // SYBIL RESISTANCE: Only nodes with valid PoW are eligible for elder status
+                // Step 2: elder promotion.
+                //
+                // SYBIL RESISTANCE: the PoW proof must VERIFY against the node_id. This used
+                // to be the SQL predicate `pow_proof IS NOT NULL` — the *presence* of a
+                // proof, not its validity — so any node that stored an arbitrary non-null
+                // string was promoted to elder and collected the +1 share forever. The proof
+                // is never validated on insert either (the INSERT/UPDATE above store it
+                // as-is), so the old comment was wrong. SQLite cannot run the PoW check, so
+                // promotion is done here in Rust where the proof is actually verified.
                 if elder_count < max_elders {
-                    let slots_available = max_elders - elder_count;
+                    let slots_available = (max_elders - elder_count) as usize;
 
-                    // Promote non-elder nodes with lowest node_ids first
-                    // BUT only if they have a valid PoW proof!
-                    // (pow_proof IS NOT NULL means they submitted a proof - validated on insert)
-                    conn.execute(
-                        "UPDATE nodes SET is_elder = 1, elder_order = (
-                            SELECT COUNT(*) + 1 FROM nodes n2 WHERE n2.is_elder = 1
+                    // Highest rank handed out so far. Ranks are assigned explicitly rather
+                    // than by a correlated subquery counting `is_elder = 1` rows while the
+                    // same UPDATE mutates them — which could hand several nodes promoted in
+                    // one pass the SAME elder_order.
+                    let mut next_order: u32 = conn
+                        .query_row(
+                            "SELECT COALESCE(MAX(elder_order), 0) FROM nodes WHERE is_elder = 1",
+                            [],
+                            |row| row.get(0),
                         )
-                        WHERE node_id IN (
-                            SELECT node_id FROM nodes
-                            WHERE is_elder = 0 AND pow_proof IS NOT NULL
-                            ORDER BY node_id ASC
-                            LIMIT ?1
-                        )",
-                        params![slots_available],
-                    )
-                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                        .map_err(|e| GhostError::Database(e.to_string()))?;
+
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT node_id, pow_proof FROM nodes
+                             WHERE is_elder = 0 AND pow_proof IS NOT NULL
+                             ORDER BY node_id ASC",
+                        )
+                        .map_err(|e| GhostError::Database(e.to_string()))?;
+                    let candidates: Vec<(String, String)> = stmt
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map_err(|e| GhostError::Database(e.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| GhostError::Database(e.to_string()))?;
+                    drop(stmt);
+
+                    let mut promoted = 0usize;
+                    for (candidate_id, proof) in candidates {
+                        if promoted >= slots_available {
+                            break;
+                        }
+                        if !verify_node_id_pow_hex(&candidate_id, &proof, NODE_ID_POW_DIFFICULTY) {
+                            tracing::debug!(
+                                node = %&candidate_id[..8.min(candidate_id.len())],
+                                "Not promoting to elder: proof-of-work does not verify"
+                            );
+                            continue;
+                        }
+                        next_order += 1;
+                        conn.execute(
+                            "UPDATE nodes SET is_elder = 1, elder_order = ?1 WHERE node_id = ?2",
+                            params![next_order, candidate_id],
+                        )
+                        .map_err(|e| GhostError::Database(e.to_string()))?;
+                        promoted += 1;
+                    }
                 }
 
                 // Fetch final status for this node
@@ -9832,6 +9869,121 @@ pub fn resolve_bond_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Elder promotion gated on `pow_proof IS NOT NULL` — the PRESENCE of a proof, not its
+    /// validity — so a node that stored an arbitrary non-null string was promoted to elder
+    /// and collected the +1 share forever. The proof was never validated on insert either.
+    ///
+    /// Fails against the old code: the junk node comes back `is_elder = true`.
+    #[test]
+    fn a_junk_pow_proof_does_not_earn_elder_status() {
+        use ghost_common::identity::NodeIdentity;
+
+        let db = Database::in_memory().expect("db");
+
+        // An honest node with a real, verifiable proof is promoted.
+        let honest = NodeIdentity::generate();
+        let honest_id = hex::encode(honest.node_id());
+        let honest_proof = honest.pow_proof_hex().expect("real pow");
+        let (is_elder, _) = db
+            .register_node_with_elder_check_and_pow(
+                &honest_id,
+                None,
+                None,
+                "{}",
+                Some(&honest_proof),
+            )
+            .expect("register honest");
+        assert!(
+            is_elder,
+            "an honest node with valid PoW must become an elder"
+        );
+
+        // An attacker who makes something up is NOT promoted.
+        let attacker = NodeIdentity::generate();
+        let attacker_id = hex::encode(attacker.node_id());
+        for junk in [
+            "deadbeef",
+            "00000000000000000000000000000000",
+            "not-even-hex",
+        ] {
+            let (is_elder, order) = db
+                .register_node_with_elder_check_and_pow(&attacker_id, None, None, "{}", Some(junk))
+                .expect("register attacker");
+            assert!(
+                !is_elder,
+                "the junk proof {:?} bought elder status — Sybil hole",
+                junk
+            );
+            assert_eq!(order, None);
+        }
+        assert!(!db.is_node_elder(&attacker_id).unwrap());
+    }
+
+    /// Ranks were assigned by a correlated subquery — `elder_order = (SELECT COUNT(*) + 1 ...
+    /// WHERE is_elder = 1)` — evaluated per row by an UPDATE that was mutating those very
+    /// rows, so promoting several nodes in ONE pass could hand them all the same rank.
+    ///
+    /// Registering one node at a time never triggers it (each promotion is its own
+    /// statement); the bug needs a BATCH, which this builds by parking several PoW-valid
+    /// non-elders and then triggering one promotion pass.
+    #[test]
+    fn a_batch_promotion_hands_out_unique_ranks() {
+        use ghost_common::identity::NodeIdentity;
+        use std::collections::HashSet;
+
+        let db = Database::in_memory().expect("db");
+
+        let pending: Vec<NodeIdentity> = (0..5).map(|_| NodeIdentity::generate()).collect();
+        for id in &pending {
+            let node_id = hex::encode(id.node_id());
+            let proof = id.pow_proof_hex().expect("pow");
+            db.with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO nodes
+                       (node_id, first_seen, last_seen, is_elder, elder_order, capabilities, pow_proof)
+                     VALUES (?1, 0, 0, 0, NULL, '{}', ?2)",
+                    params![node_id, proof],
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+                Ok(())
+            })
+            .expect("park node");
+        }
+
+        // One registration sweeps all parked nodes up in a single promotion pass.
+        let trigger = NodeIdentity::generate();
+        db.register_node_with_elder_check_and_pow(
+            &hex::encode(trigger.node_id()),
+            None,
+            None,
+            "{}",
+            Some(&trigger.pow_proof_hex().expect("pow")),
+        )
+        .expect("register");
+
+        let ranks: Vec<u32> = db
+            .with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT elder_order FROM nodes WHERE is_elder = 1")
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, u32>(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("ranks");
+
+        assert_eq!(ranks.len(), 6, "all six should have been promoted");
+        let unique: HashSet<u32> = ranks.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ranks.len(),
+            "duplicate elder ranks: {:?}",
+            ranks
+        );
+    }
 
     #[test]
     fn test_share_insert_and_query() {
