@@ -23,6 +23,7 @@
 //! Database connection and management
 
 use parking_lot::{Mutex, RwLock};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use std::sync::Arc;
@@ -612,6 +613,44 @@ impl Database {
         )
         .map_err(|e| GhostError::Database(format!("Failed to initialize connection: {}", e)))?;
 
+        Self::register_functions(conn)?;
+
+        Ok(())
+    }
+
+    /// Register custom SQL scalar functions on a connection.
+    ///
+    /// `reverse_hex(TEXT) -> TEXT` reverses a hex string byte-wise (decode hex,
+    /// reverse the bytes, re-encode). `share_hash` is stored in INTERNAL byte
+    /// order (schema v41 `normalise_legacy_share_hash_byte_order` — PoW zeros at
+    /// the back), so `ORDER BY reverse_hex(share_hash)` ranks shares by their
+    /// DISPLAY-order value (zeros at the front), i.e. genuine rarity. Non-hex or
+    /// odd-length input is returned unchanged.
+    ///
+    /// Called from `initialize_connection`, so every query connection (the single
+    /// `write_conn` per `Database`) has it before any query runs.
+    fn register_functions(conn: &Connection) -> GhostResult<()> {
+        conn.create_scalar_function(
+            "reverse_hex",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let input: String = ctx.get(0)?;
+                let reversed = match hex::decode(&input) {
+                    Ok(mut bytes) => {
+                        bytes.reverse();
+                        hex::encode(bytes)
+                    }
+                    // Non-hex / odd-length: return unchanged so a malformed row
+                    // never aborts the query.
+                    Err(_) => input,
+                };
+                Ok(reversed)
+            },
+        )
+        .map_err(|e| {
+            GhostError::Database(format!("Failed to register reverse_hex function: {}", e))
+        })?;
         Ok(())
     }
 

@@ -2552,7 +2552,10 @@ async fn api_pool_recent_shares_handler(
             // Keeps ordinary shares spread through the sphere without
             // letting an unlucky-but-ordinary share masquerade as a near-
             // block. Outer band is reserved for genuinely exceptional hashes.
-            let leading_hex_zeros = hash.chars().take_while(|c| *c == '0').count();
+            // `hash` is stored INTERNAL order (zeros at the back); count the
+            // leading zeros on the DISPLAY form (zeros at the front).
+            let display_hash = internal_hex_to_display_hex(&hash);
+            let leading_hex_zeros = display_hash.chars().take_while(|c| *c == '0').count();
             let leading_bits = (leading_hex_zeros * 4) as f64;
             let quality = if leading_bits < 72.0 {
                 ((leading_bits - 40.0) / 32.0 * 0.85).clamp(0.0, 0.85)
@@ -2924,16 +2927,18 @@ async fn api_pool_records_handler(
         }
     };
 
-    // Candidate winner so far: the rarest `share_hash` seen. `assigned_diff`
-    // is Some only for the local share. Hashes are fixed-width zero-padded hex,
-    // so string `<` matches numeric order (smaller = rarer).
+    // Candidate winner so far: the rarest `share_hash` seen, held in DISPLAY
+    // order (zeros at the front) so string `<` matches numeric order (smaller =
+    // rarer) — the local DB hash is INTERNAL order and is converted on ingest;
+    // peers already gossip DISPLAY order. `assigned_diff` is Some only for the
+    // local share.
     let mut winning_hash: Option<String> = None;
     let mut winning_redacted = String::new();
     let mut winning_timestamp: i64 = 0;
     let mut winning_assigned_diff: Option<f64> = None;
 
     if let Some(best) = local_best {
-        winning_hash = Some(best.share_hash.clone());
+        winning_hash = Some(internal_hex_to_display_hex(&best.share_hash));
         winning_redacted = redact_miner_id(&best.miner_id);
         winning_timestamp = best.timestamp;
         winning_assigned_diff = Some(best.difficulty);
@@ -2969,10 +2974,11 @@ async fn api_pool_records_handler(
         }));
     };
 
-    // Recompute the leading-zero presentation from the WINNING hash (the local
-    // and peer hashes use the same big-endian zero-padded hex encoding).
-    // Each leading '0' hex char = 4 binary leading zeros — a coarse signal;
-    // the hash itself is the definitive record but reads worse in tiles.
+    // Recompute the leading-zero presentation from the WINNING hash. `share_hash`
+    // is already DISPLAY order (zeros at the front) here, so counting leading '0'
+    // chars is correct. Each leading '0' hex char = 4 binary leading zeros — a
+    // coarse signal; the hash itself is the definitive record but reads worse in
+    // tiles.
     let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
     let leading_zero_bits = leading_hex_zeros * 4;
 
@@ -2987,10 +2993,12 @@ async fn api_pool_records_handler(
             "miner_id_redacted": winning_redacted,
             "timestamp": winning_timestamp,
             // Achieved difficulty from the hash (the score), NOT the stored
-            // vardiff target. `assigned_difficulty` keeps the stored value for
-            // any consumer that wants the share's pool-credit work — null when
-            // a peer's record wins (peers don't gossip their vardiff target).
-            "difficulty": share_difficulty_from_hash_hex(&share_hash),
+            // vardiff target. `share_hash` is DISPLAY order here, but
+            // `share_difficulty_from_hash_hex` expects INTERNAL order, so reverse
+            // it back. `assigned_difficulty` keeps the stored value for any
+            // consumer that wants the share's pool-credit work — null when a
+            // peer's record wins (peers don't gossip their vardiff target).
+            "difficulty": share_difficulty_from_hash_hex(&internal_hex_to_display_hex(&share_hash)),
             "assigned_difficulty": winning_assigned_diff,
         }
     }))
@@ -3157,7 +3165,9 @@ async fn api_pool_mesh_leaderboard_handler(
 
         if let Some(ref db) = state.database {
             if let Ok(Some(best)) = db.get_best_share_since(since_ts) {
-                winning_hash = Some(best.share_hash.clone());
+                // Local DB hash is INTERNAL order; hold the winner in DISPLAY
+                // order so `<` ranks by rarity and peers (already DISPLAY) merge.
+                winning_hash = Some(internal_hex_to_display_hex(&best.share_hash));
                 winning_redacted = redact_miner_id(&best.miner_id);
                 winning_timestamp = best.timestamp;
             }
@@ -3180,6 +3190,9 @@ async fn api_pool_mesh_leaderboard_handler(
         }
 
         if let Some(share_hash) = winning_hash {
+            // `share_hash` is DISPLAY order (zeros at front): count is correct,
+            // and it is returned as-is for the website. Difficulty needs the
+            // INTERNAL form, so reverse it back.
             let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
             records.push(serde_json::json!({
                 "window": window_name,
@@ -3188,7 +3201,7 @@ async fn api_pool_mesh_leaderboard_handler(
                 "leading_hex_zeros": leading_hex_zeros,
                 "miner_id_redacted": winning_redacted,
                 "timestamp": winning_timestamp,
-                "difficulty": share_difficulty_from_hash_hex(&share_hash),
+                "difficulty": share_difficulty_from_hash_hex(&internal_hex_to_display_hex(&share_hash)),
             }));
         }
     }
@@ -3297,10 +3310,14 @@ async fn api_pool_leaderboard_handler(
         .filter(|(miner_id, _, _, _)| !is_system_miner(miner_id))
         .take(limit as usize)
         .map(|(miner_id, hash, ts, difficulty)| {
-            let leading_hex_zeros = hash.chars().take_while(|c| *c == '0').count();
+            // `hash` is INTERNAL order from the DB: feed it straight to
+            // `share_difficulty_from_hash_hex`, but present the DISPLAY form
+            // (zeros at the front) for the website and leading-zero count.
+            let display_hash = internal_hex_to_display_hex(&hash);
+            let leading_hex_zeros = display_hash.chars().take_while(|c| *c == '0').count();
             serde_json::json!({
                 "miner_id_redacted": redact_miner_id(&miner_id),
-                "share_hash": hash,
+                "share_hash": display_hash,
                 "leading_zero_bits": leading_hex_zeros * 4,
                 "timestamp": ts,
                 // Achieved difficulty from the hash (the score). `claimed_difficulty`
@@ -3354,26 +3371,26 @@ async fn api_pool_leaderboard_handler(
 /// e.g. ~1.5K, six orders of magnitude below its true ~600M difficulty. Any stat
 /// that means "how good was this share" must therefore be computed from the hash.
 ///
-/// `share_hash` is stored/served big-endian (leading hex zeros at the front =
-/// higher difficulty), so this mirrors the web client's `hashToDifficulty`
-/// (`BigInt('0x'+hash)`) exactly — most-significant byte first — giving backend
-/// and frontend identical numbers and reading historical rows correctly with no
-/// migration. (Note: `DifficultyCalculator::difficulty_from_hash` uses the
-/// opposite, internal little-endian byte order, so it is deliberately NOT reused
-/// here.) The difficulty-1 target (pdiff) is `0xFFFF * 2^208`.
+/// `share_hash` is stored INTERNAL byte order (the schema-v41 migration
+/// `normalise_legacy_share_hash_byte_order` rewrote every row so the PoW leading
+/// zeros sit at the HIGH-index/back end, `byte[31]` most-significant). This
+/// matches `DifficultyCalculator::difficulty_from_hash`, which iterates
+/// `hash.iter().rev()`, so we do the same here — feed this the raw stored
+/// (internal-order) hash. The difficulty-1 target (pdiff) is `0xFFFF * 2^208`.
 ///
 /// Returns 0.0 for a hash that isn't 32 bytes of hex (treated as "unknown").
-/// Achieved difficulty for a 64-char big-endian hex share hash (`diff1_target
-/// / hash_value`). Returns 0.0 for malformed input. `pub` so the ping builder
-/// in ghost-pool derives the same score it would here.
+/// Achieved difficulty for a 64-char internal-order hex share hash
+/// (`diff1_target / hash_value`). Returns 0.0 for malformed input. `pub` so the
+/// ping builder in ghost-pool derives the same score it would here.
 pub fn share_difficulty_from_hash_hex(share_hash_hex: &str) -> f64 {
     let bytes = match hex::decode(share_hash_hex) {
         Ok(b) if b.len() == 32 => b,
         _ => return 0.0,
     };
-    // Big-endian: byte[0] is most-significant.
+    // Internal order: byte[31] is most-significant (zeros at the back), so
+    // iterate in reverse to build the big-endian numeric value.
     let mut hash_value = 0.0_f64;
-    for &byte in bytes.iter() {
+    for &byte in bytes.iter().rev() {
         hash_value = hash_value * 256.0 + byte as f64;
     }
     if hash_value == 0.0 {
@@ -3381,6 +3398,21 @@ pub fn share_difficulty_from_hash_hex(share_hash_hex: &str) -> f64 {
     }
     let diff1_target = 65535.0_f64 * 2.0_f64.powi(208);
     diff1_target / hash_value
+}
+
+/// Reverse a 32-byte hex hash between INTERNAL storage order (PoW zeros at the
+/// back) and DISPLAY order (zeros at the front, big-endian — what the website's
+/// `hashToDifficulty`/lexicographic comparisons assume). The reversal is its own
+/// inverse, so this maps internal→display and display→internal alike. Input that
+/// isn't exactly 32 bytes of hex is returned unchanged (treated as opaque).
+pub fn internal_hex_to_display_hex(internal_hex: &str) -> String {
+    match hex::decode(internal_hex) {
+        Ok(mut bytes) if bytes.len() == 32 => {
+            bytes.reverse();
+            hex::encode(bytes)
+        }
+        _ => internal_hex.to_string(),
+    }
 }
 
 fn is_system_miner(miner_id: &str) -> bool {
@@ -5268,7 +5300,9 @@ async fn api_mining_best_hash_handler(
     // placeholder.
     let to_entry = |best: Option<ghost_storage::models::BestShare>| match best {
         Some(b) => serde_json::json!({
-            "hash": b.share_hash,
+            // `b.share_hash` is INTERNAL order: present the DISPLAY form to the
+            // dashboard, but feed the INTERNAL form to the difficulty fn.
+            "hash": internal_hex_to_display_hex(&b.share_hash),
             "difficulty": share_difficulty_from_hash_hex(&b.share_hash),
             "timestamp": b.timestamp,
             "miner_id": redact_miner_id(&b.miner_id),
@@ -5288,7 +5322,9 @@ async fn api_mining_best_hash_handler(
     // Raw back-compat fields mirror the all-time best share (achieved score).
     let (best_hash, best_difficulty) = match &all_time_best {
         Some(b) => (
-            Some(b.share_hash.clone()),
+            // DISPLAY form for the raw `best_hash` field; INTERNAL form feeds
+            // the difficulty fn.
+            Some(internal_hex_to_display_hex(&b.share_hash)),
             share_difficulty_from_hash_hex(&b.share_hash),
         ),
         None => (None, 0.0),
@@ -11434,18 +11470,23 @@ mod tests {
 
     #[test]
     fn test_share_difficulty_from_hash_hex() {
+        // `share_hash` is stored INTERNAL byte order (schema v41 — PoW zeros at
+        // the BACK, byte[31] most-significant). The readable constants below are
+        // in DISPLAY order (big-endian) and reversed to the INTERNAL storage form
+        // the fn expects via `internal_hex_to_display_hex` (a symmetric reversal).
+
         // The difficulty-1 target (pdiff) is 0xFFFF * 2^208 → difficulty 1.0.
         // In the big-endian hash string that is 0xFFFF after 8 leading hex zeros.
-        let diff1 = "00000000ffff0000000000000000000000000000000000000000000000000000";
-        let d1 = share_difficulty_from_hash_hex(diff1);
+        let diff1_display = "00000000ffff0000000000000000000000000000000000000000000000000000";
+        let d1 = share_difficulty_from_hash_hex(&internal_hex_to_display_hex(diff1_display));
         assert!((d1 - 1.0).abs() < 1e-6, "diff-1 target hex → 1.0, got {d1}");
 
         // A real best-share hash with many leading zeros must read as a LARGE
-        // achieved difficulty — the regression returned the ~1.5K vardiff target
-        // instead. This exact hash mapped to ≈596.69M live (and via the web
-        // client's hashToDifficulty), pinning byte order + formula together.
-        let big = "000000000000000732a94aee7325d02fd49adbe4f89f9cfcb11ebf0bd33bc26b";
-        let d = share_difficulty_from_hash_hex(big);
+        // achieved difficulty — the regression read the wrong (low) end of the
+        // internal-order hash and returned a tiny value. This exact DISPLAY hash
+        // mapped to ≈596.69M via the web client's hashToDifficulty.
+        let big_display = "000000000000000732a94aee7325d02fd49adbe4f89f9cfcb11ebf0bd33bc26b";
+        let d = share_difficulty_from_hash_hex(&internal_hex_to_display_hex(big_display));
         assert!(
             (d - 596_688_523.7).abs() / 596_688_523.7 < 1e-6,
             "best-share hash must match the web client's 596.69M, got {d}"
@@ -11455,6 +11496,51 @@ mod tests {
         assert_eq!(share_difficulty_from_hash_hex(""), 0.0);
         assert_eq!(share_difficulty_from_hash_hex("not-hex"), 0.0);
         assert_eq!(share_difficulty_from_hash_hex("00ff"), 0.0);
+    }
+
+    #[test]
+    fn test_share_difficulty_internal_order_hash_is_large() {
+        // Regression guard for the schema-v41 byte-order flip. Build a hash whose
+        // DISPLAY form has leading zeros at the FRONT, store it INTERNAL order
+        // (zeros at the BACK), and confirm the difficulty is read from the correct
+        // (high) end — a LARGE value, not the near-zero the old forward read gave.
+        let mut display = [0u8; 32];
+        // 16 leading DISPLAY hex zeros (8 zero bytes), then 0x01 at byte 8:
+        // value = 256^23 = 2^184 → difficulty = 0xFFFF*2^208 / 2^184 = 0xFFFF*2^24
+        // ≈ 1.1e12.
+        display[8] = 0x01;
+        let display_hex = hex::encode(display);
+        let internal_hex = internal_hex_to_display_hex(&display_hex);
+
+        // The internal-order storage form carries the PoW zeros at the BACK.
+        assert!(
+            internal_hex.ends_with("0000000000000000"),
+            "internal form should carry the PoW zeros at the back: {internal_hex}"
+        );
+
+        let d = share_difficulty_from_hash_hex(&internal_hex);
+        let expected = 65535.0_f64 * 2.0_f64.powi(24);
+        assert!(d > 1.0, "internal-order difficulty must be large, got {d}");
+        assert!(
+            (d - expected).abs() / expected < 1e-6,
+            "expected ≈{expected}, got {d}"
+        );
+    }
+
+    #[test]
+    fn test_internal_hex_to_display_hex() {
+        // Byte-wise reversal of the 32-byte hash.
+        let internal = "0100000000000000000000000000000000000000000000000000000000000000";
+        let display = "0000000000000000000000000000000000000000000000000000000000000001";
+        assert_eq!(internal_hex_to_display_hex(internal), display);
+        // Symmetric: applying it twice is the identity.
+        assert_eq!(
+            internal_hex_to_display_hex(&internal_hex_to_display_hex(internal)),
+            internal
+        );
+        // Non-32-byte input returned unchanged.
+        assert_eq!(internal_hex_to_display_hex("00ff"), "00ff");
+        assert_eq!(internal_hex_to_display_hex("not-hex"), "not-hex");
     }
 
     #[test]

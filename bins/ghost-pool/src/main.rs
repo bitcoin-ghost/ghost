@@ -420,9 +420,13 @@ fn build_local_best_records(
         if let Ok(Some(best)) = db.get_best_share_since(now_s - cutoff) {
             out.push(ghost_common::types::WindowBestRecord {
                 window: window.to_string(),
+                // `best.share_hash` is INTERNAL order: feed it to the difficulty
+                // fn as-is, but gossip the DISPLAY form so receiving nodes rank
+                // it by rarity (string `<`) and serve it consistently with their
+                // own display-order endpoint output.
                 difficulty: ghost_verification::share_difficulty_from_hash_hex(&best.share_hash),
                 miner_id_redacted: ghost_verification::redact_miner_id(&best.miner_id),
-                share_hash: best.share_hash,
+                share_hash: ghost_verification::internal_hex_to_display_hex(&best.share_hash),
                 timestamp: best.timestamp,
             });
         }
