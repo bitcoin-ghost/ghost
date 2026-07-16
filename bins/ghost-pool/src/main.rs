@@ -3199,6 +3199,41 @@ async fn main() -> Result<()> {
         Arc::clone(&health_handler) as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>
     );
 
+    // Node-reward challenge convergence (Component A): reconcile the v42
+    // verification_ledger across nodes so deterministic node-reward qualification
+    // reads the same signed challenge history everywhere — the analogue of the
+    // GHOST-03 share ledger sweep below. The handler's send is sync, so outbound
+    // frames go through an mpsc channel drained by a task that wraps each in a
+    // ChallengeConvergence envelope and broadcasts it.
+    let (verify_conv_tx, mut verify_conv_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    {
+        let mesh_for_vconv = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            while let Some(bytes) = verify_conv_rx.recv().await {
+                match mesh_for_vconv
+                    .create_envelope_raw(ghost_consensus::MessageType::ChallengeConvergence, bytes)
+                {
+                    Ok(envelope) => {
+                        if let Err(e) = mesh_for_vconv.broadcast(envelope).await {
+                            tracing::debug!(error = %e, "challenge-convergence broadcast failed");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "challenge-convergence envelope failed"),
+                }
+            }
+        });
+    }
+    let verify_conv_send: ghost_consensus::verification_handler::ChallengeSendFn = {
+        let verify_conv_tx = verify_conv_tx.clone();
+        Arc::new(move |bytes| {
+            verify_conv_tx.try_send(bytes).map_err(|e| {
+                ghost_common::error::GhostError::P2PMessage(format!(
+                    "challenge-convergence channel: {e}"
+                ))
+            })
+        })
+    };
+
     // Create and register verification result handler for P2P verification results
     // HIGH-VER-4: Use with_peers to validate challengers are known nodes before recording
     // CONSENSUS SECURITY: re-derive peer-broadcast Archive verdicts against our
@@ -3212,10 +3247,39 @@ async fn main() -> Result<()> {
                     Arc::clone(&rpc),
                     policy.clone(),
                 ),
-            )),
+            ))
+            .with_challenge_send(verify_conv_send),
     );
     mesh.register_handler(Arc::clone(&verification_result_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+
+    // Component A sweep: rotate through bounded windows of the verification
+    // ledger, advertising the keys we hold so peers backfill what we lack. Mirrors
+    // the GHOST-03 ledger sweep. One 1-hour bucket per tick keeps each request a
+    // sane size; the rotation covers the trailing 7 days that qualification reads.
+    {
+        let vconv_handler = Arc::clone(&verification_result_handler);
+        tokio::spawn(async move {
+            const VCONV_INTERVAL_SECS: u64 = 60;
+            const VLEDGER_BUCKET_SECS: i64 = 3_600; // 1h per advertisement
+            const VLEDGER_SWEEP_SPAN_SECS: i64 = 7 * 86_400; // trailing 7 days
+            const VLEDGER_BUCKETS: i64 = VLEDGER_SWEEP_SPAN_SECS / VLEDGER_BUCKET_SECS;
+
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(VCONV_INTERVAL_SECS));
+            let mut bucket: i64 = 0;
+            loop {
+                ticker.tick().await;
+                let now = chrono::Utc::now().timestamp();
+                let until = now - bucket * VLEDGER_BUCKET_SECS;
+                let since = until - VLEDGER_BUCKET_SECS;
+                bucket = (bucket + 1) % VLEDGER_BUCKETS;
+                if let Err(e) = vconv_handler.request_convergence(since, until) {
+                    tracing::debug!(error = %e, "challenge-convergence request failed");
+                }
+            }
+        });
+    }
 
     // Create and register discovery handler for peer gossip
     // This enables nodes to discover peers beyond just seed nodes
