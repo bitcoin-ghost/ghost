@@ -197,3 +197,51 @@ Steps:
 
 Only after A soaks do B/C/F (count-based, cutoff-anchored qualification + retire uptime) and E
 (node-split recompute) become sound.
+
+## Build status (feat/mesh-hardening, local only — nothing pushed)
+
+**A — challenge convergence: DONE.**
+- Schema: `verification_ledger` (v42 migration, single-ledger option chosen) — retains the signed
+  `VerificationResultMessage` blob keyed `(challenger_id, target_node_id, capability, timestamp)`.
+- Retain-on-receipt: `handle_verification_result` writes the ledger at all four capability sites
+  with the re-derived (archive/policy) or challenger-claimed (stratum/ghostpay) verdict.
+- DB methods: `verification_keys_in` / `verification_proofs_in` / `verification_proofs_missing_from`
+  / `insert_verification_proof`.
+- Message + handler: `MessageType::ChallengeConvergence` (Noise, health-monitoring port, 1MB /
+  150-proof cap) + `ChallengeConvergencePayload` and request/serve/apply methods on
+  `VerificationResultHandler`. Backfill re-applies the full live gates (signature, known-peer,
+  archive/policy re-derivation); freshness/rate-limit intentionally skipped (historical, bulk).
+  Apply writes ONLY the ledger, never the `*_challenges` tables.
+- Wired: an mpsc relay + a periodic sweep in `main.rs` rotate through 1-hour buckets of the
+  trailing 7 days. Tests: bidirectional reconciliation + idempotency + forged-proof rejection.
+
+**B/C/F — deterministic qualification: DONE (built, unwired).**
+- Storage: `ledger_pass_rate` / `ledger_unique_challengers` / `ledger_challenger_majority` read the
+  converged ledger over a bounded `[since, until]`.
+- `QualifiedCapabilityProvider::get_all_qualified_nodes_at_cutoff(node_ids, cutoff_ts)` — fixed
+  cutoff (no `now()`), converged ledger (no `*_challenges`), no uptime gatekeeper, network size from
+  the passed node set (no cache). Tests: cross-node determinism, post-cutoff exclusion with uptime
+  retired, stratum majority survives one griefer.
+- NOT on the live payout path yet — dead code until E gates it.
+
+**E — validator recompute + proposer switch: NOT STARTED (deliberately).**
+This is all-or-nothing at its gate: the proposer's `create_proposal` node_shares source and the
+validator's `validate_proposal_split` must BOTH flip to `get_all_qualified_nodes_at_cutoff(cutoff =
+proposal.timestamp)` at the same height, or every payout mismatches. Per the rollout order it cannot
+be enabled until A has deployed and soaked so ledgers actually converge — and A is not yet deployed.
+Precise plan when A is live and soaked:
+1. Add `NODE_SPLIT_ENFORCEMENT_HEIGHT` (a later height than `CLUSTER_ENFORCEMENT_HEIGHT`), default
+   inert.
+2. Proposer: source `node_shares` in `create_proposal`/`create_solo_proposal` from
+   `get_all_qualified_nodes_at_cutoff` at/above the gate (below it, keep the live path).
+3. Validator: in `validate_proposal_split`, capture the miner `dust` (currently `_dust`), rebuild
+   `augmented_node_pool = fee_dist.node_reward_pool + dust`, recompute
+   `calculate_node_payouts(get_all_qualified_nodes_at_cutoff(cutoff), augmented_node_pool)`, compare
+   the address→amount map to `proposal.node_payouts`, and — with the node split now pinned — replace
+   the treasury *floor* with an EXACT treasury check (the no-nodes→treasury fallback is finally
+   reproducible). Gate rejection on `NODE_SPLIT_ENFORCEMENT_HEIGHT`, log-only below (like the
+   existing miner-split gate in `make_proposal_validator`).
+4. Tests: a faithfully-built proposal passes; a node-split tamper and a node↔treasury shift both
+   fail above the gate and only log below it.
+Until E lands, the conservation + treasury-floor guardrails (`b6f1a643`) hold the node-vs-treasury
+line and the division within the node pool is trusted to the block finder within those bounds.
