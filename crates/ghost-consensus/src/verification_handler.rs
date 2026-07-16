@@ -470,6 +470,20 @@ impl VerificationResultHandler {
                 ) {
                     warn!(error = %e, "Failed to store archive challenge result");
                 }
+                // Retain the signed record in the verification ledger (v42) with THIS
+                // node's derived verdict — for challenge convergence + deterministic
+                // node-reward qualification. Keyed idempotently on (challenger, target,
+                // capability, timestamp).
+                if let Err(e) = self.db.insert_verification_proof(
+                    &challenger_hex,
+                    &target_hex,
+                    msg.capability.as_str(),
+                    stored_passed,
+                    msg.timestamp,
+                    &envelope.payload,
+                ) {
+                    warn!(error = %e, "Failed to persist verification proof (archive)");
+                }
             }
             CapabilityType::Policy => {
                 // SECURITY (consensus): never store the challenger-supplied
@@ -548,6 +562,16 @@ impl VerificationResultHandler {
                 ) {
                     warn!(error = %e, "Failed to store policy challenge result");
                 }
+                if let Err(e) = self.db.insert_verification_proof(
+                    &challenger_hex,
+                    &target_hex,
+                    msg.capability.as_str(),
+                    stored_passed,
+                    msg.timestamp,
+                    &envelope.payload,
+                ) {
+                    warn!(error = %e, "Failed to persist verification proof (policy)");
+                }
             }
             CapabilityType::Stratum => {
                 let connected = msg
@@ -577,6 +601,19 @@ impl VerificationResultHandler {
                 ) {
                     warn!(error = %e, "Failed to store stratum challenge result");
                 }
+                // Stratum/ghostpay aren't re-derived per-message (a distinct-challenger
+                // majority is applied at qualification), so retain the challenger's own
+                // signed verdict; the majority reads across the ledger's rows later.
+                if let Err(e) = self.db.insert_verification_proof(
+                    &challenger_hex,
+                    &target_hex,
+                    msg.capability.as_str(),
+                    msg.passed,
+                    msg.timestamp,
+                    &envelope.payload,
+                ) {
+                    warn!(error = %e, "Failed to persist verification proof (stratum)");
+                }
             }
             CapabilityType::GhostPay => {
                 let endpoint = serde_json::from_str::<serde_json::Value>(&msg.challenge_data)
@@ -603,6 +640,16 @@ impl VerificationResultHandler {
                     msg.passed,
                 ) {
                     warn!(error = %e, "Failed to store ghostpay challenge result");
+                }
+                if let Err(e) = self.db.insert_verification_proof(
+                    &challenger_hex,
+                    &target_hex,
+                    msg.capability.as_str(),
+                    msg.passed,
+                    msg.timestamp,
+                    &envelope.payload,
+                ) {
+                    warn!(error = %e, "Failed to persist verification proof (ghostpay)");
                 }
             }
         }

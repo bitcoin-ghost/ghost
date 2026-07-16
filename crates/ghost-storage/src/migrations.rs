@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 41;
+const SCHEMA_VERSION: u32 = 42;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -97,6 +97,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (39, migrate_v39),
         (40, migrate_v40),
         (41, migrate_v41),
+        (42, migrate_v42),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2125,6 +2126,37 @@ fn migrate_v41(conn: &Connection) -> GhostResult<()> {
     info!("v41: Added shares.proof column");
 
     normalise_legacy_share_hash_byte_order(conn)?;
+    Ok(())
+}
+
+/// Migration v42: the verification ledger — one table of signed
+/// `VerificationResultMessage` records across all capabilities, the challenge
+/// equivalent of `shares.proof`. It is the source of truth for challenge
+/// convergence (GHOST-03-style backfill) and, later, deterministic node-reward
+/// qualification. The signed record is UNIFORM across capabilities even though
+/// the four raw `*_challenges` tables are not, so it lives in one table (the
+/// shares model, applied to a uniform signed record). The PRIMARY KEY makes
+/// gossip re-delivery and backfill idempotent — the dedup the `*_challenges`
+/// tables never had. See `ghost-web/docs/node-reward-convergence.md`.
+fn migrate_v42(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v42: verification_ledger (signed challenge records)");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS verification_ledger (
+            challenger_id  TEXT    NOT NULL,
+            target_node_id TEXT    NOT NULL,
+            capability     TEXT    NOT NULL,
+            passed         INTEGER NOT NULL,
+            timestamp      INTEGER NOT NULL,
+            proof          BLOB    NOT NULL,
+            PRIMARY KEY (challenger_id, target_node_id, capability, timestamp)
+        );
+         CREATE INDEX IF NOT EXISTS idx_vled_target_cap_ts
+             ON verification_ledger(target_node_id, capability, timestamp);
+         CREATE INDEX IF NOT EXISTS idx_vled_ts
+             ON verification_ledger(timestamp);",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v42: created verification_ledger");
     Ok(())
 }
 

@@ -5347,6 +5347,80 @@ impl Database {
         })
     }
 
+    /// Persist a signed verification result into the verification ledger (schema v42).
+    ///
+    /// Idempotent: the PRIMARY KEY `(challenger, target, capability, timestamp)` means a
+    /// re-gossiped or backfilled record is stored exactly once — the dedup the raw
+    /// `*_challenges` tables never had. Returns `true` if this call newly stored it.
+    ///
+    /// `timestamp` is the CHALLENGE's own timestamp from the signed message (not `now()`),
+    /// and `passed` is the recipient's derived verdict — so every node keys and grades the
+    /// same record identically, which is what convergence and deterministic node-reward
+    /// qualification depend on. See `ghost-web/docs/node-reward-convergence.md`.
+    pub fn insert_verification_proof(
+        &self,
+        challenger_id: &str,
+        target_node_id: &str,
+        capability: &str,
+        passed: bool,
+        timestamp: i64,
+        proof: &[u8],
+    ) -> GhostResult<bool> {
+        if challenger_id.len() > MAX_CHALLENGE_ID_SIZE
+            || target_node_id.len() > MAX_CHALLENGE_ID_SIZE
+        {
+            return Err(GhostError::InvalidInput(
+                "verification proof: node id too large".to_string(),
+            ));
+        }
+        self.with_connection(|conn| {
+            let n = conn
+                .execute(
+                    "INSERT OR IGNORE INTO verification_ledger
+                     (challenger_id, target_node_id, capability, passed, timestamp, proof)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        challenger_id,
+                        target_node_id,
+                        capability,
+                        passed as i64,
+                        timestamp,
+                        proof,
+                    ],
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(n > 0)
+        })
+    }
+
+    /// The signed verification-proof blobs in `[since_ts, until_ts)`, capped at `limit`.
+    /// Each blob is the canonical signed `VerificationResultMessage` JSON. Used by the
+    /// convergence responder to serve what a peer is missing, and by tests.
+    pub fn verification_proofs_in(
+        &self,
+        since_ts: i64,
+        until_ts: i64,
+        limit: usize,
+    ) -> GhostResult<Vec<Vec<u8>>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT proof FROM verification_ledger
+                     WHERE timestamp >= ?1 AND timestamp < ?2
+                     ORDER BY timestamp ASC LIMIT ?3",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_ts, until_ts, limit as i64], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(rows)
+        })
+    }
+
     /// Insert a policy challenge result
     ///
     /// L-3 FIX: Uses INSERT OR REPLACE to enforce rate limiting. The unique index
@@ -12734,6 +12808,37 @@ mod tests {
         assert_eq!(loaded.status, "archived");
         assert_eq!(loaded.end_height, Some(800));
         assert_eq!(loaded.final_root, Some([0x22; 32]));
+    }
+
+    #[test]
+    fn verification_ledger_is_idempotent_and_windowed() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let blob = b"signed-verification-result".to_vec();
+
+        // A new (challenger, target, capability, timestamp) record is stored.
+        assert!(db
+            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob)
+            .expect("insert"));
+        // Re-delivery of the SAME key is a no-op — the dedup the *_challenges tables lacked.
+        assert!(!db
+            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob)
+            .expect("insert dup"));
+        // A different timestamp is a distinct record.
+        assert!(db
+            .insert_verification_proof("challengerA", "targetB", "archive", false, 2_000, &blob)
+            .expect("insert 2"));
+
+        // Windowed read serves only in-range records (the convergence responder relies on this).
+        assert_eq!(
+            db.verification_proofs_in(0, 1_500, 100).expect("read").len(),
+            1,
+            "only the ts=1000 record falls in [0,1500)"
+        );
+        assert_eq!(
+            db.verification_proofs_in(0, 10_000, 100).expect("read all").len(),
+            2,
+            "both distinct records, deduped to two"
+        );
     }
 }
 
