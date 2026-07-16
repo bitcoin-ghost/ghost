@@ -44,6 +44,17 @@ const BASE_MIN_UNIQUE_CHALLENGERS: u32 = 10;
 /// MED-VER-6: Maximum unique challengers required (cap for very large networks)
 const MAX_MIN_UNIQUE_CHALLENGERS: u32 = 50;
 
+/// Decode a 32-byte `NodeId` from a hex string, or `None` if malformed/short.
+fn decode_node_id(hex_id: &str) -> Option<NodeId> {
+    let bytes = hex::decode(hex_id).ok()?;
+    if bytes.len() < 32 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&bytes[..32]);
+    Some(id)
+}
+
 /// Configuration for capability qualification
 ///
 /// AUTH4-L3: Per-capability pass rates allow different thresholds based on
@@ -754,6 +765,152 @@ impl QualifiedCapabilityProvider {
         qualified_nodes
     }
 
+    /// Deterministic, cutoff-anchored qualification over the converged ledger.
+    ///
+    /// The reward-path replacement for [`Self::get_all_qualified_nodes`]
+    /// (Components B/C/F of node-reward determinism). It differs on every axis
+    /// that made the live path unreproducible:
+    /// - takes a fixed `cutoff_ts` (the proposal's agreed tip-change timestamp)
+    ///   instead of reading `now()`, so the window is identical on every node;
+    /// - reads the converged `verification_ledger` instead of the private,
+    ///   eventually-consistent `*_challenges` tables;
+    /// - drops the uptime gatekeeper entirely — a node that cannot answer
+    ///   challenges simply fails the count/pass floor, so liveness is proven by
+    ///   signed peer evidence rather than a private, non-convergent ping counter;
+    /// - derives network size and the scaled thresholds from the passed node set
+    ///   with no cache.
+    ///
+    /// Given a converged ledger, every node computes an identical result — which
+    /// is exactly what lets the node split be independently recomputed and
+    /// rejected on mismatch (Component E / GHOST-02). Window is
+    /// `[cutoff − lookback, cutoff]`; `node_ids` is the deterministic node set
+    /// (hex) that all nodes must agree on.
+    ///
+    /// NOTE: not yet on the live payout path — the proposer and the validator
+    /// recompute switch to this behind a height gate only after convergence (A)
+    /// has soaked, per the rollout order in the design doc.
+    pub fn get_all_qualified_nodes_at_cutoff(
+        &self,
+        node_ids: &[String],
+        cutoff_ts: i64,
+    ) -> Vec<(NodeId, i32)> {
+        let since = cutoff_ts - (self.config.lookback_days as i64 * SECONDS_PER_DAY);
+        let network_size = node_ids.len();
+        let min_unique = self.scaled_min_unique_challengers(network_size);
+        let min_challenges = self.scaled_min_challenges(network_size);
+
+        let mut qualified = Vec::new();
+        for hex_id in node_ids {
+            let caps =
+                self.qualified_caps_at_cutoff(hex_id, since, cutoff_ts, min_challenges, min_unique);
+            let shares = caps.total_shares();
+            if shares > 0 {
+                if let Some(node_id) = decode_node_id(hex_id) {
+                    qualified.push((node_id, shares));
+                }
+            }
+        }
+        qualified
+    }
+
+    /// Deterministic per-node capability set from the converged ledger over
+    /// `[since, until]`. Mirrors `get_qualified_capabilities_with_rates` plus the
+    /// C-2 unique-challenger filter, but ledger-based and cutoff-anchored.
+    fn qualified_caps_at_cutoff(
+        &self,
+        node_id_hex: &str,
+        since: i64,
+        until: i64,
+        min_challenges: u32,
+        min_unique: u32,
+    ) -> NodeCapabilities {
+        // Archive / Policy: per-row rate (verdicts are re-derived at ingest) + C-2.
+        let archive_mode = self.rate_capability_qualified(
+            node_id_hex,
+            "archive",
+            since,
+            until,
+            min_challenges,
+            min_unique,
+            self.config.archive_pass_rate,
+        );
+        let reaper = self.rate_capability_qualified(
+            node_id_hex,
+            "policy",
+            since,
+            until,
+            min_challenges,
+            min_unique,
+            self.config.policy_pass_rate,
+        );
+        // Stratum / GhostPay: strict per-distinct-challenger majority + C-2.
+        let public_mining = self
+            .majority_capability_qualified(node_id_hex, "stratum", since, until, min_challenges, min_unique);
+        let ghost_pay = self
+            .majority_capability_qualified(node_id_hex, "ghostpay", since, until, min_challenges, min_unique);
+
+        // Elder is registration order in the (converged) nodes table, unchanged.
+        let elder_status = self.db.is_node_elder(node_id_hex).unwrap_or(false);
+
+        NodeCapabilities {
+            archive_mode,
+            ghost_pay,
+            public_mining,
+            reaper,
+            elder_status,
+            coordinator: false,
+        }
+    }
+
+    /// Archive/Policy gate over the ledger: `total ≥ X AND passed/total ≥ rate
+    /// AND distinct challengers ≥ min_unique`.
+    fn rate_capability_qualified(
+        &self,
+        node_id_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+        min_challenges: u32,
+        min_unique: u32,
+        pass_rate: f64,
+    ) -> bool {
+        let (passed, total) = self
+            .db
+            .ledger_pass_rate(node_id_hex, capability, since, until)
+            .unwrap_or((0, 0));
+        if total == 0 || total < min_challenges {
+            return false;
+        }
+        if (passed as f64 / total as f64) < pass_rate {
+            return false;
+        }
+        let unique = self
+            .db
+            .ledger_unique_challengers(node_id_hex, capability, since, until)
+            .unwrap_or(0);
+        unique >= min_unique
+    }
+
+    /// Stratum/GhostPay gate over the ledger: `distinct challengers ≥ X AND a
+    /// strict majority of distinct challengers passed AND distinct challengers ≥
+    /// min_unique`. `challengers_total` from the majority query IS the distinct-
+    /// challenger count, so it serves the count floor and the C-2 Sybil floor.
+    fn majority_capability_qualified(
+        &self,
+        node_id_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+        min_challenges: u32,
+        min_unique: u32,
+    ) -> bool {
+        let (chal_pass, chal_total) = self
+            .db
+            .ledger_challenger_majority(node_id_hex, capability, since, until)
+            .unwrap_or((0, 0));
+        chal_total >= min_challenges && chal_total >= min_unique && chal_pass * 2 > chal_total
+    }
+
     /// Get statistics for a node's qualification status
     pub fn get_qualification_stats(&self, node_id: &NodeId) -> QualificationStats {
         let node_id_hex = hex::encode(node_id);
@@ -1204,6 +1361,110 @@ mod tests {
             "lookback_timestamp should be ~604800s (7 days) before now, \
              but diff from expected was {} seconds",
             diff
+        );
+    }
+
+    // =================================================================
+    // Deterministic, cutoff-anchored qualification (Components B/C/F)
+    // =================================================================
+
+    /// 32-byte hex node id from a single fill byte.
+    fn hex_id(fill: u8) -> String {
+        hex::encode([fill; 32])
+    }
+
+    /// Seed `n` distinct challengers each recording one `passed` archive proof
+    /// for `target` at `ts` into the converged ledger.
+    fn seed_archive(db: &Database, target: &str, first_challenger: u8, n: u8, passed: bool, ts: i64) {
+        for i in 0..n {
+            let challenger = hex_id(first_challenger + i);
+            db.insert_verification_proof(&challenger, target, "archive", passed, ts, b"p")
+                .unwrap();
+        }
+    }
+
+    /// Two nodes with identical converged ledgers must produce byte-identical
+    /// qualified sets for the same (node set, cutoff) — the property the whole
+    /// determinism effort exists to deliver.
+    #[test]
+    fn cutoff_qualification_is_deterministic_across_nodes() {
+        let target = hex_id(0xAA);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64;
+
+        let db_a = Arc::new(Database::in_memory().unwrap());
+        let db_b = Arc::new(Database::in_memory().unwrap());
+        // network_size = 5 → min_challenges = 4, min_unique = 3.
+        // Seed 4 distinct challengers all passing, within the window.
+        seed_archive(&db_a, &target, 0x10, 4, true, cutoff - 100);
+        seed_archive(&db_b, &target, 0x10, 4, true, cutoff - 100);
+
+        let a = QualifiedCapabilityProvider::new(db_a).get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
+        let b = QualifiedCapabilityProvider::new(db_b).get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
+
+        assert_eq!(a, b, "identical ledgers must yield identical qualified sets");
+        assert_eq!(
+            a,
+            vec![(decode_node_id(&target).unwrap(), 5)],
+            "archive-only target should qualify for exactly +5 shares"
+        );
+    }
+
+    /// Challenges after the cutoff are excluded, and no uptime rows are required
+    /// (the uptime gatekeeper is retired). A node just under the count floor
+    /// stays unqualified until an in-window challenge lifts it over.
+    #[test]
+    fn cutoff_qualification_excludes_post_cutoff_and_retires_uptime() {
+        let target = hex_id(0xBB);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64; // min_challenges = 4 at network_size 5
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        // 3 in-window (below the floor of 4) + 2 AFTER the cutoff (must be ignored).
+        seed_archive(&db, &target, 0x10, 3, true, cutoff - 100);
+        seed_archive(&db, &target, 0x20, 2, true, cutoff + 100);
+
+        let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
+        assert!(
+            provider
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff)
+                .is_empty(),
+            "post-cutoff challenges must not count; node is under the floor with no uptime rows"
+        );
+
+        // A 4th in-window distinct challenger lifts it over the floor — still no
+        // uptime data anywhere, proving liveness comes from challenge-accrual.
+        seed_archive(&db, &target, 0x13, 1, true, cutoff - 50);
+        assert_eq!(
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff),
+            vec![(decode_node_id(&target).unwrap(), 5)],
+            "an in-window challenge over the floor qualifies the node"
+        );
+    }
+
+    /// A single lazy/malicious challenger signing `passed=false` cannot drag a
+    /// stratum-qualified node under: the gate is a strict majority of DISTINCT
+    /// challengers, so 4 passing vs 1 failing still qualifies (+3 shares).
+    #[test]
+    fn cutoff_stratum_majority_survives_one_griefer() {
+        let target = hex_id(0xCC);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64; // min_challenges = 4, min_unique = 3
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        // 4 distinct challengers pass, 1 distinct challenger fails.
+        for i in 0..4u8 {
+            db.insert_verification_proof(&hex_id(0x30 + i), &target, "stratum", true, cutoff - 100, b"p")
+                .unwrap();
+        }
+        db.insert_verification_proof(&hex_id(0x40), &target, "stratum", false, cutoff - 100, b"p")
+            .unwrap();
+
+        let provider = QualifiedCapabilityProvider::new(db);
+        assert_eq!(
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff),
+            vec![(decode_node_id(&target).unwrap(), 3)],
+            "4-of-5 distinct challengers passing is a strict majority → +3 shares"
         );
     }
 }

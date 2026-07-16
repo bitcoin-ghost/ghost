@@ -5966,6 +5966,120 @@ impl Database {
         })
     }
 
+    // =========================================================================
+    // DETERMINISTIC QUALIFICATION over the converged verification_ledger (v42)
+    //
+    // These read ONLY the reconciled ledger over a bounded, cutoff-anchored
+    // window `[since, until]`, so every node that has converged its ledger
+    // computes identical tallies for the same (target, window) — the
+    // foundation for an independently-verifiable node-reward split. They mirror
+    // the live `*_challenges` gate semantics: archive/policy use a per-row pass
+    // rate (their verdicts are re-derived at ingest), stratum/ghostpay use a
+    // per-distinct-challenger majority. `capability` is one of
+    // "archive"/"policy"/"stratum"/"ghostpay" (see `CapabilityType::as_str`).
+    // =========================================================================
+
+    /// Per-row `(passed, total)` for one target+capability over `[since, until]`
+    /// from the converged ledger. Used for the archive/policy rate gate.
+    pub fn ledger_pass_rate(
+        &self,
+        target_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+    ) -> GhostResult<(u32, u32)> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) as passed,
+                        COUNT(*) as total
+                     FROM verification_ledger
+                     WHERE target_node_id = ?1 AND capability = ?2
+                       AND timestamp >= ?3 AND timestamp <= ?4",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let result = stmt
+                .query_row(params![target_hex, capability, since, until], |row| {
+                    let passed: Option<i64> = row.get(0)?;
+                    let total: i64 = row.get(1)?;
+                    Ok((
+                        i64_to_u32_count(passed.unwrap_or(0), "ledger_passed")?,
+                        i64_to_u32_count(total, "ledger_total")?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(result)
+        })
+    }
+
+    /// Distinct challengers that challenged one target+capability over
+    /// `[since, until]` in the converged ledger (C-2 Sybil floor).
+    pub fn ledger_unique_challengers(
+        &self,
+        target_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+    ) -> GhostResult<u32> {
+        self.with_connection(|conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT challenger_id)
+                     FROM verification_ledger
+                     WHERE target_node_id = ?1 AND capability = ?2
+                       AND timestamp >= ?3 AND timestamp <= ?4",
+                    params![target_hex, capability, since, until],
+                    |row| row.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            i64_to_u32_count(count, "ledger_unique_challengers")
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
+    /// Per-distinct-challenger majority `(challengers_pass, challengers_total)`
+    /// for one target+capability over `[since, until]` in the converged ledger.
+    /// Used for the stratum/ghostpay gate (a strict majority of distinct
+    /// challengers must pass), mirroring `get_stratum_challenger_majority`.
+    pub fn ledger_challenger_majority(
+        &self,
+        target_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+    ) -> GhostResult<(u32, u32)> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        SUM(CASE WHEN c_pass * 2 >= c_total THEN 1 ELSE 0 END) AS challengers_pass,
+                        COUNT(*) AS challengers_total
+                     FROM (
+                        SELECT challenger_id,
+                               SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) AS c_pass,
+                               COUNT(*) AS c_total
+                        FROM verification_ledger
+                        WHERE target_node_id = ?1 AND capability = ?2
+                          AND timestamp >= ?3 AND timestamp <= ?4
+                        GROUP BY challenger_id
+                     )",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let result = stmt
+                .query_row(params![target_hex, capability, since, until], |row| {
+                    let pass: Option<i64> = row.get(0)?;
+                    let total: i64 = row.get(1)?;
+                    Ok((
+                        i64_to_u32_count(pass.unwrap_or(0), "ledger_challengers_pass")?,
+                        i64_to_u32_count(total, "ledger_challengers_total")?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(result)
+        })
+    }
+
     /// Record an uptime sample for a node
     pub fn record_uptime_sample(
         &self,
