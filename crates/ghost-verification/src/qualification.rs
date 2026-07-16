@@ -824,26 +824,15 @@ impl QualifiedCapabilityProvider {
         min_challenges: u32,
         min_unique: u32,
     ) -> NodeCapabilities {
-        // Archive / Policy: per-row rate (verdicts are re-derived at ingest) + C-2.
-        let archive_mode = self.rate_capability_qualified(
-            node_id_hex,
-            "archive",
-            since,
-            until,
-            min_challenges,
-            min_unique,
-            self.config.archive_pass_rate,
-        );
-        let reaper = self.rate_capability_qualified(
-            node_id_hex,
-            "policy",
-            since,
-            until,
-            min_challenges,
-            min_unique,
-            self.config.policy_pass_rate,
-        );
-        // Stratum / GhostPay: strict per-distinct-challenger majority + C-2.
+        // All four capabilities use a strict per-distinct-challenger MAJORITY over the converged
+        // ledger + the C-2 unique-challenger floor. The ledger stores each challenger's own signed
+        // verdict (not a re-derived one) because re-derivation can't validate a backfilled proof
+        // past the 5-min response-freshness window; the distinct-challenger majority is what
+        // provides anti-grief — a colluding minority can neither fabricate a PASS nor a FAIL.
+        let archive_mode = self
+            .majority_capability_qualified(node_id_hex, "archive", since, until, min_challenges, min_unique);
+        let reaper = self
+            .majority_capability_qualified(node_id_hex, "policy", since, until, min_challenges, min_unique);
         let public_mining = self
             .majority_capability_qualified(node_id_hex, "stratum", since, until, min_challenges, min_unique);
         let ghost_pay = self
@@ -862,36 +851,7 @@ impl QualifiedCapabilityProvider {
         }
     }
 
-    /// Archive/Policy gate over the ledger: `total ≥ X AND passed/total ≥ rate
-    /// AND distinct challengers ≥ min_unique`.
-    fn rate_capability_qualified(
-        &self,
-        node_id_hex: &str,
-        capability: &str,
-        since: i64,
-        until: i64,
-        min_challenges: u32,
-        min_unique: u32,
-        pass_rate: f64,
-    ) -> bool {
-        let (passed, total) = self
-            .db
-            .ledger_pass_rate(node_id_hex, capability, since, until)
-            .unwrap_or((0, 0));
-        if total == 0 || total < min_challenges {
-            return false;
-        }
-        if (passed as f64 / total as f64) < pass_rate {
-            return false;
-        }
-        let unique = self
-            .db
-            .ledger_unique_challengers(node_id_hex, capability, since, until)
-            .unwrap_or(0);
-        unique >= min_unique
-    }
-
-    /// Stratum/GhostPay gate over the ledger: `distinct challengers ≥ X AND a
+    /// Per-capability gate over the ledger: `distinct challengers ≥ X AND a
     /// strict majority of distinct challengers passed AND distinct challengers ≥
     /// min_unique`. `challengers_total` from the majority query IS the distinct-
     /// challenger count, so it serves the count floor and the C-2 Sybil floor.

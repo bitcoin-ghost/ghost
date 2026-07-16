@@ -8050,6 +8050,7 @@ async fn main() -> Result<()> {
     // Start verification result broadcaster (sends results to other nodes via P2P)
     let mesh_for_verification = Arc::clone(&mesh);
     let identity_for_verification = Arc::clone(&identity);
+    let db_for_verification = Arc::clone(&db);
     tokio::spawn(async move {
         use ghost_consensus::message::{CapabilityType, MessageType, VerificationResultMessage};
 
@@ -8096,6 +8097,27 @@ async fn main() -> Result<()> {
                 target_signed_response: broadcast.target_signed_response,
                 signature,
             };
+
+            // Retain OUR OWN signed verdict in the convergence ledger, so a node's own challenges
+            // enter its ledger immediately rather than only via a convergence round-trip from a
+            // peer that happened to receive this broadcast. Same authoritative source the receive
+            // path stores (the signed message blob); the distinct-challenger majority at
+            // qualification still governs the verdict.
+            match serde_json::to_vec(&msg) {
+                Ok(blob) => {
+                    if let Err(e) = db_for_verification.insert_verification_proof(
+                        &hex::encode(msg.challenger_id),
+                        &hex::encode(msg.target_node_id),
+                        broadcast.capability.as_str(),
+                        msg.passed,
+                        msg.timestamp,
+                        &blob,
+                    ) {
+                        warn!(error = %e, "Failed to persist own verification proof to ledger");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to serialize own verification result for ledger"),
+            }
 
             // Get peer count before broadcast for logging
             let peer_count = mesh_for_verification.peers().peer_count();

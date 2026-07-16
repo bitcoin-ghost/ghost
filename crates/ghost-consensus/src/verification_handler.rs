@@ -412,39 +412,12 @@ impl VerificationResultHandler {
             }
         }
 
-        // Re-derive archive/policy against our own ground truth; stratum/ghostpay
-        // are signature-only (a distinct-challenger majority decides at
-        // qualification). Unverifiable => store nothing (no grief).
-        let passed = match msg.capability {
-            CapabilityType::Archive => match self.reverifier {
-                Some(ref rv) => match rv
-                    .reverify_archive(&msg.target_node_id, msg.target_signed_response.as_deref())
-                    .await
-                {
-                    ReVerdict::Pass => true,
-                    ReVerdict::Fail => false,
-                    ReVerdict::Unverifiable => return false,
-                },
-                None => msg.passed,
-            },
-            CapabilityType::Policy => match self.reverifier {
-                Some(ref rv) => match rv
-                    .reverify_policy(
-                        &msg.target_node_id,
-                        &msg.challenge_data,
-                        msg.target_signed_response.as_deref(),
-                    )
-                    .await
-                {
-                    ReVerdict::Pass => true,
-                    ReVerdict::Fail => false,
-                    ReVerdict::Unverifiable => return false,
-                },
-                None => msg.passed,
-            },
-            CapabilityType::Stratum | CapabilityType::GhostPay => msg.passed,
-        };
-
+        // Store the challenger's OWN signed verdict — NOT a re-derived one. A backfilled proof
+        // is by construction older than the `MAX_RESPONSE_AGE_SECS` (5 min) freshness window, so
+        // re-deriving the target's signed response would ALWAYS be Unverifiable and the capability
+        // could never converge. The challenger's signature (verified above) is ageless, and
+        // anti-grief comes from the distinct-challenger majority applied at qualification — the
+        // same model as the live receive path.
         let challenger_hex = hex::encode(msg.challenger_id);
         let target_hex = hex::encode(msg.target_node_id);
         self.db
@@ -452,7 +425,7 @@ impl VerificationResultHandler {
                 &challenger_hex,
                 &target_hex,
                 msg.capability.as_str(),
-                passed,
+                msg.passed,
                 msg.timestamp,
                 blob,
             )
@@ -619,7 +592,31 @@ impl VerificationResultHandler {
             return Ok(());
         }
 
-        // Store the result in the appropriate challenge table
+        // CONVERGENCE SOURCE OF TRUTH: retain the challenger's OWN signed verdict in the
+        // verification ledger for EVERY capability, keyed idempotently. This is what
+        // deterministic qualification (and Component E) reads.
+        //
+        // We store `msg.passed` — the challenger's claim — NOT a re-derived verdict, on purpose.
+        // Re-derivation checks the TARGET's signed response, which is rejected as stale after
+        // `MAX_RESPONSE_AGE_SECS` (5 min); but `ChallengeConvergence` backfills proofs hours to
+        // days later, so a re-derived verdict could never be reproduced on a backfilled proof and
+        // the capability would never converge. The challenger's signature (verified above) is
+        // ageless, so it converges. Anti-grief is provided instead by the DISTINCT-CHALLENGER
+        // MAJORITY applied at qualification: a colluding minority can neither fabricate a PASS nor
+        // a FAIL. Re-derivation is still applied below as a live filter on the legacy
+        // `*_challenges` tables (the pre-gate qualification path), where freshness holds.
+        if let Err(e) = self.db.insert_verification_proof(
+            &challenger_hex,
+            &target_hex,
+            msg.capability.as_str(),
+            msg.passed,
+            msg.timestamp,
+            &envelope.payload,
+        ) {
+            warn!(error = %e, "Failed to persist verification proof to convergence ledger");
+        }
+
+        // Store the derived result in the appropriate legacy challenge table (live path).
         // Use idempotent storage - ignore if already exists (based on challenger + target + timestamp)
         match msg.capability {
             CapabilityType::Archive => {
@@ -703,20 +700,6 @@ impl VerificationResultHandler {
                 ) {
                     warn!(error = %e, "Failed to store archive challenge result");
                 }
-                // Retain the signed record in the verification ledger (v42) with THIS
-                // node's derived verdict — for challenge convergence + deterministic
-                // node-reward qualification. Keyed idempotently on (challenger, target,
-                // capability, timestamp).
-                if let Err(e) = self.db.insert_verification_proof(
-                    &challenger_hex,
-                    &target_hex,
-                    msg.capability.as_str(),
-                    stored_passed,
-                    msg.timestamp,
-                    &envelope.payload,
-                ) {
-                    warn!(error = %e, "Failed to persist verification proof (archive)");
-                }
             }
             CapabilityType::Policy => {
                 // SECURITY (consensus): never store the challenger-supplied
@@ -795,16 +778,6 @@ impl VerificationResultHandler {
                 ) {
                     warn!(error = %e, "Failed to store policy challenge result");
                 }
-                if let Err(e) = self.db.insert_verification_proof(
-                    &challenger_hex,
-                    &target_hex,
-                    msg.capability.as_str(),
-                    stored_passed,
-                    msg.timestamp,
-                    &envelope.payload,
-                ) {
-                    warn!(error = %e, "Failed to persist verification proof (policy)");
-                }
             }
             CapabilityType::Stratum => {
                 let connected = msg
@@ -834,19 +807,6 @@ impl VerificationResultHandler {
                 ) {
                     warn!(error = %e, "Failed to store stratum challenge result");
                 }
-                // Stratum/ghostpay aren't re-derived per-message (a distinct-challenger
-                // majority is applied at qualification), so retain the challenger's own
-                // signed verdict; the majority reads across the ledger's rows later.
-                if let Err(e) = self.db.insert_verification_proof(
-                    &challenger_hex,
-                    &target_hex,
-                    msg.capability.as_str(),
-                    msg.passed,
-                    msg.timestamp,
-                    &envelope.payload,
-                ) {
-                    warn!(error = %e, "Failed to persist verification proof (stratum)");
-                }
             }
             CapabilityType::GhostPay => {
                 let endpoint = serde_json::from_str::<serde_json::Value>(&msg.challenge_data)
@@ -873,16 +833,6 @@ impl VerificationResultHandler {
                     msg.passed,
                 ) {
                     warn!(error = %e, "Failed to store ghostpay challenge result");
-                }
-                if let Err(e) = self.db.insert_verification_proof(
-                    &challenger_hex,
-                    &target_hex,
-                    msg.capability.as_str(),
-                    msg.passed,
-                    msg.timestamp,
-                    &envelope.payload,
-                ) {
-                    warn!(error = %e, "Failed to persist verification proof (ghostpay)");
                 }
             }
         }
@@ -1200,6 +1150,35 @@ mod tests {
         let (passed, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
         assert_eq!(total, 1);
         assert_eq!(passed, 1, "legacy path stores msg.passed unchanged");
+    }
+
+    /// THE FIX: the convergence ledger must capture the challenger's signed verdict for a
+    /// re-derived capability EVEN WHEN re-derivation says `Unverifiable` — otherwise policy
+    /// (rarely re-derivable inside the 5-min freshness window, never on a backfilled proof) could
+    /// never converge and Component E could never count reaper. The legacy `*_challenges` table
+    /// still honours the re-derivation filter and records nothing.
+    #[tokio::test]
+    async fn ledger_captures_policy_verdict_even_when_rederivation_unverifiable() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let challenger = NodeIdentity::generate();
+        let target = [23u8; 32];
+        let env = build_policy_envelope(&challenger, target, true); // challenger claims pass
+
+        let handler = VerificationResultHandler::new(Arc::clone(&db))
+            .with_rederivation(Arc::new(StubReverifier(ReVerdict::Unverifiable)));
+        handler.handle_verification_result(&env).await.unwrap();
+
+        // Legacy table: nothing — the re-derivation filter drops an Unverifiable result.
+        let (_p, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
+        assert_eq!(total, 0, "legacy policy table still honours the re-derivation filter");
+
+        // Ledger: the challenger's signed verdict IS retained, so policy can converge.
+        let keys = db.verification_keys_in(0, i64::MAX).unwrap();
+        assert_eq!(
+            keys.len(),
+            1,
+            "the convergence ledger retains the challenger's signed policy verdict"
+        );
     }
 
     // =================================================================
