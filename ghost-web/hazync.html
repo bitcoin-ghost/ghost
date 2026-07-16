@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hazync · Bitcoin validity proofs from Core's own consensus code — Bitcoin Ghost</title>
+  <meta name="description" content="Hazync proves Bitcoin blocks valid under Bitcoin Core's real, unmodified consensus code inside a zero-knowledge VM. Sync in minutes, run a full node without the spam.">
+  <meta property="og:site_name" content="Bitcoin Ghost">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Hazync — prove Bitcoin's real consensus code">
+  <meta property="og:description" content="Bitcoin Core's own consensus code, proven in a zkVM. Verify one small proof instead of re-executing history.">
+  <meta property="og:url" content="https://bitcoinghost.org/hazync.html">
+  <meta property="og:image" content="https://bitcoinghost.org/logo.png">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:site" content="@defenwycke">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20260422">
+  <script>
+    (function () {
+      var saved = localStorage.getItem('ghost-theme');
+      var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', saved || system);
+    })();
+  </script>
+  <style>
+    /* Hazync page — built on the shared Bitcoin Ghost tokens (style.css). All classes hz- namespaced. */
+    .hz-sec{padding:clamp(52px,8vw,88px) 0; border-top:1px solid var(--rule)}
+    .hz-sec:first-of-type{border-top:0}
+    .hz-eyebrow{display:inline-flex;align-items:center;gap:10px;font-family:var(--font-mono);font-size:12px;text-transform:uppercase;letter-spacing:.14em;color:var(--dim);margin:0 0 20px}
+    .hz-eyebrow::before{content:"";width:22px;height:1px;background:var(--accent)}
+    .hz-h2{font-size:clamp(25px,3.4vw,33px);font-weight:600;letter-spacing:-.02em;line-height:1.14;max-width:22ch;margin:0}
+    .hz-lead{max-width:62ch;color:var(--dim);font-size:clamp(16px,1.9vw,18px);line-height:1.55;margin:16px 0 0}
+    .hz-lead strong{color:var(--fg);font-weight:600}
+    .hz-mono{font-family:var(--font-mono)}
+    .hz-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:34px}
+
+    /* hero */
+    .hz-hero{padding:clamp(48px,6vw,78px) 0 clamp(38px,5vw,54px)}
+    .hz-hero-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:clamp(32px,5vw,58px);align-items:center}
+    @media (max-width:880px){.hz-hero-grid{grid-template-columns:1fr;gap:34px}}
+    .hz-status{display:inline-flex;align-items:center;gap:9px;font-family:var(--font-mono);font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);padding:6px 13px;border:1px solid var(--rule-strong);border-radius:999px}
+    .hz-status::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 25%,transparent);animation:hzpulse 2s ease-in-out infinite}
+    @keyframes hzpulse{0%,100%{opacity:1}50%{opacity:.5}}
+    @media (prefers-reduced-motion:reduce){.hz-status::before{animation:none}}
+    .hz-hero h1{font-size:clamp(33px,5.2vw,54px);line-height:1.05;font-weight:600;letter-spacing:-.025em;margin:24px 0 0;max-width:15ch;font-family:var(--font-sans)}
+    .hz-hero h1 .a{color:var(--accent)}
+
+    /* verification panel */
+    .hz-panel{border:1px solid var(--rule-strong);border-radius:6px;background:var(--surface);overflow:hidden}
+    .hz-panel .h{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--rule);font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+    .hz-verdict{font-family:var(--font-mono);font-weight:600;font-size:11px;letter-spacing:.1em;padding:3px 9px;border-radius:4px;color:var(--green);background:color-mix(in srgb,var(--green) 12%,transparent);border:1px solid color-mix(in srgb,var(--green) 45%,transparent)}
+    .hz-verdict.no{color:var(--accent);background:var(--accent-weak);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+    .hz-panel dl{margin:0;padding:4px 18px 12px}
+    .hz-panel .row{display:flex;align-items:baseline;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid var(--rule)}
+    .hz-panel .row:last-child{border-bottom:0}
+    .hz-panel dt{font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);white-space:nowrap}
+    .hz-panel dd{margin:0;font-family:var(--font-mono);font-size:13px;color:var(--fg);text-align:right;font-variant-numeric:tabular-nums;word-break:break-all}
+    .hz-panel dd.hash{font-size:11.5px;color:var(--accent);line-height:1.5}
+    .hz-panel .f{padding:13px 18px;border-top:1px solid var(--rule);font-family:var(--font-mono);font-size:11.5px;color:var(--fainter);line-height:1.55}
+
+    /* pipeline */
+    .hz-pipe{display:flex;flex-wrap:wrap;align-items:stretch;gap:10px;margin-top:26px}
+    .hz-stage{flex:1 1 190px;border:1px solid var(--rule);border-radius:6px;background:var(--bg);padding:18px 18px 15px;display:flex;flex-direction:column;gap:8px}
+    .hz-stage .n{font-family:var(--font-mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+    .hz-stage h3{font-size:16px;font-weight:600;letter-spacing:-.01em;margin:0}
+    .hz-stage p{margin:0;color:var(--dim);font-size:13.5px;line-height:1.5}
+    .hz-stage .sub{margin-top:auto;padding-top:9px;font-family:var(--font-mono);font-size:11px;color:var(--fainter);line-height:1.75;border-top:1px solid var(--rule)}
+    .hz-conn{flex:0 0 auto;align-self:center;color:var(--accent);font-family:var(--font-mono);font-size:18px}
+    @media (max-width:780px){.hz-pipe{flex-direction:column}.hz-conn{transform:rotate(90deg);margin:2px 0}}
+
+    .hz-grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+    @media (max-width:760px){.hz-grid2{grid-template-columns:1fr}}
+    .hz-diag{border:1px solid var(--rule);border-radius:6px;background:var(--bg);padding:22px;display:flex;flex-direction:column;gap:16px}
+    .hz-diag .lbl{font-family:var(--font-mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+    .hz-fold{width:100%;height:auto;max-width:340px;margin:0 auto;display:block}
+    .hz-fold .ln{stroke:var(--rule-strong);stroke-width:1}
+    .hz-fold .nd{fill:var(--dim)} .hz-fold .lf{fill:var(--fg)} .hz-fold .rt{fill:var(--accent)}
+    .hz-cap{margin:0;font-family:var(--font-mono);font-size:11.5px;color:var(--fainter);text-align:center;line-height:1.55}
+    .hz-cap b{color:var(--fg);font-weight:600}
+    .hz-schema .r{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--rule);font-family:var(--font-mono);font-size:12.5px}
+    .hz-schema .r:last-child{border-bottom:0}
+    .hz-schema .k{color:var(--accent)} .hz-schema .v{color:var(--dim);text-align:right}
+    .hz-foot{margin:2px 0 0;font-family:var(--font-mono);font-size:11.5px;color:var(--fainter);line-height:1.6}
+    .hz-foot b{color:var(--fg);font-weight:600}
+
+    /* facts grid (hazed) */
+    .hz-facts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:26px}
+    @media (max-width:680px){.hz-facts{grid-template-columns:1fr}}
+    .hz-fact{border:1px solid var(--rule);border-radius:6px;background:var(--bg);padding:20px;display:flex;flex-direction:column;gap:7px}
+    .hz-fact .m{font-family:var(--font-mono);color:var(--accent);font-size:15px;font-weight:600}
+    .hz-fact h3{font-size:16px;font-weight:600;margin:0;letter-spacing:-.01em}
+    .hz-fact p{margin:0;color:var(--dim);font-size:14px;line-height:1.55}
+    .hz-callout{margin-top:22px;border-left:2px solid var(--accent);padding:4px 0 4px 16px;font-family:var(--font-mono);font-size:13px;color:var(--fg);max-width:60ch}
+
+    /* ibd comparison */
+    .hz-cmp{display:flex;flex-direction:column;gap:16px;margin-top:26px}
+    .hz-cmp-row{display:grid;grid-template-columns:150px 1fr;gap:8px 16px;align-items:center}
+    @media (max-width:620px){.hz-cmp-row{grid-template-columns:1fr}}
+    .hz-cmp-lbl{font-family:var(--font-mono);font-size:12px;color:var(--fg);text-transform:uppercase;letter-spacing:.06em}
+    .hz-cmp-track{height:14px;border-radius:7px;background:var(--surface);border:1px solid var(--rule);overflow:hidden}
+    .hz-cmp-track span{display:block;height:100%;background:var(--rule-strong)}
+    .hz-cmp-track.a span{background:var(--accent)}
+    .hz-cmp-note{grid-column:2;font-family:var(--font-mono);font-size:11.5px;color:var(--fainter)}
+    @media (max-width:620px){.hz-cmp-note{grid-column:1}}
+
+    /* ledger */
+    .hz-ledger{border:1px solid var(--rule);border-radius:6px;overflow:hidden;margin-top:26px}
+    .hz-li{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:15px;padding:13px 18px;border-bottom:1px solid var(--rule);background:var(--bg)}
+    .hz-li:last-child{border-bottom:0} .hz-li:nth-child(even){background:var(--surface)}
+    .hz-ck{color:var(--green);font-family:var(--font-mono);font-weight:600;font-size:14px;width:1.1em;text-align:center}
+    .hz-nm{font-size:15px;font-weight:500} .hz-nm span{color:var(--dim);font-weight:400}
+    .hz-tag{font-family:var(--font-mono);font-size:11px;letter-spacing:.04em;color:var(--fainter);text-transform:uppercase;text-align:right;white-space:nowrap}
+    @media (max-width:600px){.hz-li{grid-template-columns:auto 1fr}.hz-tag{display:none}}
+
+    /* cards */
+    .hz-cards{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:26px}
+    @media (max-width:680px){.hz-cards{grid-template-columns:1fr}}
+    .hz-card{border:1px solid var(--rule);border-radius:6px;padding:22px;background:var(--bg);display:flex;flex-direction:column;gap:8px}
+    .hz-card .k{font-family:var(--font-mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+    .hz-card h3{font-size:20px;font-weight:600;letter-spacing:-.015em;margin:0}
+    .hz-card p{margin:0;color:var(--dim);font-size:14.5px;line-height:1.55}
+    .hz-card .st{margin-top:auto;padding-top:12px;font-family:var(--font-mono);font-size:12px;color:var(--fainter);display:flex;gap:8px;flex-wrap:wrap}
+    .hz-card .st b{color:var(--fg);font-weight:600}
+
+    /* split (boundaries) */
+    .hz-split{display:grid;grid-template-columns:.85fr 1.15fr;gap:clamp(28px,5vw,56px);align-items:start}
+    @media (max-width:820px){.hz-split{grid-template-columns:1fr;gap:26px}}
+    .hz-b{display:flex;gap:13px;padding:15px 0;border-bottom:1px solid var(--rule)}
+    .hz-b:last-child{border-bottom:0}
+    .hz-b .m{font-family:var(--font-mono);color:var(--accent);font-weight:600;flex:none;width:1.5em;text-align:center}
+    .hz-b b{display:block;font-weight:600;margin-bottom:2px;font-size:15px}
+    .hz-b span{color:var(--dim);font-size:14.5px;line-height:1.55}
+
+    /* malleate */
+    .hz-mal{border:1px solid var(--rule);border-radius:6px;overflow:hidden;margin-top:22px;font-family:var(--font-mono);font-size:12.5px}
+    .hz-mal .r{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--rule);flex-wrap:wrap;background:var(--bg)}
+    .hz-mal .r:last-child{border-bottom:0;background:var(--surface)}
+    .hz-mal .l{color:var(--dim);min-width:150px} .hz-mal .hsh{color:var(--accent);word-break:break-all;flex:1}
+
+    /* terminal */
+    .hz-term{border:1px solid var(--rule-strong);border-radius:6px;overflow:hidden;background:var(--surface);margin-top:26px}
+    .hz-term .h{display:flex;align-items:center;gap:8px;padding:11px 16px;border-bottom:1px solid var(--rule);font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;color:var(--dim)}
+    .hz-term .dot{width:9px;height:9px;border-radius:50%;background:var(--rule-strong);flex:none}
+    .hz-term pre{margin:0;padding:18px;overflow-x:auto;font-family:var(--font-mono);font-size:13px;line-height:1.95;color:var(--fg)}
+    .hz-term .c{color:var(--fainter)} .hz-term .p{color:var(--accent);user-select:none}
+
+    /* contribute */
+    .hz-note{max-width:62ch;color:var(--dim);font-size:14.5px;font-family:var(--font-mono);line-height:1.6;border-left:2px solid var(--accent);padding:2px 0 2px 16px;margin:20px 0 26px}
+    .hz-note b{color:var(--fg)}
+    .hz-help{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+    @media (max-width:680px){.hz-help{grid-template-columns:1fr}}
+    .hz-hc{border:1px solid var(--rule);border-radius:6px;padding:24px;background:var(--bg);display:flex;flex-direction:column;gap:10px}
+    .hz-hc .n{font-family:var(--font-mono);color:var(--accent);font-size:12px;letter-spacing:.1em;text-transform:uppercase}
+    .hz-hc h3{font-size:19px;font-weight:600;margin:0}
+    .hz-hc p{margin:0;color:var(--dim);font-size:14.5px;line-height:1.55}
+    .hz-a{font-family:var(--font-mono);font-size:12px;color:var(--accent);border-bottom:1px solid var(--accent-weak);align-self:flex-start}
+    .hz-inline-a{color:var(--accent);border-bottom:1px solid var(--accent-weak)}
+  </style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="/" class="brand bare">
+      <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+      <span class="wordmark">bitcoinghost</span>
+    </a>
+    <nav class="primary">
+      <a href="/">overview</a>
+      <a href="/core.html">core</a>
+      <a href="/pool.html">pool</a>
+      <a href="/nodes.html">nodes</a>
+      <a href="/hazync.html" class="current">hazync</a>
+      <a href="/hazync-party.html">proof party</a>
+      <a href="/downloads.html">downloads</a>
+    </nav>
+    <div class="utils">
+      <a href="https://github.com/bitcoin-ghost/hazync" class="bare icon-btn" aria-label="GitHub">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+      </a>
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle colour scheme"></button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- HERO -->
+  <section class="hz-hero"><div class="container hz-hero-grid">
+    <div>
+      <span class="hz-status">Chain-state proof · genesis → 550 · VALID</span>
+      <h1>Prove the whole chain is valid. Verify <span class="a">one small proof.</span></h1>
+      <p class="hz-lead" style="margin-top:22px">Hazync runs Bitcoin Core's own <strong>unmodified consensus code</strong> inside a zero-knowledge VM — script by script, signature by signature — and folds it into a single succinct proof. Not a reimplementation. The exact code the network already trusts.</p>
+      <div class="hz-actions">
+        <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.1.0">Get the release <span class="arrow">→</span></a>
+        <a class="btn btn-ghost" href="#run">Run it <span class="arrow">→</span></a>
+      </div>
+    </div>
+    <aside class="hz-panel" aria-label="Chain-state proof result">
+      <div class="h"><span>Chain-state proof · genesis → 550</span><span class="hz-verdict">VALID</span></div>
+      <dl>
+        <div class="row"><dt>Tip hash</dt><dd class="hash">75a5ad37b74e9126e265eece6af8b0e41c9594803b3a57773cf44f3100000000</dd></div>
+        <div class="row"><dt>Cumulative work</dt><dd>2,366,563,090,983</dd></div>
+        <div class="row"><dt>UTXO leaves</dt><dd>555</dd></div>
+        <div class="row"><dt>Consensus rules</dt><dd>all · real Core code</dd></div>
+      </dl>
+      <div class="f">Executed against real mainnet data. Every rule verified by the same C++ the network runs — no reimplementation.</div>
+    </aside>
+  </div></section>
+
+  <!-- THE DIFFERENCE -->
+  <section class="hz-sec"><div class="container">
+    <p class="hz-eyebrow">The difference</p>
+    <h2 class="hz-h2">Everyone else reimplements consensus. We don't.</h2>
+    <p class="hz-lead">Every prior effort expresses Bitcoin's rules in a circuit language — and inherits one question forever: <strong>does the reimplementation match Core in every edge case?</strong> Low-S, the SIGHASH_SINGLE bug, MINIMALIF, the exact sigop accounting, taproot's annex, the CVE-2012-2459 merkle malleability — miss one and the proof attests the wrong thing.</p>
+    <p class="hz-lead" style="margin-top:14px">Hazync compiles Bitcoin Core v28's real <strong>interpreter.cpp</strong>, <strong>SignatureHash</strong>, and <strong>libsecp256k1</strong> to RISC-V and proves <strong>those</strong> — two narrow portability shims, zero consensus-logic changes. Bitcoin has no separate spec: Core <strong>is</strong> the reference.</p>
+  </div></section>
+
+  <!-- HOW IT WORKS -->
+  <section class="hz-sec" id="how"><div class="container">
+    <p class="hz-eyebrow">How it works</p>
+    <h2 class="hz-h2">Validate once. Prove it. Verify forever.</h2>
+    <p class="hz-lead">The whole point is the separation — <strong>validate ≠ prove ≠ verify</strong>. Proving is expensive and done by a few; verifying is cheap and done by everyone.</p>
+    <div class="hz-pipe">
+      <div class="hz-stage"><span class="n">01 · witness</span><h3>The real block</h3><p>A block plus an inclusion proof for every coin it spends.</p><span class="sub">header · txs · Utreexo proofs<br>from any archive node</span></div>
+      <span class="hz-conn" aria-hidden="true">→</span>
+      <div class="hz-stage"><span class="n">02 · prove</span><h3>Run real Core code</h3><p>The guest executes Bitcoin Core's own consensus code and emits a STARK.</p><span class="sub">VerifyScript · SignatureHash<br>libsecp256k1 · UTXO transition</span></div>
+      <span class="hz-conn" aria-hidden="true">→</span>
+      <div class="hz-stage"><span class="n">03 · fold</span><h3>Compose the chain</h3><p>Each block proof folds into the running chain proof, genesis to tip.</p><span class="sub">recursion · log-depth<br>parallel range-fold</span></div>
+      <span class="hz-conn" aria-hidden="true">→</span>
+      <div class="hz-stage"><span class="n">04 · verify</span><h3>Check one proof</h3><p>Every node verifies a single receipt — no re-execution, no peers.</p><span class="sub">milliseconds<br>every node, cheap</span></div>
+    </div>
+    <div class="hz-grid2">
+      <div class="hz-diag">
+        <span class="lbl">The fold · genesis → tip</span>
+        <svg class="hz-fold" viewBox="0 0 320 124" role="img" aria-label="Block proofs merging log-depth into one chain-tip proof">
+          <g class="ln"><line x1="20" y1="108" x2="40" y2="72"/><line x1="60" y1="108" x2="40" y2="72"/><line x1="100" y1="108" x2="120" y2="72"/><line x1="140" y1="108" x2="120" y2="72"/><line x1="180" y1="108" x2="200" y2="72"/><line x1="220" y1="108" x2="200" y2="72"/><line x1="260" y1="108" x2="280" y2="72"/><line x1="300" y1="108" x2="280" y2="72"/><line x1="40" y1="72" x2="80" y2="40"/><line x1="120" y1="72" x2="80" y2="40"/><line x1="200" y1="72" x2="240" y2="40"/><line x1="280" y1="72" x2="240" y2="40"/><line x1="80" y1="40" x2="160" y2="14"/><line x1="240" y1="40" x2="160" y2="14"/></g>
+          <g class="lf"><circle cx="20" cy="108" r="3.2"/><circle cx="60" cy="108" r="3.2"/><circle cx="100" cy="108" r="3.2"/><circle cx="140" cy="108" r="3.2"/><circle cx="180" cy="108" r="3.2"/><circle cx="220" cy="108" r="3.2"/><circle cx="260" cy="108" r="3.2"/><circle cx="300" cy="108" r="3.2"/></g>
+          <g class="nd"><circle cx="40" cy="72" r="3.2"/><circle cx="120" cy="72" r="3.2"/><circle cx="200" cy="72" r="3.2"/><circle cx="280" cy="72" r="3.2"/><circle cx="80" cy="40" r="3.2"/><circle cx="240" cy="40" r="3.2"/></g>
+          <circle class="rt" cx="160" cy="14" r="5"/>
+        </svg>
+        <p class="hz-cap"><b>Thousands of independent block proofs</b> merge pairwise, log-depth, into <b>one</b> chain-tip proof — history proves in parallel.</p>
+      </div>
+      <div class="hz-diag">
+        <span class="lbl">Anatomy of a proof</span>
+        <div class="hz-schema">
+          <div class="r"><span class="k">tip_hash</span><span class="v">the chain's head</span></div>
+          <div class="r"><span class="k">utxo_root</span><span class="v">Utreexo commitment</span></div>
+          <div class="r"><span class="k">cum_work</span><span class="v">total proof-of-work</span></div>
+          <div class="r"><span class="k">height</span><span class="v">blocks proven</span></div>
+        </div>
+        <p class="hz-foot">A verified receipt commits exactly this <b>ChainState</b> — and nothing else can produce it. Checked in milliseconds; SNARK-wrappable to a few hundred bytes, to verify anywhere.</p>
+      </div>
+    </div>
+  </div></section>
+
+  <!-- HAZED BLOCKS -->
+  <section class="hz-sec" id="hazed"><div class="container">
+    <p class="hz-eyebrow">What the proof unlocks</p>
+    <h2 class="hz-h2">Full-node security. None of the spam.</h2>
+    <p class="hz-lead">Once a block's validity proof exists and it's past the re-org window, the block is <strong>hazed</strong> — its raw data can be dropped. You keep the proof and the UTXO commitment, and you are <strong>still fully validated.</strong> Because the proof already checked every consensus rule, your node trusts the proof, not the bytes.</p>
+    <div class="hz-facts">
+      <div class="hz-fact"><span class="m">✓</span><h3>Full consensus security</h3><p>Every rule — scripts, signatures, no-inflation, PoW, the lot — was proven. No trust in peers, no assumevalid.</p></div>
+      <div class="hz-fact"><span class="m">⌗</span><h3>No forced data retention</h3><p>Inscriptions, images, arbitrary payloads never have to touch your disk. A hazed node keeps the proof and the UTXO set — not the megabytes of witness spam.</p></div>
+      <div class="hz-fact"><span class="m">↔</span><h3>Full usage preserved</h3><p>The data stays available from archive nodes for anyone who wants it. Storing and serving it becomes a <strong>choice</strong>, not a requirement for full-node security.</p></div>
+      <div class="hz-fact"><span class="m">◆</span><h3>The proof is the state</h3><p>The chain proof plus the UTXO root <em>is</em> the exact valid state. You don't need the history to know it's correct — so you don't have to carry it.</p></div>
+    </div>
+    <p class="hz-callout">You decide what your node stores. The proof decides what it validates. For the first time, those are two separate questions.</p>
+  </div></section>
+
+  <!-- IBD SPEED -->
+  <section class="hz-sec" id="ibd"><div class="container">
+    <p class="hz-eyebrow">Sync</p>
+    <h2 class="hz-h2">Verify one proof. Skip re-executing history.</h2>
+    <p class="hz-lead">A new node today re-executes ~16 years of blocks — hundreds of gigabytes, hours to days, every byte of inscription spam included. With a Hazync + hazed archive, it fetches headers, verifies one chain-tip proof, and validates only the short unproven tail.</p>
+    <div class="hz-cmp">
+      <div class="hz-cmp-row">
+        <span class="hz-cmp-lbl">Today · full IBD</span>
+        <div class="hz-cmp-track"><span style="width:100%"></span></div>
+        <span class="hz-cmp-note">~600 GB downloaded · hours to days · every script re-run · all spam stored</span>
+      </div>
+      <div class="hz-cmp-row">
+        <span class="hz-cmp-lbl">With Hazync</span>
+        <div class="hz-cmp-track a"><span style="width:4%"></span></div>
+        <span class="hz-cmp-note">one proof verified in seconds + a bounded tail · UTXO accumulator only · spam optional</span>
+      </div>
+    </div>
+    <p class="hz-lead" style="font-size:14.5px;margin-top:18px">Same full-consensus security as replaying the chain yourself — because the proof <em>is</em> that replay, done once and checked by everyone. The tail you validate live is only as long as the proving lag.</p>
+  </div></section>
+
+  <!-- COVERAGE -->
+  <section class="hz-sec" id="proves"><div class="container">
+    <p class="hz-eyebrow">What it proves</p>
+    <h2 class="hz-h2">Every consensus rule — on real mainnet blocks.</h2>
+    <p class="hz-lead">Enforced with real Core code, each demonstrated on actual mainnet data.</p>
+    <div class="hz-ledger">
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">Script validity, <span>all types &amp; per-height flags</span></span><span class="hz-tag">interpreter.cpp</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">ECDSA + Schnorr signatures, <span>real sighash</span></span><span class="hz-tag">libsecp256k1</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">CheckTransaction <span>+ no inflation (Σin ≥ Σout, subsidy)</span></span><span class="hz-tag">tx_check.cpp</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">Proof-of-work <span>+ difficulty retarget</span></span><span class="hz-tag">arith_uint256</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">Merkle root <span>incl. CVE-2012-2459 mutation</span></span><span class="hz-tag">merkle.cpp</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">Block weight ≤ 4M <span>· sigop cost ≤ 80k</span></span><span class="hz-tag">BIP141</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">Witness commitment · BIP34 · BIP30</span><span class="hz-tag">soft forks</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">Coinbase maturity · absolute + relative locktime <span>(BIP68, real MTP)</span></span><span class="hz-tag">time rules</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">time-too-old <span>(block time &gt; median of prev 11)</span></span><span class="hz-tag">header</span></div>
+      <div class="hz-li"><span class="hz-ck">✓</span><span class="hz-nm">UTXO transition <span>— inclusion, delete, insert</span></span><span class="hz-tag">Utreexo</span></div>
+    </div>
+  </div></section>
+
+  <!-- EVIDENCE -->
+  <section class="hz-sec" id="evidence"><div class="container">
+    <p class="hz-eyebrow">Proven on real data</p>
+    <h2 class="hz-h2">Real STARK receipts, real mainnet blocks.</h2>
+    <p class="hz-lead">Not execute-mode traces — cryptographic proofs a verifier can check, generated on GPU.</p>
+    <div class="hz-cards">
+      <div class="hz-card"><span class="k">Block 170</span><h3>The first Bitcoin transaction</h3><p>Satoshi → Hal. Full consensus validity, end-to-end, as a verified STARK receipt.</p><div class="st"><span><b>~9.4s</b> a comparable block on one L40S</span></div></div>
+      <div class="hz-card"><span class="k">Block 741000</span><h3>SegWit + Taproot, at scale</h3><p>A modern block with key-path and script-path taproot spends, proven whole.</p><div class="st"><span><b>670</b> inputs</span><span>·</span><span><b>394</b> UTXO leaves</span></div></div>
+      <div class="hz-card"><span class="k">Genesis → 550</span><h3>A folded chain proof</h3><p>Every block linked into one recursive proof; parallel range-fold verified.</p><div class="st"><span>tip <b>75a5ad37…</b></span><span>·</span><span><b>555</b> leaves</span></div></div>
+      <div class="hz-card"><span class="k">Block 958250</span><h3>A real 90-day time-lock</h3><p>A live Taproot CSV spend, validated with real median-time-past — matching mainnet.</p><div class="st"><span>coin <b>90.2d</b> old</span><span>·</span><span>VALID, as accepted</span></div></div>
+    </div>
+  </div></section>
+
+  <!-- BOUNDARIES -->
+  <section class="hz-sec" id="honesty"><div class="container hz-split">
+    <div>
+      <p class="hz-eyebrow">What a proof can't cover</p>
+      <h2 class="hz-h2" style="font-size:clamp(23px,3vw,29px)">By design, not omission.</h2>
+      <p class="hz-lead" style="font-size:15.5px">The interesting objections live at the trust boundary. Stated up front — a proof is only as honest as its edges.</p>
+    </div>
+    <div>
+      <div class="hz-b"><span class="m">—</span><span><b>The 2-hour future-time limit</b><span>Depends on a node's wall-clock, not the chain. Not a provable rule — deliberately excluded. (The chain-side <em>time-too-old</em> half is enforced.)</span></span></div>
+      <div class="hz-b"><span class="m">—</span><span><b>Data availability</b><span>The proof attests validity <em>given</em> the block's transactions; they're bound to the header, but the proof is not the data.</span></span></div>
+      <div class="hz-b"><span class="m">—</span><span><b>The anchor</b><span>Genesis is unconditional; any later checkpoint is a documented trust input.</span></span></div>
+      <div class="hz-b"><span class="m">—</span><span><b>Cryptographic assumptions</b><span>RISC0/STARK soundness, SHA-256, secp256k1 — and the recursion self-reference, hardened and argued in writing.</span></span></div>
+    </div>
+  </div></section>
+
+  <!-- AUDIT -->
+  <section class="hz-sec" id="audit"><div class="container">
+    <p class="hz-eyebrow">Self-audited, adversarially</p>
+    <h2 class="hz-h2">Every finding fixed, validated, and negative-tested.</h2>
+    <p class="hz-lead">A witness-commitment bypass, an under-constrained accumulator delete, the BIP68 time value, and two from a pass over Core's block-validation surface — <strong>time-too-old</strong> and the merkle mutation. Each rejects the malicious case, not just passes the honest one.</p>
+    <div class="hz-mal" aria-label="Merkle mutation negative test">
+      <div class="r"><span class="l">honest [A,B,C]</span><span class="hsh">cacd895c…a0f3f5e6</span><span class="hz-verdict">merkle_ok</span></div>
+      <div class="r"><span class="l">malleated [A,B,C,C]</span><span class="hsh">cacd895c…a0f3f5e6</span><span class="hz-verdict no">REJECTED · mutated</span></div>
+    </div>
+    <p class="hz-foot" style="margin-top:12px">CVE-2012-2459 — identical merkle root, caught and rejected on the mutation flag.</p>
+  </div></section>
+
+  <!-- RUN IT -->
+  <section class="hz-sec" id="run"><div class="container">
+    <p class="hz-eyebrow">Run it</p>
+    <h2 class="hz-h2">Prove a block yourself — in about 25 minutes.</h2>
+    <p class="hz-lead">Open source and reproducible. You need a Linux box with an NVIDIA GPU; the provisioner handles the rest — RISC0, CUDA 12.6, and Bitcoin Core v28 from source.</p>
+    <div class="hz-term">
+      <div class="h"><span class="dot"></span> bash · github.com/bitcoin-ghost/hazync</div>
+<pre><span class="c"># 1 · provision — RISC0 toolchain + CUDA 12.6 + Bitcoin Core v28 + build</span>
+<span class="p">$</span> git clone https://github.com/bitcoin-ghost/hazync &amp;&amp; cd hazync
+<span class="p">$</span> GPU=1 REPO_DIR=$PWD ./provision-vps.sh
+
+<span class="c"># 2 · prove a real mainnet block  →  a verified STARK receipt</span>
+<span class="p">$</span> cd prover
+<span class="p">$</span> HAZYNC_BLOCK=block_100000.json ./target/release/host prove-full
+
+<span class="c"># 3 · or fold the chain from genesis (real recursion)</span>
+<span class="p">$</span> HAZYNC_WITNESS_DIR=/w HAZYNC_TO=170 HAZYNC_TIP=3 ./target/release/host prove-ibd</pre>
+    </div>
+    <p class="hz-lead" style="font-size:14.5px;margin-top:16px">No GPU? <strong>Verifying</strong> a finished proof is cheap and needs none — that's the whole point. Full steps are in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository README</a>, and the tagged build is the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.1.0">v0.1.0 research preview</a>.</p>
+  </div></section>
+
+  <!-- CONTRIBUTE -->
+  <section class="hz-sec" id="help"><div class="container">
+    <p class="hz-eyebrow">How to help</p>
+    <h2 class="hz-h2">The method is built. Now it needs eyes and compute.</h2>
+    <p class="hz-note">A research prototype, demonstrated end-to-end on real data — <b>not yet externally audited.</b> That's exactly why the code is open: real Core code invites real scrutiny.</p>
+    <div class="hz-help">
+      <div class="hz-hc"><span class="n">01 · review</span><h3>Try to make it lie</h3><p>The valuable finding is a case where a Hazync proof says <em>valid</em> for something Core rejects. SECURITY.md maps the soft spots — the accumulator, the recursion binding, the metadata plumbing. Reproduce in ~25 min.</p></div>
+      <div class="hz-hc"><span class="n">02 · compute</span><h3>Prove a slice of history</h3><p>Genesis→tip is GPU-hours the parallel backfill is built to absorb — thousands of independent block proofs, folded log-depth. Pick a block on the <a class="hz-inline-a" href="/hazync-party.html">Proof Party board</a> and put your name on it. A community effort to prove Bitcoin's whole history, once.</p></div>
+    </div>
+    <div class="hz-actions" style="margin-top:24px">
+      <a class="btn btn-primary" href="/hazync-party.html">Open the Proof Party <span class="arrow">→</span></a>
+      <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync">GitHub · bitcoin-ghost/hazync <span class="arrow">→</span></a>
+      <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync/blob/main/SOUNDNESS.md">Soundness statement <span class="arrow">→</span></a>
+      <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync/blob/main/SECURITY.md">Security review <span class="arrow">→</span></a>
+    </div>
+  </div></section>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="colophon">
+      <div class="brand">
+        <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+        <span class="wordmark">bitcoinghost</span>
+      </div>
+      <div class="meta">Hazync is a Bitcoin Ghost research project. Open source under the MIT license.</div>
+    </div>
+    <div>
+      <h4>Hazync</h4>
+      <ul>
+        <li><a href="https://github.com/bitcoin-ghost/hazync">GitHub</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.1.0">v0.1.0 release</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SOUNDNESS.md">Soundness</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SECURITY.md">Security</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="/">Bitcoin Ghost</a></li>
+        <li><a href="https://github.com/bitcoin-ghost">GitHub org</a></li>
+        <li><a href="https://x.com/defenwycke">@defenwycke</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var html = document.documentElement;
+    var btn = document.getElementById('theme-toggle');
+    var sun = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+    var moon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+    function render(){ btn.innerHTML = html.getAttribute('data-theme') === 'dark' ? sun : moon; }
+    render();
+    btn.addEventListener('click', function(){
+      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      localStorage.setItem('ghost-theme', next);
+      render();
+    });
+  })();
+</script>
+</body>
+</html>
