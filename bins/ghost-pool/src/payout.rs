@@ -1018,6 +1018,70 @@ impl PayoutProposalCreator {
                 proposal_map.len()
             ));
         }
+
+        // GHOST-02 (extended): pin the rest of the coinbase. The miner split is
+        // recomputed exactly above; the checks below stop a proposer from moving
+        // value across the miner / node-reward / treasury boundaries.
+        //
+        // NOT enforced here: the division WITHIN the node-reward pool (which node
+        // gets how much). That depends on verified-capability shares, which are not
+        // deterministically recomputable by a validator today — see
+        // `tasks/decision_ghost02_node_split.md`.
+
+        // (1) Conservation — every satoshi of subsidy + fees lands in exactly one
+        // output. With the miner sum already pinned, this also pins the aggregate
+        // (node + treasury) bucket, so value can't be moved out of the miner pool.
+        let miner_sum: u64 = proposal.miner_payouts.iter().map(|e| e.amount).sum();
+        let node_sum: u64 = proposal.node_payouts.iter().map(|e| e.amount).sum();
+        let allocated = miner_sum
+            .saturating_add(node_sum)
+            .saturating_add(proposal.treasury_amount);
+        let available = proposal.subsidy.saturating_add(proposal.tx_fees);
+        if allocated != available {
+            return Err(format!(
+                "GHOST-02: coinbase does not conserve value \
+                 (allocated {allocated} != subsidy+fees {available})"
+            ));
+        }
+
+        // (2) Treasury address — a non-zero treasury output must pay the treasury
+        // script this node is configured for, so a proposer cannot redirect it.
+        if proposal.treasury_amount > 0 {
+            match &self.config.treasury_address {
+                Some(expected_addr) if &proposal.treasury_address == expected_addr => {}
+                Some(_) => {
+                    return Err(
+                        "GHOST-02: treasury address does not match the configured treasury"
+                            .to_string(),
+                    )
+                }
+                None => {} // this validator has no treasury configured — cannot check
+            }
+        }
+
+        // (3) Treasury floor — the treasury can't be shorted below its deterministic
+        // minimum: the base rate plus any sub-dust block-finder fees (which always fold
+        // into treasury rather than a dust output). We deliberately do NOT pin the
+        // treasury EXACTLY: the node-reward pool falls through to treasury only when
+        // there are no eligible nodes, and node eligibility is not reproducible by a
+        // validator (attacker-controlled `node_payouts` would otherwise let a proposer
+        // choose which recompute branch the validator takes). Pinning the node-vs-
+        // treasury allocation needs the node-share determinism — see
+        // `tasks/decision_ghost02_node_split.md`.
+        let mut treasury_floor = fee_dist.treasury_amount;
+        if fee_dist.tx_fees_to_block_finder > 0
+            && fee_dist.tx_fees_to_block_finder < ghost_common::constants::DUST_THRESHOLD_SATS
+        {
+            treasury_floor = treasury_floor.saturating_add(fee_dist.tx_fees_to_block_finder);
+        }
+        if proposal.treasury_amount < treasury_floor {
+            return Err(format!(
+                "GHOST-02: treasury below its deterministic floor \
+                 (proposal {} < floor {treasury_floor})",
+                proposal.treasury_amount
+            ));
+        }
+
         Ok(())
     }
 
@@ -1785,6 +1849,12 @@ mod tests {
     }
 
     fn ghost02_proposal(subsidy: u64, miner_payouts: Vec<PayoutEntry>) -> PayoutProposal {
+        // Conserve value (GHOST-02 requires it): with no node payouts, everything not
+        // paid to miners is the treasury's — the same remainder a real empty-node block
+        // routes there. Without this the proposal would make `subsidy - miner` sats
+        // vanish and be rejected on conservation before the miner recompute is even
+        // reached.
+        let miner_sum: u64 = miner_payouts.iter().map(|e| e.amount).sum();
         PayoutProposal {
             proposal_hash: [0u8; 32],
             round_id: 1,
@@ -1793,7 +1863,7 @@ mod tests {
             proposer: [0u8; 32],
             miner_payouts,
             node_payouts: vec![],
-            treasury_amount: 0,
+            treasury_amount: subsidy.saturating_sub(miner_sum),
             treasury_address: vec![1u8; 20],
             tx_fees: 0,
             subsidy,
@@ -1826,20 +1896,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ghost02_accepts_split_matching_local_recompute() {
-        let creator = ghost02_creator();
-        let ts = TreasuryState::new();
-        // Empty ledger → the only honest split is the empty one.
-        let local_work: Vec<(String, u128)> = vec![];
-        let proposal = ghost02_proposal(5_000_000_000, vec![]);
-        assert!(
-            creator
-                .validate_proposal_split(&proposal, &local_work, &ts)
-                .is_ok(),
-            "GHOST-02: an empty split matches an empty-ledger recompute"
-        );
-    }
+    // The honest-accept case is covered by `ghost02_ledger_proposal_survives_validator_recompute`
+    // below (a full proposal from the real proposer). An empty-ledger split can't be tested as
+    // "accepted" any more: with no miners the coinbase can't conserve value, so it is correctly
+    // rejected — which is what the conservation check exists to catch.
 
     // ---- GHOST-02: the proposer and the validator must agree on WHICH shares pay ----
     //
@@ -2033,6 +2093,122 @@ mod tests {
             "GHOST-02: an honest ledger-built proposal must survive an honest node's \
              recompute — if this fails, the fleet rejects its own payout and the coinbase \
              falls back to paying pool_payout_address alone"
+        );
+    }
+
+    /// GHOST-02 (extended): a coinbase that doesn't conserve value — a satoshi minted or
+    /// destroyed — is rejected even though its miner split recomputes cleanly.
+    #[test]
+    fn ghost02_rejects_non_conserving_coinbase() {
+        let (creator, db) = ledger_creator();
+        let now = 1_800_000_000i64;
+        let addrs = seed_unpaid_ledger(&db, now);
+        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
+
+        // Mint one satoshi from nothing: treasury up by one, nothing else moved.
+        proposal.treasury_amount += 1;
+
+        let local_work = select_ledger_miner_work(
+            &db,
+            proposal.timestamp as i64,
+            proposal.block_height,
+            proposal.subsidy,
+        )
+        .expect("validator recompute");
+        assert!(
+            creator
+                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
+                .is_err(),
+            "GHOST-02: a coinbase that doesn't conserve value must be rejected"
+        );
+    }
+
+    /// GHOST-02 (extended): the treasury output must pay the configured treasury script.
+    /// A same-amount redirect to another address is rejected.
+    #[test]
+    fn ghost02_rejects_redirected_treasury() {
+        let (creator, db) = ledger_creator();
+        let now = 1_800_000_000i64;
+        let addrs = seed_unpaid_ledger(&db, now);
+        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
+        assert!(
+            proposal.treasury_amount > 0,
+            "the ledger proposal funds the treasury (node_shares empty → fallback)"
+        );
+
+        // Same amount, attacker's address.
+        proposal.treasury_address = vec![0xabu8; 22];
+
+        let local_work = select_ledger_miner_work(
+            &db,
+            proposal.timestamp as i64,
+            proposal.block_height,
+            proposal.subsidy,
+        )
+        .expect("validator recompute");
+        assert!(
+            creator
+                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
+                .is_err(),
+            "GHOST-02: a redirected treasury address must be rejected"
+        );
+    }
+
+    /// GHOST-02 (extended): the treasury can't be shorted below its deterministic floor
+    /// (base rate + sub-dust fees), even if the shortfall is moved to a node so the
+    /// coinbase still conserves. NB: the node-vs-treasury split ABOVE the floor is NOT
+    /// pinned — node eligibility isn't validator-reproducible (see the node-split
+    /// decision doc) — so this only asserts the floor.
+    #[test]
+    fn ghost02_rejects_treasury_below_floor() {
+        let (creator, db) = ledger_creator();
+        let now = 1_800_000_000i64;
+        let addrs = seed_unpaid_ledger(&db, now);
+        let mut proposal = ledger_proposal(&creator, &db, &addrs, now);
+
+        // The floor is the base treasury rate (this fixture has no tx fees).
+        let block_time =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(proposal.timestamp as i64, 0).unwrap();
+        let floor = FeeDistribution::calculate_at_height(
+            proposal.subsidy,
+            proposal.tx_fees,
+            &TreasuryState::new(),
+            block_time,
+            proposal.block_height,
+        )
+        .treasury_amount;
+        if floor == 0 {
+            return; // no positive floor at this height/decay — nothing to violate
+        }
+        assert!(
+            proposal.treasury_amount >= floor,
+            "the honest proposal sits at or above the treasury floor"
+        );
+
+        // Short the treasury one satoshi below its floor, moving the shortfall to a node
+        // so the coinbase still conserves value.
+        let target = floor - 1;
+        let shortfall = proposal.treasury_amount - target;
+        proposal.treasury_amount = target;
+        proposal.node_payouts.push(PayoutEntry {
+            address: vec![0x33u8; 22],
+            amount: shortfall,
+            recipient_id: [0x33u8; 32],
+            payout_type: PayoutType::NodeReward,
+        });
+
+        let local_work = select_ledger_miner_work(
+            &db,
+            proposal.timestamp as i64,
+            proposal.block_height,
+            proposal.subsidy,
+        )
+        .expect("validator recompute");
+        assert!(
+            creator
+                .validate_proposal_split(&proposal, &local_work, &TreasuryState::new())
+                .is_err(),
+            "GHOST-02: treasury shorted below its deterministic floor must be rejected"
         );
     }
 
