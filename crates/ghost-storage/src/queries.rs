@@ -5421,6 +5421,64 @@ impl Database {
         })
     }
 
+    /// The dedup keys `(challenger|target|capability|timestamp)` of the verification records
+    /// this node holds in `[since_ts, until_ts)`. A convergence requester advertises these so
+    /// the responder only sends back what's missing. Mirrors `unpaid_share_hashes_in`.
+    pub fn verification_keys_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT challenger_id || '|' || target_node_id || '|' || capability || '|' || timestamp
+                     FROM verification_ledger WHERE timestamp >= ?1 AND timestamp < ?2",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_ts, until_ts], |r| r.get::<_, String>(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(rows)
+        })
+    }
+
+    /// The signed proof blobs this node holds in `[since_ts, until_ts)` whose dedup key the
+    /// requester did NOT advertise — i.e. what they're missing. Capped at `limit`. Mirrors
+    /// `unpaid_proofs_missing_from`.
+    pub fn verification_proofs_missing_from(
+        &self,
+        since_ts: i64,
+        until_ts: i64,
+        theirs: &std::collections::HashSet<String>,
+        limit: usize,
+    ) -> GhostResult<Vec<Vec<u8>>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT challenger_id || '|' || target_node_id || '|' || capability || '|' || timestamp, proof
+                     FROM verification_ledger WHERE timestamp >= ?1 AND timestamp < ?2
+                     ORDER BY timestamp ASC",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![since_ts, until_ts], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for (key, blob) in rows {
+                if !theirs.contains(&key) {
+                    out.push(blob);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Insert a policy challenge result
     ///
     /// L-3 FIX: Uses INSERT OR REPLACE to enforce rate limiting. The unique index
@@ -12838,6 +12896,42 @@ mod tests {
             db.verification_proofs_in(0, 10_000, 100).expect("read all").len(),
             2,
             "both distinct records, deduped to two"
+        );
+    }
+
+    #[test]
+    fn verification_convergence_serves_only_missing() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let blob = |n: u8| vec![n; 8];
+        db.insert_verification_proof("cA", "tB", "archive", true, 100, &blob(1))
+            .unwrap();
+        db.insert_verification_proof("cA", "tB", "policy", true, 200, &blob(2))
+            .unwrap();
+        db.insert_verification_proof("cC", "tB", "archive", false, 300, &blob(3))
+            .unwrap();
+
+        let keys = db.verification_keys_in(0, 1_000).expect("keys");
+        assert_eq!(keys.len(), 3, "all three records' keys are advertised");
+
+        // A peer that already holds the first record advertises its key; we serve the other two.
+        let mut theirs = std::collections::HashSet::new();
+        theirs.insert("cA|tB|archive|100".to_string());
+        assert_eq!(
+            db.verification_proofs_missing_from(0, 1_000, &theirs, 100)
+                .expect("missing")
+                .len(),
+            2,
+            "serve only the two records the peer lacks"
+        );
+
+        // A peer that holds everything gets nothing back.
+        let all: std::collections::HashSet<String> = keys.into_iter().collect();
+        assert_eq!(
+            db.verification_proofs_missing_from(0, 1_000, &all, 100)
+                .expect("none")
+                .len(),
+            0,
+            "a fully-synced peer is served nothing"
         );
     }
 }

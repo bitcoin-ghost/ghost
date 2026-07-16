@@ -42,6 +42,20 @@ Plus: `network_size` (`get_all_node_ids_with_payout`, `queries.rs:2200`) feeds t
 (`qualification.rs:239-288, 621-630`) and is loosely gossiped + cached in per-node memory
 (`qualification.rs:164, 623`) — non-deterministic.
 
+### The five capabilities — four converge here, one does not
+The reward is the 5-4-3-2-1 set: Archive (+5), GhostPay (+4), Public Mining (+3), Reaper (+2),
+Elder (+1). Only the first four are **challenge-verified** — they are the `CapabilityType` variants
+(`message.rs:442`: Archive, Policy=Reaper, Stratum=Mining, GhostPay) and are exactly what the
+challenge ledger converges. **Elder (+1) is NOT a challenge** — it is assigned by registration order
+(first 101 node_ids) and read from the `nodes` registry (`is_node_elder` → `elder_order`). So Elder's
+determinism is a SEPARATE convergence problem: the node registry must converge on `elder_order`.
+`0e4c4da6` (this branch) already made promotion deterministic (PoW-verified + unique ranks) *given*
+a converged registry; the remaining piece is converging the registry itself (nodes rows come from
+loosely-gossiped HealthPing registration, `health_handler.rs:933`). Track as a sibling of the
+challenge convergence — same "one converged, signed ledger at a fixed cutoff" shape, applied to node
+registration. (Coordinator is excluded from `total_shares()` and hard-coded false; not one of the
+five.)
+
 ## The design
 
 ### Principle
