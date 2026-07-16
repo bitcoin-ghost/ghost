@@ -1788,6 +1788,7 @@ impl MeshNetwork {
             | MessageType::ZkBlockProposal
             | MessageType::ZkVote
             | MessageType::VerificationResult
+            | MessageType::ChallengeConvergence
             | MessageType::EquivocationProof
             | MessageType::ElderRegistrationProposal
             | MessageType::ElderListProposal
@@ -2098,8 +2099,10 @@ impl MeshNetwork {
             // ZK-BFT messages use consensus voting port
             MessageType::ZkBlockProposal
             | MessageType::ZkVote => self.config.ports.consensus_voting,
-            // Verification results use health monitoring port
-            MessageType::VerificationResult => self.config.ports.health_monitoring,
+            // Verification results (and their convergence/backfill) use health monitoring port
+            MessageType::VerificationResult | MessageType::ChallengeConvergence => {
+                self.config.ports.health_monitoring
+            }
             // P2P-H3: Equivocation proofs use consensus voting port
             MessageType::EquivocationProof => self.config.ports.consensus_voting,
             // L2 messages use consensus voting port
@@ -3156,7 +3159,9 @@ impl MeshNetwork {
             | MessageType::L2CheckpointVote
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
-            MessageType::VerificationResult => self.config.ports.health_monitoring,
+            MessageType::VerificationResult | MessageType::ChallengeConvergence => {
+                self.config.ports.health_monitoring
+            }
             MessageType::GhostGlyphClaim | MessageType::GhostGlyphRegistered => {
                 self.config.ports.consensus_voting
             }
@@ -4033,6 +4038,7 @@ mod tests {
                 | MessageType::ZkBlockProposal
                 | MessageType::ZkVote
                 | MessageType::VerificationResult
+                | MessageType::ChallengeConvergence
                 | MessageType::EquivocationProof
                 | MessageType::ElderRegistrationProposal
                 | MessageType::ElderListProposal

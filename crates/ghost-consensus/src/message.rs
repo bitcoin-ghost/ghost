@@ -202,6 +202,10 @@ pub enum MessageType {
     ZkVote,
     /// Capability verification result
     VerificationResult,
+    /// Challenge-ledger convergence request/response (backfill of signed
+    /// verification results, so the node-reward capability ledger converges the
+    /// way the miner share ledger does). Rides the verification topic.
+    ChallengeConvergence,
     /// P2P-H3: Equivocation proof broadcast for Byzantine behavior evidence
     EquivocationProof,
     /// P2P-C1: Elder registration proposal (new elder candidate)
@@ -253,6 +257,7 @@ impl MessageType {
             Self::ZkBlockProposal => topics::ZK_PROPOSAL,
             Self::ZkVote => topics::ZK_VOTE,
             Self::VerificationResult => topics::VERIFICATION,
+            Self::ChallengeConvergence => topics::VERIFICATION,
             Self::EquivocationProof => topics::EQUIVOCATION,
             Self::ElderRegistrationProposal => topics::ELDER,
             Self::ElderListProposal => topics::ELDER,
@@ -287,7 +292,7 @@ impl MessageType {
             Self::ElderUpdate => "elder",
             Self::ZkBlockProposal => "zkproposal",
             Self::ZkVote => "zkvote",
-            Self::VerificationResult => "verify",
+            Self::VerificationResult | Self::ChallengeConvergence => "verify",
             Self::EquivocationProof => "equivoc",
             Self::ElderRegistrationProposal => "elder",
             Self::ElderListProposal => "elder",

@@ -49,6 +49,7 @@ use ghost_common::error::GhostResult;
 use ghost_common::identity::verify_signature;
 use ghost_common::types::NodeId;
 use ghost_storage::Database;
+use serde::{Deserialize, Serialize};
 
 use crate::mesh::MessageHandler;
 use crate::message::{CapabilityType, MessageEnvelope, MessageType, VerificationResultMessage};
@@ -111,6 +112,47 @@ pub trait ResultReVerifier: Send + Sync {
         challenge_data: &str,
         target_signed_response: Option<&str>,
     ) -> ReVerdict;
+}
+
+/// Callback used to transmit a serialized [`ChallengeConvergencePayload`] to a
+/// peer over the `verify` topic. Supplied by `main.rs`, which owns the mesh.
+pub type ChallengeSendFn = Arc<dyn Fn(Vec<u8>) -> GhostResult<()> + Send + Sync>;
+
+/// Upper bound on proofs served in one convergence response. Sized so a full
+/// batch of worst-case proofs (`MAX_VERIFICATION_SIZE` each) stays under the 1MB
+/// `MAX_CHALLENGE_CONVERGENCE_SIZE` envelope cap. A requester that is further
+/// behind pulls the tail on the next sweep (each round it advertises the keys it
+/// just gained, shrinking the "missing" set until it converges).
+const MAX_CONVERGENCE_PROOFS: usize = 150;
+
+/// Wire payload exchanged under [`MessageType::ChallengeConvergence`] to reconcile
+/// the `verification_ledger` across nodes — the node-reward analogue of
+/// GHOST-03 share backfill. A requester advertises the ledger keys it already
+/// holds in a window; the responder returns the signed proofs it holds that the
+/// requester lacks. Every served proof is re-verified on receipt exactly as the
+/// live gossip path is, so backfill is no more trusted than a first-hand result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ChallengeConvergencePayload {
+    /// "Here is what I already have in `[since_ts, until_ts)` — send me the rest."
+    Request(ChallengeConvergenceRequest),
+    /// "Here are the signed proofs you were missing."
+    Response(ChallengeConvergenceResponse),
+}
+
+/// Advertises the verification-ledger keys held in a window so a peer can serve
+/// only the difference. `keys` are `challenger|target|capability|timestamp`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeConvergenceRequest {
+    pub since_ts: i64,
+    pub until_ts: i64,
+    pub keys: Vec<String>,
+}
+
+/// The signed `VerificationResultMessage` blobs (as broadcast on the wire) the
+/// responder holds in the requester's window that the requester did not advertise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeConvergenceResponse {
+    pub proofs: Vec<Vec<u8>>,
 }
 
 /// Extract `(block_height, block_hash)` from the TARGET-signed archive response
@@ -189,6 +231,9 @@ pub struct VerificationResultHandler {
     /// `passed`. When `None`, the legacy "trust the challenger" behaviour is
     /// preserved (used by unit tests / the no-dependencies path).
     reverifier: Option<Arc<dyn ResultReVerifier>>,
+    /// Optional transmit callback for challenge-convergence exchanges. When
+    /// `None`, this node still answers inbound requests but never initiates one.
+    send: Option<ChallengeSendFn>,
 }
 
 impl VerificationResultHandler {
@@ -199,6 +244,7 @@ impl VerificationResultHandler {
             peers: None,
             rate_limiter: RateLimiter::new(VERIFICATION_RATE_LIMIT_BURST, VERIFICATION_RATE_REFILL),
             reverifier: None,
+            send: None,
         }
     }
 
@@ -213,6 +259,7 @@ impl VerificationResultHandler {
             peers: Some(peers),
             rate_limiter: RateLimiter::new(VERIFICATION_RATE_LIMIT_BURST, VERIFICATION_RATE_REFILL),
             reverifier: None,
+            send: None,
         }
     }
 
@@ -224,6 +271,192 @@ impl VerificationResultHandler {
     pub fn with_rederivation(mut self, reverifier: Arc<dyn ResultReVerifier>) -> Self {
         self.reverifier = Some(reverifier);
         self
+    }
+
+    /// Attach a transmit callback so this node can INITIATE challenge-convergence
+    /// requests (the node-reward analogue of GHOST-03 share backfill). Without
+    /// one the node still answers inbound requests but never starts an exchange.
+    pub fn with_challenge_send(mut self, send: ChallengeSendFn) -> Self {
+        self.send = Some(send);
+        self
+    }
+
+    /// Build a serialized convergence REQUEST advertising the ledger keys we hold
+    /// in `[since_ts, until_ts)`, so a peer serves back only what we are missing.
+    pub fn build_challenge_request(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<u8>> {
+        let keys = self.db.verification_keys_in(since_ts, until_ts)?;
+        let payload = ChallengeConvergencePayload::Request(ChallengeConvergenceRequest {
+            since_ts,
+            until_ts,
+            keys,
+        });
+        serde_json::to_vec(&payload)
+            .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))
+    }
+
+    /// Initiate a convergence sweep over `[since_ts, until_ts)` by broadcasting a
+    /// request. A no-op when no transmit callback is configured.
+    pub fn request_convergence(&self, since_ts: i64, until_ts: i64) -> GhostResult<()> {
+        let Some(ref send) = self.send else {
+            return Ok(());
+        };
+        let bytes = self.build_challenge_request(since_ts, until_ts)?;
+        send(bytes)
+    }
+
+    /// Handle an inbound [`ChallengeConvergencePayload`] (request or response).
+    /// A request is answered by transmitting the proofs the peer lacks; a
+    /// response is applied to our ledger after per-proof re-verification.
+    pub async fn handle_challenge_convergence(&self, envelope: &MessageEnvelope) -> GhostResult<()> {
+        let payload: ChallengeConvergencePayload = serde_json::from_slice(&envelope.payload)
+            .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))?;
+        match payload {
+            ChallengeConvergencePayload::Request(req) => {
+                let resp = self.build_challenge_response(&req)?;
+                if resp.proofs.is_empty() {
+                    return Ok(()); // nothing to serve — stay quiet
+                }
+                let Some(ref send) = self.send else {
+                    return Ok(()); // cannot reply without a transmit callback
+                };
+                let bytes = serde_json::to_vec(&ChallengeConvergencePayload::Response(resp))
+                    .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))?;
+                send(bytes)?;
+            }
+            ChallengeConvergencePayload::Response(resp) => {
+                let applied = self.apply_challenge_response(&resp).await;
+                if applied > 0 {
+                    debug!(applied, "Applied backfilled verification proofs from convergence");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Answer a peer's convergence REQUEST: the signed proofs we hold in their
+    /// window that they did not advertise (capped at [`MAX_CONVERGENCE_PROOFS`]).
+    fn build_challenge_response(
+        &self,
+        req: &ChallengeConvergenceRequest,
+    ) -> GhostResult<ChallengeConvergenceResponse> {
+        let theirs: std::collections::HashSet<String> = req.keys.iter().cloned().collect();
+        let proofs = self.db.verification_proofs_missing_from(
+            req.since_ts,
+            req.until_ts,
+            &theirs,
+            MAX_CONVERGENCE_PROOFS,
+        )?;
+        Ok(ChallengeConvergenceResponse { proofs })
+    }
+
+    /// Apply a convergence RESPONSE: verify + (re-derive) + store each served
+    /// proof. Returns the number newly stored.
+    async fn apply_challenge_response(&self, resp: &ChallengeConvergenceResponse) -> usize {
+        let mut applied = 0usize;
+        for blob in &resp.proofs {
+            if self.ingest_backfilled_proof(blob).await {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    /// Verify, re-derive (archive/policy), and store ONE backfilled signed
+    /// verification result into the ledger. This applies the same authenticity
+    /// gates as the live gossip path — the challenger's signature over the
+    /// canonical signing data, a known-peer check, and re-derivation of
+    /// archive/policy verdicts against THIS node's own ground truth — so a
+    /// backfilled proof is no more trusted than a first-hand one. Freshness and
+    /// per-challenger rate limits are intentionally NOT applied: backfill is
+    /// historical by nature and arrives in bulk. Returns whether it was stored.
+    async fn ingest_backfilled_proof(&self, blob: &[u8]) -> bool {
+        let msg: VerificationResultMessage = match serde_json::from_slice(blob) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        // Size sanity (mirror H-5 bounds on the live path).
+        if msg.challenge_data.len() > MAX_CHALLENGE_DATA_SIZE {
+            return false;
+        }
+        if let Some(ref rd) = msg.response_data {
+            if rd.len() > MAX_CHALLENGE_DATA_SIZE {
+                return false;
+            }
+        }
+
+        // C-2: never accept a self-challenge.
+        if msg.challenger_id == msg.target_node_id {
+            return false;
+        }
+
+        // Authenticity: the challenger's signature over the canonical signing
+        // data. Unlike the gossip path there is no envelope sender to cross-check
+        // — the signature IS the binding, since `challenger_id` is inside the
+        // signed message and the signature verifies against it.
+        if !matches!(
+            verify_signature(&msg.challenger_id, &msg.signing_data(), &msg.signature),
+            Ok(true)
+        ) {
+            return false;
+        }
+
+        // HIGH-VER-4: challenger must be a known peer (PeerManager or the
+        // persisted nodes table), the same gate as the live path.
+        if let Some(ref peers) = self.peers {
+            let challenger_hex = hex::encode(msg.challenger_id);
+            if peers.get_peer(&msg.challenger_id).is_none()
+                && self.db.get_node(&challenger_hex).ok().flatten().is_none()
+            {
+                return false;
+            }
+        }
+
+        // Re-derive archive/policy against our own ground truth; stratum/ghostpay
+        // are signature-only (a distinct-challenger majority decides at
+        // qualification). Unverifiable => store nothing (no grief).
+        let passed = match msg.capability {
+            CapabilityType::Archive => match self.reverifier {
+                Some(ref rv) => match rv
+                    .reverify_archive(&msg.target_node_id, msg.target_signed_response.as_deref())
+                    .await
+                {
+                    ReVerdict::Pass => true,
+                    ReVerdict::Fail => false,
+                    ReVerdict::Unverifiable => return false,
+                },
+                None => msg.passed,
+            },
+            CapabilityType::Policy => match self.reverifier {
+                Some(ref rv) => match rv
+                    .reverify_policy(
+                        &msg.target_node_id,
+                        &msg.challenge_data,
+                        msg.target_signed_response.as_deref(),
+                    )
+                    .await
+                {
+                    ReVerdict::Pass => true,
+                    ReVerdict::Fail => false,
+                    ReVerdict::Unverifiable => return false,
+                },
+                None => msg.passed,
+            },
+            CapabilityType::Stratum | CapabilityType::GhostPay => msg.passed,
+        };
+
+        let challenger_hex = hex::encode(msg.challenger_id);
+        let target_hex = hex::encode(msg.target_node_id);
+        self.db
+            .insert_verification_proof(
+                &challenger_hex,
+                &target_hex,
+                msg.capability.as_str(),
+                passed,
+                msg.timestamp,
+                blob,
+            )
+            .unwrap_or(false)
     }
 
     /// Handle an incoming verification result message
@@ -669,8 +902,14 @@ impl VerificationResultHandler {
 #[async_trait]
 impl MessageHandler for VerificationResultHandler {
     async fn handle_message(&self, envelope: Arc<MessageEnvelope>) -> GhostResult<()> {
-        if envelope.msg_type == MessageType::VerificationResult {
-            self.handle_verification_result(&envelope).await?;
+        match envelope.msg_type {
+            MessageType::VerificationResult => {
+                self.handle_verification_result(&envelope).await?;
+            }
+            MessageType::ChallengeConvergence => {
+                self.handle_challenge_convergence(&envelope).await?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -961,5 +1200,132 @@ mod tests {
         let (passed, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
         assert_eq!(total, 1);
         assert_eq!(passed, 1, "legacy path stores msg.passed unchanged");
+    }
+
+    // =================================================================
+    // CHALLENGE CONVERGENCE: two divergent ledgers reconcile
+    // =================================================================
+
+    /// Capture outbound convergence bytes into a shared buffer so a test can
+    /// hand-deliver them to the other node.
+    fn capturing_send(buf: Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> ChallengeSendFn {
+        Arc::new(move |bytes: Vec<u8>| {
+            buf.lock().unwrap().push(bytes);
+            Ok(())
+        })
+    }
+
+    fn convergence_envelope(sender: NodeId, payload: Vec<u8>) -> MessageEnvelope {
+        MessageEnvelope::new(MessageType::ChallengeConvergence, sender, payload, 1, [0u8; 64])
+    }
+
+    /// Two nodes start with disjoint verification ledgers. After a request/serve
+    /// exchange in each direction, BOTH hold the union — the node-reward analogue
+    /// of GHOST-03 share backfill. Backfill writes ONLY the `verification_ledger`
+    /// (not the per-capability `*_challenges` tables), so we assert on the ledger.
+    #[tokio::test]
+    async fn challenge_convergence_reconciles_divergent_ledgers() {
+        let db_a = Arc::new(Database::in_memory().unwrap());
+        let db_b = Arc::new(Database::in_memory().unwrap());
+
+        let outbox_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbox_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // No re-verifier and no PeerManager: archive proofs apply via msg.passed
+        // and the known-peer gate is skipped — isolates the convergence plumbing.
+        let handler_a = VerificationResultHandler::new(Arc::clone(&db_a))
+            .with_challenge_send(capturing_send(Arc::clone(&outbox_a)));
+        let handler_b = VerificationResultHandler::new(Arc::clone(&db_b))
+            .with_challenge_send(capturing_send(Arc::clone(&outbox_b)));
+
+        // A learns proof P1 (target T1); B learns proof P2 (target T2), first-hand.
+        let challenger = NodeIdentity::generate();
+        let target_1 = [21u8; 32];
+        let target_2 = [22u8; 32];
+        handler_a
+            .handle_verification_result(&build_archive_envelope(&challenger, target_1, true))
+            .await
+            .unwrap();
+        handler_b
+            .handle_verification_result(&build_archive_envelope(&challenger, target_2, true))
+            .await
+            .unwrap();
+
+        let window = (0i64, Utc::now().timestamp() + 100);
+        assert_eq!(db_a.verification_keys_in(window.0, window.1).unwrap().len(), 1);
+        assert_eq!(db_b.verification_keys_in(window.0, window.1).unwrap().len(), 1);
+
+        // --- Direction 1: A pulls from B ---
+        // A advertises what it holds (P1); B serves back what A lacks (P2).
+        let a_req = handler_a.build_challenge_request(window.0, window.1).unwrap();
+        handler_b
+            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), a_req))
+            .await
+            .unwrap();
+        let b_reply = outbox_b.lock().unwrap().pop().expect("B serves A's missing proof");
+        handler_a
+            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), b_reply))
+            .await
+            .unwrap();
+
+        // --- Direction 2: B pulls from A ---
+        let b_req = handler_b.build_challenge_request(window.0, window.1).unwrap();
+        handler_a
+            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), b_req))
+            .await
+            .unwrap();
+        let a_reply = outbox_a.lock().unwrap().pop().expect("A serves B's missing proof");
+        handler_b
+            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), a_reply.clone()))
+            .await
+            .unwrap();
+
+        // Both ledgers now hold the union {P1, P2}.
+        assert_eq!(
+            db_a.verification_keys_in(window.0, window.1).unwrap().len(),
+            2,
+            "A must hold both proofs after convergence"
+        );
+        assert_eq!(
+            db_b.verification_keys_in(window.0, window.1).unwrap().len(),
+            2,
+            "B must hold both proofs after convergence"
+        );
+
+        // Re-applying an already-held proof is idempotent (INSERT OR IGNORE).
+        handler_b
+            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), a_reply))
+            .await
+            .unwrap();
+        assert_eq!(
+            db_b.verification_keys_in(window.0, window.1).unwrap().len(),
+            2,
+            "re-applying the same proof must not duplicate a ledger row"
+        );
+    }
+
+    /// A served proof carrying a forged/invalid signature must be rejected on
+    /// ingest — backfill is no more trusted than the live gossip path.
+    #[tokio::test]
+    async fn challenge_convergence_rejects_forged_proof() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let handler = VerificationResultHandler::new(Arc::clone(&db));
+
+        // Build a valid envelope, then corrupt the signed blob's signature.
+        let challenger = NodeIdentity::generate();
+        let env = build_archive_envelope(&challenger, [30u8; 32], true);
+        let mut msg: VerificationResultMessage = serde_json::from_slice(&env.payload).unwrap();
+        msg.signature = [0xAA; 64]; // not a valid signature over signing_data
+        let forged = serde_json::to_vec(&msg).unwrap();
+
+        let resp = ChallengeConvergenceResponse { proofs: vec![forged] };
+        let applied = handler.apply_challenge_response(&resp).await;
+        assert_eq!(applied, 0, "forged proof must not be applied");
+
+        let window = (0i64, Utc::now().timestamp() + 100);
+        assert!(
+            db.verification_keys_in(window.0, window.1).unwrap().is_empty(),
+            "ledger must remain empty after rejecting a forged proof"
+        );
     }
 }

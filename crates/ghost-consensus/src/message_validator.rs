@@ -55,6 +55,11 @@ pub const MAX_ZK_PROPOSAL_SIZE: usize = 2_000_000;
 pub const MAX_ZK_VOTE_SIZE: usize = 1_000;
 /// Verification result is small (node IDs + capability + result + signature)
 pub const MAX_VERIFICATION_SIZE: usize = 5_000;
+/// Challenge-convergence exchange: a request advertises ledger keys for a window,
+/// a response carries a batch of signed verification-result blobs. Bounded to the
+/// 1MB envelope tier; the per-response proof count (`MAX_CONVERGENCE_PROOFS`) is
+/// sized so a full batch of worst-case proofs stays under this.
+pub const MAX_CHALLENGE_CONVERGENCE_SIZE: usize = 1_000_000;
 /// P2P-H3: Equivocation proof (two votes + metadata)
 pub const MAX_EQUIVOCATION_PROOF_SIZE: usize = 10_000;
 /// P2P-C1: Elder registration proposal (candidate + PoW + signatures)
@@ -370,6 +375,7 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::ZkBlockProposal => MAX_ZK_PROPOSAL_SIZE,
         MessageType::ZkVote => MAX_ZK_VOTE_SIZE,
         MessageType::VerificationResult => MAX_VERIFICATION_SIZE,
+        MessageType::ChallengeConvergence => MAX_CHALLENGE_CONVERGENCE_SIZE,
         MessageType::EquivocationProof => MAX_EQUIVOCATION_PROOF_SIZE,
         MessageType::ElderRegistrationProposal => MAX_ELDER_REGISTRATION_PROPOSAL_SIZE,
         MessageType::ElderListProposal => MAX_ELDER_LIST_PROPOSAL_SIZE,
