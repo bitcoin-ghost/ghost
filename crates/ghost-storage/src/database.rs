@@ -1384,6 +1384,31 @@ impl Database {
         })
     }
 
+    /// Prune old rows from the converged `verification_ledger` (v42).
+    ///
+    /// The ledger accrues one signed proof per (challenger, target, capability,
+    /// timestamp) and otherwise grows without bound. `keep_days` MUST stay well
+    /// above the challenge-convergence window (7 days) and the qualification
+    /// window, so that (a) qualification never reads a pruned row and (b)
+    /// convergence — which only reconciles the last 7 days — never re-fetches a
+    /// pruned row from a peer that hasn't pruned it yet. The default retention
+    /// (`keep_challenge_days` = 30) leaves ample margin.
+    pub fn prune_old_verification_ledger(&self, keep_days: u32) -> GhostResult<usize> {
+        self.transaction(|tx| {
+            let cutoff = chrono::Utc::now().timestamp() - (keep_days as i64 * 86400);
+            let deleted = tx
+                .execute(
+                    "DELETE FROM verification_ledger WHERE timestamp < ?1",
+                    [cutoff],
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            if deleted > 0 {
+                info!(deleted, keep_days, "Pruned old verification ledger rows");
+            }
+            Ok(deleted)
+        })
+    }
+
     /// Run full maintenance (prune + checkpoint + optimize)
     ///
     /// This should be called periodically (e.g., once per hour).
@@ -1399,6 +1424,8 @@ impl Database {
         let votes_deleted = self.prune_old_votes(config.keep_rounds)?;
         let uptime_deleted = self.prune_old_uptime_samples(config.keep_uptime_sample_days)?;
         let challenges_deleted = self.prune_old_challenges(config.keep_challenge_days)?;
+        let verification_ledger_deleted =
+            self.prune_old_verification_ledger(config.keep_challenge_days)?;
         let verifications_deleted = self.prune_old_verifications(config.keep_verification_days)?;
         let checkpoints_pruned = self.prune_old_l2_checkpoints(config.keep_checkpoint_days)?;
         let pending_shields_cleaned = match self.delete_stale_pending_shields() {
@@ -1418,6 +1445,7 @@ impl Database {
             + votes_deleted
             + uptime_deleted
             + challenges_deleted.total()
+            + verification_ledger_deleted
             + verifications_deleted
             + checkpoints_pruned
             + pending_shields_cleaned;
@@ -1433,6 +1461,7 @@ impl Database {
             votes_deleted,
             uptime_deleted,
             challenges_deleted = challenges_deleted.total(),
+            verification_ledger_deleted,
             verifications_deleted,
             checkpoints_pruned,
             pending_shields_cleaned,
@@ -1446,6 +1475,7 @@ impl Database {
             votes_deleted,
             uptime_deleted,
             challenges_deleted,
+            verification_ledger_deleted,
             verifications_deleted,
             checkpoints_pruned,
             pending_shields_cleaned,
@@ -1524,6 +1554,7 @@ pub struct MaintenanceResult {
     pub votes_deleted: usize,
     pub uptime_deleted: usize,
     pub challenges_deleted: ChallengesPruneResult,
+    pub verification_ledger_deleted: usize,
     pub verifications_deleted: usize,
     pub checkpoints_pruned: usize,
     pub pending_shields_cleaned: usize,

@@ -13014,6 +13014,26 @@ mod tests {
     }
 
     #[test]
+    fn verification_ledger_pruning_drops_only_rows_past_retention() {
+        let db = Database::in_memory().expect("create in-memory db");
+        let blob = b"signed".to_vec();
+        let now = chrono::Utc::now().timestamp();
+        let day = 86_400i64;
+
+        // One row well inside retention, one well past it.
+        db.insert_verification_proof("cA", "tB", "policy", true, now - 2 * day, &blob)
+            .expect("recent");
+        db.insert_verification_proof("cA", "tB", "policy", true, now - 40 * day, &blob)
+            .expect("old");
+
+        let deleted = db.prune_old_verification_ledger(30).expect("prune");
+        assert_eq!(deleted, 1, "only the 40-day-old row is past the 30-day retention");
+
+        let remaining = db.verification_proofs_in(0, now + day, 100).expect("read");
+        assert_eq!(remaining.len(), 1, "the in-retention row survives pruning");
+    }
+
+    #[test]
     fn verification_convergence_serves_only_missing() {
         let db = Database::in_memory().expect("create in-memory db");
         let blob = |n: u8| vec![n; 8];
