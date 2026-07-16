@@ -142,3 +142,44 @@ piece and is useful on its own; (D) coverage scheduling is independent; (B/C/F) 
 qualification rewrite; (E) is the GHOST-02 completion and is small once A–D land. Until then,
 tonight's conservation + treasury-floor guardrails (`b6f1a643`) hold the line and the node split is
 trusted to the block finder within those bounds.
+
+## Component A — build plan (mapped from the code)
+
+Exact structures found (so this is ready to execute):
+- **The signed record to retain:** `VerificationResultMessage` (`crates/ghost-common/src/types.rs:1750`)
+  — `target_node_id, challenger_id, capability, passed, challenge_data, response_data,
+  target_signed_response, timestamp, signature[64]` (signature over target||capability||passed||
+  timestamp). This is the "ShareProof" equivalent for challenges.
+- **The template to mirror:** `ConvergenceHandler` (`bins/ghost-pool/src/convergence.rs:88`) —
+  `build_ledger_request(since,until)` advertises hashes held; `handle_ledger_request` serves signed
+  proofs the requester lacks (`unpaid_proofs_missing_from`, cap 2000); `apply_ledger_response`
+  re-verifies each signature (`has_valid_received_by_signature`) before crediting. Carried under
+  `MessageType::ShareConvergence` with a `ConvergencePayload` enum.
+- **The gap:** the 4 `*_challenges` tables (`migrations.rs:488` etc.) store only the DERIVED row
+  (`node_id, challenger_id, block_height, expected/response_hash, passed, timestamp`) — **no
+  signature, no UNIQUE key.** So today a backfilled challenge can't be re-verified (signature gone)
+  and re-gossip double-inserts. This is the same shape as pre-v41 shares.
+
+Steps:
+1. **Schema (migration, forward-only).** Retain the signed `VerificationResultMessage` blob + add a
+   dedup key. **DECISION NEEDED (small):** either add a `proof TEXT` column + `UNIQUE(challenger_id,
+   node_id, timestamp)` to each of the 4 tables (mirrors `shares.proof` exactly), OR add ONE new
+   `verification_proofs` ledger table (all capabilities, one place to reconcile) and keep the 4
+   tables as the derived view. The single-ledger option is cleaner to converge (one table, one
+   backfill) — recommend it.
+2. **Retain on receipt.** In `verification_handler.rs:230` `handle_verification_result`, after the
+   existing verify/re-derive, persist the signed message blob (into the ledger / proof column)
+   idempotently (`INSERT OR IGNORE`).
+3. **DB methods** (mirror shares): `verification_keys_in(since,until)`,
+   `verification_proofs_missing_from(since,until,theirs,cap)`, `insert_verification_proof(blob)`.
+4. **`ChallengeConvergenceHandler`** mirroring `ConvergenceHandler`: build/handle/apply, verifying
+   `VerificationResultMessage.signature` (and, where applicable, re-deriving the verdict) before
+   insert. New `MessageType::ChallengeConvergence` in `message.rs` + a `ChallengeConvergencePayload`
+   enum.
+5. **Wire + trigger:** periodic sweep like `ShareConvergence` (main.rs), rate-limited, bounded
+   window.
+6. **Tests:** idempotent re-insert; a forged/mis-signed backfill is rejected; two divergent nodes
+   converge to the same challenge set after an exchange (mirror `convergence.rs` tests).
+
+Only after A soaks do B/C/F (count-based, cutoff-anchored qualification + retire uptime) and E
+(node-split recompute) become sound.
