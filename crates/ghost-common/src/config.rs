@@ -1561,6 +1561,21 @@ pub enum PolicyProfile {
     Custom,
 }
 
+impl PolicyProfile {
+    /// Canonical lowercase name, matching the serde representation AND the
+    /// strings returned by the ghostd enforced-policy reader — so the startup
+    /// reconciliation can compare pool.toml (master) against ghostd (slave)
+    /// directly. `BitcoinPure` is the internal identifier for the `strict` preset.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyProfile::BitcoinPure => "strict",
+            PolicyProfile::Permissive => "permissive",
+            PolicyProfile::FullOpen => "full_open",
+            PolicyProfile::Custom => "custom",
+        }
+    }
+}
+
 /// Custom policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomPolicyConfig {

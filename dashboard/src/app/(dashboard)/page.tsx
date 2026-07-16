@@ -126,9 +126,9 @@ function L1Card() {
           </div>
         </Tooltip>
         <div className="p-3 bg-[var(--surface)] rounded-lg">
-          <div className="text-xs text-[color:var(--fainter)] mb-1">Miners</div>
+          <div className="text-xs text-[color:var(--fainter)] mb-1">Your Miners</div>
           <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-            {isLoading ? "..." : `${mining?.connected_miners ?? 0} connected`}
+            {isLoading ? "..." : `${mining?.local_connected_miners ?? 0} connected`}
           </div>
         </div>
       </div>

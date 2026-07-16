@@ -2251,6 +2251,14 @@ async fn main() -> Result<()> {
     // Load configuration first (needed for signer config)
     let config = load_config(&args.config)?;
 
+    // Policy master/slave reconciliation. `pool.toml [policy] profile` is the single
+    // MASTER the operator edits (directly or via the dashboard); ghostd's
+    // `-ghostpolicy-allowtiers` is a derived SLAVE. If they have drifted — e.g. the
+    // dashboard shows `strict` while ghostd is still accepting T2 — bring ghostd back
+    // in line with pool.toml here, before anything else, so the two can never silently
+    // disagree. No-op when already in sync; only restarts ghostd when it must.
+    ghost_verification::routes::reconcile_ghostd_policy_to_config(config.policy.profile.as_str());
+
     // Determine the effective signer configuration
     // Priority: config.identity.signer > config.identity.key_path > data_dir/node.key
     let signer_config = resolve_signer_path(

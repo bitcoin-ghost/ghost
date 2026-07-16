@@ -6110,7 +6110,7 @@ fn ghost_setup_bin() -> String {
 /// path. Returns `Ok(message)` on success or `Err(reason)` on any failure —
 /// never a false success. The `GHOST_REAPER_APPLY_TEST_MODE` env var short-
 /// circuits the shell-out in tests (`success` → Ok, anything else → Err).
-fn run_ghostd_apply_reaper() -> Result<String, String> {
+pub fn run_ghostd_apply_reaper() -> Result<String, String> {
     // Test hook: never shell out to sudo/ghostd/systemctl from unit tests.
     if let Ok(mode) = std::env::var("GHOST_REAPER_APPLY_TEST_MODE") {
         return if mode == "success" {
@@ -6242,7 +6242,7 @@ fn ghostd_unit_is_active() -> bool {
 ///
 /// No `-ghostpolicy-allowtiers` flag ⇒ ghostd is inert ⇒ all tiers ⇒ `full_open`.
 /// Returns `None` only if ghostd's unit can't be read at all.
-fn read_ghostd_enforced_profile() -> Option<String> {
+pub fn read_ghostd_enforced_profile() -> Option<String> {
     let out = std::process::Command::new("systemctl")
         .args(["show", "ghostd", "-p", "ExecStart", "--value"])
         .output()
@@ -6270,6 +6270,51 @@ fn read_ghostd_enforced_profile() -> Option<String> {
         Some([0, 1, 2, 3]) => "full_open".to_string(),
         Some(_) => "custom".to_string(),
     })
+}
+
+/// Reconcile ghostd's enforced tier policy to `pool.toml` (the MASTER) at
+/// ghost-pool startup, so the two can never silently drift.
+///
+/// `pool.toml [policy] profile` is the single source of truth the operator edits
+/// (directly or via the dashboard); ghostd's `-ghostpolicy-allowtiers` is a
+/// derived SLAVE. If ghostd is currently enforcing a different profile than
+/// pool.toml specifies — e.g. a profile was changed in pool.toml while ghostd
+/// kept an old drop-in, or a manual flag was set out-of-band — this regenerates
+/// ghostd's drop-in from pool.toml and restarts ghostd (only ghostd, not the
+/// pool). It is idempotent: once ghostd matches, the next startup is a no-op, so
+/// there is no restart loop.
+///
+/// `custom` on either side is left alone (operator-managed, not preset-comparable).
+/// A node not managed by systemd (`read_ghostd_enforced_profile` returns `None`)
+/// is skipped. Blocking — call it early at startup, off the request path.
+pub fn reconcile_ghostd_policy_to_config(configured_profile: &str) {
+    if configured_profile == "custom" {
+        return; // operator-managed; don't second-guess a custom preset
+    }
+    let Some(enforced) = read_ghostd_enforced_profile() else {
+        return; // ghostd not systemd-managed here (dev / container) — nothing to do
+    };
+    if enforced == configured_profile {
+        tracing::debug!(profile = %configured_profile, "ghostd tier policy already matches pool.toml");
+        return;
+    }
+    tracing::warn!(
+        configured = %configured_profile,
+        enforced = %enforced,
+        "POLICY DRIFT: ghostd enforces a different tier policy than pool.toml specifies. \
+         pool.toml is master — reconciling ghostd to match it and restarting ghostd."
+    );
+    match run_ghostd_apply_reaper() {
+        Ok(msg) => tracing::info!(
+            detail = %msg,
+            profile = %configured_profile,
+            "ghostd tier policy reconciled to pool.toml"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            "Failed to reconcile ghostd tier policy to pool.toml — drift persists until next apply"
+        ),
+    }
 }
 
 /// Clear a one-shot storage marker in pool.toml, then regenerate the drop-in

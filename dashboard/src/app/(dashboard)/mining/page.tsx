@@ -318,8 +318,8 @@ export default function MiningPage() {
         />
         <StatCard
           label="Connected Miners"
-          value={status?.connected_miners ?? 0}
-          sublabel="active workers"
+          value={status?.local_connected_miners ?? status?.connected_miners ?? 0}
+          sublabel="connected to this node"
           tooltip={TOOLTIPS.connected_miners}
           loading={statusLoading}
         />
