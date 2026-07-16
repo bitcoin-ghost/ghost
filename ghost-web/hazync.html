@@ -52,6 +52,16 @@
     .hz-panel .h{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--rule);font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
     .hz-verdict{font-family:var(--font-mono);font-weight:600;font-size:11px;letter-spacing:.1em;padding:3px 9px;border-radius:4px;color:var(--green);background:color-mix(in srgb,var(--green) 12%,transparent);border:1px solid color-mix(in srgb,var(--green) 45%,transparent)}
     .hz-verdict.no{color:var(--accent);background:var(--accent-weak);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+    /* live progress badge — hidden until the Proof Party coordinator API returns real progress */
+    .hz-live{align-items:center;gap:10px;margin-top:22px;font-family:var(--font-mono);font-size:13px;color:var(--dim)}
+    .hz-live[hidden]{display:none}
+    .hz-live:not([hidden]){display:inline-flex}
+    .hz-live .d{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 25%,transparent);animation:hzpulse 2s ease-in-out infinite;flex:none}
+    @media (prefers-reduced-motion:reduce){.hz-live .d{animation:none}}
+    .hz-live .lbl{text-transform:uppercase;letter-spacing:.1em;font-size:11px;color:var(--green)}
+    .hz-live b{color:var(--accent);font-weight:600}
+    .hz-live a{color:var(--dim);text-decoration:underline;text-underline-offset:2px;text-decoration-color:var(--rule-strong)}
+    .hz-live a:hover{color:var(--fg)}
     .hz-panel dl{margin:0;padding:4px 18px 12px}
     .hz-panel .row{display:flex;align-items:baseline;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid var(--rule)}
     .hz-panel .row:last-child{border-bottom:0}
@@ -196,6 +206,7 @@
         <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.1.0">Get the release <span class="arrow">→</span></a>
         <a class="btn btn-ghost" href="#run">Run it <span class="arrow">→</span></a>
       </div>
+      <p class="hz-live" id="hz-live" hidden><span class="d"></span><span class="lbl">Live</span> <span id="hz-live-text"></span> · <a href="/hazync-party.html">Proof Party →</a></p>
     </div>
     <aside class="hz-panel" aria-label="Chain-state proof result">
       <div class="h"><span>Chain-state proof · genesis → 550</span><span class="hz-verdict">VALID</span></div>
@@ -430,6 +441,31 @@
       localStorage.setItem('ghost-theme', next);
       render();
     });
+  })();
+</script>
+<script>
+  /* Dormant live-progress hook. Stays invisible until the Proof Party coordinator API
+     returns real progress (frontier > 0) — it never shows sample/placeholder numbers.
+     To light it up when the coordinator is live, either:
+       (a) set  window.HAZYNC_STATE_URL = 'https://<coordinator>/api/state'  (CORS is open), or
+       (b) add an nginx proxy so same-origin  /api/hazync/state  reaches the coordinator's /api/state. */
+  (function () {
+    var URL = (window.HAZYNC_STATE_URL || '/api/hazync/state');
+    function fmt(n){ return (n || 0).toLocaleString(); }
+    try {
+      fetch(URL, { cache: 'no-store' })
+        .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+        .then(function (d) {
+          var p = d && d.progress;
+          if (!p || !(p.frontier > 0)) return;              // no real progress → stay dark
+          var el = document.getElementById('hz-live');
+          var t  = document.getElementById('hz-live-text');
+          if (!el || !t) return;
+          t.innerHTML = '<b>' + fmt(p.proven) + '</b> blocks proven · <b>' + p.pct + '%</b> of the chain';
+          el.hidden = false;
+        })
+        .catch(function () { /* coordinator not live yet — stay dark */ });
+    } catch (e) {}
   })();
 </script>
 </body>
