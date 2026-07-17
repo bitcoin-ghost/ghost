@@ -78,7 +78,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::bond::BondId;
-use crate::tier::LiteTier;
+#[allow(unused_imports)] // LITE_FILL_WINDOW_SECS is used only in #[cfg(test)] code
+use crate::tier::{LiteTier, LITE_FILL_WINDOW_SECS};
 use crate::SessionType;
 
 /// Errors surfaced by the registry. All map cleanly to wallet-facing

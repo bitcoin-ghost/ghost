@@ -66,6 +66,8 @@ use bellperson::{
 };
 use blstrs::{Bls12, Scalar as Fr};
 use sha2::{Digest, Sha256};
+#[allow(unused_imports)] // SeedableRng: used by `StdRng::from_seed` in the test-only prover path
+use rand::SeedableRng;
 use std::sync::Arc;
 use std::time::Instant;
 // error! is used in cfg(not(test)) and cfg(not(feature = "zk-production")) blocks
