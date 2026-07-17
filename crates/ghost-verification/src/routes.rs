@@ -346,6 +346,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/rewards/node-history",
             get(api_rewards_node_history_handler),
         )
+        .route(
+            "/api/v1/rewards/node-payout-events",
+            get(api_rewards_node_payout_events_handler),
+        )
         // Config endpoints (GET only - reading is public, POST requires auth via internal router)
         // CRIT-6: POST handlers moved to internal_router to require authentication
         .route("/api/v1/config/full", get(api_config_full_handler))
@@ -5491,6 +5495,66 @@ async fn api_rewards_node_history_handler(
 
     Json(serde_json::json!({
         "history": history,
+        "total": total
+    }))
+}
+
+/// API v1 per-event NODE payout history.
+///
+/// Unlike `node-history` (which returns the `node_rewards` running-balance
+/// ledger, one row per node), this returns individual per-round node payout
+/// EVENTS from the `payouts` table — the real "when was this node credited, how
+/// much, in which round, confirmed on-chain yet" history. Honours the same time
+/// window (default 7d; `all` disables). Each event is flagged `is_self` when its
+/// recipient is this node.
+async fn api_rewards_node_payout_events_handler(
+    State(state): State<Arc<VerificationState>>,
+    Query(query): Query<TimeFilterQuery>,
+) -> impl IntoResponse {
+    let health = state.get_health().await;
+
+    let cutoff: Option<i64> = match query.time_filter.as_deref().unwrap_or("7d") {
+        "all" | "" => None,
+        f => {
+            let days: i64 = f.trim_end_matches('d').parse().unwrap_or(7);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            Some(now - days.max(0) * 86_400)
+        }
+    };
+
+    // Cap the result set so a long-lived node can't return an unbounded history.
+    const MAX_EVENTS: u32 = 500;
+
+    let (events, total) = if let Some(ref db) = state.database {
+        let rows = db
+            .get_node_payout_events(cutoff, MAX_EVENTS)
+            .unwrap_or_default();
+        let events_json: Vec<_> = rows
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "round_id": p.round_id,
+                    "recipient_id": p.recipient_id,
+                    "amount_sats": p.amount_sats,
+                    "txid": p.txid,
+                    "status": p.status.as_str(),
+                    "created_at": p.created_at,
+                    "confirmed_at": p.confirmed_at,
+                    "is_self": p.recipient_id == health.node_id,
+                })
+            })
+            .collect();
+        let total = events_json.len();
+        (events_json, total)
+    } else {
+        (vec![], 0)
+    };
+
+    Json(serde_json::json!({
+        "events": events,
         "total": total
     }))
 }

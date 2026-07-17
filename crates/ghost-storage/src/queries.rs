@@ -4478,6 +4478,37 @@ impl Database {
         })
     }
 
+    /// Get recent NODE payout EVENTS (one row per round a node was credited),
+    /// newest first, optionally bounded to events at/after `cutoff` (unix
+    /// seconds; `None` = all time). Unlike the `node_rewards` balance ledger
+    /// (one running-balance row per node), these are the individual per-round
+    /// credit events that back a true payout history.
+    pub fn get_node_payout_events(
+        &self,
+        cutoff: Option<i64>,
+        limit: u32,
+    ) -> GhostResult<Vec<PayoutRecord>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, round_id, recipient_id, recipient_type, address, amount_sats,
+                            txid, vout, status, created_at, confirmed_at
+                     FROM payouts
+                     WHERE recipient_type = 'node' AND (?1 IS NULL OR created_at >= ?1)
+                     ORDER BY created_at DESC LIMIT ?2",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let payouts = stmt
+                .query_map(params![cutoff, limit], payout_from_row)
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(payouts)
+        })
+    }
+
     /// Insert a payout record
     pub fn insert_payout(&self, payout: &PayoutRecord) -> GhostResult<i64> {
         self.with_connection(|conn| {
