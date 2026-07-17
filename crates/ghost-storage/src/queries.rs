@@ -830,7 +830,7 @@ impl Database {
         })
     }
 
-    /// Like [`get_all_miners_stats`] but scoped to shares THIS node received
+    /// Like `get_all_miners_stats` but scoped to shares THIS node received
     /// directly — `received_by = hex(node_id[..8])` (16 hex chars), the same
     /// key `local_hashrate_th` uses. This is the genuinely LOCAL connected-miner
     /// set; it excludes miners whose shares only reached this node via mesh

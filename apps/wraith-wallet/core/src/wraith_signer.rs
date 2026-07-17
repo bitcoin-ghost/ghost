@@ -35,7 +35,7 @@
 
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::{Address, Network, ScriptBuf, Transaction, TxOut, Witness};
+use bitcoin::{Network, ScriptBuf, Transaction, TxOut, Witness};
 
 use crate::keystore::Keystore;
 use crate::wraith::PreparedPrevOut;

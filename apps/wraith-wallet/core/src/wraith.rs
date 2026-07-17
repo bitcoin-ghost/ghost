@@ -963,6 +963,7 @@ struct SessionDescriptor {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct NonceResponse {
     signing_pubkey: String,
     signer_session_id: String,
@@ -972,12 +973,14 @@ struct NonceResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BlindSignResponse {
     signature_scalar: String,
     blind_session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RoundTxResponse {
     unsigned_tx_hex: String,
     txid: String,
@@ -994,6 +997,7 @@ struct PrevOutDto {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct WitnessResponse {
     state: String,
     witnesses_collected: u32,

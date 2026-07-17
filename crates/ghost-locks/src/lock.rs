@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::denomination::Denomination;
 use crate::error::GhostLockError;
 use crate::jump::{JumpRiskTier, JumpSchedule};
-use crate::script::{build_lock_script, compute_wsh_script_hash, ghost_lock_id};
+use crate::script::{compute_wsh_script_hash, ghost_lock_id};
 use crate::state::{LockState, StateTransition};
 use crate::timelock::TimelockTier;
 

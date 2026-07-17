@@ -78,7 +78,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::bond::BondId;
-use crate::tier::{LiteTier, LITE_FILL_WINDOW_SECS};
+use crate::tier::LiteTier;
 use crate::SessionType;
 
 /// Errors surfaced by the registry. All map cleanly to wallet-facing
@@ -597,6 +597,7 @@ impl LiteSessionRegistry {
     /// id-generator collision; production CSPRNG makes this
     /// vanishingly unlikely but the assert catches dev/test mistakes).
     /// Publishes `SessionCreated` to the gossip sink.
+    #[allow(dead_code)]
     fn insert_new(&self, session: LiteSession) -> SessionDescriptor {
         let descriptor = SessionDescriptor::from_session(&session);
         let event = SessionGossipEvent::SessionCreated {

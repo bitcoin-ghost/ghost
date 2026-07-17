@@ -109,6 +109,7 @@ struct PeerInfo {
     public_address: String,
     miner_count: u32,
     public_mining: bool,
+    #[allow(dead_code)]
     last_seen: u64,
     /// Hardware-derived effective max miners. 0 = legacy / pre-update peer
     /// that doesn't broadcast capacity yet — the LB excludes such peers

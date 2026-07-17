@@ -65,7 +65,6 @@ use bellperson::{
     Circuit,
 };
 use blstrs::{Bls12, Scalar as Fr};
-use rand::SeedableRng;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Instant;

@@ -1828,7 +1828,7 @@ impl TemplateProcessor {
     /// Publish a coinbase-only (empty) template for the current tip immediately.
     /// On a new-block ZMQ event this hands miners work on the NEW tip with zero
     /// transaction-assembly latency (no BUDS filtering, no merkle over the tx
-    /// set); the full template follows via [`refresh_template_forced`]. A block
+    /// set); the full template follows via `refresh_template_forced`. A block
     /// found against it is a valid empty block (subsidy only) — the rare sub-
     /// second window before the full template arrives.
     pub async fn publish_empty_template(&self) -> anyhow::Result<()> {
