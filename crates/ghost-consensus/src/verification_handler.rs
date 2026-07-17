@@ -307,7 +307,10 @@ impl VerificationResultHandler {
     /// Handle an inbound [`ChallengeConvergencePayload`] (request or response).
     /// A request is answered by transmitting the proofs the peer lacks; a
     /// response is applied to our ledger after per-proof re-verification.
-    pub async fn handle_challenge_convergence(&self, envelope: &MessageEnvelope) -> GhostResult<()> {
+    pub async fn handle_challenge_convergence(
+        &self,
+        envelope: &MessageEnvelope,
+    ) -> GhostResult<()> {
         let payload: ChallengeConvergencePayload = serde_json::from_slice(&envelope.payload)
             .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))?;
         match payload {
@@ -326,7 +329,10 @@ impl VerificationResultHandler {
             ChallengeConvergencePayload::Response(resp) => {
                 let applied = self.apply_challenge_response(&resp).await;
                 if applied > 0 {
-                    debug!(applied, "Applied backfilled verification proofs from convergence");
+                    debug!(
+                        applied,
+                        "Applied backfilled verification proofs from convergence"
+                    );
                 }
             }
         }
@@ -1170,7 +1176,10 @@ mod tests {
 
         // Legacy table: nothing — the re-derivation filter drops an Unverifiable result.
         let (_p, total) = db.get_policy_pass_rate(&hex::encode(target), 0).unwrap();
-        assert_eq!(total, 0, "legacy policy table still honours the re-derivation filter");
+        assert_eq!(
+            total, 0,
+            "legacy policy table still honours the re-derivation filter"
+        );
 
         // Ledger: the challenger's signed verdict IS retained, so policy can converge.
         let keys = db.verification_keys_in(0, i64::MAX).unwrap();
@@ -1195,7 +1204,13 @@ mod tests {
     }
 
     fn convergence_envelope(sender: NodeId, payload: Vec<u8>) -> MessageEnvelope {
-        MessageEnvelope::new(MessageType::ChallengeConvergence, sender, payload, 1, [0u8; 64])
+        MessageEnvelope::new(
+            MessageType::ChallengeConvergence,
+            sender,
+            payload,
+            1,
+            [0u8; 64],
+        )
     }
 
     /// Two nodes start with disjoint verification ledgers. After a request/serve
@@ -1231,31 +1246,52 @@ mod tests {
             .unwrap();
 
         let window = (0i64, Utc::now().timestamp() + 100);
-        assert_eq!(db_a.verification_keys_in(window.0, window.1).unwrap().len(), 1);
-        assert_eq!(db_b.verification_keys_in(window.0, window.1).unwrap().len(), 1);
+        assert_eq!(
+            db_a.verification_keys_in(window.0, window.1).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db_b.verification_keys_in(window.0, window.1).unwrap().len(),
+            1
+        );
 
         // --- Direction 1: A pulls from B ---
         // A advertises what it holds (P1); B serves back what A lacks (P2).
-        let a_req = handler_a.build_challenge_request(window.0, window.1).unwrap();
+        let a_req = handler_a
+            .build_challenge_request(window.0, window.1)
+            .unwrap();
         handler_b
             .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), a_req))
             .await
             .unwrap();
-        let b_reply = outbox_b.lock().unwrap().pop().expect("B serves A's missing proof");
+        let b_reply = outbox_b
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("B serves A's missing proof");
         handler_a
             .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), b_reply))
             .await
             .unwrap();
 
         // --- Direction 2: B pulls from A ---
-        let b_req = handler_b.build_challenge_request(window.0, window.1).unwrap();
+        let b_req = handler_b
+            .build_challenge_request(window.0, window.1)
+            .unwrap();
         handler_a
             .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), b_req))
             .await
             .unwrap();
-        let a_reply = outbox_a.lock().unwrap().pop().expect("A serves B's missing proof");
+        let a_reply = outbox_a
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("A serves B's missing proof");
         handler_b
-            .handle_challenge_convergence(&convergence_envelope(challenger.node_id(), a_reply.clone()))
+            .handle_challenge_convergence(&convergence_envelope(
+                challenger.node_id(),
+                a_reply.clone(),
+            ))
             .await
             .unwrap();
 
@@ -1297,13 +1333,17 @@ mod tests {
         msg.signature = [0xAA; 64]; // not a valid signature over signing_data
         let forged = serde_json::to_vec(&msg).unwrap();
 
-        let resp = ChallengeConvergenceResponse { proofs: vec![forged] };
+        let resp = ChallengeConvergenceResponse {
+            proofs: vec![forged],
+        };
         let applied = handler.apply_challenge_response(&resp).await;
         assert_eq!(applied, 0, "forged proof must not be applied");
 
         let window = (0i64, Utc::now().timestamp() + 100);
         assert!(
-            db.verification_keys_in(window.0, window.1).unwrap().is_empty(),
+            db.verification_keys_in(window.0, window.1)
+                .unwrap()
+                .is_empty(),
             "ledger must remain empty after rejecting a forged proof"
         );
     }

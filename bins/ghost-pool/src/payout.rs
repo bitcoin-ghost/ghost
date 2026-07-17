@@ -1941,8 +1941,8 @@ mod tests {
             ..Default::default()
         };
         let db = Arc::new(ghost_storage::Database::in_memory().expect("in-memory db"));
-        let creator = PayoutProposalCreator::new(test_identity(), config, Arc::clone(&db))
-            .expect("creator");
+        let creator =
+            PayoutProposalCreator::new(test_identity(), config, Arc::clone(&db)).expect("creator");
         (creator, db)
     }
 

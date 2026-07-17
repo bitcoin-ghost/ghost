@@ -65,7 +65,10 @@ async fn empty_template_is_coinbase_only_while_forced_full_includes_mempool() {
     rpc.call_raw("sendtoaddress", vec![dest, json!(1.0)])
         .await
         .expect("sendtoaddress");
-    let mempool = rpc.call_raw("getrawmempool", vec![]).await.expect("mempool");
+    let mempool = rpc
+        .call_raw("getrawmempool", vec![])
+        .await
+        .expect("mempool");
     assert!(
         mempool.as_array().map(|a| a.len()).unwrap_or(0) >= 1,
         "expected a tx in the mempool to distinguish empty from full"

@@ -1651,7 +1651,9 @@ async fn api_mining_template_handler(
 ) -> impl IntoResponse {
     match state.template_snapshot() {
         Some(template) => Json(serde_json::json!({ "available": true, "template": template })),
-        None => Json(serde_json::json!({ "available": false, "template": serde_json::Value::Null })),
+        None => {
+            Json(serde_json::json!({ "available": false, "template": serde_json::Value::Null }))
+        }
     }
 }
 

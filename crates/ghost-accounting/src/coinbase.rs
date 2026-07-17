@@ -85,11 +85,7 @@ impl CoinbaseBuilder {
         // output for every height below 8_388_608, so the fix is inert on the live chain —
         // but a regtest/signet chain in the 128..=255 band produces blocks the node rejects.
         let le = self.block_height.to_le_bytes();
-        let len = le
-            .iter()
-            .rposition(|&b| b != 0)
-            .map(|i| i + 1)
-            .unwrap_or(1);
+        let len = le.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(1);
         let mut height_bytes = le[..len].to_vec();
         if height_bytes.last().is_some_and(|&b| b & 0x80 != 0) {
             height_bytes.push(0x00);
@@ -289,7 +285,9 @@ mod tests {
         assert_eq!(pushed_height(8_388_608), vec![0x00, 0x00, 0x80, 0x00]);
 
         // No encoding may ever end in a byte with the high bit set.
-        for h in [1u64, 127, 128, 203, 255, 256, 32_768, 946_743, 957_896, 8_388_608] {
+        for h in [
+            1u64, 127, 128, 203, 255, 256, 32_768, 946_743, 957_896, 8_388_608,
+        ] {
             let last = *pushed_height(h).last().expect("non-empty height push");
             assert_eq!(
                 last & 0x80,

@@ -498,8 +498,9 @@ impl Database {
     /// address undecryptable on the target, the `INNER JOIN miners` in `get_top_unpaid_addresses`
     /// would drop the share, and the miner would silently lose that work.
     pub fn export_unpaid_shares(&self) -> GhostResult<Vec<UnpaidShareExport>> {
-        let rows: Vec<(u64, String, f64, f64, String, i64, String)> = self.with_connection(|conn| {
-            let mut stmt = conn
+        let rows: Vec<(u64, String, f64, f64, String, i64, String)> =
+            self.with_connection(|conn| {
+                let mut stmt = conn
                 .prepare(
                     "SELECT round_id, miner_id, difficulty, work, share_hash, timestamp, received_by
                      FROM shares
@@ -507,25 +508,25 @@ impl Database {
                      ORDER BY timestamp",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
-            let it = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                    ))
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            let mut out = Vec::new();
-            for row in it {
-                out.push(row.map_err(|e| GhostError::Database(e.to_string()))?);
-            }
-            Ok(out)
-        })?;
+                let it = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    })
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                let mut out = Vec::new();
+                for row in it {
+                    out.push(row.map_err(|e| GhostError::Database(e.to_string()))?);
+                }
+                Ok(out)
+            })?;
 
         // Resolve each miner's address once, not per share.
         let mut addr_cache: std::collections::HashMap<String, Option<String>> =
@@ -858,17 +859,20 @@ impl Database {
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             let miners = stmt
-                .query_map(params![window_start, received_by, Self::MAX_QUERY_RESULTS], |row| {
-                    Ok(MinerSearchResult {
-                        miner_id: row.get(0)?,
-                        total_shares: row.get(1)?,
-                        total_work: row.get(2)?,
-                        valid_shares: row.get(3)?,
-                        first_seen: row.get(4)?,
-                        last_seen: row.get(5)?,
-                        avg_difficulty: row.get(6)?,
-                    })
-                })
+                .query_map(
+                    params![window_start, received_by, Self::MAX_QUERY_RESULTS],
+                    |row| {
+                        Ok(MinerSearchResult {
+                            miner_id: row.get(0)?,
+                            total_shares: row.get(1)?,
+                            total_work: row.get(2)?,
+                            valid_shares: row.get(3)?,
+                            first_seen: row.get(4)?,
+                            last_seen: row.get(5)?,
+                            avg_difficulty: row.get(6)?,
+                        })
+                    },
+                )
                 .map_err(|e| GhostError::Database(e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -10299,14 +10303,11 @@ mod tests {
         };
 
         // DISPLAY value 1 (all zeros but the last byte) — the genuinely rarest.
-        let winner_display =
-            "0000000000000000000000000000000000000000000000000000000000000001";
+        let winner_display = "0000000000000000000000000000000000000000000000000000000000000001";
         // DISPLAY value with a high leading byte — common.
-        let common_display =
-            "ff00000000000000000000000000000000000000000000000000000000000000";
+        let common_display = "ff00000000000000000000000000000000000000000000000000000000000000";
         // DISPLAY value with a mid leading byte — common.
-        let mid_display =
-            "0000ff0000000000000000000000000000000000000000000000000000000000";
+        let mid_display = "0000ff0000000000000000000000000000000000000000000000000000000000";
 
         let mk = |hash: String, miner: &str| ShareRecord {
             id: None,
@@ -13002,12 +13003,16 @@ mod tests {
 
         // Windowed read serves only in-range records (the convergence responder relies on this).
         assert_eq!(
-            db.verification_proofs_in(0, 1_500, 100).expect("read").len(),
+            db.verification_proofs_in(0, 1_500, 100)
+                .expect("read")
+                .len(),
             1,
             "only the ts=1000 record falls in [0,1500)"
         );
         assert_eq!(
-            db.verification_proofs_in(0, 10_000, 100).expect("read all").len(),
+            db.verification_proofs_in(0, 10_000, 100)
+                .expect("read all")
+                .len(),
             2,
             "both distinct records, deduped to two"
         );
@@ -13027,7 +13032,10 @@ mod tests {
             .expect("old");
 
         let deleted = db.prune_old_verification_ledger(30).expect("prune");
-        assert_eq!(deleted, 1, "only the 40-day-old row is past the 30-day retention");
+        assert_eq!(
+            deleted, 1,
+            "only the 40-day-old row is past the 30-day retention"
+        );
 
         let remaining = db.verification_proofs_in(0, now + day, 100).expect("read");
         assert_eq!(remaining.len(), 1, "the in-retention row survives pruning");
@@ -13122,7 +13130,8 @@ mod ledger_reconciliation_tests {
         }
         b.upsert_miner(&miner("m1", "bc1qexampleaddressaaaaaaaaaaaaaaaaaaaaaaaa"))
             .expect("miner");
-        b.insert_share(&share("h1", "m1", 1_000.0, 100)).expect("B share");
+        b.insert_share(&share("h1", "m1", 1_000.0, 100))
+            .expect("B share");
 
         let unpaid = |db: &Database| -> f64 {
             db.get_top_unpaid_miners(i64::MAX, 100)
@@ -13171,7 +13180,8 @@ mod ledger_reconciliation_tests {
 
         a.upsert_miner(&miner("m2", "bc1qanotheraddressbbbbbbbbbbbbbbbbbbbbbbbb"))
             .expect("miner");
-        a.insert_share(&share("x1", "m2", 500.0, 10)).expect("share");
+        a.insert_share(&share("x1", "m2", 500.0, 10))
+            .expect("share");
 
         // B has never seen this miner at all.
         assert!(b.get_miner_payout_address("m2").expect("lookup").is_none());
@@ -13180,7 +13190,10 @@ mod ledger_reconciliation_tests {
         let (inserted, miners_created) = b.import_unpaid_shares(&exported, false).expect("import");
 
         assert_eq!(inserted, 1);
-        assert_eq!(miners_created, 1, "the miner row must be created on the target");
+        assert_eq!(
+            miners_created, 1,
+            "the miner row must be created on the target"
+        );
         assert_eq!(
             b.get_miner_payout_address("m2").expect("lookup").as_deref(),
             Some("bc1qanotheraddressbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -13193,6 +13206,9 @@ mod ledger_reconciliation_tests {
             .iter()
             .map(|(_, w)| *w)
             .sum();
-        assert_eq!(credited, 500.0, "the imported work must be credited, not dropped");
+        assert_eq!(
+            credited, 500.0,
+            "the imported work must be credited, not dropped"
+        );
     }
 }

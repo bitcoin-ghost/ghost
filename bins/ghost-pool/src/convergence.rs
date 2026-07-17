@@ -132,13 +132,17 @@ impl ConvergenceHandler {
     }
 
     pub fn ledger_request_bytes(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<u8>> {
-        let payload = ConvergencePayload::LedgerRequest(self.build_ledger_request(since_ts, until_ts)?);
+        let payload =
+            ConvergencePayload::LedgerRequest(self.build_ledger_request(since_ts, until_ts)?);
         serde_json::to_vec(&payload)
             .map_err(|e| ghost_common::error::GhostError::P2PMessage(e.to_string()))
     }
 
     /// Serve the signed proofs we hold in the requester's window that they did not advertise.
-    pub fn handle_ledger_request(&self, req: &LedgerConvergenceRequest) -> LedgerConvergenceResponse {
+    pub fn handle_ledger_request(
+        &self,
+        req: &LedgerConvergenceRequest,
+    ) -> LedgerConvergenceResponse {
         let theirs: std::collections::HashSet<String> = req.share_hashes.iter().cloned().collect();
         let (proofs, unservable) = match &self.db {
             Some(db) => db
@@ -198,7 +202,11 @@ impl ConvergenceHandler {
         let work = proof.work;
         let timestamp = proof.timestamp as i64;
 
-        if self.round_manager.handle_share_proof(proof.clone()).is_err() {
+        if self
+            .round_manager
+            .handle_share_proof(proof.clone())
+            .is_err()
+        {
             return false;
         }
 
@@ -505,8 +513,10 @@ mod tests {
             rm_a.handle_share_proof(s.clone()).expect("A accepts");
             db_a.insert_share(&ledger_row(s)).expect("A persists");
         }
-        rm_b.handle_share_proof(shares[0].clone()).expect("B accepts the one it got");
-        db_b.insert_share(&ledger_row(&shares[0])).expect("B persists the one it got");
+        rm_b.handle_share_proof(shares[0].clone())
+            .expect("B accepts the one it got");
+        db_b.insert_share(&ledger_row(&shares[0]))
+            .expect("B persists the one it got");
 
         // What a payout would actually be computed from on each node.
         let unpaid_work = |db: &ghost_storage::Database| -> f64 {
@@ -575,8 +585,11 @@ mod tests {
             db_a.insert_share_with_proof(&ledger_row(s), &serde_json::to_vec(s).unwrap())
                 .expect("A persists with proof");
         }
-        db_b.insert_share_with_proof(&ledger_row(&shares[0]), &serde_json::to_vec(&shares[0]).unwrap())
-            .expect("B persists the one it got");
+        db_b.insert_share_with_proof(
+            &ledger_row(&shares[0]),
+            &serde_json::to_vec(&shares[0]).unwrap(),
+        )
+        .expect("B persists the one it got");
 
         let unpaid = |db: &ghost_storage::Database| -> f64 {
             db.get_top_unpaid_miners(i64::MAX, 100)
@@ -586,15 +599,25 @@ mod tests {
                 .sum()
         };
         assert_eq!(unpaid(&db_a), 3.0);
-        assert_eq!(unpaid(&db_b), 1.0, "B's ledger is short — and always would have been");
+        assert_eq!(
+            unpaid(&db_b),
+            1.0,
+            "B's ledger is short — and always would have been"
+        );
 
         // B advertises the window; A serves the proofs B lacks; B applies them.
         let window = (base_ts, base_ts + 3_600);
-        let req = ch_b.build_ledger_request(window.0, window.1).expect("request");
+        let req = ch_b
+            .build_ledger_request(window.0, window.1)
+            .expect("request");
         assert_eq!(req.share_hashes.len(), 1, "B advertises only what it holds");
 
         let resp = ch_a.handle_ledger_request(&req);
-        assert_eq!(resp.proofs.len(), 2, "A serves exactly the two B is missing");
+        assert_eq!(
+            resp.proofs.len(),
+            2,
+            "A serves exactly the two B is missing"
+        );
         assert_eq!(resp.unservable, 0, "all of A's shares carry proofs (v41)");
 
         assert_eq!(ch_b.apply_ledger_response(&resp), 2);

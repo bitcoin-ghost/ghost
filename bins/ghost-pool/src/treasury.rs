@@ -57,7 +57,13 @@ impl FeeDistribution {
         treasury_state: &TreasuryState,
         block_timestamp: DateTime<Utc>,
     ) -> Self {
-        Self::calculate_at_height(subsidy_sats, tx_fees_sats, treasury_state, block_timestamp, 0)
+        Self::calculate_at_height(
+            subsidy_sats,
+            tx_fees_sats,
+            treasury_state,
+            block_timestamp,
+            0,
+        )
     }
 
     /// Fee distribution for a block at `block_height`.
@@ -102,7 +108,8 @@ impl FeeDistribution {
         // M-01: Runtime invariant checks.
         // Post-gate the node pool also carries the TX fees, so the split must account for them:
         // treasury + node_pool == pool_fee + (fees routed to the node pool).
-        let expected_split = pool_fee.saturating_add(if fees_to_node_pool { tx_fees_sats } else { 0 });
+        let expected_split =
+            pool_fee.saturating_add(if fees_to_node_pool { tx_fees_sats } else { 0 });
         if treasury_amount + node_reward_pool != expected_split {
             tracing::error!(
                 treasury_amount,
@@ -262,7 +269,10 @@ mod tests {
             crate::fee_to_node_pool_height(),
         );
 
-        assert_eq!(below.tx_fees_to_block_finder, fees, "still the finder's below");
+        assert_eq!(
+            below.tx_fees_to_block_finder, fees,
+            "still the finder's below"
+        );
         assert_eq!(
             at.tx_fees_to_block_finder, 0,
             "at the gate there is no block finder to pay"

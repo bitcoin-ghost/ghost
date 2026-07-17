@@ -43,8 +43,8 @@ use ghost_pool::payout::{
     make_proposal_validator, select_ledger_miner_work, BlockFoundData, PayoutConfig, PayoutHandler,
 };
 use ghost_pool::template::{TemplateConfig, TemplateProcessor};
-use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
 use ghost_pool::treasury::TreasuryState;
+use ghost_pool::PAYOUT_ADDRESS_GROUPING_HEIGHT;
 use ghost_storage::{Database, MinerRecord, ShareRecord};
 use ghost_verification::qualification::QualifiedCapabilityProvider;
 
@@ -337,7 +337,10 @@ fn propose_at(
         })
         .expect("handle_block_found");
 
-    assert_ne!(hash, [0u8; 32], "a block win must produce a payout proposal");
+    assert_ne!(
+        hash, [0u8; 32],
+        "a block win must produce a payout proposal"
+    );
 
     node.template
         .get_proposal(&hash)
@@ -567,12 +570,8 @@ fn share_arriving_after_the_cutoff_does_not_break_ratification() {
     }
 
     // And the late share is still owed after this block is paid out.
-    ghost_pool::payout::settle_paid_block(
-        &nodes[0].db,
-        &proposal,
-        PAYOUT_ADDRESS_GROUPING_HEIGHT,
-    )
-    .expect("settle the paid block");
+    ghost_pool::payout::settle_paid_block(&nodes[0].db, &proposal, PAYOUT_ADDRESS_GROUPING_HEIGHT)
+        .expect("settle the paid block");
 
     let still_owed = select_ledger_miner_work(&nodes[0].db, now + 60, BLOCK_HEIGHT, SUBSIDY_SATS)
         .expect("ledger");
@@ -607,12 +606,11 @@ fn tip_change_arms_the_coinbase_and_leaves_the_ledger_owed() {
 
     // Every node computes the same proposer for a given height, with no coordination.
     let elders_of = |n: &Node| -> Vec<[u8; 32]> {
-        let mut e: Vec<[u8; 32]> = n
-            .db
-            .get_mpc_elder_node_ids()
-            .expect("elders")
-            .into_iter()
-            .collect();
+        let mut e: Vec<[u8; 32]> =
+            n.db.get_mpc_elder_node_ids()
+                .expect("elders")
+                .into_iter()
+                .collect();
         e.sort_unstable();
         e
     };
@@ -837,7 +835,11 @@ async fn mined_block_is_accepted_by_ghostd_and_pays_the_miners() {
     );
 
     let after = rpc.get_block_count().await.expect("height after");
-    assert_eq!(after, before + 1, "the chain must have advanced by our block");
+    assert_eq!(
+        after,
+        before + 1,
+        "the chain must have advanced by our block"
+    );
 
     // --- Read our block back out of the node and see who actually got paid on-chain.
     let hash = block.block_hash().to_string();

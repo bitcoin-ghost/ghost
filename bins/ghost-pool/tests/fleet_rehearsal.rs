@@ -94,7 +94,7 @@ fn all_shares(now: i64) -> Vec<(String, usize, u64, f64, i64)> {
         // enough weight per share that idling does not cost it the top spot, or the test asserts
         // a property the scenario does not actually have.
         let (work, last_round) = match m {
-            2 => (9_000.0, ROUNDS / 2), // owed the most, idle at the win
+            2 => (9_000.0, ROUNDS / 2),     // owed the most, idle at the win
             4 => (500.0 * 5.0, ROUNDS - 3), // went idle shortly before the win
             _ => (500.0 * (m as f64 + 1.0), ROUNDS),
         };
@@ -157,7 +157,13 @@ fn seed_divergent(db: &Database, node: usize, now: i64) {
     }
 }
 
-fn build_node(rpc: Arc<BitcoinRpc>, identity: Arc<NodeIdentity>, elders: &[[u8; 32]], node: usize, now: i64) -> Node {
+fn build_node(
+    rpc: Arc<BitcoinRpc>,
+    identity: Arc<NodeIdentity>,
+    elders: &[[u8; 32]],
+    node: usize,
+    now: i64,
+) -> Node {
     let db = Arc::new(Database::in_memory().expect("db"));
     seed_divergent(&db, node, now);
 
@@ -224,7 +230,13 @@ fn unpaid_work(db: &Database) -> f64 {
 }
 
 /// Propose a payout for `height` from the unpaid ledger, exactly as the tip-change proposer does.
-fn propose(node: &Node, cutoff: i64, height: u64, subsidy: u64, node_id: [u8; 32]) -> PayoutProposal {
+fn propose(
+    node: &Node,
+    cutoff: i64,
+    height: u64,
+    subsidy: u64,
+    node_id: [u8; 32],
+) -> PayoutProposal {
     let miner_work = select_ledger_miner_work(&node.db, cutoff, height, subsidy).expect("ledger");
     let hash = node
         .handler
@@ -254,11 +266,7 @@ fn ratifying(nodes: &[Node], proposal: &PayoutProposal) -> usize {
     nodes
         .iter()
         .filter(|n| {
-            let v = make_proposal_validator(
-                Arc::clone(&n.handler),
-                Arc::clone(&n.db),
-                ENFORCEMENT,
-            );
+            let v = make_proposal_validator(Arc::clone(&n.handler), Arc::clone(&n.db), ENFORCEMENT);
             v(proposal).is_ok()
         })
         .count()
@@ -312,7 +320,9 @@ async fn divergent_fleet_is_reconciled_ratifies_and_pays_its_miners_on_a_real_ch
         "a divergent fleet MUST reject the payout — if every node ratifies here, the ledgers \
          are not really divergent and this rehearsal proves nothing"
     );
-    eprintln!("2. REJECTED: only {before}/{FLEET} nodes ratify a payout built on a divergent ledger");
+    eprintln!(
+        "2. REJECTED: only {before}/{FLEET} nodes ratify a payout built on a divergent ledger"
+    );
 
     // ---- 3. RECONCILE: the one-time union across the operator's own nodes.
     let mut union: std::collections::BTreeMap<String, ghost_storage::queries::UnpaidShareExport> =
@@ -418,7 +428,11 @@ async fn divergent_fleet_is_reconciled_ratifies_and_pays_its_miners_on_a_real_ch
         reject, None,
         "ghostd REJECTED the block carrying the reconciled, mesh-ratified payout"
     );
-    eprintln!("6. ACCEPTED: ghostd took block {} at height {}", block.block_hash(), template.height);
+    eprintln!(
+        "6. ACCEPTED: ghostd took block {} at height {}",
+        block.block_hash(),
+        template.height
+    );
 
     // Read it back off the chain: who actually got paid?
     let onchain = rpc

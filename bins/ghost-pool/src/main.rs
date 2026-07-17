@@ -8124,7 +8124,9 @@ async fn main() -> Result<()> {
                         warn!(error = %e, "Failed to persist own verification proof to ledger");
                     }
                 }
-                Err(e) => warn!(error = %e, "Failed to serialize own verification result for ledger"),
+                Err(e) => {
+                    warn!(error = %e, "Failed to serialize own verification result for ledger")
+                }
             }
 
             // Get peer count before broadcast for logging
@@ -8309,7 +8311,8 @@ async fn main() -> Result<()> {
                     // have to name a finder it cannot know, handing that block's fees to whichever
                     // node's turn it happened to be. Routing fees to the node reward pool is what
                     // removes the last unknown from the coinbase and makes it ratifiable early.
-                    if height >= ghost_pool::fee_to_node_pool_height() && height > last_proposed_height
+                    if height >= ghost_pool::fee_to_node_pool_height()
+                        && height > last_proposed_height
                     {
                         last_proposed_height = height;
 
@@ -8324,8 +8327,8 @@ async fn main() -> Result<()> {
                         elders.sort_unstable();
 
                         let me = identity_for_tips.node_id();
-                        let my_turn = !elders.is_empty()
-                            && elders[(height as usize) % elders.len()] == me;
+                        let my_turn =
+                            !elders.is_empty() && elders[(height as usize) % elders.len()] == me;
 
                         if my_turn {
                             // The tip we are building on. Every node agrees on it, and

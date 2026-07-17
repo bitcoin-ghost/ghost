@@ -2315,9 +2315,11 @@ mod tests {
         normalise_legacy_share_hash_byte_order(&conn).expect("normalise");
 
         let (count, work): (i64, f64) = conn
-            .query_row("SELECT COUNT(*), COALESCE(SUM(work),0) FROM shares", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(work),0) FROM shares",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .expect("count");
         assert_eq!(count, 1, "the duplicate spelling must be deleted");
         assert_eq!(work, 1.0, "the work must be counted once, not twice");

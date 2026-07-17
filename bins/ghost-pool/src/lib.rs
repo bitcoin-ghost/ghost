@@ -171,7 +171,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         CLUSTER_ENFORCEMENT_HEIGHT,
     );
-    let fee = gates::from_env("GHOST_FEE_TO_NODE_POOL_HEIGHT", network, FEE_TO_NODE_POOL_HEIGHT);
+    let fee = gates::from_env(
+        "GHOST_FEE_TO_NODE_POOL_HEIGHT",
+        network,
+        FEE_TO_NODE_POOL_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::FEE_TO_NODE_POOL.set(fee);
 

@@ -829,14 +829,38 @@ impl QualifiedCapabilityProvider {
         // verdict (not a re-derived one) because re-derivation can't validate a backfilled proof
         // past the 5-min response-freshness window; the distinct-challenger majority is what
         // provides anti-grief — a colluding minority can neither fabricate a PASS nor a FAIL.
-        let archive_mode = self
-            .majority_capability_qualified(node_id_hex, "archive", since, until, min_challenges, min_unique);
-        let reaper = self
-            .majority_capability_qualified(node_id_hex, "policy", since, until, min_challenges, min_unique);
-        let public_mining = self
-            .majority_capability_qualified(node_id_hex, "stratum", since, until, min_challenges, min_unique);
-        let ghost_pay = self
-            .majority_capability_qualified(node_id_hex, "ghostpay", since, until, min_challenges, min_unique);
+        let archive_mode = self.majority_capability_qualified(
+            node_id_hex,
+            "archive",
+            since,
+            until,
+            min_challenges,
+            min_unique,
+        );
+        let reaper = self.majority_capability_qualified(
+            node_id_hex,
+            "policy",
+            since,
+            until,
+            min_challenges,
+            min_unique,
+        );
+        let public_mining = self.majority_capability_qualified(
+            node_id_hex,
+            "stratum",
+            since,
+            until,
+            min_challenges,
+            min_unique,
+        );
+        let ghost_pay = self.majority_capability_qualified(
+            node_id_hex,
+            "ghostpay",
+            since,
+            until,
+            min_challenges,
+            min_unique,
+        );
 
         // Elder is registration order in the (converged) nodes table, unchanged.
         let elder_status = self.db.is_node_elder(node_id_hex).unwrap_or(false);
@@ -1335,7 +1359,14 @@ mod tests {
 
     /// Seed `n` distinct challengers each recording one `passed` archive proof
     /// for `target` at `ts` into the converged ledger.
-    fn seed_archive(db: &Database, target: &str, first_challenger: u8, n: u8, passed: bool, ts: i64) {
+    fn seed_archive(
+        db: &Database,
+        target: &str,
+        first_challenger: u8,
+        n: u8,
+        passed: bool,
+        ts: i64,
+    ) {
         for i in 0..n {
             let challenger = hex_id(first_challenger + i);
             db.insert_verification_proof(&challenger, target, "archive", passed, ts, b"p")
@@ -1359,10 +1390,15 @@ mod tests {
         seed_archive(&db_a, &target, 0x10, 4, true, cutoff - 100);
         seed_archive(&db_b, &target, 0x10, 4, true, cutoff - 100);
 
-        let a = QualifiedCapabilityProvider::new(db_a).get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
-        let b = QualifiedCapabilityProvider::new(db_b).get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
+        let a = QualifiedCapabilityProvider::new(db_a)
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
+        let b = QualifiedCapabilityProvider::new(db_b)
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
 
-        assert_eq!(a, b, "identical ledgers must yield identical qualified sets");
+        assert_eq!(
+            a, b,
+            "identical ledgers must yield identical qualified sets"
+        );
         assert_eq!(
             a,
             vec![(decode_node_id(&target).unwrap(), 5)],
@@ -1414,8 +1450,15 @@ mod tests {
 
         // 4 distinct challengers pass, 1 distinct challenger fails.
         for i in 0..4u8 {
-            db.insert_verification_proof(&hex_id(0x30 + i), &target, "stratum", true, cutoff - 100, b"p")
-                .unwrap();
+            db.insert_verification_proof(
+                &hex_id(0x30 + i),
+                &target,
+                "stratum",
+                true,
+                cutoff - 100,
+                b"p",
+            )
+            .unwrap();
         }
         db.insert_verification_proof(&hex_id(0x40), &target, "stratum", false, cutoff - 100, b"p")
             .unwrap();
