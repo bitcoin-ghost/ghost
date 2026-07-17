@@ -534,6 +534,7 @@ fn test_pool_config_validate_success() {
         coinbase_extra: None,
         genesis_password: None,
         block_priority: Default::default(),
+        template_refresh_secs: None,
     };
 
     let result = config.validate();
