@@ -1,30 +1,41 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 
 type Theme = "light" | "dark";
+
+const THEME_EVENT = "ghost-theme-change";
+
+// The `<html data-theme>` attribute is external mutable state (set on first
+// paint by the bootstrap script in layout.tsx). Read it via useSyncExternalStore
+// — the SSR-safe, render-pure way to subscribe to external state — instead of an
+// effect that copies it into local state.
+function subscribeTheme(onChange: () => void): () => void {
+  window.addEventListener(THEME_EVENT, onChange);
+  return () => window.removeEventListener(THEME_EVENT, onChange);
+}
+
+function readTheme(): Theme {
+  return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+}
 
 /** Reads the current theme from `<html data-theme>` (set on first paint by
  *  the bootstrap script in layout.tsx) and writes the chosen theme to both
  *  the attribute and localStorage so it survives reloads. */
 export function ThemeToggle({ className = "" }: { className?: string }) {
-  const [theme, setTheme] = useState<Theme>("dark");
+  const theme = useSyncExternalStore<Theme>(subscribeTheme, readTheme, () => "dark");
 
-  useEffect(() => {
-    const current = document.documentElement.getAttribute("data-theme") as Theme | null;
-    if (current === "light" || current === "dark") setTheme(current);
-  }, []);
-
-  function toggle() {
-    const next: Theme = theme === "dark" ? "light" : "dark";
+  const toggle = useCallback(() => {
+    const next: Theme = readTheme() === "dark" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", next);
     try {
       localStorage.setItem("ghost-theme", next);
     } catch {
       /* localStorage may be unavailable (private mode) — best effort only */
     }
-    setTheme(next);
-  }
+    // Notify all subscribers (this toggle + any other mounted readers).
+    window.dispatchEvent(new Event(THEME_EVENT));
+  }, []);
 
   return (
     <button

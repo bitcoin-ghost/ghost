@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import {
@@ -21,21 +21,20 @@ export function PayoutSection() {
 
   const [miningPayoutAddress, setMiningPayoutAddress] = useState("");
   const [ghostPayPayoutAddress, setGhostPayPayoutAddress] = useState("");
+  // Seed the input fields once from the fetched config, the moment it arrives.
+  // Done during render (React's "adjust state when data changes" pattern) rather
+  // than in an effect — the `seeded` guard runs it exactly once so it never
+  // clobbers an edit the operator has since typed.
+  const [seeded, setSeeded] = useState(false);
+  if (!seeded && fullConfig?.payout) {
+    setSeeded(true);
+    if (fullConfig.payout.address) setMiningPayoutAddress(fullConfig.payout.address);
+    if (fullConfig.payout.ghostpay_address) setGhostPayPayoutAddress(fullConfig.payout.ghostpay_address);
+  }
 
   // Running-state from the explicit `sync_state` flag, not `l2_height` (0 is a
   // valid running height and would falsely trip the "not running" warning).
   const ghostPayRunning = ghostPayStatus?.sync_state === "synced";
-
-  useEffect(() => {
-    if (fullConfig?.payout?.address && !miningPayoutAddress) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setMiningPayoutAddress(fullConfig.payout.address);
-    }
-    if (fullConfig?.payout?.ghostpay_address && !ghostPayPayoutAddress) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setGhostPayPayoutAddress(fullConfig.payout.ghostpay_address);
-    }
-  }, [fullConfig?.payout?.address, fullConfig?.payout?.ghostpay_address]);
 
   const handleSaveMiningPayoutAddress = async () => {
     try {

@@ -673,7 +673,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
       </div>
 
       {/* Watchdog service LEDs — one dot per monitored service. */}
-      <WatchdogLeds leds={leds} active={active} />
+      <WatchdogLeds leds={leds} />
 
       {/* Medallion: capability ring wrapping the big ticking block height. */}
       <div
@@ -1100,7 +1100,7 @@ function Stat({
 
 // A compact row of watchdog service LEDs: one dot + tiny label per monitored
 // service. Healthy dots share a gentle unison blink so the row reads as alive.
-function WatchdogLeds({ leds, active }: { leds: Led[]; active: boolean }) {
+function WatchdogLeds({ leds }: { leds: Led[] }) {
   if (leds.length === 0) {
     return (
       <div

@@ -5,6 +5,19 @@ import nextTs from "eslint-config-next/typescript";
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
+  // The Next 16 react-hooks preset enables React-Compiler-tier rules as errors.
+  // This app is NOT built with React Compiler and intentionally uses a couple of
+  // idioms those rules flag: a wall-clock read for a time-window filter
+  // (`purity`) and the canonical "latest value" ref-sync pattern such as
+  // `callbacksRef.current = options` (`refs`). Both are correct here, so keep
+  // them as visible warnings rather than build-breaking errors. The genuinely
+  // fixable families (`set-state-in-effect`, `immutability`) stay as errors.
+  {
+    rules: {
+      "react-hooks/purity": "warn",
+      "react-hooks/refs": "warn",
+    },
+  },
   // The custom Node server and its test harness are plain CommonJS modules that
   // run outside the Next/browser bundle, so the ESM-only `require` ban does not
   // apply to them.

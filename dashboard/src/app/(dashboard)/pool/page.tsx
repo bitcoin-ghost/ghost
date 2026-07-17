@@ -335,13 +335,17 @@ export default function NodePoolPage() {
   // TODO: make node-history respect time_filter, and add a dedicated
   // payout-events endpoint if a true per-event history is wanted.)
   const SEVEN_DAYS_SEC = 7 * 24 * 60 * 60;
-  const nowSec = Date.now() / 1000;
-  const payoutRows = (payouts ?? []).filter((p) => {
-    const raw = p.timestamp ?? p.updated_at ?? p.created_at ?? 0;
-    if (!raw) return false;
-    const ts = raw > 1e12 ? raw / 1000 : raw; // normalise ms → s
-    return nowSec - ts <= SEVEN_DAYS_SEC;
-  });
+  // Capture "now" in the memo (recomputed each refetch) rather than the render
+  // body, so the wall-clock read stays out of the pure render path.
+  const payoutRows = useMemo(() => {
+    const nowSec = Date.now() / 1000;
+    return (payouts ?? []).filter((p) => {
+      const raw = p.timestamp ?? p.updated_at ?? p.created_at ?? 0;
+      if (!raw) return false;
+      const ts = raw > 1e12 ? raw / 1000 : raw; // normalise ms → s
+      return nowSec - ts <= SEVEN_DAYS_SEC;
+    });
+  }, [payouts, SEVEN_DAYS_SEC]);
 
   return (
     <div className="space-y-6">
