@@ -16,9 +16,11 @@ import {
   useMiners,
   useRewardsCurrent,
   useNodePayoutHistory,
+  useNodePayoutEvents,
   usePoolMeshLeaderboard,
 } from "@/hooks/queries";
 import { usePoolSeries } from "@/hooks/usePoolSeries";
+import type { NodePayoutEvent } from "@/lib/api/rewards";
 import type { BestHashEntry, MinerInfo, NodePayoutEntry, MeshLeaderboardNode } from "@/types/api";
 
 const TOOLTIPS = {
@@ -137,6 +139,9 @@ export default function NodePoolPage() {
   const { data: minersData } = useMiners();
   const { data: rewards } = useRewardsCurrent();
   const { data: payouts } = useNodePayoutHistory("7d");
+  // Real per-event payout history, when the node binary serves it. On older
+  // nodes this errors (404) and we fall back to the balance-ledger view below.
+  const { data: payoutEvents, isError: payoutEventsError } = useNodePayoutEvents("7d");
   const { data: meshLeaderboard } = usePoolMeshLeaderboard();
   const series = usePoolSeries();
 
@@ -327,13 +332,66 @@ export default function NodePoolPage() {
     [],
   );
 
+  // Columns for the richer per-EVENT view (used when the node serves
+  // /api/v1/rewards/node-payout-events): one row per round a node was credited.
+  const payoutEventColumns = useMemo<ColumnDef<NodePayoutEvent>[]>(
+    () => [
+      {
+        id: "when",
+        header: "When",
+        accessorFn: (e) => e.created_at,
+        cell: ({ getValue }) => formatTimeAgo(getValue() as number),
+      },
+      {
+        id: "node",
+        header: "Node",
+        accessorFn: (e) => e.recipient_id,
+        cell: ({ row }) => (
+          <span className="truncate t-caption" style={{ fontFamily: "var(--font-mono)" }}>
+            {row.original.recipient_id.slice(0, 10)}
+            {row.original.is_self && (
+              <Badge variant="default" className="ml-2">
+                this node
+              </Badge>
+            )}
+          </span>
+        ),
+      },
+      {
+        id: "round",
+        header: "Round",
+        accessorFn: (e) => e.round_id,
+        cell: ({ getValue }) => `#${(getValue() as number).toLocaleString()}`,
+      },
+      {
+        id: "amount",
+        header: "Amount",
+        accessorFn: (e) => e.amount_sats,
+        cell: ({ getValue }) => (
+          <span style={{ color: "var(--accent)", fontFamily: "var(--font-mono)" }}>
+            {formatSats(getValue() as number)}
+          </span>
+        ),
+      },
+      {
+        id: "status",
+        header: "Status",
+        accessorFn: (e) => e.status,
+        cell: ({ getValue }) => {
+          const s = String(getValue());
+          const variant = s === "confirmed" ? "success" : s === "approved" ? "info" : "default";
+          return <Badge variant={variant}>{s}</Badge>;
+        },
+      },
+    ],
+    [],
+  );
+
   // The reward-balance table honours the 7-day window even though the
-  // `/rewards/node-history` endpoint currently returns the full node reward
-  // ledger regardless of `time_filter`. Guard client-side: drop rows whose most-
-  // recent update is older than 7 days (or have no usable timestamp), so a node
-  // last credited months ago no longer surfaces as recent activity. (Backend
-  // TODO: make node-history respect time_filter, and add a dedicated
-  // payout-events endpoint if a true per-event history is wanted.)
+  // `/rewards/node-history` endpoint returns the full node reward ledger
+  // regardless of `time_filter`. Guard client-side: drop rows whose most-recent
+  // update is older than 7 days (or have no usable timestamp), so a node last
+  // credited months ago no longer surfaces as recent activity.
   const SEVEN_DAYS_SEC = 7 * 24 * 60 * 60;
   // Capture "now" in the memo (recomputed each refetch) rather than the render
   // body, so the wall-clock read stays out of the pure render path.
@@ -346,6 +404,12 @@ export default function NodePoolPage() {
       return nowSec - ts <= SEVEN_DAYS_SEC;
     });
   }, [payouts, SEVEN_DAYS_SEC]);
+
+  // Prefer the real per-event history when the node serves it; otherwise fall
+  // back to the per-node balance-ledger view (older node → the events request
+  // errored). `events` are already time-filtered server-side.
+  const payoutEventRows = payoutEvents?.events ?? [];
+  const hasPayoutEvents = !payoutEventsError && payoutEventRows.length > 0;
 
   return (
     <div className="space-y-6">
@@ -634,21 +698,39 @@ export default function NodePoolPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* Node reward balances */}
-      <SectionErrorBoundary section="Node reward balances">
-        <Card>
-          <CardHeader
-            title="Node reward balances"
-            subtitle="Per-node reward-pool balances across the mesh, updated in the last 7 days"
-          />
-          <DataTable
-            columns={payoutColumns}
-            data={payoutRows}
-            pageSize={10}
-            emptyMessage="No reward-balance activity in the last 7 days"
-          />
-        </Card>
-      </SectionErrorBoundary>
+      {/* Node payouts — real per-event history when the node serves it, else
+          the per-node reward-balance ledger. */}
+      {hasPayoutEvents ? (
+        <SectionErrorBoundary section="Recent payouts">
+          <Card>
+            <CardHeader
+              title="Recent payouts"
+              subtitle="Per-round node payout events across the mesh (last 7 days)"
+            />
+            <DataTable
+              columns={payoutEventColumns}
+              data={payoutEventRows}
+              pageSize={10}
+              emptyMessage="No node payouts in the last 7 days"
+            />
+          </Card>
+        </SectionErrorBoundary>
+      ) : (
+        <SectionErrorBoundary section="Node reward balances">
+          <Card>
+            <CardHeader
+              title="Node reward balances"
+              subtitle="Per-node reward-pool balances across the mesh, updated in the last 7 days"
+            />
+            <DataTable
+              columns={payoutColumns}
+              data={payoutRows}
+              pageSize={10}
+              emptyMessage="No reward-balance activity in the last 7 days"
+            />
+          </Card>
+        </SectionErrorBoundary>
+      )}
 
       {/* Chart source note: the mesh hashrate/miner charts use the node's
           server-side time-series ring when it has data, falling back to an

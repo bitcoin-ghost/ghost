@@ -42,6 +42,35 @@ export async function getNodePayoutHistory(
   return Array.isArray(res) ? res : res?.history ?? [];
 }
 
+// Node Payout EVENTS — individual per-round credit events (not the running
+// balance ledger). Backed by the `payouts` table via the
+// /api/v1/rewards/node-payout-events endpoint. Available only once the node
+// binary that serves it is deployed; callers fall back to the balance ledger
+// when it is absent (older node → this request 404s/throws).
+export interface NodePayoutEvent {
+  round_id: number;
+  recipient_id: string;
+  amount_sats: number;
+  txid: string | null;
+  status: string;
+  created_at: number;
+  confirmed_at: number | null;
+  is_self: boolean;
+}
+
+export interface NodePayoutEventsResponse {
+  events: NodePayoutEvent[];
+  total: number;
+}
+
+export async function getNodePayoutEvents(
+  timeFilter: PayoutHistoryTimeFilter = '7d',
+): Promise<NodePayoutEventsResponse> {
+  return fetchApi<NodePayoutEventsResponse>(
+    `/api/v1/rewards/node-payout-events?time_filter=${timeFilter}`,
+  );
+}
+
 // Node Balance Accounts — all nodes with their reward balances
 export interface NodeBalanceEntry {
   node_id: string;
