@@ -231,7 +231,9 @@ export default function MiningPage() {
 
   const totalSubmitted = status?.shares_submitted ?? 0;
   const totalAccepted = status?.shares_accepted ?? 0;
-  const acceptRate = totalSubmitted > 0 ? ((totalAccepted / totalSubmitted) * 100).toFixed(1) : "0";
+  // Null until a share has been submitted — a fresh node showing "0% accept
+  // rate" reads as "everything rejected" when nothing has been mined yet.
+  const acceptRate = totalSubmitted > 0 ? ((totalAccepted / totalSubmitted) * 100).toFixed(1) : null;
 
   // Show stratum endpoints based on mode
   const showPrivateEndpoints = currentMode === "private_solo" || currentMode === "private_pool";
@@ -326,7 +328,7 @@ export default function MiningPage() {
         <StatCard
           label="Shares / Round"
           value={(totalAccepted).toLocaleString()}
-          sublabel={`${acceptRate}% accept rate`}
+          sublabel={acceptRate === null ? "no shares yet" : `${acceptRate}% accept rate`}
           tooltip={TOOLTIPS.shares_round}
           loading={statusLoading}
         />

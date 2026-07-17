@@ -148,7 +148,9 @@ export default function NodePoolPage() {
   const submitted = status?.shares_submitted ?? 0;
   const accepted = status?.shares_accepted ?? 0;
   const rejected = status?.shares_rejected ?? Math.max(0, submitted - accepted);
-  const acceptRate = submitted > 0 ? (accepted / submitted) * 100 : 100;
+  // Null until there is at least one submitted share — otherwise a fresh node
+  // shows a fictitious 100% accept rate before any miner has connected.
+  const acceptRate = submitted > 0 ? (accepted / submitted) * 100 : null;
 
   // Network difficulty comes from ghostd's getblockchaininfo via the mining
   // status endpoint. Do NOT fall back to `best_difficulty` — that is the pool
@@ -271,50 +273,67 @@ export default function NodePoolPage() {
     [],
   );
 
+  // The `/rewards/node-history` endpoint returns the per-node reward-pool
+  // BALANCE ledger (one row per node: current balance, lifetime credits, last
+  // update) — NOT a stream of individual payout events. Present it as exactly
+  // that: node, reward balance, total credited, last updated. Columns that only
+  // a real payout-events feed could fill (block height, payout type) are omitted
+  // rather than rendered structurally empty and passed off as payout data.
   const payoutColumns = useMemo<ColumnDef<NodePayoutEntry>[]>(
     () => [
       {
-        id: "time",
-        header: "When",
-        accessorFn: (p) => p.timestamp ?? p.updated_at ?? p.created_at ?? 0,
-        cell: ({ getValue }) => formatTimeAgo(getValue() as number),
-      },
-      {
-        id: "type",
-        header: "Type",
-        accessorFn: (p) => p.payout_type ?? "reward",
-        cell: ({ getValue }) => <Badge variant="default">{String(getValue())}</Badge>,
-      },
-      {
-        id: "block",
-        header: "Block",
-        accessorFn: (p) => p.block_height ?? 0,
-        cell: ({ getValue }) => {
-          const h = getValue() as number;
-          return h > 0 ? `#${h.toLocaleString()}` : "—";
+        id: "node",
+        header: "Node",
+        accessorFn: (p) => p.node_id ?? "",
+        cell: ({ row }) => {
+          const nodeId = row.original.node_id;
+          return (
+            <span className="truncate t-caption" style={{ fontFamily: "var(--font-mono)" }}>
+              {nodeId ? nodeId.slice(0, 10) : "—"}
+              {row.original.is_self && (
+                <Badge variant="default" className="ml-2">
+                  this node
+                </Badge>
+              )}
+            </span>
+          );
         },
       },
       {
-        id: "amount",
-        header: "Amount",
-        accessorFn: (p) => p.amount_satoshis ?? p.balance_sats ?? 0,
+        id: "balance",
+        header: "Reward balance",
+        accessorFn: (p) => p.balance_sats ?? 0,
         cell: ({ getValue }) => (
           <span style={{ color: "var(--accent)", fontFamily: "var(--font-mono)" }}>
             {formatSats(getValue() as number)}
           </span>
         ),
       },
+      {
+        id: "credited",
+        header: "Total credited",
+        accessorFn: (p) => p.total_credits_sats ?? 0,
+        cell: ({ getValue }) => (
+          <span style={{ fontFamily: "var(--font-mono)" }}>{formatSats(getValue() as number)}</span>
+        ),
+      },
+      {
+        id: "updated",
+        header: "Last updated",
+        accessorFn: (p) => p.updated_at ?? p.timestamp ?? p.created_at ?? 0,
+        cell: ({ getValue }) => formatTimeAgo(getValue() as number),
+      },
     ],
     [],
   );
 
-  // "Recent payouts" must honour the 7-day window even though the
+  // The reward-balance table honours the 7-day window even though the
   // `/rewards/node-history` endpoint currently returns the full node reward
   // ledger regardless of `time_filter`. Guard client-side: drop rows whose most-
-  // recent activity is older than 7 days (or have no usable timestamp), so a node
-  // last credited months ago no longer surfaces under "recent". (Backend TODO:
-  // make node-history respect time_filter, or point this at the payout-events
-  // endpoint rather than the per-node balance ledger.)
+  // recent update is older than 7 days (or have no usable timestamp), so a node
+  // last credited months ago no longer surfaces as recent activity. (Backend
+  // TODO: make node-history respect time_filter, and add a dedicated
+  // payout-events endpoint if a true per-event history is wanted.)
   const SEVEN_DAYS_SEC = 7 * 24 * 60 * 60;
   const nowSec = Date.now() / 1000;
   const payoutRows = (payouts ?? []).filter((p) => {
@@ -371,7 +390,7 @@ export default function NodePoolPage() {
         />
         <StatCard
           label="Accept Rate"
-          value={`${acceptRate.toFixed(1)}%`}
+          value={acceptRate === null ? "—" : `${acceptRate.toFixed(1)}%`}
           sublabel={`${accepted.toLocaleString()} accepted`}
           tooltip={TOOLTIPS.accept_rate}
           loading={statusLoading}
@@ -611,15 +630,18 @@ export default function NodePoolPage() {
         </Card>
       </SectionErrorBoundary>
 
-      {/* Recent payouts */}
-      <SectionErrorBoundary section="Recent Payouts">
+      {/* Node reward balances */}
+      <SectionErrorBoundary section="Node reward balances">
         <Card>
-          <CardHeader title="Recent Payouts" subtitle="Payments credited to this node (last 7 days)" />
+          <CardHeader
+            title="Node reward balances"
+            subtitle="Per-node reward-pool balances across the mesh, updated in the last 7 days"
+          />
           <DataTable
             columns={payoutColumns}
             data={payoutRows}
             pageSize={10}
-            emptyMessage="No payouts in the last 7 days"
+            emptyMessage="No reward-balance activity in the last 7 days"
           />
         </Card>
       </SectionErrorBoundary>

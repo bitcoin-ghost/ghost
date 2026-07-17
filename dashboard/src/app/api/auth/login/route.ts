@@ -15,12 +15,14 @@ import { BACKEND_URL, internalAuthHeaders } from "@/lib/internal-auth";
 // sufficient for a single-node, SSH-tunnel-only dashboard (one process, no
 // horizontal scaling). A successful login clears the client's counter.
 //
-// We key on the connection IP when the runtime exposes it. We do NOT key on
-// X-Forwarded-For: it is client-spoofable, so trusting it would let an
-// attacker rotate the header to dodge the limit. When no trustworthy IP is
-// available (the tunnel-only norm, where every request originates from
-// 127.0.0.1), all attempts share a single global bucket — which is exactly
-// the throttle we want for a single-operator dashboard.
+// We key on the REAL TCP peer address, which `server.js` stamps into the
+// trusted `x-ghost-peer-addr` header (deleting any client-supplied value first,
+// so it cannot be spoofed). Next does not expose `request.ip` under our custom
+// server, so without this every request would collapse into one global bucket —
+// letting any LAN client lock out the real operator with five wrong passwords.
+// We do NOT key on X-Forwarded-For: it is client-spoofable. When no peer
+// address is available, we fall back to a single global bucket, which still
+// throttles brute force (just coarsely) for the loopback/tunnel norm.
 // ---------------------------------------------------------------------------
 
 const MAX_ATTEMPTS = 5;
@@ -34,8 +36,11 @@ interface Bucket {
 const attempts = new Map<string, Bucket>();
 
 function clientKey(request: NextRequest): string {
-  // `ip` is populated by some Next.js runtimes/hosts; it is the connection
-  // address, not a client-supplied header, so it is safe to key on.
+  // The real socket peer address, stamped by server.js as a trusted header
+  // (client-supplied copies are stripped there). Falls back to `request.ip`
+  // for any runtime that does populate it, then to a global bucket.
+  const peer = request.headers.get("x-ghost-peer-addr");
+  if (peer && peer.length > 0) return peer;
   const ip = (request as unknown as { ip?: string }).ip;
   return ip && ip.length > 0 ? ip : "global";
 }

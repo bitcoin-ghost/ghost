@@ -1,8 +1,8 @@
 import { redirect } from "next/navigation";
 
-// Legacy duplicate of /system's Updates section. Sidebar still links here for
-// muscle memory; redirect server-side so any clicks land in one canonical
-// place. The route can be deleted once nothing links to /updates externally.
+// Legacy duplicate of /system's Updates section. Nothing in the dashboard links
+// here any more; this server-side redirect is kept only so old external
+// bookmarks to /updates still land on the canonical /system page.
 export default function Page() {
   redirect("/system");
 }

@@ -109,6 +109,10 @@ interface Vitals {
   height: number; // node's synced height (the big ticking number)
   target: number; // chain tip height (== height once synced)
   isSyncing: boolean;
+  // True only when we have positive evidence the node is fully synced (a real
+  // height, or an explicit is_synced=true). False while syncing OR when the node
+  // reports no height yet — so we never assert "Synced · 100%" on no data.
+  synced: boolean;
   syncPct: number;
   peers: number;
   miners: number;
@@ -274,19 +278,21 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
   const syncHeight = status?.sync_height ?? status?.block_height ?? 0;
   const isSyncing = status?.is_synced === false && syncHeight > 0 && blockHeight > 0;
 
+  // Only claim "synced" with positive evidence: a real height, or an explicit
+  // is_synced=true. A node that reports status but no height yet is "acquiring",
+  // not synced — otherwise the bar/label would assert "Synced · 100%" on no data.
+  const synced = !isSyncing && status?.is_synced !== false && (syncHeight > 0 || status?.is_synced === true);
+
   const v: Vitals = {
     height: syncHeight,
     target: blockHeight,
     isSyncing,
-    // When not actively syncing, a node reporting a height is treated as synced
-    // (100%) unless it explicitly reports is_synced=false. This keeps the bar in
-    // agreement with the "Synced · 100%" label and the eyebrow, which both read
-    // an omitted is_synced as synced (previously syncPct fell to 0 here).
+    synced,
     syncPct: isSyncing
       ? Math.min(100, (syncHeight / blockHeight) * 100)
-      : status?.is_synced === false
-        ? 0
-        : 100,
+      : synced
+        ? 100
+        : 0,
     peers: status?.peer_count ?? 0,
     miners: mining?.local_connected_miners ?? mining?.connected_miners ?? 0,
     // This node's own hashrate — the combined hashrate of miners connected to
@@ -662,7 +668,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
           }}
         />
         <span style={{ color: v.isSyncing ? 'var(--accent)' : 'var(--dim)' }}>
-          {!hasStatus ? 'Acquiring signal' : v.isSyncing ? 'Syncing' : 'Synced'}
+          {!hasStatus ? 'Acquiring signal' : v.isSyncing ? 'Syncing' : v.synced ? 'Synced' : 'Acquiring'}
         </span>
       </div>
 
@@ -968,7 +974,7 @@ export function NodeVitalsOverlay({ active }: OverlayProps) {
         >
           <span>Chain Sync</span>
           <span style={{ color: v.isSyncing ? 'var(--accent)' : 'var(--green)' }}>
-            {!hasStatus ? '—' : v.isSyncing ? `${v.syncPct.toFixed(1)}%` : 'Synced · 100%'}
+            {!hasStatus ? '—' : v.isSyncing ? `${v.syncPct.toFixed(1)}%` : v.synced ? 'Synced · 100%' : 'Acquiring…'}
           </span>
         </div>
         <div

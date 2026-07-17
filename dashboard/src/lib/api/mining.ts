@@ -84,25 +84,3 @@ export async function setPayoutAddress(address: string | null): Promise<MiningSt
   });
 }
 
-// Public mining node info (advertised via P2P)
-export interface PublicMiningNode {
-  node_id: string;
-  host: string;
-  sv1_port: number;
-  sv2_port: number;
-  region: string;
-  mempool_policy: string;
-  capacity: number;
-  last_seen: number;
-}
-
-export interface PublicMiningNodesResponse {
-  nodes: PublicMiningNode[];
-  total: number;
-  data_source: string;
-  status_message: string | null;
-}
-
-export async function getPublicMiningNodes(): Promise<PublicMiningNodesResponse> {
-  return fetchApi<PublicMiningNodesResponse>('/api/v1/mining/public-nodes');
-}

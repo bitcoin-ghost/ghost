@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { BACKEND_URL, signInternalRequest } from "@/lib/internal-auth";
 
+// Upper bound on how long a single proxied backend request may take. Without
+// it, a hung or slow backend holds the Next request (and its client socket)
+// open indefinitely — a connection-exhaustion vector when the dashboard is
+// LAN-exposed. Generous enough for any loopback admin op (backup export, etc.).
+const BACKEND_TIMEOUT_MS = 30_000;
+
+function isMutating(method: string): boolean {
+  return method !== "GET" && method !== "HEAD";
+}
+
 async function proxyRequest(request: NextRequest, params: Promise<{ path: string[] }>) {
   const { path } = await params;
   const backendPath = "/" + path.join("/");
@@ -17,17 +27,30 @@ async function proxyRequest(request: NextRequest, params: Promise<{ path: string
 
   let body: string | undefined;
 
-  if (request.method !== "GET" && request.method !== "HEAD") {
+  if (isMutating(request.method)) {
     body = await request.text();
 
-    // Sign mutating requests with HMAC if key is configured
+    // Sign mutating requests with HMAC. The backend's internal router requires
+    // this signature for every mutation (and fails closed without it), so a
+    // mutation we cannot sign would be rejected downstream anyway — refuse it
+    // here, fail-closed, rather than forward an unauthenticated write and
+    // surface a confusing backend 401 to the operator.
     const { signature, timestamp } = signInternalRequest(body);
-    if (signature) {
-      headers["X-Ghost-Signature"] = signature;
-      headers["X-Ghost-Timestamp"] = timestamp;
+    if (!signature) {
+      return NextResponse.json(
+        {
+          error:
+            "Dashboard is not configured to authenticate node writes (INTERNAL_AUTH_KEY unset). Mutation refused.",
+        },
+        { status: 503 },
+      );
     }
+    headers["X-Ghost-Signature"] = signature;
+    headers["X-Ghost-Timestamp"] = timestamp;
   } else {
-    // Sign GET requests to internal endpoints too (empty body)
+    // Sign GET requests to internal endpoints too (empty body). Reads are not
+    // gated on the signature (they hit public/loopback-exempt routes), so a
+    // missing key only downgrades the rate-limit tier — GETs still pass.
     const { signature, timestamp } = signInternalRequest("");
     if (signature) {
       headers["X-Ghost-Signature"] = signature;
@@ -35,11 +58,14 @@ async function proxyRequest(request: NextRequest, params: Promise<{ path: string
     }
   }
 
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), BACKEND_TIMEOUT_MS);
   try {
     const response = await fetch(url.toString(), {
       method: request.method,
       headers,
       body,
+      signal: abort.signal,
     });
 
     const contentType = response.headers.get("Content-Type") || "application/json";
@@ -70,10 +96,18 @@ async function proxyRequest(request: NextRequest, params: Promise<{ path: string
       },
     });
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return NextResponse.json(
+        { error: "Backend timed out" },
+        { status: 504 },
+      );
+    }
     return NextResponse.json(
       { error: `Backend unavailable: ${error instanceof Error ? error.message : "unknown"}` },
       { status: 502 },
     );
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

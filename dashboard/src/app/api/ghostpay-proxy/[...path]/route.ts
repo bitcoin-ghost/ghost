@@ -6,6 +6,10 @@ if (!GHOST_PAY_URL) {
   console.error("GHOST_PAY_URL environment variable is required");
 }
 
+// Bound every ghost-pay backend request so a hung backend can't hold the Next
+// request open indefinitely (see the main proxy for the rationale).
+const BACKEND_TIMEOUT_MS = 30_000;
+
 function signRequest(body: string): { signature: string; timestamp: string } {
   const key = process.env.INTERNAL_AUTH_KEY;
   if (!key) {
@@ -45,12 +49,21 @@ async function proxyRequest(request: NextRequest, params: Promise<{ path: string
   if (request.method !== "GET" && request.method !== "HEAD") {
     body = await request.text();
 
-    // Sign mutating requests with HMAC if key is configured
+    // Sign mutating requests with HMAC. Fail closed if we cannot: a ghost-pay
+    // mutation the backend can't authenticate would be rejected anyway, so
+    // refuse it here rather than forward an unauthenticated write.
     const { signature, timestamp } = signRequest(body);
-    if (signature) {
-      headers["X-Ghost-Signature"] = signature;
-      headers["X-Ghost-Timestamp"] = timestamp;
+    if (!signature) {
+      return NextResponse.json(
+        {
+          error:
+            "Dashboard is not configured to authenticate ghost-pay writes (INTERNAL_AUTH_KEY unset). Mutation refused.",
+        },
+        { status: 503 },
+      );
     }
+    headers["X-Ghost-Signature"] = signature;
+    headers["X-Ghost-Timestamp"] = timestamp;
   } else {
     // Sign GET requests to internal endpoints too (empty body)
     const { signature, timestamp } = signRequest("");
@@ -60,11 +73,14 @@ async function proxyRequest(request: NextRequest, params: Promise<{ path: string
     }
   }
 
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), BACKEND_TIMEOUT_MS);
   try {
     const response = await fetch(url.toString(), {
       method: request.method,
       headers,
       body,
+      signal: abort.signal,
     });
 
     const responseData = await response.text();
@@ -76,10 +92,15 @@ async function proxyRequest(request: NextRequest, params: Promise<{ path: string
       },
     });
   } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return NextResponse.json({ error: "Backend timed out" }, { status: 504 });
+    }
     return NextResponse.json(
       { error: `Backend unavailable: ${error instanceof Error ? error.message : "unknown"}` },
       { status: 502 },
     );
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

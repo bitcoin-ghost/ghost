@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMiningStatus, getMiningTemplate, getMiners, getBestHash, getPublicMiningNodes, setPrivateMining, setPublicMining, setPayoutAddress, getPoolSeries, getPoolMeshLeaderboard } from '@/lib/api/mining';
+import { getMiningStatus, getMiningTemplate, getMiners, getBestHash, setPrivateMining, setPublicMining, setPayoutAddress, getPoolSeries, getPoolMeshLeaderboard } from '@/lib/api/mining';
 
 export const miningKeys = {
   all: ['mining'] as const,
@@ -97,13 +97,5 @@ export function useSetPayoutAddress() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: miningKeys.status() });
     },
-  });
-}
-
-export function usePublicMiningNodes(options?: { refetchInterval?: number }) {
-  return useQuery({
-    queryKey: miningKeys.publicNodes(),
-    queryFn: getPublicMiningNodes,
-    refetchInterval: options?.refetchInterval ?? 30_000, // Poll every 30 seconds
   });
 }
