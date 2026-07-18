@@ -203,7 +203,7 @@
       <h1>Prove the whole chain is valid. Verify <span class="a">one small proof.</span></h1>
       <p class="hz-lead" style="margin-top:22px">Hazync runs Bitcoin Core's own <strong>unmodified consensus code</strong> inside a zero-knowledge VM — script by script, signature by signature — and folds it into a single succinct proof. Not a reimplementation. The exact code the network already trusts.</p>
       <div class="hz-actions">
-        <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.1.0">Get the release <span class="arrow">→</span></a>
+        <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.3.0">Get the release <span class="arrow">→</span></a>
         <a class="btn btn-ghost" href="#run">Run it <span class="arrow">→</span></a>
       </div>
       <p class="hz-live" id="hz-live" hidden><span class="d"></span><span class="lbl">Live</span> <span id="hz-live-text"></span> · <a href="/hazync-party.html">Proof Party →</a></p>
@@ -349,9 +349,9 @@
 
   <!-- AUDIT -->
   <section class="hz-sec" id="audit"><div class="container">
-    <p class="hz-eyebrow">Self-audited, adversarially</p>
+    <p class="hz-eyebrow">Self-audited, adversarially, seven rounds</p>
     <h2 class="hz-h2">Every finding fixed, validated, and negative-tested.</h2>
-    <p class="hz-lead">A witness-commitment bypass, an under-constrained accumulator delete, the BIP68 time value, and two from a pass over Core's block-validation surface — <strong>time-too-old</strong> and the merkle mutation. Each rejects the malicious case, not just passes the honest one.</p>
+    <p class="hz-lead">Seven rounds of hostile self-review, each one attacking the fixes from the round before, until a round turned up nothing. The serious ones assumed a prover who can mine: downgrading a block's height to switch every soft-fork off and mint a 50 BTC subsidy, and inflating the fee on a multi-input transaction toward 21M BTC. Both are closed, alongside the segmented-proof binding, the recursion image-id, and the coordinator's cross-range seam. Every fix ships with a negative test that rejects the bad case, and a replayable suite runs them all. The full list, round by round, is in SECURITY.md.</p>
     <div class="hz-mal" aria-label="Merkle mutation negative test">
       <div class="r"><span class="l">honest [A,B,C]</span><span class="hsh">cacd895c…a0f3f5e6</span><span class="hz-verdict">merkle_ok</span></div>
       <div class="r"><span class="l">malleated [A,B,C,C]</span><span class="hsh">cacd895c…a0f3f5e6</span><span class="hz-verdict no">REJECTED · mutated</span></div>
@@ -377,7 +377,7 @@
 <span class="c"># 3 · or fold the chain from genesis (real recursion)</span>
 <span class="p">$</span> HAZYNC_WITNESS_DIR=/w HAZYNC_TO=170 HAZYNC_TIP=3 ./target/release/host prove-ibd</pre>
     </div>
-    <p class="hz-lead" style="font-size:14.5px;margin-top:16px">No GPU? <strong>Verifying</strong> a finished proof is cheap and needs none — that's the whole point. Full steps are in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository README</a>, and the tagged build is the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.1.0">v0.1.0 research preview</a>.</p>
+    <p class="hz-lead" style="font-size:14.5px;margin-top:16px">No GPU? <strong>Verifying</strong> a finished proof is cheap and needs none — that's the whole point. Full steps are in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository README</a>, and the tagged build is the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.3.0">v0.3.0 release</a>.</p>
   </div></section>
 
   <!-- CONTRIBUTE -->
@@ -411,7 +411,7 @@
       <h4>Hazync</h4>
       <ul>
         <li><a href="https://github.com/bitcoin-ghost/hazync">GitHub</a></li>
-        <li><a href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.1.0">v0.1.0 release</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.3.0">v0.3.0 release</a></li>
         <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SOUNDNESS.md">Soundness</a></li>
         <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SECURITY.md">Security</a></li>
       </ul>
