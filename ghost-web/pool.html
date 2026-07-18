@@ -1334,14 +1334,38 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 const frame = document.getElementById('quasar-frame');
 const canvas = document.getElementById('quasar-canvas');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+// The Quasar needs a WebGL context. If the browser can't create one — hardware
+// acceleration disabled, GPU blocklisted, or a headless/sandboxed context — the
+// WebGLRenderer constructor throws. Catch it and show a helpful message in the
+// frame instead of a blank void (and never let it break the rest of the page).
+let renderer = null;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+} catch (err) {
+  console.warn('Quasar disabled — WebGL unavailable:', err && err.message);
+  canvas.style.display = 'none';
+  const msg = document.createElement('div');
+  msg.className = 'quasar-nowebgl';
+  msg.style.cssText =
+    'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;' +
+    'justify-content:center;text-align:center;gap:10px;padding:32px;color:var(--fainter,#9aa4b2);' +
+    'font-size:14px;line-height:1.5;';
+  msg.innerHTML =
+    '<strong style="color:var(--fg,#e6e9ee);font-size:15px;">3D visualisation unavailable</strong>' +
+    '<span>The Quasar needs WebGL, which your browser has disabled. Turn on ' +
+    '<em>hardware / graphics acceleration</em> in your browser settings and reload — ' +
+    'or use the <strong>Hashrate</strong> and <strong>Miners</strong> tabs, which work without it.</span>';
+  frame.appendChild(msg);
+}
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
 camera.position.set(14, 8, 18);
 
 function sizeRenderer() {
+  if (!renderer) return;
   const r = frame.getBoundingClientRect();
   if (r.width <= 0 || r.height <= 0) return;
   renderer.setSize(r.width, r.height, false);
@@ -1521,14 +1545,18 @@ async function pollShares(vm) {
   } catch (e) { /* transient — next poll will catch up */ }
 }
 function pollAll() { POOL_VMS.forEach(pollShares); }
-// Defer first quasar poll by ~2s so the page-load burst (stats, records,
-// leaderboard, payout) drains first. The quasar can sit empty for a
-// couple of seconds without anyone noticing; the stats tiles can't.
-setTimeout(pollAll, 2000);
-// 6s cadence × 4 VMs = 40 req/min for the share stream. Enough to make
-// the quasar feel live without dominating the rate-limit burst budget
-// alongside the other pool-page polls.
-setInterval(pollAll, 6000);
+// Only drive the share stream when the Quasar can actually render it — no point
+// polling (40 req/min) into a scene that isn't there when WebGL is unavailable.
+if (renderer) {
+  // Defer first quasar poll by ~2s so the page-load burst (stats, records,
+  // leaderboard, payout) drains first. The quasar can sit empty for a
+  // couple of seconds without anyone noticing; the stats tiles can't.
+  setTimeout(pollAll, 2000);
+  // 6s cadence × 4 VMs = 40 req/min for the share stream. Enough to make
+  // the quasar feel live without dominating the rate-limit burst budget
+  // alongside the other pool-page polls.
+  setInterval(pollAll, 6000);
+}
 
 // Personal-best bar for each miner this round. A share only becomes a
 // quasar particle when it beats the miner's previous best — cuts the
@@ -1680,6 +1708,7 @@ const qHud = {
 };
 
 function animate() {
+  if (!renderer) return; // no WebGL context — fallback message is shown instead
   const dt = Math.min(clock.getDelta(), 0.05);
   tickEmitter(dt);
   tickRound(dt);
