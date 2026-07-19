@@ -351,6 +351,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/rewards/node-payout-events",
             get(api_rewards_node_payout_events_handler),
         )
+        .route(
+            "/api/v1/payout/checkpoint",
+            get(api_payout_checkpoint_handler),
+        )
         // Config endpoints (GET only - reading is public, POST requires auth via internal router)
         // CRIT-6: POST handlers moved to internal_router to require authentication
         .route("/api/v1/config/full", get(api_config_full_handler))
@@ -5603,6 +5607,40 @@ async fn api_rewards_node_payout_events_handler(
         "events": events,
         "total": total
     }))
+}
+
+/// Read-only pre-gate proof for payout-ledger finalisation.
+///
+/// Each node reports its OWN latest BFT-finalised `PayoutLedgerCheckpoint`. The
+/// coinbase gate (`fee_to_node_pool_height`) is off until we can watch the fleet
+/// finalise identically: an operator polls this endpoint on every node and checks
+/// they agree on `(height, ledger_root)`. Agreement across the fleet is exactly the
+/// property the gate depends on, so this endpoint is how we earn confidence to flip
+/// it. It exposes nothing that isn't already public (the checkpoint is gossiped).
+async fn api_payout_checkpoint_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let checkpoint = state
+        .database
+        .as_ref()
+        .and_then(|db| db.get_latest_payout_ledger_checkpoint().ok().flatten());
+
+    match checkpoint {
+        Some(cp) => Json(serde_json::json!({
+            "finalising": true,
+            "checkpoint": {
+                "height": cp.height,
+                "cutoff_ts": cp.cutoff_ts,
+                "ledger_root": hex::encode(cp.ledger_root),
+                "proposer_id": cp.proposer_id,
+                "active_node_count": cp.active_node_count,
+            }
+        })),
+        None => Json(serde_json::json!({
+            "finalising": false,
+            "checkpoint": serde_json::Value::Null,
+        })),
+    }
 }
 
 // ============================================================================
