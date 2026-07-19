@@ -54,10 +54,6 @@ pub type BroadcastFn = Arc<dyn Fn(MessageType, Vec<u8>) -> GhostResult<()> + Sen
 /// `main.rs`, which holds the DB + qualification engine.
 pub type ComputeRootFn = Arc<dyn Fn(i64, u64) -> Option<[u8; 32]> + Send + Sync>;
 
-/// `height -> Some(block timestamp)`: the deterministic, chain-committed cutoff
-/// anchor. `None` if the anchor block isn't known locally yet.
-pub type BlockTimeFn = Arc<dyn Fn(u64) -> Option<i64> + Send + Sync>;
-
 struct PendingEntry {
     /// The proposal content (needed to persist on finalise). `None` if a vote
     /// arrived before the proposal (race) — we still tally the approver.
@@ -92,7 +88,6 @@ pub struct PayoutCheckpointManager {
     db: Arc<Database>,
     send: BroadcastFn,
     compute_root: ComputeRootFn,
-    block_time_at: BlockTimeFn,
     /// height -> in-flight vote tallies.
     pending: RwLock<HashMap<u64, Pending>>,
 }
@@ -110,14 +105,12 @@ impl PayoutCheckpointManager {
         db: Arc<Database>,
         send: BroadcastFn,
         compute_root: ComputeRootFn,
-        block_time_at: BlockTimeFn,
     ) -> Self {
         Self {
             identity,
             db,
             send,
             compute_root,
-            block_time_at,
             pending: RwLock::new(HashMap::new()),
         }
     }
@@ -182,15 +175,11 @@ impl PayoutCheckpointManager {
 
     /// Called on a cadence from `main.rs` with the target lagging checkpoint
     /// height. No-op unless this node is the deterministic proposer for it.
-    pub async fn maybe_propose(&self, height: u64) {
+    pub async fn maybe_propose(&self, height: u64, cutoff_ts: i64) {
         let me = self.identity.node_id();
         if self.proposer_for(height) != Some(me) || self.already_finalized(height) {
             return;
         }
-        let Some(cutoff_ts) = (self.block_time_at)(height) else {
-            debug!(height, "payout checkpoint: anchor block time unknown yet");
-            return;
-        };
         let Some(ledger_root) = (self.compute_root)(cutoff_ts, height) else {
             // C-7: cannot compute from our own view — do not propose an
             // unreproducible root; wait for convergence.
@@ -448,13 +437,11 @@ mod tests {
             });
             let root = roots[pos];
             let compute_root: ComputeRootFn = Arc::new(move |_c, _h| root);
-            let block_time_at: BlockTimeFn = Arc::new(|_h| Some(1_784_000_000));
             let mgr = PayoutCheckpointManager::new(
                 identity.clone(),
                 Arc::clone(&db),
                 send,
                 compute_root,
-                block_time_at,
             );
             nodes.push(Node {
                 id: identity.node_id(),
@@ -496,6 +483,7 @@ mod tests {
     }
 
     const H: u64 = 100; // 100 % 4 == 0 → proposer is sorted-elder[0] = nodes[0]
+    const CUTOFF: i64 = 1_784_000_000;
 
     #[tokio::test]
     async fn convergent_fleet_finalises_identical_checkpoint() {
@@ -513,7 +501,7 @@ mod tests {
         );
         assert_eq!(nodes[0].mgr.quorum_needed(), 3, "67% of 4 = 3");
         for n in &nodes {
-            n.mgr.maybe_propose(H).await; // only the proposer acts
+            n.mgr.maybe_propose(H, CUTOFF).await; // only the proposer acts
         }
         gossip_until_quiet(&nodes).await;
         for n in &nodes {
@@ -534,7 +522,7 @@ mod tests {
         let b = [2u8; 32];
         let nodes = build(4, &[Some(a), Some(a), Some(b), Some(b)]);
         for n in &nodes {
-            n.mgr.maybe_propose(H).await;
+            n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
         // 2 approvals < ceil(67% of 4)=3 → NOTHING finalises anywhere (safe).
@@ -549,7 +537,7 @@ mod tests {
         let a = [3u8; 32];
         let nodes = build(4, &[Some(a), Some(a), Some(a), None]);
         for n in &nodes {
-            n.mgr.maybe_propose(H).await;
+            n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
         // 3 approvals >= 3 → all finalise A, including the abstainer via vote tally.

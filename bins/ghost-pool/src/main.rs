@@ -3261,6 +3261,95 @@ async fn main() -> Result<()> {
     mesh.register_handler(Arc::clone(&verification_result_handler)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
+    // ── Payout-ledger checkpoint finalisation (payout-finalisation P1) ──
+    // The fleet BFT-finalises a {height, cutoff_ts, ledger_root} snapshot at a
+    // lagging height; the coinbase becomes a pure function of it (see
+    // tasks/design_payout_finalization.md). Runs DARK here — nothing consumes the
+    // finalised checkpoint yet; the coinbase wiring lands behind an activation gate.
+    let (plchk_tx, mut plchk_rx) =
+        tokio::sync::mpsc::channel::<(ghost_consensus::MessageType, Vec<u8>)>(256);
+    {
+        let mesh_c = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            while let Some((ty, bytes)) = plchk_rx.recv().await {
+                match mesh_c.create_envelope_raw(ty, bytes) {
+                    Ok(env) => {
+                        if let Err(e) = mesh_c.broadcast(env).await {
+                            tracing::debug!(error = %e, "payout-checkpoint broadcast failed");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "payout-checkpoint envelope failed"),
+                }
+            }
+        });
+    }
+    let plchk_send: ghost_pool::payout_checkpoint::BroadcastFn = {
+        let tx = plchk_tx.clone();
+        Arc::new(move |ty, bytes| {
+            tx.try_send((ty, bytes)).map_err(|e| {
+                ghost_common::error::GhostError::P2PMessage(format!("payout-checkpoint channel: {e}"))
+            })
+        })
+    };
+    // compute_root: the canonical ledger root from THIS node's converged view at a
+    // fixed cutoff — miner set (unpaid ledger) + qualified-node set. Deterministic
+    // subsidy via calculate_block_subsidy(height, None) so every node matches.
+    let compute_ledger_root_fn: ghost_pool::payout_checkpoint::ComputeRootFn = {
+        let db_c = Arc::clone(&db);
+        Arc::new(move |cutoff_ts, height| {
+            let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
+            let miners =
+                ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
+                    .ok()?;
+            let node_ids = db_c.get_all_node_ids_with_payout().ok()?;
+            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
+            let nodes = qp.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff_ts);
+            Some(ghost_pool::payout::compute_ledger_root(
+                &miners, &nodes, cutoff_ts, height,
+            ))
+        })
+    };
+    let payout_checkpoint_mgr =
+        Arc::new(ghost_pool::payout_checkpoint::PayoutCheckpointManager::new(
+            Arc::clone(&identity),
+            Arc::clone(&db),
+            plchk_send,
+            compute_ledger_root_fn,
+        ));
+    mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
+        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+    // Propose cadence: every ~30s the deterministic proposer for (tip - LAG)
+    // proposes that checkpoint. LAG keeps the anchor far enough behind the tip that
+    // the share/qualification ledgers have converged there (else validators reject).
+    {
+        let mgr = Arc::clone(&payout_checkpoint_mgr);
+        let rpc_c = Arc::clone(&rpc);
+        tokio::spawn(async move {
+            const LAG: u64 = 6;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let tip = match rpc_c.get_block_count().await {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                if tip <= LAG {
+                    continue;
+                }
+                let height = tip - LAG;
+                let cutoff_ts = match rpc_c.get_block_hash(height).await {
+                    Ok(hash) => match rpc_c.get_block_header(&hash).await {
+                        Ok(hdr) => hdr.time as i64,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+                mgr.maybe_propose(height, cutoff_ts).await;
+            }
+        });
+    }
+
     // Component A sweep: rotate through bounded windows of the verification
     // ledger, advertising the keys we hold so peers backfill what we lack. Mirrors
     // the GHOST-03 ledger sweep. One 1-hour bucket per tick keeps each request a
