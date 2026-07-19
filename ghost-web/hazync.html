@@ -383,22 +383,19 @@
   <!-- RUN IT -->
   <section class="hz-sec" id="run"><div class="container">
     <p class="hz-eyebrow">Run it</p>
-    <h2 class="hz-h2">Prove a block yourself, in about 25 minutes.</h2>
-    <p class="hz-lead">Open source and reproducible. You need a Linux box with an NVIDIA GPU; the provisioner handles the rest, RISC0, CUDA 12.6, and Bitcoin Core v28 from source.</p>
+    <h2 class="hz-h2">Check a proof yourself, no build, no GPU.</h2>
+    <p class="hz-lead">Every proof on the board is public and reproducible. Grab the prebuilt verifier, it's the canonical guest, the same code that made the proofs, download any proven block, and check it against real Bitcoin Core consensus. Any Linux x86-64 box, no GPU, no toolchain.</p>
     <div class="hz-term">
-      <div class="h"><span class="dot"></span> bash · github.com/bitcoin-ghost/hazync</div>
-<pre><span class="c"># 1 · provision, RISC0 toolchain + CUDA 12.6 + Bitcoin Core v28 + build</span>
-<span class="p">$</span> git clone https://github.com/bitcoin-ghost/hazync &amp;&amp; cd hazync
-<span class="p">$</span> GPU=1 REPO_DIR=$PWD ./provision-vps.sh
+      <div class="h"><span class="dot"></span> bash · verify a proof</div>
+<pre><span class="c"># 1 · get the prebuilt verifier (no build)</span>
+<span class="p">$</span> curl -L -o host https://github.com/bitcoin-ghost/hazync/releases/latest/download/hazync-host-v0.4.0-x86_64-linux-gnu
+<span class="p">$</span> chmod +x host
 
-<span class="c"># 2 · prove a real mainnet block  →  a verified STARK receipt</span>
-<span class="p">$</span> cd prover
-<span class="p">$</span> HAZYNC_BLOCK=block_100000.json ./target/release/host prove-full
-
-<span class="c"># 3 · or fold the chain from genesis (real recursion)</span>
-<span class="p">$</span> HAZYNC_WITNESS_DIR=/w HAZYNC_TO=170 HAZYNC_TIP=3 ./target/release/host prove-ibd</pre>
+<span class="c"># 2 · download a proof by block number and verify it</span>
+<span class="p">$</span> curl https://bitcoinghost.org/hazync/api/proof/1 -o proof.bin
+<span class="p">$</span> ./host verify-any proof.bin        <span class="c"># → RANGE-OK</span></pre>
     </div>
-    <p class="hz-lead" style="font-size:14.5px;margin-top:16px">No GPU? Verifying a finished proof is cheap and needs none, that's the whole point. Full steps are in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">contributor guide</a>, and the tagged build is the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.4.0">v0.4.0 release</a>.</p>
+    <p class="hz-lead" style="font-size:14.5px;margin-top:16px"><strong>Want to prove blocks?</strong> Grab the CUDA prover binary (NVIDIA GPU + CUDA 12.6) and join the <a class="hz-inline-a" href="/hazync-party.html">Proof Party</a>; full steps in <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">CONTRIBUTING</a>. Building from source or reproducing the image id is in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository</a>; the tagged release is <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.4.0">v0.4.0</a>.</p>
   </div></section>
 
   <!-- WHO ELSE CAN USE IT -->
