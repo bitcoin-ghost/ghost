@@ -3301,9 +3301,8 @@ async fn main() -> Result<()> {
             let miners =
                 ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
                     .ok()?;
-            let node_ids = db_c.get_all_node_ids_with_payout().ok()?;
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
-            let nodes = qp.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff_ts);
+            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts);
             Some(ghost_pool::payout::compute_ledger_root(
                 &miners, &nodes, cutoff_ts, height,
             ))

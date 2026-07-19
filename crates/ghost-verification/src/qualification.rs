@@ -813,6 +813,28 @@ impl QualifiedCapabilityProvider {
         qualified
     }
 
+    /// DB-sourced form of [`Self::get_all_qualified_nodes_at_cutoff`]: sources the
+    /// candidate node set from the payout table itself (identical to what
+    /// [`Self::get_all_qualified_nodes`] uses), so callers need only supply the
+    /// cutoff. This is the SINGLE method both the checkpoint's `ledger_root` and the
+    /// coinbase's node split call, guaranteeing the coinbase pays exactly the
+    /// qualified-node set the fleet ratified — recompute a different set anywhere and
+    /// the root mismatches. An empty result on a DB error is fail-safe (no node
+    /// payout rather than a wrong one).
+    pub fn get_all_qualified_nodes_at_cutoff_from_db(&self, cutoff_ts: i64) -> Vec<(NodeId, i32)> {
+        let node_ids = match self.db.get_all_node_ids_with_payout() {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "qualified-nodes-at-cutoff: node-id query failed; empty node split this block"
+                );
+                return Vec::new();
+            }
+        };
+        self.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff_ts)
+    }
+
     /// Deterministic per-node capability set from the converged ledger over
     /// `[since, until]`. Mirrors `get_qualified_capabilities_with_rates` plus the
     /// C-2 unique-challenger filter, but ledger-based and cutoff-anchored.

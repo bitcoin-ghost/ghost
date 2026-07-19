@@ -1766,9 +1766,21 @@ impl PayoutHandler {
         // H-MINE-1: Provider is now required at construction time, no Option check needed
         // This guarantees node rewards are always based on verified capabilities
 
-        // Get all nodes with verified capabilities from the database
-        // This ensures all verified nodes get payouts, not just ones that received shares directly
-        let qualified_shares = self.qualification_provider.get_all_qualified_nodes();
+        // Get all nodes with verified capabilities from the database.
+        //
+        // The node split flips at the SAME gate as the miner cutoff. Below the gate:
+        // the legacy now()-based path (node split is not consensus-enforced pre-
+        // Component-E, so a divergent set costs nothing). At and above the gate: the
+        // deterministic, cutoff-anchored, converged-ledger qualification evaluated at
+        // `data.ledger_cutoff_ts` (the finalised checkpoint cutoff) — byte-for-byte the
+        // SAME set the checkpoint's ledger_root committed to, so the coinbase pays
+        // exactly what the fleet ratified and Component-E recompute-reject can only pass.
+        let qualified_shares = if data.block_height >= crate::fee_to_node_pool_height() {
+            self.qualification_provider
+                .get_all_qualified_nodes_at_cutoff_from_db(data.ledger_cutoff_ts)
+        } else {
+            self.qualification_provider.get_all_qualified_nodes()
+        };
 
         let claimed_count = data.node_shares.len();
         let verified_count = qualified_shares.len();
