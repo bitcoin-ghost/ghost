@@ -133,7 +133,11 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// new binary; every node switches at the same block.
 ///
 /// SET THIS BEFORE DEPLOY — comfortably past the roll window (~144 blocks/day).
-pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
+/// v1.10.32: activated at 958_760 (tip-change coinbase ratification — every block carries the
+/// top-200 miner split (GHOST-02-enforced) + top-100 node reward pool + treasury). Node-split
+/// enforcement (Component E) stays deferred to the mesh-hardening v1 release; until then the
+/// node-pool distribution is proposer-trusted within conservation + treasury-floor guardrails.
+pub const FEE_TO_NODE_POOL_HEIGHT: u64 = 958_760;
 
 /// Activation heights, resolved once at startup.
 ///
