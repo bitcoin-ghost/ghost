@@ -34,13 +34,19 @@ use ghost_common::error::GhostResult;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::types::NodeId;
 use ghost_consensus::{
-    MeshNetwork, MessageEnvelope, MessageHandler, MessageType, PayoutLedgerCheckpointMessage,
+    MessageEnvelope, MessageHandler, MessageType, PayoutLedgerCheckpointMessage,
     PayoutLedgerCheckpointVoteMessage,
 };
 use ghost_storage::{Database, PayoutLedgerCheckpointRecord};
 
 /// BFT approval threshold (percent of the active/elder set).
 const BFT_THRESHOLD_PERCENT: u64 = 67;
+
+/// Enqueues an outbound broadcast `(msg_type, json_payload)`. Injected so the
+/// manager doesn't depend on the mesh directly: `main.rs` wires a closure that
+/// pushes to the broadcast task (as `ConvergenceHandler` does), and tests wire a
+/// closure that captures messages for in-process routing under induced lag.
+pub type BroadcastFn = Arc<dyn Fn(MessageType, Vec<u8>) -> GhostResult<()> + Send + Sync>;
 
 /// `(cutoff_ts, height) -> Some(ledger_root)` if this node can compute the
 /// canonical root from its converged view, or `None` if it lacks the data
@@ -84,7 +90,7 @@ impl Pending {
 pub struct PayoutCheckpointManager {
     identity: Arc<NodeIdentity>,
     db: Arc<Database>,
-    mesh: Arc<MeshNetwork>,
+    send: BroadcastFn,
     compute_root: ComputeRootFn,
     block_time_at: BlockTimeFn,
     /// height -> in-flight vote tallies.
@@ -102,17 +108,29 @@ impl PayoutCheckpointManager {
     pub fn new(
         identity: Arc<NodeIdentity>,
         db: Arc<Database>,
-        mesh: Arc<MeshNetwork>,
+        send: BroadcastFn,
         compute_root: ComputeRootFn,
         block_time_at: BlockTimeFn,
     ) -> Self {
         Self {
             identity,
             db,
-            mesh,
+            send,
             compute_root,
             block_time_at,
             pending: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Serialise + enqueue an outbound broadcast (fire-and-forget).
+    fn broadcast<T: serde::Serialize>(&self, ty: MessageType, msg: &T) {
+        match serde_json::to_vec(msg) {
+            Ok(bytes) => {
+                if let Err(e) = (self.send)(ty, bytes) {
+                    warn!(error = %e, "payout checkpoint: enqueue broadcast failed");
+                }
+            }
+            Err(e) => error!(error = %e, "payout checkpoint: serialise failed"),
         }
     }
 
@@ -209,14 +227,8 @@ impl PayoutCheckpointManager {
             root = %hex::encode(&ledger_root[..8]),
             "payout checkpoint: proposing"
         );
-        if let Err(e) = self
-            .mesh
-            .broadcast_message(MessageType::PayoutLedgerCheckpoint, &msg)
-            .await
-        {
-            warn!(height, error = %e, "payout checkpoint: proposal broadcast failed");
-        }
-        self.cast_vote(height, hash, true).await;
+        self.broadcast(MessageType::PayoutLedgerCheckpoint, &msg);
+        self.cast_vote(height, hash, true);
         self.maybe_finalize(height, hash);
     }
 
@@ -269,7 +281,7 @@ impl PayoutCheckpointManager {
                 "payout checkpoint: local root mismatch — voting reject"
             );
         }
-        self.cast_vote(msg.height, hash, approve).await;
+        self.cast_vote(msg.height, hash, approve);
         if approve {
             self.maybe_finalize(msg.height, hash);
         }
@@ -305,7 +317,7 @@ impl PayoutCheckpointManager {
         Ok(())
     }
 
-    async fn cast_vote(&self, height: u64, checkpoint_hash: [u8; 32], approve: bool) {
+    fn cast_vote(&self, height: u64, checkpoint_hash: [u8; 32], approve: bool) {
         let mut vote = PayoutLedgerCheckpointVoteMessage {
             height,
             checkpoint_hash,
@@ -315,13 +327,7 @@ impl PayoutCheckpointManager {
             timestamp: now_ms(),
         };
         vote.signature = self.identity.sign(&vote.signing_message());
-        if let Err(e) = self
-            .mesh
-            .broadcast_message(MessageType::PayoutLedgerCheckpointVote, &vote)
-            .await
-        {
-            warn!(height, error = %e, "payout checkpoint: vote broadcast failed");
-        }
+        self.broadcast(MessageType::PayoutLedgerCheckpointVote, &vote);
     }
 
     /// Persist the checkpoint once ≥67% of elders have approved a hash for which
@@ -379,6 +385,215 @@ impl MessageHandler for PayoutCheckpointManager {
             MessageType::PayoutLedgerCheckpoint => self.on_proposal(&envelope).await,
             MessageType::PayoutLedgerCheckpointVote => self.on_vote(&envelope).await,
             _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! In-process N-node cluster tests with INDUCED per-node ledger divergence —
+    //! the property that only a converged input finalises, and a divergent/lagged
+    //! or malicious view can never force a bad checkpoint. This is exactly the
+    //! gap that shipped v1.10.32 broken (regtest had no gossip lag → false green).
+    use super::*;
+    use ghost_storage::MpcContributionRecord;
+    use std::sync::Mutex;
+
+    type Outbox = Arc<Mutex<Vec<(MessageType, Vec<u8>)>>>;
+
+    struct Node {
+        id: NodeId,
+        db: Arc<Database>,
+        mgr: PayoutCheckpointManager,
+        outbox: Outbox,
+    }
+
+    fn register_elders(db: &Database, elders: &[NodeId]) {
+        for (i, e) in elders.iter().enumerate() {
+            db.save_mpc_contribution(&MpcContributionRecord {
+                elder_position: (i as u32) + 1,
+                contributor_node_id: hex::encode(e),
+                prev_params_hash: [0u8; 32],
+                new_params_hash: [0u8; 32],
+                contribution_proof: Vec::new(),
+                epoch: 0,
+                created_at: 0,
+            })
+            .expect("save elder");
+        }
+    }
+
+    /// Build `n` nodes whose elder set is all `n` ids (sorted by node_id). The
+    /// node at SORTED position `i` computes `roots[i]` from its own view
+    /// (`None` = "can't compute yet" → C-7 abstain). Building in sorted order
+    /// means `nodes[i].id == elders_sorted[i]`, so the proposer for height `H` is
+    /// `nodes[H % n]` — deterministic and controllable.
+    fn build(n: usize, roots: &[Option<[u8; 32]>]) -> Vec<Node> {
+        assert_eq!(n, roots.len());
+        let ids: Vec<Arc<NodeIdentity>> =
+            (0..n).map(|_| Arc::new(NodeIdentity::generate())).collect();
+        let mut elders: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        elders.sort_unstable();
+
+        let mut nodes = Vec::new();
+        for (pos, &want) in elders.iter().enumerate() {
+            let identity = ids.iter().find(|i| i.node_id() == want).unwrap().clone();
+            let db = Arc::new(Database::in_memory().expect("db"));
+            register_elders(&db, &elders);
+            let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+            let ob = Arc::clone(&outbox);
+            let send: BroadcastFn = Arc::new(move |ty, bytes| {
+                ob.lock().unwrap().push((ty, bytes));
+                Ok(())
+            });
+            let root = roots[pos];
+            let compute_root: ComputeRootFn = Arc::new(move |_c, _h| root);
+            let block_time_at: BlockTimeFn = Arc::new(|_h| Some(1_784_000_000));
+            let mgr = PayoutCheckpointManager::new(
+                identity.clone(),
+                Arc::clone(&db),
+                send,
+                compute_root,
+                block_time_at,
+            );
+            nodes.push(Node {
+                id: identity.node_id(),
+                db,
+                mgr,
+                outbox,
+            });
+        }
+        nodes
+    }
+
+    fn drain(n: &Node) -> Vec<(MessageType, Vec<u8>)> {
+        std::mem::take(&mut *n.outbox.lock().unwrap())
+    }
+
+    /// Deliver every queued broadcast to every other node until the fleet is
+    /// quiet (bounded — the flow settles in a couple of rounds).
+    async fn gossip_until_quiet(nodes: &[Node]) {
+        for _ in 0..20 {
+            let mut msgs = Vec::new();
+            for n in nodes {
+                for (ty, payload) in drain(n) {
+                    msgs.push((n.id, ty, payload));
+                }
+            }
+            if msgs.is_empty() {
+                break;
+            }
+            for (from, ty, payload) in msgs {
+                for n in nodes {
+                    if n.id != from {
+                        let env =
+                            Arc::new(MessageEnvelope::new(ty, from, payload.clone(), 0, [0u8; 64]));
+                        n.mgr.handle_message(env).await.expect("handle");
+                    }
+                }
+            }
+        }
+    }
+
+    const H: u64 = 100; // 100 % 4 == 0 → proposer is sorted-elder[0] = nodes[0]
+
+    #[tokio::test]
+    async fn convergent_fleet_finalises_identical_checkpoint() {
+        let root = [7u8; 32];
+        let nodes = build(4, &[Some(root); 4]);
+        assert_eq!(
+            nodes[0].db.get_mpc_elder_node_ids().unwrap().len(),
+            4,
+            "elder set must be populated"
+        );
+        assert_eq!(
+            nodes[0].mgr.proposer_for(H),
+            Some(nodes[0].id),
+            "nodes[0] must be the proposer for H"
+        );
+        assert_eq!(nodes[0].mgr.quorum_needed(), 3, "67% of 4 = 3");
+        for n in &nodes {
+            n.mgr.maybe_propose(H).await; // only the proposer acts
+        }
+        gossip_until_quiet(&nodes).await;
+        for n in &nodes {
+            let cp = n
+                .db
+                .get_latest_payout_ledger_checkpoint()
+                .unwrap()
+                .expect("every node finalises");
+            assert_eq!(cp.ledger_root, root);
+            assert_eq!(cp.height, H);
+        }
+    }
+
+    #[tokio::test]
+    async fn diverged_minority_prevents_finalisation() {
+        // Proposer + one peer compute A; two peers have a lagged/divergent view (B).
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let nodes = build(4, &[Some(a), Some(a), Some(b), Some(b)]);
+        for n in &nodes {
+            n.mgr.maybe_propose(H).await;
+        }
+        gossip_until_quiet(&nodes).await;
+        // 2 approvals < ceil(67% of 4)=3 → NOTHING finalises anywhere (safe).
+        for n in &nodes {
+            assert!(n.db.get_latest_payout_ledger_checkpoint().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn c7_abstainer_does_not_block_liveness() {
+        // Three nodes converged on A; one lacks data (None) → abstains, not rejects.
+        let a = [3u8; 32];
+        let nodes = build(4, &[Some(a), Some(a), Some(a), None]);
+        for n in &nodes {
+            n.mgr.maybe_propose(H).await;
+        }
+        gossip_until_quiet(&nodes).await;
+        // 3 approvals >= 3 → all finalise A, including the abstainer via vote tally.
+        for n in &nodes {
+            let cp = n
+                .db
+                .get_latest_payout_ledger_checkpoint()
+                .unwrap()
+                .expect("finalises despite one abstainer");
+            assert_eq!(cp.ledger_root, a);
+        }
+    }
+
+    #[tokio::test]
+    async fn malicious_proposer_wrong_root_rejected() {
+        // Every honest node computes A; a forged proposal (even from the real
+        // proposer) claims a different root. Honest recompute rejects it.
+        let a = [4u8; 32];
+        let forged = [9u8; 32];
+        let nodes = build(4, &[Some(a); 4]);
+        let proposer = nodes[0].id;
+        let msg = PayoutLedgerCheckpointMessage {
+            height: H,
+            cutoff_ts: 1_784_000_000,
+            ledger_root: forged,
+            active_node_count: 4,
+            proposer,
+            proposer_signature: [0u8; 64],
+            timestamp: 0,
+        };
+        let payload = serde_json::to_vec(&msg).unwrap();
+        for n in &nodes[1..] {
+            let env = Arc::new(MessageEnvelope::new(
+                MessageType::PayoutLedgerCheckpoint,
+                proposer,
+                payload.clone(),
+                0,
+                [0u8; 64],
+            ));
+            n.mgr.handle_message(env).await.unwrap();
+        }
+        gossip_until_quiet(&nodes).await;
+        for n in &nodes {
+            assert!(n.db.get_latest_payout_ledger_checkpoint().unwrap().is_none());
         }
     }
 }

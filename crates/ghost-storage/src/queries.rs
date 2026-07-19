@@ -9103,7 +9103,8 @@ impl Database {
                 "SELECT height, cutoff_ts, ledger_root, proposer_id, active_node_count
                  FROM payout_ledger_checkpoints
                  WHERE height <= ?1 ORDER BY height DESC LIMIT 1",
-                params![max_height as i64],
+                // Clamp to i64::MAX so u64::MAX ("latest") doesn't wrap to -1.
+                params![max_height.min(i64::MAX as u64) as i64],
                 |row| {
                     let height: i64 = row.get(0)?;
                     let cutoff_ts: i64 = row.get(1)?;
