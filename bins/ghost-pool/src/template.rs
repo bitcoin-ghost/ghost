@@ -2887,6 +2887,68 @@ impl TemplateProcessor {
         })
     }
 
+    /// Categorised breakdown of the coinbase for the block currently being
+    /// built, derived from the approved payout proposal: the miner pool, the
+    /// node reward pool, the treasury allocation, and the tx fees routed to the
+    /// block finder, plus the per-recipient entries behind the two pools.
+    ///
+    /// Returns `None` until a payout has been agreed for the current round —
+    /// early in a round no proposal is approved yet and the coinbase is
+    /// subsidy-only. Addresses are included raw (as their human-readable string,
+    /// which is how `PayoutEntry::address` is stored); the API handler redacts
+    /// them for non-operator callers.
+    pub fn current_coinbase_breakdown(&self) -> Option<serde_json::Value> {
+        let hash = (*self.approved_payout.read())?;
+        let proposals = self.payout_proposals.read();
+        let proposal = proposals.get(&hash)?;
+
+        let miner_pool_sat: u64 = proposal.miner_payouts.iter().map(|e| e.amount).sum();
+        let node_reward_pool_sat: u64 = proposal.node_payouts.iter().map(|e| e.amount).sum();
+        let treasury_sat = proposal.treasury_amount;
+        let tx_fees_to_finder_sat = proposal.tx_fees;
+        let total_coinbase_sat = miner_pool_sat
+            .saturating_add(node_reward_pool_sat)
+            .saturating_add(treasury_sat)
+            .saturating_add(tx_fees_to_finder_sat);
+
+        let miners: Vec<serde_json::Value> = proposal
+            .miner_payouts
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "address": String::from_utf8_lossy(&e.address),
+                    "amount_sat": e.amount,
+                })
+            })
+            .collect();
+        let nodes: Vec<serde_json::Value> = proposal
+            .node_payouts
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "node_id": hex::encode(&e.recipient_id[..4]),
+                    "address": String::from_utf8_lossy(&e.address),
+                    "amount_sat": e.amount,
+                })
+            })
+            .collect();
+
+        Some(serde_json::json!({
+            "height": proposal.block_height,
+            "round_id": proposal.round_id,
+            "subsidy_sat": proposal.subsidy,
+            "tx_fees_to_finder_sat": tx_fees_to_finder_sat,
+            "treasury_sat": treasury_sat,
+            "miner_pool_sat": miner_pool_sat,
+            "node_reward_pool_sat": node_reward_pool_sat,
+            "total_coinbase_sat": total_coinbase_sat,
+            "miner_count": proposal.miner_payouts.len(),
+            "node_count": proposal.node_payouts.len(),
+            "miners": miners,
+            "nodes": nodes,
+        }))
+    }
+
     /// Store work state by template_id (for SubmitSolution lookup)
     pub fn store_work_state(&self, template_id: u64, work_state: WorkState) {
         let mut states = self.work_states.write();

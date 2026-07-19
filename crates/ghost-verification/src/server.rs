@@ -1320,6 +1320,13 @@ pub struct VerificationState {
     /// `WorkState` type. `None` (or a `None` result) means no template yet.
     #[allow(clippy::type_complexity)]
     template_snapshot: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
+    /// Provider returning a JSON snapshot of how the coinbase for the block
+    /// currently being built splits across recipients (miner pool, node reward
+    /// pool, treasury, tx fees to finder) plus per-recipient entries. A closure
+    /// so this crate needn't depend on ghost-pool's payout types. `None` (or a
+    /// `None` result) means no payout has been agreed for the current round yet.
+    #[allow(clippy::type_complexity)]
+    coinbase_snapshot: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
     /// Seconds elapsed in the current mining round (time working the current
     /// template), from the round manager's `current_round_elapsed_secs`.
     /// Surfaced as `current_round_duration_secs` on the pool-status endpoint so
@@ -1551,6 +1558,7 @@ impl VerificationState {
             local_received_by: None,
             template_refresh_ms: None,
             template_snapshot: None,
+            coinbase_snapshot: None,
             get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
@@ -2244,6 +2252,20 @@ impl VerificationState {
     /// The current block-template snapshot, or `None` if unwired / no template yet.
     pub fn template_snapshot(&self) -> Option<serde_json::Value> {
         self.template_snapshot.as_ref().and_then(|f| f())
+    }
+
+    /// Wire the current-coinbase categorised-breakdown provider.
+    pub fn with_coinbase_snapshot(
+        mut self,
+        f: impl Fn() -> Option<serde_json::Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.coinbase_snapshot = Some(Box::new(f));
+        self
+    }
+
+    /// The current coinbase breakdown, or `None` if unwired / no payout agreed yet.
+    pub fn coinbase_snapshot(&self) -> Option<serde_json::Value> {
+        self.coinbase_snapshot.as_ref().and_then(|f| f())
     }
 
     /// Set the current-round-elapsed-seconds callback (from the round manager).

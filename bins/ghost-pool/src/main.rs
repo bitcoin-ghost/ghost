@@ -6090,6 +6090,12 @@ async fn main() -> Result<()> {
     let tp_for_snapshot = Arc::clone(&template_processor);
     verification_state = verification_state
         .with_template_snapshot(move || tp_for_snapshot.current_template_summary());
+    // Coinbase-payments breakdown provider: how the current block's coinbase
+    // splits across miners / node rewards / treasury / finder fees, from the
+    // approved payout proposal. `None` result until a payout is agreed.
+    let tp_for_coinbase = Arc::clone(&template_processor);
+    verification_state = verification_state
+        .with_coinbase_snapshot(move || tp_for_coinbase.current_coinbase_breakdown());
 
     // Seconds elapsed working the current template, surfaced as
     // `current_round_duration_secs` on the pool-status endpoint so the

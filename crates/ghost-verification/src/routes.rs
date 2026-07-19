@@ -193,6 +193,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/api/v1/node/shares", get(api_node_shares_handler))
         .route("/api/v1/mining/status", get(api_mining_status_handler))
         .route("/api/v1/mining/template", get(api_mining_template_handler))
+        .route("/api/v1/mining/coinbase", get(api_mining_coinbase_handler))
         .route("/api/v1/mining/miners", get(api_miners_handler))
         .route("/api/v1/miners/search", get(api_miners_search_handler))
         // Public self-lookup endpoint — exact-match only, requires the full
@@ -1659,6 +1660,51 @@ async fn api_mining_template_handler(
             Json(serde_json::json!({ "available": false, "template": serde_json::Value::Null }))
         }
     }
+}
+
+/// Categorised coinbase breakdown for the block currently being built: the
+/// miner pool, node reward pool, treasury and finder tx-fees, plus per-recipient
+/// entries. Operator-authed callers (dashboard proxy signing over an empty body,
+/// same as `/api/v1/mining/miners`) see full recipient addresses; everyone else
+/// gets the amounts and counts with addresses stripped (`addresses_redacted`).
+/// `{ "available": false }` until a payout has been agreed for the round.
+async fn api_mining_coinbase_handler(
+    State(state): State<Arc<VerificationState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(mut breakdown) = state.coinbase_snapshot() else {
+        return Json(serde_json::json!({ "available": false }));
+    };
+
+    // Operator-authed detail path mirrors api_miners_handler: the proxy signs the
+    // GET with the operator INTERNAL_AUTH_KEY over an empty body.
+    let operator = state
+        .internal_auth
+        .as_ref()
+        .map(|auth| verify_internal_auth(auth, &headers, b"").is_ok())
+        .unwrap_or(false);
+
+    if !operator {
+        for key in ["miners", "nodes"] {
+            if let Some(arr) = breakdown.get_mut(key).and_then(|v| v.as_array_mut()) {
+                for entry in arr.iter_mut() {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.remove("address");
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(obj) = breakdown.as_object_mut() {
+        obj.insert("available".to_string(), serde_json::Value::Bool(true));
+        obj.insert(
+            "addresses_redacted".to_string(),
+            serde_json::Value::Bool(!operator),
+        );
+    }
+
+    Json(breakdown)
 }
 
 /// API v1 mining status handler
