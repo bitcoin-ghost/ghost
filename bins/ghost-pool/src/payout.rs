@@ -173,6 +173,57 @@ pub fn select_ledger_miner_work(
         .collect())
 }
 
+/// Domain-separated tag for the payout-ledger checkpoint root. Bump the version
+/// suffix if the canonical encoding below ever changes (it is consensus-visible).
+const LEDGER_ROOT_DOMAIN: &[u8] = b"PayoutLedgerRoot/v1";
+
+/// Deterministic 32-byte root over the payout inputs as of a fixed cutoff: the
+/// canonical unpaid-miner set (payout address → scaled integer work) and the
+/// qualified-node set (node_id → 5-4-3-2-1 capability shares). This is the object
+/// the fleet BFT-finalises; the coinbase then becomes a pure function of the
+/// checkpoint carrying this root, so every node builds the identical coinbase and
+/// GHOST-02/Component-E recompute-reject can never spuriously fire.
+///
+/// PURE and ORDER-INDEPENDENT: both sets are sorted canonically here (miners by
+/// work desc then address asc — matching `select_ledger_miner_work`'s order; nodes
+/// by node_id asc), so two nodes holding the same rows produce a byte-identical
+/// root regardless of the order their queries returned. Work is a `u128` (already
+/// `WORK_SCALE`-quantised, never a float) so the hash is reproducible. Every field
+/// is length-prefixed to prevent concatenation ambiguity.
+pub fn compute_ledger_root(
+    miners: &[(String, u128)],
+    nodes: &[(NodeId, i32)],
+    cutoff_ts: i64,
+    block_height: u64,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut m = miners.to_vec();
+    m.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut n = nodes.to_vec();
+    n.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut h = Sha256::new();
+    h.update(LEDGER_ROOT_DOMAIN);
+    h.update(cutoff_ts.to_le_bytes());
+    h.update(block_height.to_le_bytes());
+    h.update((m.len() as u32).to_le_bytes());
+    for (addr, work) in &m {
+        h.update((addr.len() as u32).to_le_bytes());
+        h.update(addr.as_bytes());
+        h.update(work.to_le_bytes());
+    }
+    h.update((n.len() as u32).to_le_bytes());
+    for (node_id, shares) in &n {
+        h.update(&node_id[..]);
+        h.update(shares.to_le_bytes());
+    }
+    let out = h.finalize();
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&out);
+    root
+}
+
 /// Build the GHOST-02 proposal validator that every node installs on its vote handler.
 ///
 /// A peer's payout proposal is vote-approved only if its split matches what THIS node
@@ -1834,6 +1885,79 @@ mod tests {
 
     fn test_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::generate())
+    }
+
+    // ---- Payout-ledger root (checkpoint canonicaliser) ----
+
+    fn nid(b: u8) -> NodeId {
+        [b; 32]
+    }
+
+    #[test]
+    fn ledger_root_is_deterministic_and_order_independent() {
+        let miners_a = vec![
+            ("bc1qaaa".to_string(), 100u128),
+            ("bc1qbbb".to_string(), 250u128),
+            ("bc1qccc".to_string(), 250u128), // tie on work → address breaks it
+        ];
+        let nodes_a = vec![(nid(3), 9i32), (nid(1), 15i32), (nid(2), 7i32)];
+
+        // Same content, different query order on BOTH sets.
+        let miners_b = vec![
+            ("bc1qccc".to_string(), 250u128),
+            ("bc1qaaa".to_string(), 100u128),
+            ("bc1qbbb".to_string(), 250u128),
+        ];
+        let nodes_b = vec![(nid(1), 15i32), (nid(2), 7i32), (nid(3), 9i32)];
+
+        let root_a = compute_ledger_root(&miners_a, &nodes_a, 1_784_000_000, 958_800);
+        let root_b = compute_ledger_root(&miners_b, &nodes_b, 1_784_000_000, 958_800);
+        assert_eq!(root_a, root_b, "root must be independent of input order");
+
+        // Recompute must be byte-stable across calls.
+        let root_a2 = compute_ledger_root(&miners_a, &nodes_a, 1_784_000_000, 958_800);
+        assert_eq!(root_a, root_a2);
+    }
+
+    #[test]
+    fn ledger_root_changes_when_any_input_changes() {
+        let miners = vec![("bc1qaaa".to_string(), 100u128)];
+        let nodes = vec![(nid(1), 15i32)];
+        let base = compute_ledger_root(&miners, &nodes, 1_784_000_000, 958_800);
+
+        // different miner work
+        let m2 = vec![("bc1qaaa".to_string(), 101u128)];
+        assert_ne!(base, compute_ledger_root(&m2, &nodes, 1_784_000_000, 958_800));
+        // different node shares
+        let n2 = vec![(nid(1), 14i32)];
+        assert_ne!(base, compute_ledger_root(&miners, &n2, 1_784_000_000, 958_800));
+        // different cutoff
+        assert_ne!(base, compute_ledger_root(&miners, &nodes, 1_784_000_001, 958_800));
+        // different height
+        assert_ne!(base, compute_ledger_root(&miners, &nodes, 1_784_000_000, 958_801));
+    }
+
+    #[test]
+    fn ledger_root_length_prefixing_prevents_ambiguity() {
+        // ("ab","c") vs ("a","bc") must not collide (concatenation ambiguity guard).
+        let m1 = vec![("ab".to_string(), 1u128), ("c".to_string(), 1u128)];
+        let m2 = vec![("a".to_string(), 1u128), ("bc".to_string(), 1u128)];
+        let nodes: Vec<(NodeId, i32)> = vec![];
+        assert_ne!(
+            compute_ledger_root(&m1, &nodes, 1, 1),
+            compute_ledger_root(&m2, &nodes, 1, 1),
+        );
+    }
+
+    #[test]
+    fn ledger_root_handles_empty_sets() {
+        let empty_m: Vec<(String, u128)> = vec![];
+        let empty_n: Vec<(NodeId, i32)> = vec![];
+        // Deterministic, non-panicking, and distinct from a populated root.
+        let r0 = compute_ledger_root(&empty_m, &empty_n, 1, 1);
+        assert_eq!(r0, compute_ledger_root(&empty_m, &empty_n, 1, 1));
+        let r1 = compute_ledger_root(&[("x".to_string(), 1)], &empty_n, 1, 1);
+        assert_ne!(r0, r1);
     }
 
     // ---- GHOST-02: proposal split recompute ----
