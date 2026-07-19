@@ -52,6 +52,10 @@ pub mod log_ring;
 /// Payout proposal creation and consensus coordination.
 pub mod payout;
 
+/// Payout-ledger checkpoint finalisation (BFT-agreed snapshot the coinbase is a
+/// pure function of).
+pub mod payout_checkpoint;
+
 /// Economic validation of payout proposals.
 pub mod payout_validator;
 
