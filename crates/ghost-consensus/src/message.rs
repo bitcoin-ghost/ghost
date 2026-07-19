@@ -62,6 +62,10 @@ pub mod topics {
     pub const L2_VOTE: &[u8] = b"l2vote";
     /// L2 tree sync
     pub const L2_SYNC: &[u8] = b"l2sync";
+    /// Payout-ledger checkpoint proposal (BFT-finalised payout snapshot root)
+    pub const PAYOUT_LEDGER_CHECKPOINT: &[u8] = b"plchk";
+    /// Payout-ledger checkpoint vote
+    pub const PAYOUT_LEDGER_VOTE: &[u8] = b"plvote";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
@@ -240,6 +244,11 @@ pub enum MessageType {
     GhostGlyphClaim,
     /// GhostGlyph: Registration confirmed (lock funded)
     GhostGlyphRegistered,
+    /// Payout-ledger checkpoint proposal (proposer → all): the BFT-finalised
+    /// snapshot the coinbase is a pure function of.
+    PayoutLedgerCheckpoint,
+    /// Payout-ledger checkpoint vote (validator → all)
+    PayoutLedgerCheckpointVote,
 }
 
 impl MessageType {
@@ -271,6 +280,8 @@ impl MessageType {
             Self::L2TransferBroadcast => topics::L2_TRANSFER,
             Self::L2CheckpointBlock => topics::L2_CHECKPOINT,
             Self::L2CheckpointVote => topics::L2_VOTE,
+            Self::PayoutLedgerCheckpoint => topics::PAYOUT_LEDGER_CHECKPOINT,
+            Self::PayoutLedgerCheckpointVote => topics::PAYOUT_LEDGER_VOTE,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
@@ -306,6 +317,8 @@ impl MessageType {
             Self::L2TransferBroadcast => "l2tx",
             Self::L2CheckpointBlock => "l2chk",
             Self::L2CheckpointVote => "l2vote",
+            Self::PayoutLedgerCheckpoint => "plchk",
+            Self::PayoutLedgerCheckpointVote => "plvote",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
@@ -1470,6 +1483,82 @@ impl L2CheckpointVoteMessage {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"L2CheckpointVote/v1");
+        hasher.update(self.height.to_le_bytes());
+        hasher.update(self.checkpoint_hash);
+        hasher.update([self.approve as u8]);
+        hasher.finalize().into()
+    }
+}
+
+/// Payout-ledger checkpoint proposal (proposer → all).
+///
+/// The BFT-finalised snapshot the coinbase is a pure function of: at a lagging
+/// `height`, the `ledger_root` commits the canonical unpaid-miner set and
+/// qualified-node set as of `cutoff_ts` (= the anchor block's time). Every node
+/// recomputes the root from its own converged ledger and votes approve iff it
+/// matches; 67% finalises it identically fleet-wide (see `payout::compute_ledger_root`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutLedgerCheckpointMessage {
+    /// Lagging anchor height this checkpoint pins the payout ledger at.
+    pub height: u64,
+    /// Ledger cutoff = the anchor block's timestamp (deterministic, chain-committed).
+    pub cutoff_ts: i64,
+    /// Canonical payout-ledger root (miner set ‖ node set) as of `cutoff_ts`.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub ledger_root: [u8; 32],
+    /// Number of active nodes at this checkpoint.
+    pub active_node_count: u32,
+    /// Proposer's node ID (deterministic election for `height`).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub proposer: NodeId,
+    /// Proposer's signature over `checkpoint_hash()`.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub proposer_signature: [u8; 64],
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
+}
+
+impl PayoutLedgerCheckpointMessage {
+    /// Content hash (excludes the signature) — the object voters sign/compare.
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"PayoutLedgerCheckpoint/v1");
+        hasher.update(self.height.to_le_bytes());
+        hasher.update(self.cutoff_ts.to_le_bytes());
+        hasher.update(self.ledger_root);
+        hasher.update(self.active_node_count.to_le_bytes());
+        hasher.update(self.proposer);
+        hasher.finalize().into()
+    }
+}
+
+/// Payout-ledger checkpoint vote (validator → all).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutLedgerCheckpointVoteMessage {
+    /// Checkpoint height being voted on.
+    pub height: u64,
+    /// Hash of the checkpoint being voted on (`PayoutLedgerCheckpointMessage::checkpoint_hash`).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub checkpoint_hash: [u8; 32],
+    /// Voter's node ID.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub voter: NodeId,
+    /// Vote (true = approve; the voter reproduced the same `ledger_root`).
+    pub approve: bool,
+    /// Voter's signature over `signing_message()`.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub signature: [u8; 64],
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
+}
+
+impl PayoutLedgerCheckpointVoteMessage {
+    /// Get the message to be signed.
+    pub fn signing_message(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"PayoutLedgerCheckpointVote/v1");
         hasher.update(self.height.to_le_bytes());
         hasher.update(self.checkpoint_hash);
         hasher.update([self.approve as u8]);

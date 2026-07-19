@@ -8421,6 +8421,18 @@ pub struct L2CheckpointRecord {
     pub block_data: Vec<u8>,
 }
 
+/// A BFT-finalised payout-ledger checkpoint (migration v43): the agreed snapshot
+/// `{height, cutoff_ts, ledger_root}` the coinbase is a pure function of.
+#[derive(Debug, Clone)]
+pub struct PayoutLedgerCheckpointRecord {
+    pub height: u64,
+    pub cutoff_ts: i64,
+    pub ledger_root: [u8; 32],
+    /// Hex-encoded proposer node id.
+    pub proposer_id: String,
+    pub active_node_count: u32,
+}
+
 /// L2 epoch record (lifecycle and compaction state)
 #[derive(Debug, Clone)]
 pub struct L2EpochRecord {
@@ -9054,6 +9066,81 @@ impl Database {
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
         })
+    }
+
+    /// Persist a finalised payout-ledger checkpoint (idempotent by height).
+    pub fn upsert_payout_ledger_checkpoint(
+        &self,
+        r: &PayoutLedgerCheckpointRecord,
+    ) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO payout_ledger_checkpoints
+                 (height, cutoff_ts, ledger_root, proposer_id, active_node_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    r.height as i64,
+                    r.cutoff_ts,
+                    r.ledger_root.as_slice(),
+                    r.proposer_id,
+                    r.active_node_count as i64,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// The latest finalised payout-ledger checkpoint at or below `max_height`.
+    /// The coinbase for block N reads the checkpoint with `height <= N - LAG`;
+    /// pass `u64::MAX` for "the latest finalised checkpoint".
+    pub fn get_payout_ledger_checkpoint_at_or_before(
+        &self,
+        max_height: u64,
+    ) -> GhostResult<Option<PayoutLedgerCheckpointRecord>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT height, cutoff_ts, ledger_root, proposer_id, active_node_count
+                 FROM payout_ledger_checkpoints
+                 WHERE height <= ?1 ORDER BY height DESC LIMIT 1",
+                params![max_height as i64],
+                |row| {
+                    let height: i64 = row.get(0)?;
+                    let cutoff_ts: i64 = row.get(1)?;
+                    let root_blob: Vec<u8> = row.get(2)?;
+                    let proposer_id: String = row.get(3)?;
+                    let active_node_count: i64 = row.get(4)?;
+                    Ok((height, cutoff_ts, root_blob, proposer_id, active_node_count))
+                },
+            )
+            .optional()
+            .map_err(|e| GhostError::Database(e.to_string()))
+            .map(|opt| {
+                opt.and_then(
+                    |(height, cutoff_ts, root_blob, proposer_id, active_node_count)| {
+                        if root_blob.len() != 32 {
+                            return None;
+                        }
+                        let mut ledger_root = [0u8; 32];
+                        ledger_root.copy_from_slice(&root_blob);
+                        Some(PayoutLedgerCheckpointRecord {
+                            height: height as u64,
+                            cutoff_ts,
+                            ledger_root,
+                            proposer_id,
+                            active_node_count: active_node_count as u32,
+                        })
+                    },
+                )
+            })
+        })
+    }
+
+    /// The latest finalised payout-ledger checkpoint.
+    pub fn get_latest_payout_ledger_checkpoint(
+        &self,
+    ) -> GhostResult<Option<PayoutLedgerCheckpointRecord>> {
+        self.get_payout_ledger_checkpoint_at_or_before(u64::MAX)
     }
 
     /// Get the latest L2 checkpoint

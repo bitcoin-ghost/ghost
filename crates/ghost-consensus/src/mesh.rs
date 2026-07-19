@@ -1784,6 +1784,8 @@ impl MeshNetwork {
             | MessageType::BlockFound
             | MessageType::Vote
             | MessageType::PayoutProposal
+            | MessageType::PayoutLedgerCheckpoint
+            | MessageType::PayoutLedgerCheckpointVote
             | MessageType::ElderUpdate
             | MessageType::ZkBlockProposal
             | MessageType::ZkVote
@@ -2111,6 +2113,8 @@ impl MeshNetwork {
             | MessageType::L2TransferBroadcast
             | MessageType::L2CheckpointBlock
             | MessageType::L2CheckpointVote
+            | MessageType::PayoutLedgerCheckpoint
+            | MessageType::PayoutLedgerCheckpointVote
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             // GhostGlyph messages use consensus voting port
@@ -3157,6 +3161,8 @@ impl MeshNetwork {
             | MessageType::L2TransferBroadcast
             | MessageType::L2CheckpointBlock
             | MessageType::L2CheckpointVote
+            | MessageType::PayoutLedgerCheckpoint
+            | MessageType::PayoutLedgerCheckpointVote
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {

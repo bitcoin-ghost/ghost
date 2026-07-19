@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 42;
+const SCHEMA_VERSION: u32 = 43;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -98,6 +98,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (40, migrate_v40),
         (41, migrate_v41),
         (42, migrate_v42),
+        (43, migrate_v43),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2157,6 +2158,28 @@ fn migrate_v42(conn: &Connection) -> GhostResult<()> {
     )
     .map_err(|e| GhostError::Migration(e.to_string()))?;
     info!("v42: created verification_ledger");
+    Ok(())
+}
+
+/// Migration v43: the payout-ledger checkpoint store. Each row is a BFT-finalised
+/// snapshot `{height, cutoff_ts, ledger_root}` that the fleet agreed on — the
+/// object the coinbase becomes a pure function of. Keyed by `height` (one finalised
+/// checkpoint per anchor height), so re-delivery/replay is idempotent. Additive:
+/// a fresh table, no change to existing data. See `tasks/design_payout_finalization.md`.
+fn migrate_v43(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v43: payout_ledger_checkpoints");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS payout_ledger_checkpoints (
+            height            INTEGER PRIMARY KEY,
+            cutoff_ts         INTEGER NOT NULL,
+            ledger_root       BLOB    NOT NULL,
+            proposer_id       TEXT    NOT NULL,
+            active_node_count INTEGER NOT NULL,
+            created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v43: created payout_ledger_checkpoints");
     Ok(())
 }
 
