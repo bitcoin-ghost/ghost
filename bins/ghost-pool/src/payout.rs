@@ -224,6 +224,42 @@ pub fn compute_ledger_root(
     root
 }
 
+/// Resolve the cutoff timestamp that anchors the payout for a block at `tip_height`.
+///
+/// This is the fix for the v1.10.32 live failure. BELOW `fee_to_node_pool_height()`
+/// the coinbase is treasury-only, so the anchor is wall-clock `now()` — the legacy
+/// behaviour, with no cross-node split to diverge on. AT AND ABOVE the gate the
+/// coinbase carries the miner+node split, and anchoring at `now()` is exactly what
+/// broke: the proposer's ledger at `now()` has not converged across the fleet
+/// (GHOST-03 gossip lag), so validators recompute a different split and GHOST-02
+/// rejects every proposal. Instead the anchor becomes the `cutoff_ts` of the latest
+/// BFT-finalised `PayoutLedgerCheckpoint` at-or-before `tip_height` — a lagging,
+/// fleet-agreed point where the share and qualification ledgers HAVE converged. Every
+/// node derives the same checkpoint deterministically, so every node recomputes the
+/// identical split and the recompute-reject can only ever pass.
+///
+/// Returns `None` only at/above the gate when no checkpoint has finalised yet (the
+/// brief window at first activation, before the dark finaliser has produced one). The
+/// caller must then build NO split payout — the block falls back to a treasury-only
+/// coinbase, which is safe because there is nothing for validators to disagree on.
+pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> Option<i64> {
+    if tip_height < crate::fee_to_node_pool_height() {
+        return Some(chrono::Utc::now().timestamp());
+    }
+    match db.get_payout_ledger_checkpoint_at_or_before(tip_height) {
+        Ok(Some(cp)) => Some(cp.cutoff_ts),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                tip_height,
+                "payout checkpoint lookup failed; refusing to anchor a split payout this block"
+            );
+            None
+        }
+    }
+}
+
 /// Build the GHOST-02 proposal validator that every node installs on its vote handler.
 ///
 /// A peer's payout proposal is vote-approved only if its split matches what THIS node
@@ -1935,6 +1971,37 @@ mod tests {
         assert_ne!(base, compute_ledger_root(&miners, &nodes, 1_784_000_001, 958_800));
         // different height
         assert_ne!(base, compute_ledger_root(&miners, &nodes, 1_784_000_000, 958_801));
+    }
+
+    // ---- Cutoff resolver (the v1.10.32 fix) ----
+
+    #[test]
+    fn resolve_cutoff_dormant_gate_ignores_checkpoint_and_returns_now() {
+        // The gate is dormant (u64::MAX) in the test process — no test sets it — so
+        // this locks the deploy-safety invariant: shipping this binary with the gate
+        // dormant behaves EXACTLY like before. Even with a finalised checkpoint sitting
+        // in the DB (the dark finaliser is always running post-deploy), the coinbase
+        // cutoff stays wall-clock now() until the gate actually fires.
+        let db = ghost_storage::Database::in_memory().expect("in-memory db");
+        db.upsert_payout_ledger_checkpoint(&ghost_storage::PayoutLedgerCheckpointRecord {
+            height: 958_800,
+            cutoff_ts: 1_700_000_000, // deliberately far in the past
+            ledger_root: [7u8; 32],
+            proposer_id: "aa".repeat(32),
+            active_node_count: 8,
+        })
+        .expect("upsert checkpoint");
+
+        let before = chrono::Utc::now().timestamp();
+        let got = resolve_payout_cutoff(&db, 958_900).expect("dormant gate always resolves");
+        let after = chrono::Utc::now().timestamp();
+
+        assert!(
+            got >= before && got <= after,
+            "dormant gate must return now() ({before}..={after}), not the checkpoint's {}: got {got}",
+            1_700_000_000i64
+        );
+        assert_ne!(got, 1_700_000_000, "must NOT use the checkpoint cutoff while dormant");
     }
 
     #[test]

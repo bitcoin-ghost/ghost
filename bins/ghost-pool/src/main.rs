@@ -6743,10 +6743,19 @@ async fn main() -> Result<()> {
                 //
                 // Shares arriving after this moment belong to the next
                 // block's ledger and aren't swept.
-                let cutoff_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                // v1.10.32 fix: anchor the split at the fleet-finalised checkpoint
+                // cutoff (converged — every node agrees) instead of now() (gossip-
+                // lagged, so validators would recompute a different split and reject).
+                // Below the activation gate this still resolves to now().
+                let Some(cutoff_ts) =
+                    ghost_pool::payout::resolve_payout_cutoff(&db_for_bf, height)
+                else {
+                    debug!(
+                        height,
+                        "no finalised payout checkpoint yet; skipping split payout this block"
+                    );
+                    return;
+                };
 
                 // No round-tracker fallback here, deliberately: a validator has no
                 // way to know the proposer fell back, so it would recompute from the
@@ -6949,10 +6958,17 @@ async fn main() -> Result<()> {
                     // GHOST-02: the unpaid ledger, NOT this round's work. Every proposal
                     // path must derive its split the same way the validators recompute it
                     // (`select_ledger_miner_work`), or the fleet rejects its own payout.
-                    let cutoff_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
+                    // v1.10.32 fix: checkpoint cutoff (converged), not now() (lagged).
+                    // Below the activation gate this still resolves to now().
+                    let Some(cutoff_ts) =
+                        ghost_pool::payout::resolve_payout_cutoff(&db_for_block, height)
+                    else {
+                        debug!(
+                            height,
+                            "no finalised payout checkpoint yet; skipping split payout this block"
+                        );
+                        continue;
+                    };
                     let miner_work = match ghost_pool::payout::select_ledger_miner_work(
                         &db_for_block,
                         cutoff_ts,
@@ -8432,7 +8448,23 @@ async fn main() -> Result<()> {
                             // payout instead.
                             match rm_notify.current_template_id() {
                                 Some(tip) => {
-                                    let cutoff_ts = chrono::Utc::now().timestamp();
+                                    // v1.10.32 fix: this is the tip-change path that FAILED
+                                    // live. Anchor at the fleet-finalised checkpoint cutoff
+                                    // (converged) instead of now() (gossip-lagged), so every
+                                    // node recomputes the identical split. Below the gate this
+                                    // still resolves to now().
+                                    let Some(cutoff_ts) =
+                                        ghost_pool::payout::resolve_payout_cutoff(
+                                            &db_for_rounds,
+                                            height,
+                                        )
+                                    else {
+                                        debug!(
+                                            height,
+                                            "no finalised payout checkpoint yet; skipping tip-change payout"
+                                        );
+                                        continue;
+                                    };
                                     // `None` matches what `validate_block_data` uses to compute
                                     // the expected subsidy — pass anything else and the proposal
                                     // fails its own validation.
@@ -8685,10 +8717,17 @@ async fn main() -> Result<()> {
                     } else {
                         // Pool mode: ledger-style proportional distribution.
                         // Shares arriving after this moment belong to the next block's ledger.
-                        let cutoff_ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
+                        // v1.10.32 fix: checkpoint cutoff (converged), not now() (lagged).
+                        // Below the activation gate this still resolves to now().
+                        let Some(cutoff_ts) =
+                            ghost_pool::payout::resolve_payout_cutoff(&db_for_events, height)
+                        else {
+                            debug!(
+                                height,
+                                "no finalised payout checkpoint yet; skipping split payout this block"
+                            );
+                            continue;
+                        };
                         let miner_work = {
                             // GHOST-02: the unpaid ledger, NOT this round's work. Every
                             // proposal path must derive its split the same way validators
