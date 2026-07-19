@@ -260,6 +260,49 @@ pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> O
     }
 }
 
+/// Option B cutoff-binding: a proposal's payout cutoff must be a fleet-ratified one.
+///
+/// At and above `fee_gate_height` the coinbase is a pure function of a BFT-finalised
+/// `PayoutLedgerCheckpoint`, so `proposal_cutoff_ts` MUST equal the cutoff_ts of a
+/// finalised checkpoint at-or-before the block. This is the check that gives the
+/// GHOST-02 recompute below its teeth: on its own the recompute reproduces the split
+/// at WHATEVER cutoff the proposal names, so a proposer who names a non-converged
+/// cutoff still matches himself and every honest node diverges from him. Pinning the
+/// cutoff to a checkpoint the fleet already agreed on (at a lagging, converged height)
+/// removes that freedom — an honest proposer always passes, a cutoff-forging one is
+/// rejected by everyone. Below the gate the cutoff is wall-clock now() and there is
+/// nothing to bind, so this is inert (and the whole scheme ships dormant).
+///
+/// Extracted from the validator closure so it is unit-testable: the gate is a
+/// parameter here rather than the process-global `fee_to_node_pool_height()`.
+pub fn check_proposal_cutoff_binding(
+    db: &ghost_storage::Database,
+    block_height: u64,
+    proposal_cutoff_ts: i64,
+    fee_gate_height: u64,
+) -> Result<(), String> {
+    if block_height < fee_gate_height {
+        return Ok(()); // pre-gate: now()-cutoffs, nothing to bind against
+    }
+    match db.get_payout_ledger_checkpoint_at_or_before(block_height) {
+        Ok(Some(cp)) => {
+            if proposal_cutoff_ts != cp.cutoff_ts {
+                Err(format!(
+                    "GHOST-02: proposal cutoff {proposal_cutoff_ts} is not the finalised \
+                     checkpoint cutoff {} (checkpoint height {})",
+                    cp.cutoff_ts, cp.height
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(None) => Err("GHOST-02: no finalised payout checkpoint at or before this height; \
+             a split payout cannot be ratified yet"
+            .to_string()),
+        Err(e) => Err(format!("GHOST-02: checkpoint lookup failed: {e}")),
+    }
+}
+
 /// Build the GHOST-02 proposal validator that every node installs on its vote handler.
 ///
 /// A peer's payout proposal is vote-approved only if its split matches what THIS node
@@ -281,6 +324,15 @@ pub fn make_proposal_validator(
     enforcement_height: u64,
 ) -> ghost_consensus::vote_handler::ProposalValidateFn {
     Arc::new(move |proposal: &PayoutProposal| {
+        // Option B: bind the cutoff to a fleet-finalised checkpoint before trusting it.
+        // Inert below the fee gate; at/above it a forged cutoff is rejected outright.
+        check_proposal_cutoff_binding(
+            &db,
+            proposal.block_height,
+            proposal.timestamp as i64,
+            crate::fee_to_node_pool_height(),
+        )?;
+
         // Recompute from the UNPAID LEDGER, over the proposer's exact window — the same
         // source and cutoff the proposer used. The cutoff rides on `proposal.timestamp`.
         let local_work = match select_ledger_miner_work(
@@ -1172,6 +1224,58 @@ impl PayoutProposalCreator {
         Ok(())
     }
 
+    /// Component E (Option B): recompute the intra-node-pool division and reject a
+    /// mismatch. This is the check `validate_proposal_split` deliberately omits — it
+    /// pins the miner split, conservation and the treasury floor, but NOT which node
+    /// gets how much, because that was not reproducible by a validator. Option B makes
+    /// it reproducible: `recomputed_node_shares` is the qualified-node set at the
+    /// proposal's RATIFIED checkpoint cutoff (converged, fleet-agreed), so turning
+    /// shares → sats with the SAME `calculate_node_payouts` the proposer used yields
+    /// the identical address→amount map. Any divergence is a forged node split.
+    ///
+    /// The caller gates this on `fee_to_node_pool_height()` and only reaches it after
+    /// `check_proposal_cutoff_binding` has confirmed the cutoff is a finalised one.
+    pub fn validate_node_split(
+        &self,
+        proposal: &PayoutProposal,
+        local_miner_work: &[(String, u128)],
+        recomputed_node_shares: &[(NodeId, i32)],
+        treasury_state: &TreasuryState,
+    ) -> Result<(), String> {
+        let block_time =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(proposal.timestamp as i64, 0)
+                .unwrap_or_else(chrono::Utc::now);
+        let fee_dist = FeeDistribution::calculate_at_height(
+            proposal.subsidy,
+            proposal.tx_fees,
+            treasury_state,
+            block_time,
+            proposal.block_height,
+        );
+        // The node pool is the base node-reward pool plus miner dust — recompute the
+        // dust exactly the way `create_proposal` does (from the same miner work).
+        let (_expected_miners, miner_dust) = self
+            .calculate_miner_payouts(local_miner_work, fee_dist.miner_pool)
+            .map_err(|e| format!("Component-E: miner recompute failed: {e}"))?;
+        let augmented_node_pool = fee_dist.node_reward_pool.saturating_add(miner_dust);
+
+        let expected = self
+            .calculate_node_payouts(recomputed_node_shares, augmented_node_pool)
+            .map_err(|e| format!("Component-E: node recompute failed: {e}"))?;
+
+        let expected_map = Self::address_amount_map(&expected);
+        let proposal_map = Self::address_amount_map(&proposal.node_payouts);
+        if expected_map != proposal_map {
+            return Err(format!(
+                "Component-E: node split does not match local recompute \
+                 ({} expected node addresses vs {} in proposal)",
+                expected_map.len(),
+                proposal_map.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// Address-grouped (address -> total amount) view of a payout set, for the
     /// GHOST-02 comparison. Ordered so the comparison is independent of entry order.
     fn address_amount_map(entries: &[PayoutEntry]) -> std::collections::BTreeMap<Vec<u8>, u64> {
@@ -1346,9 +1450,16 @@ impl PayoutProposalCreator {
             return Ok(payouts);
         }
 
-        // Sort by shares descending, take top N
+        // Sort by shares descending, then node_id ascending as a DETERMINISTIC
+        // tiebreak, take top N. The tiebreak is load-bearing for Option B: without
+        // it, truncation at `max_node_outputs`, the dust-to-top-node redistribution
+        // (`payouts.first_mut()` below) and the merge order all depend on the order
+        // the qualified-node query happened to return, which differs per node — so
+        // two nodes would build different node splits from the same set and
+        // Component-E recompute-reject would fire on honest proposals. With the
+        // node_id tiebreak the output is a pure function of the input set.
         let mut sorted: Vec<_> = node_shares.to_vec();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         sorted.truncate(self.config.max_node_outputs);
 
         // Recalculate total shares for top nodes
@@ -1756,7 +1867,26 @@ impl PayoutHandler {
         treasury_state: &TreasuryState,
     ) -> Result<(), String> {
         self.creator
-            .validate_proposal_split(proposal, local_miner_work, treasury_state)
+            .validate_proposal_split(proposal, local_miner_work, treasury_state)?;
+
+        // Component E (Option B): at/above the fee gate the node split is a pure
+        // function of the ratified checkpoint, so pin it too. The cutoff on the
+        // proposal is a finalised checkpoint cutoff (guaranteed by the validator's
+        // cutoff-binding), so this recomputes the qualified-node set at a converged
+        // point — every honest node matches. Below the gate the node split is not
+        // consensus-enforced (legacy behaviour) and this is skipped.
+        if proposal.block_height >= crate::fee_to_node_pool_height() {
+            let node_shares = self
+                .qualification_provider
+                .get_all_qualified_nodes_at_cutoff_from_db(proposal.timestamp as i64);
+            self.creator.validate_node_split(
+                proposal,
+                local_miner_work,
+                &node_shares,
+                treasury_state,
+            )?;
+        }
+        Ok(())
     }
 
     /// H-MINE-1 SECURITY: The QualifiedCapabilityProvider is REQUIRED in the constructor.
@@ -2014,6 +2144,110 @@ mod tests {
             1_700_000_000i64
         );
         assert_ne!(got, 1_700_000_000, "must NOT use the checkpoint cutoff while dormant");
+    }
+
+    fn db_with_checkpoint(height: u64, cutoff_ts: i64) -> ghost_storage::Database {
+        let db = ghost_storage::Database::in_memory().expect("in-memory db");
+        db.upsert_payout_ledger_checkpoint(&ghost_storage::PayoutLedgerCheckpointRecord {
+            height,
+            cutoff_ts,
+            ledger_root: [1u8; 32],
+            proposer_id: "bb".repeat(32),
+            active_node_count: 8,
+        })
+        .expect("upsert checkpoint");
+        db
+    }
+
+    fn seed_node_with_addr(db: &ghost_storage::Database, node_id: NodeId, addr: &str) {
+        db.upsert_node(&ghost_storage::NodeRecord {
+            node_id: hex::encode(node_id),
+            public_address: None,
+            display_name: None,
+            first_seen: 0,
+            last_seen: 0,
+            is_elder: false,
+            elder_order: None,
+            capabilities: "{}".to_string(),
+            total_uptime_secs: 0,
+            uptime_7d_percent: 0.0,
+            verification_pass_rate: 0.0,
+            total_shares_received: 0,
+            total_blocks_found: 0,
+            payout_address: Some(addr.to_string()),
+        })
+        .expect("seed node");
+    }
+
+    #[test]
+    fn node_payouts_are_a_pure_function_of_the_set_not_its_order() {
+        // The tiebreak fix: equal top-shares nodes plus a non-dividing pool leave a
+        // remainder that goes to the top node. Without a node_id tiebreak the "top"
+        // node — and thus the whole split — would depend on the order the qualified-
+        // node query returned, so two nodes would build different coinbases and
+        // Component-E recompute-reject would fire on honest proposals.
+        let config = PayoutConfig {
+            treasury_address: Some(vec![1u8; 20]),
+            network: ghost_common::config::BitcoinNetwork::Regtest,
+            ..Default::default()
+        };
+        let db = Arc::new(ghost_storage::Database::in_memory().expect("db"));
+        let (a1, a2, a3) = (payout_addr(0x21), payout_addr(0x22), payout_addr(0x23));
+        seed_node_with_addr(&db, nid(1), &a1);
+        seed_node_with_addr(&db, nid(2), &a2);
+        seed_node_with_addr(&db, nid(3), &a3);
+        let creator =
+            PayoutProposalCreator::new(test_identity(), config, Arc::clone(&db)).expect("creator");
+
+        let fwd = vec![(nid(1), 5i32), (nid(2), 5i32), (nid(3), 5i32)];
+        let rev = vec![(nid(3), 5i32), (nid(2), 5i32), (nid(1), 5i32)];
+        let pool = 10_000u64; // 10000 / 15 shares → remainder, routed to the top node
+
+        let via_fwd = creator.calculate_node_payouts(&fwd, pool).expect("fwd");
+        let via_rev = creator.calculate_node_payouts(&rev, pool).expect("rev");
+        assert_eq!(
+            PayoutProposalCreator::address_amount_map(&via_fwd),
+            PayoutProposalCreator::address_amount_map(&via_rev),
+            "node split must not depend on input order"
+        );
+        // Remainder lands on the lowest node_id (nid(1) → a1) deterministically.
+        let map = PayoutProposalCreator::address_amount_map(&via_fwd);
+        let top = *map.get(a1.as_bytes()).expect("a1 present");
+        let other = *map.get(a2.as_bytes()).expect("a2 present");
+        assert!(top > other, "remainder must go to the lowest-id top node: {top} vs {other}");
+    }
+
+    #[test]
+    fn cutoff_binding_inert_below_gate() {
+        // Below the gate there is no checkpoint requirement even with none present.
+        let db = ghost_storage::Database::in_memory().expect("in-memory db");
+        assert!(check_proposal_cutoff_binding(&db, 900_000, 123, 950_000).is_ok());
+    }
+
+    #[test]
+    fn cutoff_binding_accepts_matching_checkpoint_cutoff() {
+        let db = db_with_checkpoint(958_800, 1_784_000_000);
+        // Block at-or-above the checkpoint, cutoff equals the finalised cutoff.
+        assert!(check_proposal_cutoff_binding(&db, 958_806, 1_784_000_000, 950_000).is_ok());
+    }
+
+    #[test]
+    fn cutoff_binding_rejects_forged_cutoff() {
+        let db = db_with_checkpoint(958_800, 1_784_000_000);
+        // A proposer who names any cutoff other than the ratified one is rejected —
+        // this is the attack the whole scheme closes.
+        let err = check_proposal_cutoff_binding(&db, 958_806, 1_784_000_042, 950_000)
+            .expect_err("forged cutoff must be rejected");
+        assert!(err.contains("not the finalised checkpoint cutoff"), "{err}");
+    }
+
+    #[test]
+    fn cutoff_binding_rejects_when_no_checkpoint_finalised() {
+        // At/above the gate with no finalised checkpoint yet: refuse to ratify a split.
+        let db = ghost_storage::Database::in_memory().expect("in-memory db");
+        let err = check_proposal_cutoff_binding(&db, 958_806, 1_784_000_000, 950_000)
+            .expect_err("must reject with no checkpoint");
+        assert!(err.contains("no finalised payout checkpoint"), "{err}");
     }
 
     #[test]
