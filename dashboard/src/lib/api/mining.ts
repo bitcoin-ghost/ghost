@@ -6,6 +6,7 @@ import type {
   BestHashResponse,
   PoolSeriesResponse,
   MeshLeaderboardResponse,
+  MiningCoinbaseResponse,
 } from '@/types/api';
 
 export async function getMiningStatus(): Promise<MiningStatus> {
@@ -33,6 +34,15 @@ export interface MiningTemplateResponse {
 }
 export async function getMiningTemplate(): Promise<MiningTemplateResponse> {
   return fetchApi<MiningTemplateResponse>('/api/v1/mining/template');
+}
+
+// Coinbase payout breakdown for the block above — how the coinbase splits
+// across miners, node rewards, treasury, and the finder's tx-fee share. The
+// Next.js proxy signs this GET with the operator INTERNAL_AUTH_KEY, so an
+// authed operator gets the full unredacted recipient lists; unsigned/pre-
+// redeploy nodes return `addresses_redacted: true` (amounts only).
+export async function getMiningCoinbase(): Promise<MiningCoinbaseResponse> {
+  return fetchApi<MiningCoinbaseResponse>('/api/v1/mining/coinbase');
 }
 
 // Rolling server-side time-series of pool hashrate + connected miners.

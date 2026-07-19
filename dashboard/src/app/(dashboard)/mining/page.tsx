@@ -9,7 +9,6 @@ import { Button } from "@/components/ui/Button";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { ConfirmDialog } from "@/components/ui/Dialog";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { BlockTemplateCard } from "@/components/mining/BlockTemplateCard";
 import { formatHashrate } from "@/components/ui/DataTable";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { useMiningStatus, useBestHash, useSetPrivateMining, useSetPublicMining, useSelfCheck } from "@/hooks/queries";
@@ -340,11 +339,6 @@ export default function MiningPage() {
           loading={statusLoading}
         />
       </div>
-
-      {/* Block template visualiser — the block this node is currently building. */}
-      <SectionErrorBoundary section="Block Template">
-        <BlockTemplateCard />
-      </SectionErrorBoundary>
 
       {/* Mining Mode — the mode selector only. Connection endpoints live in
           their own section below so the two concerns don't get conflated. */}
