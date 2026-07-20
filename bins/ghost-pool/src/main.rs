@@ -2486,11 +2486,58 @@ async fn main() -> Result<()> {
     }
 
     if let Some(path) = &args.ledger_import {
-        let raw = std::fs::read(path)?;
-        let shares: Vec<ghost_storage::queries::UnpaidShareExport> = serde_json::from_slice(&raw)?;
-        let (inserted, miners) = db.import_unpaid_shares(&shares, args.dry_run)?;
+        // Batched + (for .jsonl) STREAMING import. The unbatched load-everything path OOM-killed
+        // memory-constrained nodes on a 600MB+ union; a `.jsonl` file (one record per line) is
+        // streamed a chunk at a time so peak RAM stays tiny, and each chunk commits in one
+        // transaction. A legacy JSON array still works (loaded whole, then batched in chunks).
+        const CHUNK: usize = 100_000;
+        type Rec = ghost_storage::queries::UnpaidShareExport;
+        let is_jsonl = path.extension().map(|e| e == "jsonl").unwrap_or(false);
+        let (mut offered, mut inserted, mut miners) = (0usize, 0usize, 0usize);
+
+        if is_jsonl {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            let mut chunk: Vec<Rec> = Vec::with_capacity(CHUNK);
+            let mut flush = |chunk: &mut Vec<Rec>,
+                             offered: &mut usize,
+                             inserted: &mut usize,
+                             miners: &mut usize|
+             -> anyhow::Result<()> {
+                if chunk.is_empty() {
+                    return Ok(());
+                }
+                let (ins, m) = db.import_unpaid_shares_batch(chunk, args.dry_run)?;
+                *offered += chunk.len();
+                *inserted += ins;
+                *miners += m;
+                info!(offered = *offered, inserted = *inserted, "Ledger import progress");
+                chunk.clear();
+                Ok(())
+            };
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                chunk.push(serde_json::from_str(&line)?);
+                if chunk.len() >= CHUNK {
+                    flush(&mut chunk, &mut offered, &mut inserted, &mut miners)?;
+                }
+            }
+            flush(&mut chunk, &mut offered, &mut inserted, &mut miners)?;
+        } else {
+            let raw = std::fs::read(path)?;
+            let shares: Vec<Rec> = serde_json::from_slice(&raw)?;
+            offered = shares.len();
+            for chunk in shares.chunks(CHUNK) {
+                let (ins, m) = db.import_unpaid_shares_batch(chunk, args.dry_run)?;
+                inserted += ins;
+                miners += m;
+            }
+        }
         info!(
-            offered = shares.len(),
+            offered,
             inserted,
             miners_created = miners,
             dry_run = args.dry_run,

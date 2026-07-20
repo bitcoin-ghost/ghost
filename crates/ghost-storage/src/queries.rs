@@ -628,6 +628,100 @@ impl Database {
         Ok((inserted, miners_created))
     }
 
+    /// Batched form of [`Self::import_unpaid_shares`] for large reconciliations.
+    ///
+    /// The caller streams the export in CHUNKS (so the whole file never sits in RAM — the
+    /// unbatched CLI path OOM-killed memory-constrained nodes loading a 600MB+ union). Here
+    /// each chunk's share inserts run in ONE transaction (one fsync per chunk, not per row —
+    /// the per-row autocommit made the import take tens of minutes and hammer the WAL). Miners
+    /// are few and distinct, so they go through the encryption-aware `upsert_miner` helper
+    /// (outside the transaction — nesting `self.*` inside `self.transaction` would deadlock on
+    /// the single write connection). `INSERT OR IGNORE` keeps it idempotent on UNIQUE(share_hash);
+    /// `execute` returns rows-affected (1 = new, 0 = already had it).
+    pub fn import_unpaid_shares_batch(
+        &self,
+        chunk: &[UnpaidShareExport],
+        dry_run: bool,
+    ) -> GhostResult<(usize, usize)> {
+        let mut miners_created = 0usize;
+
+        // Ensure each distinct miner exists (few of them; the payout query's INNER JOIN drops a
+        // share whose miner is absent). Deduped per chunk so we don't re-check every row.
+        let mut checked: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for s in chunk {
+            if !checked.insert(s.miner_id.as_str()) {
+                continue;
+            }
+            if let Some(addr) = &s.payout_address {
+                if self.get_miner_payout_address(&s.miner_id)?.is_none() {
+                    if !dry_run {
+                        self.upsert_miner(&crate::models::MinerRecord {
+                            miner_id: s.miner_id.clone(),
+                            payout_address: addr.clone(),
+                            first_seen: s.timestamp,
+                            last_seen: s.timestamp,
+                            connected_node: None,
+                            total_shares: 0,
+                            total_work: 0.0,
+                            blocks_won: 0,
+                            total_payouts_sats: 0,
+                            avg_hashrate_ths: 0.0,
+                        })?;
+                    }
+                    miners_created += 1;
+                }
+            }
+        }
+
+        if dry_run {
+            let mut inserted = 0usize;
+            self.with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT 1 FROM shares WHERE share_hash = ?1")
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                for s in chunk {
+                    let exists = stmt
+                        .exists(params![s.share_hash])
+                        .map_err(|e| GhostError::Database(e.to_string()))?;
+                    if !exists {
+                        inserted += 1;
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok((inserted, miners_created));
+        }
+
+        let inserted = self.transaction(|tx| {
+            let mut n = 0usize;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT OR IGNORE INTO shares
+                         (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                    )
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                for s in chunk {
+                    n += stmt
+                        .execute(params![
+                            s.round_id,
+                            s.miner_id,
+                            s.difficulty,
+                            s.work,
+                            s.share_hash,
+                            s.timestamp,
+                            s.received_by,
+                        ])
+                        .map_err(|e| GhostError::Database(e.to_string()))?;
+                }
+            }
+            Ok(n)
+        })?;
+
+        Ok((inserted, miners_created))
+    }
+
     /// Maximum rows returned by unbounded queries (H-7: OOM prevention)
     pub const MAX_QUERY_RESULTS: u32 = 10000;
 
@@ -13329,5 +13423,50 @@ mod ledger_reconciliation_tests {
             credited, 500.0,
             "the imported work must be credited, not dropped"
         );
+    }
+
+    /// The batched/streaming import must behave exactly like the row-at-a-time one:
+    /// insert the missing shares, create the missing miner, credit the work, and be
+    /// safe to re-run. This is the path the CLI uses for large reconciliations.
+    #[test]
+    fn batched_import_matches_and_is_idempotent() {
+        let a = Database::in_memory().expect("db a");
+        let b = Database::in_memory().expect("db b");
+
+        a.upsert_miner(&miner("m9", "bc1qbatchaddrcccccccccccccccccccccccccccc"))
+            .expect("miner");
+        a.insert_share(&share("b1", "m9", 700.0, 10)).expect("s1");
+        a.insert_share(&share("b2", "m9", 300.0, 20)).expect("s2");
+
+        assert!(b.get_miner_payout_address("m9").expect("lookup").is_none());
+        let exported = a.export_unpaid_shares().expect("export");
+
+        // Dry run writes nothing.
+        let (would, _) = b
+            .import_unpaid_shares_batch(&exported, true)
+            .expect("dry run");
+        assert_eq!(would, 2);
+        assert!(b.get_top_unpaid_miners(i64::MAX, 100).expect("ledger").is_empty());
+
+        // Real batched import inserts both shares and creates the miner.
+        let (inserted, miners_created) = b
+            .import_unpaid_shares_batch(&exported, false)
+            .expect("import");
+        assert_eq!(inserted, 2);
+        assert_eq!(miners_created, 1);
+        let credited: f64 = b
+            .get_top_unpaid_miners(i64::MAX, 100)
+            .expect("ledger")
+            .iter()
+            .map(|(_, w)| *w)
+            .sum();
+        assert_eq!(credited, 1_000.0, "work must be credited");
+
+        // Idempotent: re-running the same chunk changes nothing.
+        let (again, again_miners) = b
+            .import_unpaid_shares_batch(&exported, false)
+            .expect("re-import");
+        assert_eq!(again, 0, "re-running must not double-count");
+        assert_eq!(again_miners, 0, "miner already exists on re-run");
     }
 }
