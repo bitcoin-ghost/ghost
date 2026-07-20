@@ -1,0 +1,112 @@
+name: Semver Check
+
+on:
+  pull_request:
+    branches:
+      - "main"
+
+jobs:
+  semver-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (1.85)
+        uses: dtolnay/rust-toolchain@1.85
+        id: toolchain
+
+      # NOTE: A repo-local `rust-toolchain.toml` is still respected by rustup.
+      # `dtolnay/rust-toolchain` installs the requested toolchain but does not
+      # automatically override it.
+      - name: Override toolchain
+        run: |
+          rustup override set ${{ steps.toolchain.outputs.name }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache Cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --version 0.37.0 --locked
+
+      - name: Run semver checks for sv2/buffer-sv2
+        working-directory: sv2/buffer-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/binary-sv2
+        working-directory: sv2/binary-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/framing-sv2
+        working-directory: sv2/framing-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/noise-sv2
+        working-directory: sv2/noise-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/codec-sv2
+        working-directory: sv2/codec-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/subprotocols/common-messages
+        working-directory: sv2/subprotocols/common-messages
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/subprotocols/job-declaration
+        working-directory: sv2/subprotocols/job-declaration
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/subprotocols/mining
+        working-directory: sv2/subprotocols/mining
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/subprotocols/template-distribution
+        working-directory: sv2/subprotocols/template-distribution
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/channels-sv2
+        working-directory: sv2/channels-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/parsers-sv2
+        working-directory: sv2/parsers-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/handlers-sv2
+        working-directory: sv2/handlers-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for sv2/extensions-sv2
+        working-directory: sv2/extensions-sv2
+        run: cargo semver-checks
+
+      - name: Run semver checks for protocols/v1
+        working-directory: sv1
+        run: cargo semver-checks
+
+      - name: Run semver checks for stratum-core/stratum-translation
+        working-directory: stratum-core/stratum-translation
+        run: cargo semver-checks
+
+      - name: Run semver checks for stratum-core
+        working-directory: stratum-core
+        run: cargo semver-checks
+

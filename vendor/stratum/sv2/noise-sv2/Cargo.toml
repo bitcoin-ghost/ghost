@@ -1,0 +1,47 @@
+[package]
+name = "noise_sv2"
+version = "1.4.2"
+authors = ["The Stratum V2 Developers"]
+edition = "2021"
+readme = "README.md"
+description = "Sv2 noise"
+documentation = "https://docs.rs/noise_sv2"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stratum-mining/stratum"
+homepage = "https://stratumprotocol.org"
+keywords = ["stratum", "mining", "bitcoin", "protocol"]
+
+[dependencies]
+secp256k1 = { workspace = true, features = ["hashes", "alloc", "rand"] }
+rand = { workspace = true, default-features = false }
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["rand/std", "rand/std_rng", "secp256k1/rand-std"]
+
+[dev-dependencies]
+quickcheck = { workspace = true }
+quickcheck_macros = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+rayon-core = { workspace = true }
+rand = { workspace = true, default-features = false, features = ["std", "std_rng"] }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "abort"
+
+[package.metadata.docs.rs]
+features = ["std"]
+
+[[bench]]
+name = "handshake"
+harness = false
+
+
+[[bench]]
+name = "roundtrip"
+harness = false

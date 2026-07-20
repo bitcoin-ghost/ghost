@@ -1,0 +1,4 @@
+.idea
+/integration-test-framework
+target/
+.vscode

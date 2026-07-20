@@ -1,0 +1,34 @@
+[package]
+name = "buffer_sv2"
+version = "3.0.1"
+authors = ["The Stratum V2 Developers"]
+edition = "2021"
+description = "buffer"
+documentation = "https://docs.rs/buffer_sv2"
+readme = "README.md"
+homepage = "https://stratumprotocol.org"
+repository = "https://github.com/stratum-mining/stratum"
+license = "MIT OR Apache-2.0"
+keywords = ["stratum", "mining", "bitcoin", "protocol"]
+
+[dependencies]
+aes-gcm = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true, default-features = true }
+iai = { workspace = true }
+criterion = { workspace = true }
+rayon-core = { workspace = true }
+
+[[bench]]
+name = "pool_benchmark"
+harness = false
+
+[[bench]]
+name = "pool_iai"
+harness = false
+
+[features]
+debug = []
+fuzz = []
+

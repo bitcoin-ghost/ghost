@@ -30,7 +30,7 @@ description = "Stratum V2 protocol wrapper for Bitcoin Ghost - re-exports stratu
 
 [dependencies]
 # Stratum protocol crates (from stratum/ submodule)
-stratum-core = { path = "../../stratum/stratum-core", features = ["translation"] }
+stratum-core = { path = "../../vendor/stratum/stratum-core", features = ["translation"] }
 
 # Re-export these for convenience (they're also in stratum-core but direct access is useful)
 sv1_api = { path = "../../stratum/sv1" }

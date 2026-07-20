@@ -78,7 +78,12 @@ members = [
     "crates/bitcoin-core-sv2",
     "tests/integration-sv2",
 ]
-exclude = []
+# Vendored stratum-core (SV2 protocol libs), copied in-tree from
+# stratum-mining/stratum @ ab5b17f (dual MIT/Apache — LICENSEs retained) so the
+# monorepo is self-contained and forkable in place. It keeps its OWN [workspace]
+# (its own dependency versions), so it is EXCLUDED from ours; the SV2 crates depend
+# on it by path (vendor/stratum/stratum-core).
+exclude = ["vendor/stratum"]
 # NOTE: Full Node Wallets (ghost-wallet-cli, ghost-wallet-tui) are built from
 # the bitcoin-ghost repository since they require ghostd and ghost-crypto.
 # Use scripts/build-all-wallets.sh to build all wallet types.

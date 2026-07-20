@@ -21,6 +21,6 @@ async-channel = "1.5.1"
 # fetching from github enables synchronizing development workflows across sv2-apps and stratum repos
 # it MUST be changed before bitcoin-core-sv2 is published to crates.io
 # with the proper version of stratum-core being fetched from crates.io as well
-stratum-core = { git = "https://github.com/stratum-mining/stratum", rev = "ab5b17f23d567c41a128776f979a597327f0800c" }
+stratum-core = { path = "../../vendor/stratum/stratum-core" }
 
 bitcoin-capnp-types = "0.1.0"

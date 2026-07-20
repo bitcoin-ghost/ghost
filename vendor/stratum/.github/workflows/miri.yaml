@@ -1,0 +1,38 @@
+name: Miri
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  miri-sv2:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly + Miri
+        # FIXME: Pin nightly due to a regression in miri on nightly-2026-02-12.
+        # See https://github.com/rust-lang/miri/issues/4855.
+        # Revert to plain `channel: nightly` once this is fixed upstream.
+        uses: dtolnay/rust-toolchain@master
+        id: toolchain
+        with:
+          toolchain: nightly-2026-02-10
+          components: miri
+      
+      # NOTE: A repo-local `rust-toolchain.toml` is still respected by rustup.
+      # `dtolnay/rust-toolchain` installs the requested toolchain but does not
+      # automatically override it.
+      - name: Override toolchain
+        run: rustup override set ${{ steps.toolchain.outputs.name }}
+
+      - name: Miri setup
+        run: cargo miri setup
+
+      - name: Run Miri for buffer-sv2
+        run: cargo miri test -p buffer_sv2
+
+      - name: Run Miri for noise-sv2
+        run: cargo miri test -p noise_sv2
