@@ -463,6 +463,7 @@ mod tests {
 
     fn signed_share(signer: &NodeIdentity, nonce: u64) -> ShareProof {
         let mut p = ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,
@@ -735,6 +736,7 @@ mod tests {
         // Remote share: received_by = a different node, signed by it, sender's template.
         let remote_signer = NodeIdentity::generate();
         let mut remote = ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,
@@ -764,6 +766,7 @@ mod tests {
         let rm_local = Arc::new(RoundManager::new(local_id.node_id(), cfg));
         rm_local.set_template_id(TPL);
         let mut local = ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,
@@ -805,6 +808,7 @@ mod tests {
         rm.set_template_id(TPL);
 
         let mut p = ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,

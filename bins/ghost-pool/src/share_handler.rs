@@ -262,6 +262,7 @@ mod tests {
 
         // Create a share proof from our own node
         let proof = ghost_common::types::ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [2u8; 32],
             difficulty: 1000.0,
@@ -295,6 +296,7 @@ mod tests {
 
         // Create a share proof with a very old timestamp
         let proof = ghost_common::types::ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [3u8; 32],
             difficulty: 1000.0,
@@ -331,6 +333,7 @@ mod tests {
         // Create a share proof with a timestamp 60 seconds in the future (beyond 30s tolerance)
         let future_timestamp = (Utc::now().timestamp() + 60) as u64;
         let proof = ghost_common::types::ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [3u8; 32],
             difficulty: 1000.0,
@@ -366,6 +369,7 @@ mod tests {
 
         // Create a share proof from another node with a valid (recent) timestamp
         let proof = ghost_common::types::ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [3u8; 32],
             difficulty: 1000.0,
@@ -404,6 +408,7 @@ mod tests {
         let handler = ShareProofHandler::new(rm, db.clone(), our_node_id);
 
         let proof = ghost_common::types::ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [3u8; 32],
             difficulty: 1000.0,
@@ -452,6 +457,7 @@ mod tests {
         let miner_hex = hex::encode(&miner_id[..8]);
 
         let proof = ghost_common::types::ShareProof {
+            header: None,
             round_id: 1,
             miner_id,
             difficulty: 500.0,

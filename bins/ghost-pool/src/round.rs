@@ -599,8 +599,47 @@ impl RoundManager {
 
         let diff_calc = self.difficulty.read();
 
-        // C4: Cryptographic verification - verify the hash actually meets the claimed difficulty
-        if !diff_calc.verify_share_difficulty(&proof.share_hash, proof.difficulty) {
+        // C4: verify the share actually meets its claimed difficulty.
+        //
+        // Multi-operator: AT/ABOVE `SHARE_POW_VERIFY_HEIGHT` this is not enough. The numeric
+        // check trusts that `share_hash` is a REAL sha256d of a header — true when your own SRI
+        // produced it, but a hostile peer can gossip a fabricated 32-byte value with an in-range
+        // numeric difficulty and no real hashing. So require the 80-byte header and recompute the
+        // PoW preimage independently: `sha256d(header) == share_hash` AND meets difficulty. You
+        // cannot forge a header that hashes to a chosen value without doing the work. The header
+        // is bound by the GHOST-09 signature, so it can't be stripped or swapped in flight. This
+        // runs on the GOSSIP + BACKFILL ingest paths (both funnel here), which is exactly where an
+        // injected share would enter the converged ledger; a node's own SRI-validated shares are
+        // its own trust anchor. Below the gate, the legacy numeric check stands (single-operator).
+        if self.current_height() >= crate::SHARE_POW_VERIFY_HEIGHT {
+            let header80 = match proof.header.as_deref() {
+                Some(h) if h.len() == 80 => {
+                    let mut a = [0u8; 80];
+                    a.copy_from_slice(h);
+                    a
+                }
+                _ => {
+                    warn!(
+                        round_id = proof.round_id,
+                        miner = %hex::encode(&proof.miner_id[..8]),
+                        "share proof missing its 80-byte PoW header (required at/above SHARE_POW_VERIFY_HEIGHT)"
+                    );
+                    return Err(ShareError::InvalidShareHash);
+                }
+            };
+            if !ghost_accounting::DifficultyCalculator::verify_pow_preimage(
+                &header80,
+                &proof.share_hash,
+                proof.difficulty,
+            ) {
+                warn!(
+                    round_id = proof.round_id,
+                    miner = %hex::encode(&proof.miner_id[..8]),
+                    "share PoW does not verify against its header — rejecting (fabricated/relayed)"
+                );
+                return Err(ShareError::InvalidShareHash);
+            }
+        } else if !diff_calc.verify_share_difficulty(&proof.share_hash, proof.difficulty) {
             return Err(ShareError::InvalidShareHash);
         }
 
@@ -1686,6 +1725,7 @@ mod tests {
         // Create a share proof
         let share_hash = [42u8; 32];
         let proof = ShareProof {
+            header: None,
             round_id: 1,
             miner_id: [1u8; 32],
             difficulty: 1500.0, // Above pool minimum
@@ -1718,6 +1758,53 @@ mod tests {
                 "Duplicate share proof should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn share_pow_verify_gate_rejects_missing_and_fabricated_header() {
+        // Multi-operator (B-4): at/above SHARE_POW_VERIFY_HEIGHT a gossiped share MUST carry
+        // its 80-byte header and re-verify PoW; a fabricated hash (the injection vector) is
+        // rejected because no header hashes to it.
+        let our = [1u8; 32];
+        let manager = RoundManager::new(our, RoundConfig::default());
+        // The gate is u64::MAX (dormant); put the round height AT it so the gated path runs.
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+        assert!(manager.current_height() >= crate::SHARE_POW_VERIFY_HEIGHT);
+
+        let peer = [9u8; 32]; // received_by != our_node_id → skips the local-template check
+        let base = ShareProof {
+            round_id: 1,
+            miner_id: [2u8; 32],
+            difficulty: 1.0,
+            work: 1.0,
+            share_hash: [7u8; 32],
+            timestamp: 0,
+            received_by: peer,
+            template_id: Some([3u8; 32]),
+            payout_address: None,
+            header: None,
+            signature: None,
+        };
+
+        // No header above the gate → rejected (can't independently re-verify PoW).
+        assert!(
+            matches!(
+                manager.handle_share_proof(base.clone()),
+                Err(ShareError::InvalidShareHash)
+            ),
+            "a share with no header must be rejected at/above the gate"
+        );
+
+        // A header that does NOT hash to share_hash → rejected (fabricated/relayed).
+        let mut fabricated = base.clone();
+        fabricated.header = Some(vec![0u8; 80]); // sha256d([0;80]) != [7;32]
+        assert!(
+            matches!(
+                manager.handle_share_proof(fabricated),
+                Err(ShareError::InvalidShareHash)
+            ),
+            "a header that isn't the share's PoW preimage must be rejected"
+        );
     }
 
     #[test]
