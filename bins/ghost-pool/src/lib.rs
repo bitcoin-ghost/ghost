@@ -173,6 +173,27 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = u64::MAX;
 /// comfortably past the roll window.
 pub const VOTER_SET_QUALIFICATION_HEIGHT: u64 = u64::MAX;
 
+/// Multi-operator consensus-drawn challenger assignment (Surface A-2b). At and above this
+/// height, node-reward qualification counts a challenger's verdict only if that challenger was
+/// ASSIGNED to challenge the target for the round the verdict was issued in — a deterministic
+/// draw seeded by a buried block hash over the converged, subnet-deduplicated node pool
+/// (`ghost_verification::challenger_assignment`). Below it, any recorded verdict counts (A-2's
+/// voter-set + subnet floor still applies).
+///
+/// This removes the self-selected-challenger hole: without it the "random" challenger choice
+/// only binds honest nodes, so a Sybil operator points its own fakes at its own target and
+/// rubber-stamps. Which verdicts count is consensus-visible (it decides the coinbase node
+/// split), so this is a height gate: every node recomputes the identical assignment at the
+/// checkpoint cutoff, so a mixed-version fleet agrees on the node split during the roll.
+/// DORMANT until challenges have been issued+recorded against their assigned round for a full
+/// lookback window; SET comfortably past the roll window.
+pub const CHALLENGER_ASSIGNMENT_HEIGHT: u64 = u64::MAX;
+
+/// Finality lag (in blocks) between a round and the block whose hash seeds it: a round at tip
+/// height `H` is seeded by `blockhash(H - CHALLENGER_ASSIGNMENT_SEED_LAG)`, buried enough that a
+/// miner cannot grind the tip to steer the draw.
+pub const CHALLENGER_ASSIGNMENT_SEED_LAG: u64 = 6;
+
 /// Activation heights, resolved once at startup.
 ///
 /// A regtest chain is ~100 blocks tall, so every mainnet gate is dormant there and a regtest
@@ -191,6 +212,7 @@ mod gates {
     pub(super) static CLUSTER_ENFORCEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static FEE_TO_NODE_POOL: OnceLock<u64> = OnceLock::new();
     pub(super) static VOTER_SET_QUALIFICATION: OnceLock<u64> = OnceLock::new();
+    pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -220,18 +242,26 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         VOTER_SET_QUALIFICATION_HEIGHT,
     );
+    let challenger_assignment = gates::from_env(
+        "GHOST_CHALLENGER_ASSIGNMENT_HEIGHT",
+        network,
+        CHALLENGER_ASSIGNMENT_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::FEE_TO_NODE_POOL.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
+    let _ = gates::CHALLENGER_ASSIGNMENT.set(challenger_assignment);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != FEE_TO_NODE_POOL_HEIGHT
         || voter_set != VOTER_SET_QUALIFICATION_HEIGHT
+        || challenger_assignment != CHALLENGER_ASSIGNMENT_HEIGHT
     {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
             fee_to_node_pool_height = fee,
             voter_set_qualification_height = voter_set,
+            challenger_assignment_height = challenger_assignment,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
         );
@@ -253,6 +283,12 @@ pub fn fee_to_node_pool_height() -> u64 {
 /// voter set and requires IP/subnet diversity (Surface A-2).
 pub fn voter_set_qualification_height() -> u64 {
     *gates::VOTER_SET_QUALIFICATION.get_or_init(|| VOTER_SET_QUALIFICATION_HEIGHT)
+}
+
+/// The height at which node-reward qualification counts only verdicts from the challenger that
+/// was consensus-ASSIGNED to challenge the target that round (Surface A-2b).
+pub fn challenger_assignment_height() -> u64 {
+    *gates::CHALLENGER_ASSIGNMENT.get_or_init(|| CHALLENGER_ASSIGNMENT_HEIGHT)
 }
 
 /// GhostGlyph P2P handler for visual identity registration.
