@@ -318,6 +318,13 @@ impl ConvergenceHandler {
                     // Mirrors the live-gossip insert in `share_handler.rs` exactly, so a share
                     // backfilled here is byte-identical to one that arrived first time. The
                     // UNIQUE constraint on `share_hash` makes this idempotent.
+                    //
+                    // Store the SIGNED PROOF alongside the row (not `insert_share`, which
+                    // leaves `proof` NULL). A proof-less row is UNSERVABLE — GHOST-03 backfills
+                    // from the stored proof blob, so a node can never re-serve it to a third
+                    // node, and the divergence this protocol exists to REPAIR instead
+                    // PROPAGATES. The window path (`apply_ledger_response`) already does this;
+                    // this round-scoped path was the outlier manufacturing unservable orphans.
                     let share_record = ghost_storage::models::ShareRecord {
                         id: None,
                         round_id,
@@ -329,8 +336,9 @@ impl ConvergenceHandler {
                         received_by: from_node,
                         valid: true,
                     };
+                    let proof_blob = serde_json::to_vec(proof).unwrap_or_default();
 
-                    match db.insert_share(&share_record) {
+                    match db.insert_share_with_proof(&share_record, &proof_blob) {
                         Ok(_) => {
                             if let Err(e) = db.increment_miner_stats(&miner_hex, 1, work) {
                                 warn!(
