@@ -793,6 +793,7 @@ impl QualifiedCapabilityProvider {
         &self,
         node_ids: &[String],
         cutoff_ts: i64,
+        voter_set_scoped: bool,
     ) -> Vec<(NodeId, i32)> {
         let since = cutoff_ts - (self.config.lookback_days as i64 * SECONDS_PER_DAY);
         let network_size = node_ids.len();
@@ -801,8 +802,14 @@ impl QualifiedCapabilityProvider {
 
         let mut qualified = Vec::new();
         for hex_id in node_ids {
-            let caps =
-                self.qualified_caps_at_cutoff(hex_id, since, cutoff_ts, min_challenges, min_unique);
+            let caps = self.qualified_caps_at_cutoff(
+                hex_id,
+                since,
+                cutoff_ts,
+                min_challenges,
+                min_unique,
+                voter_set_scoped,
+            );
             let shares = caps.total_shares();
             if shares > 0 {
                 if let Some(node_id) = decode_node_id(hex_id) {
@@ -821,7 +828,11 @@ impl QualifiedCapabilityProvider {
     /// qualified-node set the fleet ratified — recompute a different set anywhere and
     /// the root mismatches. An empty result on a DB error is fail-safe (no node
     /// payout rather than a wrong one).
-    pub fn get_all_qualified_nodes_at_cutoff_from_db(&self, cutoff_ts: i64) -> Vec<(NodeId, i32)> {
+    pub fn get_all_qualified_nodes_at_cutoff_from_db(
+        &self,
+        cutoff_ts: i64,
+        voter_set_scoped: bool,
+    ) -> Vec<(NodeId, i32)> {
         let node_ids = match self.db.get_all_node_ids_with_payout() {
             Ok(ids) => ids,
             Err(e) => {
@@ -832,7 +843,7 @@ impl QualifiedCapabilityProvider {
                 return Vec::new();
             }
         };
-        self.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff_ts)
+        self.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff_ts, voter_set_scoped)
     }
 
     /// Deterministic per-node capability set from the converged ledger over
@@ -845,6 +856,7 @@ impl QualifiedCapabilityProvider {
         until: i64,
         min_challenges: u32,
         min_unique: u32,
+        voter_set_scoped: bool,
     ) -> NodeCapabilities {
         // All four capabilities use a strict per-distinct-challenger MAJORITY over the converged
         // ledger + the C-2 unique-challenger floor. The ledger stores each challenger's own signed
@@ -858,6 +870,7 @@ impl QualifiedCapabilityProvider {
             until,
             min_challenges,
             min_unique,
+            voter_set_scoped,
         );
         let reaper = self.majority_capability_qualified(
             node_id_hex,
@@ -866,6 +879,7 @@ impl QualifiedCapabilityProvider {
             until,
             min_challenges,
             min_unique,
+            voter_set_scoped,
         );
         let public_mining = self.majority_capability_qualified(
             node_id_hex,
@@ -874,6 +888,7 @@ impl QualifiedCapabilityProvider {
             until,
             min_challenges,
             min_unique,
+            voter_set_scoped,
         );
         let ghost_pay = self.majority_capability_qualified(
             node_id_hex,
@@ -882,6 +897,7 @@ impl QualifiedCapabilityProvider {
             until,
             min_challenges,
             min_unique,
+            voter_set_scoped,
         );
 
         // Elder is registration order in the (converged) nodes table, unchanged.
@@ -901,6 +917,13 @@ impl QualifiedCapabilityProvider {
     /// strict majority of distinct challengers passed AND distinct challengers ≥
     /// min_unique`. `challengers_total` from the majority query IS the distinct-
     /// challenger count, so it serves the count floor and the C-2 Sybil floor.
+    ///
+    /// When `voter_set_scoped` (Surface A-2, at/above `VOTER_SET_QUALIFICATION_HEIGHT`),
+    /// the distinct challengers are restricted to the consensus VOTER SET (nodes with
+    /// a payout address) and the Sybil floor is applied to the number of distinct `/24`
+    /// IP SUBNETS those challengers span — so a Sybil farm sharing a subnet cannot
+    /// reach the floor no matter how many identities it mints. Below the gate the
+    /// legacy network-size-scaled distinct-challenger count stands.
     fn majority_capability_qualified(
         &self,
         node_id_hex: &str,
@@ -909,12 +932,25 @@ impl QualifiedCapabilityProvider {
         until: i64,
         min_challenges: u32,
         min_unique: u32,
+        voter_set_scoped: bool,
     ) -> bool {
-        let (chal_pass, chal_total) = self
-            .db
-            .ledger_challenger_majority(node_id_hex, capability, since, until)
-            .unwrap_or((0, 0));
-        chal_total >= min_challenges && chal_total >= min_unique && chal_pass * 2 > chal_total
+        if voter_set_scoped {
+            let (chal_pass, chal_total, distinct_subnets) = self
+                .db
+                .ledger_voterset_challenger_stats(node_id_hex, capability, since, until)
+                .unwrap_or((0, 0, 0));
+            // Count floor on voter-set challengers; Sybil floor on distinct SUBNETS
+            // (not identities); strict majority of the voter-set challengers passed.
+            chal_total >= min_challenges
+                && distinct_subnets >= min_unique
+                && chal_pass * 2 > chal_total
+        } else {
+            let (chal_pass, chal_total) = self
+                .db
+                .ledger_challenger_majority(node_id_hex, capability, since, until)
+                .unwrap_or((0, 0));
+            chal_total >= min_challenges && chal_total >= min_unique && chal_pass * 2 > chal_total
+        }
     }
 
     /// Get statistics for a node's qualification status
@@ -1413,9 +1449,9 @@ mod tests {
         seed_archive(&db_b, &target, 0x10, 4, true, cutoff - 100);
 
         let a = QualifiedCapabilityProvider::new(db_a)
-            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false);
         let b = QualifiedCapabilityProvider::new(db_b)
-            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff);
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false);
 
         assert_eq!(
             a, b,
@@ -1445,7 +1481,7 @@ mod tests {
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
         assert!(
             provider
-                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff)
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false)
                 .is_empty(),
             "post-cutoff challenges must not count; node is under the floor with no uptime rows"
         );
@@ -1454,7 +1490,7 @@ mod tests {
         // uptime data anywhere, proving liveness comes from challenge-accrual.
         seed_archive(&db, &target, 0x13, 1, true, cutoff - 50);
         assert_eq!(
-            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff),
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false),
             vec![(decode_node_id(&target).unwrap(), 5)],
             "an in-window challenge over the floor qualifies the node"
         );
@@ -1487,9 +1523,138 @@ mod tests {
 
         let provider = QualifiedCapabilityProvider::new(db);
         assert_eq!(
-            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff),
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false),
             vec![(decode_node_id(&target).unwrap(), 3)],
             "4-of-5 distinct challengers passing is a strict majority → +3 shares"
+        );
+    }
+
+    // =================================================================
+    // A-2: voter-set-scoped + IP-subnet-diverse distinct challengers
+    // =================================================================
+
+    /// Register `node_hex` as a consensus voter-set member (a `nodes` row with a
+    /// payout address) advertising `address`, so it counts as a voter-set
+    /// challenger with a resolvable `/24` subnet.
+    fn register_voter(db: &Database, node_hex: &str, address: &str) {
+        let rec = ghost_storage::models::NodeRecord {
+            node_id: node_hex.to_string(),
+            public_address: Some(address.to_string()),
+            display_name: None,
+            first_seen: 0,
+            last_seen: 0,
+            is_elder: false,
+            elder_order: None,
+            capabilities: "{}".to_string(),
+            total_uptime_secs: 0,
+            uptime_7d_percent: 0.0,
+            verification_pass_rate: 0.0,
+            total_shares_received: 0,
+            total_blocks_found: 0,
+            payout_address: Some("beef".to_string()),
+        };
+        db.upsert_node(&rec).unwrap();
+        db.update_node_payout_address(node_hex, "beef").unwrap();
+    }
+
+    /// Under the A-2 gate, challengers that are NOT voter-set members (only rows in
+    /// the ledger, never registered nodes with a payout address) do not count — the
+    /// same seed that qualifies on the legacy path yields nothing when voter-scoped.
+    #[test]
+    fn voterset_excludes_non_voter_challengers() {
+        let target = hex_id(0xD1);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64; // network_size 5 → min_challenges 4, min_unique 3
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        // 4 passing challengers, none of them registered voter-set members.
+        seed_archive(&db, &target, 0x10, 4, true, cutoff - 100);
+        let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
+
+        assert_eq!(
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false),
+            vec![(decode_node_id(&target).unwrap(), 5)],
+            "legacy path counts any challenger → qualifies"
+        );
+        assert!(
+            provider
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true)
+                .is_empty(),
+            "voter-set path: no challenger is a voter-set member → not qualified"
+        );
+    }
+
+    /// Under the A-2 gate, a Sybil farm sharing IP subnets cannot reach the floor no
+    /// matter how many identities it mints: 4 voter-set identities across only 2
+    /// subnets fail; spreading them across ≥3 subnets qualifies.
+    #[test]
+    fn voterset_requires_subnet_diversity() {
+        let target = hex_id(0xD2);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64; // min_challenges 4, min_unique 3
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        let chs = [hex_id(0x11), hex_id(0x12), hex_id(0x13), hex_id(0x14)];
+        // Four passing voter-set challengers, but only TWO distinct /24 subnets.
+        let clustered = [
+            "10.0.0.1:8080",
+            "10.0.0.2:8080",
+            "10.0.1.9:8080",
+            "10.0.1.8:8080",
+        ];
+        for (c, a) in chs.iter().zip(clustered.iter()) {
+            register_voter(&db, c, a);
+            db.insert_verification_proof(c, &target, "archive", true, cutoff - 100, b"p")
+                .unwrap();
+        }
+        let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
+        assert!(
+            provider
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true)
+                .is_empty(),
+            "4 identities across only 2 subnets must not reach the subnet floor of 3"
+        );
+
+        // Re-home two challengers onto fresh subnets → 3 distinct subnets → qualifies.
+        register_voter(&db, &chs[2], "172.16.5.5:8080");
+        register_voter(&db, &chs[3], "192.168.9.9:8080");
+        assert_eq!(
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true),
+            vec![(decode_node_id(&target).unwrap(), 5)],
+            "4 voter-set challengers across ≥3 distinct subnets clears the floor"
+        );
+    }
+
+    /// Under the A-2 gate the pass majority is taken over voter-set challengers: 4
+    /// passing (distinct subnets) vs 1 failing still qualifies (+3 stratum shares).
+    #[test]
+    fn voterset_majority_survives_one_griefer() {
+        let target = hex_id(0xD3);
+        let node_ids = vec![target.clone(), hex_id(1), hex_id(2), hex_id(3), hex_id(4)];
+        let cutoff = 2_000_000i64; // min_challenges 4, min_unique 3
+        let db = Arc::new(Database::in_memory().unwrap());
+
+        let passers = [
+            (hex_id(0x21), "10.1.0.1:3333"),
+            (hex_id(0x22), "10.2.0.1:3333"),
+            (hex_id(0x23), "10.3.0.1:3333"),
+            (hex_id(0x24), "10.4.0.1:3333"),
+        ];
+        for (c, a) in passers.iter() {
+            register_voter(&db, c, a);
+            db.insert_verification_proof(c, &target, "stratum", true, cutoff - 100, b"p")
+                .unwrap();
+        }
+        // One voter-set griefer on its own subnet signs a FAIL.
+        register_voter(&db, &hex_id(0x25), "10.5.0.1:3333");
+        db.insert_verification_proof(&hex_id(0x25), &target, "stratum", false, cutoff - 100, b"p")
+            .unwrap();
+
+        let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
+        assert_eq!(
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true),
+            vec![(decode_node_id(&target).unwrap(), 3)],
+            "4-of-5 voter-set challengers passing across distinct subnets → +3 shares"
         );
     }
 }

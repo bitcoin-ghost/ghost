@@ -333,6 +333,29 @@ fn i64_to_u32_count(value: i64, field_name: &str) -> Result<u32, rusqlite::Error
     Ok(value as u32)
 }
 
+/// A-2: Extract the `/24` IPv4 subnet prefix (`"a.b.c"`) from a `host` or
+/// `host:port` address, for IP-diversity counting of distinct challengers.
+///
+/// Returns `None` for anything that is not a dotted-quad IPv4 literal (hostnames,
+/// IPv6, malformed input), so an unresolvable/absent address never fabricates a
+/// distinct subnet. Deterministic and pure — mirrors the mesh's
+/// `extract_ipv4_subnet` without depending on ghost-consensus.
+fn ipv4_subnet_24(addr: &str) -> Option<String> {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr).trim();
+    let octets: Vec<&str> = host.split('.').collect();
+    if octets.len() != 4 {
+        return None;
+    }
+    // Every octet must be a valid 0-255 integer for this to be an IPv4 literal.
+    for o in &octets {
+        match o.parse::<u16>() {
+            Ok(v) if v <= 255 && !o.is_empty() => {}
+            _ => return None,
+        }
+    }
+    Some(format!("{}.{}.{}", octets[0], octets[1], octets[2]))
+}
+
 /// 4.19 SECURITY: Generic i64 to u64 conversion for non-satoshi values (epochs, timestamps, heights)
 ///
 /// SQLite stores all integers as signed i64. This helper validates the conversion for
@@ -6225,6 +6248,93 @@ impl Database {
         })
     }
 
+    /// Sybil-resistant (A-2) form of [`Self::ledger_challenger_majority`]: over the
+    /// converged ledger, count only DISTINCT challengers that are members of the
+    /// consensus voter set (nodes with a payout address), and additionally report
+    /// how many DISTINCT `/24` IP subnets those voter-set challengers span.
+    ///
+    /// Returns `(challengers_pass, challengers_total, distinct_subnets)` where:
+    /// - `challengers_total` = distinct voter-set challengers,
+    /// - `challengers_pass`  = those whose own verdicts were a majority PASS,
+    /// - `distinct_subnets`  = distinct `/24` prefixes of those challengers'
+    ///   `public_address` (a challenger with no/unparseable address contributes no
+    ///   subnet), so a Sybil farm sharing one subnet counts once no matter how many
+    ///   identities it mints.
+    ///
+    /// All inputs are converged DB state (the `verification_ledger` and the `nodes`
+    /// registration table the checkpoint already agrees on), so every node computes
+    /// an identical result — required for the node split to stay recomputable.
+    pub fn ledger_voterset_challenger_stats(
+        &self,
+        target_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+    ) -> GhostResult<(u32, u32, u32)> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        SUM(CASE WHEN c_pass * 2 >= c_total THEN 1 ELSE 0 END) AS challengers_pass,
+                        COUNT(*) AS challengers_total
+                     FROM (
+                        SELECT vl.challenger_id AS cid,
+                               SUM(CASE WHEN vl.passed = 1 THEN 1 ELSE 0 END) AS c_pass,
+                               COUNT(*) AS c_total
+                        FROM verification_ledger vl
+                        JOIN nodes n ON n.node_id = vl.challenger_id
+                        WHERE vl.target_node_id = ?1 AND vl.capability = ?2
+                          AND vl.timestamp >= ?3 AND vl.timestamp <= ?4
+                          AND n.payout_address IS NOT NULL AND n.payout_address != ''
+                        GROUP BY vl.challenger_id
+                     )",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let (pass, total) = stmt
+                .query_row(params![target_hex, capability, since, until], |row| {
+                    let pass: Option<i64> = row.get(0)?;
+                    let total: i64 = row.get(1)?;
+                    Ok((
+                        i64_to_u32_count(pass.unwrap_or(0), "voterset_challengers_pass")?,
+                        i64_to_u32_count(total, "voterset_challengers_total")?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            // Distinct /24 subnets among the voter-set challengers. Computed in Rust
+            // (rather than SQL string surgery) so the parse is well-defined and
+            // testable; a NULL/unparseable address simply contributes no subnet.
+            let mut addr_stmt = conn
+                .prepare(
+                    "SELECT DISTINCT n.public_address
+                     FROM verification_ledger vl
+                     JOIN nodes n ON n.node_id = vl.challenger_id
+                     WHERE vl.target_node_id = ?1 AND vl.capability = ?2
+                       AND vl.timestamp >= ?3 AND vl.timestamp <= ?4
+                       AND n.payout_address IS NOT NULL AND n.payout_address != ''",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let addrs = addr_stmt
+                .query_map(params![target_hex, capability, since, until], |row| {
+                    let a: Option<String> = row.get(0)?;
+                    Ok(a)
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let mut subnets: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for a in addrs {
+                let a = a.map_err(|e| GhostError::Database(e.to_string()))?;
+                if let Some(subnet) = a.as_deref().and_then(ipv4_subnet_24) {
+                    subnets.insert(subnet);
+                }
+            }
+            let distinct_subnets = i64_to_u32_count(subnets.len() as i64, "voterset_subnets")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok((pass, total, distinct_subnets))
+        })
+    }
+
     /// Record an uptime sample for a node
     pub fn record_uptime_sample(
         &self,
@@ -10364,6 +10474,25 @@ pub fn resolve_bond_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A-2: the `/24` subnet extractor must accept only dotted-quad IPv4 literals
+    /// (with or without a port) and reject hostnames / IPv6 / malformed input, so an
+    /// unresolvable address never fabricates a distinct subnet for the diversity count.
+    #[test]
+    fn ipv4_subnet_24_parses_only_real_ipv4() {
+        assert_eq!(ipv4_subnet_24("10.0.0.1:8080"), Some("10.0.0".to_string()));
+        assert_eq!(ipv4_subnet_24("192.168.9.9"), Some("192.168.9".to_string()));
+        assert_eq!(ipv4_subnet_24("255.255.255.255:1"), Some("255.255.255".to_string()));
+        // Two hosts on the same /24 collapse to one subnet.
+        assert_eq!(ipv4_subnet_24("10.0.0.1:3333"), ipv4_subnet_24("10.0.0.250:9"));
+        // Rejections → None (no fabricated subnet).
+        assert_eq!(ipv4_subnet_24("node.example.com:8080"), None);
+        assert_eq!(ipv4_subnet_24("::1"), None);
+        assert_eq!(ipv4_subnet_24("10.0.0"), None);
+        assert_eq!(ipv4_subnet_24("10.0.0.256"), None);
+        assert_eq!(ipv4_subnet_24("10.0.0.1.5"), None);
+        assert_eq!(ipv4_subnet_24(""), None);
+    }
 
     /// Elder promotion gated on `pow_proof IS NOT NULL` — the PRESENCE of a proof, not its
     /// validity — so a node that stored an arbitrary non-null string was promoted to elder

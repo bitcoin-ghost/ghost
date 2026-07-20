@@ -1926,9 +1926,17 @@ impl PayoutHandler {
         // point — every honest node matches. Below the gate the node split is not
         // consensus-enforced (legacy behaviour) and this is skipped.
         if proposal.block_height >= crate::fee_to_node_pool_height() {
+            // A-2: at/above the voter-set gate, restrict distinct challengers to the
+            // consensus voter set + require IP-subnet diversity. Height-derived so the
+            // whole fleet recomputes the SAME set.
+            let voter_set_scoped =
+                proposal.block_height >= crate::voter_set_qualification_height();
             let node_shares = self
                 .qualification_provider
-                .get_all_qualified_nodes_at_cutoff_from_db(proposal.timestamp as i64);
+                .get_all_qualified_nodes_at_cutoff_from_db(
+                    proposal.timestamp as i64,
+                    voter_set_scoped,
+                );
             self.creator.validate_node_split(
                 proposal,
                 local_miner_work,
@@ -1956,8 +1964,10 @@ impl PayoutHandler {
         // SAME set the checkpoint's ledger_root committed to, so the coinbase pays
         // exactly what the fleet ratified and Component-E recompute-reject can only pass.
         let qualified_shares = if data.block_height >= crate::fee_to_node_pool_height() {
+            // A-2: height-gated voter-set + IP-subnet scoping of the distinct challengers.
+            let voter_set_scoped = data.block_height >= crate::voter_set_qualification_height();
             self.qualification_provider
-                .get_all_qualified_nodes_at_cutoff_from_db(data.ledger_cutoff_ts)
+                .get_all_qualified_nodes_at_cutoff_from_db(data.ledger_cutoff_ts, voter_set_scoped)
         } else {
             self.qualification_provider.get_all_qualified_nodes()
         };

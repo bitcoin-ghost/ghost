@@ -158,6 +158,21 @@ pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
 /// node AND the SRI layer emit the header; SET comfortably past the roll window.
 pub const SHARE_POW_VERIFY_HEIGHT: u64 = u64::MAX;
 
+/// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
+/// the deterministic node-reward qualification counts a target's DISTINCT challengers only
+/// when they are members of the consensus voter set AND come from diverse IP subnets, and it
+/// requires the distinct-challenger floor as a fraction of the whole voter set — instead of
+/// counting any node that recorded a verdict. Below it, the legacy network-size-scaled
+/// distinct count stands (correct for a single-operator fleet whose challengers are all its
+/// own nodes).
+///
+/// Which nodes qualify is consensus-visible (it decides the coinbase node split), so this is a
+/// height gate, not a feature flag: both counting paths exist in the new binary and every node
+/// switches at the same block, so a mixed-version fleet computes an identical node split during
+/// the roll. DORMANT until the voter set + per-node subnet map are converged fleet-wide; SET
+/// comfortably past the roll window.
+pub const VOTER_SET_QUALIFICATION_HEIGHT: u64 = u64::MAX;
+
 /// Activation heights, resolved once at startup.
 ///
 /// A regtest chain is ~100 blocks tall, so every mainnet gate is dormant there and a regtest
@@ -175,6 +190,7 @@ mod gates {
 
     pub(super) static CLUSTER_ENFORCEMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static FEE_TO_NODE_POOL: OnceLock<u64> = OnceLock::new();
+    pub(super) static VOTER_SET_QUALIFICATION: OnceLock<u64> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -199,13 +215,23 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         FEE_TO_NODE_POOL_HEIGHT,
     );
+    let voter_set = gates::from_env(
+        "GHOST_VOTER_SET_QUALIFICATION_HEIGHT",
+        network,
+        VOTER_SET_QUALIFICATION_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::FEE_TO_NODE_POOL.set(fee);
+    let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
 
-    if enforcement != CLUSTER_ENFORCEMENT_HEIGHT || fee != FEE_TO_NODE_POOL_HEIGHT {
+    if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
+        || fee != FEE_TO_NODE_POOL_HEIGHT
+        || voter_set != VOTER_SET_QUALIFICATION_HEIGHT
+    {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
             fee_to_node_pool_height = fee,
+            voter_set_qualification_height = voter_set,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
         );
@@ -221,6 +247,12 @@ pub fn cluster_enforcement_height() -> u64 {
 /// at tip change.
 pub fn fee_to_node_pool_height() -> u64 {
     *gates::FEE_TO_NODE_POOL.get_or_init(|| FEE_TO_NODE_POOL_HEIGHT)
+}
+
+/// The height at which node-reward qualification restricts distinct challengers to the consensus
+/// voter set and requires IP/subnet diversity (Surface A-2).
+pub fn voter_set_qualification_height() -> u64 {
+    *gates::VOTER_SET_QUALIFICATION.get_or_init(|| VOTER_SET_QUALIFICATION_HEIGHT)
 }
 
 /// GhostGlyph P2P handler for visual identity registration.

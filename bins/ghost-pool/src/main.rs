@@ -3353,7 +3353,12 @@ async fn main() -> Result<()> {
                 ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
                     .ok()?;
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
-            let node_shares = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts);
+            // A-2: the checkpoint root must scope challengers to the voter set + subnets
+            // at/above the gate, identically to the coinbase node split, or the root and
+            // the paid split would disagree.
+            let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
+            let node_shares =
+                qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts, voter_set_scoped);
             let root = ghost_pool::payout::compute_ledger_root(
                 &miner_payouts,
                 &node_shares,
@@ -3381,7 +3386,8 @@ async fn main() -> Result<()> {
                     Err(e) => return format!("miner recompute failed: {e}"),
                 };
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
-            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts);
+            let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
+            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts, voter_set_scoped);
             ghost_pool::payout::ledger_root_diag(&miners, &nodes, cutoff_ts, height)
         })
     };
