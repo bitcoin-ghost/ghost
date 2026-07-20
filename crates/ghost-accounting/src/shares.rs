@@ -449,6 +449,37 @@ impl DifficultyCalculator {
         actual_difficulty >= claimed_difficulty * 0.999
     }
 
+    /// Independent PoW re-verification (multi-operator). Recompute the share hash from
+    /// the raw 80-byte Bitcoin block header and confirm it BOTH equals `expected_hash`
+    /// AND meets `claimed_difficulty`.
+    ///
+    /// A conventional pool trusts its own SRI layer to have validated PoW — fine, one
+    /// operator. A DECENTRALISED pool gossips shares between MUTUALLY-DISTRUSTING
+    /// operators and pays out on the aggregate, so `verify_share_difficulty` (which only
+    /// checks the NUMERIC value of a supplied 32-byte hash) is not enough: a hostile
+    /// operator broadcasts a fabricated `share_hash` with an in-range numeric difficulty
+    /// and no real hashing, and mints unbounded fake work for its own address. Binding the
+    /// hash to a real header preimage is the only thing that makes fabrication impossible —
+    /// you cannot produce an 80-byte header whose `sha256d` meets the target without
+    /// actually doing the work.
+    ///
+    /// `header80` is the raw header; the recomputed hash and `expected_hash` are in
+    /// INTERNAL byte order (PoW zeros at the high-index end), matching
+    /// [`Self::difficulty_from_hash`] and the ledger's stored `share_hash`.
+    pub fn verify_pow_preimage(
+        header80: &[u8; 80],
+        expected_hash: &[u8; 32],
+        claimed_difficulty: f64,
+    ) -> bool {
+        use bitcoin::hashes::{sha256d, Hash};
+        let computed = sha256d::Hash::hash(header80).to_byte_array();
+        if &computed != expected_hash {
+            return false; // the supplied hash is not this header's PoW — fabricated/relayed
+        }
+        // Reuse the 0.1% difficulty tolerance of the numeric check.
+        Self::difficulty_from_hash(&computed) >= claimed_difficulty * 0.999
+    }
+
     /// Verify that a share hash meets the pool's minimum difficulty
     pub fn verify_share_meets_pool_target(&self, hash: &[u8; 32]) -> bool {
         let actual_difficulty = Self::difficulty_from_hash(hash);
@@ -630,5 +661,41 @@ mod tests {
 
         // Verify no overflow work was added, only the valid one
         assert!(shares.total_miner_work > 0.0);
+    }
+
+    #[test]
+    fn pow_preimage_accepts_real_header_and_rejects_fabrication() {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::Hash;
+
+        // A REAL header (Bitcoin genesis) — a known-valid PoW preimage.
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut bytes = Vec::new();
+        genesis.header.consensus_encode(&mut bytes).unwrap();
+        let header80: [u8; 80] = bytes.try_into().unwrap();
+        let real_hash: [u8; 32] = genesis.header.block_hash().to_byte_array();
+
+        // The genuine header + its hash + a modest difficulty verifies.
+        assert!(
+            DifficultyCalculator::verify_pow_preimage(&header80, &real_hash, 1.0),
+            "a real header whose sha256d == the hash must verify"
+        );
+
+        // FABRICATION: a hash that is NOT this header's sha256d is rejected — the core
+        // multi-operator defence. An attacker can pick any low-numeric-difficulty value,
+        // but cannot produce a header that hashes to it without doing the work.
+        let mut fabricated = real_hash;
+        fabricated[0] ^= 0x01;
+        assert!(
+            !DifficultyCalculator::verify_pow_preimage(&header80, &fabricated, 1.0),
+            "a hash that isn't the header's preimage must be rejected"
+        );
+
+        // A real header + real hash but a claimed difficulty far above what it meets
+        // (genesis is ~diff 1) is rejected on the difficulty check.
+        assert!(
+            !DifficultyCalculator::verify_pow_preimage(&header80, &real_hash, 1e12),
+            "must reject work claimed far above the header's actual difficulty"
+        );
     }
 }
