@@ -6588,6 +6588,27 @@ async fn main() -> Result<()> {
         hasher.update(share.miner_id.as_bytes());
         let miner_hash: [u8; 32] = hasher.finalize().into();
 
+        // Multi-operator PoW verification: at/above SHARE_POW_VERIFY_HEIGHT bind the raw
+        // 80-byte header the SRI layer validated against, so any peer can independently
+        // recompute sha256d(header) == share_hash instead of trusting our numeric claim.
+        // Below the gate this stays None → signing_bytes byte-identical to today.
+        let header = if rm_for_shares.current_height() >= ghost_pool::SHARE_POW_VERIFY_HEIGHT {
+            match share.header.as_ref().and_then(|h| hex::decode(h).ok()) {
+                Some(bytes) if bytes.len() == 80 => Some(bytes),
+                _ => {
+                    tracing::warn!(
+                        miner_id = %share.miner_id,
+                        share_hash = %share.share_hash,
+                        "SHARE_POW_VERIFY active but SRI submission carried no valid 80-byte header; \
+                         proof will not verify at peers (upgrade the translator/pool)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut proof = ghost_common::types::ShareProof {
             round_id,
             miner_id: miner_hash,
@@ -6598,10 +6619,7 @@ async fn main() -> Result<()> {
             received_by: identity_for_shares.node_id(),
             template_id: rm_for_shares.current_template_id(),
             payout_address: share.payout_address.clone(),
-            // Multi-operator PoW verification: populated with the 80-byte header only
-            // at/above SHARE_POW_VERIFY_HEIGHT (B-3 wires it from the SRI submission).
-            // None while the gate is dormant → signing_bytes unchanged from today.
-            header: None,
+            header,
             signature: None,
         };
         // GHOST-09: sign as the receiving node so peers can authenticate the

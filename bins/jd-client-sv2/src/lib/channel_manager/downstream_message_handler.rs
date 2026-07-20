@@ -1001,7 +1001,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let mut is_downstream_share_valid = false;
                 let mut downstream_share_hash: Option<sha256d::Hash> = None;
                 match res {
-                    Ok(ShareValidationResult::Valid(share_hash)) => {
+                    Ok(ShareValidationResult::Valid(share_hash, _)) => {
                         let share_accounting = standard_channel.get_share_accounting();
                         if share_accounting.should_acknowledge() {
                             let success = SubmitSharesSuccess {
@@ -1021,7 +1021,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         downstream_share_hash = Some(share_hash);
                         is_downstream_share_valid = true;
                     }
-                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase, _)) => {
                         info!("SubmitSharesStandard on downstream channel: 💰 Block Found!!! 💰{share_hash}");
                         downstream_share_hash = Some(share_hash);
                         is_downstream_share_valid = true;
@@ -1257,7 +1257,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let mut is_downstream_share_valid = false;
                 let mut downstream_share_hash: Option<sha256d::Hash> = None;
                 match res {
-                    Ok(ShareValidationResult::Valid(share_hash)) => {
+                    Ok(ShareValidationResult::Valid(share_hash, _)) => {
                         let share_accounting = extended_channel.get_share_accounting();
                         if share_accounting.should_acknowledge() {
                             let success = SubmitSharesSuccess {
@@ -1277,7 +1277,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         downstream_share_hash = Some(share_hash);
                         is_downstream_share_valid = true;
                     }
-                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase, _)) => {
                         info!("SubmitSharesExtended on downstream channel: 💰 Block Found!!! 💰{share_hash}");
                         downstream_share_hash = Some(share_hash);
                         if let Some(template_id) = template_id {

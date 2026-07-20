@@ -859,6 +859,11 @@ pub struct ShareNotification {
     pub is_block: bool,
     /// Payout address extracted from user_identity (format: `<address>.<worker>`)
     pub payout_address: Option<String>,
+    /// Raw 80-byte block header as hex, the PoW preimage for `share_hash`
+    /// (`sha256d(header) == share_hash`). Used to re-verify a gossiped share's
+    /// proof-of-work independently. Optional for backward compatibility.
+    #[serde(default)]
+    pub header: Option<String>,
 }
 
 /// Data for a single share in a batch (from SRI Pool native webhook)
@@ -884,6 +889,10 @@ pub struct ShareData {
     /// Used to identify the miner's payout address
     #[serde(default)]
     pub user_identity: String,
+    /// Raw 80-byte block header as hex, the PoW preimage for `share_hash`
+    /// (`sha256d(header) == share_hash`). Optional for backward compatibility.
+    #[serde(default)]
+    pub header: Option<String>,
 }
 
 /// Batch of shares from SRI Pool native webhook
@@ -1776,6 +1785,7 @@ impl VerificationState {
                 } else {
                     None
                 },
+                header: share.header.clone(),
             };
 
             if let Err(e) = self.record_share(notification) {

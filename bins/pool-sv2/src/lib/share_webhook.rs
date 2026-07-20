@@ -36,6 +36,12 @@ pub struct ShareData {
     /// User identity string (format: <payout_address>.<worker_name>)
     /// Used to identify the miner's payout address
     pub user_identity: String,
+    /// Raw 80-byte block header as hex, the PoW preimage for `share_hash`
+    /// (`sha256d(header) == share_hash`). Lets a decentralised pool re-verify
+    /// a gossiped share's proof-of-work independently instead of trusting the
+    /// origin's numeric claim. Optional for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
 }
 
 /// Batch of shares to send to the webhook endpoint
@@ -267,6 +273,7 @@ mod tests {
             downstream_id: 5,
             is_block: false,
             user_identity: "bc1qtest.worker1".to_string(),
+            header: None,
         };
 
         let json = serde_json::to_string(&share).unwrap();

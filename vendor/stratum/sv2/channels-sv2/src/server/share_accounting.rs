@@ -23,7 +23,10 @@ use std::collections::HashSet;
 
 /// The outcome of share validation, from the perspective of a Mining Server.
 ///
-/// The [`ShareValidationResult::Valid`] variant carries the hash of the accepted share.
+/// The [`ShareValidationResult::Valid`] variant carries the hash of the accepted share and
+/// the raw 80-byte block header it was validated against (Bitcoin Ghost fork: lets a
+/// decentralised pool re-verify a gossiped share's PoW independently — `sha256d(header)`
+/// must equal the hash — instead of trusting the origin's numeric claim).
 ///
 /// The [`ShareValidationResult::BlockFound`] variant carries:
 /// - `share_hash`: The hash of the share that solved the block.
@@ -31,14 +34,17 @@ use std::collections::HashSet;
 /// - `coinbase`: The serialized coinbase transaction for the block (as `Vec<u8>`).
 #[derive(Debug)]
 pub enum ShareValidationResult {
-    /// The share is valid and accepted.
-    Valid(Hash),
+    /// The share is valid and accepted. Carries `(share_hash, header80)` where `header80`
+    /// is the raw 80-byte block header (Ghost fork), so `sha256d(header80) == share_hash`.
+    Valid(Hash, Vec<u8>),
     /// The share solves a block.
     /// Contains:
     /// - `share_hash`: The hash of the share that solved the block.
     /// - `template_id`: The template ID associated with the job, or `None` for custom jobs.
     /// - `coinbase`: The serialized coinbase transaction for the block.
-    BlockFound(Hash, Option<u64>, Vec<u8>),
+    /// - `header80`: The raw 80-byte block header (Ghost fork), so a decentralised
+    ///   pool can re-verify the share's PoW preimage: `sha256d(header80) == share_hash`.
+    BlockFound(Hash, Option<u64>, Vec<u8>, Vec<u8>),
 }
 
 /// The error variants that can occur during share validation.

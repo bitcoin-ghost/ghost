@@ -678,10 +678,18 @@ where
                 .consensus_encode(&mut serialized_coinbase)
                 .map_err(|_| ShareValidationError::InvalidCoinbase)?;
 
+            // serialize the raw 80-byte header so the block-finding share carries a
+            // verifiable PoW preimage as well: sha256d(header80) == share_hash
+            let mut header80 = Vec::with_capacity(80);
+            header
+                .consensus_encode(&mut header80)
+                .map_err(|_| ShareValidationError::Invalid)?;
+
             return Ok(ShareValidationResult::BlockFound(
                 share_hash.to_raw_hash(),
                 Some(job.get_template().template_id),
                 serialized_coinbase,
+                header80,
             ));
         }
 
@@ -703,7 +711,16 @@ where
             // update the best diff
             self.share_accounting.update_best_diff(share_hash_as_diff);
 
-            Ok(ShareValidationResult::Valid(share_hash.to_raw_hash()))
+            // serialize the raw 80-byte header so a decentralised pool can re-verify
+            // the share's PoW preimage independently: sha256d(header80) == share_hash
+            let mut header80 = Vec::with_capacity(80);
+            header
+                .consensus_encode(&mut header80)
+                .map_err(|_| ShareValidationError::Invalid)?;
+            Ok(ShareValidationResult::Valid(
+                share_hash.to_raw_hash(),
+                header80,
+            ))
         } else {
             Err(ShareValidationError::DoesNotMeetTarget)
         }
@@ -1067,7 +1084,7 @@ mod tests {
 
         assert!(matches!(
             res,
-            Ok(ShareValidationResult::BlockFound(_, _, _))
+            Ok(ShareValidationResult::BlockFound(..))
         ));
         assert_eq!(
             standard_channel.get_share_accounting().get_blocks_found(),
@@ -1299,7 +1316,7 @@ mod tests {
         };
         let res = standard_channel.validate_share(valid_share);
 
-        assert!(matches!(res, Ok(ShareValidationResult::Valid(_))));
+        assert!(matches!(res, Ok(ShareValidationResult::Valid(_, _))));
     }
 
     #[test]

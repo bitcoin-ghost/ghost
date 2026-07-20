@@ -630,7 +630,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
 
                 match res {
-                    Ok(ShareValidationResult::Valid(share_hash)) => {
+                    Ok(ShareValidationResult::Valid(share_hash, header80)) => {
                         let share_work = standard_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
                             sender.send(ShareData {
@@ -643,6 +643,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 downstream_id,
                                 is_block: false,
                                 user_identity: standard_channel.get_user_identity().to_string(),
+                                header: Some(hex::encode(&header80)),
                             });
                         }
                         let share_accounting = standard_channel.get_share_accounting();
@@ -663,7 +664,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         }
 
                     }
-                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase, header80)) => {
                         info!("SubmitSharesStandard: 💰 Block Found!!! 💰{share_hash}");
                         let share_work = standard_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
@@ -677,6 +678,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 downstream_id,
                                 is_block: true,
                                 user_identity: standard_channel.get_user_identity().to_string(),
+                                header: Some(hex::encode(&header80)),
                             });
                         }
                         // if we have a template id (i.e.: this was not a custom job)
@@ -853,7 +855,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     user_identity.as_ref().and_then(|ui| ui.as_str());
 
                 match res {
-                    Ok(ShareValidationResult::Valid(share_hash)) => {
+                    Ok(ShareValidationResult::Valid(share_hash, header80)) => {
                         let share_work = extended_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
                             sender.send(ShareData {
@@ -869,6 +871,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     extended_channel.get_user_identity().to_string(),
                                     tlv_worker,
                                 ),
+                                header: Some(hex::encode(&header80)),
                             });
                         }
                         let share_accounting = extended_channel.get_share_accounting();
@@ -888,7 +891,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             );
                         }
                     }
-                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                    Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase, header80)) => {
                         info!("SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}");
                         let share_work = extended_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
@@ -905,6 +908,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     extended_channel.get_user_identity().to_string(),
                                     tlv_worker,
                                 ),
+                                header: Some(hex::encode(&header80)),
                             });
                         }
                         // if we have a template id (i.e.: this was not a custom job)
