@@ -389,8 +389,10 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::L2TransferBroadcast => MAX_L2_BROADCAST_SIZE,
         MessageType::L2CheckpointBlock => MAX_L2_CHECKPOINT_SIZE,
         MessageType::L2CheckpointVote => MAX_L2_VOTE_SIZE,
-        // Small fixed-field messages (root + sig, no txs).
-        MessageType::PayoutLedgerCheckpoint => MAX_VOTE_SIZE,
+        // The checkpoint carries the CANONICAL payout (top-N miner addresses + top-N node
+        // shares) so the fleet can adopt it on finalise (option c); bounded but not tiny.
+        // The vote is just a hash + signature.
+        MessageType::PayoutLedgerCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::PayoutLedgerCheckpointVote => MAX_VOTE_SIZE,
         MessageType::L2TreeSync => MAX_L2_TREE_SYNC_SIZE,
         MessageType::L2ShieldBroadcast => 256, // ShieldCommitment: 32-byte commitment + u64 index + u64 height

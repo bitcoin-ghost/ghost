@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 43;
+const SCHEMA_VERSION: u32 = 44;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -99,6 +99,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (41, migrate_v41),
         (42, migrate_v42),
         (43, migrate_v43),
+        (44, migrate_v44),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2180,6 +2181,19 @@ fn migrate_v43(conn: &Connection) -> GhostResult<()> {
     )
     .map_err(|e| GhostError::Migration(e.to_string()))?;
     info!("v43: created payout_ledger_checkpoints");
+    Ok(())
+}
+
+/// v44: option (c) adopt-on-finalise — store the CANONICAL payout the fleet ratified
+/// (miner + node lists) so the coinbase builds from the agreed checkpoint, not the local
+/// (divergent) share ledger. One JSON blob column; NULL on pre-(c) rows.
+fn migrate_v44(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v44: payout_ledger_checkpoints.canonical_payout");
+    conn.execute_batch(
+        "ALTER TABLE payout_ledger_checkpoints ADD COLUMN canonical_payout BLOB;",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v44: added payout_ledger_checkpoints.canonical_payout");
     Ok(())
 }
 

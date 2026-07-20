@@ -1504,8 +1504,18 @@ pub struct PayoutLedgerCheckpointMessage {
     /// Ledger cutoff = the anchor block's timestamp (deterministic, chain-committed).
     pub cutoff_ts: i64,
     /// Canonical payout-ledger root (miner set ‖ node set) as of `cutoff_ts`.
+    /// Equals `H(miner_payouts ‖ node_shares)`, so the signed `checkpoint_hash`
+    /// commits to the lists below and voters can verify their integrity.
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub ledger_root: [u8; 32],
+    /// The CANONICAL miner payout set the proposer computed: `(payout_address,
+    /// WORK_SCALE-quantised work)`, top-N. Option (c): voters tolerance-check it and
+    /// ADOPT it verbatim on finalise, so agreement doesn't need identical local ledgers.
+    #[serde(default)]
+    pub miner_payouts: Vec<(String, u128)>,
+    /// The CANONICAL qualified-node set: `(node_id, 5-4-3-2-1 shares)`, top-N.
+    #[serde(default)]
+    pub node_shares: Vec<(NodeId, i32)>,
     /// Number of active nodes at this checkpoint.
     pub active_node_count: u32,
     /// Proposer's node ID (deterministic election for `height`).

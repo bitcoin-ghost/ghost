@@ -8525,6 +8525,12 @@ pub struct PayoutLedgerCheckpointRecord {
     /// Hex-encoded proposer node id.
     pub proposer_id: String,
     pub active_node_count: u32,
+    /// Option (c) adopt-on-finalise: the CANONICAL miner payout set the fleet ratified,
+    /// `(payout_address, WORK_SCALE-quantised work)`. The coinbase builds from THIS, not
+    /// from the local (divergent) share ledger. Empty for pre-(c) rows.
+    pub miner_payouts: Vec<(String, u128)>,
+    /// The canonical qualified-node set the fleet ratified, `(node_id, 5-4-3-2-1 shares)`.
+    pub node_shares: Vec<([u8; 32], i32)>,
 }
 
 /// L2 epoch record (lifecycle and compaction state)
@@ -9167,17 +9173,20 @@ impl Database {
         &self,
         r: &PayoutLedgerCheckpointRecord,
     ) -> GhostResult<()> {
+        let canonical = serde_json::to_vec(&(&r.miner_payouts, &r.node_shares))
+            .map_err(|e| GhostError::Database(e.to_string()))?;
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO payout_ledger_checkpoints
-                 (height, cutoff_ts, ledger_root, proposer_id, active_node_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (height, cutoff_ts, ledger_root, proposer_id, active_node_count, canonical_payout)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     r.height as i64,
                     r.cutoff_ts,
                     r.ledger_root.as_slice(),
                     r.proposer_id,
                     r.active_node_count as i64,
+                    canonical.as_slice(),
                 ],
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -9194,7 +9203,7 @@ impl Database {
     ) -> GhostResult<Option<PayoutLedgerCheckpointRecord>> {
         self.with_connection(|conn| {
             conn.query_row(
-                "SELECT height, cutoff_ts, ledger_root, proposer_id, active_node_count
+                "SELECT height, cutoff_ts, ledger_root, proposer_id, active_node_count, canonical_payout
                  FROM payout_ledger_checkpoints
                  WHERE height <= ?1 ORDER BY height DESC LIMIT 1",
                 // Clamp to i64::MAX so u64::MAX ("latest") doesn't wrap to -1.
@@ -9205,25 +9214,32 @@ impl Database {
                     let root_blob: Vec<u8> = row.get(2)?;
                     let proposer_id: String = row.get(3)?;
                     let active_node_count: i64 = row.get(4)?;
-                    Ok((height, cutoff_ts, root_blob, proposer_id, active_node_count))
+                    let canonical: Option<Vec<u8>> = row.get(5)?;
+                    Ok((height, cutoff_ts, root_blob, proposer_id, active_node_count, canonical))
                 },
             )
             .optional()
             .map_err(|e| GhostError::Database(e.to_string()))
             .map(|opt| {
                 opt.and_then(
-                    |(height, cutoff_ts, root_blob, proposer_id, active_node_count)| {
+                    |(height, cutoff_ts, root_blob, proposer_id, active_node_count, canonical)| {
                         if root_blob.len() != 32 {
                             return None;
                         }
                         let mut ledger_root = [0u8; 32];
                         ledger_root.copy_from_slice(&root_blob);
+                        // Adopt-on-finalise lists; empty for pre-(c) rows (NULL blob).
+                        let (miner_payouts, node_shares) = canonical
+                            .and_then(|b| serde_json::from_slice(&b).ok())
+                            .unwrap_or_default();
                         Some(PayoutLedgerCheckpointRecord {
                             height: height as u64,
                             cutoff_ts,
                             ledger_root,
                             proposer_id,
                             active_node_count: active_node_count as u32,
+                            miner_payouts,
+                            node_shares,
                         })
                     },
                 )

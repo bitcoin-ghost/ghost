@@ -2181,6 +2181,8 @@ mod tests {
             ledger_root: [7u8; 32],
             proposer_id: "aa".repeat(32),
             active_node_count: 8,
+            miner_payouts: vec![],
+            node_shares: vec![],
         })
         .expect("upsert checkpoint");
 
@@ -2204,6 +2206,8 @@ mod tests {
             ledger_root: [1u8; 32],
             proposer_id: "bb".repeat(32),
             active_node_count: 8,
+            miner_payouts: vec![],
+            node_shares: vec![],
         })
         .expect("upsert checkpoint");
         db

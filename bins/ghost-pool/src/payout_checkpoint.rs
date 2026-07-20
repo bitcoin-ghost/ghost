@@ -48,11 +48,67 @@ const BFT_THRESHOLD_PERCENT: u64 = 67;
 /// closure that captures messages for in-process routing under induced lag.
 pub type BroadcastFn = Arc<dyn Fn(MessageType, Vec<u8>) -> GhostResult<()> + Send + Sync>;
 
-/// `(cutoff_ts, height) -> Some(ledger_root)` if this node can compute the
-/// canonical root from its converged view, or `None` if it lacks the data
-/// (triggers the C-7 abstain-and-wait-for-convergence path). Injected by
-/// `main.rs`, which holds the DB + qualification engine.
-pub type ComputeRootFn = Arc<dyn Fn(i64, u64) -> Option<[u8; 32]> + Send + Sync>;
+/// The canonical payout a node computes at a cutoff: the miner set (payout address →
+/// WORK_SCALE-quantised work) and the qualified-node set (node_id → 5-4-3-2-1 shares),
+/// plus their root `H(miners ‖ nodes)`. Option (c): the fleet BFT-ratifies the
+/// proposer's `CanonicalPayout` (tolerance-checked, not byte-identical) and ADOPTS it,
+/// so agreement no longer needs every node's local ledger to be identical.
+#[derive(Clone, Debug)]
+pub struct CanonicalPayout {
+    pub miner_payouts: Vec<(String, u128)>,
+    pub node_shares: Vec<(NodeId, i32)>,
+    pub root: [u8; 32],
+}
+
+pub type ComputeRootFn = Arc<dyn Fn(i64, u64) -> Option<CanonicalPayout> + Send + Sync>;
+
+/// Miner-work tolerance for option (c). The share SET converges (proven by the union)
+/// but attribution (same share → different miner_id representation) and float-sum-order
+/// leave a per-address work difference; a voter approves the proposer's canonical payout
+/// if every address's work is within `REL_TOL` (relative) or `ABS_TOL` (absolute floor)
+/// of its own. This is sound because the fleet is SINGLE-OPERATOR — an honest quorum
+/// still bounds any per-block drift to the tolerance, strictly stronger than no split.
+const REL_TOL_NUM: u128 = 2; // 2%
+const REL_TOL_DEN: u128 = 100;
+const ABS_TOL: u128 = 1_000_000_000_000; // ~one share of WORK_SCALE-quantised work
+
+/// Does the proposer's canonical payout agree with our own within tolerance?
+/// Node set: exact (it converges via payout-address gossip). Miner set: identical
+/// address keys, each address's work within tolerance.
+fn payouts_agree(
+    local: &CanonicalPayout,
+    proposed_miners: &[(String, u128)],
+    proposed_nodes: &[(NodeId, i32)],
+) -> bool {
+    let mut ln = local.node_shares.clone();
+    ln.sort();
+    let mut pn = proposed_nodes.to_vec();
+    pn.sort();
+    if ln != pn {
+        return false;
+    }
+
+    let lm: HashMap<&str, u128> = local
+        .miner_payouts
+        .iter()
+        .map(|(a, w)| (a.as_str(), *w))
+        .collect();
+    if lm.len() != proposed_miners.len() {
+        return false;
+    }
+    for (addr, pw) in proposed_miners {
+        let pw = *pw;
+        let Some(&lw) = lm.get(addr.as_str()) else {
+            return false; // address only in the proposal
+        };
+        let diff = lw.max(pw) - lw.min(pw);
+        let tol = (lw / REL_TOL_DEN * REL_TOL_NUM).max(ABS_TOL);
+        if diff > tol {
+            return false;
+        }
+    }
+    true
+}
 
 /// Optional diagnostic: `(cutoff_ts, height) -> human breakdown` of the root inputs
 /// (miner-set + node-set hashed separately, with counts + node list). Injected by
@@ -201,12 +257,12 @@ impl PayoutCheckpointManager {
         if self.proposer_for(height) != Some(me) || self.already_finalized(height) {
             return;
         }
-        let Some(ledger_root) = (self.compute_root)(cutoff_ts, height) else {
+        let Some(canonical) = (self.compute_root)(cutoff_ts, height) else {
             // C-7: cannot compute from our own view — do not propose an
-            // unreproducible root; wait for convergence.
+            // unreproducible payout; wait for convergence.
             warn!(
                 height,
-                "payout checkpoint: ledger_root not computable (data not converged) — not proposing"
+                "payout checkpoint: canonical payout not computable (data not converged) — not proposing"
             );
             return;
         };
@@ -215,7 +271,9 @@ impl PayoutCheckpointManager {
         let mut msg = PayoutLedgerCheckpointMessage {
             height,
             cutoff_ts,
-            ledger_root,
+            ledger_root: canonical.root,
+            miner_payouts: canonical.miner_payouts,
+            node_shares: canonical.node_shares,
             active_node_count,
             proposer: me,
             proposer_signature: [0u8; 64],
@@ -234,7 +292,9 @@ impl PayoutCheckpointManager {
         }
         info!(
             height,
-            root = %hex::encode(&ledger_root[..8]),
+            root = %hex::encode(&msg.ledger_root[..8]),
+            miners = msg.miner_payouts.len(),
+            nodes = msg.node_shares.len(),
             "payout checkpoint: proposing"
         );
         self.log_diag("propose", height, cutoff_ts);
@@ -259,15 +319,33 @@ impl PayoutCheckpointManager {
         }
         let hash = msg.checkpoint_hash();
 
-        // Recompute the root from our own converged view.
-        let Some(local_root) = (self.compute_root)(msg.cutoff_ts, msg.height) else {
-            // C-7: we lack the data to reproduce it — abstain (do NOT approve).
+        // INTEGRITY: the proposer's `ledger_root` must actually be the hash of the lists
+        // it sent — otherwise the signed `checkpoint_hash` (which commits to `ledger_root`)
+        // wouldn't bind the payload, and a proposer could ship one root but different lists.
+        let claimed_root = crate::payout::compute_ledger_root(
+            &msg.miner_payouts,
+            &msg.node_shares,
+            msg.cutoff_ts,
+            msg.height,
+        );
+        if claimed_root != msg.ledger_root {
             warn!(
                 height = msg.height,
-                "payout checkpoint: cannot recompute ledger_root — abstaining (needs convergence)"
+                proposer = %hex::encode(&msg.proposer[..4]),
+                "payout checkpoint: proposal root does not match its lists — voting reject"
+            );
+            self.cast_vote(msg.height, hash, false);
+            return Ok(());
+        }
+
+        // Option (c): recompute our OWN canonical payout and tolerance-check the proposer's.
+        let Some(local) = (self.compute_root)(msg.cutoff_ts, msg.height) else {
+            // C-7: we lack the data to judge it — abstain (do NOT approve).
+            warn!(
+                height = msg.height,
+                "payout checkpoint: cannot recompute canonical payout — abstaining (needs convergence)"
             );
             self.log_diag("abstain", msg.height, msg.cutoff_ts);
-            // Still record the proposal so a later recompute/vote can finalise.
             let height = msg.height;
             let mut pending = self.pending.write();
             let slot = pending
@@ -277,7 +355,9 @@ impl PayoutCheckpointManager {
             slot.proposal = Some(msg);
             return Ok(());
         };
-        let approve = local_root == msg.ledger_root;
+        // Approve if the proposer's payout is within tolerance of ours (attribution +
+        // float-order noise is same-operator cosmetic); a real misallocation exceeds it.
+        let approve = payouts_agree(&local, &msg.miner_payouts, &msg.node_shares);
         {
             let mut pending = self.pending.write();
             let p = pending.entry(msg.height).or_insert_with(Pending::new);
@@ -290,10 +370,10 @@ impl PayoutCheckpointManager {
         if !approve {
             warn!(
                 height = msg.height,
-                local_root = %hex::encode(&local_root[..8]),
+                local_root = %hex::encode(&local.root[..8]),
                 proposed_root = %hex::encode(&msg.ledger_root[..8]),
                 proposer = %hex::encode(&msg.proposer[..4]),
-                "payout checkpoint: local root mismatch — voting reject"
+                "payout checkpoint: payout outside tolerance — voting reject"
             );
             self.log_diag("reject", msg.height, msg.cutoff_ts);
         }
@@ -377,6 +457,10 @@ impl PayoutCheckpointManager {
             ledger_root: msg.ledger_root,
             proposer_id: hex::encode(msg.proposer),
             active_node_count: msg.active_node_count,
+            // Adopt-on-finalise: persist the proposer's canonical lists verbatim so the
+            // coinbase builds from THEM, not from this node's (divergent) local ledger.
+            miner_payouts: msg.miner_payouts.clone(),
+            node_shares: msg.node_shares.clone(),
         };
         match self.db.upsert_payout_ledger_checkpoint(&record) {
             Ok(()) => {
@@ -444,8 +528,30 @@ mod tests {
     /// (`None` = "can't compute yet" → C-7 abstain). Building in sorted order
     /// means `nodes[i].id == elders_sorted[i]`, so the proposer for height `H` is
     /// `nodes[H % n]` — deterministic and controllable.
-    fn build(n: usize, roots: &[Option<[u8; 32]>]) -> Vec<Node> {
-        assert_eq!(n, roots.len());
+    /// A shared 3-node qualified set every test uses (node set must match EXACTLY for
+    /// approval — it converges via payout-address gossip in production).
+    fn node_set() -> Vec<(NodeId, i32)> {
+        vec![([1u8; 32], 10), ([2u8; 32], 6), ([3u8; 32], 6)]
+    }
+
+    /// Build a `CanonicalPayout` from a miner list (address, work), reusing `node_set()`.
+    fn cp(miners: &[(&str, u128)]) -> CanonicalPayout {
+        let miner_payouts: Vec<(String, u128)> =
+            miners.iter().map(|(a, w)| (a.to_string(), *w)).collect();
+        let node_shares = node_set();
+        let root = crate::payout::compute_ledger_root(&miner_payouts, &node_shares, CUTOFF, H);
+        CanonicalPayout {
+            miner_payouts,
+            node_shares,
+            root,
+        }
+    }
+
+    /// Build `n` nodes; node at SORTED elder position `i` computes `payouts[i]` from its
+    /// own view (`None` = C-7 abstain). Sorted order means `nodes[i].id == elders_sorted[i]`,
+    /// so the proposer for height `H` is `nodes[H % n]`.
+    fn build(n: usize, payouts: &[Option<CanonicalPayout>]) -> Vec<Node> {
+        assert_eq!(n, payouts.len());
         let ids: Vec<Arc<NodeIdentity>> =
             (0..n).map(|_| Arc::new(NodeIdentity::generate())).collect();
         let mut elders: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
@@ -462,8 +568,8 @@ mod tests {
                 ob.lock().unwrap().push((ty, bytes));
                 Ok(())
             });
-            let root = roots[pos];
-            let compute_root: ComputeRootFn = Arc::new(move |_c, _h| root);
+            let payout = payouts[pos].clone();
+            let compute_root: ComputeRootFn = Arc::new(move |_c, _h| payout.clone());
             let mgr = PayoutCheckpointManager::new(
                 identity.clone(),
                 Arc::clone(&db),
@@ -513,46 +619,68 @@ mod tests {
     const CUTOFF: i64 = 1_784_000_000;
 
     #[tokio::test]
-    async fn convergent_fleet_finalises_identical_checkpoint() {
-        let root = [7u8; 32];
-        let nodes = build(4, &[Some(root); 4]);
-        assert_eq!(
-            nodes[0].db.get_mpc_elder_node_ids().unwrap().len(),
-            4,
-            "elder set must be populated"
-        );
-        assert_eq!(
-            nodes[0].mgr.proposer_for(H),
-            Some(nodes[0].id),
-            "nodes[0] must be the proposer for H"
-        );
+    async fn convergent_fleet_finalises_and_adopts_lists() {
+        let payout = cp(&[("bc1qaaa", 1_000_000_000_000_000), ("bc1qbbb", 500_000_000_000_000)]);
+        let nodes = build(4, &vec![Some(payout.clone()); 4]);
+        assert_eq!(nodes[0].mgr.proposer_for(H), Some(nodes[0].id));
         assert_eq!(nodes[0].mgr.quorum_needed(), 3, "67% of 4 = 3");
-        for n in &nodes {
-            n.mgr.maybe_propose(H, CUTOFF).await; // only the proposer acts
-        }
-        gossip_until_quiet(&nodes).await;
-        for n in &nodes {
-            let cp = n
-                .db
-                .get_latest_payout_ledger_checkpoint()
-                .unwrap()
-                .expect("every node finalises");
-            assert_eq!(cp.ledger_root, root);
-            assert_eq!(cp.height, H);
-        }
-    }
-
-    #[tokio::test]
-    async fn diverged_minority_prevents_finalisation() {
-        // Proposer + one peer compute A; two peers have a lagged/divergent view (B).
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let nodes = build(4, &[Some(a), Some(a), Some(b), Some(b)]);
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
-        // 2 approvals < ceil(67% of 4)=3 → NOTHING finalises anywhere (safe).
+        for n in &nodes {
+            let rec = n
+                .db
+                .get_latest_payout_ledger_checkpoint()
+                .unwrap()
+                .expect("every node finalises");
+            assert_eq!(rec.ledger_root, payout.root);
+            assert_eq!(rec.height, H);
+            // Adopt-on-finalise: the canonical lists are persisted verbatim.
+            assert_eq!(rec.miner_payouts, payout.miner_payouts, "adopted miner list");
+            assert_eq!(rec.node_shares.len(), 3, "adopted node list");
+        }
+    }
+
+    #[tokio::test]
+    async fn within_tolerance_divergence_still_finalises() {
+        // THE option-(c) property: nodes DON'T have byte-identical ledgers. The proposer
+        // says a miner has 1_000_000..., peers each computed a slightly different value
+        // (attribution/float noise) — all within 2% — so they ADOPT the proposer's list.
+        let proposer = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
+        let near1 = cp(&[("bc1qaaa", 1_005_000_000_000_000)]); // +0.5%
+        let near2 = cp(&[("bc1qaaa", 995_000_000_000_000)]); //  -0.5%
+        let near3 = cp(&[("bc1qaaa", 1_010_000_000_000_000)]); // +1.0%
+        let nodes = build(
+            4,
+            &[Some(proposer.clone()), Some(near1), Some(near2), Some(near3)],
+        );
+        for n in &nodes {
+            n.mgr.maybe_propose(H, CUTOFF).await;
+        }
+        gossip_until_quiet(&nodes).await;
+        for n in &nodes {
+            let rec = n
+                .db
+                .get_latest_payout_ledger_checkpoint()
+                .unwrap()
+                .expect("finalises within tolerance");
+            // Every node adopted the PROPOSER's exact value — convergence by adoption.
+            assert_eq!(rec.miner_payouts, proposer.miner_payouts);
+        }
+    }
+
+    #[tokio::test]
+    async fn gross_misallocation_outside_tolerance_rejected() {
+        // Proposer + one peer agree; two peers computed a value 2x off (WAY beyond 2%).
+        // Those two reject → only 2 approvals < 3 → nothing finalises (safe).
+        let a = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
+        let gross = cp(&[("bc1qaaa", 2_000_000_000_000_000)]);
+        let nodes = build(4, &[Some(a.clone()), Some(a), Some(gross.clone()), Some(gross)]);
+        for n in &nodes {
+            n.mgr.maybe_propose(H, CUTOFF).await;
+        }
+        gossip_until_quiet(&nodes).await;
         for n in &nodes {
             assert!(n.db.get_latest_payout_ledger_checkpoint().unwrap().is_none());
         }
@@ -560,36 +688,32 @@ mod tests {
 
     #[tokio::test]
     async fn c7_abstainer_does_not_block_liveness() {
-        // Three nodes converged on A; one lacks data (None) → abstains, not rejects.
-        let a = [3u8; 32];
-        let nodes = build(4, &[Some(a), Some(a), Some(a), None]);
+        let a = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
+        let nodes = build(4, &[Some(a.clone()), Some(a.clone()), Some(a), None]);
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
-        // 3 approvals >= 3 → all finalise A, including the abstainer via vote tally.
         for n in &nodes {
-            let cp = n
-                .db
-                .get_latest_payout_ledger_checkpoint()
+            n.db.get_latest_payout_ledger_checkpoint()
                 .unwrap()
                 .expect("finalises despite one abstainer");
-            assert_eq!(cp.ledger_root, a);
         }
     }
 
     #[tokio::test]
-    async fn malicious_proposer_wrong_root_rejected() {
-        // Every honest node computes A; a forged proposal (even from the real
-        // proposer) claims a different root. Honest recompute rejects it.
-        let a = [4u8; 32];
-        let forged = [9u8; 32];
-        let nodes = build(4, &[Some(a); 4]);
+    async fn proposal_root_not_matching_its_lists_rejected() {
+        // Integrity: a proposal whose ledger_root does NOT hash its own lists is rejected
+        // even from the real proposer — otherwise the signed hash wouldn't bind the payload.
+        let a = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
+        let nodes = build(4, &vec![Some(a.clone()); 4]);
         let proposer = nodes[0].id;
         let msg = PayoutLedgerCheckpointMessage {
             height: H,
-            cutoff_ts: 1_784_000_000,
-            ledger_root: forged,
+            cutoff_ts: CUTOFF,
+            ledger_root: [9u8; 32], // does NOT match the lists below
+            miner_payouts: a.miner_payouts.clone(),
+            node_shares: a.node_shares.clone(),
             active_node_count: 4,
             proposer,
             proposer_signature: [0u8; 64],

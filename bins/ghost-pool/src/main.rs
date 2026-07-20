@@ -3349,14 +3349,22 @@ async fn main() -> Result<()> {
         let db_c = Arc::clone(&db);
         Arc::new(move |cutoff_ts, height| {
             let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
-            let miners =
+            let miner_payouts =
                 ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
                     .ok()?;
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
-            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts);
-            Some(ghost_pool::payout::compute_ledger_root(
-                &miners, &nodes, cutoff_ts, height,
-            ))
+            let node_shares = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts);
+            let root = ghost_pool::payout::compute_ledger_root(
+                &miner_payouts,
+                &node_shares,
+                cutoff_ts,
+                height,
+            );
+            Some(ghost_pool::payout_checkpoint::CanonicalPayout {
+                miner_payouts,
+                node_shares,
+                root,
+            })
         })
     };
     // DIAGNOSTIC (v1.10.34): breakdown of the root inputs (miner-set + node-set
