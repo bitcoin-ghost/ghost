@@ -358,6 +358,18 @@ impl PayoutCheckpointManager {
         // Approve if the proposer's payout is within tolerance of ours (attribution +
         // float-order noise is same-operator cosmetic); a real misallocation exceeds it.
         let approve = payouts_agree(&local, &msg.miner_payouts, &msg.node_shares);
+        // DIAG (tolerance-zero readiness): does our OWN root match the proposer's EXACTLY?
+        // If `exact=true` holds fleet-wide, the determinism fixes are sufficient and the
+        // tolerance can be dropped to zero (multi-operator-safe). `exact=false, approve=true`
+        // means we're still relying on tolerance.
+        info!(
+            height = msg.height,
+            exact = (local.root == msg.ledger_root),
+            approve,
+            local_root = %hex::encode(&local.root[..8]),
+            proposed_root = %hex::encode(&msg.ledger_root[..8]),
+            "payout checkpoint: vote"
+        );
         {
             let mut pending = self.pending.write();
             let p = pending.entry(msg.height).or_insert_with(Pending::new);
