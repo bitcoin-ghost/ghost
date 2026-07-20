@@ -462,6 +462,7 @@ impl VerificationResultHandler {
                 msg.passed,
                 msg.timestamp,
                 blob,
+                msg.round_height.map(|h| h as i64),
             )
             .unwrap_or(false)
     }
@@ -646,6 +647,7 @@ impl VerificationResultHandler {
             msg.passed,
             msg.timestamp,
             &envelope.payload,
+            msg.round_height.map(|h| h as i64),
         ) {
             warn!(error = %e, "Failed to persist verification proof to convergence ledger");
         }
@@ -1046,6 +1048,7 @@ mod tests {
             response_data: Some(r#"{"hash":"00ff"}"#.to_string()),
             target_signed_response: Some("{\"stub\":true}".to_string()),
             timestamp: Utc::now().timestamp(),
+            round_height: None,
             signature: [0u8; 64],
         };
         let signing_data = msg.signing_data();
@@ -1149,6 +1152,7 @@ mod tests {
             response_data: Some(r#"{"tier":"T0","accepted":true}"#.to_string()),
             target_signed_response: Some("{\"stub\":true}".to_string()),
             timestamp: Utc::now().timestamp(),
+            round_height: None,
             signature: [0u8; 64],
         };
         let signing_data = msg.signing_data();

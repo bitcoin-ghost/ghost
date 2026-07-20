@@ -8282,6 +8282,7 @@ async fn main() -> Result<()> {
     let mesh_for_verification = Arc::clone(&mesh);
     let identity_for_verification = Arc::clone(&identity);
     let db_for_verification = Arc::clone(&db);
+    let rm_for_verification = Arc::clone(&round_manager);
     tokio::spawn(async move {
         use ghost_consensus::message::{CapabilityType, MessageType, VerificationResultMessage};
 
@@ -8317,6 +8318,12 @@ async fn main() -> Result<()> {
             signing_data.extend_from_slice(&broadcast.timestamp.to_le_bytes());
             let signature = identity_for_verification.sign(&signing_data);
 
+            // A-2b: stamp the round this challenge was issued in (our current L1 tip),
+            // so qualification can recompute the challenger draw for this round. Only
+            // consulted at/above CHALLENGER_ASSIGNMENT_HEIGHT; recorded always so the
+            // column is populated before the gate is armed.
+            let round_height = Some(rm_for_verification.current_height());
+
             let msg = VerificationResultMessage {
                 target_node_id: broadcast.target_node_id,
                 challenger_id: broadcast.challenger_id,
@@ -8326,6 +8333,7 @@ async fn main() -> Result<()> {
                 challenge_data: broadcast.challenge_data,
                 response_data: broadcast.response_data,
                 target_signed_response: broadcast.target_signed_response,
+                round_height,
                 signature,
             };
 
@@ -8343,6 +8351,7 @@ async fn main() -> Result<()> {
                         msg.passed,
                         msg.timestamp,
                         &blob,
+                        msg.round_height.map(|h| h as i64),
                     ) {
                         warn!(error = %e, "Failed to persist own verification proof to ledger");
                     }

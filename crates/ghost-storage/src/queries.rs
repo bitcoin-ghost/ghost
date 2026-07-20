@@ -5533,6 +5533,7 @@ impl Database {
         passed: bool,
         timestamp: i64,
         proof: &[u8],
+        round_height: Option<i64>,
     ) -> GhostResult<bool> {
         if challenger_id.len() > MAX_CHALLENGE_ID_SIZE
             || target_node_id.len() > MAX_CHALLENGE_ID_SIZE
@@ -5545,8 +5546,8 @@ impl Database {
             let n = conn
                 .execute(
                     "INSERT OR IGNORE INTO verification_ledger
-                     (challenger_id, target_node_id, capability, passed, timestamp, proof)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (challenger_id, target_node_id, capability, passed, timestamp, proof, round_height)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         challenger_id,
                         target_node_id,
@@ -5554,6 +5555,7 @@ impl Database {
                         passed as i64,
                         timestamp,
                         proof,
+                        round_height,
                     ],
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -13364,15 +13366,15 @@ mod tests {
 
         // A new (challenger, target, capability, timestamp) record is stored.
         assert!(db
-            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob)
+            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob, None)
             .expect("insert"));
         // Re-delivery of the SAME key is a no-op — the dedup the *_challenges tables lacked.
         assert!(!db
-            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob)
+            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob, None)
             .expect("insert dup"));
         // A different timestamp is a distinct record.
         assert!(db
-            .insert_verification_proof("challengerA", "targetB", "archive", false, 2_000, &blob)
+            .insert_verification_proof("challengerA", "targetB", "archive", false, 2_000, &blob, None)
             .expect("insert 2"));
 
         // Windowed read serves only in-range records (the convergence responder relies on this).
@@ -13400,9 +13402,9 @@ mod tests {
         let day = 86_400i64;
 
         // One row well inside retention, one well past it.
-        db.insert_verification_proof("cA", "tB", "policy", true, now - 2 * day, &blob)
+        db.insert_verification_proof("cA", "tB", "policy", true, now - 2 * day, &blob, None)
             .expect("recent");
-        db.insert_verification_proof("cA", "tB", "policy", true, now - 40 * day, &blob)
+        db.insert_verification_proof("cA", "tB", "policy", true, now - 40 * day, &blob, None)
             .expect("old");
 
         let deleted = db.prune_old_verification_ledger(30).expect("prune");
@@ -13419,11 +13421,11 @@ mod tests {
     fn verification_convergence_serves_only_missing() {
         let db = Database::in_memory().expect("create in-memory db");
         let blob = |n: u8| vec![n; 8];
-        db.insert_verification_proof("cA", "tB", "archive", true, 100, &blob(1))
+        db.insert_verification_proof("cA", "tB", "archive", true, 100, &blob(1), None)
             .unwrap();
-        db.insert_verification_proof("cA", "tB", "policy", true, 200, &blob(2))
+        db.insert_verification_proof("cA", "tB", "policy", true, 200, &blob(2), None)
             .unwrap();
-        db.insert_verification_proof("cC", "tB", "archive", false, 300, &blob(3))
+        db.insert_verification_proof("cC", "tB", "archive", false, 300, &blob(3), None)
             .unwrap();
 
         let keys = db.verification_keys_in(0, 1_000).expect("keys");

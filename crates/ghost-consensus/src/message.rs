@@ -519,6 +519,19 @@ pub struct VerificationResultMessage {
     pub target_signed_response: Option<String>,
     /// Timestamp when challenge was issued
     pub timestamp: i64,
+    /// Surface A-2b: the ROUND this challenge was issued in — the block height
+    /// whose buried hash (`blockhash(round_height - CHALLENGER_ASSIGNMENT_SEED_LAG)`)
+    /// seeds the consensus challenger draw. Qualification recomputes the draw for
+    /// this round to decide whether this challenger was ASSIGNED to the target and
+    /// therefore whether the verdict counts (only at/above CHALLENGER_ASSIGNMENT_HEIGHT).
+    /// `#[serde(default)]` so older peers that omit it still deserialize.
+    ///
+    /// NOTE: not yet folded into `signing_data` — binding it into the signature
+    /// (so a relay cannot tamper the round to drop an honest verdict) is a REQUIRED
+    /// follow-up before the gate is armed; while the gate is dormant the field is
+    /// only recorded, never consulted.
+    #[serde(default)]
+    pub round_height: Option<u64>,
     /// Challenger's signature over (target_node_id || capability || passed || timestamp)
     #[serde(with = "ghost_common::serde_hex::bytes64")]
     pub signature: [u8; 64],

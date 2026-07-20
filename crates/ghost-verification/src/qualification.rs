@@ -1427,7 +1427,7 @@ mod tests {
     ) {
         for i in 0..n {
             let challenger = hex_id(first_challenger + i);
-            db.insert_verification_proof(&challenger, target, "archive", passed, ts, b"p")
+            db.insert_verification_proof(&challenger, target, "archive", passed, ts, b"p", None)
                 .unwrap();
         }
     }
@@ -1515,10 +1515,11 @@ mod tests {
                 true,
                 cutoff - 100,
                 b"p",
+                None,
             )
             .unwrap();
         }
-        db.insert_verification_proof(&hex_id(0x40), &target, "stratum", false, cutoff - 100, b"p")
+        db.insert_verification_proof(&hex_id(0x40), &target, "stratum", false, cutoff - 100, b"p", None)
             .unwrap();
 
         let provider = QualifiedCapabilityProvider::new(db);
@@ -1604,7 +1605,7 @@ mod tests {
         ];
         for (c, a) in chs.iter().zip(clustered.iter()) {
             register_voter(&db, c, a);
-            db.insert_verification_proof(c, &target, "archive", true, cutoff - 100, b"p")
+            db.insert_verification_proof(c, &target, "archive", true, cutoff - 100, b"p", None)
                 .unwrap();
         }
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
@@ -1642,12 +1643,12 @@ mod tests {
         ];
         for (c, a) in passers.iter() {
             register_voter(&db, c, a);
-            db.insert_verification_proof(c, &target, "stratum", true, cutoff - 100, b"p")
+            db.insert_verification_proof(c, &target, "stratum", true, cutoff - 100, b"p", None)
                 .unwrap();
         }
         // One voter-set griefer on its own subnet signs a FAIL.
         register_voter(&db, &hex_id(0x25), "10.5.0.1:3333");
-        db.insert_verification_proof(&hex_id(0x25), &target, "stratum", false, cutoff - 100, b"p")
+        db.insert_verification_proof(&hex_id(0x25), &target, "stratum", false, cutoff - 100, b"p", None)
             .unwrap();
 
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
