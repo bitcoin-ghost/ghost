@@ -112,6 +112,34 @@ pub trait ResultReVerifier: Send + Sync {
         challenge_data: &str,
         target_signed_response: Option<&str>,
     ) -> ReVerdict;
+
+    // NOTE: there is deliberately NO `reverify_stratum`. Public-port reachability
+    // is a NETWORK-POSITION fact, not chain/L2 content: it cannot be reproduced
+    // from a transcript by a third party. The only sound evidence is the
+    // challenger's OWN external TCP probe, which is exactly what is stored. Its
+    // Sybil defence is the DISTINCT voter-set challenger supermajority + IP
+    // diversity applied at qualification (Surface A-2), NOT recipient-side
+    // re-derivation. (Re-deriving Stratum to a target SELF-attestation would be
+    // strictly worse — it would discard the independent probe and let a target
+    // vouch for its own reachability, defeating A-2.)
+
+    /// Re-derive a GhostPay verdict from the TARGET's signed `GhostPayResponse`.
+    ///
+    /// The recipient BINDS the signed response to the challenge nonce by
+    /// recomputing `nonce_bound_proof = SHA256(epoch_state_hash || challenge_nonce)`
+    /// (the nonce is read from the challenger-authored `challenge_data`) and
+    /// requiring it to equal the TARGET-signed `nonce_bound_proof`. This proves the
+    /// target computed the response FRESH for this challenge (defeating precompute
+    /// and replay) and that a colluding challenger cannot pair a stale/forged proof
+    /// with an arbitrary nonce. A signed, epoch-proving, nonce-bound response is a
+    /// PASS; a signed response that fails to prove epoch state is a FAIL; anything
+    /// unsigned/invalid/unparseable is `Unverifiable` and records nothing.
+    async fn reverify_ghostpay(
+        &self,
+        target_node_id: &NodeId,
+        challenge_data: &str,
+        target_signed_response: Option<&str>,
+    ) -> ReVerdict;
 }
 
 /// Callback used to transmit a serialized [`ChallengeConvergencePayload`] to a
@@ -804,6 +832,14 @@ impl VerificationResultHandler {
                         .map(|l| l as u32)
                 });
 
+                // GHOST-01: Stratum is NOT recipient-re-derived. Public-port
+                // reachability is a network-position fact, not content, so the
+                // challenger's OWN external TCP probe (`connected`/`passed`) is the
+                // only sound evidence — recipient re-derivation to a target
+                // self-attestation would discard that probe and defeat the A-2
+                // distinct-challenger defence. A colluding challenger's lone
+                // fabricated verdict is instead diluted by the DISTINCT voter-set
+                // challenger supermajority + IP diversity applied at qualification.
                 if let Err(e) = self.db.insert_stratum_challenge(
                     &target_hex,
                     &challenger_hex,
@@ -831,12 +867,42 @@ impl VerificationResultHandler {
                     })
                     .unwrap_or(false);
 
+                // SECURITY (GHOST-01): never store the challenger-supplied `passed`
+                // verbatim. When a re-deriver is configured, require the TARGET's own
+                // signed, nonce-bound L2 proof (recomputed against the challenge nonce),
+                // so a colluding challenger cannot fabricate a PASS or FAIL.
+                let stored_passed = if let Some(ref reverifier) = self.reverifier {
+                    match reverifier
+                        .reverify_ghostpay(
+                            &msg.target_node_id,
+                            &msg.challenge_data,
+                            msg.target_signed_response.as_deref(),
+                        )
+                        .await
+                    {
+                        ReVerdict::Pass => true,
+                        ReVerdict::Fail => false,
+                        ReVerdict::Unverifiable => {
+                            debug!(
+                                challenger = %short_challenger,
+                                target = %short_target,
+                                "GhostPay verdict unverifiable - not recording (no grief)"
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    // Legacy path (unit tests / no re-deriver wired): preserve the
+                    // prior behaviour of trusting the challenger's verdict.
+                    msg.passed
+                };
+
                 if let Err(e) = self.db.insert_ghostpay_challenge(
                     &target_hex,
                     &challenger_hex,
                     &endpoint,
                     response_valid,
-                    msg.passed,
+                    stored_passed,
                 ) {
                     warn!(error = %e, "Failed to store ghostpay challenge result");
                 }
@@ -946,6 +1012,15 @@ mod tests {
         }
 
         async fn reverify_policy(
+            &self,
+            _target_node_id: &NodeId,
+            _challenge_data: &str,
+            _target_signed_response: Option<&str>,
+        ) -> ReVerdict {
+            self.0
+        }
+
+        async fn reverify_ghostpay(
             &self,
             _target_node_id: &NodeId,
             _challenge_data: &str,

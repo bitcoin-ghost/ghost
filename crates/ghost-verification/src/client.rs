@@ -878,6 +878,7 @@ impl VerificationClient {
     ) -> GhostResult<GhostPayResponse> {
         self.verify_ghostpay_with_nonce(node_address, challenge_epoch, None)
             .await
+            .map(|(resp, _signed)| resp)
     }
 
     /// VER-2 FIX: Verify GhostPay capability with challenge nonce
@@ -885,21 +886,32 @@ impl VerificationClient {
     /// The challenge_nonce is a random 32-byte hex string that must be incorporated
     /// into the response's nonce_bound_proof field as SHA256(epoch_state_hash || nonce).
     /// This prevents attackers from precomputing a lookup table of epoch_state_hash values.
+    ///
+    /// Returns `(GhostPayResponse, Option<raw_signed_json>)`. We request a SIGNED
+    /// response (no `unsigned=true`) so recipients of the broadcast can RE-DERIVE
+    /// the verdict against the target's own signature + nonce-bound epoch proof
+    /// (GHOST-01). The second element is the raw `SignedResponse<GhostPayResponse>`
+    /// JSON verbatim (when the target signed), so the signature stays verifiable
+    /// end-to-end.
     pub async fn verify_ghostpay_with_nonce(
         &self,
         node_address: &str,
         challenge_epoch: Option<u64>,
         challenge_nonce: Option<&str>,
-    ) -> GhostResult<GhostPayResponse> {
+    ) -> GhostResult<(GhostPayResponse, Option<String>)> {
         // H-1/VER-2 FIX: Include both challenge_epoch and challenge_nonce in the request
-        let mut params = vec!["unsigned=true".to_string()];
+        let mut params: Vec<String> = Vec::new();
         if let Some(epoch) = challenge_epoch {
             params.push(format!("challenge_epoch={}", epoch));
         }
         if let Some(nonce) = challenge_nonce {
             params.push(format!("challenge_nonce={}", nonce));
         }
-        let path = format!("/verify/ghostpay?{}", params.join("&"));
+        let path = if params.is_empty() {
+            "/verify/ghostpay".to_string()
+        } else {
+            format!("/verify/ghostpay?{}", params.join("&"))
+        };
         let url = self.build_url(node_address, &path)?;
 
         debug!(url = %url, challenge_epoch = ?challenge_epoch, challenge_nonce = ?challenge_nonce, "Verifying GhostPay capability");
@@ -909,22 +921,60 @@ impl VerificationClient {
             GhostError::VerificationTimeout("GhostPay verification request failed".to_string())
         })?;
 
-        // GhostPay endpoint returns {"signed": bool, "response": GhostPayResponse}
+        // GhostPay endpoint returns {"signed": bool, "response": <T>} where T is a
+        // `SignedResponse<GhostPayResponse>` when signed==true, else a bare
+        // `GhostPayResponse`.
         let wrapper: serde_json::Value = response.json().await.map_err(|e| {
             debug!("GhostPay verification response parse error: {}", e);
             GhostError::InvalidVerificationResponse("Invalid GhostPay response format".to_string())
         })?;
 
+        let signed_flag = wrapper
+            .get("signed")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+
         let inner = wrapper.get("response").ok_or_else(|| {
             GhostError::InvalidVerificationResponse("Missing 'response' field".to_string())
         })?;
 
-        let result: GhostPayResponse = serde_json::from_value(inner.clone()).map_err(|e| {
-            debug!("GhostPay response deserialization error: {}", e);
-            GhostError::InvalidVerificationResponse("Invalid GhostPay response data".to_string())
-        })?;
+        if signed_flag {
+            // `inner` is a SignedResponse<GhostPayResponse>; the GhostPayResponse is
+            // its `payload`. Capture the raw signed JSON verbatim so the target's
+            // signature stays verifiable end-to-end by recipients.
+            let raw_signed = serde_json::to_string(inner).map_err(|e| {
+                debug!("GhostPay signed response re-serialization error: {}", e);
+                GhostError::InvalidVerificationResponse(
+                    "Invalid signed GhostPay response".to_string(),
+                )
+            })?;
 
-        Ok(result)
+            let payload = inner.get("payload").ok_or_else(|| {
+                GhostError::InvalidVerificationResponse(
+                    "Signed GhostPay response missing 'payload'".to_string(),
+                )
+            })?;
+
+            let result: GhostPayResponse =
+                serde_json::from_value(payload.clone()).map_err(|e| {
+                    debug!("GhostPay payload deserialization error: {}", e);
+                    GhostError::InvalidVerificationResponse(
+                        "Invalid GhostPay response data".to_string(),
+                    )
+                })?;
+
+            Ok((result, Some(raw_signed)))
+        } else {
+            let result: GhostPayResponse =
+                serde_json::from_value(inner.clone()).map_err(|e| {
+                    debug!("GhostPay response deserialization error: {}", e);
+                    GhostError::InvalidVerificationResponse(
+                        "Invalid GhostPay response data".to_string(),
+                    )
+                })?;
+
+            Ok((result, None))
+        }
     }
 
     /// Probe a peer's current GhostPay epoch without issuing a challenge.
@@ -1024,7 +1074,9 @@ impl VerificationClient {
                 .verify_ghostpay_with_nonce(node_address, None, ghostpay_nonce.as_deref())
                 .await
             {
-                Ok(resp) => result.ghostpay_verified = resp.success && resp.l2_enabled,
+                Ok((resp, _signed)) => {
+                    result.ghostpay_verified = resp.success && resp.l2_enabled
+                }
                 Err(e) => result.errors.push(format!("GhostPay: {}", e)),
             }
         }

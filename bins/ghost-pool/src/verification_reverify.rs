@@ -33,8 +33,8 @@ use ghost_common::types::NodeId;
 use ghost_consensus::verification_handler::{ReVerdict, ResultReVerifier};
 use ghost_policy::{PolicyEngine, PolicyProfile};
 use ghost_verification::challenge::{
-    validate_archive_response, validate_policy_response, ArchiveResponse, PolicyResponse,
-    SignedResponse,
+    validate_archive_response, validate_policy_response, ArchiveResponse, GhostPayResponse,
+    PolicyResponse, SignedResponse,
 };
 
 /// Read-only view of the recipient's own chain. Abstracted behind a trait so the
@@ -112,6 +112,15 @@ impl ResultReVerifier for ChainReVerifier {
             challenge_data,
             target_signed_response,
         )
+    }
+
+    async fn reverify_ghostpay(
+        &self,
+        target_node_id: &NodeId,
+        challenge_data: &str,
+        target_signed_response: Option<&str>,
+    ) -> ReVerdict {
+        reverify_ghostpay_impl(target_node_id, challenge_data, target_signed_response)
     }
 }
 
@@ -299,6 +308,121 @@ fn reverify_policy_impl(
         ReVerdict::Pass
     } else {
         ReVerdict::Fail
+    }
+}
+
+/// Core GhostPay re-derivation. Pure (no RPC) so it can be unit-tested directly.
+///
+/// GhostPay reachability of an L2 endpoint cannot be reproduced from a transcript
+/// by a node that does not itself run that L2 — but the TARGET can PROVE fresh
+/// possession of L2 state cryptographically: for a challenger-chosen random epoch
+/// it returns `epoch_state_hash` and a nonce-bound proof
+/// `SHA256(epoch_state_hash || challenge_nonce)`, all inside a response SIGNED by
+/// its node identity (which also binds the `challenge_nonce`). A colluding
+/// challenger therefore cannot fabricate a PASS for a target that never answered:
+/// it can forge neither the signature nor a nonce-bound proof over a random epoch.
+///
+/// SECURITY: this verdict is PASS-or-`Unverifiable` — it NEVER returns `Fail`.
+/// Every negative (no/invalid/stale signature, missing epoch proof, nonce
+/// mismatch) could equally be an honest target that a colluding challenger denied
+/// a fair challenge (omitted the epoch, swapped the nonce), so recording a FAIL
+/// would let a colluder grief. A node that cannot positively prove GhostPay simply
+/// accrues no PASS rows and never reaches the qualification floor — which is the
+/// correct outcome without any grief surface. (The residual "an operator runs its
+/// OWN signing target" self-attestation is a Sybil-cost problem addressed by
+/// Surface A-2/A-5, not by re-derivation.)
+fn reverify_ghostpay_impl(
+    target_node_id: &NodeId,
+    challenge_data: &str,
+    target_signed_response: Option<&str>,
+) -> ReVerdict {
+    // 1. No signed response at all — we cannot judge.
+    let raw = match target_signed_response {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return ReVerdict::Unverifiable,
+    };
+
+    // 2. Parse the TARGET's signed response. A malformed blob is not a FAIL.
+    let signed: SignedResponse<GhostPayResponse> = match serde_json::from_str(raw) {
+        Ok(s) => s,
+        Err(_) => return ReVerdict::Unverifiable,
+    };
+
+    // 3a. The signer MUST be the target.
+    let target_hex = hex::encode(target_node_id);
+    if !signed.signer.eq_ignore_ascii_case(&target_hex) {
+        return ReVerdict::Unverifiable;
+    }
+
+    // 3b. Verify the target's Ed25519 signature + freshness. This authenticates the
+    //     payload AND the `challenge_nonce` the target signed over. A
+    //     bad/absent/stale signature is Unverifiable, NOT Fail.
+    let verify_result = signed.verify(|signer_hex, message_hash, signature_bytes| {
+        let pk_bytes = match hex::decode(signer_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => return false,
+        };
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&pk_bytes);
+        let sig: [u8; 64] = match signature_bytes.try_into() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        verify_signature(&pk, message_hash, &sig).unwrap_or(false)
+    });
+    if verify_result.is_err() {
+        return ReVerdict::Unverifiable;
+    }
+
+    // 4. Extract the nonce the challenger says it issued (challenger-authored, but
+    //    bound to the broadcast by the M-6 challenge_data_hash signature).
+    let challenge_nonce = match serde_json::from_str::<serde_json::Value>(challenge_data)
+        .ok()
+        .and_then(|v| {
+            v.get("challenge_nonce")
+                .and_then(|n| n.as_str())
+                .map(String::from)
+        }) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ReVerdict::Unverifiable,
+    };
+
+    // 5. BINDING: the nonce the TARGET signed over must be the nonce the challenger
+    //    issued. A mismatch means the challenger paired this challenge with an
+    //    unrelated signed response — we cannot judge, so we must not grief.
+    match signed.challenge_nonce.as_deref() {
+        Some(cn) if cn == challenge_nonce => {}
+        _ => return ReVerdict::Unverifiable,
+    }
+
+    // 6. The signed payload must positively PROVE fresh L2 state: success, an
+    //    epoch state hash, and a nonce-bound proof. Anything short of that is
+    //    Unverifiable (never a griefing FAIL).
+    let payload = &signed.payload;
+    let (state_hash, nonce_bound_proof) = match (
+        payload.success,
+        payload.epoch_state_hash.as_deref(),
+        payload.nonce_bound_proof.as_deref(),
+    ) {
+        (true, Some(h), Some(p)) if !h.is_empty() && !p.is_empty() => (h, p),
+        _ => return ReVerdict::Unverifiable,
+    };
+
+    // 7. Recompute the nonce-bound proof from the TARGET-signed epoch_state_hash and
+    //    the issued nonce, exactly as the server does
+    //    (SHA256(epoch_state_hash || challenge_nonce)), and require an exact match.
+    //    This proves the target incorporated THIS challenge's nonce into a proof
+    //    over its OWN epoch state — defeating precompute and replay.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(state_hash.as_bytes());
+    hasher.update(challenge_nonce.as_bytes());
+    let expected = hex::encode(hasher.finalize());
+
+    if expected.eq_ignore_ascii_case(nonce_bound_proof) {
+        ReVerdict::Pass
+    } else {
+        ReVerdict::Unverifiable
     }
 }
 
@@ -871,5 +995,162 @@ mod tests {
         let cd2 = serde_json::json!({ "tx_hex": "zzzz" }).to_string();
         let verdict2 = reverify_policy_impl(&pure(), &target.node_id(), &cd2, Some(&signed));
         assert_eq!(verdict2, ReVerdict::Unverifiable);
+    }
+
+    // =================================================================
+    // GhostPay re-derivation (nonce-bound epoch proof)
+    // =================================================================
+
+    use ghost_verification::challenge::GhostPayResponse;
+
+    const GP_STATE_HASH: &str =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn nonce_bound(state_hash: &str, nonce: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(state_hash.as_bytes());
+        h.update(nonce.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    /// Build a `SignedResponse<GhostPayResponse>` JSON. When `good_proof` the
+    /// `nonce_bound_proof` is the correct `SHA256(state_hash || nonce)`; otherwise
+    /// it is a deliberately wrong value.
+    fn make_signed_ghostpay(
+        identity: &NodeIdentity,
+        challenge_nonce: &str,
+        state_hash: Option<&str>,
+        success: bool,
+        good_proof: bool,
+    ) -> String {
+        let nonce_bound_proof = state_hash.map(|sh| {
+            if good_proof {
+                nonce_bound(sh, challenge_nonce)
+            } else {
+                "00".repeat(32)
+            }
+        });
+        let resp = GhostPayResponse {
+            success,
+            l2_enabled: true,
+            virtual_block: Some(42),
+            epoch: Some(7),
+            balance_sats: None,
+            wraith_enabled: false,
+            epoch_state_hash: state_hash.map(String::from),
+            epoch_tx_count: Some(3),
+            nonce_bound_proof,
+            epoch_proof: None,
+            error: None,
+        };
+        let signer_hex = identity.node_id_hex();
+        let signed = SignedResponse::new(
+            resp,
+            signer_hex,
+            |msg| identity.sign(msg),
+            Some(challenge_nonce.to_string()),
+        );
+        serde_json::to_string(&signed).expect("serialize signed ghostpay response")
+    }
+
+    fn gp_challenge_data(nonce: &str) -> String {
+        serde_json::json!({
+            "endpoint": "ghostpay",
+            "challenge_epoch": 7,
+            "challenge_nonce": nonce,
+        })
+        .to_string()
+    }
+
+    /// Happy path: signed, fresh, correct nonce-bound epoch proof => Pass.
+    #[test]
+    fn ghostpay_valid_nonce_bound_proof_is_pass() {
+        let target = NodeIdentity::generate();
+        let nonce = "a1b2c3d4e5f60718";
+        let signed = make_signed_ghostpay(&target, nonce, Some(GP_STATE_HASH), true, true);
+        let verdict =
+            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data(nonce), Some(&signed));
+        assert_eq!(verdict, ReVerdict::Pass);
+    }
+
+    /// No signed response at all => Unverifiable (never fabricate a PASS).
+    #[test]
+    fn ghostpay_missing_signed_response_is_unverifiable() {
+        let target = NodeIdentity::generate();
+        assert_eq!(
+            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data("deadbeef"), None),
+            ReVerdict::Unverifiable
+        );
+        assert_eq!(
+            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data("deadbeef"), Some("   ")),
+            ReVerdict::Unverifiable
+        );
+    }
+
+    /// Signed by someone OTHER than the target => Unverifiable (anti-proxy).
+    #[test]
+    fn ghostpay_wrong_signer_is_unverifiable() {
+        let target = NodeIdentity::generate();
+        let impostor = NodeIdentity::generate();
+        let nonce = "a1b2c3d4e5f60718";
+        let signed = make_signed_ghostpay(&impostor, nonce, Some(GP_STATE_HASH), true, true);
+        let verdict =
+            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data(nonce), Some(&signed));
+        assert_eq!(verdict, ReVerdict::Unverifiable);
+    }
+
+    /// The nonce the target signed differs from the one the challenger issued =>
+    /// Unverifiable (a colluder cannot bolt a valid proof onto a foreign challenge).
+    #[test]
+    fn ghostpay_nonce_mismatch_is_unverifiable() {
+        let target = NodeIdentity::generate();
+        let signed_nonce = "1111111111111111";
+        let signed = make_signed_ghostpay(&target, signed_nonce, Some(GP_STATE_HASH), true, true);
+        // challenger claims a DIFFERENT nonce
+        let verdict = reverify_ghostpay_impl(
+            &target.node_id(),
+            &gp_challenge_data("2222222222222222"),
+            Some(&signed),
+        );
+        assert_eq!(verdict, ReVerdict::Unverifiable);
+    }
+
+    /// A wrong `nonce_bound_proof` (precompute/replay attempt) => Unverifiable,
+    /// NEVER Fail (a FAIL would be a grief surface).
+    #[test]
+    fn ghostpay_bad_nonce_bound_proof_is_unverifiable() {
+        let target = NodeIdentity::generate();
+        let nonce = "a1b2c3d4e5f60718";
+        let signed = make_signed_ghostpay(&target, nonce, Some(GP_STATE_HASH), true, false);
+        let verdict =
+            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data(nonce), Some(&signed));
+        assert_eq!(verdict, ReVerdict::Unverifiable);
+    }
+
+    /// A signed response that fails to prove epoch state (no epoch_state_hash, or
+    /// success=false) => Unverifiable, never Fail.
+    #[test]
+    fn ghostpay_missing_epoch_proof_is_unverifiable() {
+        let target = NodeIdentity::generate();
+        let nonce = "a1b2c3d4e5f60718";
+
+        // No epoch_state_hash / nonce_bound_proof.
+        let no_state = make_signed_ghostpay(&target, nonce, None, true, true);
+        assert_eq!(
+            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data(nonce), Some(&no_state)),
+            ReVerdict::Unverifiable
+        );
+
+        // success=false even with a well-formed proof.
+        let not_success = make_signed_ghostpay(&target, nonce, Some(GP_STATE_HASH), false, true);
+        assert_eq!(
+            reverify_ghostpay_impl(
+                &target.node_id(),
+                &gp_challenge_data(nonce),
+                Some(&not_success)
+            ),
+            ReVerdict::Unverifiable
+        );
     }
 }

@@ -1755,8 +1755,8 @@ impl VerificationTask {
             )
             .await;
 
-        let (passed, response_valid, response_data) = match result {
-            Ok(resp) => {
+        let (passed, response_valid, response_data, target_signed_response) = match result {
+            Ok((resp, signed)) => {
                 // H-1/VER-2/VER-3 FIX: Validate the response includes proper epoch state proof
                 // and nonce-bound proof to prevent precomputation attacks
                 let validation =
@@ -1773,15 +1773,19 @@ impl VerificationTask {
                     "validation": validation.1,
                 });
 
+                // GHOST-01: carry the TARGET's own signed GhostPayResponse so
+                // recipients re-derive the verdict (nonce-bound epoch proof) rather
+                // than trusting our `passed` claim.
                 (
                     validation.0,
                     resp.l2_enabled,
                     Some(response_json.to_string()),
+                    signed,
                 )
             }
             Err(e) => {
                 warn!(peer = %short_id, error = %e, "GhostPay verification failed");
-                (false, false, Some(format!("{{\"error\":\"{}\"}}", e)))
+                (false, false, Some(format!("{{\"error\":\"{}\"}}", e)), None)
             }
         };
 
@@ -1820,7 +1824,7 @@ impl VerificationTask {
             challenge_data,
             response_data,
             timestamp,
-            None,
+            target_signed_response,
         )
         .await;
 
