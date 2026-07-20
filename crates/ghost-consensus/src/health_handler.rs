@@ -944,6 +944,23 @@ impl HealthPingHandler {
             if let Err(e) = db.record_uptime_sample(&node_id_hex, now, true) {
                 warn!(error = %e, peer_id = %short_id, "Failed to record uptime sample");
             }
+
+            // Learn this peer's node-reward payout address (payout-finalisation).
+            // `node_id_hex` is `hex(envelope.sender)` — the Noise-authenticated
+            // sender — so a node can only advertise its OWN address; it can never
+            // set a peer's. Without this every node's `nodes.payout_address` is NULL
+            // except its own, so `get_all_node_ids_with_payout` returns `{self}` and
+            // the payout-ledger checkpoint's node set never converges. The address is
+            // public (a coinbase output); the read path still validates it, and a
+            // bounded length guards against a malformed advertisement. `register_node`
+            // above created the row, so this UPDATE lands on it.
+            if let Some(ref addr) = ping.payout_address {
+                if !addr.is_empty() && addr.len() <= 128 {
+                    if let Err(e) = db.update_node_payout_address(&node_id_hex, addr) {
+                        debug!(error = %e, peer_id = %short_id, "Failed to store peer payout address");
+                    }
+                }
+            }
         }
 
         Ok(())

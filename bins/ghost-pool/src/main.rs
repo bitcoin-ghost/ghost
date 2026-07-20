@@ -2771,6 +2771,10 @@ async fn main() -> Result<()> {
         } else {
             None
         },
+        // Advertise our node-reward payout address so every peer's node registry
+        // converges (payout-finalisation: without it get_all_node_ids_with_payout
+        // returns {self} everywhere and the payout checkpoint can't finalise).
+        advertised_payout_address: config.pool.node_payout_address.clone(),
         // C-1: Noise Protocol configuration for encrypted P2P
         // Read from config (mainnet validation ensures this is true on mainnet)
         noise_enabled: config.network.noise_enabled,
@@ -3493,7 +3497,14 @@ async fn main() -> Result<()> {
             // rotating back through `LEDGER_SWEEP_SPAN_SECS`. Bucketing keeps each advertisement
             // a sane size; the rotation covers the whole span.
             const LEDGER_BUCKET_SECS: i64 = 1_800; // 30 min per advertisement
-            const LEDGER_SWEEP_SPAN_SECS: i64 = 86_400; // sweep the last 24h
+            // Sweep the trailing 7 days, matching the verification-ledger sweep
+            // (VLEDGER_SWEEP_SPAN_SECS). At 24h a proof-present share dropped in gossip
+            // that was not reconciled within a day aged out of the rotation and stayed
+            // divergent forever — even though its proof exists and it is fully servable.
+            // The unpaid-share horizon spans well past 24h (shares accumulate until a
+            // payout settles), so the sweep must too, or the payout ledger can never
+            // reach the byte-identical totals the checkpoint requires.
+            const LEDGER_SWEEP_SPAN_SECS: i64 = 7 * 86_400; // sweep the last 7 days
             const LEDGER_BUCKETS: i64 = LEDGER_SWEEP_SPAN_SECS / LEDGER_BUCKET_SECS;
 
             let mut ticker =

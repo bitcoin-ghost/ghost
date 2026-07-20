@@ -97,6 +97,10 @@ pub struct MeshConfig {
     /// `.onion`. `None` for nodes that haven't opted in — they advertise no
     /// endpoint and so are never elected.
     pub advertised_coordinator_endpoint: Option<String>,
+    /// This node's node-reward payout address, advertised in health pings so every
+    /// peer learns it (see `HealthPing::payout_address`). Read from local config;
+    /// `None` when no payout address is configured.
+    pub advertised_payout_address: Option<String>,
     /// C-1: Enable Noise Protocol for transport encryption
     ///
     /// When enabled, sensitive P2P messages (shares, blocks, votes, payouts)
@@ -161,6 +165,7 @@ impl Default for MeshConfig {
             max_seen_messages: 100_000, // Cap at 100k messages (~3.2MB with 32-byte IDs)
             capabilities: ghost_common::types::NodeCapabilities::default(),
             advertised_coordinator_endpoint: None,
+            advertised_payout_address: None,
             // C-1: Enable Noise by default for secure-by-default operation
             noise_enabled: true,
             noise_port: DEFAULT_NOISE_PORT,
@@ -2998,6 +3003,9 @@ impl MeshNetwork {
                 uptime_percent,
                 peer_count,
                 l2_height,
+                // Operator-chosen, read from config — advertise our payout address so
+                // every peer's node registry converges (see HealthPing::payout_address).
+                payout_address: self.config.advertised_payout_address.clone(),
             };
 
             match self.create_envelope(
@@ -4040,6 +4048,8 @@ mod tests {
                 | MessageType::BlockFound
                 | MessageType::Vote
                 | MessageType::PayoutProposal
+                | MessageType::PayoutLedgerCheckpoint
+                | MessageType::PayoutLedgerCheckpointVote
                 | MessageType::ElderUpdate
                 | MessageType::ZkBlockProposal
                 | MessageType::ZkVote

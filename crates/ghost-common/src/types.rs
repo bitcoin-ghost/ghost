@@ -497,6 +497,18 @@ pub struct HealthPing {
     /// for backward compatibility.
     #[serde(default)]
     pub l2_height: Option<u64>,
+    /// This node's node-reward payout address (a Bitcoin address string). Gossiped
+    /// so EVERY node learns EVERY node's payout address — without this, each node
+    /// only knows its own (written from local config), so the qualified-node
+    /// candidate set (`get_all_node_ids_with_payout`, which filters
+    /// `payout_address IS NOT NULL`) is `{self}` on every node and the payout-ledger
+    /// checkpoint can never converge. Public information (it is a coinbase output),
+    /// and authenticated: the receiver stores it only for the Noise-authenticated
+    /// `envelope.sender`, so a node can only advertise its OWN address. `None` for
+    /// nodes with no configured payout address (or older peers); `#[serde(default)]`
+    /// keeps the wire change additive for a mixed-version fleet.
+    #[serde(default)]
+    pub payout_address: Option<String>,
 }
 
 /// One node's best (rarest) valid share in a public records window.
@@ -1103,6 +1115,7 @@ mod tests {
             uptime_percent: Some(99.5),
             peer_count: Some(3),
             l2_height: Some(12_345),
+            payout_address: Some("bc1qexamplepayoutaddr".to_string()),
         }
     }
 
@@ -1136,6 +1149,22 @@ mod tests {
         // Unrelated fields are unaffected.
         assert_eq!(back.miner_count, 2);
         assert_eq!(back.active_miner_id_hashes.len(), 2);
+    }
+
+    #[test]
+    fn health_ping_payout_address_roundtrips_and_defaults_none() {
+        // The payout address drives the qualified-node candidate set, so its wire
+        // behaviour is consensus-relevant: it must roundtrip, and an older peer that
+        // omits it must default to None (not qualify, rather than qualify with junk).
+        let ping = sample_health_ping();
+        let back: HealthPing =
+            serde_json::from_slice(&serde_json::to_vec(&ping).unwrap()).unwrap();
+        assert_eq!(back.payout_address, ping.payout_address);
+
+        let mut v = serde_json::to_value(&ping).unwrap();
+        assert!(v.as_object_mut().unwrap().remove("payout_address").is_some());
+        let old: HealthPing = serde_json::from_value(v).unwrap();
+        assert_eq!(old.payout_address, None);
     }
 
     #[test]
