@@ -6598,6 +6598,10 @@ async fn main() -> Result<()> {
             received_by: identity_for_shares.node_id(),
             template_id: rm_for_shares.current_template_id(),
             payout_address: share.payout_address.clone(),
+            // Multi-operator PoW verification: populated with the 80-byte header only
+            // at/above SHARE_POW_VERIFY_HEIGHT (B-3 wires it from the SRI submission).
+            // None while the gate is dormant → signing_bytes unchanged from today.
+            header: None,
             signature: None,
         };
         // GHOST-09: sign as the receiving node so peers can authenticate the

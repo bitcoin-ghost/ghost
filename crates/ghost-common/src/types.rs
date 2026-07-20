@@ -268,6 +268,16 @@ pub struct ShareProof {
     /// Payout address for the miner (needed by remote nodes that haven't seen this miner)
     #[serde(default)]
     pub payout_address: Option<String>,
+    /// Multi-operator PoW verification: the raw 80-byte Bitcoin block header this share
+    /// solved, so ANY node can independently recompute `sha256d(header) == share_hash`
+    /// (see `DifficultyCalculator::verify_pow_preimage`) rather than trusting the origin's
+    /// signed numeric claim. `None` below `SHARE_POW_VERIFY_HEIGHT` (populated only at/above
+    /// the gate, so while dormant `signing_bytes` is byte-identical to pre-header proofs and
+    /// a mixed-version fleet stays compatible). Bound by the GHOST-09 signature when present,
+    /// so it can't be stripped or swapped. `Vec<u8>` (not `[u8;80]`) for serde simplicity;
+    /// verifiers require `len()==80`.
+    #[serde(default)]
+    pub header: Option<Vec<u8>>,
     /// GHOST-09: ed25519 signature by `received_by` over [`ShareProof::signing_bytes`].
     /// Authenticates the node-reward credit recipient so a relayed proof can't be
     /// re-credited to a different node. `None` on pre-GHOST-09 proofs, which fail
@@ -312,6 +322,12 @@ impl ShareProof {
         m.extend_from_slice(&self.received_by);
         if let Some(ref t) = self.template_id {
             m.extend_from_slice(t);
+        }
+        // Bind the PoW header when present (populated at/above SHARE_POW_VERIFY_HEIGHT), so
+        // a relay can't strip or swap it. Absent while the gate is dormant → identical to
+        // pre-header proofs, keeping a mixed-version fleet's signatures compatible.
+        if let Some(ref h) = self.header {
+            m.extend_from_slice(h);
         }
         m
     }
@@ -847,6 +863,7 @@ mod tests {
             received_by: id.node_id(),
             template_id: Some([9u8; 32]),
             payout_address: Some("bcrt1qexample".to_string()),
+            header: None,
             signature: None,
         };
         proof.sign(&id);
@@ -860,6 +877,53 @@ mod tests {
         assert!(
             proof2.has_valid_received_by_signature(),
             "signature must still verify after a serde_json round-trip (gossip path)"
+        );
+    }
+
+    #[test]
+    fn share_proof_header_is_bound_by_signature_and_backcompat() {
+        let id = crate::identity::NodeIdentity::generate();
+        let base = ShareProof {
+            round_id: 1,
+            miner_id: [1u8; 32],
+            difficulty: 1.0,
+            work: 1.0,
+            share_hash: [2u8; 32],
+            timestamp: 100,
+            received_by: id.node_id(),
+            template_id: Some([3u8; 32]),
+            payout_address: Some("bc1qx".to_string()),
+            header: None,
+            signature: None,
+        };
+
+        // Back-compat: a header-less proof's signing_bytes is unchanged from before the
+        // field existed (the `None` branch appends nothing), so mixed-version peers agree.
+        let no_header = base.clone();
+        let mut with_header = base.clone();
+        with_header.header = Some(vec![0xabu8; 80]);
+        assert_ne!(
+            no_header.signing_bytes(),
+            with_header.signing_bytes(),
+            "a present header must change the signed bytes (so it's bound)"
+        );
+
+        // Sign WITH a header, then strip it → signature must FAIL (can't remove the PoW).
+        let mut signed = with_header.clone();
+        signed.sign(&id);
+        assert!(signed.has_valid_received_by_signature(), "valid as signed");
+        let mut stripped = signed.clone();
+        stripped.header = None;
+        assert!(
+            !stripped.has_valid_received_by_signature(),
+            "stripping the signed header must invalidate the signature"
+        );
+        // Swapping the header for a different one also breaks it.
+        let mut swapped = signed.clone();
+        swapped.header = Some(vec![0xcdu8; 80]);
+        assert!(
+            !swapped.has_valid_received_by_signature(),
+            "swapping the signed header must invalidate the signature"
         );
     }
 
@@ -1250,6 +1314,7 @@ mod tests {
             received_by,
             template_id: Some([4u8; 32]),
             payout_address: None,
+            header: None,
             signature: None,
         }
     }

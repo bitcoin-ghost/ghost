@@ -145,6 +145,19 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// the tip-change anchors a converged cutoff and it is verified against real gossip lag.
 pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
 
+/// Multi-operator share-injection defence. At and above this height, a `ShareProof` MUST
+/// carry its 80-byte block header and every node independently re-verifies the PoW
+/// (`sha256d(header) == share_hash` + meets difficulty) instead of trusting the origin's
+/// signed numeric claim — see `DifficultyCalculator::verify_pow_preimage`. Below it, the
+/// legacy numeric check stands (correct for a single-operator fleet trusting its own SRI).
+///
+/// A share's PoW binding is consensus-visible (it decides which shares are creditable and
+/// so the coinbase split), hence a height gate: the header is populated into proofs and
+/// required by verifiers only at/above this block, so a mixed-version fleet computes
+/// identical `signing_bytes` and identical ledgers during the roll. DORMANT until every
+/// node AND the SRI layer emit the header; SET comfortably past the roll window.
+pub const SHARE_POW_VERIFY_HEIGHT: u64 = u64::MAX;
+
 /// Activation heights, resolved once at startup.
 ///
 /// A regtest chain is ~100 blocks tall, so every mainnet gate is dormant there and a regtest
