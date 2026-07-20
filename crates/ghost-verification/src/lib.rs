@@ -41,6 +41,7 @@ pub mod alerts;
 pub mod auth;
 pub mod chain_health;
 pub mod challenge;
+pub mod challenger_assignment;
 pub mod client;
 pub mod config;
 pub mod handlers;
