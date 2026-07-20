@@ -1169,22 +1169,30 @@ impl Database {
         limit: u32,
     ) -> GhostResult<Vec<(String, f64)>> {
         self.with_connection(|conn| {
+            // DETERMINISM (multi-operator): sum INTEGER micro-work, not float `work`.
+            // Float `SUM(work)` over millions of rows depends on accumulation ORDER, which
+            // differs by physical row order per node — after WORK_SCALE the tiny delta becomes
+            // a huge u128 divergence and the checkpoint root differs. Each share's `work` is
+            // bit-identical across nodes, so `CAST(ROUND(work*1e6) AS INTEGER)` is too, and
+            // integer SUM is associative → byte-identical everywhere. Tie-break by miner_id so
+            // the ORDER BY + LIMIT cut is deterministic across ties.
             let mut stmt = conn
                 .prepare(
-                    "SELECT miner_id, SUM(work) AS unpaid_work
+                    "SELECT miner_id, SUM(CAST(ROUND(work * 1000000) AS INTEGER)) AS micro_work
                      FROM shares
                      WHERE paid_in_proposal_hash IS NULL
                        AND timestamp <= ?1
                        AND valid = 1
                      GROUP BY miner_id
-                     ORDER BY unpaid_work DESC
+                     ORDER BY micro_work DESC, miner_id ASC
                      LIMIT ?2",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             let rows = stmt
                 .query_map(params![cutoff_ts, limit], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                    let micro: i64 = row.get(1)?;
+                    Ok((row.get::<_, String>(0)?, micro as f64 / 1_000_000.0))
                 })
                 .map_err(|e| GhostError::Database(e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
@@ -1223,10 +1231,15 @@ impl Database {
     ) -> GhostResult<Vec<(String, f64, Vec<String>)>> {
         // 1. Pull every unpaid (miner_id, work, encrypted_address) row.
         //    No GROUP BY in SQL because the address is encrypted.
-        let raw: Vec<(String, f64, String)> = self.with_connection(|conn| {
+        // DETERMINISM (multi-operator): sum INTEGER micro-work per miner (see
+        // get_top_unpaid_miners) and carry it as an integer through the address grouping
+        // below — integer addition is order-independent, so every node computes a
+        // byte-identical per-address total. Float summation here was the residual
+        // divergence that kept the checkpoint from finalising exactly.
+        let raw: Vec<(String, i64, String)> = self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT s.miner_id, SUM(s.work) AS unpaid_work, m.payout_address
+                    "SELECT s.miner_id, SUM(CAST(ROUND(s.work * 1000000) AS INTEGER)) AS micro_work, m.payout_address
                      FROM shares s
                      INNER JOIN miners m ON m.miner_id = s.miner_id
                      WHERE s.paid_in_proposal_hash IS NULL
@@ -1240,7 +1253,7 @@ impl Database {
                 .query_map(params![cutoff_ts], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, f64>(1)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                     ))
                 })
@@ -1256,8 +1269,10 @@ impl Database {
         //    valid output target and should be excluded from payout
         //    rather than crashing the whole proposal.
         use std::collections::HashMap;
-        let mut acc: HashMap<String, (f64, Vec<String>)> = HashMap::new();
-        for (miner_id, work, enc_addr) in raw {
+        // Accumulate INTEGER micro-work per address (order-independent), so the total is
+        // byte-identical on every node regardless of HashMap iteration order.
+        let mut acc: HashMap<String, (i64, Vec<String>)> = HashMap::new();
+        for (miner_id, micro_work, enc_addr) in raw {
             if enc_addr.is_empty() {
                 continue;
             }
@@ -1265,31 +1280,32 @@ impl Database {
                 Ok(s) if !s.is_empty() => s,
                 _ => continue,
             };
-            let entry = acc.entry(plain).or_insert((0.0, Vec::new()));
-            entry.0 += work;
+            let entry = acc.entry(plain).or_insert((0, Vec::new()));
+            entry.0 = entry.0.saturating_add(micro_work);
             entry.1.push(miner_id);
         }
 
-        // 3. Sort by (unpaid_work desc, address asc) — deterministic
-        //    tie-break for cross-node BFT consensus.
-        let mut sorted: Vec<(String, f64, Vec<String>)> = acc
+        // 3. Sort by (micro_work desc, address asc) — an INTEGER key, so the ordering
+        //    (and therefore the top-N truncation) is identical on every node.
+        let mut sorted: Vec<(String, i64, Vec<String>)> = acc
             .into_iter()
-            .map(|(addr, (work, ids))| (addr, work, ids))
+            .map(|(addr, (micro, ids))| (addr, micro, ids))
             .collect();
-        sorted.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         sorted.truncate(limit as usize);
 
-        // 4. Each group's miner_ids list also gets a stable order so
-        //    downstream callers that hash / serialise it converge.
-        for entry in sorted.iter_mut() {
-            entry.2.sort();
-        }
+        // 4. Each group's miner_ids list also gets a stable order so downstream
+        //    callers that hash / serialise it converge.
+        // 5. Convert micro-work → f64 at the boundary: one deterministic op per value.
+        let out: Vec<(String, f64, Vec<String>)> = sorted
+            .into_iter()
+            .map(|(addr, micro, mut ids)| {
+                ids.sort();
+                (addr, micro as f64 / 1_000_000.0, ids)
+            })
+            .collect();
 
-        Ok(sorted)
+        Ok(out)
     }
 
     /// Resolve a list of decrypted payout addresses to every `miner_id`
@@ -13339,6 +13355,35 @@ mod ledger_reconciliation_tests {
             total_payouts_sats: 0,
             avg_hashrate_ths: 0.0,
         }
+    }
+
+    /// Multi-operator determinism: the unpaid-work aggregation must be an EXACT integer sum,
+    /// not a float sum whose result depends on accumulation order. Ten shares of `work=0.1`
+    /// float-sum to 0.9999999999999999; the integer micro-work path gives exactly 1.0 — the
+    /// same value on every node regardless of row order, so the checkpoint root can converge
+    /// byte-for-byte (letting the tolerance drop to zero).
+    #[test]
+    fn unpaid_work_aggregation_is_exact_integer_not_float_drift() {
+        let db = Database::in_memory().expect("db");
+        db.upsert_miner(&miner("m1", "bc1qdeterministicaddrxxxxxxxxxxxxxxxxxxxxxx"))
+            .expect("miner");
+        for i in 0..10 {
+            db.insert_share(&share(&format!("h{i}"), "m1", 0.1, 100))
+                .expect("share");
+        }
+
+        // Per-miner path.
+        let miners = db.get_top_unpaid_miners(i64::MAX, 100).expect("miners");
+        assert_eq!(miners.len(), 1);
+        assert_eq!(
+            miners[0].1, 1.0,
+            "10 × 0.1 must be EXACTLY 1.0 (integer sum), not 0.999999… (float sum)"
+        );
+
+        // Address-grouped path (what the checkpoint uses post-gate).
+        let addrs = db.get_top_unpaid_addresses(i64::MAX, 100).expect("addrs");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].1, 1.0, "address total must be exact too");
     }
 
     /// The one-time union must converge two divergent ledgers, carry the miner across (or the
