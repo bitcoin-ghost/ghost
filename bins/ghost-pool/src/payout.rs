@@ -224,6 +224,56 @@ pub fn compute_ledger_root(
     root
 }
 
+/// Diagnostic breakdown of the ledger-root inputs, for isolating live root
+/// divergence. Hashes the miner-set and node-set SEPARATELY (each with the same
+/// canonical encoding `compute_ledger_root` uses for that half) and includes their
+/// counts plus the full node list (node_id prefix : shares). Comparing this string
+/// across nodes tells us (a) whether the rejecters agree with each other, and
+/// (b) whether the miner half or the node half is the divergent one — and for the
+/// node half, exactly which node/shares differ. Diagnostic only; not consensus.
+pub fn ledger_root_diag(
+    miners: &[(String, u128)],
+    nodes: &[(NodeId, i32)],
+    cutoff_ts: i64,
+    block_height: u64,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut m = miners.to_vec();
+    m.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut mh = Sha256::new();
+    for (addr, work) in &m {
+        mh.update((addr.len() as u32).to_le_bytes());
+        mh.update(addr.as_bytes());
+        mh.update(work.to_le_bytes());
+    }
+    let mdig = mh.finalize();
+
+    let mut n = nodes.to_vec();
+    n.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut nh = Sha256::new();
+    for (node_id, shares) in &n {
+        nh.update(&node_id[..]);
+        nh.update(shares.to_le_bytes());
+    }
+    let ndig = nh.finalize();
+    let node_list: Vec<String> = n
+        .iter()
+        .map(|(id, s)| format!("{}:{}", hex::encode(&id[..4]), s))
+        .collect();
+
+    let root = compute_ledger_root(miners, nodes, cutoff_ts, block_height);
+    format!(
+        "root={} miners{{n={},h={}}} nodes{{n={},h={},[{}]}}",
+        hex::encode(&root[..8]),
+        m.len(),
+        hex::encode(&mdig[..8]),
+        n.len(),
+        hex::encode(&ndig[..8]),
+        node_list.join(","),
+    )
+}
+
 /// Resolve the cutoff timestamp that anchors the payout for a block at `tip_height`.
 ///
 /// This is the fix for the v1.10.32 live failure. BELOW `fee_to_node_pool_height()`

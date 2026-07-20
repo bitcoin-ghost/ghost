@@ -3308,13 +3308,32 @@ async fn main() -> Result<()> {
             ))
         })
     };
+    // DIAGNOSTIC (v1.10.34): breakdown of the root inputs (miner-set + node-set
+    // hashed separately, with counts + node list), so a live root divergence can be
+    // isolated to the miner half or the node half and compared across nodes.
+    let compute_ledger_root_diag_fn: ghost_pool::payout_checkpoint::ComputeRootDiagFn = {
+        let db_c = Arc::clone(&db);
+        Arc::new(move |cutoff_ts, height| {
+            let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
+            let miners =
+                match ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
+                {
+                    Ok(m) => m,
+                    Err(e) => return format!("miner recompute failed: {e}"),
+                };
+            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
+            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts);
+            ghost_pool::payout::ledger_root_diag(&miners, &nodes, cutoff_ts, height)
+        })
+    };
     let payout_checkpoint_mgr =
         Arc::new(ghost_pool::payout_checkpoint::PayoutCheckpointManager::new(
             Arc::clone(&identity),
             Arc::clone(&db),
             plchk_send,
             compute_ledger_root_fn,
-        ));
+        )
+        .with_diag(compute_ledger_root_diag_fn));
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
     // Propose cadence: every ~30s the deterministic proposer for (tip - LAG)

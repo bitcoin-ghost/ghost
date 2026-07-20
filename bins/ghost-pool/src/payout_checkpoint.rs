@@ -54,6 +54,11 @@ pub type BroadcastFn = Arc<dyn Fn(MessageType, Vec<u8>) -> GhostResult<()> + Sen
 /// `main.rs`, which holds the DB + qualification engine.
 pub type ComputeRootFn = Arc<dyn Fn(i64, u64) -> Option<[u8; 32]> + Send + Sync>;
 
+/// Optional diagnostic: `(cutoff_ts, height) -> human breakdown` of the root inputs
+/// (miner-set + node-set hashed separately, with counts + node list). Injected by
+/// `main.rs` to isolate live root divergence; `None` in tests and once diagnosed.
+pub type ComputeRootDiagFn = Arc<dyn Fn(i64, u64) -> String + Send + Sync>;
+
 struct PendingEntry {
     /// The proposal content (needed to persist on finalise). `None` if a vote
     /// arrived before the proposal (race) — we still tally the approver.
@@ -88,6 +93,8 @@ pub struct PayoutCheckpointManager {
     db: Arc<Database>,
     send: BroadcastFn,
     compute_root: ComputeRootFn,
+    /// Optional root-input breakdown for live divergence diagnosis.
+    diag: Option<ComputeRootDiagFn>,
     /// height -> in-flight vote tallies.
     pending: RwLock<HashMap<u64, Pending>>,
 }
@@ -111,7 +118,21 @@ impl PayoutCheckpointManager {
             db,
             send,
             compute_root,
+            diag: None,
             pending: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Attach a diagnostic breakdown closure (see [`ComputeRootDiagFn`]).
+    pub fn with_diag(mut self, diag: ComputeRootDiagFn) -> Self {
+        self.diag = Some(diag);
+        self
+    }
+
+    /// Emit the root-input breakdown at INFO under a shared `tag`, if diag is wired.
+    fn log_diag(&self, tag: &str, height: u64, cutoff_ts: i64) {
+        if let Some(d) = &self.diag {
+            info!(height, tag, "payout checkpoint DIAG: {}", d(cutoff_ts, height));
         }
     }
 
@@ -216,6 +237,7 @@ impl PayoutCheckpointManager {
             root = %hex::encode(&ledger_root[..8]),
             "payout checkpoint: proposing"
         );
+        self.log_diag("propose", height, cutoff_ts);
         self.broadcast(MessageType::PayoutLedgerCheckpoint, &msg);
         self.cast_vote(height, hash, true);
         self.maybe_finalize(height, hash);
@@ -244,6 +266,7 @@ impl PayoutCheckpointManager {
                 height = msg.height,
                 "payout checkpoint: cannot recompute ledger_root — abstaining (needs convergence)"
             );
+            self.log_diag("abstain", msg.height, msg.cutoff_ts);
             // Still record the proposal so a later recompute/vote can finalise.
             let height = msg.height;
             let mut pending = self.pending.write();
@@ -267,8 +290,12 @@ impl PayoutCheckpointManager {
         if !approve {
             warn!(
                 height = msg.height,
+                local_root = %hex::encode(&local_root[..8]),
+                proposed_root = %hex::encode(&msg.ledger_root[..8]),
+                proposer = %hex::encode(&msg.proposer[..4]),
                 "payout checkpoint: local root mismatch — voting reject"
             );
+            self.log_diag("reject", msg.height, msg.cutoff_ts);
         }
         self.cast_vote(msg.height, hash, approve);
         if approve {
