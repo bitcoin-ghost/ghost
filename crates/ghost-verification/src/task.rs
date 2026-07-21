@@ -53,6 +53,11 @@ pub struct VerificationTaskConfig {
     /// LOW-VER-1: Stratum connection timeout (default: 5 seconds)
     /// Separate from HTTP timeout since stratum uses raw TCP
     pub stratum_timeout: Duration,
+    /// A-2b: block height at/above which target selection follows the consensus
+    /// challenger assignment (challenge only the targets we are drawn for). Default
+    /// `u64::MAX` (dormant → legacy random selection). Set from
+    /// `ghost_pool::challenger_assignment_height()`.
+    pub assignment_gate_height: u64,
 }
 
 impl Default for VerificationTaskConfig {
@@ -66,6 +71,8 @@ impl Default for VerificationTaskConfig {
             request_timeout: Duration::from_secs(VERIFICATION_TIMEOUT_SECS),
             // LOW-VER-1: Default stratum timeout of 5 seconds
             stratum_timeout: Duration::from_secs(5),
+            // A-2b: dormant by default; legacy random selection until set + gate armed.
+            assignment_gate_height: u64::MAX,
         }
     }
 }
@@ -873,6 +880,14 @@ impl VerificationTask {
         self
     }
 
+    /// A-2b: set the block height at/above which target selection follows the
+    /// consensus challenger assignment (from `ghost_pool::challenger_assignment_height()`).
+    /// Below it, legacy random selection stands.
+    pub fn with_assignment_gate(mut self, height: u64) -> Self {
+        self.config.assignment_gate_height = height;
+        self
+    }
+
     /// H-1 FIX: Check if identity has been verified before allowing DB writes
     ///
     /// Returns Ok(()) if identity is verified, Err if not.
@@ -914,21 +929,34 @@ impl VerificationTask {
             }
         }
 
-        // CRIT-VER-1: Request 3x peers to allow filtering for Sybil resistance
-        let peers = self
-            .peer_provider
-            .get_random_peers(&self.our_node_id, self.config.peers_per_cycle * 3);
+        // A-2b: at/above the assignment gate, challenge exactly the targets we are
+        // consensus-DRAWN to challenge this round — otherwise our verdicts would be
+        // dropped at qualification (they only count from the assigned challenger).
+        // Below the gate (or without RPC), fall back to the legacy Sybil-resistant
+        // random selection.
+        let selected = if let Some(assigned) = self.assigned_targets_this_round().await {
+            info!(
+                assigned = assigned.len(),
+                "Verification cycle: challenging consensus-assigned targets (A-2b)"
+            );
+            assigned
+        } else {
+            // CRIT-VER-1: Request 3x peers to allow filtering for Sybil resistance
+            let peers = self
+                .peer_provider
+                .get_random_peers(&self.our_node_id, self.config.peers_per_cycle * 3);
 
-        if peers.is_empty() {
-            info!("Verification cycle: no connected peers");
-            return;
-        }
+            if peers.is_empty() {
+                info!("Verification cycle: no connected peers");
+                return;
+            }
 
-        // CRIT-VER-1: Apply Sybil-resistant selection
-        let selected = self.select_sybil_resistant_peers(peers, self.config.peers_per_cycle);
+            // CRIT-VER-1: Apply Sybil-resistant selection
+            self.select_sybil_resistant_peers(peers, self.config.peers_per_cycle)
+        };
 
         if selected.is_empty() {
-            debug!("No peers passed Sybil resistance filters");
+            debug!("No peers passed selection (assignment or Sybil filters)");
             return;
         }
 
@@ -982,6 +1010,58 @@ impl VerificationTask {
                 tracker.record_challenge(peer.node_id);
             }
         }
+    }
+
+    /// A-2b: the peers we are consensus-DRAWN to challenge this round, or `None` when
+    /// the assignment gate is dormant / RPC is unavailable (the caller then uses the
+    /// legacy random selection). Deterministic: uses the SAME buried-block-hash seed
+    /// and converged pool that qualification recomputes, so our verdicts land on the
+    /// targets whose draw actually includes us — otherwise they would be dropped.
+    async fn assigned_targets_this_round(&self) -> Option<Vec<VerifiablePeer>> {
+        use crate::challenger_assignment::{
+            is_assigned, AssignmentCandidate, ROUND_FANOUT_K, SEED_LAG,
+        };
+
+        let rpc = self.rpc.as_ref()?;
+        let tip = rpc.get_block_count().await.ok()?;
+        if tip < self.config.assignment_gate_height {
+            return None; // gate dormant → legacy selection
+        }
+        let seed_height = tip.checked_sub(SEED_LAG)?;
+        let seed_hex = rpc.get_block_hash(seed_height).await.ok()?;
+        let seed_bytes = hex::decode(seed_hex.trim()).ok()?;
+        if seed_bytes.len() != 32 {
+            return None;
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+
+        let pool: Vec<AssignmentCandidate> = self
+            .db
+            .voterset_assignment_pool()
+            .ok()?
+            .into_iter()
+            .map(|(id, subnet)| AssignmentCandidate::new(id, subnet))
+            .collect();
+
+        let my_id = hex::encode(self.our_node_id);
+        // Keep the currently-known peers we are drawn to challenge this round.
+        let assigned: Vec<VerifiablePeer> = self
+            .peer_provider
+            .get_random_peers(&self.our_node_id, 100_000)
+            .into_iter()
+            .filter(|p| {
+                is_assigned(
+                    &seed,
+                    tip,
+                    &pool,
+                    &hex::encode(p.node_id),
+                    &my_id,
+                    ROUND_FANOUT_K,
+                )
+            })
+            .collect();
+        Some(assigned)
     }
 
     /// CRIT-VER-1: Select peers with Sybil resistance

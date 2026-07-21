@@ -8280,6 +8280,7 @@ async fn main() -> Result<()> {
         Ok(verification_task) => {
             let verification_task = verification_task
                 .with_rpc(Arc::clone(&rpc))
+                .with_assignment_gate(ghost_pool::challenger_assignment_height())
                 .with_policy(policy.clone())
                 .with_broadcast(verification_tx);
 
@@ -8333,21 +8334,23 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Sign the verification result
-            let mut signing_data = Vec::new();
-            signing_data.extend_from_slice(&broadcast.target_node_id);
-            signing_data.extend_from_slice(broadcast.capability.as_bytes());
-            signing_data.push(if broadcast.passed { 1 } else { 0 });
-            signing_data.extend_from_slice(&broadcast.timestamp.to_le_bytes());
-            let signature = identity_for_verification.sign(&signing_data);
+            // A-2b: stamp the round this challenge was issued in (our current L1 tip)
+            // so qualification can recompute the challenger draw for it. Populated
+            // ONLY at/above the assignment gate: below the gate it stays None, so the
+            // signed bytes are byte-identical to the pre-A-2b format and a
+            // mixed-version fleet verifies each other's verdicts across the roll. The
+            // gate is armed only once the fleet is uniform, so the None→Some flip is
+            // simultaneous everywhere.
+            let round_height = {
+                let tip = rm_for_verification.current_height();
+                if tip >= ghost_pool::challenger_assignment_height() {
+                    Some(tip)
+                } else {
+                    None
+                }
+            };
 
-            // A-2b: stamp the round this challenge was issued in (our current L1 tip),
-            // so qualification can recompute the challenger draw for this round. Only
-            // consulted at/above CHALLENGER_ASSIGNMENT_HEIGHT; recorded always so the
-            // column is populated before the gate is armed.
-            let round_height = Some(rm_for_verification.current_height());
-
-            let msg = VerificationResultMessage {
+            let mut msg = VerificationResultMessage {
                 target_node_id: broadcast.target_node_id,
                 challenger_id: broadcast.challenger_id,
                 capability,
@@ -8357,8 +8360,11 @@ async fn main() -> Result<()> {
                 response_data: broadcast.response_data,
                 target_signed_response: broadcast.target_signed_response,
                 round_height,
-                signature,
+                signature: [0u8; 64],
             };
+            // Sign the CANONICAL bytes (never a hand-rolled copy that could drift
+            // from signing_data) — this binds round_height when present.
+            msg.signature = identity_for_verification.sign(&msg.signing_data());
 
             // Retain OUR OWN signed verdict in the convergence ledger, so a node's own challenges
             // enter its ledger immediately rather than only via a convergence round-trip from a

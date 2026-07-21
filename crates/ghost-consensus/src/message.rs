@@ -545,6 +545,15 @@ impl VerificationResultMessage {
         data.extend_from_slice(self.capability.as_str().as_bytes());
         data.push(if self.passed { 1 } else { 0 });
         data.extend_from_slice(&self.timestamp.to_le_bytes());
+        // A-2b: bind the round (so a relay can't retag a verdict to a round the
+        // challenger WAS assigned in, to smuggle it past the filter). Appended ONLY
+        // when present, so pre-A-2b verdicts (round_height = None, below the gate)
+        // sign byte-identically to before and a mixed-version fleet verifies each
+        // other across the roll. round_height becomes Some only at/above the gate,
+        // by which point the fleet is uniform.
+        if let Some(rh) = self.round_height {
+            data.extend_from_slice(&rh.to_le_bytes());
+        }
         data
     }
 }
