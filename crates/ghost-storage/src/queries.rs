@@ -356,6 +356,21 @@ fn ipv4_subnet_24(addr: &str) -> Option<String> {
     Some(format!("{}.{}.{}", octets[0], octets[1], octets[2]))
 }
 
+/// A-2b: one un-aggregated voter-set verdict row for a target+capability, carrying
+/// the per-verdict `round_height` so the caller can filter by consensus challenger
+/// assignment before recomputing the distinct/majority floors.
+#[derive(Debug, Clone)]
+pub struct LedgerVerdictRow {
+    /// Hex node id of the challenger that recorded this verdict.
+    pub challenger_id: String,
+    /// The round (block height) the challenge was issued in; `None` on pre-A-2b rows.
+    pub round_height: Option<i64>,
+    /// The challenger's `/24` subnet, `None` if unknown/unparseable.
+    pub subnet: Option<String>,
+    /// Whether this verdict was a pass.
+    pub passed: bool,
+}
+
 /// 4.19 SECURITY: Generic i64 to u64 conversion for non-satoshi values (epochs, timestamps, heights)
 ///
 /// SQLite stores all integers as signed i64. This helper validates the conversion for
@@ -6334,6 +6349,79 @@ impl Database {
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             Ok((pass, total, distinct_subnets))
+        })
+    }
+
+    /// A-2b: per-verdict rows for the voter-set challengers of one target+capability
+    /// over `[since, until]`, WITHOUT aggregation, so the caller can filter each
+    /// verdict by consensus challenger assignment (which needs the per-verdict
+    /// `round_height`) before recomputing the distinct/majority floors. Each row is
+    /// `(challenger_id, round_height, challenger /24 subnet, passed)`; only
+    /// challengers that are voter-set members (a `nodes` row with a payout address)
+    /// are returned.
+    pub fn ledger_voterset_challenger_rows(
+        &self,
+        target_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+    ) -> GhostResult<Vec<LedgerVerdictRow>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT vl.challenger_id, vl.round_height, n.public_address, vl.passed
+                     FROM verification_ledger vl
+                     JOIN nodes n ON n.node_id = vl.challenger_id
+                     WHERE vl.target_node_id = ?1 AND vl.capability = ?2
+                       AND vl.timestamp >= ?3 AND vl.timestamp <= ?4
+                       AND n.payout_address IS NOT NULL AND n.payout_address != ''",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![target_hex, capability, since, until], |row| {
+                    let challenger_id: String = row.get(0)?;
+                    let round_height: Option<i64> = row.get(1)?;
+                    let public_address: Option<String> = row.get(2)?;
+                    let passed: i64 = row.get(3)?;
+                    Ok(LedgerVerdictRow {
+                        challenger_id,
+                        round_height,
+                        subnet: public_address.as_deref().and_then(ipv4_subnet_24),
+                        passed: passed != 0,
+                    })
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// A-2b: the challenger draw pool — every voter-set node (a `nodes` row with a
+    /// payout address) paired with its `/24` subnet (`None` if unknown/unparseable).
+    /// This is the converged candidate set the consensus assignment draws from.
+    pub fn voterset_assignment_pool(&self) -> GhostResult<Vec<(String, Option<String>)>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT node_id, public_address FROM nodes
+                     WHERE payout_address IS NOT NULL AND payout_address != ''",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let node_id: String = row.get(0)?;
+                    let public_address: Option<String> = row.get(1)?;
+                    Ok((node_id, public_address.as_deref().and_then(ipv4_subnet_24)))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
         })
     }
 

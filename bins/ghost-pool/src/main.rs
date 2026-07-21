@@ -3352,13 +3352,20 @@ async fn main() -> Result<()> {
             let miner_payouts =
                 ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
                     .ok()?;
+            // A-2b TODO: attach the RPC block-hash oracle here (and at the PayoutHandler
+            // provider + the diag closure) so the assignment filter is live above the
+            // gate; until then `new()` leaves it inert and A-2 scoping stands.
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
-            // A-2: the checkpoint root must scope challengers to the voter set + subnets
-            // at/above the gate, identically to the coinbase node split, or the root and
-            // the paid split would disagree.
+            // A-2/A-2b: the checkpoint root must scope challengers to the voter set +
+            // subnets AND to the consensus assignment at/above the gates, identically to
+            // the coinbase node split, or the root and the paid split would disagree.
             let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
-            let node_shares =
-                qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts, voter_set_scoped);
+            let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
+            let node_shares = qp.get_all_qualified_nodes_at_cutoff_from_db(
+                cutoff_ts,
+                voter_set_scoped,
+                assignment_scoped,
+            );
             let root = ghost_pool::payout::compute_ledger_root(
                 &miner_payouts,
                 &node_shares,
@@ -3387,7 +3394,12 @@ async fn main() -> Result<()> {
                 };
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
             let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
-            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff_ts, voter_set_scoped);
+            let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
+            let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(
+                cutoff_ts,
+                voter_set_scoped,
+                assignment_scoped,
+            );
             ghost_pool::payout::ledger_root_diag(&miners, &nodes, cutoff_ts, height)
         })
     };

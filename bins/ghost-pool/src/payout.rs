@@ -1928,14 +1928,18 @@ impl PayoutHandler {
         if proposal.block_height >= crate::fee_to_node_pool_height() {
             // A-2: at/above the voter-set gate, restrict distinct challengers to the
             // consensus voter set + require IP-subnet diversity. Height-derived so the
-            // whole fleet recomputes the SAME set.
+            // whole fleet recomputes the SAME set. A-2b: at/above the assignment gate,
+            // additionally count only verdicts from the consensus-assigned challenger.
             let voter_set_scoped =
                 proposal.block_height >= crate::voter_set_qualification_height();
+            let assignment_scoped =
+                proposal.block_height >= crate::challenger_assignment_height();
             let node_shares = self
                 .qualification_provider
                 .get_all_qualified_nodes_at_cutoff_from_db(
                     proposal.timestamp as i64,
                     voter_set_scoped,
+                    assignment_scoped,
                 );
             self.creator.validate_node_split(
                 proposal,
@@ -1964,10 +1968,15 @@ impl PayoutHandler {
         // SAME set the checkpoint's ledger_root committed to, so the coinbase pays
         // exactly what the fleet ratified and Component-E recompute-reject can only pass.
         let qualified_shares = if data.block_height >= crate::fee_to_node_pool_height() {
-            // A-2: height-gated voter-set + IP-subnet scoping of the distinct challengers.
+            // A-2/A-2b: height-gated voter-set + IP-subnet scoping of the distinct
+            // challengers, and consensus-assignment scoping of which verdicts count.
             let voter_set_scoped = data.block_height >= crate::voter_set_qualification_height();
-            self.qualification_provider
-                .get_all_qualified_nodes_at_cutoff_from_db(data.ledger_cutoff_ts, voter_set_scoped)
+            let assignment_scoped = data.block_height >= crate::challenger_assignment_height();
+            self.qualification_provider.get_all_qualified_nodes_at_cutoff_from_db(
+                data.ledger_cutoff_ts,
+                voter_set_scoped,
+                assignment_scoped,
+            )
         } else {
             self.qualification_provider.get_all_qualified_nodes()
         };

@@ -136,6 +136,12 @@ pub struct QualifiedCapabilityProvider {
     /// M-7/H-14 FIX: Cached network size with timestamp for expiration
     /// Uses RwLock for thread-safe access with timestamp
     cached_network_size: parking_lot::RwLock<Option<CachedNetworkSize>>,
+    /// A-2b: optional L1 block-hash source for recomputing the consensus challenger
+    /// draw. When present AND the caller is assignment-scoped (at/above
+    /// CHALLENGER_ASSIGNMENT_HEIGHT), a verdict counts only if its challenger was
+    /// drawn to challenge the target that round. `None` → the assignment filter is
+    /// skipped and A-2 (voter-set + subnet) behaviour stands.
+    block_hash_oracle: Option<Arc<dyn crate::challenger_assignment::BlockHashProvider>>,
 }
 
 impl QualifiedCapabilityProvider {
@@ -146,7 +152,19 @@ impl QualifiedCapabilityProvider {
             config: QualificationConfig::default(),
             // M-7/H-14 FIX: Initialize with empty cache
             cached_network_size: parking_lot::RwLock::new(None),
+            block_hash_oracle: None,
         }
+    }
+
+    /// Attach the L1 block-hash oracle that lets qualification recompute the
+    /// consensus challenger assignment (A-2b). Without it the assignment filter is
+    /// inert even above the gate — so production wires the RPC-backed oracle here.
+    pub fn with_block_hash_oracle(
+        mut self,
+        oracle: Arc<dyn crate::challenger_assignment::BlockHashProvider>,
+    ) -> Self {
+        self.block_hash_oracle = Some(oracle);
+        self
     }
 
     /// Create with custom configuration
@@ -155,6 +173,7 @@ impl QualifiedCapabilityProvider {
             db,
             config,
             cached_network_size: parking_lot::RwLock::new(None),
+            block_hash_oracle: None,
         }
     }
 
@@ -794,11 +813,25 @@ impl QualifiedCapabilityProvider {
         node_ids: &[String],
         cutoff_ts: i64,
         voter_set_scoped: bool,
+        assignment_scoped: bool,
     ) -> Vec<(NodeId, i32)> {
         let since = cutoff_ts - (self.config.lookback_days as i64 * SECONDS_PER_DAY);
         let network_size = node_ids.len();
         let min_unique = self.scaled_min_unique_challengers(network_size);
         let min_challenges = self.scaled_min_challenges(network_size);
+
+        // A-2b: the challenger draw pool is the same converged voter set, resolved
+        // once for the whole block (identical on every node).
+        let assignment_pool = if assignment_scoped && self.block_hash_oracle.is_some() {
+            self.db
+                .voterset_assignment_pool()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, subnet)| crate::challenger_assignment::AssignmentCandidate::new(id, subnet))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut qualified = Vec::new();
         for hex_id in node_ids {
@@ -809,6 +842,8 @@ impl QualifiedCapabilityProvider {
                 min_challenges,
                 min_unique,
                 voter_set_scoped,
+                assignment_scoped,
+                &assignment_pool,
             );
             let shares = caps.total_shares();
             if shares > 0 {
@@ -832,6 +867,7 @@ impl QualifiedCapabilityProvider {
         &self,
         cutoff_ts: i64,
         voter_set_scoped: bool,
+        assignment_scoped: bool,
     ) -> Vec<(NodeId, i32)> {
         let node_ids = match self.db.get_all_node_ids_with_payout() {
             Ok(ids) => ids,
@@ -843,12 +879,18 @@ impl QualifiedCapabilityProvider {
                 return Vec::new();
             }
         };
-        self.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff_ts, voter_set_scoped)
+        self.get_all_qualified_nodes_at_cutoff(
+            &node_ids,
+            cutoff_ts,
+            voter_set_scoped,
+            assignment_scoped,
+        )
     }
 
     /// Deterministic per-node capability set from the converged ledger over
     /// `[since, until]`. Mirrors `get_qualified_capabilities_with_rates` plus the
     /// C-2 unique-challenger filter, but ledger-based and cutoff-anchored.
+    #[allow(clippy::too_many_arguments)]
     fn qualified_caps_at_cutoff(
         &self,
         node_id_hex: &str,
@@ -857,6 +899,8 @@ impl QualifiedCapabilityProvider {
         min_challenges: u32,
         min_unique: u32,
         voter_set_scoped: bool,
+        assignment_scoped: bool,
+        assignment_pool: &[crate::challenger_assignment::AssignmentCandidate],
     ) -> NodeCapabilities {
         // All four capabilities use a strict per-distinct-challenger MAJORITY over the converged
         // ledger + the C-2 unique-challenger floor. The ledger stores each challenger's own signed
@@ -871,6 +915,8 @@ impl QualifiedCapabilityProvider {
             min_challenges,
             min_unique,
             voter_set_scoped,
+            assignment_scoped,
+            assignment_pool,
         );
         let reaper = self.majority_capability_qualified(
             node_id_hex,
@@ -880,6 +926,8 @@ impl QualifiedCapabilityProvider {
             min_challenges,
             min_unique,
             voter_set_scoped,
+            assignment_scoped,
+            assignment_pool,
         );
         let public_mining = self.majority_capability_qualified(
             node_id_hex,
@@ -889,6 +937,8 @@ impl QualifiedCapabilityProvider {
             min_challenges,
             min_unique,
             voter_set_scoped,
+            assignment_scoped,
+            assignment_pool,
         );
         let ghost_pay = self.majority_capability_qualified(
             node_id_hex,
@@ -898,6 +948,8 @@ impl QualifiedCapabilityProvider {
             min_challenges,
             min_unique,
             voter_set_scoped,
+            assignment_scoped,
+            assignment_pool,
         );
 
         // Elder is registration order in the (converged) nodes table, unchanged.
@@ -924,6 +976,14 @@ impl QualifiedCapabilityProvider {
     /// IP SUBNETS those challengers span — so a Sybil farm sharing a subnet cannot
     /// reach the floor no matter how many identities it mints. Below the gate the
     /// legacy network-size-scaled distinct-challenger count stands.
+    ///
+    /// When `assignment_scoped` (Surface A-2b, at/above `CHALLENGER_ASSIGNMENT_HEIGHT`)
+    /// AND a block-hash oracle is attached, a verdict is counted only if its
+    /// challenger was CONSENSUS-ASSIGNED to challenge the target for the round the
+    /// verdict was issued in — so a Sybil operator cannot point its own fakes at its
+    /// own target and rubber-stamp. The distinct/subnet/majority floors are then
+    /// recomputed over the surviving (assigned) verdicts.
+    #[allow(clippy::too_many_arguments)]
     fn majority_capability_qualified(
         &self,
         node_id_hex: &str,
@@ -933,7 +993,26 @@ impl QualifiedCapabilityProvider {
         min_challenges: u32,
         min_unique: u32,
         voter_set_scoped: bool,
+        assignment_scoped: bool,
+        assignment_pool: &[crate::challenger_assignment::AssignmentCandidate],
     ) -> bool {
+        if assignment_scoped {
+            if let Some(oracle) = self.block_hash_oracle.as_deref() {
+                let (chal_pass, chal_total, distinct_subnets) = self.assigned_challenger_stats(
+                    node_id_hex,
+                    capability,
+                    since,
+                    until,
+                    assignment_pool,
+                    oracle,
+                );
+                return chal_total >= min_challenges
+                    && distinct_subnets >= min_unique
+                    && chal_pass * 2 > chal_total;
+            }
+            // No oracle attached → cannot recompute assignment; fall back to the A-2
+            // voter-set behaviour below (never silently count everything).
+        }
         if voter_set_scoped {
             let (chal_pass, chal_total, distinct_subnets) = self
                 .db
@@ -951,6 +1030,71 @@ impl QualifiedCapabilityProvider {
                 .unwrap_or((0, 0));
             chal_total >= min_challenges && chal_total >= min_unique && chal_pass * 2 > chal_total
         }
+    }
+
+    /// A-2b: recompute `(challengers_pass, challengers_total, distinct_subnets)` for a
+    /// target+capability counting ONLY verdicts whose challenger was consensus-assigned
+    /// to challenge the target in the verdict's round. Mirrors
+    /// `ledger_voterset_challenger_stats` but filters each raw verdict by the recomputed
+    /// draw first. A row with no `round_height` (pre-A-2b) or whose round seed is
+    /// unavailable is dropped (fail-safe: never falsely counted).
+    fn assigned_challenger_stats(
+        &self,
+        node_id_hex: &str,
+        capability: &str,
+        since: i64,
+        until: i64,
+        pool: &[crate::challenger_assignment::AssignmentCandidate],
+        oracle: &dyn crate::challenger_assignment::BlockHashProvider,
+    ) -> (u32, u32, u32) {
+        use crate::challenger_assignment::{assigned_challengers, ROUND_FANOUT_K, SEED_LAG};
+        use std::collections::{HashMap, HashSet};
+
+        let rows = self
+            .db
+            .ledger_voterset_challenger_rows(node_id_hex, capability, since, until)
+            .unwrap_or_default();
+
+        // Cache the assigned set per round for THIS target (round_height varies, target
+        // is fixed), so the draw is computed once per distinct round, not per verdict.
+        let mut assigned_by_round: HashMap<u64, Vec<String>> = HashMap::new();
+        // challenger_id -> (pass_count, total_count, subnet)
+        let mut per_ch: HashMap<String, (u32, u32, Option<String>)> = HashMap::new();
+
+        for r in rows {
+            let rh = match r.round_height {
+                Some(h) if h >= 0 => h as u64,
+                _ => continue, // pre-A-2b / invalid → not assignment-verifiable
+            };
+            let assigned = assigned_by_round.entry(rh).or_insert_with(|| {
+                match rh.checked_sub(SEED_LAG).and_then(|h| oracle.hash_at(h)) {
+                    Some(seed) => assigned_challengers(&seed, rh, pool, node_id_hex, ROUND_FANOUT_K),
+                    None => Vec::new(), // seed unavailable → nobody counts for this round
+                }
+            });
+            if !assigned.iter().any(|c| c == &r.challenger_id) {
+                continue; // this challenger was not drawn for this round → verdict ignored
+            }
+            let entry = per_ch
+                .entry(r.challenger_id.clone())
+                .or_insert((0, 0, r.subnet.clone()));
+            entry.1 += 1;
+            if r.passed {
+                entry.0 += 1;
+            }
+        }
+
+        let challengers_total = per_ch.len() as u32;
+        let challengers_pass = per_ch
+            .values()
+            .filter(|(pass, total, _)| pass * 2 >= *total)
+            .count() as u32;
+        let distinct_subnets = per_ch
+            .values()
+            .filter_map(|(_, _, subnet)| subnet.clone())
+            .collect::<HashSet<_>>()
+            .len() as u32;
+        (challengers_pass, challengers_total, distinct_subnets)
     }
 
     /// Get statistics for a node's qualification status
@@ -1449,9 +1593,9 @@ mod tests {
         seed_archive(&db_b, &target, 0x10, 4, true, cutoff - 100);
 
         let a = QualifiedCapabilityProvider::new(db_a)
-            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false);
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false);
         let b = QualifiedCapabilityProvider::new(db_b)
-            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false);
+            .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false);
 
         assert_eq!(
             a, b,
@@ -1481,7 +1625,7 @@ mod tests {
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
         assert!(
             provider
-                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false)
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false)
                 .is_empty(),
             "post-cutoff challenges must not count; node is under the floor with no uptime rows"
         );
@@ -1490,7 +1634,7 @@ mod tests {
         // uptime data anywhere, proving liveness comes from challenge-accrual.
         seed_archive(&db, &target, 0x13, 1, true, cutoff - 50);
         assert_eq!(
-            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false),
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false),
             vec![(decode_node_id(&target).unwrap(), 5)],
             "an in-window challenge over the floor qualifies the node"
         );
@@ -1524,7 +1668,7 @@ mod tests {
 
         let provider = QualifiedCapabilityProvider::new(db);
         assert_eq!(
-            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false),
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false),
             vec![(decode_node_id(&target).unwrap(), 3)],
             "4-of-5 distinct challengers passing is a strict majority → +3 shares"
         );
@@ -1573,13 +1717,13 @@ mod tests {
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
 
         assert_eq!(
-            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false),
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, false, false),
             vec![(decode_node_id(&target).unwrap(), 5)],
             "legacy path counts any challenger → qualifies"
         );
         assert!(
             provider
-                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true)
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false)
                 .is_empty(),
             "voter-set path: no challenger is a voter-set member → not qualified"
         );
@@ -1611,7 +1755,7 @@ mod tests {
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
         assert!(
             provider
-                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true)
+                .get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false)
                 .is_empty(),
             "4 identities across only 2 subnets must not reach the subnet floor of 3"
         );
@@ -1620,7 +1764,7 @@ mod tests {
         register_voter(&db, &chs[2], "172.16.5.5:8080");
         register_voter(&db, &chs[3], "192.168.9.9:8080");
         assert_eq!(
-            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true),
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false),
             vec![(decode_node_id(&target).unwrap(), 5)],
             "4 voter-set challengers across ≥3 distinct subnets clears the floor"
         );
@@ -1653,9 +1797,147 @@ mod tests {
 
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
         assert_eq!(
-            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true),
+            provider.get_all_qualified_nodes_at_cutoff(&node_ids, cutoff, true, false),
             vec![(decode_node_id(&target).unwrap(), 3)],
             "4-of-5 voter-set challengers passing across distinct subnets → +3 shares"
+        );
+    }
+
+    // =================================================================
+    // A-2b: consensus-drawn challenger-assignment filter
+    // =================================================================
+
+    use crate::challenger_assignment::{
+        assigned_challengers, AssignmentCandidate, BlockHashProvider, ROUND_FANOUT_K, SEED_LAG,
+    };
+
+    /// Deterministic block-hash stub: a distinct seed per height, so the recomputed
+    /// draw differs round to round.
+    struct StubOracle;
+    impl BlockHashProvider for StubOracle {
+        fn hash_at(&self, height: u64) -> Option<[u8; 32]> {
+            let mut s = [0u8; 32];
+            s[..8].copy_from_slice(&height.to_le_bytes());
+            Some(s)
+        }
+    }
+
+    /// Register `n` voter-set nodes each on its own distinct `/24`; return hex ids.
+    fn register_assignment_pool(db: &Database, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let id = hex_id(0x80 + i as u8);
+                register_voter(db, &id, &format!("10.{}.{}.1:8080", i / 256, i % 256));
+                id
+            })
+            .collect()
+    }
+
+    fn pool_from_db(db: &Database) -> Vec<AssignmentCandidate> {
+        db.voterset_assignment_pool()
+            .unwrap()
+            .into_iter()
+            .map(|(id, subnet)| AssignmentCandidate::new(id, subnet))
+            .collect()
+    }
+
+    /// The challengers the consensus draw assigns to `target` for round `rh`, using
+    /// the SAME seed source qualification will (`StubOracle` at `rh - SEED_LAG`).
+    fn assigned_for(pool: &[AssignmentCandidate], target: &str, rh: u64) -> Vec<String> {
+        let seed = StubOracle.hash_at(rh - SEED_LAG).unwrap();
+        assigned_challengers(&seed, rh, pool, target, ROUND_FANOUT_K)
+    }
+
+    /// Verdicts from the ASSIGNED challengers, across several rounds, qualify the
+    /// target (the mechanism works end-to-end through the provider).
+    #[test]
+    fn assignment_counts_assigned_challengers() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let ids = register_assignment_pool(&db, 40);
+        let target = ids[0].clone();
+        let cutoff = 2_000_000i64;
+        let pool = pool_from_db(&db);
+
+        for &rh in &[100u64, 200, 300, 400, 500] {
+            for ch in assigned_for(&pool, &target, rh) {
+                db.insert_verification_proof(
+                    &ch,
+                    &target,
+                    "archive",
+                    true,
+                    cutoff - 100,
+                    b"p",
+                    Some(rh as i64),
+                )
+                .unwrap();
+            }
+        }
+
+        let provider = QualifiedCapabilityProvider::new(Arc::clone(&db))
+            .with_block_hash_oracle(Arc::new(StubOracle));
+        let qualified = provider.get_all_qualified_nodes_at_cutoff(&ids, cutoff, true, true);
+        assert!(
+            qualified
+                .iter()
+                .any(|(n, _)| *n == decode_node_id(&target).unwrap()),
+            "assigned passing challengers across rounds must qualify the target"
+        );
+    }
+
+    /// A Sybil that stacks passing verdicts from challengers it was NOT assigned to
+    /// (the self-selection attack) qualifies NOTHING under assignment scoping — while
+    /// the exact same verdicts DO qualify under A-2 alone, proving the assignment
+    /// filter is what drops them.
+    #[test]
+    fn assignment_drops_unassigned_stack() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        let ids = register_assignment_pool(&db, 40);
+        let target = ids[0].clone();
+        let cutoff = 2_000_000i64;
+        let pool = pool_from_db(&db);
+
+        for &rh in &[100u64, 200, 300, 400, 500] {
+            let assigned = assigned_for(&pool, &target, rh);
+            for id in &ids {
+                if id == &target || assigned.contains(id) {
+                    continue; // insert ONLY from challengers not drawn this round
+                }
+                db.insert_verification_proof(
+                    id,
+                    &target,
+                    "archive",
+                    true,
+                    cutoff - 100,
+                    b"p",
+                    Some(rh as i64),
+                )
+                .unwrap();
+            }
+        }
+
+        let target_node = decode_node_id(&target).unwrap();
+
+        // Assignment scoping ON: every verdict is from an unassigned challenger → dropped.
+        let with_assign = QualifiedCapabilityProvider::new(Arc::clone(&db))
+            .with_block_hash_oracle(Arc::new(StubOracle));
+        assert!(
+            !with_assign
+                .get_all_qualified_nodes_at_cutoff(&ids, cutoff, true, true)
+                .iter()
+                .any(|(n, _)| *n == target_node),
+            "unassigned verdicts must not qualify the target under assignment scoping"
+        );
+
+        // Control — A-2 only (assignment OFF): the same verdicts are otherwise-valid
+        // distinct-subnet voter-set passes and DO qualify. Proves the drop is the
+        // assignment filter, not some other floor.
+        let without_assign = QualifiedCapabilityProvider::new(Arc::clone(&db));
+        assert!(
+            without_assign
+                .get_all_qualified_nodes_at_cutoff(&ids, cutoff, true, false)
+                .iter()
+                .any(|(n, _)| *n == target_node),
+            "control: the same verdicts qualify under A-2, isolating the assignment filter"
         );
     }
 }

@@ -32,6 +32,33 @@
 
 use sha2::{Digest, Sha256};
 
+/// Per-round, per-target number of assigned challengers (the draw fan-out). The
+/// SAME value must be used at selection time (a node challenges the targets it is
+/// drawn for) and at qualification time (a verdict counts only if its challenger
+/// was drawn), or honest verdicts would be dropped. Sized with headroom above the
+/// small-network floor; higher qualification floors are reached by accumulation
+/// across the many rounds in the 7-day lookback window, not by one large round.
+pub const ROUND_FANOUT_K: usize = 16;
+
+/// Finality lag between a round and the block whose hash seeds it: a round at tip
+/// height `H` is seeded by `blockhash(H - SEED_LAG)`, buried enough that a miner
+/// cannot grind the tip to steer the draw. Canonical home for the value that
+/// `ghost_pool::CHALLENGER_ASSIGNMENT_SEED_LAG` re-exports.
+pub const SEED_LAG: u64 = 6;
+
+/// Read-only accessor for L1 block hashes by height — the consensus beacon source.
+/// The seed for a round is the block hash at `round_height - SEED_LAG`; every node
+/// reads the same buried hash from its own chain, so the draw is identical
+/// fleet-wide. (Must be the shared L1 chain, NOT a pool-local table which can be
+/// gappy and diverge.)
+pub trait BlockHashProvider: Send + Sync {
+    /// The 32-byte block hash at `height`, or `None` if unavailable (node behind,
+    /// height not yet buried, or lookup error) — in which case a verdict for that
+    /// round cannot be assignment-verified and is simply not counted (fail-safe:
+    /// never falsely counted, at worst a legitimate verdict qualifies slower).
+    fn hash_at(&self, height: u64) -> Option<[u8; 32]>;
+}
+
 /// A candidate in the challenger draw: a node and the `/24` subnet it was
 /// observed on. `subnet` is `None` when the node's network position is unknown
 /// (it is then never drawn — it cannot prove a distinct position).
