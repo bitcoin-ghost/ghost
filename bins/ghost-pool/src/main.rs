@@ -8261,6 +8261,40 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Onboarding fan-out: proactively warm a Noise handshake to every known peer.
+    // The handshake makes the CALLEE reverse-subscribe to us, which is the only
+    // way an established fleet learns about a JOINING node (ZMQ PUB/SUB is
+    // one-directional — a late joiner can pull the fleet but can't push its own
+    // existence). Aggressive at first (a joiner needs symmetric visibility fast),
+    // tapering to a slow keep-alive as the mesh settles. Pure transport topology:
+    // no consensus effect, no wire change, no height gate.
+    let mesh_for_fanout = Arc::clone(&mesh);
+    let mut fanout_shutdown = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        // Let discovery populate an initial peer set before the first pass.
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let mut delay = std::time::Duration::from_secs(30);
+        let max = std::time::Duration::from_secs(300);
+        loop {
+            let warmed = mesh_for_fanout.bootstrap_fanout().await;
+            if warmed > 0 {
+                tracing::debug!(
+                    warmed = warmed,
+                    "Onboarding fan-out: warmed Noise handshakes (fleet reverse-subscribes)"
+                );
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {
+                    delay = (delay * 2).min(max); // 30s → 60 → 120 → 240 → 300 → 300…
+                }
+                _ = fanout_shutdown.recv() => {
+                    tracing::info!("Onboarding fan-out task shutting down");
+                    break;
+                }
+            }
+        }
+    });
+
     // Start periodic verification task (verifies peer capabilities every 5 minutes)
     // This implements the spec: nodes verify each other, results stored in DB for payout calculation.
     //

@@ -1865,6 +1865,54 @@ impl MeshNetwork {
         Ok(())
     }
 
+    /// Onboarding fan-out: open (or reuse) a Noise connection to `peer`. The
+    /// handshake ALONE is the payload — no message is sent. Completing it makes
+    /// the CALLEE reverse-subscribe to us (`run_noise_listener`), which is the
+    /// only path by which an established fleet learns about a JOINING node it has
+    /// never heard of (ZMQ PUB/SUB is one-directional, so a late joiner can pull
+    /// the fleet but can't push its own existence). No-op if Noise is disabled.
+    pub async fn warm_noise_peer(&self, peer: &Peer) -> GhostResult<()> {
+        let pool = match self.noise_pool.as_ref() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let host = peer
+            .public_address
+            .split(':')
+            .next()
+            .unwrap_or(&peer.public_address);
+        let noise_addr: std::net::SocketAddr = format!("{}:{}", host, self.config.noise_port)
+            .parse()
+            .map_err(|e| GhostError::P2PMessage(format!("Invalid peer address: {}", e)))?;
+        pool.get_connection(noise_addr)
+            .await
+            .map_err(|e| GhostError::P2PMessage(format!("Noise warm-up failed: {}", e)))?;
+        Ok(())
+    }
+
+    /// Onboarding fan-out driver: warm a Noise handshake to every currently-known
+    /// peer so an established fleet reverse-subscribes to this (possibly joining)
+    /// node, giving it symmetric mesh visibility. Returns how many handshakes
+    /// succeeded. Bounded by the known-peer list; safe to call repeatedly
+    /// (connections are pooled and the reverse-subscribe is deduped per host).
+    /// Pure transport topology — no consensus effect, no wire change, no gate.
+    pub async fn bootstrap_fanout(&self) -> usize {
+        let peers = self.peers.get_all_peers();
+        let mut warmed = 0usize;
+        for peer in peers {
+            if peer.node_id == self.identity.node_id() {
+                continue;
+            }
+            match self.warm_noise_peer(&peer).await {
+                Ok(()) => warmed += 1,
+                Err(e) => {
+                    debug!(peer = %peer.node_id_short(), error = %e, "onboarding fan-out warm-up failed")
+                }
+            }
+        }
+        warmed
+    }
+
     /// C-1: Broadcast message via encrypted Noise channels to all peers
     ///
     /// For sensitive messages, this uses point-to-point encryption to each peer.
