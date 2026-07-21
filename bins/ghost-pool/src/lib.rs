@@ -157,9 +157,16 @@ pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
 /// A share's PoW binding is consensus-visible (it decides which shares are creditable and
 /// so the coinbase split), hence a height gate: the header is populated into proofs and
 /// required by verifiers only at/above this block, so a mixed-version fleet computes
-/// identical `signing_bytes` and identical ledgers during the roll. DORMANT until every
-/// node AND the SRI layer emit the header; SET comfortably past the roll window.
-pub const SHARE_POW_VERIFY_HEIGHT: u64 = u64::MAX;
+/// identical `signing_bytes` and identical ledgers during the roll. SET comfortably past
+/// the roll window once every node AND the SRI layer (pool_sv2) emit the header.
+///
+/// ARMED at 959_030 (v1.11.1, 2026-07-21): the fleet ships ghost-pool + pool_sv2 v1.11.0
+/// (pool_sv2 emits the 80-byte header on the share webhook); this arms the recipient-side
+/// re-verification. Bounded blast radius — FEE_TO_NODE_POOL is still dormant, so this only
+/// gates cross-node share-gossip verification (no coinbase/fund impact), and it is
+/// reversible by re-releasing with a higher height. The fleet must be fully on v1.11.1
+/// BEFORE the tip reaches this height (canary roll finishes ~959_022, ~8-block margin).
+pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
