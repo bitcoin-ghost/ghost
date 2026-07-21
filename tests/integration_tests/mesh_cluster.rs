@@ -145,6 +145,7 @@ impl TestMeshCluster {
             received_by: self.nodes[from].node_id,
             template_id: Some(TEST_TEMPLATE_ID),
             payout_address: None,
+            header: None,
             signature: None,
         }
     }

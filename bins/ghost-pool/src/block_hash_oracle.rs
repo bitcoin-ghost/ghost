@@ -3,7 +3,7 @@
 //! Qualification is synchronous, but block-hash lookups are async RPC — and the
 //! qualification closures run inside the tokio runtime, where a blocking
 //! `block_on` would panic. So a background task keeps a trailing window of
-//! `height -> blockhash` warm, and the sync [`BlockHashProvider::hash_at`] is a
+//! `height -> blockhash` warm, and the sync `BlockHashProvider::hash_at` is a
 //! pure cache read.
 //!
 //! Determinism: every node fills the SAME trailing window from its OWN complete

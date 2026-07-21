@@ -1082,10 +1082,7 @@ mod tests {
 
         let res = standard_channel.validate_share(share_valid_block.clone());
 
-        assert!(matches!(
-            res,
-            Ok(ShareValidationResult::BlockFound(..))
-        ));
+        assert!(matches!(res, Ok(ShareValidationResult::BlockFound(..))));
         assert_eq!(
             standard_channel.get_share_accounting().get_blocks_found(),
             1

@@ -1297,10 +1297,7 @@ mod tests {
 
         let res = channel.validate_share(share_valid_block.clone());
 
-        assert!(matches!(
-            res,
-            Ok(ShareValidationResult::BlockFound(..))
-        ));
+        assert!(matches!(res, Ok(ShareValidationResult::BlockFound(..))));
         assert_eq!(channel.get_share_accounting().get_blocks_found(), 1);
 
         // re-submitting the same valid block must be rejected as duplicate
