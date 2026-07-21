@@ -812,9 +812,11 @@ async fn test_658_noise_connection_pool_establishment() {
     // Wait for acceptance
     let conn2 = accept_handle.await.unwrap().unwrap();
 
-    // Verify connections
+    // Verify connections: pool1 pooled its OUTBOUND dial; pool2 accepted an inbound
+    // (owned by `conn2` below), which is deliberately NOT pooled — the pool is an
+    // outbound send-cache, so inbound accepts never clobber the outbound connection.
     assert_eq!(pool1.connection_count(), 1);
-    assert_eq!(pool2.connection_count(), 1);
+    assert_eq!(pool2.connection_count(), 0);
 
     // Verify peer keys match
     assert_eq!(conn1.peer_key, *pool2.public_key());
