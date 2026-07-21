@@ -689,7 +689,7 @@ fn ghost02_round_scoped_recompute_is_rejected() {
 
     let err = node
         .handler
-        .validate_proposal_split(&proposal, &round_work, &TreasuryState::new())
+        .validate_proposal_split(&proposal, &round_work, None, &TreasuryState::new())
         .expect_err(
             "a round-scoped recompute cannot reproduce a ledger-built split — if this \
              succeeds, the test scenario has gone degenerate and proves nothing",

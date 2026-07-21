@@ -6892,25 +6892,47 @@ async fn main() -> Result<()> {
                     return;
                 };
 
-                // No round-tracker fallback here, deliberately: a validator has no
-                // way to know the proposer fell back, so it would recompute from the
-                // ledger and reject the split. An empty ledger means nobody is owed —
-                // `handle_block_found` then skips submission and the shares (if any
-                // are merely late to persist) are swept by the next block instead.
-                let miner_work = match ghost_pool::payout::select_ledger_miner_work(
-                    &db_for_bf, cutoff_ts, height, subsidy,
-                ) {
-                    Ok(work) => work,
-                    Err(e) => {
-                        error!(
-                            round = round_id,
-                            cutoff_ts,
-                            error = %e,
-                            "Failed to read unpaid ledger at block-found; no miner payout \
-                             this block — unpaid shares roll forward to the next"
-                        );
-                        Vec::new()
+                // Option (c) adopt-CONSUMPTION: at/above the fee gate BOTH the miner and
+                // node lists are the fleet-ratified lists from the finalised checkpoint
+                // (`read_adopted_payout`), NOT a local recompute — every node builds the
+                // byte-identical coinbase the fleet agreed on, so the exact-equality
+                // validators pass. Below the gate: legacy local recompute of the miner
+                // ledger + the round-tracker's claimed node shares (unchanged behaviour).
+                //
+                // No round-tracker fallback for the miner side, deliberately: a validator
+                // has no way to know the proposer fell back, so it would recompute and
+                // reject. An empty list means nobody is owed — `handle_block_found` skips
+                // submission and any merely-late shares are swept by the next block.
+                let (miner_work, node_shares) = if height >= ghost_pool::fee_to_node_pool_height()
+                {
+                    match ghost_pool::payout::read_adopted_payout(&db_for_bf, height) {
+                        Some((m, n)) => (m, n),
+                        None => {
+                            debug!(
+                                height,
+                                "no adopted payout in the finalised checkpoint yet; skipping \
+                                 split payout this block"
+                            );
+                            return;
+                        }
                     }
+                } else {
+                    let m = match ghost_pool::payout::select_ledger_miner_work(
+                        &db_for_bf, cutoff_ts, height, subsidy,
+                    ) {
+                        Ok(work) => work,
+                        Err(e) => {
+                            error!(
+                                round = round_id,
+                                cutoff_ts,
+                                error = %e,
+                                "Failed to read unpaid ledger at block-found; no miner payout \
+                                 this block — unpaid shares roll forward to the next"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    (m, node_shares)
                 };
 
                 let treasury_address_snapshot =
@@ -8621,13 +8643,18 @@ async fn main() -> Result<()> {
                                     let subsidy =
                                         ghost_common::rpc::calculate_block_subsidy(height, None);
 
-                                    match ghost_pool::payout::select_ledger_miner_work(
+                                    // Option (c) adopt-CONSUMPTION: this tip-change path is
+                                    // entirely above the fee gate, so the coinbase consumes
+                                    // the fleet-ratified miner + node lists from the finalised
+                                    // checkpoint — never a local recompute (which diverges and
+                                    // was rejected every block in v1.10.32).
+                                    match ghost_pool::payout::read_adopted_payout(
                                         &db_for_rounds,
-                                        cutoff_ts,
                                         height,
-                                        subsidy,
                                     ) {
-                                        Ok(miner_work) if !miner_work.is_empty() => {
+                                        Some((miner_work, node_shares))
+                                            if !miner_work.is_empty() =>
+                                        {
                                             let (_, fees, _) =
                                                 tp_for_template_events.get_current_block_info();
                                             let treasury_state = TreasuryState::from_stored(
@@ -8655,7 +8682,7 @@ async fn main() -> Result<()> {
                                                 subsidy_sats: subsidy,
                                                 tx_fees_sats: fees,
                                                 miner_work,
-                                                node_shares: rm_notify.get_node_shares(round_id),
+                                                node_shares,
                                                 treasury_state,
                                             };
 
@@ -8678,14 +8705,15 @@ async fn main() -> Result<()> {
                                                 ),
                                             }
                                         }
-                                        Ok(_) => debug!(
+                                        Some(_) => debug!(
                                             height,
-                                            "No unpaid ledger at tip change; nothing to arm"
+                                            "Adopted checkpoint has an empty miner list at tip \
+                                             change; nothing to arm"
                                         ),
-                                        Err(e) => error!(
+                                        None => debug!(
                                             height,
-                                            error = %e,
-                                            "Failed to read the unpaid ledger at tip change"
+                                            "No finalised checkpoint to adopt at tip change; \
+                                             skipping"
                                         ),
                                     }
                                 }

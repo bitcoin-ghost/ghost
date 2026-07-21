@@ -310,6 +310,39 @@ pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> O
     }
 }
 
+/// Option (c) adopt-CONSUMPTION: the BFT-finalised checkpoint's ADOPTED payout lists at
+/// or before `tip_height` — `(miner_payouts: (address, WORK_SCALE-quantised work),
+/// node_shares: (node_id, 5-4-3-2-1 shares))`.
+///
+/// At and above the fee gate the coinbase — AND the GHOST-02/Component-E validators that
+/// check it — build from THESE, never from a local recompute. Independent nodes cannot
+/// reproduce a byte-identical split (share attribution + float-sum order diverge), which
+/// is exactly why v1.10.32's recompute-at-`now()` was rejected every block. Every node
+/// instead reads the SAME finalised row (the fleet BFT-ratified the proposer's lists
+/// within tolerance and persisted them identically), so the split is fleet-identical and
+/// the validators' exact-equality check compares like-with-like and passes.
+///
+/// `None` when no checkpoint has finalised at or before `tip_height` (the brief window at
+/// first activation) — the caller then builds NO split (treasury-only fallback, safe:
+/// there is nothing for validators to disagree on).
+pub fn read_adopted_payout(
+    db: &ghost_storage::Database,
+    tip_height: u64,
+) -> Option<(Vec<(String, u128)>, Vec<(NodeId, i32)>)> {
+    match db.get_payout_ledger_checkpoint_at_or_before(tip_height) {
+        Ok(Some(cp)) => Some((cp.miner_payouts, cp.node_shares)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                tip_height,
+                "adopted payout lookup failed; refusing to anchor a split payout this block"
+            );
+            None
+        }
+    }
+}
+
 /// Option B cutoff-binding: a proposal's payout cutoff must be a fleet-ratified one.
 ///
 /// At and above `fee_gate_height` the coinbase is a pure function of a BFT-finalised
@@ -383,16 +416,40 @@ pub fn make_proposal_validator(
             crate::fee_to_node_pool_height(),
         )?;
 
-        // Recompute from the UNPAID LEDGER, over the proposer's exact window — the same
-        // source and cutoff the proposer used. The cutoff rides on `proposal.timestamp`.
-        let local_work = match select_ledger_miner_work(
-            &db,
-            proposal.timestamp as i64,
-            proposal.block_height,
-            proposal.subsidy,
-        ) {
-            Ok(work) => work,
-            Err(e) => return Err(format!("GHOST-02: local ledger recompute failed: {e}")),
+        // Determine the miner list to validate the proposal against.
+        //
+        // At/above the fee gate (option c adopt-CONSUMPTION): validate against the
+        // fleet-ratified checkpoint list — the SAME list the proposer built from — so the
+        // exact-equality check below compares like-with-like and passes. A local recompute
+        // here would diverge (independent nodes can't reproduce byte-identical attribution)
+        // and reject the very split the fleet adopted (the v1.10.32 failure mode).
+        //
+        // Below the gate (legacy GHOST-02): recompute from the UNPAID LEDGER over the
+        // proposer's exact window (cutoff rides on `proposal.timestamp`) — unchanged.
+        let (local_work, adopted_nodes) = if proposal.block_height
+            >= crate::fee_to_node_pool_height()
+        {
+            match read_adopted_payout(&db, proposal.block_height) {
+                Some((miners, nodes)) => (miners, Some(nodes)),
+                None => {
+                    return Err(
+                        "GHOST-02: no finalised checkpoint to validate the adopted split \
+                         against"
+                            .to_string(),
+                    )
+                }
+            }
+        } else {
+            let work = match select_ledger_miner_work(
+                &db,
+                proposal.timestamp as i64,
+                proposal.block_height,
+                proposal.subsidy,
+            ) {
+                Ok(work) => work,
+                Err(e) => return Err(format!("GHOST-02: local ledger recompute failed: {e}")),
+            };
+            (work, None)
         };
 
         let treasury_state = match db.get_treasury_balance() {
@@ -408,7 +465,12 @@ pub fn make_proposal_validator(
             Err(_) => TreasuryState::new(),
         };
 
-        let result = handler.validate_proposal_split(proposal, &local_work, &treasury_state);
+        let result = handler.validate_proposal_split(
+            proposal,
+            &local_work,
+            adopted_nodes.as_deref(),
+            &treasury_state,
+        );
 
         if proposal.block_height >= enforcement_height {
             result
@@ -1914,37 +1976,32 @@ impl PayoutHandler {
         &self,
         proposal: &PayoutProposal,
         local_miner_work: &[(String, u128)],
+        adopted_node_shares: Option<&[(NodeId, i32)]>,
         treasury_state: &TreasuryState,
     ) -> Result<(), String> {
         self.creator
             .validate_proposal_split(proposal, local_miner_work, treasury_state)?;
 
-        // Component E (Option B): at/above the fee gate the node split is a pure
-        // function of the ratified checkpoint, so pin it too. The cutoff on the
-        // proposal is a finalised checkpoint cutoff (guaranteed by the validator's
-        // cutoff-binding), so this recomputes the qualified-node set at a converged
-        // point — every honest node matches. Below the gate the node split is not
-        // consensus-enforced (legacy behaviour) and this is skipped.
+        // Component E: at/above the fee gate the node split is a pure function of the
+        // fleet-ratified checkpoint, so pin it too — validate the proposal's node split
+        // against the SAME adopted node list the caller read from the finalised
+        // checkpoint (option c consumption). Recomputing the qualified set here would
+        // diverge from the adopted list and reject the split the fleet agreed on. Below
+        // the gate the node split is not consensus-enforced (legacy) and this is skipped.
         if proposal.block_height >= crate::fee_to_node_pool_height() {
-            // A-2: at/above the voter-set gate, restrict distinct challengers to the
-            // consensus voter set + require IP-subnet diversity. Height-derived so the
-            // whole fleet recomputes the SAME set. A-2b: at/above the assignment gate,
-            // additionally count only verdicts from the consensus-assigned challenger.
-            let voter_set_scoped =
-                proposal.block_height >= crate::voter_set_qualification_height();
-            let assignment_scoped =
-                proposal.block_height >= crate::challenger_assignment_height();
-            let node_shares = self
-                .qualification_provider
-                .get_all_qualified_nodes_at_cutoff_from_db(
-                    proposal.timestamp as i64,
-                    voter_set_scoped,
-                    assignment_scoped,
-                );
+            let node_shares = match adopted_node_shares {
+                Some(n) => n,
+                None => {
+                    return Err(
+                        "Component-E: no adopted node list to validate the split against"
+                            .to_string(),
+                    )
+                }
+            };
             self.creator.validate_node_split(
                 proposal,
                 local_miner_work,
-                &node_shares,
+                node_shares,
                 treasury_state,
             )?;
         }
@@ -1968,15 +2025,14 @@ impl PayoutHandler {
         // SAME set the checkpoint's ledger_root committed to, so the coinbase pays
         // exactly what the fleet ratified and Component-E recompute-reject can only pass.
         let qualified_shares = if data.block_height >= crate::fee_to_node_pool_height() {
-            // A-2/A-2b: height-gated voter-set + IP-subnet scoping of the distinct
-            // challengers, and consensus-assignment scoping of which verdicts count.
-            let voter_set_scoped = data.block_height >= crate::voter_set_qualification_height();
-            let assignment_scoped = data.block_height >= crate::challenger_assignment_height();
-            self.qualification_provider.get_all_qualified_nodes_at_cutoff_from_db(
-                data.ledger_cutoff_ts,
-                voter_set_scoped,
-                assignment_scoped,
-            )
+            // Option (c) adopt-CONSUMPTION: at/above the gate the node split is the
+            // fleet-ratified set the proposer path already sourced from the finalised
+            // checkpoint (`read_adopted_payout`) and passed in as `data.node_shares`.
+            // Trust it VERBATIM — recomputing here (as the pre-(c) code did) would
+            // diverge from the adopted list and the exact-equality validators would
+            // reject the very split the fleet agreed on. A-2/A-2b subnet/assignment
+            // scoping already happened when the checkpoint's set was computed.
+            data.node_shares.clone()
         } else {
             self.qualification_provider.get_all_qualified_nodes()
         };
@@ -1991,7 +2047,8 @@ impl PayoutHandler {
             verified_nodes = verified_count,
             claimed_shares = total_claimed_shares,
             verified_shares = total_verified_shares,
-            "Recalculated node shares using VERIFIED capabilities"
+            adopted = data.block_height >= crate::fee_to_node_pool_height(),
+            "Node shares for payout (adopted checkpoint set at/above gate, else verified)"
         );
 
         data.node_shares = qualified_shares;
@@ -2230,6 +2287,41 @@ mod tests {
         })
         .expect("upsert checkpoint");
         db
+    }
+
+    /// Option (c) consumption: `read_adopted_payout` returns the finalised checkpoint's
+    /// ADOPTED miner + node lists verbatim (what the coinbase and the validators build
+    /// from at/above the gate), and `None` when there is no checkpoint at/before the
+    /// height (caller then builds a treasury-only coinbase).
+    #[test]
+    fn read_adopted_payout_round_trips_the_finalised_lists() {
+        let db = ghost_storage::Database::in_memory().expect("in-memory db");
+        let miners = vec![
+            ("bc1qalice".to_string(), 3_000_000u128),
+            ("bc1qbob".to_string(), 1_500_000u128),
+        ];
+        let nodes = vec![([0xAAu8; 32], 10i32), ([0xBBu8; 32], 6i32)];
+        db.upsert_payout_ledger_checkpoint(&ghost_storage::PayoutLedgerCheckpointRecord {
+            height: 958_800,
+            cutoff_ts: 1_700_000_000,
+            ledger_root: [9u8; 32],
+            proposer_id: "cc".repeat(32),
+            active_node_count: 8,
+            miner_payouts: miners.clone(),
+            node_shares: nodes.clone(),
+        })
+        .expect("upsert checkpoint");
+
+        let (got_m, got_n) =
+            read_adopted_payout(&db, 958_900).expect("a finalised checkpoint exists at/before");
+        assert_eq!(got_m, miners, "adopted miner list must round-trip verbatim");
+        assert_eq!(got_n, nodes, "adopted node list must round-trip verbatim");
+
+        // No checkpoint at/before an earlier height → None (treasury-only fallback).
+        assert!(
+            read_adopted_payout(&db, 958_700).is_none(),
+            "no finalised checkpoint at/before the height must yield None"
+        );
     }
 
     fn seed_node_with_addr(db: &ghost_storage::Database, node_id: NodeId, addr: &str) {
