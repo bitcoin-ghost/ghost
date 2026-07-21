@@ -1003,8 +1003,7 @@ mod tests {
 
     use ghost_verification::challenge::GhostPayResponse;
 
-    const GP_STATE_HASH: &str =
-        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const GP_STATE_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     fn nonce_bound(state_hash: &str, nonce: &str) -> String {
         use sha2::{Digest, Sha256};
@@ -1083,7 +1082,11 @@ mod tests {
             ReVerdict::Unverifiable
         );
         assert_eq!(
-            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data("deadbeef"), Some("   ")),
+            reverify_ghostpay_impl(
+                &target.node_id(),
+                &gp_challenge_data("deadbeef"),
+                Some("   ")
+            ),
             ReVerdict::Unverifiable
         );
     }
@@ -1138,7 +1141,11 @@ mod tests {
         // No epoch_state_hash / nonce_bound_proof.
         let no_state = make_signed_ghostpay(&target, nonce, None, true, true);
         assert_eq!(
-            reverify_ghostpay_impl(&target.node_id(), &gp_challenge_data(nonce), Some(&no_state)),
+            reverify_ghostpay_impl(
+                &target.node_id(),
+                &gp_challenge_data(nonce),
+                Some(&no_state)
+            ),
             ReVerdict::Unverifiable
         );
 

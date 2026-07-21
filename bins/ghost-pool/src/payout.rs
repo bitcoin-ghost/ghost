@@ -379,9 +379,11 @@ pub fn check_proposal_cutoff_binding(
                 Ok(())
             }
         }
-        Ok(None) => Err("GHOST-02: no finalised payout checkpoint at or before this height; \
+        Ok(None) => Err(
+            "GHOST-02: no finalised payout checkpoint at or before this height; \
              a split payout cannot be ratified yet"
-            .to_string()),
+                .to_string(),
+        ),
         Err(e) => Err(format!("GHOST-02: checkpoint lookup failed: {e}")),
     }
 }
@@ -426,31 +428,30 @@ pub fn make_proposal_validator(
         //
         // Below the gate (legacy GHOST-02): recompute from the UNPAID LEDGER over the
         // proposer's exact window (cutoff rides on `proposal.timestamp`) — unchanged.
-        let (local_work, adopted_nodes) = if proposal.block_height
-            >= crate::fee_to_node_pool_height()
-        {
-            match read_adopted_payout(&db, proposal.block_height) {
-                Some((miners, nodes)) => (miners, Some(nodes)),
-                None => {
-                    return Err(
-                        "GHOST-02: no finalised checkpoint to validate the adopted split \
+        let (local_work, adopted_nodes) =
+            if proposal.block_height >= crate::fee_to_node_pool_height() {
+                match read_adopted_payout(&db, proposal.block_height) {
+                    Some((miners, nodes)) => (miners, Some(nodes)),
+                    None => {
+                        return Err(
+                            "GHOST-02: no finalised checkpoint to validate the adopted split \
                          against"
-                            .to_string(),
-                    )
+                                .to_string(),
+                        )
+                    }
                 }
-            }
-        } else {
-            let work = match select_ledger_miner_work(
-                &db,
-                proposal.timestamp as i64,
-                proposal.block_height,
-                proposal.subsidy,
-            ) {
-                Ok(work) => work,
-                Err(e) => return Err(format!("GHOST-02: local ledger recompute failed: {e}")),
+            } else {
+                let work = match select_ledger_miner_work(
+                    &db,
+                    proposal.timestamp as i64,
+                    proposal.block_height,
+                    proposal.subsidy,
+                ) {
+                    Ok(work) => work,
+                    Err(e) => return Err(format!("GHOST-02: local ledger recompute failed: {e}")),
+                };
+                (work, None)
             };
-            (work, None)
-        };
 
         let treasury_state = match db.get_treasury_balance() {
             Ok(balance) => {
@@ -2237,14 +2238,26 @@ mod tests {
 
         // different miner work
         let m2 = vec![("bc1qaaa".to_string(), 101u128)];
-        assert_ne!(base, compute_ledger_root(&m2, &nodes, 1_784_000_000, 958_800));
+        assert_ne!(
+            base,
+            compute_ledger_root(&m2, &nodes, 1_784_000_000, 958_800)
+        );
         // different node shares
         let n2 = vec![(nid(1), 14i32)];
-        assert_ne!(base, compute_ledger_root(&miners, &n2, 1_784_000_000, 958_800));
+        assert_ne!(
+            base,
+            compute_ledger_root(&miners, &n2, 1_784_000_000, 958_800)
+        );
         // different cutoff
-        assert_ne!(base, compute_ledger_root(&miners, &nodes, 1_784_000_001, 958_800));
+        assert_ne!(
+            base,
+            compute_ledger_root(&miners, &nodes, 1_784_000_001, 958_800)
+        );
         // different height
-        assert_ne!(base, compute_ledger_root(&miners, &nodes, 1_784_000_000, 958_801));
+        assert_ne!(
+            base,
+            compute_ledger_root(&miners, &nodes, 1_784_000_000, 958_801)
+        );
     }
 
     // ---- Cutoff resolver (the v1.10.32 fix) ----
@@ -2277,7 +2290,10 @@ mod tests {
             "dormant gate must return now() ({before}..={after}), not the checkpoint's {}: got {got}",
             1_700_000_000i64
         );
-        assert_ne!(got, 1_700_000_000, "must NOT use the checkpoint cutoff while dormant");
+        assert_ne!(
+            got, 1_700_000_000,
+            "must NOT use the checkpoint cutoff while dormant"
+        );
     }
 
     fn db_with_checkpoint(height: u64, cutoff_ts: i64) -> ghost_storage::Database {
@@ -2385,7 +2401,10 @@ mod tests {
         let map = PayoutProposalCreator::address_amount_map(&via_fwd);
         let top = *map.get(a1.as_bytes()).expect("a1 present");
         let other = *map.get(a2.as_bytes()).expect("a2 present");
-        assert!(top > other, "remainder must go to the lowest-id top node: {top} vs {other}");
+        assert!(
+            top > other,
+            "remainder must go to the lowest-id top node: {top} vs {other}"
+        );
     }
 
     #[test]

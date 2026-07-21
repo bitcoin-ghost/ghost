@@ -196,8 +196,7 @@ pub const CHALLENGER_ASSIGNMENT_HEIGHT: u64 = u64::MAX;
 /// height `H` is seeded by `blockhash(H - CHALLENGER_ASSIGNMENT_SEED_LAG)`, buried enough that a
 /// miner cannot grind the tip to steer the draw. Canonical value lives in ghost-verification so
 /// the challenger draw uses one source of truth on both the selection and qualification sides.
-pub const CHALLENGER_ASSIGNMENT_SEED_LAG: u64 =
-    ghost_verification::challenger_assignment::SEED_LAG;
+pub const CHALLENGER_ASSIGNMENT_SEED_LAG: u64 = ghost_verification::challenger_assignment::SEED_LAG;
 
 /// Activation heights, resolved once at startup.
 ///

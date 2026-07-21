@@ -2191,10 +2191,8 @@ fn migrate_v43(conn: &Connection) -> GhostResult<()> {
 /// (divergent) share ledger. One JSON blob column; NULL on pre-(c) rows.
 fn migrate_v44(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v44: payout_ledger_checkpoints.canonical_payout");
-    conn.execute_batch(
-        "ALTER TABLE payout_ledger_checkpoints ADD COLUMN canonical_payout BLOB;",
-    )
-    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    conn.execute_batch("ALTER TABLE payout_ledger_checkpoints ADD COLUMN canonical_payout BLOB;")
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
     info!("v44: added payout_ledger_checkpoints.canonical_payout");
     Ok(())
 }

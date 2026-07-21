@@ -1221,12 +1221,15 @@ mod tests {
         // behaviour is consensus-relevant: it must roundtrip, and an older peer that
         // omits it must default to None (not qualify, rather than qualify with junk).
         let ping = sample_health_ping();
-        let back: HealthPing =
-            serde_json::from_slice(&serde_json::to_vec(&ping).unwrap()).unwrap();
+        let back: HealthPing = serde_json::from_slice(&serde_json::to_vec(&ping).unwrap()).unwrap();
         assert_eq!(back.payout_address, ping.payout_address);
 
         let mut v = serde_json::to_value(&ping).unwrap();
-        assert!(v.as_object_mut().unwrap().remove("payout_address").is_some());
+        assert!(v
+            .as_object_mut()
+            .unwrap()
+            .remove("payout_address")
+            .is_some());
         let old: HealthPing = serde_json::from_value(v).unwrap();
         assert_eq!(old.payout_address, None);
     }

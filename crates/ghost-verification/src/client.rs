@@ -965,13 +965,12 @@ impl VerificationClient {
 
             Ok((result, Some(raw_signed)))
         } else {
-            let result: GhostPayResponse =
-                serde_json::from_value(inner.clone()).map_err(|e| {
-                    debug!("GhostPay response deserialization error: {}", e);
-                    GhostError::InvalidVerificationResponse(
-                        "Invalid GhostPay response data".to_string(),
-                    )
-                })?;
+            let result: GhostPayResponse = serde_json::from_value(inner.clone()).map_err(|e| {
+                debug!("GhostPay response deserialization error: {}", e);
+                GhostError::InvalidVerificationResponse(
+                    "Invalid GhostPay response data".to_string(),
+                )
+            })?;
 
             Ok((result, None))
         }
@@ -1074,9 +1073,7 @@ impl VerificationClient {
                 .verify_ghostpay_with_nonce(node_address, None, ghostpay_nonce.as_deref())
                 .await
             {
-                Ok((resp, _signed)) => {
-                    result.ghostpay_verified = resp.success && resp.l2_enabled
-                }
+                Ok((resp, _signed)) => result.ghostpay_verified = resp.success && resp.l2_enabled,
                 Err(e) => result.errors.push(format!("GhostPay: {}", e)),
             }
         }

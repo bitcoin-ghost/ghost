@@ -2519,7 +2519,11 @@ async fn main() -> Result<()> {
                 *offered += chunk.len();
                 *inserted += ins;
                 *miners += m;
-                info!(offered = *offered, inserted = *inserted, "Ledger import progress");
+                info!(
+                    offered = *offered,
+                    inserted = *inserted,
+                    "Ledger import progress"
+                );
                 chunk.clear();
                 Ok(())
             };
@@ -3348,7 +3352,9 @@ async fn main() -> Result<()> {
         let tx = plchk_tx.clone();
         Arc::new(move |ty, bytes| {
             tx.try_send((ty, bytes)).map_err(|e| {
-                ghost_common::error::GhostError::P2PMessage(format!("payout-checkpoint channel: {e}"))
+                ghost_common::error::GhostError::P2PMessage(format!(
+                    "payout-checkpoint channel: {e}"
+                ))
             })
         })
     };
@@ -3396,12 +3402,12 @@ async fn main() -> Result<()> {
         let oracle_c = block_hash_oracle.clone();
         Arc::new(move |cutoff_ts, height| {
             let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
-            let miners =
-                match ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
-                {
-                    Ok(m) => m,
-                    Err(e) => return format!("miner recompute failed: {e}"),
-                };
+            let miners = match ghost_pool::payout::select_ledger_miner_work(
+                &db_c, cutoff_ts, height, subsidy,
+            ) {
+                Ok(m) => m,
+                Err(e) => return format!("miner recompute failed: {e}"),
+            };
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()));
             let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
@@ -3414,14 +3420,15 @@ async fn main() -> Result<()> {
             ghost_pool::payout::ledger_root_diag(&miners, &nodes, cutoff_ts, height)
         })
     };
-    let payout_checkpoint_mgr =
-        Arc::new(ghost_pool::payout_checkpoint::PayoutCheckpointManager::new(
+    let payout_checkpoint_mgr = Arc::new(
+        ghost_pool::payout_checkpoint::PayoutCheckpointManager::new(
             Arc::clone(&identity),
             Arc::clone(&db),
             plchk_send,
             compute_ledger_root_fn,
         )
-        .with_diag(compute_ledger_root_diag_fn));
+        .with_diag(compute_ledger_root_diag_fn),
+    );
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
     // Propose cadence: every ~30s the deterministic proposer for (tip - LAG)
@@ -3581,13 +3588,13 @@ async fn main() -> Result<()> {
             // rotating back through `LEDGER_SWEEP_SPAN_SECS`. Bucketing keeps each advertisement
             // a sane size; the rotation covers the whole span.
             const LEDGER_BUCKET_SECS: i64 = 1_800; // 30 min per advertisement
-            // Sweep the trailing 7 days, matching the verification-ledger sweep
-            // (VLEDGER_SWEEP_SPAN_SECS). At 24h a proof-present share dropped in gossip
-            // that was not reconciled within a day aged out of the rotation and stayed
-            // divergent forever — even though its proof exists and it is fully servable.
-            // The unpaid-share horizon spans well past 24h (shares accumulate until a
-            // payout settles), so the sweep must too, or the payout ledger can never
-            // reach the byte-identical totals the checkpoint requires.
+                                                   // Sweep the trailing 7 days, matching the verification-ledger sweep
+                                                   // (VLEDGER_SWEEP_SPAN_SECS). At 24h a proof-present share dropped in gossip
+                                                   // that was not reconciled within a day aged out of the rotation and stayed
+                                                   // divergent forever — even though its proof exists and it is fully servable.
+                                                   // The unpaid-share horizon spans well past 24h (shares accumulate until a
+                                                   // payout settles), so the sweep must too, or the payout ledger can never
+                                                   // reach the byte-identical totals the checkpoint requires.
             const LEDGER_SWEEP_SPAN_SECS: i64 = 7 * 86_400; // sweep the last 7 days
             const LEDGER_BUCKETS: i64 = LEDGER_SWEEP_SPAN_SECS / LEDGER_BUCKET_SECS;
 
@@ -8625,12 +8632,10 @@ async fn main() -> Result<()> {
                                     // (converged) instead of now() (gossip-lagged), so every
                                     // node recomputes the identical split. Below the gate this
                                     // still resolves to now().
-                                    let Some(cutoff_ts) =
-                                        ghost_pool::payout::resolve_payout_cutoff(
-                                            &db_for_rounds,
-                                            height,
-                                        )
-                                    else {
+                                    let Some(cutoff_ts) = ghost_pool::payout::resolve_payout_cutoff(
+                                        &db_for_rounds,
+                                        height,
+                                    ) else {
                                         debug!(
                                             height,
                                             "no finalised payout checkpoint yet; skipping tip-change payout"

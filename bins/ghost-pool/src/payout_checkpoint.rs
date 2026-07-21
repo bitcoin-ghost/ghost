@@ -188,7 +188,12 @@ impl PayoutCheckpointManager {
     /// Emit the root-input breakdown at INFO under a shared `tag`, if diag is wired.
     fn log_diag(&self, tag: &str, height: u64, cutoff_ts: i64) {
         if let Some(d) = &self.diag {
-            info!(height, tag, "payout checkpoint DIAG: {}", d(cutoff_ts, height));
+            info!(
+                height,
+                tag,
+                "payout checkpoint DIAG: {}",
+                d(cutoff_ts, height)
+            );
         }
     }
 
@@ -311,7 +316,10 @@ impl PayoutCheckpointManager {
         // Authorisation: the Noise-authenticated sender must be the declared
         // proposer AND the deterministic proposer for this height.
         if env.sender != msg.proposer || self.proposer_for(msg.height) != Some(msg.proposer) {
-            debug!(height = msg.height, "payout checkpoint: proposal from non-proposer — ignored");
+            debug!(
+                height = msg.height,
+                "payout checkpoint: proposal from non-proposer — ignored"
+            );
             return Ok(());
         }
         if self.already_finalized(msg.height) {
@@ -571,12 +579,8 @@ mod tests {
             });
             let payout = payouts[pos].clone();
             let compute_root: ComputeRootFn = Arc::new(move |_c, _h| payout.clone());
-            let mgr = PayoutCheckpointManager::new(
-                identity.clone(),
-                Arc::clone(&db),
-                send,
-                compute_root,
-            );
+            let mgr =
+                PayoutCheckpointManager::new(identity.clone(), Arc::clone(&db), send, compute_root);
             nodes.push(Node {
                 id: identity.node_id(),
                 db,
@@ -607,8 +611,13 @@ mod tests {
             for (from, ty, payload) in msgs {
                 for n in nodes {
                     if n.id != from {
-                        let env =
-                            Arc::new(MessageEnvelope::new(ty, from, payload.clone(), 0, [0u8; 64]));
+                        let env = Arc::new(MessageEnvelope::new(
+                            ty,
+                            from,
+                            payload.clone(),
+                            0,
+                            [0u8; 64],
+                        ));
                         n.mgr.handle_message(env).await.expect("handle");
                     }
                 }
@@ -621,7 +630,10 @@ mod tests {
 
     #[tokio::test]
     async fn convergent_fleet_finalises_and_adopts_lists() {
-        let payout = cp(&[("bc1qaaa", 1_000_000_000_000_000), ("bc1qbbb", 500_000_000_000_000)]);
+        let payout = cp(&[
+            ("bc1qaaa", 1_000_000_000_000_000),
+            ("bc1qbbb", 500_000_000_000_000),
+        ]);
         let nodes = build(4, &vec![Some(payout.clone()); 4]);
         assert_eq!(nodes[0].mgr.proposer_for(H), Some(nodes[0].id));
         assert_eq!(nodes[0].mgr.quorum_needed(), 3, "67% of 4 = 3");
@@ -630,15 +642,17 @@ mod tests {
         }
         gossip_until_quiet(&nodes).await;
         for n in &nodes {
-            let rec = n
-                .db
-                .get_latest_payout_ledger_checkpoint()
-                .unwrap()
-                .expect("every node finalises");
+            let rec =
+                n.db.get_latest_payout_ledger_checkpoint()
+                    .unwrap()
+                    .expect("every node finalises");
             assert_eq!(rec.ledger_root, payout.root);
             assert_eq!(rec.height, H);
             // Adopt-on-finalise: the canonical lists are persisted verbatim.
-            assert_eq!(rec.miner_payouts, payout.miner_payouts, "adopted miner list");
+            assert_eq!(
+                rec.miner_payouts, payout.miner_payouts,
+                "adopted miner list"
+            );
             assert_eq!(rec.node_shares.len(), 3, "adopted node list");
         }
     }
@@ -654,18 +668,22 @@ mod tests {
         let near3 = cp(&[("bc1qaaa", 1_010_000_000_000_000)]); // +1.0%
         let nodes = build(
             4,
-            &[Some(proposer.clone()), Some(near1), Some(near2), Some(near3)],
+            &[
+                Some(proposer.clone()),
+                Some(near1),
+                Some(near2),
+                Some(near3),
+            ],
         );
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
         for n in &nodes {
-            let rec = n
-                .db
-                .get_latest_payout_ledger_checkpoint()
-                .unwrap()
-                .expect("finalises within tolerance");
+            let rec =
+                n.db.get_latest_payout_ledger_checkpoint()
+                    .unwrap()
+                    .expect("finalises within tolerance");
             // Every node adopted the PROPOSER's exact value — convergence by adoption.
             assert_eq!(rec.miner_payouts, proposer.miner_payouts);
         }
@@ -677,13 +695,20 @@ mod tests {
         // Those two reject → only 2 approvals < 3 → nothing finalises (safe).
         let a = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
         let gross = cp(&[("bc1qaaa", 2_000_000_000_000_000)]);
-        let nodes = build(4, &[Some(a.clone()), Some(a), Some(gross.clone()), Some(gross)]);
+        let nodes = build(
+            4,
+            &[Some(a.clone()), Some(a), Some(gross.clone()), Some(gross)],
+        );
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }
         gossip_until_quiet(&nodes).await;
         for n in &nodes {
-            assert!(n.db.get_latest_payout_ledger_checkpoint().unwrap().is_none());
+            assert!(n
+                .db
+                .get_latest_payout_ledger_checkpoint()
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -733,7 +758,11 @@ mod tests {
         }
         gossip_until_quiet(&nodes).await;
         for n in &nodes {
-            assert!(n.db.get_latest_payout_ledger_checkpoint().unwrap().is_none());
+            assert!(n
+                .db
+                .get_latest_payout_ledger_checkpoint()
+                .unwrap()
+                .is_none());
         }
     }
 }

@@ -10588,14 +10588,22 @@ mod tests {
     #[test]
     fn blocks_found_count_tracks_settled_wins_only() {
         let db = Database::in_memory().expect("in-memory db");
-        assert_eq!(db.get_blocks_found_count().unwrap(), 0, "fresh db → no wins");
+        assert_eq!(
+            db.get_blocks_found_count().unwrap(),
+            0,
+            "fresh db → no wins"
+        );
 
         db.record_won_block(958_800).unwrap();
         db.record_won_block(958_800).unwrap(); // idempotent — same block, still one win
         assert_eq!(db.get_blocks_found_count().unwrap(), 1);
 
         db.record_won_block(958_820).unwrap();
-        assert_eq!(db.get_blocks_found_count().unwrap(), 2, "a second distinct win counts");
+        assert_eq!(
+            db.get_blocks_found_count().unwrap(),
+            2,
+            "a second distinct win counts"
+        );
     }
 
     /// A-2: the `/24` subnet extractor must accept only dotted-quad IPv4 literals
@@ -10605,9 +10613,15 @@ mod tests {
     fn ipv4_subnet_24_parses_only_real_ipv4() {
         assert_eq!(ipv4_subnet_24("10.0.0.1:8080"), Some("10.0.0".to_string()));
         assert_eq!(ipv4_subnet_24("192.168.9.9"), Some("192.168.9".to_string()));
-        assert_eq!(ipv4_subnet_24("255.255.255.255:1"), Some("255.255.255".to_string()));
+        assert_eq!(
+            ipv4_subnet_24("255.255.255.255:1"),
+            Some("255.255.255".to_string())
+        );
         // Two hosts on the same /24 collapse to one subnet.
-        assert_eq!(ipv4_subnet_24("10.0.0.1:3333"), ipv4_subnet_24("10.0.0.250:9"));
+        assert_eq!(
+            ipv4_subnet_24("10.0.0.1:3333"),
+            ipv4_subnet_24("10.0.0.250:9")
+        );
         // Rejections → None (no fabricated subnet).
         assert_eq!(ipv4_subnet_24("node.example.com:8080"), None);
         assert_eq!(ipv4_subnet_24("::1"), None);
@@ -13487,15 +13501,39 @@ mod tests {
 
         // A new (challenger, target, capability, timestamp) record is stored.
         assert!(db
-            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob, None)
+            .insert_verification_proof(
+                "challengerA",
+                "targetB",
+                "archive",
+                true,
+                1_000,
+                &blob,
+                None
+            )
             .expect("insert"));
         // Re-delivery of the SAME key is a no-op — the dedup the *_challenges tables lacked.
         assert!(!db
-            .insert_verification_proof("challengerA", "targetB", "archive", true, 1_000, &blob, None)
+            .insert_verification_proof(
+                "challengerA",
+                "targetB",
+                "archive",
+                true,
+                1_000,
+                &blob,
+                None
+            )
             .expect("insert dup"));
         // A different timestamp is a distinct record.
         assert!(db
-            .insert_verification_proof("challengerA", "targetB", "archive", false, 2_000, &blob, None)
+            .insert_verification_proof(
+                "challengerA",
+                "targetB",
+                "archive",
+                false,
+                2_000,
+                &blob,
+                None
+            )
             .expect("insert 2"));
 
         // Windowed read serves only in-range records (the convergence responder relies on this).
@@ -13759,7 +13797,10 @@ mod ledger_reconciliation_tests {
             .import_unpaid_shares_batch(&exported, true)
             .expect("dry run");
         assert_eq!(would, 2);
-        assert!(b.get_top_unpaid_miners(i64::MAX, 100).expect("ledger").is_empty());
+        assert!(b
+            .get_top_unpaid_miners(i64::MAX, 100)
+            .expect("ledger")
+            .is_empty());
 
         // Real batched import inserts both shares and creates the miner.
         let (inserted, miners_created) = b

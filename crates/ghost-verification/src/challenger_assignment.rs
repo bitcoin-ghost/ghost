@@ -81,7 +81,12 @@ impl AssignmentCandidate {
 
 /// The per-candidate ranking score: `SHA256(seed ‖ round_height ‖ target ‖ candidate)`.
 /// Returned as the raw 32-byte digest so callers rank by byte order.
-fn score(seed: &[u8], round_height: u64, target_node_id: &str, candidate_node_id: &str) -> [u8; 32] {
+fn score(
+    seed: &[u8],
+    round_height: u64,
+    target_node_id: &str,
+    candidate_node_id: &str,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(seed);
     h.update(round_height.to_le_bytes());
@@ -273,8 +278,8 @@ mod tests {
     #[test]
     fn excludes_same_subnet_and_unknown() {
         let mut pool = vec![
-            cand("t", "10.0.0"),           // target
-            cand("same", "10.0.0"),        // same subnet as target → excluded
+            cand("t", "10.0.0"),                        // target
+            cand("same", "10.0.0"),                     // same subnet as target → excluded
             AssignmentCandidate::new("nosubnet", None), // unknown → excluded
             cand("ok1", "10.0.1"),
             cand("ok2", "10.0.2"),
@@ -285,7 +290,11 @@ mod tests {
         assert!(!drawn.contains(&"nosubnet".to_string()));
         assert!(drawn.contains(&"ok1".to_string()));
         assert!(drawn.contains(&"ok2".to_string()));
-        assert_eq!(drawn.len(), 2, "only the two distinct-subnet peers are eligible");
+        assert_eq!(
+            drawn.len(),
+            2,
+            "only the two distinct-subnet peers are eligible"
+        );
     }
 
     /// `is_assigned` agrees with membership of `assigned_challengers`.
@@ -308,7 +317,11 @@ mod tests {
         let pool = distinct_pool(4); // target + 3 others
         let target = &pool[0].node_id.clone();
         let drawn = assigned_challengers(SEED_A, 1, &pool, target, 100);
-        assert_eq!(drawn.len(), 3, "only the 3 non-target distinct subnets are eligible");
+        assert_eq!(
+            drawn.len(),
+            3,
+            "only the 3 non-target distinct subnets are eligible"
+        );
     }
 
     /// An attacker that stacks identities on a handful of subnets cannot occupy
@@ -319,7 +332,10 @@ mod tests {
         let mut pool = distinct_pool(10);
         for s in 0..3 {
             for i in 0..100 {
-                pool.push(cand(&format!("{:064x}", 100_000 + s * 1000 + i), &format!("172.16.{}", s)));
+                pool.push(cand(
+                    &format!("{:064x}", 100_000 + s * 1000 + i),
+                    &format!("172.16.{}", s),
+                ));
             }
         }
         // Average assigned attacker slots over many targets/rounds must never
@@ -330,11 +346,18 @@ mod tests {
                 let drawn = assigned_challengers(SEED_A, round, &pool, &t.node_id, 8);
                 let atk = drawn
                     .iter()
-                    .filter(|id| u128::from_str_radix(id, 16).map(|n| n >= 100_000).unwrap_or(false))
+                    .filter(|id| {
+                        u128::from_str_radix(id, 16)
+                            .map(|n| n >= 100_000)
+                            .unwrap_or(false)
+                    })
                     .count();
                 worst = worst.max(atk);
             }
         }
-        assert!(worst <= 3, "attacker occupied {worst} slots but holds only 3 subnets");
+        assert!(
+            worst <= 3,
+            "attacker occupied {worst} slots but holds only 3 subnets"
+        );
     }
 }

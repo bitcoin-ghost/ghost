@@ -827,7 +827,9 @@ impl QualifiedCapabilityProvider {
                 .voterset_assignment_pool()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(id, subnet)| crate::challenger_assignment::AssignmentCandidate::new(id, subnet))
+                .map(|(id, subnet)| {
+                    crate::challenger_assignment::AssignmentCandidate::new(id, subnet)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -1068,7 +1070,9 @@ impl QualifiedCapabilityProvider {
             };
             let assigned = assigned_by_round.entry(rh).or_insert_with(|| {
                 match rh.checked_sub(SEED_LAG).and_then(|h| oracle.hash_at(h)) {
-                    Some(seed) => assigned_challengers(&seed, rh, pool, node_id_hex, ROUND_FANOUT_K),
+                    Some(seed) => {
+                        assigned_challengers(&seed, rh, pool, node_id_hex, ROUND_FANOUT_K)
+                    }
                     None => Vec::new(), // seed unavailable → nobody counts for this round
                 }
             });
@@ -1663,8 +1667,16 @@ mod tests {
             )
             .unwrap();
         }
-        db.insert_verification_proof(&hex_id(0x40), &target, "stratum", false, cutoff - 100, b"p", None)
-            .unwrap();
+        db.insert_verification_proof(
+            &hex_id(0x40),
+            &target,
+            "stratum",
+            false,
+            cutoff - 100,
+            b"p",
+            None,
+        )
+        .unwrap();
 
         let provider = QualifiedCapabilityProvider::new(db);
         assert_eq!(
@@ -1792,8 +1804,16 @@ mod tests {
         }
         // One voter-set griefer on its own subnet signs a FAIL.
         register_voter(&db, &hex_id(0x25), "10.5.0.1:3333");
-        db.insert_verification_proof(&hex_id(0x25), &target, "stratum", false, cutoff - 100, b"p", None)
-            .unwrap();
+        db.insert_verification_proof(
+            &hex_id(0x25),
+            &target,
+            "stratum",
+            false,
+            cutoff - 100,
+            b"p",
+            None,
+        )
+        .unwrap();
 
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
         assert_eq!(
