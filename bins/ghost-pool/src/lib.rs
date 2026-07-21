@@ -42,6 +42,9 @@
 /// Periodic operator-alert monitors (behind-tip / update-available).
 pub mod alert_monitors;
 
+/// A-2b: cached L1 block-hash oracle seeding the consensus challenger draw.
+pub mod block_hash_oracle;
+
 /// Coinbase transaction verification against payout commitments.
 pub mod coinbase_verifier;
 

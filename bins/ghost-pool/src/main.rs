@@ -2370,6 +2370,14 @@ async fn main() -> Result<()> {
     rpc.set_network(config.bitcoin.network);
     let rpc = Arc::new(rpc);
 
+    // A-2b: start the cached L1 block-hash oracle that seeds the consensus
+    // challenger draw. Its background task keeps a trailing window warm so the
+    // (synchronous) qualification path can look up round seeds without blocking.
+    // Attached to every qualification provider below; inert until the assignment
+    // gate is armed.
+    let block_hash_oracle =
+        ghost_pool::block_hash_oracle::CachedBlockHashOracle::spawn(Arc::clone(&rpc));
+
     // Test RPC connection
     let blockchain_info = match rpc.get_blockchain_info().await {
         Ok(info) => {
@@ -3238,8 +3246,10 @@ async fn main() -> Result<()> {
     // P2P4-M2: Create capability verifier to replace claimed capabilities with VERIFIED ones
     // This ensures health pings register nodes with their actual verified capabilities,
     // not just what they claim. The QualifiedCapabilityProvider checks challenge results.
-    let qualification_provider_for_health =
-        Arc::new(QualifiedCapabilityProvider::new(Arc::clone(&db)));
+    let qualification_provider_for_health = Arc::new(
+        QualifiedCapabilityProvider::new(Arc::clone(&db))
+            .with_block_hash_oracle(Arc::new(block_hash_oracle.clone())),
+    );
     let qp_for_verifier = Arc::clone(&qualification_provider_for_health);
     let capability_verifier: ghost_consensus::health_handler::CapabilityVerifierCallback =
         Arc::new(move |node_id| qp_for_verifier.get_qualified(node_id));
@@ -3347,15 +3357,14 @@ async fn main() -> Result<()> {
     // subsidy via calculate_block_subsidy(height, None) so every node matches.
     let compute_ledger_root_fn: ghost_pool::payout_checkpoint::ComputeRootFn = {
         let db_c = Arc::clone(&db);
+        let oracle_c = block_hash_oracle.clone();
         Arc::new(move |cutoff_ts, height| {
             let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
             let miner_payouts =
                 ghost_pool::payout::select_ledger_miner_work(&db_c, cutoff_ts, height, subsidy)
                     .ok()?;
-            // A-2b TODO: attach the RPC block-hash oracle here (and at the PayoutHandler
-            // provider + the diag closure) so the assignment filter is live above the
-            // gate; until then `new()` leaves it inert and A-2 scoping stands.
-            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
+            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
+                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
             // A-2/A-2b: the checkpoint root must scope challengers to the voter set +
             // subnets AND to the consensus assignment at/above the gates, identically to
             // the coinbase node split, or the root and the paid split would disagree.
@@ -3384,6 +3393,7 @@ async fn main() -> Result<()> {
     // isolated to the miner half or the node half and compared across nodes.
     let compute_ledger_root_diag_fn: ghost_pool::payout_checkpoint::ComputeRootDiagFn = {
         let db_c = Arc::clone(&db);
+        let oracle_c = block_hash_oracle.clone();
         Arc::new(move |cutoff_ts, height| {
             let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
             let miners =
@@ -3392,7 +3402,8 @@ async fn main() -> Result<()> {
                     Ok(m) => m,
                     Err(e) => return format!("miner recompute failed: {e}"),
                 };
-            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c));
+            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
+                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
             let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
             let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
             let nodes = qp.get_all_qualified_nodes_at_cutoff_from_db(
