@@ -6628,7 +6628,7 @@ async fn main() -> Result<()> {
         // 80-byte header the SRI layer validated against, so any peer can independently
         // recompute sha256d(header) == share_hash instead of trusting our numeric claim.
         // Below the gate this stays None → signing_bytes byte-identical to today.
-        let header = if rm_for_shares.current_height() >= ghost_pool::SHARE_POW_VERIFY_HEIGHT {
+        let header = if rm_for_shares.current_height() >= ghost_pool::share_pow_verify_height() {
             match share.header.as_ref().and_then(|h| hex::decode(h).ok()) {
                 Some(bytes) if bytes.len() == 80 => Some(bytes),
                 _ => {

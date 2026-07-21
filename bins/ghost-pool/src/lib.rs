@@ -217,6 +217,7 @@ mod gates {
     pub(super) static FEE_TO_NODE_POOL: OnceLock<u64> = OnceLock::new();
     pub(super) static VOTER_SET_QUALIFICATION: OnceLock<u64> = OnceLock::new();
     pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
+    pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -251,21 +252,29 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         CHALLENGER_ASSIGNMENT_HEIGHT,
     );
+    let share_pow_verify = gates::from_env(
+        "GHOST_SHARE_POW_VERIFY_HEIGHT",
+        network,
+        SHARE_POW_VERIFY_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::FEE_TO_NODE_POOL.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
     let _ = gates::CHALLENGER_ASSIGNMENT.set(challenger_assignment);
+    let _ = gates::SHARE_POW_VERIFY.set(share_pow_verify);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != FEE_TO_NODE_POOL_HEIGHT
         || voter_set != VOTER_SET_QUALIFICATION_HEIGHT
         || challenger_assignment != CHALLENGER_ASSIGNMENT_HEIGHT
+        || share_pow_verify != SHARE_POW_VERIFY_HEIGHT
     {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
             fee_to_node_pool_height = fee,
             voter_set_qualification_height = voter_set,
             challenger_assignment_height = challenger_assignment,
+            share_pow_verify_height = share_pow_verify,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
         );
@@ -293,6 +302,13 @@ pub fn voter_set_qualification_height() -> u64 {
 /// was consensus-ASSIGNED to challenge the target that round (Surface A-2b).
 pub fn challenger_assignment_height() -> u64 {
     *gates::CHALLENGER_ASSIGNMENT.get_or_init(|| CHALLENGER_ASSIGNMENT_HEIGHT)
+}
+
+/// The height at/above which a share's 80-byte PoW header is required and every node
+/// re-verifies `sha256d(header) == share_hash` instead of trusting the numeric claim
+/// (Surface B). Accessor form so the gate is env-overridable off-mainnet like the rest.
+pub fn share_pow_verify_height() -> u64 {
+    *gates::SHARE_POW_VERIFY.get_or_init(|| SHARE_POW_VERIFY_HEIGHT)
 }
 
 /// GhostGlyph P2P handler for visual identity registration.

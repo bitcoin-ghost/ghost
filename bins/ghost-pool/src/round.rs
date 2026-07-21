@@ -611,7 +611,7 @@ impl RoundManager {
         // runs on the GOSSIP + BACKFILL ingest paths (both funnel here), which is exactly where an
         // injected share would enter the converged ledger; a node's own SRI-validated shares are
         // its own trust anchor. Below the gate, the legacy numeric check stands (single-operator).
-        if self.current_height() >= crate::SHARE_POW_VERIFY_HEIGHT {
+        if self.current_height() >= crate::share_pow_verify_height() {
             let header80 = match proof.header.as_deref() {
                 Some(h) if h.len() == 80 => {
                     let mut a = [0u8; 80];
@@ -1769,7 +1769,7 @@ mod tests {
         let manager = RoundManager::new(our, RoundConfig::default());
         // The gate is u64::MAX (dormant); put the round height AT it so the gated path runs.
         manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
-        assert!(manager.current_height() >= crate::SHARE_POW_VERIFY_HEIGHT);
+        assert!(manager.current_height() >= crate::share_pow_verify_height());
 
         let peer = [9u8; 32]; // received_by != our_node_id → skips the local-template check
         let base = ShareProof {
