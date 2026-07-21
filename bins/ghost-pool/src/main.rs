@@ -2507,10 +2507,10 @@ async fn main() -> Result<()> {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(std::fs::File::open(path)?);
             let mut chunk: Vec<Rec> = Vec::with_capacity(CHUNK);
-            let mut flush = |chunk: &mut Vec<Rec>,
-                             offered: &mut usize,
-                             inserted: &mut usize,
-                             miners: &mut usize|
+            let flush = |chunk: &mut Vec<Rec>,
+                         offered: &mut usize,
+                         inserted: &mut usize,
+                         miners: &mut usize|
              -> anyhow::Result<()> {
                 if chunk.is_empty() {
                     return Ok(());
@@ -3459,6 +3459,9 @@ async fn main() -> Result<()> {
                     Err(_) => continue,
                 };
                 mgr.maybe_propose(height, cutoff_ts).await;
+                // On-demand backfill: if we lag the anchor (a missed proposal left a
+                // hole the once-only broadcast can't recover), pull it from peers.
+                mgr.maybe_request_backfill(height);
             }
         });
     }

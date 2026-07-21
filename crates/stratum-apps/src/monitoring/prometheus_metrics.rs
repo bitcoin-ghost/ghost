@@ -199,7 +199,7 @@ mod tests {
         m.sv2_uptime_seconds.set(42.0);
 
         let families = m.registry.gather();
-        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
         assert!(names.contains(&"sv2_uptime_seconds"));
     }
 
@@ -248,7 +248,7 @@ mod tests {
         let families = m.registry.gather();
         // Only uptime should be registered (with default value 0)
         assert_eq!(families.len(), 1);
-        assert_eq!(families[0].get_name(), "sv2_uptime_seconds");
+        assert_eq!(families[0].name(), "sv2_uptime_seconds");
     }
 
     #[test]

@@ -1791,6 +1791,7 @@ impl MeshNetwork {
             | MessageType::PayoutProposal
             | MessageType::PayoutLedgerCheckpoint
             | MessageType::PayoutLedgerCheckpointVote
+            | MessageType::PayoutLedgerCheckpointSync
             | MessageType::ElderUpdate
             | MessageType::ZkBlockProposal
             | MessageType::ZkVote
@@ -2120,6 +2121,7 @@ impl MeshNetwork {
             | MessageType::L2CheckpointVote
             | MessageType::PayoutLedgerCheckpoint
             | MessageType::PayoutLedgerCheckpointVote
+            | MessageType::PayoutLedgerCheckpointSync
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             // GhostGlyph messages use consensus voting port
@@ -2387,8 +2389,11 @@ impl MeshNetwork {
                             }
                         }
                         Err(e) => {
+                            // This is an INBOUND connection, owned solely by this loop and
+                            // NOT in the pool — so do not touch the pool here: the pool holds
+                            // only our OUTBOUND connection to this peer (same key), which is a
+                            // separate, healthy socket. Just drop `conn` by ending the loop.
                             debug!(peer = %addr, error = %e, "Noise connection error");
-                            pool.remove_connection(&conn.peer_key);
                             break;
                         }
                     }
@@ -3171,6 +3176,7 @@ impl MeshNetwork {
             | MessageType::L2CheckpointVote
             | MessageType::PayoutLedgerCheckpoint
             | MessageType::PayoutLedgerCheckpointVote
+            | MessageType::PayoutLedgerCheckpointSync
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {
@@ -4050,6 +4056,7 @@ mod tests {
                 | MessageType::PayoutProposal
                 | MessageType::PayoutLedgerCheckpoint
                 | MessageType::PayoutLedgerCheckpointVote
+                | MessageType::PayoutLedgerCheckpointSync
                 | MessageType::ElderUpdate
                 | MessageType::ZkBlockProposal
                 | MessageType::ZkVote

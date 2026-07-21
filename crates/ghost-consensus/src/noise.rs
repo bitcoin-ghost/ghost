@@ -412,7 +412,7 @@ impl NoiseSession {
         let mut peer_key = [0u8; 32];
         peer_key.copy_from_slice(peer_public_key);
 
-        info!(
+        debug!(
             peer = %hex::encode(&peer_key[..8]),
             "Noise handshake complete"
         );

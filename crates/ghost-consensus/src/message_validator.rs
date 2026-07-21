@@ -48,6 +48,9 @@ pub const MAX_VOTE_SIZE: usize = 1_000;
 pub const MAX_HEALTH_PING_SIZE: usize = 2_000;
 pub const MAX_DISCOVERY_SIZE: usize = 50_000;
 pub const MAX_PAYOUT_PROPOSAL_SIZE: usize = 500_000;
+/// Payout-checkpoint sync response: a small page of checkpoints (`MAX_SYNC_CHECKPOINTS`),
+/// bounded by the hard envelope cap so a peer can't ship an oversized batch.
+pub const MAX_PAYOUT_SYNC_SIZE: usize = MAX_ENVELOPE_SIZE;
 pub const MAX_ELDER_UPDATE_SIZE: usize = 10_000;
 /// ZK block proposal can include transactions + proof (up to 2MB)
 pub const MAX_ZK_PROPOSAL_SIZE: usize = 2_000_000;
@@ -394,6 +397,7 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         // The vote is just a hash + signature.
         MessageType::PayoutLedgerCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::PayoutLedgerCheckpointVote => MAX_VOTE_SIZE,
+        MessageType::PayoutLedgerCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
         MessageType::L2TreeSync => MAX_L2_TREE_SYNC_SIZE,
         MessageType::L2ShieldBroadcast => 256, // ShieldCommitment: 32-byte commitment + u64 index + u64 height
         MessageType::GhostGlyphClaim => MAX_GLYPH_CLAIM_SIZE,

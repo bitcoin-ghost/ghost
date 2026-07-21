@@ -2187,7 +2187,7 @@ async fn bonds_refund_coordinator_aborted_when_witness_merge_fails() {
     use wraith_protocol::{BondResolution, RefundReason};
 
     let (router, state, ledger, _broadcaster) = deterministic_router(1_000_000);
-    let (session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
+    let (_session_id, _rt) = make_assembled_session(router.clone(), &state, &ledger).await;
     assert_eq!(ledger.len(), 5);
 
     // 4 valid submissions, 1 with a stored witness that's malformed

@@ -34,13 +34,23 @@ use ghost_common::error::GhostResult;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::types::NodeId;
 use ghost_consensus::{
-    MessageEnvelope, MessageHandler, MessageType, PayoutLedgerCheckpointMessage,
+    MessageEnvelope, MessageHandler, MessageType, PayoutCheckpointSyncEntry,
+    PayoutCheckpointSyncRequest, PayoutCheckpointSyncResponse, PayoutLedgerCheckpointMessage,
     PayoutLedgerCheckpointVoteMessage,
 };
 use ghost_storage::{Database, PayoutLedgerCheckpointRecord};
 
 /// BFT approval threshold (percent of the active/elder set).
 const BFT_THRESHOLD_PERCENT: u64 = 67;
+
+/// Backfill cooldown (both client re-request and per-peer serve). Mirrors the L2
+/// tree-sync 60s window — bounds request/response churn without stalling recovery.
+const SYNC_COOLDOWN_MS: u64 = 60_000;
+
+/// Max checkpoints served per sync response; the requester paginates if capped.
+/// Small: holes are typically a single height, and each checkpoint carries the
+/// adopted payout lists, so a page must stay well under the 1 MB envelope cap.
+const MAX_SYNC_CHECKPOINTS: u64 = 8;
 
 /// Enqueues an outbound broadcast `(msg_type, json_payload)`. Injected so the
 /// manager doesn't depend on the mesh directly: `main.rs` wires a closure that
@@ -153,6 +163,10 @@ pub struct PayoutCheckpointManager {
     diag: Option<ComputeRootDiagFn>,
     /// height -> in-flight vote tallies.
     pending: RwLock<HashMap<u64, Pending>>,
+    /// Client-side backfill cooldown: last time we broadcast a sync request (ms; 0 = never).
+    last_sync_request: RwLock<u64>,
+    /// Server-side per-peer serve cooldown: requesting node -> last time we served it (ms).
+    sync_serves: RwLock<HashMap<NodeId, u64>>,
 }
 
 fn now_ms() -> u64 {
@@ -176,6 +190,8 @@ impl PayoutCheckpointManager {
             compute_root,
             diag: None,
             pending: RwLock::new(HashMap::new()),
+            last_sync_request: RwLock::new(0),
+            sync_serves: RwLock::new(HashMap::new()),
         }
     }
 
@@ -485,6 +501,214 @@ impl PayoutCheckpointManager {
             Err(e) => error!(height, error = %e, "payout checkpoint: persist failed"),
         }
     }
+
+    /// Backfill trigger, called on the propose cadence with `target_height` (= tip − LAG).
+    /// If our latest finalised checkpoint lags the anchor, broadcast a bounded sync
+    /// request. This recovers holes a *missed* proposal left — including the parked-tip
+    /// case (proposals are broadcast once and never rebroadcast, so a dropped packet is
+    /// otherwise unrecoverable until the tip advances). Rate-limited to one per cooldown.
+    ///
+    /// Residual: a hole that opens and is jumped past within one cooldown (tip advancing
+    /// <60s after a miss) is not chased — rare, and coinbase-relevant for only one
+    /// already-past block. The dominant failure (node behind a parked anchor) is covered.
+    pub fn maybe_request_backfill(&self, target_height: u64) {
+        let latest = self
+            .db
+            .get_latest_payout_ledger_checkpoint()
+            .ok()
+            .flatten()
+            .map(|r| r.height)
+            .unwrap_or(0);
+        if latest >= target_height {
+            return; // our max finalised height is at/above the anchor — nothing to pull
+        }
+        let now = now_ms();
+        {
+            let mut last = self.last_sync_request.write();
+            if now.saturating_sub(*last) < SYNC_COOLDOWN_MS {
+                return; // client cooldown
+            }
+            *last = now;
+        }
+        // Only ever pull a recent window near the anchor; never trawl ancient history.
+        let from_height = (latest + 1).max(target_height.saturating_sub(MAX_SYNC_CHECKPOINTS - 1));
+        let req = PayoutCheckpointSyncRequest {
+            requesting_node: self.identity.node_id(),
+            from_height,
+            timestamp: now,
+        };
+        info!(
+            from_height,
+            latest,
+            target = target_height,
+            "payout checkpoint: requesting backfill"
+        );
+        self.broadcast(MessageType::PayoutLedgerCheckpointSync, &req);
+    }
+
+    /// Responder: serve a bounded, ascending page of finalised checkpoints from the
+    /// requested height. Per-peer cooldown bounds response churn; the requester paginates.
+    async fn on_sync_request(&self, env: &MessageEnvelope) -> GhostResult<()> {
+        let req: PayoutCheckpointSyncRequest = match serde_json::from_slice(&env.payload) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        // The Noise-authenticated sender must be the declared requester.
+        if env.sender != req.requesting_node {
+            return Ok(());
+        }
+        let now = now_ms();
+        {
+            let mut serves = self.sync_serves.write();
+            if let Some(&last) = serves.get(&req.requesting_node) {
+                if now.saturating_sub(last) < SYNC_COOLDOWN_MS {
+                    return Ok(()); // per-peer serve cooldown
+                }
+            }
+            serves.insert(req.requesting_node, now);
+        }
+        let records = match self
+            .db
+            .get_payout_ledger_checkpoints_from_height(req.from_height, MAX_SYNC_CHECKPOINTS)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "payout checkpoint: sync query failed");
+                return Ok(());
+            }
+        };
+        if records.is_empty() {
+            return Ok(());
+        }
+        let has_more = records.len() as u64 >= MAX_SYNC_CHECKPOINTS;
+        let mut checkpoints = Vec::with_capacity(records.len());
+        for r in records {
+            // proposer_id is stored as hex; parse back to NodeId for the entry.
+            let Some(proposer) = decode_node_id(&r.proposer_id) else {
+                continue;
+            };
+            checkpoints.push(PayoutCheckpointSyncEntry {
+                height: r.height,
+                cutoff_ts: r.cutoff_ts,
+                ledger_root: r.ledger_root,
+                miner_payouts: r.miner_payouts,
+                node_shares: r.node_shares,
+                active_node_count: r.active_node_count,
+                proposer,
+            });
+        }
+        if checkpoints.is_empty() {
+            return Ok(());
+        }
+        let resp = PayoutCheckpointSyncResponse {
+            responding_node: self.identity.node_id(),
+            checkpoints,
+            has_more,
+            timestamp: now,
+        };
+        debug!(
+            count = resp.checkpoints.len(),
+            to = %hex::encode(&req.requesting_node[..4]),
+            "payout checkpoint: serving backfill"
+        );
+        self.broadcast(MessageType::PayoutLedgerCheckpointSync, &resp);
+        Ok(())
+    }
+
+    /// Requester: trustlessly adopt each synced checkpoint (see `apply_synced_checkpoint`).
+    async fn on_sync_response(&self, env: &MessageEnvelope) -> GhostResult<()> {
+        let resp: PayoutCheckpointSyncResponse = match serde_json::from_slice(&env.payload) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        if env.sender != resp.responding_node {
+            return Ok(());
+        }
+        let mut applied = 0usize;
+        for entry in &resp.checkpoints {
+            if self.apply_synced_checkpoint(entry) {
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            info!(
+                applied,
+                from = %hex::encode(&resp.responding_node[..4]),
+                "payout checkpoint: backfilled"
+            );
+        }
+        Ok(())
+    }
+
+    /// Trustlessly adopt one synced checkpoint: verify authorship + root integrity,
+    /// INDEPENDENTLY recompute our own canonical payout, require it agrees within
+    /// tolerance, then persist. Never trusts the serving peer (strictly stronger than
+    /// L2's signature-only sync). Returns true iff newly persisted.
+    fn apply_synced_checkpoint(&self, entry: &PayoutCheckpointSyncEntry) -> bool {
+        if self.already_finalized(entry.height) {
+            return false;
+        }
+        // Authorship: must be the deterministic proposer for this height.
+        if self.proposer_for(entry.height) != Some(entry.proposer) {
+            return false;
+        }
+        // Integrity: the root must be the hash of the lists carried.
+        let claimed_root = crate::payout::compute_ledger_root(
+            &entry.miner_payouts,
+            &entry.node_shares,
+            entry.cutoff_ts,
+            entry.height,
+        );
+        if claimed_root != entry.ledger_root {
+            return false;
+        }
+        // Trustless: recompute OUR canonical payout and require tolerance agreement.
+        let Some(local) = (self.compute_root)(entry.cutoff_ts, entry.height) else {
+            return false; // cannot validate yet — skip; a later cadence retries
+        };
+        if !payouts_agree(&local, &entry.miner_payouts, &entry.node_shares) {
+            warn!(
+                height = entry.height,
+                "payout checkpoint: synced checkpoint outside tolerance — rejected"
+            );
+            return false;
+        }
+        let record = PayoutLedgerCheckpointRecord {
+            height: entry.height,
+            cutoff_ts: entry.cutoff_ts,
+            ledger_root: entry.ledger_root,
+            proposer_id: hex::encode(entry.proposer),
+            active_node_count: entry.active_node_count,
+            miner_payouts: entry.miner_payouts.clone(),
+            node_shares: entry.node_shares.clone(),
+        };
+        match self.db.upsert_payout_ledger_checkpoint(&record) {
+            Ok(()) => {
+                // Mark pending finalised so we won't re-propose/re-vote this height.
+                self.pending
+                    .write()
+                    .entry(entry.height)
+                    .or_insert_with(Pending::new)
+                    .finalized = true;
+                true
+            }
+            Err(e) => {
+                error!(height = entry.height, error = %e, "payout checkpoint: sync persist failed");
+                false
+            }
+        }
+    }
+}
+
+/// Decode a hex node-id string back to a `NodeId`.
+fn decode_node_id(s: &str) -> Option<NodeId> {
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&bytes);
+    Some(id)
 }
 
 #[async_trait]
@@ -493,6 +717,16 @@ impl MessageHandler for PayoutCheckpointManager {
         match envelope.msg_type {
             MessageType::PayoutLedgerCheckpoint => self.on_proposal(&envelope).await,
             MessageType::PayoutLedgerCheckpointVote => self.on_vote(&envelope).await,
+            MessageType::PayoutLedgerCheckpointSync => {
+                // Multiplex request/response by trial-deserialise (as L2 tree-sync does):
+                // only the request carries `from_height`, so it parses iff it's a request.
+                if serde_json::from_slice::<PayoutCheckpointSyncRequest>(&envelope.payload).is_ok()
+                {
+                    self.on_sync_request(&envelope).await
+                } else {
+                    self.on_sync_response(&envelope).await
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -764,5 +998,117 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    /// A finalised checkpoint record for `H`, authored by the deterministic proposer.
+    fn finalised_record(nodes: &[Node], p: &CanonicalPayout) -> PayoutLedgerCheckpointRecord {
+        PayoutLedgerCheckpointRecord {
+            height: H,
+            cutoff_ts: CUTOFF,
+            ledger_root: p.root,
+            proposer_id: hex::encode(nodes[(H as usize) % nodes.len()].id),
+            active_node_count: nodes.len() as u32,
+            miner_payouts: p.miner_payouts.clone(),
+            node_shares: p.node_shares.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_recovers_a_missed_checkpoint() {
+        // Nodes 0-2 finalised H; node 3 MISSED the once-only proposal (a hole). Its
+        // cadence backfill request pulls H from a peer and it adopts it TRUSTLESSLY.
+        let payout = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
+        let nodes = build(4, &vec![Some(payout.clone()); 4]);
+        let rec = finalised_record(&nodes, &payout);
+        for n in &nodes[..3] {
+            n.db.upsert_payout_ledger_checkpoint(&rec).unwrap();
+        }
+        assert!(nodes[3]
+            .db
+            .get_latest_payout_ledger_checkpoint()
+            .unwrap()
+            .is_none());
+
+        nodes[3].mgr.maybe_request_backfill(H);
+        gossip_until_quiet(&nodes).await;
+
+        let got = nodes[3]
+            .db
+            .get_latest_payout_ledger_checkpoint()
+            .unwrap()
+            .expect("node 3 backfilled the hole");
+        assert_eq!(got.height, H);
+        assert_eq!(got.ledger_root, payout.root);
+        assert_eq!(
+            got.miner_payouts, payout.miner_payouts,
+            "adopted exact lists"
+        );
+    }
+
+    #[tokio::test]
+    async fn synced_checkpoint_outside_tolerance_is_rejected() {
+        // A peer serves an integrity-valid, correctly-authored checkpoint whose payout
+        // is 2x off. Trustless apply recomputes locally and rejects it — no blind trust.
+        let good = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
+        let nodes = build(4, &vec![Some(good); 4]);
+        let gross_miners = vec![("bc1qaaa".to_string(), 2_000_000_000_000_000u128)];
+        let gross_nodes = node_set();
+        let gross_root = crate::payout::compute_ledger_root(&gross_miners, &gross_nodes, CUTOFF, H);
+        let entry = PayoutCheckpointSyncEntry {
+            height: H,
+            cutoff_ts: CUTOFF,
+            ledger_root: gross_root,
+            miner_payouts: gross_miners,
+            node_shares: gross_nodes,
+            active_node_count: 4,
+            proposer: nodes[(H as usize) % 4].id,
+        };
+        assert!(
+            !nodes[3].mgr.apply_synced_checkpoint(&entry),
+            "outside tolerance → rejected"
+        );
+        assert!(nodes[3]
+            .db
+            .get_latest_payout_ledger_checkpoint()
+            .unwrap()
+            .is_none());
+
+        // Correct lists but WRONG proposer (not the deterministic proposer for H) → rejected.
+        let mut bad_author = entry.clone();
+        bad_author.miner_payouts = vec![("bc1qaaa".to_string(), 1_000_000_000_000_000)];
+        bad_author.ledger_root = crate::payout::compute_ledger_root(
+            &bad_author.miner_payouts,
+            &bad_author.node_shares,
+            CUTOFF,
+            H,
+        );
+        bad_author.proposer = nodes[((H as usize) + 1) % 4].id;
+        assert!(
+            !nodes[3].mgr.apply_synced_checkpoint(&bad_author),
+            "wrong proposer → rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_request_fires_only_when_behind() {
+        let payout = cp(&[("bc1qaaa", 1_000_000_000_000_000)]);
+        let nodes = build(4, &vec![Some(payout.clone()); 4]);
+        let n = &nodes[3];
+
+        // Behind the anchor (no checkpoints yet) → a sync request is broadcast.
+        n.mgr.maybe_request_backfill(H);
+        assert!(
+            drain(n)
+                .iter()
+                .any(|(ty, _)| *ty == MessageType::PayoutLedgerCheckpointSync),
+            "behind → backfill request"
+        );
+
+        // Caught up (finalised H) → request for anchor H is a no-op (latest >= target).
+        n.db.upsert_payout_ledger_checkpoint(&finalised_record(&nodes, &payout))
+            .unwrap();
+        *n.mgr.last_sync_request.write() = 0; // clear cooldown so silence is the real reason
+        n.mgr.maybe_request_backfill(H);
+        assert!(drain(n).is_empty(), "caught up → no request");
     }
 }

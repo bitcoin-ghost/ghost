@@ -66,6 +66,8 @@ pub mod topics {
     pub const PAYOUT_LEDGER_CHECKPOINT: &[u8] = b"plchk";
     /// Payout-ledger checkpoint vote
     pub const PAYOUT_LEDGER_VOTE: &[u8] = b"plvote";
+    /// Payout-ledger checkpoint sync (on-demand backfill of missed checkpoints)
+    pub const PAYOUT_LEDGER_SYNC: &[u8] = b"plsync";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
@@ -249,6 +251,10 @@ pub enum MessageType {
     PayoutLedgerCheckpoint,
     /// Payout-ledger checkpoint vote (validator → all)
     PayoutLedgerCheckpointVote,
+    /// Payout-ledger checkpoint sync request/response (node ↔ peer): on-demand
+    /// backfill of finalised checkpoints a node missed (proposals are broadcast
+    /// once and never rebroadcast). Multiplexes request + response by trial-deser.
+    PayoutLedgerCheckpointSync,
 }
 
 impl MessageType {
@@ -282,6 +288,7 @@ impl MessageType {
             Self::L2CheckpointVote => topics::L2_VOTE,
             Self::PayoutLedgerCheckpoint => topics::PAYOUT_LEDGER_CHECKPOINT,
             Self::PayoutLedgerCheckpointVote => topics::PAYOUT_LEDGER_VOTE,
+            Self::PayoutLedgerCheckpointSync => topics::PAYOUT_LEDGER_SYNC,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
@@ -319,6 +326,7 @@ impl MessageType {
             Self::L2CheckpointVote => "l2vote",
             Self::PayoutLedgerCheckpoint => "plchk",
             Self::PayoutLedgerCheckpointVote => "plvote",
+            Self::PayoutLedgerCheckpointSync => "plsync",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
@@ -1596,6 +1604,60 @@ impl PayoutLedgerCheckpointVoteMessage {
         hasher.update([self.approve as u8]);
         hasher.finalize().into()
     }
+}
+
+/// One finalised payout checkpoint carried in a sync response. Deliberately
+/// signature-free: the requester adopts it only after independently recomputing
+/// the canonical payout and tolerance-checking these lists (trustless apply), so
+/// no trust is placed in the serving peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutCheckpointSyncEntry {
+    /// Lagging anchor height.
+    pub height: u64,
+    /// Ledger cutoff = anchor block's timestamp.
+    pub cutoff_ts: i64,
+    /// Canonical payout-ledger root as of `cutoff_ts` (= `H(miner_payouts ‖ node_shares)`).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub ledger_root: [u8; 32],
+    /// Canonical miner payout set `(payout_address, quantised work)`.
+    #[serde(default)]
+    pub miner_payouts: Vec<(String, u128)>,
+    /// Canonical qualified-node set `(node_id, 5-4-3-2-1 shares)`.
+    #[serde(default)]
+    pub node_shares: Vec<(NodeId, i32)>,
+    /// Active-node count at this checkpoint.
+    pub active_node_count: u32,
+    /// Deterministic proposer for `height` (checked against `proposer_for(height)` on apply).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub proposer: NodeId,
+}
+
+/// Payout-ledger checkpoint sync REQUEST (node → peers): "send me finalised
+/// checkpoints from `from_height` up." Backfills holes left by missed proposals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutCheckpointSyncRequest {
+    /// The node asking to be backfilled.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub requesting_node: NodeId,
+    /// Lowest height the requester lacks (its `latest_finalised + 1`).
+    pub from_height: u64,
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
+}
+
+/// Payout-ledger checkpoint sync RESPONSE (peer → requester): a bounded, ascending
+/// page of finalised checkpoints. `has_more` signals the requester to paginate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutCheckpointSyncResponse {
+    /// The peer serving the backfill.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub responding_node: NodeId,
+    /// Finalised checkpoints, ascending from the requested height (bounded page).
+    pub checkpoints: Vec<PayoutCheckpointSyncEntry>,
+    /// True if the responder hit its page cap — the requester should re-request.
+    pub has_more: bool,
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
 }
 
 /// L2: Tree sync request/response (node → peer)

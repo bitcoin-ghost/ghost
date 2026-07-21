@@ -6079,7 +6079,7 @@ async fn simulate_unshield(State(state): State<Arc<AppState>>) -> Json<serde_jso
 /// Test the full L1 withdrawal pipeline: shield → proof → submit_unshield → relay.
 /// POST /api/v1/admin/trigger-settlement — Force-trigger epoch settlement now
 async fn admin_trigger_settlement(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    use ghost_common::constants::{SettlementClass, L2_EPOCH_BLOCKS};
+    use ghost_common::constants::L2_EPOCH_BLOCKS;
 
     // Use the current L2 epoch (or next one) to trigger settlement for all due classes
     let current_epoch = state

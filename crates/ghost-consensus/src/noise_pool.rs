@@ -64,7 +64,9 @@ pub const MAX_CONNECTIONS: usize = 200;
 
 /// Pool of established Noise connections to peers
 pub struct NoiseConnectionPool {
-    /// Active connections indexed by peer's Noise public key
+    /// OUTBOUND (dialed) connections — the send cache, indexed by peer's Noise public
+    /// key. Populated only by [`Self::get_connection`]/[`Self::establish_connection`];
+    /// inbound accepts are deliberately NOT pooled (see [`Self::accept_connection`]).
     connections: RwLock<HashMap<[u8; 32], Arc<NoiseConnection>>>,
     /// Noise manager for creating sessions (handles keypair internally)
     manager: NoiseManager,
@@ -300,7 +302,7 @@ impl NoiseConnectionPool {
         // Store connection
         self.store_connection(peer_key, Arc::clone(&conn));
 
-        info!(
+        debug!(
             peer = %peer_addr,
             peer_key = %hex::encode(&peer_key[..8]),
             "Noise connection established (initiator)"
@@ -311,7 +313,17 @@ impl NoiseConnectionPool {
 
     /// Accept an incoming connection (responder role)
     ///
-    /// Called when a peer connects to our Noise listener.
+    /// Called when a peer connects to our Noise listener. The returned connection is
+    /// **NOT** placed in the pool: the caller (the mesh accept-listener) owns it via a
+    /// dedicated per-connection receive loop, which keeps it alive for its lifetime.
+    ///
+    /// This is deliberate and load-bearing. The pool is an OUTBOUND send-cache keyed by
+    /// peer noise key, looked up by dial address in [`Self::get_connection`]. An inbound
+    /// connection has the peer's *ephemeral* source port (never the dialable noise port),
+    /// so it can never be reused for sending — its only effect if pooled would be to
+    /// evict the healthy outbound connection to the same peer (shared key), dropping that
+    /// socket and forcing an endless re-dial/re-handshake churn. Keeping inbound out of
+    /// the pool makes each direction an independent, stable connection.
     pub async fn accept_connection(
         &self,
         stream: TcpStream,
@@ -325,10 +337,8 @@ impl NoiseConnectionPool {
 
         let conn = Arc::new(NoiseConnection::new(peer_key, peer_addr, transport));
 
-        // Store connection
-        self.store_connection(peer_key, Arc::clone(&conn));
-
-        info!(
+        // Intentionally NOT stored in the pool — see the doc comment above.
+        debug!(
             peer = %peer_addr,
             peer_key = %hex::encode(&peer_key[..8]),
             "Noise connection accepted (responder)"
@@ -502,9 +512,10 @@ mod tests {
         // Wait for pool2 to accept
         let conn2 = accept_handle.await.unwrap().unwrap();
 
-        // Verify connection counts
+        // Verify connection counts: pool1 pooled its OUTBOUND dial; pool2 accepted an
+        // inbound (owned by `conn2` below), which is deliberately NOT pooled.
         assert_eq!(pool1.connection_count(), 1);
-        assert_eq!(pool2.connection_count(), 1);
+        assert_eq!(pool2.connection_count(), 0);
 
         // Verify peer keys match
         assert_eq!(conn1.peer_key, *pool2.public_key());
@@ -568,6 +579,60 @@ mod tests {
         let small = b"{\"ok\":true}".to_vec();
         conn2.send(&small).await.unwrap();
         assert_eq!(conn1.recv().await.unwrap(), small);
+    }
+
+    /// Regression for the fleet-wide Noise re-handshake churn: accepting an INBOUND
+    /// connection from a peer must NOT evict/clobber the pooled OUTBOUND connection to
+    /// that same peer (they share the peer's noise key). Before the fix, the accept
+    /// stored the inbound conn under the shared key, dropping the outbound socket and
+    /// forcing a perpetual re-dial cycle.
+    #[tokio::test]
+    async fn accept_does_not_evict_outbound_to_same_peer() {
+        let pool_a = Arc::new(
+            NoiseConnectionPool::new(NoiseKeypair::generate(), test_pool_config()).unwrap(),
+        );
+        let pool_b = Arc::new(
+            NoiseConnectionPool::new(NoiseKeypair::generate(), test_pool_config()).unwrap(),
+        );
+
+        // B listens; A dials B → A pools an OUTBOUND conn keyed by B's noise key.
+        let lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = lb.local_addr().unwrap();
+        let pb = Arc::clone(&pool_b);
+        let b_accept = tokio::spawn(async move {
+            let (s, _) = lb.accept().await.unwrap();
+            pb.accept_connection(s).await
+        });
+        let out = pool_a.get_connection(b_addr).await.unwrap();
+        let _b_side = b_accept.await.unwrap().unwrap();
+        let out_ptr = Arc::as_ptr(&out);
+        assert_eq!(pool_a.connection_count(), 1, "A pooled its outbound to B");
+
+        // A listens; B dials A → A ACCEPTS an inbound whose peer_key is ALSO B's noise
+        // key — the exact clobber scenario.
+        let la = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = la.local_addr().unwrap();
+        let pa = Arc::clone(&pool_a);
+        let a_accept = tokio::spawn(async move {
+            let (s, _) = la.accept().await.unwrap();
+            pa.accept_connection(s).await
+        });
+        let _b_out = pool_b.get_connection(a_addr).await.unwrap();
+        let inbound = a_accept.await.unwrap().unwrap();
+        assert_eq!(inbound.peer_key, *pool_b.public_key());
+
+        // THE FIX: the inbound accept left A's outbound untouched, and A still reuses it.
+        assert_eq!(
+            pool_a.connection_count(),
+            1,
+            "inbound accept must not be pooled nor clobber the outbound"
+        );
+        let reused = pool_a.get_connection(b_addr).await.unwrap();
+        assert_eq!(
+            Arc::as_ptr(&reused),
+            out_ptr,
+            "A reuses its stable outbound to B — no re-dial"
+        );
     }
 
     #[tokio::test]

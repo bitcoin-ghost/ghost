@@ -9488,6 +9488,63 @@ impl Database {
         self.get_payout_ledger_checkpoint_at_or_before(u64::MAX)
     }
 
+    /// Finalised payout-ledger checkpoints at `height >= from_height`, ascending,
+    /// bounded by `limit`. Backs the payout-checkpoint sync responder — the analog
+    /// of `get_l2_checkpoints_from_height`. A node backfilling holes requests from
+    /// its latest+1; the responder returns a bounded page and the requester paginates.
+    pub fn get_payout_ledger_checkpoints_from_height(
+        &self,
+        from_height: u64,
+        limit: u64,
+    ) -> GhostResult<Vec<PayoutLedgerCheckpointRecord>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT height, cutoff_ts, ledger_root, proposer_id, active_node_count, canonical_payout
+                     FROM payout_ledger_checkpoints
+                     WHERE height >= ?1 ORDER BY height ASC LIMIT ?2",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(
+                    params![from_height.min(i64::MAX as u64) as i64, limit as i64],
+                    |row| {
+                        let height: i64 = row.get(0)?;
+                        let cutoff_ts: i64 = row.get(1)?;
+                        let root_blob: Vec<u8> = row.get(2)?;
+                        let proposer_id: String = row.get(3)?;
+                        let active_node_count: i64 = row.get(4)?;
+                        let canonical: Option<Vec<u8>> = row.get(5)?;
+                        Ok((height, cutoff_ts, root_blob, proposer_id, active_node_count, canonical))
+                    },
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (height, cutoff_ts, root_blob, proposer_id, active_node_count, canonical) =
+                    row.map_err(|e| GhostError::Database(e.to_string()))?;
+                if root_blob.len() != 32 {
+                    continue;
+                }
+                let mut ledger_root = [0u8; 32];
+                ledger_root.copy_from_slice(&root_blob);
+                let (miner_payouts, node_shares) = canonical
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or_default();
+                out.push(PayoutLedgerCheckpointRecord {
+                    height: height as u64,
+                    cutoff_ts,
+                    ledger_root,
+                    proposer_id,
+                    active_node_count: active_node_count as u32,
+                    miner_payouts,
+                    node_shares,
+                });
+            }
+            Ok(out)
+        })
+    }
+
     /// Get the latest L2 checkpoint
     pub fn get_latest_l2_checkpoint(&self) -> GhostResult<Option<L2CheckpointRecord>> {
         self.with_connection(|conn| {
