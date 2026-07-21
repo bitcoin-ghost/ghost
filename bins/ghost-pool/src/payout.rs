@@ -543,6 +543,12 @@ pub fn settle_paid_block(
 
     let marked = db.mark_miners_paid(&proposal.proposal_hash, &matched, cutoff_ts)?;
 
+    // Record the real win: this is the only place a block is settled (coins exist), so
+    // it is the authoritative "blocks found" signal — see `get_blocks_found_count`.
+    if let Err(e) = db.record_won_block(proposal.block_height) {
+        warn!(error = %e, height = proposal.block_height, "Failed to record won block");
+    }
+
     if proposal.treasury_amount > 0 {
         match db.add_treasury_funds(
             proposal.treasury_amount,

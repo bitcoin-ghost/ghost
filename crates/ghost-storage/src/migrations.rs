@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 45;
+const SCHEMA_VERSION: u32 = 46;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -101,6 +101,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (43, migrate_v43),
         (44, migrate_v44),
         (45, migrate_v45),
+        (46, migrate_v46),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2209,6 +2210,24 @@ fn migrate_v45(conn: &Connection) -> GhostResult<()> {
     conn.execute_batch("ALTER TABLE verification_ledger ADD COLUMN round_height INTEGER;")
         .map_err(|e| GhostError::Migration(e.to_string()))?;
     info!("v45: added verification_ledger.round_height");
+    Ok(())
+}
+
+/// Migration v46: an isolated record of blocks the pool actually WON and settled, so the
+/// "blocks found" count reflects real wins rather than every proposed (incl. rejected)
+/// block in `payout_proposals`. Written only by `settle_paid_block` (coins exist). Kept
+/// separate from `rounds.payout_status` so round pruning / payout-history queries are
+/// unaffected. Additive: a fresh table, no change to existing data.
+fn migrate_v46(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v46: won_blocks");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS won_blocks (
+            block_height INTEGER PRIMARY KEY,
+            settled_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v46: created won_blocks");
     Ok(())
 }
 

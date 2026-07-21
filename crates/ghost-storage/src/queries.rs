@@ -4898,14 +4898,32 @@ impl Database {
         })
     }
 
+    /// Record that the pool actually WON and settled the block at `block_height` — the
+    /// definitive "blocks found" signal. Called from `settle_paid_block`, which only runs
+    /// when a block WE mined has been accepted and its coinbase paid. Idempotent
+    /// (`INSERT OR IGNORE`). Kept in a dedicated `won_blocks` table so it is isolated from
+    /// the round lifecycle (round pruning / payout-history queries key off `payout_status`).
+    pub fn record_won_block(&self, block_height: u64) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO won_blocks (block_height) VALUES (?1)",
+                params![block_height as i64],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Number of blocks the pool has actually WON and settled.
+    ///
+    /// Counts `won_blocks` (recorded by `settle_paid_block` only when the coins exist), NOT
+    /// rows in `payout_proposals` — a proposal is created for EVERY block's tip-change/attempt,
+    /// so the old `COUNT(DISTINCT block_height) FROM payout_proposals` inflated the count by
+    /// every proposed (incl. rejected) block, not just wins.
     pub fn get_blocks_found_count(&self) -> GhostResult<u64> {
         self.with_connection(|conn| {
             let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(DISTINCT block_height) FROM payout_proposals",
-                    [],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM won_blocks", [], |row| row.get(0))
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             i64_to_u64(count, "blocks_found").map_err(|e| GhostError::Database(e.to_string()))
         })
@@ -10564,6 +10582,21 @@ pub fn resolve_bond_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `get_blocks_found_count` reflects only real settled WINS (`won_blocks`), is
+    /// idempotent per height, and is not inflated by payout proposals.
+    #[test]
+    fn blocks_found_count_tracks_settled_wins_only() {
+        let db = Database::in_memory().expect("in-memory db");
+        assert_eq!(db.get_blocks_found_count().unwrap(), 0, "fresh db → no wins");
+
+        db.record_won_block(958_800).unwrap();
+        db.record_won_block(958_800).unwrap(); // idempotent — same block, still one win
+        assert_eq!(db.get_blocks_found_count().unwrap(), 1);
+
+        db.record_won_block(958_820).unwrap();
+        assert_eq!(db.get_blocks_found_count().unwrap(), 2, "a second distinct win counts");
+    }
 
     /// A-2: the `/24` subnet extractor must accept only dotted-quad IPv4 literals
     /// (with or without a port) and reject hostnames / IPv6 / malformed input, so an
