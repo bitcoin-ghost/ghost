@@ -11,7 +11,7 @@
 //! - **Voter set**: `voter_set[height % n]` proposes. The voter set is the MPC
 //!   elder set below the `ACTIVE_VOTER_SET` gate; at/above it, the converged active
 //!   qualified set (all qualified nodes, not just MPC contributors), floored so it
-//!   can only ever be a superset of the elders — see [`PayoutCheckpointManager::voter_set_for`].
+//!   can only ever be a superset of the elders — see `voter_set_for`.
 //! - **Propose**: the deterministic proposer computes `ledger_root` from ITS
 //!   converged view at `cutoff_ts = block(height).time` and broadcasts the checkpoint.
 //! - **Vote**: every voter independently recomputes the root; it votes approve
@@ -195,7 +195,7 @@ fn quorum_for(n: usize) -> usize {
     (n as u64 * BFT_THRESHOLD_PERCENT).div_ceil(100) as usize
 }
 
-/// The bootstrap-floor decision for [`PayoutCheckpointManager::voter_set_for`]: widen to
+/// The bootstrap-floor decision for `voter_set_for`: widen to
 /// the `active` qualified set only when it is a non-empty *superset* of `elders` (both
 /// sorted). Otherwise keep `elders`, so the voter set can only grow beyond the established
 /// floor, never shrink below it. Pure so the floor invariant is unit-tested independent of
