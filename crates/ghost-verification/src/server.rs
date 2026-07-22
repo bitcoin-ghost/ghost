@@ -1253,6 +1253,12 @@ pub struct VerificationState {
     /// compute the assignment-scoped qualified set (to prove its convergence
     /// before arming `CHALLENGER_ASSIGNMENT`).
     pub block_hash_oracle: Option<Arc<dyn crate::challenger_assignment::BlockHashProvider>>,
+    /// FEE convergence proof: given a height, returns a hash of the FEE-armed node-reward
+    /// split (adopted `node_shares` distributed over a normalised pool) so the scoped-set
+    /// endpoint can prove the coinbase node-split converges fleet-wide BEFORE arming
+    /// `FEE_TO_NODE_POOL`. Injected from ghost-pool (owns the `PayoutHandler` split math).
+    #[allow(clippy::type_complexity)]
+    pub fee_node_split_fn: Option<Arc<dyn Fn(u64) -> Option<String> + Send + Sync>>,
     /// Dashboard config (mutable settings)
     pub dashboard_config: parking_lot::RwLock<DashboardConfig>,
     /// Node config with disk persistence (ghost_mode, etc.) - minimal JSON config
@@ -1552,6 +1558,7 @@ impl VerificationState {
             database: None,
             rpc: None,
             block_hash_oracle: None,
+            fee_node_split_fn: None,
             dashboard_config: parking_lot::RwLock::new(dashboard_config),
             node_config: parking_lot::RwLock::new(NodeConfig::default()),
             node_config_path: None,
@@ -1972,6 +1979,16 @@ impl VerificationState {
         oracle: Arc<dyn crate::challenger_assignment::BlockHashProvider>,
     ) -> Self {
         self.block_hash_oracle = Some(oracle);
+        self
+    }
+
+    /// Set the FEE node-split hash closure (enables the FEE_TO_NODE_POOL convergence proof).
+    #[allow(clippy::type_complexity)]
+    pub fn with_fee_node_split_fn(
+        mut self,
+        f: Arc<dyn Fn(u64) -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.fee_node_split_fn = Some(f);
         self
     }
 

@@ -6103,7 +6103,7 @@ async fn main() -> Result<()> {
     // This ensures consistent verified capability lookups across the system
     let payout_handler = Arc::new(PayoutHandler::new(
         Arc::clone(&identity),
-        payout_config,
+        payout_config.clone(),
         Arc::clone(&db),
         Arc::clone(&vote_handler),
         Arc::clone(&template_processor),
@@ -6187,6 +6187,40 @@ async fn main() -> Result<()> {
     // assignment-scoped set (the convergence proof for arming CHALLENGER_ASSIGNMENT).
     verification_state =
         verification_state.with_block_hash_oracle(Arc::new(block_hash_oracle.clone()));
+    // FEE convergence proof: hash the FEE-armed node-reward split (the adopted checkpoint's
+    // node_shares distributed over a normalised 1-BTC pool) so /api/v1/qualification/scoped-set
+    // can prove the coinbase node-split converges fleet-wide BEFORE arming FEE_TO_NODE_POOL —
+    // the exact thing that diverged in v1.10.32. Normalised pool → the hash reflects the
+    // adopted distribution + the deterministic split math, independent of block-specific fees.
+    verification_state = verification_state.with_fee_node_split_fn({
+        let db_c = Arc::clone(&db);
+        // Build one proposal creator for the REAL split math (same config as the coinbase path).
+        let creator = ghost_pool::payout::PayoutProposalCreator::new(
+            Arc::clone(&identity),
+            payout_config.clone(),
+            Arc::clone(&db),
+        )
+        .ok()
+        .map(Arc::new);
+        Arc::new(move |height: u64| -> Option<String> {
+            use sha2::{Digest, Sha256};
+            let creator = creator.as_ref()?;
+            let (_miners, node_shares) = ghost_pool::payout::read_adopted_payout(&db_c, height)?;
+            const NORMALIZED_POOL: u64 = 100_000_000;
+            let payouts = creator
+                .calculate_node_payouts(&node_shares, NORMALIZED_POOL)
+                .ok()?;
+            let mut v: Vec<([u8; 32], u64)> =
+                payouts.iter().map(|p| (p.recipient_id, p.amount)).collect();
+            v.sort();
+            let mut h = Sha256::new();
+            for (id, amt) in &v {
+                h.update(id);
+                h.update(amt.to_le_bytes());
+            }
+            Some(hex::encode(h.finalize()))
+        })
+    });
 
     // Report the operator's Wraith-mixing choice from `[ghost_pay] wraith_enabled`
     // on the ghostpay status endpoint, so the dashboard's L2 card reflects the

@@ -5696,6 +5696,10 @@ async fn api_qualification_scoped_set_handler(
     // has no block-hash seeds). `has_oracle` tells the reviewer whether this hash is real.
     let has_oracle = state.block_hash_oracle.is_some();
     let assignment = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, true);
+    // FEE convergence: hash of the FEE-armed node-reward split (adopted node_shares over a
+    // normalised pool). Identical across all nodes = the FEE coinbase node-split converges —
+    // the check to run before arming FEE_TO_NODE_POOL. `has_fn` reports whether it's wired.
+    let fee_node_split = state.fee_node_split_fn.as_ref().and_then(|f| f(cp.height));
     Json(serde_json::json!({
         "cutoff_ts": cutoff,
         "checkpoint_height": cp.height,
@@ -5705,6 +5709,10 @@ async fn api_qualification_scoped_set_handler(
             "count": assignment.len(),
             "hash": hash_set(&assignment),
             "has_oracle": has_oracle,
+        },
+        "fee_node_split": {
+            "hash": fee_node_split,
+            "has_fn": state.fee_node_split_fn.is_some(),
         },
     }))
 }

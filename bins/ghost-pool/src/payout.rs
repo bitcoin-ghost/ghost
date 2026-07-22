@@ -1556,7 +1556,11 @@ impl PayoutProposalCreator {
 
     /// Calculate node payouts proportional to capability shares
     /// Returns (payouts, dust_amount) where dust is added to top node's payout
-    fn calculate_node_payouts(
+    ///
+    /// `pub` so the FEE convergence flag (`/api/v1/qualification/scoped-set`) can hash the
+    /// FEE-armed node-split from the adopted checkpoint on a normalised pool — a read-only
+    /// determinism/convergence proof, no state change.
+    pub fn calculate_node_payouts(
         &self,
         node_shares: &[(NodeId, i32)],
         total_sats: u64,
