@@ -211,9 +211,11 @@ pub const CHALLENGER_ASSIGNMENT_SEED_LAG: u64 = ghost_verification::challenger_a
 /// voting membership track the fleet as it grows/shrinks. Below it, the MPC elder set is used
 /// (current behaviour), so with this gate DORMANT (`u64::MAX`) the binary is byte-identical to
 /// today. Which nodes vote is consensus-visible, so this is a height gate: every node resolves the
-/// identical set at the checkpoint cutoff. DORMANT — scaffolding only; do NOT arm until the active
-/// set has soaked clean fleet-wide (post Component E), then set comfortably past the roll window.
-pub const ACTIVE_VOTER_SET_HEIGHT: u64 = u64::MAX;
+/// identical set at the checkpoint cutoff. ARMED @959_200 — the checkpoint-path voter set was
+/// proven byte-identical fleet-wide first (`checkpoint_voter_set.hash` `98100ee8…` on all 8,
+/// count=8, floored=false), and the redesign soaked clean gate-off on v1.11.9. Revert = restore
+/// the prior binary (`.bak`) = instant disarm.
+pub const ACTIVE_VOTER_SET_HEIGHT: u64 = 959_200;
 
 /// Activation heights, resolved once at startup.
 ///
