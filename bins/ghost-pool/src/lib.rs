@@ -197,7 +197,7 @@ pub const VOTER_SET_QUALIFICATION_HEIGHT: u64 = 959_116;
 /// checkpoint cutoff, so a mixed-version fleet agrees on the node split during the roll.
 /// DORMANT until challenges have been issued+recorded against their assigned round for a full
 /// lookback window; SET comfortably past the roll window.
-pub const CHALLENGER_ASSIGNMENT_HEIGHT: u64 = u64::MAX;
+pub const CHALLENGER_ASSIGNMENT_HEIGHT: u64 = 959_161;
 
 /// Finality lag (in blocks) between a round and the block whose hash seeds it: a round at tip
 /// height `H` is seeded by `blockhash(H - CHALLENGER_ASSIGNMENT_SEED_LAG)`, buried enough that a
