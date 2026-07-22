@@ -74,7 +74,10 @@ async fn onboarding_fanout_makes_joiner_visible_to_established_node() {
             .expect("joiner mesh init"),
     );
     joiner.start().await.expect("joiner start");
-    joiner.connect_peer("127.0.0.1").await.expect("joiner learns established (seed)");
+    joiner
+        .connect_peer("127.0.0.1")
+        .await
+        .expect("joiner learns established (seed)");
 
     // Baseline asymmetry: the joiner knows the established node, but the
     // established node does NOT yet know the joiner (nothing pushed it there).
@@ -86,7 +89,10 @@ async fn onboarding_fanout_makes_joiner_visible_to_established_node() {
 
     // The fix: the joiner proactively warms a Noise handshake to its known peers.
     let warmed = joiner.bootstrap_fanout().await;
-    assert!(warmed >= 1, "joiner should warm at least the established peer");
+    assert!(
+        warmed >= 1,
+        "joiner should warm at least the established peer"
+    );
 
     // The established node reverse-subscribes to the joiner (a spawned task on
     // handshake completion), so it now registers the joiner — symmetric visibility.

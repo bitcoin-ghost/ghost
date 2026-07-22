@@ -6147,7 +6147,11 @@ async fn main() -> Result<()> {
             let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
                 .with_block_hash_oracle(Arc::new(oracle_c.clone()));
             let voters: Vec<ghost_common::types::NodeId> = qp
-                .get_all_qualified_nodes_at_cutoff_from_db(cutoff, voter_set_scoped, assignment_scoped)
+                .get_all_qualified_nodes_at_cutoff_from_db(
+                    cutoff,
+                    voter_set_scoped,
+                    assignment_scoped,
+                )
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect();
