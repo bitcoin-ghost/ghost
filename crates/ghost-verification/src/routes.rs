@@ -5672,7 +5672,11 @@ async fn api_qualification_scoped_set_handler(
     let cutoff = cp.cutoff_ts;
     // `Database` is a cheap Clone (shares an inner `Arc<DatabaseInner>`); the provider
     // wants an owned `Arc<Database>`, so wrap a clone — same underlying connection.
-    let qp = crate::QualifiedCapabilityProvider::new(Arc::new(db.clone()));
+    // Attach the block-hash oracle if present so the assignment-scoped (A-2b) draw can run.
+    let mut qp = crate::QualifiedCapabilityProvider::new(Arc::new(db.clone()));
+    if let Some(oracle) = state.block_hash_oracle.as_ref() {
+        qp = qp.with_block_hash_oracle(Arc::clone(oracle));
+    }
 
     // Deterministic hash of a qualified set: sort by node id, then fold in (id ‖ shares_le).
     let hash_set = |set: &[([u8; 32], i32)]| -> String {
@@ -5686,13 +5690,22 @@ async fn api_qualification_scoped_set_handler(
         hex::encode(h.finalize())
     };
 
-    let scoped = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, false);
     let unscoped = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, false, false);
+    let scoped = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, false);
+    // A-2b assignment-scoped: only meaningful with the oracle wired in (else the draw
+    // has no block-hash seeds). `has_oracle` tells the reviewer whether this hash is real.
+    let has_oracle = state.block_hash_oracle.is_some();
+    let assignment = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, true);
     Json(serde_json::json!({
         "cutoff_ts": cutoff,
         "checkpoint_height": cp.height,
-        "voter_set_scoped": { "count": scoped.len(), "hash": hash_set(&scoped) },
         "unscoped": { "count": unscoped.len(), "hash": hash_set(&unscoped) },
+        "voter_set_scoped": { "count": scoped.len(), "hash": hash_set(&scoped) },
+        "assignment_scoped": {
+            "count": assignment.len(),
+            "hash": hash_set(&assignment),
+            "has_oracle": has_oracle,
+        },
     }))
 }
 

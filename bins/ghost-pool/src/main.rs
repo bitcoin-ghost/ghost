@@ -6182,6 +6182,11 @@ async fn main() -> Result<()> {
     // Report the node's real configured chain on the status/info endpoints
     // (dashboard + wallets) instead of the historical hardcoded "signet".
     verification_state = verification_state.with_network(config.bitcoin.network);
+    // A-2b: hand the verification server the same warm block-hash oracle the payout
+    // checkpoint uses, so /api/v1/qualification/scoped-set can compute the
+    // assignment-scoped set (the convergence proof for arming CHALLENGER_ASSIGNMENT).
+    verification_state =
+        verification_state.with_block_hash_oracle(Arc::new(block_hash_oracle.clone()));
 
     // Report the operator's Wraith-mixing choice from `[ghost_pay] wraith_enabled`
     // on the ghostpay status endpoint, so the dashboard's L2 card reflects the

@@ -1248,6 +1248,11 @@ pub struct VerificationState {
     pub database: Option<Database>,
     /// Ghost Core RPC client (optional)
     pub rpc: Option<Arc<BitcoinRpc>>,
+    /// A-2b block-hash oracle for the consensus challenger draw. Injected from
+    /// ghost-pool's warm `CachedBlockHashOracle` so the scoped-set endpoint can
+    /// compute the assignment-scoped qualified set (to prove its convergence
+    /// before arming `CHALLENGER_ASSIGNMENT`).
+    pub block_hash_oracle: Option<Arc<dyn crate::challenger_assignment::BlockHashProvider>>,
     /// Dashboard config (mutable settings)
     pub dashboard_config: parking_lot::RwLock<DashboardConfig>,
     /// Node config with disk persistence (ghost_mode, etc.) - minimal JSON config
@@ -1546,6 +1551,7 @@ impl VerificationState {
             stratum_sv1_port: SV1_STRATUM_PORT,
             database: None,
             rpc: None,
+            block_hash_oracle: None,
             dashboard_config: parking_lot::RwLock::new(dashboard_config),
             node_config: parking_lot::RwLock::new(NodeConfig::default()),
             node_config_path: None,
@@ -1957,6 +1963,15 @@ impl VerificationState {
     /// Set Ghost Core RPC client
     pub fn with_rpc(mut self, rpc: Arc<BitcoinRpc>) -> Self {
         self.rpc = Some(rpc);
+        self
+    }
+
+    /// Set the A-2b block-hash oracle (enables the assignment-scoped convergence proof).
+    pub fn with_block_hash_oracle(
+        mut self,
+        oracle: Arc<dyn crate::challenger_assignment::BlockHashProvider>,
+    ) -> Self {
+        self.block_hash_oracle = Some(oracle);
         self
     }
 
