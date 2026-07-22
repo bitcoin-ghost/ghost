@@ -205,6 +205,16 @@ pub const CHALLENGER_ASSIGNMENT_HEIGHT: u64 = u64::MAX;
 /// the challenger draw uses one source of truth on both the selection and qualification sides.
 pub const CHALLENGER_ASSIGNMENT_SEED_LAG: u64 = ghost_verification::challenger_assignment::SEED_LAG;
 
+/// Active-voter-set scaffolding (Phase 4, v1.x). At and above this height, BFT payout voting
+/// draws its eligible-voter set from the QUALIFIED ACTIVE nodes at the block's cutoff (the same
+/// converged resolver Component E uses) instead of the static genesis MPC elder set — letting the
+/// voting membership track the fleet as it grows/shrinks. Below it, the MPC elder set is used
+/// (current behaviour), so with this gate DORMANT (`u64::MAX`) the binary is byte-identical to
+/// today. Which nodes vote is consensus-visible, so this is a height gate: every node resolves the
+/// identical set at the checkpoint cutoff. DORMANT — scaffolding only; do NOT arm until the active
+/// set has soaked clean fleet-wide (post Component E), then set comfortably past the roll window.
+pub const ACTIVE_VOTER_SET_HEIGHT: u64 = u64::MAX;
+
 /// Activation heights, resolved once at startup.
 ///
 /// A regtest chain is ~100 blocks tall, so every mainnet gate is dormant there and a regtest
@@ -225,6 +235,7 @@ mod gates {
     pub(super) static VOTER_SET_QUALIFICATION: OnceLock<u64> = OnceLock::new();
     pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
+    pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -264,17 +275,24 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         SHARE_POW_VERIFY_HEIGHT,
     );
+    let active_voter_set = gates::from_env(
+        "GHOST_ACTIVE_VOTER_SET_HEIGHT",
+        network,
+        ACTIVE_VOTER_SET_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::FEE_TO_NODE_POOL.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
     let _ = gates::CHALLENGER_ASSIGNMENT.set(challenger_assignment);
     let _ = gates::SHARE_POW_VERIFY.set(share_pow_verify);
+    let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != FEE_TO_NODE_POOL_HEIGHT
         || voter_set != VOTER_SET_QUALIFICATION_HEIGHT
         || challenger_assignment != CHALLENGER_ASSIGNMENT_HEIGHT
         || share_pow_verify != SHARE_POW_VERIFY_HEIGHT
+        || active_voter_set != ACTIVE_VOTER_SET_HEIGHT
     {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
@@ -282,6 +300,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
             voter_set_qualification_height = voter_set,
             challenger_assignment_height = challenger_assignment,
             share_pow_verify_height = share_pow_verify,
+            active_voter_set_height = active_voter_set,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
         );
@@ -316,6 +335,13 @@ pub fn challenger_assignment_height() -> u64 {
 /// (Surface B). Accessor form so the gate is env-overridable off-mainnet like the rest.
 pub fn share_pow_verify_height() -> u64 {
     *gates::SHARE_POW_VERIFY.get_or_init(|| SHARE_POW_VERIFY_HEIGHT)
+}
+
+/// The height at which BFT payout voting draws its eligible-voter set from the qualified active
+/// nodes at the block's cutoff instead of the static MPC elder set (Phase 4 scaffolding). DORMANT
+/// (`u64::MAX`) — below it the MPC elder set is used, so the binary is behaviour-neutral today.
+pub fn active_voter_set_height() -> u64 {
+    *gates::ACTIVE_VOTER_SET.get_or_init(|| ACTIVE_VOTER_SET_HEIGHT)
 }
 
 /// GhostGlyph P2P handler for visual identity registration.

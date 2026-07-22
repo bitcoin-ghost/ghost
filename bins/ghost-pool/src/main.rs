@@ -6123,6 +6123,43 @@ async fn main() -> Result<()> {
         vote_handler.set_proposal_validator(validator);
     }
 
+    // Phase 4 (DORMANT scaffolding): install the active-voter-set resolver. Below
+    // ACTIVE_VOTER_SET_HEIGHT (u64::MAX on mainnet today) it returns None and the vote handler
+    // keeps using the static MPC elder set — byte-identical to current behaviour. When armed in
+    // v1.x, the eligible-voter set becomes the qualified active nodes at the cutoff of the latest
+    // finalised payout checkpoint at/below the block — resolved identically fleet-wide via the
+    // same converged resolver + height scoping the payout root uses (so voters and the node split
+    // agree). The gate lives inside the closure, so this wiring is behaviour-neutral until armed.
+    {
+        let db_c = Arc::clone(&db);
+        let oracle_c = block_hash_oracle.clone();
+        let resolver: ghost_consensus::ActiveVoterSetFn = Arc::new(move |block_height: u64| {
+            if block_height < ghost_pool::active_voter_set_height() {
+                return None; // dormant → fall back to the MPC elder set
+            }
+            let cutoff = db_c
+                .get_payout_ledger_checkpoint_at_or_before(block_height)
+                .ok()
+                .flatten()?
+                .cutoff_ts;
+            let voter_set_scoped = block_height >= ghost_pool::voter_set_qualification_height();
+            let assignment_scoped = block_height >= ghost_pool::challenger_assignment_height();
+            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
+                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
+            let voters: Vec<ghost_common::types::NodeId> = qp
+                .get_all_qualified_nodes_at_cutoff_from_db(cutoff, voter_set_scoped, assignment_scoped)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            if voters.is_empty() {
+                None
+            } else {
+                Some(voters)
+            }
+        });
+        vote_handler.set_active_voter_set_fn(resolver);
+    }
+
     // Start verification HTTP server
     let rpc_for_verification = Arc::clone(&rpc);
     let rm_for_height = Arc::clone(&round_manager);

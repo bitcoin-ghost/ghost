@@ -543,6 +543,12 @@ pub type RevocationFn = Arc<dyn Fn(&str, u32, &str) -> GhostResult<()> + Send + 
 /// split from this node's own converged ledger. Returns `Err(reason)` to reject.
 pub type ProposalValidateFn = Arc<dyn Fn(&PayoutProposal) -> Result<(), String> + Send + Sync>;
 
+/// Phase 4 (dormant scaffolding): resolve the active eligible-voter set for a proposal's block
+/// height, or `None` to fall back to the static MPC elder set. Installed after construction
+/// (main.rs owns the `ACTIVE_VOTER_SET_HEIGHT` gate + DB). The gate lives inside the closure, so
+/// while dormant it always returns `None` and voting membership is byte-identical to today.
+pub type ActiveVoterSetFn = Arc<dyn Fn(u64) -> Option<Vec<NodeId>> + Send + Sync>;
+
 /// Rate limit configuration for P2P messages
 ///
 /// Default: 100 messages burst, 20/second sustained per node
@@ -640,6 +646,10 @@ pub struct VoteHandler {
     /// lock so it can be installed after construction (the pool's PayoutHandler
     /// is built later than the VoteHandler).
     ledger_validator_fn: RwLock<Option<ProposalValidateFn>>,
+    /// Phase 4 (dormant): optional active-voter-set resolver. When it returns `Some(voters)` for
+    /// a proposal's block height (gate armed) those are the eligible voters; `None` keeps the
+    /// static MPC elder set (current behaviour). Installed after construction, like the validator.
+    active_voter_set_fn: RwLock<Option<ActiveVoterSetFn>>,
     /// Tracked revocation proposals: proposal_hash -> (node_id_hex, reason)
     revocation_proposals: RwLock<HashMap<[u8; 32], (String, String)>>,
 }
@@ -678,6 +688,7 @@ impl VoteHandler {
             proposal_store_fn: None,
             revocation_fn: None,
             ledger_validator_fn: RwLock::new(None),
+            active_voter_set_fn: RwLock::new(None),
             revocation_proposals: RwLock::new(HashMap::new()),
         }
     }
@@ -1017,6 +1028,14 @@ impl VoteHandler {
         *self.ledger_validator_fn.write() = Some(f);
     }
 
+    /// Phase 4 (dormant): install the active-voter-set resolver (after construction). When it
+    /// returns `Some(voters)` for a proposal's block height those are the eligible voters; `None`
+    /// keeps the MPC elder set. The `ACTIVE_VOTER_SET_HEIGHT` gate lives inside the closure, so
+    /// this is behaviour-neutral until v1.x arms the gate.
+    pub fn set_active_voter_set_fn(&self, f: ActiveVoterSetFn) {
+        *self.active_voter_set_fn.write() = Some(f);
+    }
+
     /// Propose revocation of an offline elder.
     /// Creates a deterministic VotingSession, casts our approve vote, and
     /// returns a serialized VoteMessage for broadcast. Returns None if
@@ -1180,21 +1199,32 @@ impl VoteHandler {
             store_fn(proposal.clone());
         }
 
-        // Create voting session using MPC elders from DB as eligible voters
+        // Create voting session. Eligible voters are the static MPC elder set — UNLESS the
+        // Phase 4 active-voter-set resolver yields a set for this block height (i.e. the
+        // ACTIVE_VOTER_SET_HEIGHT gate, checked inside the closure, is armed). While the gate is
+        // dormant the resolver returns None and this is exactly the MPC-elder path as before.
         let session = {
-            let voters = self
-                .db
+            let active = self
+                .active_voter_set_fn
+                .read()
                 .as_ref()
-                .ok_or_else(|| {
-                    ghost_common::error::GhostError::Internal(
-                        "No database configured for voting".to_string(),
-                    )
-                })?
-                .get_mpc_elder_node_ids()
-                .map_err(|e| {
-                    warn!(error = %e, "Failed to query MPC elders for voting");
-                    e
-                })?;
+                .and_then(|f| f(proposal.block_height));
+            let voters = match active {
+                Some(v) => v.into_iter().collect(),
+                None => self
+                    .db
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ghost_common::error::GhostError::Internal(
+                            "No database configured for voting".to_string(),
+                        )
+                    })?
+                    .get_mpc_elder_node_ids()
+                    .map_err(|e| {
+                        warn!(error = %e, "Failed to query MPC elders for voting");
+                        e
+                    })?,
+            };
 
             match VotingSession::new(
                 proposal.round_id,
@@ -1913,6 +1943,45 @@ mod tests {
         let handler = VoteHandler::new(identity, voting_manager);
 
         assert_eq!(handler.elder_count(), 0);
+    }
+
+    #[test]
+    fn active_voter_set_resolver_installs_and_is_deterministic() {
+        // Phase 4 (dormant) scaffolding. The injected resolver must: (a) be absent by default so
+        // voting falls back to the static MPC elder set; (b) be gated INSIDE the closure — below
+        // the height it returns None (the current MPC-elder path); (c) be DETERMINISTIC — the same
+        // block height always resolves the same eligible-voter set, which is what makes swapping
+        // the voter set BFT-safe fleet-wide.
+        let identity = create_test_identity();
+        let voting_manager = Arc::new(VotingManager::new(100));
+        let handler = VoteHandler::new(identity, voting_manager);
+
+        // (a) none installed by default → MPC-elder fallback path.
+        assert!(handler.active_voter_set_fn.read().is_none());
+
+        // Install a resolver gated at height 1000, returning a fixed set at/above it.
+        let gate = 1000u64;
+        let resolver: ActiveVoterSetFn = Arc::new(move |h: u64| {
+            if h < gate {
+                None
+            } else {
+                Some(vec![[9u8; 32], [1u8; 32], [5u8; 32]])
+            }
+        });
+        handler.set_active_voter_set_fn(resolver);
+
+        let guard = handler.active_voter_set_fn.read();
+        let f = guard.as_ref().expect("resolver installed");
+
+        // (b) dormant below the gate → None (fall back to MPC elders).
+        assert_eq!(f(gate - 1), None);
+
+        // (c) armed at/above the gate → deterministic: identical set every call, every height.
+        let first = f(gate);
+        assert!(first.is_some());
+        assert_eq!(first, f(gate), "same height → identical voter set");
+        assert_eq!(f(5000), f(5000));
+        assert_eq!(f(gate), f(9999), "fixed resolver stable across heights");
     }
 
     #[test]
