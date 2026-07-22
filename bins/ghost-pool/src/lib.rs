@@ -181,7 +181,7 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// switches at the same block, so a mixed-version fleet computes an identical node split during
 /// the roll. DORMANT until the voter set + per-node subnet map are converged fleet-wide; SET
 /// comfortably past the roll window.
-pub const VOTER_SET_QUALIFICATION_HEIGHT: u64 = u64::MAX;
+pub const VOTER_SET_QUALIFICATION_HEIGHT: u64 = 959_116;
 
 /// Multi-operator consensus-drawn challenger assignment (Surface A-2b). At and above this
 /// height, node-reward qualification counts a challenger's verdict only if that challenger was
