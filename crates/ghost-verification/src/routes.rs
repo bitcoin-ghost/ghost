@@ -355,6 +355,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/payout/checkpoint",
             get(api_payout_checkpoint_handler),
         )
+        .route(
+            "/api/v1/qualification/scoped-set",
+            get(api_qualification_scoped_set_handler),
+        )
         // Config endpoints (GET only - reading is public, POST requires auth via internal router)
         // CRIT-6: POST handlers moved to internal_router to require authentication
         .route("/api/v1/config/full", get(api_config_full_handler))
@@ -5641,6 +5645,55 @@ async fn api_payout_checkpoint_handler(
             "checkpoint": serde_json::Value::Null,
         })),
     }
+}
+
+/// Convergence proof for arming `VOTER_SET_QUALIFICATION` (and, later, the other
+/// qualification-scoped gates). Computes the node-reward qualified set at the latest
+/// finalised checkpoint's cutoff — BOTH the A-2 **scoped** view (`voter_set_scoped=true`:
+/// voter-set membership + /24 subnet dedup) and the current unscoped view — and returns a
+/// hash of each. Because every node uses the SAME cutoff (the fleet-agreed checkpoint) and
+/// the resolver is deterministic, an identical `voter_set_scoped.hash` across all nodes is a
+/// DIRECT proof the scoped set converges — the check to run before flipping the gate off
+/// `u64::MAX`. Read-only and independent of the gate's own height (forces the scoped path
+/// regardless), so it works while the gate is still dormant.
+///
+/// `assignment_scoped=false` here: A-2b (`CHALLENGER_ASSIGNMENT`) is a separate gate and its
+/// draw needs the block-hash oracle; this endpoint proves only the A-2 voter-set/subnet layer.
+async fn api_qualification_scoped_set_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    use sha2::{Digest, Sha256};
+    let Some(db) = state.database.as_ref() else {
+        return Json(serde_json::json!({ "error": "no database configured" }));
+    };
+    let Some(cp) = db.get_latest_payout_ledger_checkpoint().ok().flatten() else {
+        return Json(serde_json::json!({ "error": "no finalised checkpoint yet" }));
+    };
+    let cutoff = cp.cutoff_ts;
+    // `Database` is a cheap Clone (shares an inner `Arc<DatabaseInner>`); the provider
+    // wants an owned `Arc<Database>`, so wrap a clone — same underlying connection.
+    let qp = crate::QualifiedCapabilityProvider::new(Arc::new(db.clone()));
+
+    // Deterministic hash of a qualified set: sort by node id, then fold in (id ‖ shares_le).
+    let hash_set = |set: &[([u8; 32], i32)]| -> String {
+        let mut v = set.to_vec();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut h = Sha256::new();
+        for (id, shares) in &v {
+            h.update(id);
+            h.update(shares.to_le_bytes());
+        }
+        hex::encode(h.finalize())
+    };
+
+    let scoped = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, false);
+    let unscoped = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, false, false);
+    Json(serde_json::json!({
+        "cutoff_ts": cutoff,
+        "checkpoint_height": cp.height,
+        "voter_set_scoped": { "count": scoped.len(), "hash": hash_set(&scoped) },
+        "unscoped": { "count": unscoped.len(), "hash": hash_set(&unscoped) },
+    }))
 }
 
 // ============================================================================
