@@ -8,14 +8,17 @@
 //! agreed checkpoint (see `tasks/design_payout_finalization.md`).
 //!
 //! Flow (mirrors the L2 nullifier checkpoint, but decoupled and payout-scoped):
-//! - **Propose**: the deterministic proposer for `height` (`elders[height % n]`,
-//!   over the MPC elder set) computes `ledger_root` from ITS converged view at
-//!   `cutoff_ts = block(height).time` and broadcasts the checkpoint.
-//! - **Vote**: every elder independently recomputes the root; it votes approve
+//! - **Voter set**: `voter_set[height % n]` proposes. The voter set is the MPC
+//!   elder set below the `ACTIVE_VOTER_SET` gate; at/above it, the converged active
+//!   qualified set (all qualified nodes, not just MPC contributors), floored so it
+//!   can only ever be a superset of the elders — see [`PayoutCheckpointManager::voter_set_for`].
+//! - **Propose**: the deterministic proposer computes `ledger_root` from ITS
+//!   converged view at `cutoff_ts = block(height).time` and broadcasts the checkpoint.
+//! - **Vote**: every voter independently recomputes the root; it votes approve
 //!   iff its root equals the proposal's. A node that cannot yet compute the root
 //!   (data not converged) **abstains** rather than approving — the C-7 rule.
-//! - **Finalise**: at ≥67% approvals for a checkpoint hash, the checkpoint is
-//!   persisted (`payout_ledger_checkpoints`), identical fleet-wide.
+//! - **Finalise**: at ≥67% approvals (from voter-set members) for a checkpoint hash,
+//!   the checkpoint is persisted (`payout_ledger_checkpoints`), identical fleet-wide.
 //!
 //! Authentication rides the mesh's Noise channel: `envelope.sender` is
 //! cryptographically authenticated, so proposer/voter identity is taken from it
@@ -125,6 +128,15 @@ fn payouts_agree(
 /// `main.rs` to isolate live root divergence; `None` in tests and once diagnosed.
 pub type ComputeRootDiagFn = Arc<dyn Fn(i64, u64) -> String + Send + Sync>;
 
+/// Resolves the ACTIVE qualified voter set at a cutoff: `(cutoff_ts, height) -> sorted
+/// node ids`. Wired in `main.rs` to the SAME scoped qualified-node query
+/// (`get_all_qualified_nodes_at_cutoff_from_db`) that [`ComputeRootFn`] uses to build
+/// `node_shares`, so the voter set and the ratified ledger's node set are identical by
+/// construction. Once `ACTIVE_VOTER_SET` activates, the payout consensus draws its
+/// proposer/quorum/eligibility from this set (all qualified nodes) instead of only the
+/// MPC ceremony elders. `None` in tests → the elder floor is always used.
+pub type ActiveVoterSetFn = Arc<dyn Fn(i64, u64) -> Vec<NodeId> + Send + Sync>;
+
 struct PendingEntry {
     /// The proposal content (needed to persist on finalise). `None` if a vote
     /// arrived before the proposal (race) — we still tally the approver.
@@ -161,6 +173,8 @@ pub struct PayoutCheckpointManager {
     compute_root: ComputeRootFn,
     /// Optional root-input breakdown for live divergence diagnosis.
     diag: Option<ComputeRootDiagFn>,
+    /// Optional active-voter-set resolver (see [`ActiveVoterSetFn`]). `None` = elder-only.
+    active_voter_set: Option<ActiveVoterSetFn>,
     /// height -> in-flight vote tallies.
     pending: RwLock<HashMap<u64, Pending>>,
     /// Client-side backfill cooldown: last time we broadcast a sync request (ms; 0 = never).
@@ -176,6 +190,24 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Approvals required to finalise: ceil of 67% of `n` voters.
+fn quorum_for(n: usize) -> usize {
+    (n as u64 * BFT_THRESHOLD_PERCENT).div_ceil(100) as usize
+}
+
+/// The bootstrap-floor decision for [`PayoutCheckpointManager::voter_set_for`]: widen to
+/// the `active` qualified set only when it is a non-empty *superset* of `elders` (both
+/// sorted). Otherwise keep `elders`, so the voter set can only grow beyond the established
+/// floor, never shrink below it. Pure so the floor invariant is unit-tested independent of
+/// the gate/resolver plumbing.
+fn widen_voter_set(elders: Vec<NodeId>, active: Vec<NodeId>) -> Vec<NodeId> {
+    if !active.is_empty() && elders.iter().all(|e| active.binary_search(e).is_ok()) {
+        active
+    } else {
+        elders
+    }
+}
+
 impl PayoutCheckpointManager {
     pub fn new(
         identity: Arc<NodeIdentity>,
@@ -189,6 +221,7 @@ impl PayoutCheckpointManager {
             send,
             compute_root,
             diag: None,
+            active_voter_set: None,
             pending: RwLock::new(HashMap::new()),
             last_sync_request: RwLock::new(0),
             sync_serves: RwLock::new(HashMap::new()),
@@ -198,6 +231,14 @@ impl PayoutCheckpointManager {
     /// Attach a diagnostic breakdown closure (see [`ComputeRootDiagFn`]).
     pub fn with_diag(mut self, diag: ComputeRootDiagFn) -> Self {
         self.diag = Some(diag);
+        self
+    }
+
+    /// Attach the active-voter-set resolver (see [`ActiveVoterSetFn`]). Once
+    /// `ACTIVE_VOTER_SET` activates, the consensus draws its voter/proposer/quorum set
+    /// from all qualified active nodes instead of only the MPC elders.
+    pub fn with_active_voter_set_fn(mut self, f: ActiveVoterSetFn) -> Self {
+        self.active_voter_set = Some(f);
         self
     }
 
@@ -238,20 +279,36 @@ impl PayoutCheckpointManager {
         e
     }
 
-    /// Deterministic proposer for `height` (round-robin over the elder set).
-    fn proposer_for(&self, height: u64) -> Option<NodeId> {
-        let e = self.elders_sorted();
-        if e.is_empty() {
-            None
-        } else {
-            Some(e[(height as usize) % e.len()])
+    /// The consensus voter set for `height` at `cutoff_ts` — who may propose, vote, and
+    /// count toward quorum. Below the `ACTIVE_VOTER_SET` gate (or with no resolver wired)
+    /// this is the MPC elder set, identical to the historical behaviour. At/above the gate
+    /// it WIDENS to the converged active qualified set (all qualified nodes, not just MPC
+    /// contributors) so post-ceremony joiners participate.
+    ///
+    /// BOOTSTRAP FLOOR: the active set is used only when it is a *superset* of the current
+    /// elders. If a partition or an unqualified elder would make it narrower, we fall back
+    /// to the elder set — so the voter set can only ever GROW beyond the established floor,
+    /// never shrink below it. This makes the gate strictly no-less-safe than the elder path.
+    /// Determinism across the fleet is guaranteed because the active set is the same
+    /// convergence-proven qualified set the ledger root already commits to.
+    fn voter_set_for(&self, height: u64, cutoff_ts: i64) -> Vec<NodeId> {
+        let elders = self.elders_sorted();
+        if height >= crate::active_voter_set_height() {
+            if let Some(resolve) = &self.active_voter_set {
+                return widen_voter_set(elders, resolve(cutoff_ts, height));
+            }
         }
+        elders
     }
 
-    /// Approvals required for finalisation (ceil of 67% of the elder set).
-    fn quorum_needed(&self) -> usize {
-        let n = self.elders_sorted().len() as u64;
-        (n * BFT_THRESHOLD_PERCENT).div_ceil(100) as usize
+    /// Deterministic proposer for `height` (round-robin over the voter set at `cutoff_ts`).
+    fn proposer_for(&self, height: u64, cutoff_ts: i64) -> Option<NodeId> {
+        let v = self.voter_set_for(height, cutoff_ts);
+        if v.is_empty() {
+            None
+        } else {
+            Some(v[(height as usize) % v.len()])
+        }
     }
 
     fn already_finalized(&self, height: u64) -> bool {
@@ -275,7 +332,9 @@ impl PayoutCheckpointManager {
     /// height. No-op unless this node is the deterministic proposer for it.
     pub async fn maybe_propose(&self, height: u64, cutoff_ts: i64) {
         let me = self.identity.node_id();
-        if self.proposer_for(height) != Some(me) || self.already_finalized(height) {
+        let voters = self.voter_set_for(height, cutoff_ts);
+        let proposer = (!voters.is_empty()).then(|| voters[(height as usize) % voters.len()]);
+        if proposer != Some(me) || self.already_finalized(height) {
             return;
         }
         let Some(canonical) = (self.compute_root)(cutoff_ts, height) else {
@@ -288,7 +347,7 @@ impl PayoutCheckpointManager {
             return;
         };
 
-        let active_node_count = self.elders_sorted().len() as u32;
+        let active_node_count = voters.len() as u32;
         let mut msg = PayoutLedgerCheckpointMessage {
             height,
             cutoff_ts,
@@ -331,7 +390,9 @@ impl PayoutCheckpointManager {
         };
         // Authorisation: the Noise-authenticated sender must be the declared
         // proposer AND the deterministic proposer for this height.
-        if env.sender != msg.proposer || self.proposer_for(msg.height) != Some(msg.proposer) {
+        if env.sender != msg.proposer
+            || self.proposer_for(msg.height, msg.cutoff_ts) != Some(msg.proposer)
+        {
             debug!(
                 height = msg.height,
                 "payout checkpoint: proposal from non-proposer — ignored"
@@ -414,12 +475,13 @@ impl PayoutCheckpointManager {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
-        // Authenticated sender must be the voter, and the voter must be an elder.
+        // The Noise-authenticated sender must be the voter. Voter-set ELIGIBILITY is
+        // enforced authoritatively in `maybe_finalize` (where the proposal — and thus the
+        // cutoff that resolves the voter set — is known); here we only accumulate
+        // authenticated approvals. The approvers set is a `HashSet<NodeId>` bounded by the
+        // authenticated peer set, and finalisation counts only approvers ∩ voter_set, so an
+        // ineligible authenticated node's vote can never contribute to quorum.
         if env.sender != vote.voter {
-            return Ok(());
-        }
-        if !self.elders_sorted().contains(&vote.voter) {
-            debug!("payout checkpoint: vote from non-elder — ignored");
             return Ok(());
         }
         if !vote.approve {
@@ -454,10 +516,6 @@ impl PayoutCheckpointManager {
     /// Persist the checkpoint once ≥67% of elders have approved a hash for which
     /// we hold the proposal content. Idempotent.
     fn maybe_finalize(&self, height: u64, hash: [u8; 32]) {
-        let needed = self.quorum_needed();
-        if needed == 0 {
-            return;
-        }
         let mut pending = self.pending.write();
         let Some(p) = pending.get_mut(&height) else {
             return;
@@ -465,17 +523,31 @@ impl PayoutCheckpointManager {
         if p.finalized {
             return;
         }
-        let Some(entry) = p.by_hash.get(&hash) else {
-            return;
+        // Need the proposal BOTH to resolve the voter set (its cutoff) and to persist. If a
+        // vote arrived before the proposal, we hold no content yet — the proposal message
+        // will arrive and re-trigger this.
+        let (approvers, msg) = {
+            let Some(entry) = p.by_hash.get(&hash) else {
+                return;
+            };
+            let Some(msg) = entry.proposal.clone() else {
+                return;
+            };
+            (entry.approvers.clone(), msg)
         };
-        if entry.approvers.len() < needed {
+        // Authoritative eligibility + quorum: resolve the voter set at the proposal's cutoff
+        // and count ONLY approvers that are in it. Below the ACTIVE_VOTER_SET gate this is
+        // the elder set (identical to the historical `approvers.len() >= quorum(elders)`);
+        // at/above it, the widened qualified set.
+        let voters = self.voter_set_for(height, msg.cutoff_ts);
+        let needed = quorum_for(voters.len());
+        if needed == 0 {
             return;
         }
-        let Some(msg) = entry.proposal.clone() else {
-            // Quorum reached but we don't hold the proposal content — cannot
-            // persist yet; the proposal message will arrive and re-trigger this.
+        let approvals = voters.iter().filter(|v| approvers.contains(*v)).count();
+        if approvals < needed {
             return;
-        };
+        }
         let record = PayoutLedgerCheckpointRecord {
             height,
             cutoff_ts: msg.cutoff_ts,
@@ -493,7 +565,7 @@ impl PayoutCheckpointManager {
                 info!(
                     height,
                     root = %hex::encode(&msg.ledger_root[..8]),
-                    approvals = entry.approvers.len(),
+                    approvals,
                     needed,
                     "payout ledger checkpoint FINALISED"
                 );
@@ -649,7 +721,7 @@ impl PayoutCheckpointManager {
             return false;
         }
         // Authorship: must be the deterministic proposer for this height.
-        if self.proposer_for(entry.height) != Some(entry.proposer) {
+        if self.proposer_for(entry.height, entry.cutoff_ts) != Some(entry.proposer) {
             return false;
         }
         // Integrity: the root must be the hash of the lists carried.
@@ -862,6 +934,23 @@ mod tests {
     const H: u64 = 100; // 100 % 4 == 0 → proposer is sorted-elder[0] = nodes[0]
     const CUTOFF: i64 = 1_784_000_000;
 
+    #[test]
+    fn voter_set_floor_only_widens_to_a_superset() {
+        let id = |b: u8| -> NodeId { [b; 32] };
+        let elders = vec![id(1), id(2), id(3)]; // sorted MPC floor
+                                                // A new qualified joiner extends the set → widen to include it.
+        let grown = vec![id(1), id(2), id(3), id(4)];
+        assert_eq!(widen_voter_set(elders.clone(), grown.clone()), grown);
+        // An elder missing (partition / unqualified elder) → keep the elder floor,
+        // never a narrower set. BFT tolerates the absent elder within 33%.
+        let narrower = vec![id(1), id(2), id(4)];
+        assert_eq!(widen_voter_set(elders.clone(), narrower), elders.clone());
+        // Empty active set (no convergence) → floor.
+        assert_eq!(widen_voter_set(elders.clone(), vec![]), elders.clone());
+        // Exactly the elders (no joiners) → the same set (a superset of itself).
+        assert_eq!(widen_voter_set(elders.clone(), elders.clone()), elders);
+    }
+
     #[tokio::test]
     async fn convergent_fleet_finalises_and_adopts_lists() {
         let payout = cp(&[
@@ -869,8 +958,13 @@ mod tests {
             ("bc1qbbb", 500_000_000_000_000),
         ]);
         let nodes = build(4, &vec![Some(payout.clone()); 4]);
-        assert_eq!(nodes[0].mgr.proposer_for(H), Some(nodes[0].id));
-        assert_eq!(nodes[0].mgr.quorum_needed(), 3, "67% of 4 = 3");
+        assert_eq!(nodes[0].mgr.proposer_for(H, CUTOFF), Some(nodes[0].id));
+        assert_eq!(
+            nodes[0].mgr.voter_set_for(H, CUTOFF).len(),
+            4,
+            "gate off → elder floor of 4"
+        );
+        assert_eq!(quorum_for(4), 3, "67% of 4 = 3");
         for n in &nodes {
             n.mgr.maybe_propose(H, CUTOFF).await;
         }

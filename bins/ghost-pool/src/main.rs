@@ -3420,6 +3420,32 @@ async fn main() -> Result<()> {
             ghost_pool::payout::ledger_root_diag(&miners, &nodes, cutoff_ts, height)
         })
     };
+    // ACTIVE_VOTER_SET resolver: the qualified active node set at a cutoff, from the SAME
+    // scoped query `compute_ledger_root_fn` uses for `node_shares` — so the voter set and
+    // the ratified ledger's node set are identical by construction. Once ACTIVE_VOTER_SET
+    // activates, the payout consensus votes/proposes over ALL qualified nodes, not just the
+    // MPC ceremony elders (with an elder floor; see `voter_set_for`).
+    let active_voter_set_fn: ghost_pool::payout_checkpoint::ActiveVoterSetFn = {
+        let db_c = Arc::clone(&db);
+        let oracle_c = block_hash_oracle.clone();
+        Arc::new(move |cutoff_ts, height| {
+            let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
+                .with_block_hash_oracle(Arc::new(oracle_c.clone()));
+            let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
+            let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
+            let mut ids: Vec<ghost_common::types::NodeId> = qp
+                .get_all_qualified_nodes_at_cutoff_from_db(
+                    cutoff_ts,
+                    voter_set_scoped,
+                    assignment_scoped,
+                )
+                .into_iter()
+                .map(|(id, _shares)| id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        })
+    };
     let payout_checkpoint_mgr = Arc::new(
         ghost_pool::payout_checkpoint::PayoutCheckpointManager::new(
             Arc::clone(&identity),
@@ -3427,7 +3453,8 @@ async fn main() -> Result<()> {
             plchk_send,
             compute_ledger_root_fn,
         )
-        .with_diag(compute_ledger_root_diag_fn),
+        .with_diag(compute_ledger_root_diag_fn)
+        .with_active_voter_set_fn(active_voter_set_fn),
     );
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
