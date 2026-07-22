@@ -1259,6 +1259,15 @@ pub struct VerificationState {
     /// `FEE_TO_NODE_POOL`. Injected from ghost-pool (owns the `PayoutHandler` split math).
     #[allow(clippy::type_complexity)]
     pub fee_node_split_fn: Option<Arc<dyn Fn(u64) -> Option<String> + Send + Sync>>,
+    /// ACTIVE_VOTER_SET convergence proof: given `(cutoff_ts, height)`, returns the
+    /// checkpoint-path voter set consensus WOULD use once the gate is armed —
+    /// `(count, hash-of-sorted-node-ids, floored)` where `floored` = the superset floor
+    /// engaged (active set not a superset of elders → fell back to the elder set). Ignores
+    /// the gate height itself so the value that goes live can be proven identical fleet-wide
+    /// BEFORE arming. Injected from ghost-pool (owns `widen_voter_set`).
+    #[allow(clippy::type_complexity)]
+    pub checkpoint_voter_set_fn:
+        Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>>,
     /// Dashboard config (mutable settings)
     pub dashboard_config: parking_lot::RwLock<DashboardConfig>,
     /// Node config with disk persistence (ghost_mode, etc.) - minimal JSON config
@@ -1559,6 +1568,7 @@ impl VerificationState {
             rpc: None,
             block_hash_oracle: None,
             fee_node_split_fn: None,
+            checkpoint_voter_set_fn: None,
             dashboard_config: parking_lot::RwLock::new(dashboard_config),
             node_config: parking_lot::RwLock::new(NodeConfig::default()),
             node_config_path: None,
@@ -1989,6 +1999,16 @@ impl VerificationState {
         f: Arc<dyn Fn(u64) -> Option<String> + Send + Sync>,
     ) -> Self {
         self.fee_node_split_fn = Some(f);
+        self
+    }
+
+    /// Set the checkpoint-path voter-set closure (enables the ACTIVE_VOTER_SET proof).
+    #[allow(clippy::type_complexity)]
+    pub fn with_checkpoint_voter_set_fn(
+        mut self,
+        f: Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>,
+    ) -> Self {
+        self.checkpoint_voter_set_fn = Some(f);
         self
     }
 

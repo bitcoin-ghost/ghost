@@ -199,13 +199,20 @@ fn quorum_for(n: usize) -> usize {
 /// the `active` qualified set only when it is a non-empty *superset* of `elders` (both
 /// sorted). Otherwise keep `elders`, so the voter set can only grow beyond the established
 /// floor, never shrink below it. Pure so the floor invariant is unit-tested independent of
-/// the gate/resolver plumbing.
-fn widen_voter_set(elders: Vec<NodeId>, active: Vec<NodeId>) -> Vec<NodeId> {
-    if !active.is_empty() && elders.iter().all(|e| active.binary_search(e).is_ok()) {
+/// the gate/resolver plumbing, and `pub` so the convergence-proof endpoint hashes the
+/// EXACT set consensus would use.
+pub fn widen_voter_set(elders: Vec<NodeId>, active: Vec<NodeId>) -> Vec<NodeId> {
+    if active_is_superset_of_elders(&elders, &active) {
         active
     } else {
         elders
     }
+}
+
+/// The superset predicate `widen_voter_set` uses to decide whether to widen. Exposed so the
+/// convergence-proof endpoint can report whether the floor engaged (`floored = !this`).
+pub fn active_is_superset_of_elders(elders: &[NodeId], active: &[NodeId]) -> bool {
+    !active.is_empty() && elders.iter().all(|e| active.binary_search(e).is_ok())
 }
 
 impl PayoutCheckpointManager {

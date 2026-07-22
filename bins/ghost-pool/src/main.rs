@@ -6248,6 +6248,44 @@ async fn main() -> Result<()> {
             Some(hex::encode(h.finalize()))
         })
     });
+    // ACTIVE_VOTER_SET convergence proof: hash the checkpoint-path voter set consensus WOULD
+    // use once the gate is armed — the widened set (active-qualified set floored to a superset
+    // of the elders), from the SAME scoped query the consensus resolver uses. Ignores the gate
+    // height so the go-live value is provable identical fleet-wide BEFORE arming.
+    verification_state = verification_state.with_checkpoint_voter_set_fn({
+        let db_c = Arc::clone(&db);
+        let oracle_c = block_hash_oracle.clone();
+        Arc::new(
+            move |cutoff_ts: i64, height: u64| -> Option<(usize, String, bool)> {
+                use sha2::{Digest, Sha256};
+                let mut elders: Vec<ghost_common::types::NodeId> =
+                    db_c.get_mpc_elder_node_ids().ok()?.into_iter().collect();
+                elders.sort_unstable();
+                let qp = ghost_verification::QualifiedCapabilityProvider::new(Arc::clone(&db_c))
+                    .with_block_hash_oracle(Arc::new(oracle_c.clone()));
+                let voter_set_scoped = height >= ghost_pool::voter_set_qualification_height();
+                let assignment_scoped = height >= ghost_pool::challenger_assignment_height();
+                let mut active: Vec<ghost_common::types::NodeId> = qp
+                    .get_all_qualified_nodes_at_cutoff_from_db(
+                        cutoff_ts,
+                        voter_set_scoped,
+                        assignment_scoped,
+                    )
+                    .into_iter()
+                    .map(|(id, _shares)| id)
+                    .collect();
+                active.sort_unstable();
+                let floored =
+                    !ghost_pool::payout_checkpoint::active_is_superset_of_elders(&elders, &active);
+                let voters = ghost_pool::payout_checkpoint::widen_voter_set(elders, active);
+                let mut h = Sha256::new();
+                for id in &voters {
+                    h.update(id);
+                }
+                Some((voters.len(), hex::encode(h.finalize()), floored))
+            },
+        )
+    });
 
     // Report the operator's Wraith-mixing choice from `[ghost_pay] wraith_enabled`
     // on the ghostpay status endpoint, so the dashboard's L2 card reflects the

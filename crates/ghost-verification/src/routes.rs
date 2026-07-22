@@ -5700,6 +5700,14 @@ async fn api_qualification_scoped_set_handler(
     // normalised pool). Identical across all nodes = the FEE coinbase node-split converges —
     // the check to run before arming FEE_TO_NODE_POOL. `has_fn` reports whether it's wired.
     let fee_node_split = state.fee_node_split_fn.as_ref().and_then(|f| f(cp.height));
+    // ACTIVE_VOTER_SET convergence: the checkpoint-path voter set consensus WOULD use once the
+    // gate is armed (active-qualified set floored to a superset of the elders), hashed over its
+    // sorted node ids. Identical across all nodes = the payout voter set converges — the check
+    // to run before arming ACTIVE_VOTER_SET. `floored` = the elder floor engaged this block.
+    let checkpoint_voter_set = state
+        .checkpoint_voter_set_fn
+        .as_ref()
+        .and_then(|f| f(cutoff, cp.height));
     Json(serde_json::json!({
         "cutoff_ts": cutoff,
         "checkpoint_height": cp.height,
@@ -5713,6 +5721,12 @@ async fn api_qualification_scoped_set_handler(
         "fee_node_split": {
             "hash": fee_node_split,
             "has_fn": state.fee_node_split_fn.is_some(),
+        },
+        "checkpoint_voter_set": {
+            "count": checkpoint_voter_set.as_ref().map(|(c, _, _)| *c),
+            "hash": checkpoint_voter_set.as_ref().map(|(_, h, _)| h.clone()),
+            "floored": checkpoint_voter_set.as_ref().map(|(_, _, f)| *f),
+            "has_fn": state.checkpoint_voter_set_fn.is_some(),
         },
     }))
 }
