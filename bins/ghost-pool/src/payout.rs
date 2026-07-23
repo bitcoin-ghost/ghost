@@ -276,7 +276,7 @@ pub fn ledger_root_diag(
 
 /// Resolve the cutoff timestamp that anchors the payout for a block at `tip_height`.
 ///
-/// This is the fix for the v1.10.32 live failure. BELOW `fee_to_node_pool_height()`
+/// This is the fix for the v1.10.32 live failure. BELOW `coinbase_fee_split_height()`
 /// the coinbase is treasury-only, so the anchor is wall-clock `now()` — the legacy
 /// behaviour, with no cross-node split to diverge on. AT AND ABOVE the gate the
 /// coinbase carries the miner+node split, and anchoring at `now()` is exactly what
@@ -293,7 +293,7 @@ pub fn ledger_root_diag(
 /// caller must then build NO split payout — the block falls back to a treasury-only
 /// coinbase, which is safe because there is nothing for validators to disagree on.
 pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> Option<i64> {
-    if tip_height < crate::fee_to_node_pool_height() {
+    if tip_height < crate::coinbase_fee_split_height() {
         return Some(chrono::Utc::now().timestamp());
     }
     match db.get_payout_ledger_checkpoint_at_or_before(tip_height) {
@@ -357,7 +357,7 @@ pub fn read_adopted_payout(
 /// nothing to bind, so this is inert (and the whole scheme ships dormant).
 ///
 /// Extracted from the validator closure so it is unit-testable: the gate is a
-/// parameter here rather than the process-global `fee_to_node_pool_height()`.
+/// parameter here rather than the process-global `coinbase_fee_split_height()`.
 pub fn check_proposal_cutoff_binding(
     db: &ghost_storage::Database,
     block_height: u64,
@@ -415,7 +415,7 @@ pub fn make_proposal_validator(
             &db,
             proposal.block_height,
             proposal.timestamp as i64,
-            crate::fee_to_node_pool_height(),
+            crate::coinbase_fee_split_height(),
         )?;
 
         // Timestamp freshness is GATE-AWARE and owned here (the vote handler keeps only a loose
@@ -427,7 +427,7 @@ pub fn make_proposal_validator(
         // is `block(tip-LAG).time`, legitimately minutes-to-hours behind now — anchoring the
         // freshness window at now() is exactly what rejected every post-gate proposal and broke
         // the FEE activation).
-        if proposal.block_height < crate::fee_to_node_pool_height() {
+        if proposal.block_height < crate::coinbase_fee_split_height() {
             const PRE_GATE_FRESHNESS_SECS: i64 = 1800; // 30 min
             let now = chrono::Utc::now().timestamp();
             if (now - proposal.timestamp as i64).abs() > PRE_GATE_FRESHNESS_SECS {
@@ -449,7 +449,7 @@ pub fn make_proposal_validator(
         // Below the gate (legacy GHOST-02): recompute from the UNPAID LEDGER over the
         // proposer's exact window (cutoff rides on `proposal.timestamp`) — unchanged.
         let (local_work, adopted_nodes) =
-            if proposal.block_height >= crate::fee_to_node_pool_height() {
+            if proposal.block_height >= crate::coinbase_fee_split_height() {
                 match read_adopted_payout(&db, proposal.block_height) {
                     Some((miners, nodes)) => (miners, Some(nodes)),
                     None => {
@@ -774,7 +774,7 @@ impl PayoutProposalCreator {
             data.tx_fees_sats,
             &data.treasury_state,
             decay_ts,
-            data.block_height,
+            data.block_height >= crate::coinbase_fee_split_height(),
         );
 
         info!(
@@ -1289,7 +1289,7 @@ impl PayoutProposalCreator {
             proposal.tx_fees,
             treasury_state,
             block_time,
-            proposal.block_height,
+            proposal.block_height >= crate::coinbase_fee_split_height(),
         );
         let (expected, _dust) = self
             .calculate_miner_payouts(local_miner_work, fee_dist.miner_pool)
@@ -1381,7 +1381,7 @@ impl PayoutProposalCreator {
     /// shares → sats with the SAME `calculate_node_payouts` the proposer used yields
     /// the identical address→amount map. Any divergence is a forged node split.
     ///
-    /// The caller gates this on `fee_to_node_pool_height()` and only reaches it after
+    /// The caller gates this on `coinbase_fee_split_height()` and only reaches it after
     /// `check_proposal_cutoff_binding` has confirmed the cutoff is a finalised one.
     pub fn validate_node_split(
         &self,
@@ -1398,7 +1398,7 @@ impl PayoutProposalCreator {
             proposal.tx_fees,
             treasury_state,
             block_time,
-            proposal.block_height,
+            proposal.block_height >= crate::coinbase_fee_split_height(),
         );
         // The node pool is the base node-reward pool plus miner dust — recompute the
         // dust exactly the way `create_proposal` does (from the same miner work).
@@ -2028,7 +2028,7 @@ impl PayoutHandler {
         // checkpoint (option c consumption). Recomputing the qualified set here would
         // diverge from the adopted list and reject the split the fleet agreed on. Below
         // the gate the node split is not consensus-enforced (legacy) and this is skipped.
-        if proposal.block_height >= crate::fee_to_node_pool_height() {
+        if proposal.block_height >= crate::coinbase_fee_split_height() {
             let node_shares = match adopted_node_shares {
                 Some(n) => n,
                 None => {
@@ -2064,7 +2064,7 @@ impl PayoutHandler {
         // `data.ledger_cutoff_ts` (the finalised checkpoint cutoff) — byte-for-byte the
         // SAME set the checkpoint's ledger_root committed to, so the coinbase pays
         // exactly what the fleet ratified and Component-E recompute-reject can only pass.
-        let qualified_shares = if data.block_height >= crate::fee_to_node_pool_height() {
+        let qualified_shares = if data.block_height >= crate::coinbase_fee_split_height() {
             // Option (c) adopt-CONSUMPTION: at/above the gate the node split is the
             // fleet-ratified set the proposer path already sourced from the finalised
             // checkpoint (`read_adopted_payout`) and passed in as `data.node_shares`.
@@ -2087,7 +2087,7 @@ impl PayoutHandler {
             verified_nodes = verified_count,
             claimed_shares = total_claimed_shares,
             verified_shares = total_verified_shares,
-            adopted = data.block_height >= crate::fee_to_node_pool_height(),
+            adopted = data.block_height >= crate::coinbase_fee_split_height(),
             "Node shares for payout (adopted checkpoint set at/above gate, else verified)"
         );
 
@@ -2773,7 +2773,7 @@ mod tests {
                 0,
                 &treasury,
                 chrono::DateTime::from_timestamp(ts, 0).unwrap(),
-                LEDGER_TEST_HEIGHT,
+                false, // pre-gate; tx_fees=0 so the fee-split regime is immaterial here
             )
             .treasury_amount
         };
@@ -2911,7 +2911,7 @@ mod tests {
             proposal.tx_fees,
             &TreasuryState::new(),
             block_time,
-            proposal.block_height,
+            proposal.block_height >= crate::coinbase_fee_split_height(),
         )
         .treasury_amount;
         if floor == 0 {

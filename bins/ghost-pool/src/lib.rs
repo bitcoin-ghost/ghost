@@ -118,22 +118,24 @@ pub const CLUSTER_ENFORCEMENT_HEIGHT: u64 = 955_200;
 /// differently from the proposer would reject an honest split.
 pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 
-/// At and above this height, TX fees go to the NODE REWARD POOL (shared out by 5-4-3-2-1
-/// capability shares) instead of 100% to the block finder.
+/// At and above this height, TX fees are FOLDED INTO THE COINBASE REWARD and split like the
+/// subsidy — 99% to miners (by share/work), and the 1% pool fee levied on `subsidy + fees` and
+/// divided between treasury and node pool by the decay schedule — instead of the whole fee going
+/// to the block finder.
 ///
 /// This is what makes a block's coinbase fully determined BEFORE the block is found, and so it
-/// is what makes tip-change payout ratification possible at all.
+/// is what makes tip-change payout ratification possible at all. The block finder was the single
+/// unknown in the coinbase (it existed only to receive the fees); routing fees through the
+/// share-based split removes it, and both the miner split (unpaid ledger) and the node split
+/// (verified capabilities) are already fixed by state that exists at tip change.
 ///
-/// Every other part of the coinbase — the miner split (unpaid ledger) and the node reward split
-/// (verified capabilities) — is already fixed by state that exists at tip change. The block
-/// finder was the single unknown, and it existed only to receive the fees. Remove it and the
-/// mesh can ratify the whole coinbase in advance, which is the only way a block can pay miners:
-/// a block's coinbase is fixed when its template is built, so it can only ever pay a payout that
-/// was already approved.
-///
-/// Fees remain NODE income and never touch the miner pool; only *which* nodes changes. Which
-/// node "finds" a block is luck — it is whichever node the load balancer routed the winning
-/// miner to — whereas capability shares reflect actual contribution.
+/// Economic model (chosen 2026-07-23): the pool takes a flat 1% of the whole reward
+/// (`subsidy + fees`); miners keep the other 99% of everything. The 1% is split treasury/node by
+/// the SAME decay curve as before (50/50 → 0/100 over 5y), so once the treasury wind-down
+/// completes the node pool earns the full 1% — of `subsidy + fees`. As the subsidy halves away
+/// and fees come to dominate, node income rides the fee economy exactly when it needs to, and
+/// miners always receive a clean 99% of the total. Below the gate (legacy): the 1% pool fee is
+/// levied on the subsidy only and TX fees go 100% to the block finder.
 ///
 /// Coinbase construction is consensus-visible, so this is a height gate, not a feature flag: a
 /// mixed-version fleet must not split on how the coinbase is built. Both code paths exist in the
@@ -157,7 +159,7 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// RE-ARM (after v1.11.14 is deployed + re-soaked): set this to a height comfortably past the
 /// roll window, deploy ALL 8 before the anchor reaches it, and watch the first FEE block closely
 /// (coinbase correct, proposal RATIFIED, block accepted, node pool paid). Revert = `.bak`.
-pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
+pub const COINBASE_FEE_SPLIT_HEIGHT: u64 = u64::MAX;
 
 /// Multi-operator share-injection defence. At and above this height, a `ShareProof` MUST
 /// carry its 80-byte block header and every node independently re-verifies the PoW
@@ -173,7 +175,7 @@ pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
 ///
 /// ARMED at 959_030 (v1.11.1, 2026-07-21): the fleet ships ghost-pool + pool_sv2 v1.11.0
 /// (pool_sv2 emits the 80-byte header on the share webhook); this arms the recipient-side
-/// re-verification. Bounded blast radius — FEE_TO_NODE_POOL is still dormant, so this only
+/// re-verification. Bounded blast radius — COINBASE_FEE_SPLIT is still dormant, so this only
 /// gates cross-node share-gossip verification (no coinbase/fund impact), and it is
 /// reversible by re-releasing with a higher height. The fleet must be fully on v1.11.1
 /// BEFORE the tip reaches this height (canary roll finishes ~959_022, ~8-block margin).
@@ -244,7 +246,7 @@ mod gates {
     use std::sync::OnceLock;
 
     pub(super) static CLUSTER_ENFORCEMENT: OnceLock<u64> = OnceLock::new();
-    pub(super) static FEE_TO_NODE_POOL: OnceLock<u64> = OnceLock::new();
+    pub(super) static COINBASE_FEE_SPLIT: OnceLock<u64> = OnceLock::new();
     pub(super) static VOTER_SET_QUALIFICATION: OnceLock<u64> = OnceLock::new();
     pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
@@ -269,9 +271,9 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         CLUSTER_ENFORCEMENT_HEIGHT,
     );
     let fee = gates::from_env(
-        "GHOST_FEE_TO_NODE_POOL_HEIGHT",
+        "GHOST_COINBASE_FEE_SPLIT_HEIGHT",
         network,
-        FEE_TO_NODE_POOL_HEIGHT,
+        COINBASE_FEE_SPLIT_HEIGHT,
     );
     let voter_set = gates::from_env(
         "GHOST_VOTER_SET_QUALIFICATION_HEIGHT",
@@ -294,14 +296,14 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         ACTIVE_VOTER_SET_HEIGHT,
     );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
-    let _ = gates::FEE_TO_NODE_POOL.set(fee);
+    let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
     let _ = gates::CHALLENGER_ASSIGNMENT.set(challenger_assignment);
     let _ = gates::SHARE_POW_VERIFY.set(share_pow_verify);
     let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
-        || fee != FEE_TO_NODE_POOL_HEIGHT
+        || fee != COINBASE_FEE_SPLIT_HEIGHT
         || voter_set != VOTER_SET_QUALIFICATION_HEIGHT
         || challenger_assignment != CHALLENGER_ASSIGNMENT_HEIGHT
         || share_pow_verify != SHARE_POW_VERIFY_HEIGHT
@@ -309,7 +311,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
-            fee_to_node_pool_height = fee,
+            coinbase_fee_split_height = fee,
             voter_set_qualification_height = voter_set,
             challenger_assignment_height = challenger_assignment,
             share_pow_verify_height = share_pow_verify,
@@ -327,8 +329,8 @@ pub fn cluster_enforcement_height() -> u64 {
 
 /// The height at which TX fees move to the node reward pool and the coinbase becomes ratifiable
 /// at tip change.
-pub fn fee_to_node_pool_height() -> u64 {
-    *gates::FEE_TO_NODE_POOL.get_or_init(|| FEE_TO_NODE_POOL_HEIGHT)
+pub fn coinbase_fee_split_height() -> u64 {
+    *gates::COINBASE_FEE_SPLIT.get_or_init(|| COINBASE_FEE_SPLIT_HEIGHT)
 }
 
 /// The height at which node-reward qualification restricts distinct challengers to the consensus

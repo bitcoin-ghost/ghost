@@ -1256,7 +1256,7 @@ pub struct VerificationState {
     /// FEE convergence proof: given a height, returns a hash of the FEE-armed node-reward
     /// split (adopted `node_shares` distributed over a normalised pool) so the scoped-set
     /// endpoint can prove the coinbase node-split converges fleet-wide BEFORE arming
-    /// `FEE_TO_NODE_POOL`. Injected from ghost-pool (owns the `PayoutHandler` split math).
+    /// `COINBASE_FEE_SPLIT`. Injected from ghost-pool (owns the `PayoutHandler` split math).
     #[allow(clippy::type_complexity)]
     pub fee_node_split_fn: Option<Arc<dyn Fn(u64) -> Option<String> + Send + Sync>>,
     /// ACTIVE_VOTER_SET convergence proof: given `(cutoff_ts, height)`, returns the
@@ -1268,12 +1268,13 @@ pub struct VerificationState {
     #[allow(clippy::type_complexity)]
     pub checkpoint_voter_set_fn:
         Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>>,
-    /// FEE coinbase convergence proof (treasury half): given `(cutoff_ts, height)`, returns a
-    /// hash of the treasury-decay fee split (`miner_pool`, `treasury_amount`, `node_reward_pool`)
-    /// computed from THIS node's `treasury_state` at the CONVERGED checkpoint cutoff. Identical
-    /// across all nodes = the treasury-dependent half of the FEE coinbase converges — the last
-    /// input, after `FEE_TO_NODE_POOL`'s adopted lists (checkpoint) and node distribution
-    /// (`fee_node_split`) are already proven. Injected from ghost-pool.
+    /// FEE coinbase reward-split convergence proof: given `(cutoff_ts, height)`, returns a hash of
+    /// the GO-LIVE reward split (`miner_pool`, `treasury_amount`, `node_reward_pool`) — the
+    /// `COINBASE_FEE_SPLIT` regime forced ON — computed from THIS node's `treasury_state` at the
+    /// CONVERGED checkpoint cutoff. Identical across all nodes = the coinbase reward split (miners
+    /// 99% of subsidy+fees; treasury/node the decaying 1%) converges before the gate is armed;
+    /// the adopted lists (checkpoint) and node distribution (`fee_node_split`) are already proven.
+    /// Injected from ghost-pool.
     #[allow(clippy::type_complexity)]
     pub fee_split_fn: Option<Arc<dyn Fn(i64, u64) -> Option<String> + Send + Sync>>,
     /// Dashboard config (mutable settings)
@@ -2001,7 +2002,7 @@ impl VerificationState {
         self
     }
 
-    /// Set the FEE node-split hash closure (enables the FEE_TO_NODE_POOL convergence proof).
+    /// Set the FEE node-split hash closure (enables the COINBASE_FEE_SPLIT convergence proof).
     #[allow(clippy::type_complexity)]
     pub fn with_fee_node_split_fn(
         mut self,
@@ -2021,7 +2022,7 @@ impl VerificationState {
         self
     }
 
-    /// Set the FEE treasury-decay split closure (enables the FEE_TO_NODE_POOL treasury proof).
+    /// Set the FEE treasury-decay split closure (enables the COINBASE_FEE_SPLIT treasury proof).
     #[allow(clippy::type_complexity)]
     pub fn with_fee_split_fn(
         mut self,

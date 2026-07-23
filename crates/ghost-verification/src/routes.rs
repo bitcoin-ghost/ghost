@@ -5616,7 +5616,7 @@ async fn api_rewards_node_payout_events_handler(
 /// Read-only pre-gate proof for payout-ledger finalisation.
 ///
 /// Each node reports its OWN latest BFT-finalised `PayoutLedgerCheckpoint`. The
-/// coinbase gate (`fee_to_node_pool_height`) is off until we can watch the fleet
+/// coinbase gate (`coinbase_fee_split_height`) is off until we can watch the fleet
 /// finalise identically: an operator polls this endpoint on every node and checks
 /// they agree on `(height, ledger_root)`. Agreement across the fleet is exactly the
 /// property the gate depends on, so this endpoint is how we earn confidence to flip
@@ -5698,7 +5698,7 @@ async fn api_qualification_scoped_set_handler(
     let assignment = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, true);
     // FEE convergence: hash of the FEE-armed node-reward split (adopted node_shares over a
     // normalised pool). Identical across all nodes = the FEE coinbase node-split converges —
-    // the check to run before arming FEE_TO_NODE_POOL. `has_fn` reports whether it's wired.
+    // the check to run before arming COINBASE_FEE_SPLIT. `has_fn` reports whether it's wired.
     let fee_node_split = state.fee_node_split_fn.as_ref().and_then(|f| f(cp.height));
     // ACTIVE_VOTER_SET convergence: the checkpoint-path voter set consensus WOULD use once the
     // gate is armed (active-qualified set floored to a superset of the elders), hashed over its
@@ -5708,9 +5708,10 @@ async fn api_qualification_scoped_set_handler(
         .checkpoint_voter_set_fn
         .as_ref()
         .and_then(|f| f(cutoff, cp.height));
-    // FEE coinbase treasury-half convergence: hash of the treasury-decay fee split from this
-    // node's treasury_state at the checkpoint cutoff. Identical across all nodes = the last
-    // FEE coinbase input (treasury) converges — the check before arming FEE_TO_NODE_POOL.
+    // FEE coinbase reward-split convergence: hash of the GO-LIVE split (miners 99% of
+    // subsidy+fees; treasury/node the decaying 1%) from this node's treasury_state at the
+    // checkpoint cutoff. Identical across all nodes = the coinbase split converges — the check
+    // before arming COINBASE_FEE_SPLIT.
     let fee_split = state
         .fee_split_fn
         .as_ref()

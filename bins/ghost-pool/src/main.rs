@@ -6216,7 +6216,7 @@ async fn main() -> Result<()> {
         verification_state.with_block_hash_oracle(Arc::new(block_hash_oracle.clone()));
     // FEE convergence proof: hash the FEE-armed node-reward split (the adopted checkpoint's
     // node_shares distributed over a normalised 1-BTC pool) so /api/v1/qualification/scoped-set
-    // can prove the coinbase node-split converges fleet-wide BEFORE arming FEE_TO_NODE_POOL —
+    // can prove the coinbase node-split converges fleet-wide BEFORE arming COINBASE_FEE_SPLIT —
     // the exact thing that diverged in v1.10.32. Normalised pool → the hash reflects the
     // adopted distribution + the deterministic split math, independent of block-specific fees.
     verification_state = verification_state.with_fee_node_split_fn({
@@ -6290,7 +6290,7 @@ async fn main() -> Result<()> {
     // THIS node's treasury_state at the CONVERGED checkpoint cutoff (matching the coinbase after
     // the now()->cutoff fix). A fixed subsidy+fees makes all nodes compare like-with-like, so
     // only treasury_state (threshold_reached_at) can move the hash — proving the last coinbase
-    // input converges before arming FEE_TO_NODE_POOL (adopted lists + node split already proven).
+    // input converges before arming COINBASE_FEE_SPLIT (adopted lists + node split already proven).
     verification_state = verification_state.with_fee_split_fn({
         let db_c = Arc::clone(&db);
         Arc::new(move |cutoff_ts: i64, height: u64| -> Option<String> {
@@ -6306,12 +6306,15 @@ async fn main() -> Result<()> {
             let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
             let decay_ts = chrono::DateTime::from_timestamp(cutoff_ts, 0)?;
             const PROOF_FEES: u64 = 100_000;
+            // Force the fee-split ON so this proves the GO-LIVE coinbase split (miner_pool +
+            // treasury + node over subsidy+fees) converges fleet-wide BEFORE the gate is armed —
+            // exactly what will run at/above COINBASE_FEE_SPLIT_HEIGHT.
             let fd = ghost_pool::treasury::FeeDistribution::calculate_at_height(
                 subsidy,
                 PROOF_FEES,
                 &treasury_state,
                 decay_ts,
-                height,
+                true,
             );
             let mut h = Sha256::new();
             h.update(fd.miner_pool.to_le_bytes());
@@ -7092,7 +7095,7 @@ async fn main() -> Result<()> {
                 // has no way to know the proposer fell back, so it would recompute and
                 // reject. An empty list means nobody is owed — `handle_block_found` skips
                 // submission and any merely-late shares are swept by the next block.
-                let (miner_work, node_shares) = if height >= ghost_pool::fee_to_node_pool_height()
+                let (miner_work, node_shares) = if height >= ghost_pool::coinbase_fee_split_height()
                 {
                     match ghost_pool::payout::read_adopted_payout(&db_for_bf, height) {
                         Some((m, n)) => (m, n),
@@ -8811,13 +8814,13 @@ async fn main() -> Result<()> {
                     // is settled when a block PAYS (see `payout::settle_paid_block`), not when a
                     // proposal is approved — otherwise this would wipe the ledger every tip while
                     // paying nobody.
-                    // Gated on FEE_TO_NODE_POOL_HEIGHT, and it must be: below that gate the
+                    // Gated on COINBASE_FEE_SPLIT_HEIGHT, and it must be: below that gate the
                     // coinbase still carries a TX-fee output addressed to the block FINDER, and
                     // at tip change nobody has found the block yet. A pre-gate tip proposal would
                     // have to name a finder it cannot know, handing that block's fees to whichever
                     // node's turn it happened to be. Routing fees to the node reward pool is what
                     // removes the last unknown from the coinbase and makes it ratifiable early.
-                    if height >= ghost_pool::fee_to_node_pool_height()
+                    if height >= ghost_pool::coinbase_fee_split_height()
                         && height > last_proposed_height
                     {
                         last_proposed_height = height;

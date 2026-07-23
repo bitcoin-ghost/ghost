@@ -23,15 +23,16 @@ pub const POOL_FEE_BASIS_POINTS: u64 = ghost_common::constants::POOL_FEE_BASIS_P
 /// Calculate fee distribution for a block
 #[derive(Debug, Clone)]
 pub struct FeeDistribution {
-    /// TX fees go 100% to block finder
+    /// TX fees paid whole to the block finder — pre-gate only; 0 once the fee-split regime is on
+    /// (post-gate the fees are folded into the miner pool).
     pub tx_fees_to_block_finder: u64,
-    /// Treasury allocation (decays over time)
+    /// Treasury allocation (decaying share of the 1% pool fee)
     pub treasury_amount: u64,
-    /// Node reward pool (increases as treasury decays)
+    /// Node reward pool (rising share of the 1% pool fee as the treasury decays)
     pub node_reward_pool: u64,
-    /// Miner pool (99% of subsidy)
+    /// Miner pool — 99% of the reward (subsidy pre-gate; subsidy + fees post-gate)
     pub miner_pool: u64,
-    /// Total pool fee (1% of subsidy)
+    /// Total pool fee — 1% of the reward (subsidy pre-gate; subsidy + fees post-gate)
     pub pool_fee: u64,
     /// Treasury rate in basis points (for logging)
     pub treasury_rate_bps: u64,
@@ -51,6 +52,10 @@ impl FeeDistribution {
     /// 2. miner_pool + pool_fee == subsidy (no satoshis lost)
     ///
     /// M-5 SECURITY: Takes a block_timestamp to ensure deterministic decay calculation.
+    ///
+    /// Legacy / solo path: the fee-split regime is OFF (TX fees go to the block finder, pool fee
+    /// on subsidy only). Callers on the mesh coinbase path use `calculate_at_height` with the
+    /// gate-derived `fee_split`.
     pub fn calculate(
         subsidy_sats: u64,
         tx_fees_sats: u64,
@@ -62,61 +67,67 @@ impl FeeDistribution {
             tx_fees_sats,
             treasury_state,
             block_timestamp,
-            0,
+            false,
         )
     }
 
-    /// Fee distribution for a block at `block_height`.
+    /// Fee distribution, given whether the coinbase fee-split regime is active (`fee_split`).
     ///
-    /// At and above `FEE_TO_NODE_POOL_HEIGHT`, TX fees go to the NODE REWARD POOL rather than
-    /// 100% to the block finder. That removes the only part of the coinbase that depends on who
-    /// wins the block, which is what lets the mesh ratify the coinbase at tip change — and a
-    /// block can only ever pay a payout that was ratified before its template was built.
+    /// `fee_split` is `block_height >= COINBASE_FEE_SPLIT_HEIGHT` in production; it is an explicit
+    /// parameter (not read from the global gate) so the split is unit-testable and the convergence
+    /// proof can compute the go-live value while the gate is still dormant.
     ///
-    /// Fees stay node income either way; only which nodes changes. Pre-gate behaviour is
-    /// untouched so a mixed-version fleet cannot split on coinbase construction.
+    /// `fee_split = true` (at/above the gate): TX fees are FOLDED INTO THE REWARD and split like
+    /// the subsidy — the 1% pool fee is levied on `subsidy + fees` and divided treasury/node by the
+    /// decay schedule, and miners keep the other 99% of `subsidy + fees`. No block-finder output,
+    /// so the coinbase is fully determined before the block is found (ratifiable at tip change).
+    ///
+    /// `fee_split = false` (legacy / pre-gate): the 1% pool fee is levied on the subsidy only, and
+    /// TX fees go 100% to the block finder. Untouched so a mixed-version fleet cannot split on
+    /// coinbase construction.
     pub fn calculate_at_height(
         subsidy_sats: u64,
         tx_fees_sats: u64,
         treasury_state: &TreasuryState,
         block_timestamp: DateTime<Utc>,
-        block_height: u64,
+        fee_split: bool,
     ) -> Self {
-        let fees_to_node_pool = block_height >= crate::fee_to_node_pool_height();
-        let tx_fees_to_block_finder = if fees_to_node_pool { 0 } else { tx_fees_sats };
+        // Post-gate the fees join the reward the pool fee is levied on and the miners share; below
+        // the gate they go whole to the finder and the pool fee is on the subsidy alone.
+        let total_reward = if fee_split {
+            subsidy_sats.saturating_add(tx_fees_sats)
+        } else {
+            subsidy_sats
+        };
+        let tx_fees_to_block_finder = if fee_split { 0 } else { tx_fees_sats };
 
-        // Pool fee is 1% of subsidy only (not TX fees)
-        let pool_fee = subsidy_sats * POOL_FEE_BASIS_POINTS / 10000;
+        // Pool fee is 1% of the reward the pool fee applies to (u128 to avoid overflow on the sum).
+        let pool_fee = (total_reward as u128 * POOL_FEE_BASIS_POINTS as u128 / 10000) as u64;
 
-        // Split pool fee between treasury and nodes based on decay schedule
+        // Split pool fee between treasury and nodes based on decay schedule. The node pool gets the
+        // remainder — the WHOLE pool fee, never the raw TX fees (post-gate those are in the miner
+        // pool), so once the treasury decays to 0 the node pool earns the full 1% of subsidy+fees.
         let (treasury_rate_bps, node_rate_bps) = treasury_state.get_fee_split_bps(block_timestamp);
         let treasury_amount = (pool_fee as u128 * treasury_rate_bps as u128 / 10000) as u64;
-        // Explicit remainder handling - node pool gets everything not going to treasury.
-        // Post-gate the TX fees are added here: shared across qualified nodes by capability,
-        // rather than handed whole to whichever node happened to find the block.
-        let node_reward_pool = pool_fee
-            .saturating_sub(treasury_amount)
-            .saturating_add(if fees_to_node_pool { tx_fees_sats } else { 0 });
+        let node_reward_pool = pool_fee.saturating_sub(treasury_amount);
 
-        // Miner pool is 99% of subsidy (subsidy minus pool fee)
-        let miner_pool = subsidy_sats.saturating_sub(pool_fee);
+        // Miners keep 99% of the reward (reward minus the pool fee).
+        let miner_pool = total_reward.saturating_sub(pool_fee);
 
         // Convert bps to f64 for backward compatibility with logging
         let treasury_rate = treasury_rate_bps as f64 / 10000.0;
         let node_rate = node_rate_bps as f64 / 10000.0;
 
-        // M-01: Runtime invariant checks.
-        // Post-gate the node pool also carries the TX fees, so the split must account for them:
-        // treasury + node_pool == pool_fee + (fees routed to the node pool).
-        let expected_split =
-            pool_fee.saturating_add(if fees_to_node_pool { tx_fees_sats } else { 0 });
-        if treasury_amount + node_reward_pool != expected_split {
+        // M-01: Runtime invariant checks. Treasury + node pool == the whole pool fee; miner pool +
+        // pool fee == the total reward. Together with `tx_fees_to_block_finder` these account for
+        // every satoshi: pre-gate total = subsidy + fees(finder); post-gate total = subsidy + fees.
+        if treasury_amount + node_reward_pool != pool_fee {
             tracing::error!(
                 treasury_amount,
                 node_reward_pool,
                 pool_fee,
                 tx_fees_sats,
-                fees_to_node_pool,
+                fee_split,
                 "M-01 CRITICAL: Treasury split invariant violated"
             );
             return Self {
@@ -131,11 +142,11 @@ impl FeeDistribution {
                 node_rate,
             };
         }
-        if miner_pool + pool_fee != subsidy_sats {
+        if miner_pool + pool_fee != total_reward {
             tracing::error!(
                 miner_pool,
                 pool_fee,
-                subsidy_sats,
+                total_reward,
                 "M-01 CRITICAL: Miner pool + pool fee invariant violated"
             );
             return Self {
@@ -233,9 +244,20 @@ mod tests {
         let subsidy = 312_500_000u64;
         let fees = 40_000_000u64;
 
-        let d = FeeDistribution::calculate_at_height(subsidy, fees, &state, now, 0);
+        // fee_split = false (legacy / pre-gate).
+        let d = FeeDistribution::calculate_at_height(subsidy, fees, &state, now, false);
 
         assert_eq!(d.tx_fees_to_block_finder, fees);
+        assert_eq!(
+            d.pool_fee,
+            subsidy / 100,
+            "below the gate the 1% is on subsidy only"
+        );
+        assert_eq!(
+            d.miner_pool,
+            subsidy - d.pool_fee,
+            "miners get 99% of subsidy, no fees"
+        );
         assert_eq!(
             d.treasury_amount + d.node_reward_pool,
             d.pool_fee,
@@ -243,31 +265,20 @@ mod tests {
         );
     }
 
-    /// Post-gate: TX fees are shared into the NODE REWARD POOL, so nothing in the coinbase
-    /// depends on who finds the block — which is what lets the mesh ratify it at tip change.
-    ///
-    /// Fees remain node income and never reach the miner pool; only *which* nodes changes.
+    /// Post-gate: TX fees are FOLDED INTO THE REWARD and split like the subsidy — miners keep 99%
+    /// of `subsidy + fees`, and the 1% pool fee (now levied on `subsidy + fees`) is split
+    /// treasury/node by the decay schedule. Nothing in the coinbase depends on who finds the block,
+    /// which is what lets the mesh ratify it at tip change.
     #[test]
-    fn fees_go_to_the_node_pool_at_and_above_the_gate() {
-        let state = TreasuryState::new();
+    fn fees_split_into_the_reward_at_and_above_the_gate() {
+        let state = TreasuryState::new(); // pre-threshold → 50/50 treasury/node
         let now = Utc::now();
         let subsidy = 312_500_000u64;
         let fees = 40_000_000u64;
+        let total = subsidy + fees;
 
-        let below = FeeDistribution::calculate_at_height(
-            subsidy,
-            fees,
-            &state,
-            now,
-            crate::fee_to_node_pool_height() - 1,
-        );
-        let at = FeeDistribution::calculate_at_height(
-            subsidy,
-            fees,
-            &state,
-            now,
-            crate::fee_to_node_pool_height(),
-        );
+        let below = FeeDistribution::calculate_at_height(subsidy, fees, &state, now, false);
+        let at = FeeDistribution::calculate_at_height(subsidy, fees, &state, now, true);
 
         assert_eq!(
             below.tx_fees_to_block_finder, fees,
@@ -277,26 +288,68 @@ mod tests {
             at.tx_fees_to_block_finder, 0,
             "at the gate there is no block finder to pay"
         );
+        // The 1% is now levied on subsidy + fees, not the subsidy alone.
+        assert_eq!(at.pool_fee, total / 100);
+        assert!(
+            at.pool_fee > below.pool_fee,
+            "the pool fee base grew by the fees"
+        );
+        // Miners keep 99% of the WHOLE reward — they gain ~99% of the fees vs the legacy path.
+        assert_eq!(at.miner_pool, total - at.pool_fee);
+        assert!(
+            at.miner_pool > below.miner_pool,
+            "miners now share in the fees"
+        );
+        // The node pool is the pool-fee remainder ONLY — raw fees never land in it.
         assert_eq!(
             at.node_reward_pool,
-            below.node_reward_pool + fees,
-            "the fees land in the node reward pool"
+            at.pool_fee - at.treasury_amount,
+            "node pool is the decay remainder of the 1%, not the raw fees"
         );
         assert_eq!(
-            at.treasury_amount, below.treasury_amount,
-            "the treasury's share is derived from the subsidy, not the fees"
+            at.treasury_amount + at.node_reward_pool,
+            at.pool_fee,
+            "treasury + node == the whole pool fee"
         );
-        assert_eq!(
-            at.miner_pool, below.miner_pool,
-            "the miner pool is untouched — fees are node income, never the miners'"
-        );
-
         // No satoshis invented or lost: every sat of subsidy + fees is accounted for.
         assert_eq!(
             at.miner_pool + at.treasury_amount + at.node_reward_pool,
-            subsidy + fees,
+            total,
             "the whole coinbase must be accounted for"
         );
+    }
+
+    /// The long-term target of the fee model: once the treasury wind-down completes (year 5+ of
+    /// the decay, treasury 0% / node 100%), the node pool earns the WHOLE 1% — levied on
+    /// `subsidy + fees` — while miners keep a clean 99% of everything. As the subsidy halves away
+    /// and fees dominate, node income rides the fee economy.
+    #[test]
+    fn post_gate_full_decay_gives_nodes_the_whole_one_percent_of_reward() {
+        let threshold = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let state = TreasuryState::from_stored(0, Some(threshold));
+        // ~6 years past the threshold → decay year 5+ (treasury 0%, node 100%).
+        let now = chrono::DateTime::from_timestamp(1_700_000_000 + 6 * 31_536_000, 0).unwrap();
+        let subsidy = 312_500_000u64;
+        let fees = 40_000_000u64;
+        let total = subsidy + fees;
+
+        let d = FeeDistribution::calculate_at_height(subsidy, fees, &state, now, true);
+        assert_eq!(d.treasury_amount, 0, "treasury wound down to zero");
+        assert_eq!(
+            d.pool_fee,
+            total / 100,
+            "the 1% is levied on subsidy + fees"
+        );
+        assert_eq!(
+            d.node_reward_pool, d.pool_fee,
+            "node pool earns the whole 1% of subsidy + fees"
+        );
+        assert_eq!(
+            d.miner_pool,
+            total - d.pool_fee,
+            "miners keep 99% of everything"
+        );
+        assert_eq!(d.tx_fees_to_block_finder, 0);
     }
 
     #[test]
