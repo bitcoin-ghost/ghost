@@ -1268,6 +1268,14 @@ pub struct VerificationState {
     #[allow(clippy::type_complexity)]
     pub checkpoint_voter_set_fn:
         Option<Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>>,
+    /// FEE coinbase convergence proof (treasury half): given `(cutoff_ts, height)`, returns a
+    /// hash of the treasury-decay fee split (`miner_pool`, `treasury_amount`, `node_reward_pool`)
+    /// computed from THIS node's `treasury_state` at the CONVERGED checkpoint cutoff. Identical
+    /// across all nodes = the treasury-dependent half of the FEE coinbase converges — the last
+    /// input, after `FEE_TO_NODE_POOL`'s adopted lists (checkpoint) and node distribution
+    /// (`fee_node_split`) are already proven. Injected from ghost-pool.
+    #[allow(clippy::type_complexity)]
+    pub fee_split_fn: Option<Arc<dyn Fn(i64, u64) -> Option<String> + Send + Sync>>,
     /// Dashboard config (mutable settings)
     pub dashboard_config: parking_lot::RwLock<DashboardConfig>,
     /// Node config with disk persistence (ghost_mode, etc.) - minimal JSON config
@@ -1569,6 +1577,7 @@ impl VerificationState {
             block_hash_oracle: None,
             fee_node_split_fn: None,
             checkpoint_voter_set_fn: None,
+            fee_split_fn: None,
             dashboard_config: parking_lot::RwLock::new(dashboard_config),
             node_config: parking_lot::RwLock::new(NodeConfig::default()),
             node_config_path: None,
@@ -2009,6 +2018,16 @@ impl VerificationState {
         f: Arc<dyn Fn(i64, u64) -> Option<(usize, String, bool)> + Send + Sync>,
     ) -> Self {
         self.checkpoint_voter_set_fn = Some(f);
+        self
+    }
+
+    /// Set the FEE treasury-decay split closure (enables the FEE_TO_NODE_POOL treasury proof).
+    #[allow(clippy::type_complexity)]
+    pub fn with_fee_split_fn(
+        mut self,
+        f: Arc<dyn Fn(i64, u64) -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.fee_split_fn = Some(f);
         self
     }
 

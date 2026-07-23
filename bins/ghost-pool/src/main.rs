@@ -6286,6 +6286,40 @@ async fn main() -> Result<()> {
             },
         )
     });
+    // FEE coinbase convergence proof (treasury half): hash the treasury-decay fee split from
+    // THIS node's treasury_state at the CONVERGED checkpoint cutoff (matching the coinbase after
+    // the now()->cutoff fix). A fixed subsidy+fees makes all nodes compare like-with-like, so
+    // only treasury_state (threshold_reached_at) can move the hash — proving the last coinbase
+    // input converges before arming FEE_TO_NODE_POOL (adopted lists + node split already proven).
+    verification_state = verification_state.with_fee_split_fn({
+        let db_c = Arc::clone(&db);
+        Arc::new(move |cutoff_ts: i64, height: u64| -> Option<String> {
+            use sha2::{Digest, Sha256};
+            let balance = db_c.get_treasury_balance().ok()?;
+            let threshold_ts = db_c
+                .get_treasury_threshold_reached()
+                .ok()
+                .flatten()
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
+            let treasury_state =
+                ghost_pool::treasury::TreasuryState::from_stored(balance, threshold_ts);
+            let subsidy = ghost_common::rpc::calculate_block_subsidy(height, None);
+            let decay_ts = chrono::DateTime::from_timestamp(cutoff_ts, 0)?;
+            const PROOF_FEES: u64 = 100_000;
+            let fd = ghost_pool::treasury::FeeDistribution::calculate_at_height(
+                subsidy,
+                PROOF_FEES,
+                &treasury_state,
+                decay_ts,
+                height,
+            );
+            let mut h = Sha256::new();
+            h.update(fd.miner_pool.to_le_bytes());
+            h.update(fd.treasury_amount.to_le_bytes());
+            h.update(fd.node_reward_pool.to_le_bytes());
+            Some(hex::encode(h.finalize()))
+        })
+    });
 
     // Report the operator's Wraith-mixing choice from `[ghost_pay] wraith_enabled`
     // on the ghostpay status endpoint, so the dashboard's L2 card reflects the

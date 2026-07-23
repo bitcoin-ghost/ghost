@@ -738,13 +738,22 @@ impl PayoutProposalCreator {
         // shares the proposer never counted and fail the exact-equality check.
         let now = data.ledger_cutoff_ts as u64;
 
-        // Calculate fee distribution using treasury decay schedule
-        // M-5 SECURITY: Use block_timestamp for deterministic decay calculation
+        // GHOST-02: compute the treasury-decay fee split against the SAME timestamp the
+        // proposal is stamped with (`ledger_cutoff_ts`) and that both validators recompute
+        // from (`validate_proposal_split`/`validate_node_split` use `proposal.timestamp`) —
+        // NOT wall-clock `now()`. `block_timestamp` is `now()` in every live build path, and
+        // at/above the fee gate the cutoff is the CONVERGED checkpoint time (~tip-6, minutes
+        // behind now); building the split from `now()` while validators use the cutoff diverges
+        // at a decay-year boundary and the proposer's own split is rejected. Anchoring to the
+        // cutoff makes the coinbase deterministic fleet-wide. Below the gate the cutoff is
+        // ~now(), so pre-gate behaviour is unchanged.
+        let decay_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(data.ledger_cutoff_ts, 0)
+            .unwrap_or(data.block_timestamp);
         let fee_dist = FeeDistribution::calculate_at_height(
             data.subsidy_sats,
             data.tx_fees_sats,
             &data.treasury_state,
-            data.block_timestamp,
+            decay_ts,
             data.block_height,
         );
 
@@ -756,7 +765,7 @@ impl PayoutProposalCreator {
             node_rate = fee_dist.node_rate,
             miner_pool = fee_dist.miner_pool,
             node_pool = fee_dist.node_reward_pool,
-            decay_year = data.treasury_state.decay_year(data.block_timestamp),
+            decay_year = data.treasury_state.decay_year(decay_ts),
             "Calculating fee distribution"
         );
 
@@ -2685,6 +2694,83 @@ mod tests {
                 treasury_state: TreasuryState::new(),
             })
             .expect("create proposal")
+    }
+
+    /// REGRESSION (FEE pre-arm): `create_proposal` must compute the treasury-decay fee split
+    /// from the proposal's cutoff (`ledger_cutoff_ts`) — the timestamp the proposal is stamped
+    /// with and that both validators recompute against — NOT wall-clock `block_timestamp`. With
+    /// the decay threshold reached, a cutoff in decay year 0 and a `block_timestamp` a year later
+    /// give different treasury rates; building from `block_timestamp` diverges from every
+    /// validator at a decay-year boundary and the proposer's own coinbase is rejected — the class
+    /// of now()-under-enforcement bug that broke v1.10.32. Post-gate the cutoff is the converged
+    /// checkpoint time (~tip-6, ~an hour behind now), widening the divergence window.
+    #[test]
+    fn create_proposal_fee_split_anchors_to_cutoff_not_block_timestamp() {
+        let (creator, db) = ledger_creator();
+        let cutoff_ts = 1_800_000_000i64; // ≈40 days after threshold → decay year 0
+        let block_ts = 1_831_200_000i64; // ≈400 days after threshold → decay year 1
+        let threshold = chrono::DateTime::<chrono::Utc>::from_timestamp(1_796_544_000, 0).unwrap();
+        let treasury = TreasuryState::from_stored(0, Some(threshold));
+        let addrs = seed_unpaid_ledger(&db, cutoff_ts);
+        // Give the node a payout address so its share lands as a node output rather than
+        // falling back to the treasury (which would make treasury_amount decay-independent).
+        seed_node_with_addr(&db, [9u8; 32], &addrs[0]);
+        let miner_work =
+            select_ledger_miner_work(&db, cutoff_ts, LEDGER_TEST_HEIGHT, LEDGER_TEST_SUBSIDY)
+                .expect("ledger work");
+
+        let proposal = creator
+            .create_proposal(BlockFoundData {
+                round_id: LEDGER_ROUNDS,
+                ledger_cutoff_ts: cutoff_ts,
+                block_hash: [7u8; 32],
+                block_height: LEDGER_TEST_HEIGHT,
+                // A FULL YEAR after the cutoff: if the split used this (the bug), the decay
+                // year — and thus the treasury amount — would differ from the cutoff's.
+                block_timestamp: chrono::DateTime::from_timestamp(block_ts, 0).expect("ts"),
+                winning_miner_id: "pool".to_string(),
+                winning_miner_payout_address: Some(addrs[0].clone()),
+                treasury_address_snapshot: Some(treasury_script()),
+                winning_node_id: [9u8; 32],
+                subsidy_sats: LEDGER_TEST_SUBSIDY,
+                tx_fees_sats: 0,
+                miner_work,
+                // A node so the pool has a recipient and does NOT fall back to treasury
+                // (which would perturb treasury_amount away from the pure decay split).
+                node_shares: vec![([9u8; 32], 5)],
+                treasury_state: treasury.clone(),
+            })
+            .expect("create proposal");
+        assert!(
+            !proposal.node_payouts.is_empty(),
+            "node pool has a recipient (no treasury fallback perturbing treasury_amount)"
+        );
+
+        // Expected splits derived from the same function the coinbase uses, at each timestamp.
+        let at = |ts: i64| {
+            FeeDistribution::calculate_at_height(
+                LEDGER_TEST_SUBSIDY,
+                0,
+                &treasury,
+                chrono::DateTime::from_timestamp(ts, 0).unwrap(),
+                LEDGER_TEST_HEIGHT,
+            )
+            .treasury_amount
+        };
+        let cutoff_treasury = at(cutoff_ts);
+        let now_treasury = at(block_ts);
+        assert_ne!(
+            cutoff_treasury, now_treasury,
+            "sanity: the cutoff and block_timestamp fall in different decay years"
+        );
+        assert_eq!(
+            proposal.treasury_amount, cutoff_treasury,
+            "fee split must anchor to the cutoff, not block_timestamp"
+        );
+        assert_ne!(
+            proposal.treasury_amount, now_treasury,
+            "must NOT reflect the wall-clock block_timestamp's decay year"
+        );
     }
 
     /// The fix: a validator recomputing from the unpaid ledger — over the cutoff the

@@ -5708,6 +5708,13 @@ async fn api_qualification_scoped_set_handler(
         .checkpoint_voter_set_fn
         .as_ref()
         .and_then(|f| f(cutoff, cp.height));
+    // FEE coinbase treasury-half convergence: hash of the treasury-decay fee split from this
+    // node's treasury_state at the checkpoint cutoff. Identical across all nodes = the last
+    // FEE coinbase input (treasury) converges — the check before arming FEE_TO_NODE_POOL.
+    let fee_split = state
+        .fee_split_fn
+        .as_ref()
+        .and_then(|f| f(cutoff, cp.height));
     Json(serde_json::json!({
         "cutoff_ts": cutoff,
         "checkpoint_height": cp.height,
@@ -5727,6 +5734,10 @@ async fn api_qualification_scoped_set_handler(
             "hash": checkpoint_voter_set.as_ref().map(|(_, h, _)| h.clone()),
             "floored": checkpoint_voter_set.as_ref().map(|(_, _, f)| *f),
             "has_fn": state.checkpoint_voter_set_fn.is_some(),
+        },
+        "fee_split": {
+            "hash": fee_split,
+            "has_fn": state.fee_split_fn.is_some(),
         },
     }))
 }
