@@ -140,13 +140,22 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// new binary; every node switches at the same block.
 ///
 /// SET THIS BEFORE DEPLOY — comfortably past the roll window (~144 blocks/day).
-/// v1.10.32 activated this at 958_760 and it FAILED live: the tip-change proposer anchors its
+/// v1.10.32 activated this at 958_760 and it FAILED live: the tip-change proposer anchored its
 /// ledger cutoff at now(), where the miner ledger is not yet converged across nodes (GHOST-03
-/// gossip lag), so validators recompute a different miner split and GHOST-02 rejects every
-/// tip-change proposal — the coinbase never armed and fell back to treasury-only. v1.10.33
-/// REVERTS to dormant while the cutoff/convergence root cause is fixed. Re-activate only after
-/// the tip-change anchors a converged cutoff and it is verified against real gossip lag.
-pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
+/// gossip lag), so validators recomputed a different miner split and GHOST-02 rejected every
+/// tip-change proposal — the coinbase never armed and fell back to treasury-only.
+///
+/// ARMED @959_255 (2026-07-23) after the root cause was comprehensively fixed and PROVEN:
+///  - At/above the gate the coinbase AND its validators read the BFT-adopted checkpoint
+///    (`read_adopted_payout`), never a local now()-recompute — every node builds the
+///    byte-identical coinbase the fleet ratified (Option (c) adopt-consumption).
+///  - The last now()-dependence removed: `create_proposal` now anchors the treasury-decay fee
+///    split to `ledger_cutoff_ts` (the converged checkpoint time the validators use), not
+///    `block_timestamp` — no decay-year-boundary divergence (v1.11.12 + regression test).
+///  - All three coinbase inputs proven byte-identical fleet-wide before arming (soaked ~1h):
+///    checkpoint `ledger_root` (adopted lists), `fee_node_split.hash`, `fee_split.hash`.
+/// Revert = restore the prior binary (`.bak`) = instant disarm.
+pub const FEE_TO_NODE_POOL_HEIGHT: u64 = 959_255;
 
 /// Multi-operator share-injection defence. At and above this height, a `ShareProof` MUST
 /// carry its 80-byte block header and every node independently re-verifies the PoW
