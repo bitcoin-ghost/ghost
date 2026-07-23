@@ -1364,15 +1364,23 @@ impl VoteHandler {
             }
         }
 
-        // 7. Validate timestamp is reasonable (not too far in the past or future)
-        // 4.2 SECURITY: Reduced to 30 minutes to limit replay attack window
-        // Nodes should use NTP or similar time sync to stay within tolerance
-        const TIMESTAMP_TOLERANCE_SECS: u64 = 1800; // 30 minutes
+        // 7. Loose sanity bound on the timestamp — reject only obvious garbage. PRECISE,
+        // gate-aware timestamp validation is owned by the injected proposal validator (see
+        // ghost-pool `make_proposal_validator`): AT/ABOVE the fee gate the timestamp must EQUAL
+        // a fleet-finalised checkpoint cutoff, which legitimately lags the tip by the checkpoint
+        // anchor depth (~LAG blocks, minutes-to-hours old). The previous tight 30-min symmetric
+        // window wrongly rejected that lagged-but-valid cutoff and broke the FEE activation.
+        // BELOW the gate the injected validator enforces freshness against now(). A cutoff is
+        // never in the future, so keep a tight FUTURE bound (clock skew only); allow a generous
+        // PAST bound to tolerate the anchor lag. Replay of an old proposal is still bounded by
+        // the block-height check (#8, must be near the tip) and, post-gate, the cutoff-binding.
+        const MAX_FUTURE_SECS: u64 = 1800; // 30 min clock skew — a cutoff is never future-dated
+        const MAX_PAST_SECS: u64 = 86_400; // 24 h — reject only ancient/replayed garbage
         let now = chrono::Utc::now().timestamp() as u64;
-        let min_valid = now.saturating_sub(TIMESTAMP_TOLERANCE_SECS);
-        let max_valid = now.saturating_add(TIMESTAMP_TOLERANCE_SECS);
-        if proposal.timestamp < min_valid || proposal.timestamp > max_valid {
-            return Err("proposal timestamp out of range");
+        if proposal.timestamp > now.saturating_add(MAX_FUTURE_SECS)
+            || proposal.timestamp < now.saturating_sub(MAX_PAST_SECS)
+        {
+            return Err("proposal timestamp out of sane range");
         }
 
         // 8. Validate block height is reasonable
@@ -1943,6 +1951,40 @@ mod tests {
         let handler = VoteHandler::new(identity, voting_manager);
 
         assert_eq!(handler.elder_count(), 0);
+    }
+
+    #[test]
+    fn validate_proposal_accepts_anchor_lagged_cutoff_timestamp() {
+        // REGRESSION (FEE arm 2026-07-23): at/above the fee gate the proposal timestamp is a
+        // converged checkpoint cutoff = block(tip-LAG).time, minutes-to-hours behind now(). The
+        // vote handler's built-in check must be a LOOSE sanity bound only — a cutoff is never in
+        // the future, and a generous past bound tolerates the anchor lag. The previous tight
+        // 30-min symmetric window rejected every post-gate proposal and broke FEE activation.
+        // Precise, gate-aware validation lives in ghost-pool's injected proposal validator.
+        let identity = create_test_identity();
+        let voting_manager = Arc::new(VotingManager::new(100));
+        let handler = VoteHandler::new(identity, voting_manager);
+        let now = chrono::Utc::now().timestamp() as u64;
+        let mut p = create_test_proposal();
+
+        // ~90 min old — beyond the old 30-min window, well within the anchor lag. MUST pass now.
+        p.timestamp = now - 5_400;
+        assert!(
+            handler.validate_proposal(&p).is_ok(),
+            "an anchor-lagged checkpoint-cutoff timestamp must pass the loose sanity bound"
+        );
+        // Future-dated beyond clock skew — a cutoff is never in the future; reject.
+        p.timestamp = now + 3_600;
+        assert!(
+            handler.validate_proposal(&p).is_err(),
+            "far-future timestamp must be rejected"
+        );
+        // Ancient garbage (> 24h old) — reject.
+        p.timestamp = now - 90_000;
+        assert!(
+            handler.validate_proposal(&p).is_err(),
+            "ancient timestamp must be rejected"
+        );
     }
 
     #[test]

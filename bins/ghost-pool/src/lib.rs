@@ -145,17 +145,19 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// gossip lag), so validators recomputed a different miner split and GHOST-02 rejected every
 /// tip-change proposal — the coinbase never armed and fell back to treasury-only.
 ///
-/// ARMED @959_255 (2026-07-23) after the root cause was comprehensively fixed and PROVEN:
-///  - At/above the gate the coinbase AND its validators read the BFT-adopted checkpoint
-///    (`read_adopted_payout`), never a local now()-recompute — every node builds the
-///    byte-identical coinbase the fleet ratified (Option (c) adopt-consumption).
-///  - The last now()-dependence removed: `create_proposal` now anchors the treasury-decay fee
-///    split to `ledger_cutoff_ts` (the converged checkpoint time the validators use), not
-///    `block_timestamp` — no decay-year-boundary divergence (v1.11.12 + regression test).
-///  - All three coinbase inputs proven byte-identical fleet-wide before arming (soaked ~1h):
-///    checkpoint `ledger_root` (adopted lists), `fee_node_split.hash`, `fee_split.hash`.
-/// Revert = restore the prior binary (`.bak`) = instant disarm.
-pub const FEE_TO_NODE_POOL_HEIGHT: u64 = 959_255;
+/// ARMED @959_255 (2026-07-23) then REVERTED to dormant the same day. The coinbase itself was
+/// perfect — checkpoint finalised byte-identical fleet-wide across the boundary, tip advanced,
+/// all three convergence proofs held (NOT a v1.10.32 tip-stall). But arming exposed a SEPARATE
+/// defect: the vote handler's 30-min wall-clock freshness window on `PayoutProposal.timestamp`
+/// rejected every post-gate proposal, whose timestamp is the converged checkpoint cutoff
+/// (`block(tip-LAG).time`, ~an hour behind now), so the payout never RATIFIED. Fixed in v1.11.14:
+/// the freshness check is now gate-aware — post-gate the cutoff-binding (a stronger, lag-tolerant
+/// guarantee) validates the timestamp, and the vote handler keeps only a loose garbage bound.
+///
+/// RE-ARM (after v1.11.14 is deployed + re-soaked): set this to a height comfortably past the
+/// roll window, deploy ALL 8 before the anchor reaches it, and watch the first FEE block closely
+/// (coinbase correct, proposal RATIFIED, block accepted, node pool paid). Revert = `.bak`.
+pub const FEE_TO_NODE_POOL_HEIGHT: u64 = u64::MAX;
 
 /// Multi-operator share-injection defence. At and above this height, a `ShareProof` MUST
 /// carry its 80-byte block header and every node independently re-verifies the PoW

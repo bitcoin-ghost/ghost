@@ -418,6 +418,26 @@ pub fn make_proposal_validator(
             crate::fee_to_node_pool_height(),
         )?;
 
+        // Timestamp freshness is GATE-AWARE and owned here (the vote handler keeps only a loose
+        // garbage bound). BELOW the fee gate the proposal timestamp is wall-clock now() (there is
+        // no checkpoint to bind to), so enforce a tight freshness window to bound replay — this
+        // is the 30-min check the vote handler used to apply globally. AT/ABOVE the gate this is
+        // inert: the cutoff-binding above already pins the timestamp to a finalised checkpoint
+        // cutoff, a stronger guarantee that ALSO tolerates the anchor lag (the checkpoint cutoff
+        // is `block(tip-LAG).time`, legitimately minutes-to-hours behind now — anchoring the
+        // freshness window at now() is exactly what rejected every post-gate proposal and broke
+        // the FEE activation).
+        if proposal.block_height < crate::fee_to_node_pool_height() {
+            const PRE_GATE_FRESHNESS_SECS: i64 = 1800; // 30 min
+            let now = chrono::Utc::now().timestamp();
+            if (now - proposal.timestamp as i64).abs() > PRE_GATE_FRESHNESS_SECS {
+                return Err(format!(
+                    "pre-gate proposal timestamp {} not within {PRE_GATE_FRESHNESS_SECS}s of now {now}",
+                    proposal.timestamp
+                ));
+            }
+        }
+
         // Determine the miner list to validate the proposal against.
         //
         // At/above the fee gate (option c adopt-CONSUMPTION): validate against the
