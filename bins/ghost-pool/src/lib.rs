@@ -156,10 +156,12 @@ pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 /// the freshness check is now gate-aware — post-gate the cutoff-binding (a stronger, lag-tolerant
 /// guarantee) validates the timestamp, and the vote handler keeps only a loose garbage bound.
 ///
-/// RE-ARM (after v1.11.14 is deployed + re-soaked): set this to a height comfortably past the
-/// roll window, deploy ALL 8 before the anchor reaches it, and watch the first FEE block closely
-/// (coinbase correct, proposal RATIFIED, block accepted, node pool paid). Revert = `.bak`.
-pub const COINBASE_FEE_SPLIT_HEIGHT: u64 = u64::MAX;
+/// ARMED @959_290 (2026-07-23, attempt 2) — now with the NEW fee model (miners keep 99% of
+/// subsidy+fees; the 1% pool fee decays treasury→node) AND the v1.11.14 timestamp fix, so the
+/// post-gate payout proposal ratifies. Pre-arm the go-live coinbase split was proven byte-identical
+/// fleet-wide (`fee_split.hash` `d3ab532e…` on all 8) and soaked ~24 min. Revert = restore the
+/// prior binary (`.bak`) = instant disarm onto the dormant new-model build.
+pub const COINBASE_FEE_SPLIT_HEIGHT: u64 = 959_290;
 
 /// Multi-operator share-injection defence. At and above this height, a `ShareProof` MUST
 /// carry its 80-byte block header and every node independently re-verifies the PoW
