@@ -7,7 +7,8 @@ use crate::{
         downstream::{downstream::Downstream, SubmitShareWithChannelId},
         sv1_server::{
             channel::Sv1ServerChannelState, is_mining_authorize, is_mining_configure,
-            is_mining_subscribe, KEEPALIVE_JOB_ID_DELIMITER,
+            is_mining_subscribe, is_mining_suggest_difficulty, parse_suggest_difficulty,
+            KEEPALIVE_JOB_ID_DELIMITER,
         },
     },
     utils::AGGREGATED_CHANNEL_ID,
@@ -202,6 +203,57 @@ impl Sv1Server {
             valid_sv1_jobs: Arc::new(DashMap::new()),
             load_balancer,
         }
+    }
+
+    /// Record a miner-declared difficulty (from `mining.suggest_difficulty` or a `d=` in the
+    /// `mining.authorize` password) as a nominal hashrate for this downstream.
+    ///
+    /// Clamped into `[min_individual_miner_hashrate, MAX_SUGGESTED_HASHRATE]`: the floor stops a
+    /// miner requesting a difficulty low enough to flood the pool with shares, and the ceiling
+    /// keeps a nonsense value from overflowing the hashrate→target conversion. Recorded before
+    /// the SV2 channel opens it sizes the channel directly; if the channel is already open it is
+    /// staged as a pending update for the next vardiff tick to push upstream and downstream.
+    pub(super) fn record_suggested_difficulty(
+        &self,
+        downstream_id: DownstreamId,
+        difficulty: f64,
+        source: &str,
+    ) {
+        let config = &self.config.downstream_difficulty_config;
+        let shares_per_minute = config.shares_per_minute as f64;
+        let requested = super::difficulty_to_hashrate(difficulty, shares_per_minute);
+        let floor = config.min_individual_miner_hashrate as f64;
+        let clamped = requested.clamp(floor, super::MAX_SUGGESTED_HASHRATE);
+
+        if clamped != requested {
+            warn!(
+                "Down: downstream {} suggested difficulty {} ({:.3e} H/s) via {} — clamped to {:.3e} H/s",
+                downstream_id, difficulty, requested, source, clamped
+            );
+        } else {
+            info!(
+                "Down: downstream {} suggested difficulty {} via {} — sizing channel at {:.3e} H/s",
+                downstream_id, difficulty, source, clamped
+            );
+        }
+
+        let Some(downstream) = self.downstreams.get(&downstream_id) else {
+            return;
+        };
+        let pending_target = hash_rate_to_target(clamped, shares_per_minute).ok();
+        downstream.downstream_data.super_safe_lock(|data| {
+            data.suggested_hashrate = Some(clamped as Hashrate);
+            data.hashrate = Some(clamped as Hashrate);
+            // Channel already open: the open path can no longer pick this up, so stage it for
+            // the vardiff loop, which pushes UpdateChannel upstream and mining.set_difficulty
+            // downstream on its next tick.
+            if data.channel_id.is_some() {
+                data.set_pending_hashrate(Some(clamped as Hashrate), downstream_id);
+                if let Some(target) = pending_target {
+                    data.set_pending_target(target, downstream_id);
+                }
+            }
+        });
     }
 
     /// Registers a freshly accepted downstream connection and spawns its tasks.
@@ -627,6 +679,27 @@ impl Sv1Server {
             return Ok(());
         };
 
+        // `mining.suggest_difficulty` is handled here, ahead of the channel-open branch, so it
+        // works in both directions: before the channel opens it sizes the initial target (the
+        // point of the message — the channel opens on authorize, so a queued suggestion would
+        // drain too late to skip the vardiff ramp), and after the open it is staged as a pending
+        // update. The vendored SV1 library parses the method but discards it (`Ok(None)`), so
+        // the value is read straight off the raw request. It expects no reply.
+        if is_mining_suggest_difficulty(&downstream_message) {
+            match parse_suggest_difficulty(&downstream_message) {
+                Some(difficulty) => self.record_suggested_difficulty(
+                    downstream_id,
+                    difficulty,
+                    "mining.suggest_difficulty",
+                ),
+                None => warn!(
+                    "Down: downstream {} sent an unparseable mining.suggest_difficulty; ignoring",
+                    downstream_id
+                ),
+            }
+            return Ok(());
+        }
+
         let channel_id = downstream
             .downstream_data
             .super_safe_lock(|data| data.channel_id);
@@ -1014,6 +1087,14 @@ impl Sv1Server {
                             d.extranonce1 = real_extranonce1.clone();
                             d.extranonce2_len = real_extranonce2_size;
                             d.channel_id = Some(m.channel_id);
+                            // Adopt the channel's ACTUAL allocated target as this downstream's
+                            // target. It matches the config-derived starting target for a miner
+                            // that took the default, but diverges when the miner declared its own
+                            // size (`mining.suggest_difficulty` / `d=` in the authorize password),
+                            // and the channel is the authority. Leaving the config value here
+                            // would have local share validation and vardiff working against a
+                            // different target from the one the pool is actually enforcing.
+                            d.target = initial_target;
                             // Set the initial upstream target from OpenExtendedMiningChannelSuccess
                             d.set_upstream_target(initial_target, downstream_id);
                             was_placeholder
@@ -1149,12 +1230,23 @@ impl Sv1Server {
                         }
                     }
 
-                    let set_difficulty = build_sv1_set_difficulty_from_sv2_target(first_target)
+                    // Announce the channel's REAL target, not the global config-derived
+                    // `first_target`. The two agree for a miner that accepted the pool default,
+                    // but a miner that declared its own size gets a channel sized to that
+                    // declaration — and telling it `first_target` would set it hashing at the
+                    // pool floor while the pool enforced a far higher target, so virtually every
+                    // share it submitted would fall short and be rejected. Falls back to
+                    // `first_target` only if the channel target is somehow unavailable.
+                    let channel_target = downstream
+                        .downstream_data
+                        .super_safe_lock(|d| d.upstream_target)
+                        .unwrap_or(first_target);
+                    let set_difficulty = build_sv1_set_difficulty_from_sv2_target(channel_target)
                         .map_err(|_| {
-                            TproxyError::shutdown(TproxyErrorKind::General(
-                                "Failed to generate set_difficulty".into(),
-                            ))
-                        })?;
+                        TproxyError::shutdown(TproxyErrorKind::General(
+                            "Failed to generate set_difficulty".into(),
+                        ))
+                    })?;
                     // send the set_difficulty message to the downstream
                     if let Some(sender) = self
                         .sv1_server_channel_state
@@ -1270,7 +1362,16 @@ impl Sv1Server {
             return Ok(());
         };
 
-        let hashrate = config.min_individual_miner_hashrate as f64;
+        // Prefer a size the miner declared for itself (`mining.suggest_difficulty`, or `d=` in
+        // the authorize password) over the configured floor. The floor is sized for the
+        // smallest expected miner, so a farm or a rented-hashrate order that starts there
+        // spends minutes flooding shares while vardiff ramps (capped at ×3–×5 per 60s tick).
+        // Already clamped to a sane range in `record_suggested_difficulty`.
+        let hashrate = downstream
+            .downstream_data
+            .super_safe_lock(|data| data.suggested_hashrate)
+            .map(|h| h as f64)
+            .unwrap_or(config.min_individual_miner_hashrate as f64);
         let shares_per_min = config.shares_per_minute as f64;
         let min_extranonce_size = self.config.downstream_extranonce2_size;
         let vardiff_enabled = config.enable_vardiff;

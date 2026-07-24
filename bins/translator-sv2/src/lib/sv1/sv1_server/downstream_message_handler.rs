@@ -102,6 +102,14 @@ impl IsServer<'static> for Sv1Server {
             );
             return false;
         }
+
+        // Honour a `d=<difficulty>` in the password. This is the convention rented-hashrate
+        // marketplaces use to declare their size up front, and it arrives with authorize —
+        // i.e. before the channel opens — so it can size the initial target rather than
+        // leaving vardiff to ramp there over several minutes.
+        if let Some(difficulty) = super::parse_password_difficulty(&request.password) {
+            self.record_suggested_difficulty(downstream_id, difficulty, "authorize password");
+        }
         true
     }
 

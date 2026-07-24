@@ -20,6 +20,15 @@ pub struct DownstreamData {
     pub extranonce2_len: usize,
     pub target: Target,
     pub hashrate: Option<Hashrate>,
+    /// Hashrate declared by the miner itself, via `mining.suggest_difficulty` or a `d=` in the
+    /// `mining.authorize` password, converted from the difficulty it asked for. `None` when the
+    /// miner said nothing, in which case the configured `min_individual_miner_hashrate` stands.
+    ///
+    /// This exists because vardiff alone cannot size a large miner quickly: it starts every
+    /// connection at the configured floor (bitaxe-sized here) and caps any correction above
+    /// 1000% to ×3–×5 per 60s tick, so a farm or a rented-hashrate order spends minutes
+    /// flooding shares before converging. A declared size skips the ramp entirely.
+    pub suggested_hashrate: Option<Hashrate>,
     pub version_rolling_mask: Option<HexU32Be>,
     pub version_rolling_min_bit: Option<HexU32Be>,
     pub last_job_version_field: Option<u32>,
@@ -62,6 +71,7 @@ impl DownstreamData {
             extranonce2_len,
             target,
             hashrate,
+            suggested_hashrate: None,
             version_rolling_mask: None,
             version_rolling_min_bit: None,
             last_job_version_field: None,

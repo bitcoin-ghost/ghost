@@ -110,6 +110,54 @@ def test_placeholder_extranonce2_size():
     return ok
 
 
+def _first_set_difficulty(sock, timeout=8.0):
+    """Return the difficulty from the first mining.set_difficulty, or None."""
+    msgs = recv_until(sock, timeout, lambda m: m.get("method") == "mining.set_difficulty")
+    for m in msgs:
+        if m.get("method") == "mining.set_difficulty":
+            params = m.get("params") or []
+            if params and isinstance(params[0], (int, float)):
+                return float(params[0])
+    return None
+
+
+def _declared_difficulty_case(label, requested, pre_subscribe=None, password="x"):
+    """Assert a miner-declared difficulty is honoured on the initial set_difficulty.
+
+    Without this, every connection starts at the configured floor (sized for the smallest
+    expected miner) and vardiff needs several 60s ticks to climb — it caps corrections above
+    1000% to x3-x5 per tick — so a farm or a rented-hashrate order floods shares for minutes
+    before converging. Marketplaces reject a pool whose starting difficulty is far below the
+    hashrate they are pointing at it.
+    """
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    if pre_subscribe is not None:
+        send(s, pre_subscribe)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
+    send(s, {"id": 2, "method": "mining.authorize", "params": [USER, password]})
+    got = _first_set_difficulty(s)
+    s.close()
+    # Allow 1% for the target->difficulty rounding through the SV2 channel.
+    ok = got is not None and abs(got - requested) / requested < 0.01
+    print(f"  [{label}]{' ' * max(0, 16 - len(label))}{'PASS' if ok else 'FAIL'} — "
+          f"asked for difficulty {requested:,.0f}, pool set {got if got is None else f'{got:,.1f}'}")
+    return ok
+
+
+def test_password_difficulty():
+    # The convention rented-hashrate marketplaces use: difficulty in the password.
+    return _declared_difficulty_case("pw-difficulty", 1_000_000.0, password="x;d=1000000")
+
+
+def test_suggest_difficulty():
+    # The protocol-native route, sent before subscribe/authorize.
+    return _declared_difficulty_case(
+        "suggest-diff",
+        1_000_000.0,
+        pre_subscribe={"id": 0, "method": "mining.suggest_difficulty", "params": [1000000]},
+    )
+
+
 def test_pipeliner():
     s = socket.create_connection((HOST, PORT), timeout=10)
     send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
@@ -183,6 +231,8 @@ def main():
     results = {
         "serializer": test_serializer(),
         "probe-en2-size": test_placeholder_extranonce2_size(),
+        "pw-difficulty": test_password_difficulty(),
+        "suggest-diff": test_suggest_difficulty(),
         "pipeliner": test_pipeliner(),
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),
