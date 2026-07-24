@@ -94,7 +94,9 @@ impl IsServer<'static> for Sv1Server {
         // can fix their config rather than silently lose earnings to whatever fallback the
         // pool happened to set. This is the same convention every public Bitcoin mining pool
         // enforces.
-        let name = request.name.as_str();
+        // A trailing `.d=<difficulty>` is stripped here so the rest of the checks — and the
+        // payout address / worker attribution downstream — see the plain `<address>.<worker>`.
+        let (name, username_difficulty) = super::split_username_difficulty(request.name.as_str());
         if !name.contains('.') {
             warn!(
                 "Down: Rejecting mining.authorize from downstream {} — username '{}' has no '.' separator; expected `<bitcoin_address>.<worker_name>`",
@@ -107,8 +109,12 @@ impl IsServer<'static> for Sv1Server {
         // marketplaces use to declare their size up front, and it arrives with authorize —
         // i.e. before the channel opens — so it can size the initial target rather than
         // leaving vardiff to ramp there over several minutes.
+        // Password first, then the username suffix as a fallback for order forms that expose no
+        // password field at all (Braiins' marketplace being the case in point).
         if let Some(difficulty) = super::parse_password_difficulty(&request.password) {
             self.record_suggested_difficulty(downstream_id, difficulty, "authorize password");
+        } else if let Some(difficulty) = username_difficulty {
+            self.record_suggested_difficulty(downstream_id, difficulty, "username suffix");
         }
         true
     }
@@ -207,6 +213,8 @@ impl IsServer<'static> for Sv1Server {
             .downstreams
             .get(&downstream_id)
             .expect("Downstream should exist");
+        // Compare against the stored name, which has any `.d=` directive stripped.
+        let (name, _) = super::split_username_difficulty(name);
         downstream
             .downstream_data
             .super_safe_lock(|data| data.authorized_worker_name == *name)
@@ -220,6 +228,10 @@ impl IsServer<'static> for Sv1Server {
             .get(&downstream_id)
             .expect("Downstream should exist");
 
+        // Store the username WITHOUT any trailing `.d=<difficulty>` directive: this string
+        // becomes the channel `user_identity`, from which the pool derives the miner's payout
+        // address and worker name. Leaving the directive on would corrupt attribution.
+        let (name, _) = super::split_username_difficulty(name);
         let is_authorized = self.is_authorized(client_id, name);
         downstream.downstream_data.super_safe_lock(|data| {
             if !is_authorized {

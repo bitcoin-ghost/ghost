@@ -108,6 +108,30 @@ pub(super) fn parse_password_difficulty(password: &str) -> Option<f64> {
         .find(|d| d.is_finite() && *d > 0.0)
 }
 
+/// Split a trailing difficulty directive off an SV1 username.
+///
+/// Returns `(username_without_directive, difficulty)`.
+///
+/// Needed because some order forms expose only a username field — Braiins' hashrate
+/// marketplace has Pool URL and Pool Username and nothing else, so there is no password to put
+/// `d=` in, and no way to declare the size of the order being pointed at us. Accepting the same
+/// directive as a trailing dot-segment (`<address>.<worker>.d=9300000`) gives those clients a
+/// route. Several pools accept this form for the same reason.
+///
+/// The directive is stripped before the username is used for anything else, so payout-address
+/// and worker attribution are unaffected — the pool still sees `<address>.<worker>`.
+pub(super) fn split_username_difficulty(name: &str) -> (&str, Option<f64>) {
+    let Some((head, last)) = name.rsplit_once('.') else {
+        return (name, None);
+    };
+    match parse_password_difficulty(last) {
+        // Only strip when the final segment is *nothing but* the directive; a worker legitimately
+        // named e.g. `d=rig` parses to None and is left alone.
+        Some(difficulty) => (head, Some(difficulty)),
+        None => (name, None),
+    }
+}
+
 /// Extract the difficulty from a `mining.suggest_difficulty` request.
 ///
 /// The method takes a single numeric parameter. Accepts a JSON number or a numeric string,
@@ -261,5 +285,53 @@ mod difficulty_suggestion_tests {
             (3.9e15..4.1e15).contains(&four_ph),
             "expected ~4 PH/s, got {four_ph}"
         );
+    }
+}
+
+#[cfg(test)]
+mod username_difficulty_tests {
+    use super::*;
+
+    const ADDR: &str = "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492";
+
+    #[test]
+    fn strips_a_trailing_difficulty_directive() {
+        let username = format!("{ADDR}.braiins.d=9300000");
+        let (name, difficulty) = split_username_difficulty(&username);
+        assert_eq!(name, format!("{ADDR}.braiins"));
+        assert_eq!(difficulty, Some(9_300_000.0));
+    }
+
+    #[test]
+    fn leaves_ordinary_usernames_untouched() {
+        // Attribution must survive: the pool derives payout address and worker from this.
+        for username in [
+            format!("{ADDR}.braiins"),
+            format!("{ADDR}.bitaxe1"),
+            ADDR.to_string(),
+            // A worker legitimately containing an `=` but not a difficulty directive.
+            format!("{ADDR}.d=rig"),
+            format!("{ADDR}.diff=abc"),
+        ] {
+            let (name, difficulty) = split_username_difficulty(&username);
+            assert_eq!(
+                name, username,
+                "username {username:?} must not be rewritten"
+            );
+            assert_eq!(
+                difficulty, None,
+                "username {username:?} must not yield a difficulty"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stripped_username_still_has_its_worker_separator() {
+        // The bare-worker rejection runs on the stripped name, so stripping must not turn a
+        // valid `<address>.<worker>` into a bare address and get the miner rejected.
+        let username = format!("{ADDR}.braiins.d=9300000");
+        let (name, _) = split_username_difficulty(&username);
+        assert!(name.contains('.'));
+        assert_eq!(extract_worker_name(name), "braiins");
     }
 }
