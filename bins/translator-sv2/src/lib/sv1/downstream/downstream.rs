@@ -61,9 +61,14 @@ impl Downstream {
         sv1_server_receiver: Receiver<json_rpc::Message>,
         target: Target,
         hashrate: Option<Hashrate>,
+        extranonce2_len: usize,
         connection_token: CancellationToken,
     ) -> Self {
-        let downstream_data = Arc::new(Mutex::new(DownstreamData::new(hashrate, target)));
+        let downstream_data = Arc::new(Mutex::new(DownstreamData::new(
+            hashrate,
+            target,
+            extranonce2_len,
+        )));
         let downstream_channel_state = DownstreamChannelState::new(
             downstream_sv1_sender,
             downstream_sv1_receiver,

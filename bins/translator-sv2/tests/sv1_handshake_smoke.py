@@ -34,6 +34,9 @@ USER = sys.argv[3] if len(sys.argv) > 3 else "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9
 _tls_arg = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("GHOST_TLS_PORT")
 TLS_PORT = int(_tls_arg) if _tls_arg else None
 PLACEHOLDER = "0000000000000000"
+# Minimum extranonce2_size a pool must advertise to be accepted by rented-hashrate
+# marketplaces (Braiins requires >= 7). Override with GHOST_MIN_EXTRANONCE2_SIZE.
+MIN_EXTRANONCE2_SIZE = int(os.environ.get("GHOST_MIN_EXTRANONCE2_SIZE", "7"))
 
 
 def recv_until(sock, timeout, pred):
@@ -74,11 +77,37 @@ def test_serializer():
     t0 = time.time()
     msgs = recv_until(s, 4.0, lambda m: m.get("id") == 1 and "result" in m)
     dt = time.time() - t0
-    got = any(m.get("id") == 1 and "result" in m for m in msgs)
+    sub = [m for m in msgs if m.get("id") == 1 and "result" in m]
+    got = bool(sub)
     s.close()
     print(f"  [serializer]      {'PASS' if got else 'FAIL'} — subscribe answered in {dt:.2f}s "
           f"({'no deadlock' if got else 'DEADLOCK — no response'})")
     return got
+
+
+def test_placeholder_extranonce2_size():
+    """The subscribe-defer fallback must advertise the CONFIGURED extranonce2_size.
+
+    A pool-capability probe (Braiins' hashrate marketplace, notably) sends mining.subscribe
+    and never authorizes, so the ~1.5s fallback placeholder is the ONLY extranonce2_size it
+    ever sees — the real channel-allocated value delivered later via mining.set_extranonce
+    comes too late. Braiins rejects any pool advertising < 7 ("Pool exists but is not
+    compatible"). This regressed once already: the placeholder was hardcoded to 4 in
+    DownstreamData::new while the config said 8, so raising the config alone changed nothing
+    for probes. Guard the placeholder, not just the real value.
+    """
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
+    msgs = recv_until(s, 4.0, lambda m: m.get("id") == 1 and "result" in m)
+    sub = [m for m in msgs if m.get("id") == 1 and "result" in m]
+    r = sub[0]["result"] if sub and isinstance(sub[0]["result"], list) else None
+    en2 = r[2] if r and len(r) > 2 and isinstance(r[2], int) else None
+    s.close()
+    ok = en2 is not None and en2 >= MIN_EXTRANONCE2_SIZE
+    print(f"  [probe-en2-size]  {'PASS' if ok else 'FAIL'} — subscribe-only extranonce2_size={en2} "
+          f"(need >= {MIN_EXTRANONCE2_SIZE}"
+          f"{'' if ok else '; rented-hashrate marketplaces would reject this pool'})")
+    return ok
 
 
 def test_pipeliner():
@@ -153,6 +182,7 @@ def main():
     print(f"SV1 handshake smoke test vs {HOST}:{PORT}")
     results = {
         "serializer": test_serializer(),
+        "probe-en2-size": test_placeholder_extranonce2_size(),
         "pipeliner": test_pipeliner(),
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),

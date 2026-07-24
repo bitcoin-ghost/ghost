@@ -247,6 +247,7 @@ impl Sv1Server {
                     .downstream_difficulty_config
                     .min_individual_miner_hashrate,
             ),
+            self.config.downstream_extranonce2_size as usize,
             connection_token.clone(),
         );
         self.downstreams.insert(downstream_id, downstream.clone());

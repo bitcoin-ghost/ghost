@@ -40,13 +40,26 @@ pub struct DownstreamData {
 }
 
 impl DownstreamData {
-    pub fn new(hashrate: Option<Hashrate>, target: Target) -> Self {
+    /// `extranonce2_len` is the configured `downstream_extranonce2_size`. It is only the
+    /// PLACEHOLDER value, used for the `mining.subscribe` response when a serializing miner
+    /// (or a pool-capability probe) forces the 1.5s subscribe-defer fallback before the SV2
+    /// channel has opened. It must match the configured size because that placeholder is what
+    /// such clients read to decide whether the pool is compatible — Braiins' hashrate
+    /// marketplace, for one, rejects any pool advertising `extranonce2_size < 7` and never
+    /// sends `mining.authorize`, so it only ever sees this value. Once the channel opens, the
+    /// real channel-allocated size from `OpenExtendedMiningChannelSuccess` overwrites it.
+    ///
+    /// NB: the `extranonce1` placeholder stays 8 zero bytes — `sv1_server` identifies the
+    /// placeholder by exactly that (`len() == 8` and all-zero) to decide whether to send the
+    /// corrective `mining.set_extranonce`. Changing it would strand serializing miners on the
+    /// placeholder extranonce and reject every share they submit.
+    pub fn new(hashrate: Option<Hashrate>, target: Target, extranonce2_len: usize) -> Self {
         DownstreamData {
             channel_id: None,
             extranonce1: vec![0; 8]
                 .try_into()
                 .expect("8-byte extranonce is always valid"),
-            extranonce2_len: 4,
+            extranonce2_len,
             target,
             hashrate,
             version_rolling_mask: None,
