@@ -977,11 +977,73 @@ impl Database {
         })
     }
 
-    /// Optimize the database (vacuum and analyze)
+    /// Minimum reclaimable free space before a full `VACUUM` is worth doing.
+    ///
+    /// `VACUUM` rebuilds the entire database through SQLite's page cache, so its peak memory is
+    /// proportional to database size, not to the amount being reclaimed. Rebuilding 2.1GB to
+    /// recover a few MB of pruned rows is what OOM-killed ghost-pool hourly on 3.87GB nodes.
+    ///
+    /// 256MB means a rebuild only happens when it would actually recover a meaningful amount of
+    /// disk, at which point paying the memory cost once is reasonable.
+    const VACUUM_MIN_RECLAIMABLE_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Optimize the database.
+    ///
+    /// Always runs `ANALYZE` (cheap, and it is what actually helps the query planner) and a
+    /// WAL checkpoint. Only runs `VACUUM` when there is enough reclaimable space to justify
+    /// it — see `VACUUM_MIN_RECLAIMABLE_BYTES`.
+    ///
+    /// This used to run `VACUUM; ANALYZE;` unconditionally, and `run_maintenance` calls it
+    /// whenever a maintenance pass deletes more than 1000 rows — which pruning health pings,
+    /// challenges and verifications clears most hours. `VACUUM` rebuilds the ENTIRE database
+    /// by streaming it through SQLite's page cache, so on a 2.1GB SQLCipher file it took
+    /// ~2.8GB resident, every hour, to reclaim a few MB of freed rows.
+    ///
+    /// On 3.87GB nodes that was fatal: the kernel OOM-killed ghost-pool on the hour, every
+    /// hour. Because an OOM kill is SIGKILL, it also never got to checkpoint, so the WAL grew
+    /// to the size of the database and stayed there. Heap profiling attributed 96.9% of all
+    /// allocation in the process to this one call.
+    ///
+    /// The checkpoint here is deliberate too: `VACUUM` holds a long transaction across the
+    /// whole database, which blocks `wal_checkpoint(TRUNCATE)` (it returned busy with only
+    /// ~4MB live inside a 2GB WAL). Checkpointing before any VACUUM lets the WAL actually
+    /// shrink.
     pub fn optimize(&self) -> GhostResult<()> {
-        info!("Optimizing database");
         self.with_connection(|conn| {
-            conn.execute_batch("VACUUM; ANALYZE;")
+            // Truncating checkpoint first: cheap, and bounds WAL growth. Without this the WAL
+            // file never shrinks (`journal_size_limit` is -1 by default).
+            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                warn!("WAL checkpoint during maintenance failed: {e}");
+            }
+
+            // ANALYZE is the part that pays for itself — it refreshes planner statistics and
+            // costs orders of magnitude less than a rebuild.
+            conn.execute_batch("ANALYZE;")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let page_size: i64 = conn
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let freelist_pages: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let reclaimable =
+                (freelist_pages.max(0) as u64).saturating_mul(page_size.max(0) as u64);
+
+            if reclaimable < Self::VACUUM_MIN_RECLAIMABLE_BYTES {
+                debug!(
+                    reclaimable_bytes = reclaimable,
+                    threshold = Self::VACUUM_MIN_RECLAIMABLE_BYTES,
+                    "Skipping VACUUM — not enough reclaimable space to justify a full rebuild"
+                );
+                return Ok(());
+            }
+
+            info!(
+                reclaimable_bytes = reclaimable,
+                "Running VACUUM — reclaimable space exceeds threshold"
+            );
+            conn.execute_batch("VACUUM;")
                 .map_err(|e| GhostError::Database(e.to_string()))
         })
     }
@@ -1596,6 +1658,48 @@ impl DatabaseStats {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `optimize()` must not run a full VACUUM when there is nothing worth reclaiming.
+    ///
+    /// Regression guard for the hourly OOM: `optimize()` ran `VACUUM; ANALYZE;`
+    /// unconditionally, and `run_maintenance` calls it whenever a pass deletes >1000 rows —
+    /// most hours. VACUUM rebuilds the whole database through SQLite's page cache, so on a
+    /// 2.1GB file it needed ~2.8GB resident and the kernel OOM-killed the process on the
+    /// hour. Heap profiling attributed 96.9% of all allocation to that one call.
+    ///
+    /// A fresh database has an empty freelist, so this asserts the cheap path is taken and
+    /// the database is still usable afterwards.
+    #[test]
+    fn optimize_skips_vacuum_when_nothing_to_reclaim() {
+        let db = Database::in_memory().expect("create in-memory database");
+
+        let freelist_before: i64 = db
+            .with_connection(|conn| {
+                conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                    .map_err(|e| GhostError::Database(e.to_string()))
+            })
+            .expect("read freelist");
+        assert_eq!(
+            freelist_before, 0,
+            "a fresh database should have no free pages"
+        );
+
+        db.optimize().expect("optimize must succeed");
+
+        // Still usable, and ANALYZE ran without a rebuild.
+        let stats = db.stats().expect("stats after optimize");
+        assert!(stats.page_count > 0);
+    }
+
+    #[test]
+    fn vacuum_threshold_is_large_enough_to_matter() {
+        // The threshold exists so a rebuild only happens when it recovers meaningful disk.
+        // Anything small here reintroduces the hourly rebuild this was written to stop.
+        assert!(
+            Database::VACUUM_MIN_RECLAIMABLE_BYTES >= 64 * 1024 * 1024,
+            "threshold too low — VACUUM would run routinely again"
+        );
+    }
 
     #[test]
     fn test_in_memory_database() {

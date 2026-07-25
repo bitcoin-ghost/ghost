@@ -119,6 +119,15 @@ zk-consensus = ["ghost-consensus/zk-consensus", "ghost-zkp"]
 mpc-ceremony = ["ghost-consensus/mpc-ceremony", "ghost-mpc"]
 # Use MPC ceremony parameters for ZK proofs (required for mainnet)
 zk-production = ["ghost-zkp/zk-production"]
+# Heap profiling. OFF by default and adds nothing to a normal build — it swaps in jemalloc
+# with profiling compiled in, which is inert until enabled at runtime via MALLOC_CONF.
+# Used to find what holds ghost-pool's ~2.2GB steady-state working set (see issue #418).
+heap-profiling = ["dep:tikv-jemallocator"]
+
+[dependencies.tikv-jemallocator]
+version = "0.6"
+features = ["profiling", "unprefixed_malloc_on_supported_platforms"]
+optional = true
 
 [dependencies.ghost-zkp]
 workspace = true

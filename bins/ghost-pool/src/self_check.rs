@@ -241,6 +241,18 @@ async fn check_public_mining(config: &NodeConfig) -> CapabilityCheck {
             config.network.sv2_port
         ));
     }
+    // A listening port only proves something bound it. Require a live TDP client too, which
+    // means pool_sv2 is connected and being served templates — the actual chain a miner needs.
+    // Without this, a node whose provider was wedged (ports up, nothing served) kept claiming
+    // the capability, and the load balancer preferentially routed miners to it because it
+    // looked idle.
+    if !port_has_established_connection(ghost_common::constants::TDP_PORT) {
+        missing.push(format!(
+            "no template-provider client connected on port {} — sri-pool is not being served \
+             templates",
+            ghost_common::constants::TDP_PORT
+        ));
+    }
     if config.network.public_address.is_none() {
         missing.push("public_address unset in pool.toml".to_string());
     }
@@ -357,6 +369,42 @@ fn check_reaper(config: &NodeConfig) -> CapabilityCheck {
 /// Reads `/proc/net/tcp{,6}` directly instead of opening a TCP connection,
 /// which keeps probes invisible to the listening daemon (no spurious
 /// "downstream connected → disconnected" log entries every tick).
+/// True when `port` has at least one ESTABLISHED connection.
+///
+/// Used to tell "the listener is up" apart from "the node is actually serving". A listening
+/// socket only proves a process bound the port; it says nothing about whether the stack behind
+/// it works. A node whose template provider was wedged still had every port listening while
+/// being completely unable to serve a miner, and it kept advertising `public_mining: true` —
+/// so the load balancer, which prefers least-loaded peers, actively steered miners INTO it.
+///
+/// An established TDP connection is a much stronger signal: it means pool_sv2 is running,
+/// connected and being served templates, which is the whole chain a miner depends on.
+#[cfg(target_os = "linux")]
+fn port_has_established_connection(port: u16) -> bool {
+    fn scan(path: &str, port: u16) -> bool {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let port_hex = format!("{:04X}", port);
+        for line in content.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            let _sl = fields.next();
+            let Some(local) = fields.next() else { continue };
+            let _rem = fields.next();
+            let Some(state) = fields.next() else { continue };
+            // 01 = ESTABLISHED
+            if state != "01" {
+                continue;
+            }
+            if local.rsplit_once(':').map(|(_, p)| p) == Some(port_hex.as_str()) {
+                return true;
+            }
+        }
+        false
+    }
+    scan("/proc/net/tcp", port) || scan("/proc/net/tcp6", port)
+}
+
 #[cfg(target_os = "linux")]
 fn port_listening(port: u16) -> bool {
     fn scan(path: &str, port: u16) -> bool {
@@ -383,6 +431,14 @@ fn port_listening(port: u16) -> bool {
         false
     }
     scan("/proc/net/tcp", port) || scan("/proc/net/tcp6", port)
+}
+
+/// Non-Linux fallback. Establishing a connection to check for OTHER established
+/// connections isn't meaningful, and this only runs in dev environments, so report false
+/// rather than probing. Production is Linux, where the /proc implementation is used.
+#[cfg(not(target_os = "linux"))]
+fn port_has_established_connection(_port: u16) -> bool {
+    false
 }
 
 /// Non-Linux fallback for dev environments. Falls back to a short-lived TCP
