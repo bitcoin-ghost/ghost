@@ -24,6 +24,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +36,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -49,6 +51,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +113,7 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -124,6 +128,7 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # H-07: Security audit failures should block CI
     steps:
       - uses: actions/checkout@v5
@@ -136,6 +141,7 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -147,6 +153,7 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v5
@@ -169,7 +176,8 @@ jobs:
         # external infrastructure (a real bitcoin-core/ghostd node, a running
         # stratum server, a live cluster) that isn't available in CI — those
         # are exercised separately, not in the coverage gate.
-        run: cargo llvm-cov $WORKSPACE_EXCLUDES --lib --bins --lcov --output-path lcov.info
+        run: cargo llvm-cov $WORKSPACE_EXCLUDES --exclude integration_tests_sv2 \
+            --lib --bins --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
