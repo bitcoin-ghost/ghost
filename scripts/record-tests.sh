@@ -25,6 +25,11 @@ EXCLUDES="--exclude wraith-wallet-gui --exclude ghost-tap-desktop"
 echo "==> fmt"
 cargo fmt --all -- --check || { echo "FAILED: formatting" >&2; exit 1; }
 
+# Cheap and first, because a broken workflow does not fail until after merge — the
+# Coverage job was red on main for six commits before anyone looked (#428).
+echo "==> workflow line continuations"
+./scripts/check-workflow-scalars.sh || { echo "FAILED: workflow scalars" >&2; exit 1; }
+
 # NB: do NOT write these as `cmd | grep ... && { fail }`. With `set -o pipefail` a failing
 # cargo makes the whole pipeline non-zero, the `&&` short-circuits, the failure branch never
 # runs — and the gate reports success while not gating. That exact bug let a commit with two
