@@ -345,45 +345,61 @@ impl TemplateDistributionServer {
                         .next_client_id
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                    // Create Noise responder for this connection
-                    let responder = match Responder::from_authority_kp(
-                        &self.config.authority_public_key,
-                        &self.config.authority_secret_key,
-                        Duration::from_secs(self.config.cert_validity_secs),
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("Failed to create Noise responder: {:?}", e);
-                            continue;
-                        }
-                    };
-
-                    // Perform Noise handshake. The 10s per-read timeout matches
-                    // stratum-apps' NOISE_HANDSHAKE_TIMEOUT default (used by
-                    // accept_noise_connection), so a stalled peer handshake can't
-                    // hang the TDP responder.
-                    let noise_stream = match NoiseTcpStream::<Message>::new(
-                        socket,
-                        HandshakeRole::Responder(responder),
-                        Duration::from_secs(10),
-                    )
-                    .await
-                    {
-                        Ok(ns) => {
-                            info!("Noise handshake completed with {}", peer_addr);
-                            ns
-                        }
-                        Err(e) => {
-                            error!("Noise handshake failed with {}: {:?}", peer_addr, e);
-                            continue;
-                        }
-                    };
-
                     let clients = Arc::clone(&self.clients);
                     let template_processor = Arc::clone(&self.template_processor);
                     let template_id_counter = Arc::clone(&self.template_id_counter);
+                    let authority_public_key = self.config.authority_public_key.clone();
+                    let authority_secret_key = self.config.authority_secret_key.clone();
+                    let cert_validity_secs = self.config.cert_validity_secs;
 
+                    // The Noise handshake runs INSIDE the spawned task, never on the accept
+                    // loop.
+                    //
+                    // It used to run inline here, and a handshake can take up to its 10s
+                    // timeout. For that whole time `listener.accept()` could not run, so further
+                    // connections sat unaccepted in the kernel backlog. That is not merely slow,
+                    // it is self-sustaining: the client's handshake timeout is also ~10s, so once
+                    // the loop falls one connection behind, every queued client has already given
+                    // up by the time the server reaches it — and the server then spends another
+                    // full timeout handshaking against a socket nobody is listening on. The
+                    // backlog never drains.
+                    //
+                    // Observed in production as a wedged template provider: `ss` showing
+                    // `LISTEN 2` with 64 unread bytes on accepted sockets while the pool was
+                    // otherwise healthy and still building blocks, and every pool_sv2 client
+                    // timing out and exiting, which systemd then restarted in a loop. Spawning
+                    // first keeps accept() free at all times, so a slow or dead peer costs one
+                    // task rather than the whole listener.
                     tokio::spawn(async move {
+                        let responder = match Responder::from_authority_kp(
+                            &authority_public_key,
+                            &authority_secret_key,
+                            Duration::from_secs(cert_validity_secs),
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!("Failed to create Noise responder: {:?}", e);
+                                return;
+                            }
+                        };
+
+                        let noise_stream = match NoiseTcpStream::<Message>::new(
+                            socket,
+                            HandshakeRole::Responder(responder),
+                            Duration::from_secs(10),
+                        )
+                        .await
+                        {
+                            Ok(ns) => {
+                                info!("Noise handshake completed with {}", peer_addr);
+                                ns
+                            }
+                            Err(e) => {
+                                error!("Noise handshake failed with {}: {:?}", peer_addr, e);
+                                return;
+                            }
+                        };
+
                         if let Err(e) = handle_tdp_client(
                             noise_stream,
                             peer_addr,
