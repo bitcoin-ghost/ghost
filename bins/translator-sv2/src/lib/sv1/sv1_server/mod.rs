@@ -335,3 +335,37 @@ mod username_difficulty_tests {
         assert_eq!(extract_worker_name(name), "braiins");
     }
 }
+
+#[cfg(test)]
+mod worker_tlv_length_tests {
+    use stratum_apps::stratum_core::{extensions_sv2::UserIdentity, parsers_sv2::TlvField};
+
+    /// A full `<address>.<worker>` must survive TLV encode AND decode.
+    ///
+    /// Lives here rather than in `parsers-sv2` because that crate is not a workspace member,
+    /// so tests written there never run.
+    ///
+    /// Regression guard for a two-layer bug: `MAX_USER_IDENTITY_LENGTH` was declared
+    /// independently in BOTH `extensions_sv2` (gating `UserIdentity::new`) and
+    /// `parsers_sv2::tlv_extensions` (gating `to_tlv`/`from_tlv`). Raising only the first left
+    /// encoding still rejecting at 32 bytes; the caller discarded that error with `.ok()`, so
+    /// the share went upstream with NO identity TLV and the pool credited it to the channel's
+    /// provisional identity — i.e. the operator's address instead of the miner's. Verified
+    /// end-to-end on an isolated node: before, a share from `<addr>.attrtest` landed on
+    /// `<config-addr>.miner2`; after, it lands on `<addr>.attrtest`.
+    #[test]
+    fn full_address_and_worker_round_trips_through_tlv() {
+        for identity in [
+            "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492.attrtest",
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr.worker1",
+        ] {
+            assert!(identity.len() > 32, "must exceed the old 32-byte cap");
+            let ui = UserIdentity::new(identity).expect("construct");
+            let tlv = ui
+                .to_tlv()
+                .unwrap_or_else(|e| panic!("encode rejected {identity:?}: {e:?}"));
+            let decoded = UserIdentity::from_tlv(&tlv).expect("decode");
+            assert_eq!(decoded.as_str().unwrap(), identity);
+        }
+    }
+}

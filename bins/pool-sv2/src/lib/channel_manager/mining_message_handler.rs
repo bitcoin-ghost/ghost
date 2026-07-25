@@ -21,7 +21,7 @@ use stratum_apps::stratum_core::{
     parsers_sv2::{Mining, TemplateDistribution, Tlv, TlvField},
     template_distribution_sv2::SubmitSolution,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 
@@ -853,6 +853,15 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 // sharing one aggregated channel.
                 let tlv_worker: Option<&str> =
                     user_identity.as_ref().and_then(|ui| ui.as_str());
+                debug!(
+                    "share attribution: channel_uid={:?} tlv_worker={:?} -> {:?}",
+                    extended_channel.get_user_identity(),
+                    tlv_worker,
+                    build_webhook_user_identity(
+                        extended_channel.get_user_identity().to_string(),
+                        tlv_worker
+                    )
+                );
 
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash, header80)) => {
