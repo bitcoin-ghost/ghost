@@ -2192,6 +2192,25 @@ async fn ensure_mpc_params_present(
     ))
 }
 
+/// Heap profiling allocator, compiled in only under `--features heap-profiling`.
+///
+/// jemalloc with profiling support. Inert until switched on at runtime, so a build with this
+/// feature behaves normally until you ask for a profile:
+///
+/// ```text
+/// MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:30,prof_prefix:/tmp/gp-heap \
+///     /opt/ghost/bin/ghost-pool ...
+/// jeprof --show_bytes --text /opt/ghost/bin/ghost-pool /tmp/gp-heap.*.heap | head -40
+/// ```
+///
+/// `lg_prof_sample:19` samples every ~512KB allocated (cheap), and `lg_prof_interval:30`
+/// dumps a profile per ~1GB allocated, which is enough granularity to see what accumulates
+/// without babysitting it. Added to chase the ~2.2GB steady-state working set in #418, where
+/// reasoning from the outside repeatedly produced wrong answers.
+#[cfg(feature = "heap-profiling")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
