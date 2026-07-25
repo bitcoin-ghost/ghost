@@ -37,9 +37,18 @@ monitoring_address = "0.0.0.0:9092"
 
 # Difficulty configuration for SV1 miners
 [downstream_difficulty_config]
-# Minimum hashrate of connected miners (500 GH/s — lowered for BitAxe ~0.5-1.5 TH/s)
-# MAINNET: raise back to 10_000_000_000_000.0 (10 TH/s)
-min_individual_miner_hashrate = 500_000_000_000.0
+# Vardiff floor and starting point for a new SV1 connection: 10 TH/s => difficulty ~23,283.
+#
+# This is the STARTING difficulty, not a cap, and starting high is strictly safer than
+# starting low. Vardiff falls quickly for a small miner (/1.5, /2, /3 per 60s tick) but is
+# capped climbing (x3-x5 above 1000% delta), so a large miner pointed at a low floor floods
+# for minutes before converging. At 500 GH/s (difficulty 1,164) a 1 PH/s order produces
+# ~200 shares/sec; at this floor it is ~2.3/sec. Rented-hashrate marketplaces also refuse to
+# dispatch into a pool advertising a difficulty far below the order size.
+#
+# A BitAxe (~0.5-1.5 TH/s) converges down in about 3 vardiff ticks, and payouts are
+# work-weighted, so a small miner loses share cadence during that window, not earnings.
+min_individual_miner_hashrate = 10_000_000_000_000.0
 # Target shares per minute
 shares_per_minute = 6.0
 # Enable variable difficulty adjustment
