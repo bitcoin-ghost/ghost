@@ -229,6 +229,12 @@ pub const SV2_STRATUM_PORT: u16 = 34255;
 /// SV1 Stratum port (translator)
 pub const SV1_STRATUM_PORT: u16 = 3333;
 
+/// Template Distribution Protocol port, served by ghost-pool and consumed by pool_sv2.
+///
+/// Matches the `--tdp-port` default. Shared here so health checks can reason about the
+/// provider without duplicating the literal.
+pub const TDP_PORT: u16 = 8442;
+
 /// SV2 pool authority public key (the Noise static key SV2/Noise clients pin).
 ///
 /// This is the network-wide authority key that every `pool_sv2` instance

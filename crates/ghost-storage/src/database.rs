@@ -991,7 +991,7 @@ impl Database {
     ///
     /// Always runs `ANALYZE` (cheap, and it is what actually helps the query planner) and a
     /// WAL checkpoint. Only runs `VACUUM` when there is enough reclaimable space to justify
-    /// it — see [`VACUUM_MIN_RECLAIMABLE_BYTES`].
+    /// it — see `VACUUM_MIN_RECLAIMABLE_BYTES`.
     ///
     /// This used to run `VACUUM; ANALYZE;` unconditionally, and `run_maintenance` calls it
     /// whenever a maintenance pass deletes more than 1000 rows — which pruning health pings,
