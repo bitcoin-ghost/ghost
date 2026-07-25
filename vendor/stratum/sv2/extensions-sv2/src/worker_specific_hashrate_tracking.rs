@@ -9,8 +9,19 @@ use alloc::{
     vec::Vec,
 };
 
-/// Maximum length for user identity in bytes as per the spec.
-pub const MAX_USER_IDENTITY_LENGTH: usize = 32;
+/// Maximum length for user identity in bytes.
+///
+/// The TLV `length` field is a `u16`, so the encoding permits far more than this; 255 matches
+/// the `Str0255` limit used for identity strings elsewhere in SV2.
+///
+/// This was 32, which fits a bare worker name but not a full `<address>.<worker>` — a bech32
+/// address is 42 bytes by itself. That mattered once the TLV became the authoritative source of
+/// a miner's payout address: `UserIdentity::new` returns `Err` past the cap and the caller
+/// discards it with `.ok()`, so an over-long identity did not truncate, it silently sent NO TLV
+/// at all, and the pool fell back to the channel's identity. For a channel opened before
+/// `mining.authorize` that identity is the translator's provisional config value, so shares
+/// were credited to the operator's configured address instead of the miner's.
+pub const MAX_USER_IDENTITY_LENGTH: usize = 255;
 
 /// Extension type for Worker-Specific Hashrate Tracking
 pub const EXTENSION_TYPE: u16 = 0x0002;
@@ -24,11 +35,11 @@ pub const FIELD_TYPE_USER_IDENTITY: u8 = 0x01;
 /// `SubmitSharesExtended` messages via TLV encoding when the Worker-Specific Hashrate Tracking
 /// extension (0x0002) is negotiated.
 ///
-/// The UserIdentity is stored as raw UTF-8 bytes (max 32 bytes) to
+/// The UserIdentity is stored as raw UTF-8 bytes (max [`MAX_USER_IDENTITY_LENGTH`]) to
 /// match the TLV specification exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserIdentity {
-    /// UserIdentity as raw UTF-8 bytes (max 32 bytes).
+    /// UserIdentity as raw UTF-8 bytes (max [`MAX_USER_IDENTITY_LENGTH`]).
     ///
     /// The TLV Value field contains these raw bytes directly.
     pub(crate) user_identity: Vec<u8>,
@@ -43,7 +54,7 @@ impl UserIdentity {
     /// Creates a UserIdentity directly from raw bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.len() > MAX_USER_IDENTITY_LENGTH {
-            return Err("UserIdentity exceeds 32 bytes");
+            return Err("UserIdentity exceeds MAX_USER_IDENTITY_LENGTH");
         }
         Ok(Self {
             user_identity: bytes.to_vec(),
@@ -110,12 +121,28 @@ mod tests {
 
     #[test]
     fn test_user_identity_max_length() {
-        let worker_name = "Worker_1234567890123456789012345";
-        assert_eq!(worker_name.len(), MAX_USER_IDENTITY_LENGTH);
-
-        let msg = UserIdentity::new(worker_name).unwrap();
+        let worker_name = "W".repeat(MAX_USER_IDENTITY_LENGTH);
+        let msg = UserIdentity::new(&worker_name).unwrap();
         assert_eq!(msg.as_str().unwrap(), worker_name);
-        assert_eq!(msg.len(), 32);
+        assert_eq!(msg.len(), MAX_USER_IDENTITY_LENGTH);
+    }
+
+    #[test]
+    fn test_user_identity_fits_full_address_and_worker() {
+        // The TLV must carry a full `<address>.<worker>`, because for a channel opened before
+        // `mining.authorize` it is the only place the miner's payout address travels. A bech32
+        // address alone is 42 bytes, so the old 32-byte cap rejected these outright — and the
+        // caller discards the error, so the TLV vanished and shares were credited to the
+        // channel's provisional identity instead of the miner.
+        for identity in [
+            "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492.braiins",
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr.worker1",
+            "148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN.SKBitaxe",
+        ] {
+            let msg = UserIdentity::new(identity)
+                .unwrap_or_else(|e| panic!("{identity} ({} bytes) rejected: {e}", identity.len()));
+            assert_eq!(msg.as_str().unwrap(), identity);
+        }
     }
 
     #[test]
@@ -135,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_user_identity_too_long() {
-        let too_long = "x".repeat(33);
+        let too_long = "x".repeat(MAX_USER_IDENTITY_LENGTH + 1);
         let result = UserIdentity::new(&too_long);
         assert!(result.is_err());
     }
