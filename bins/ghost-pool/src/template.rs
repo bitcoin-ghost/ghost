@@ -4225,9 +4225,14 @@ mod tests {
             total_weight
         );
 
-        // Edge case: maximum allowed
-        let max_weight: u64 = 4_000_000;
-        assert!(max_weight <= u64::MAX, "No overflow");
+        // Edge case: a block exactly at the BIP141 weight limit is allowed, not rejected.
+        // (The previous `max_weight <= u64::MAX` assertion was vacuous — max_weight is u64.)
+        const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+        let max_weight: u64 = MAX_BLOCK_WEIGHT;
+        assert!(
+            max_weight <= MAX_BLOCK_WEIGHT,
+            "a block at exactly the BIP141 limit must be permitted"
+        );
     }
 
     /// Helper to create a TemplateTransaction for sorting tests

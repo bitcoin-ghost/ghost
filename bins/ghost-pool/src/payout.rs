@@ -4307,9 +4307,9 @@ mod tests {
             "u128 multiplication should not overflow for max sats * max work"
         );
 
-        // Verify the product is within u128 range
+        // `product.is_some()` above IS the overflow check — `checked_mul` returns None on
+        // overflow. (A `p <= u128::MAX` assertion here was vacuous: p is u128.)
         let p = product.unwrap();
-        assert!(p <= u128::MAX);
 
         // Division should produce a valid result
         let result = p / max_work;
