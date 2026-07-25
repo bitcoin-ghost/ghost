@@ -973,12 +973,40 @@ impl Sv1Server {
             // bytes. If it somehow isn't (empty downstream pre-authorize), skip the TLV
             // gracefully rather than disconnecting the miner.
             if user_identity.is_empty() {
+                warn!(
+                    "Down: downstream {} has no user_identity at share submit — TLV omitted, \
+                     pool will attribute this share to the CHANNEL identity",
+                    message.downstream_id
+                );
                 None
             } else {
-                UserIdentity::new(&user_identity)
-                    .ok()
-                    .and_then(|ui| ui.to_tlv().ok())
-                    .map(|tlv| vec![tlv])
+                match UserIdentity::new(&user_identity)
+                    .map_err(|e| e.to_string())
+                    .and_then(|ui| ui.to_tlv().map_err(|e| format!("{e:?}")))
+                {
+                    Ok(tlv) => {
+                        debug!(
+                            "Down: attaching worker TLV for downstream {}: {:?} ({} bytes)",
+                            message.downstream_id,
+                            user_identity,
+                            user_identity.len()
+                        );
+                        Some(vec![tlv])
+                    }
+                    Err(e) => {
+                        // Previously `.ok()` — an error here silently dropped the TLV and sent
+                        // the share with no identity at all, so the pool credited the channel's
+                        // (possibly provisional) identity instead of the miner.
+                        warn!(
+                            "Down: FAILED to build worker TLV for downstream {} from {:?} \
+                             ({} bytes): {e} — share will be misattributed",
+                            message.downstream_id,
+                            user_identity,
+                            user_identity.len()
+                        );
+                        None
+                    }
+                }
             }
         };
 

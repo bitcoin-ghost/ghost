@@ -21,7 +21,7 @@ use stratum_apps::stratum_core::{
     parsers_sv2::{Mining, TemplateDistribution, Tlv, TlvField},
     template_distribution_sv2::SubmitSolution,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 
@@ -854,10 +854,38 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let tlv_worker: Option<&str> =
                     user_identity.as_ref().and_then(|ui| ui.as_str());
 
+                // FAIL CLOSED on a missing worker TLV when the extension IS negotiated.
+                //
+                // A client that negotiated Worker-Specific Hashrate Tracking is telling us its
+                // channel identity is not the payout target — it is a translator or proxy
+                // fronting other miners, and the per-miner identity travels in the TLV. If the
+                // TLV is then absent, we do NOT know who earned this share, and crediting the
+                // channel identity means silently paying the fronting operator's own address.
+                // That is exactly how a duplicated length constant quietly misdirected shares:
+                // encoding failed, the TLV vanished, and the fallback looked like normal
+                // operation. Dropping the share is visible and costs one share; guessing is
+                // invisible and costs someone their earnings.
+                //
+                // Clients that never negotiate the extension (direct SV2 miners) are unaffected
+                // — their channel identity IS the payout target.
+                let extension_negotiated = negotiated_extensions
+                    .as_ref()
+                    .is_ok_and(|exts| exts.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING));
+                let attributable = !(extension_negotiated && tlv_worker.is_none());
+                if !attributable {
+                    error!(
+                        "share attribution FAILED: channel {} (identity {:?}) negotiated the \
+                         worker-identity extension but submitted a share with no TLV — share \
+                         accepted for the miner but NOT credited, as the payout target is unknown",
+                        channel_id,
+                        extended_channel.get_user_identity()
+                    );
+                }
+
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash, header80)) => {
                         let share_work = extended_channel.get_target().difficulty_float();
-                        if let Some(ref sender) = self.share_webhook_sender {
+                        if let (Some(ref sender), true) = (&self.share_webhook_sender, attributable) {
                             sender.send(ShareData {
                                 timestamp_ms: now_ms(),
                                 share_hash: share_hash.to_string(),
@@ -893,6 +921,17 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase, header80)) => {
                         info!("SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}");
+                        // Deliberately NOT gated on `attributable`: a block is always reported,
+                        // even if we cannot identify who found it. Losing a block to an
+                        // attribution problem would be far worse than recording one whose finder
+                        // needs resolving by hand afterwards.
+                        if !attributable {
+                            error!(
+                                "BLOCK FOUND on channel {} but the worker TLV is missing — block \
+                                 IS being reported; finder attribution needs manual resolution",
+                                channel_id
+                            );
+                        }
                         let share_work = extended_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
                             sender.send(ShareData {

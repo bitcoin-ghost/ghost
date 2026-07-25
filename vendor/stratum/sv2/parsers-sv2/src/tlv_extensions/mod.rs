@@ -10,14 +10,23 @@ pub use error::{ExtensionError, UserIdentityError};
 use super::{Tlv, TlvField};
 use crate::ParserError;
 use extensions_sv2::{
-    UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
+    UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, MAX_USER_IDENTITY_LENGTH,
+    TLV_FIELD_TYPE_USER_IDENTITY,
 };
 
 extern crate alloc;
 use alloc::vec::Vec;
 
-/// Maximum length for worker identifiers in bytes as per the spec.
-const MAX_USER_IDENTITY_LENGTH: usize = 32;
+// NOTE: `MAX_USER_IDENTITY_LENGTH` is imported from `extensions_sv2`, which owns
+// `UserIdentity`, rather than redeclared here.
+//
+// This module previously kept its own `const MAX_USER_IDENTITY_LENGTH: usize = 32`. Two
+// constants of the same name in different crates silently diverged: raising the one in
+// `extensions_sv2` fixed `UserIdentity::new` but left this copy gating `to_tlv`/`from_tlv`,
+// so an over-long identity still failed to encode — and because the caller discarded the
+// error, the share went out with NO identity TLV and was credited to the channel's
+// (possibly provisional) identity instead of the miner. Keeping a single owner of the limit
+// makes that class of drift impossible.
 
 /// Implementation of TlvField trait for UserIdentity.
 ///
