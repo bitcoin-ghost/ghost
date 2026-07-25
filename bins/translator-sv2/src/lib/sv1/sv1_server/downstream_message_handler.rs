@@ -240,8 +240,15 @@ impl IsServer<'static> for Sv1Server {
             // Extract the worker-name portion of `<addr>.<worker>` so the TLV carries the
             // per-device identifier (which fits in 32 bytes) rather than the wallet address
             // (which doesn't and would duplicate the channel-level user_identity anyway).
-            data.user_identity =
-                tlv_compatible_username(super::extract_worker_name(name)).to_string();
+            // Carry the FULL `<address>.<worker>` in the TLV, not just the worker name.
+            //
+            // The channel's own `user_identity` is only correct when the channel was opened
+            // after `mining.authorize`. Miners that wait for the `mining.subscribe` response
+            // before authorising — proxies and rented-hashrate marketplaces — get their channel
+            // opened early under a provisional identity, so the TLV is the only place their
+            // real payout address can travel. pool_sv2 uses a dotted TLV verbatim and falls
+            // back to splicing a worker-only TLV onto the channel address.
+            data.user_identity = tlv_compatible_username(name).to_string();
             debug!(
                 "Down: Set user_identity to '{}' for downstream {}",
                 data.user_identity, downstream_id

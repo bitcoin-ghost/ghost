@@ -170,7 +170,11 @@ pub(super) fn extract_worker_name(name: &str) -> &str {
 /// If the input string exceeds the limit, it is truncated at the last valid UTF-8 character
 /// boundary before or at [`MAX_USER_IDENTITY_BYTES`] and a warning is logged.
 fn tlv_compatible_username(s: &str) -> &str {
-    const MAX_USER_IDENTITY_BYTES: usize = 32;
+    // The SV2 wire type is `Str0255`, so 255 bytes are permitted; this cap is ours. It was 32,
+    // which fits a worker name but truncates a full `<address>.<worker>` — a bech32 address is
+    // 42 bytes on its own. The TLV now carries the full identity for miners whose channel was
+    // opened before `mining.authorize` arrived, so it must fit one.
+    const MAX_USER_IDENTITY_BYTES: usize = 255;
     let len = s.len();
 
     if len <= MAX_USER_IDENTITY_BYTES {
