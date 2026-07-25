@@ -86,4 +86,3 @@ impl TlvField for UserIdentity {
         ))
     }
 }
-
