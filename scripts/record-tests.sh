@@ -25,17 +25,33 @@ EXCLUDES="--exclude wraith-wallet-gui --exclude ghost-tap-desktop"
 echo "==> fmt"
 cargo fmt --all -- --check || { echo "FAILED: formatting" >&2; exit 1; }
 
-echo "==> clippy"
-cargo clippy --workspace $EXCLUDES --all-targets 2>&1 | grep -E "^error" && {
-    echo "FAILED: clippy errors" >&2; exit 1; }
+# NB: do NOT write these as `cmd | grep ... && { fail }`. With `set -o pipefail` a failing
+# cargo makes the whole pipeline non-zero, the `&&` short-circuits, the failure branch never
+# runs — and the gate reports success while not gating. That exact bug let a commit with two
+# clippy errors be recorded as tested. Capture output and exit code explicitly instead.
+run_gate() {
+    local name="$1"; shift
+    echo "==> $name"
+    local out status
+    out="$("$@" 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 0 ] || grep -qE "^error" <<<"$out"; then
+        echo "$out" | grep -E "^error" -A 6 | head -40 >&2
+        echo "FAILED: $name" >&2
+        exit 1
+    fi
+    echo "$out"
+}
 
-echo "==> check (all targets, all features)"
-cargo check --workspace $EXCLUDES --all-targets --all-features 2>&1 | grep -E "^error" && {
-    echo "FAILED: check errors" >&2; exit 1; }
+run_gate clippy cargo clippy --workspace $EXCLUDES --all-targets >/dev/null
+run_gate "check (all targets, all features)" \
+    cargo check --workspace $EXCLUDES --all-targets --all-features >/dev/null
 
 echo "==> tests"
-cargo test --workspace $EXCLUDES --lib --bins 2>&1 | tee /tmp/ghost-test-out.txt | grep -E "^test result" | tail -5
-grep -qE "FAILED" /tmp/ghost-test-out.txt && { echo "FAILED: test failures" >&2; exit 1; }
+test_out="$(cargo test --workspace $EXCLUDES --lib --bins 2>&1)" || {
+    echo "$test_out" | grep -E "FAILED|^error" | head -20 >&2
+    echo "FAILED: tests" >&2; exit 1; }
+grep -E "^test result" <<<"$test_out" | tail -5
+grep -qE "FAILED" <<<"$test_out" && { echo "FAILED: test failures" >&2; exit 1; }
 
 SHA="$(git rev-parse HEAD)"
 date +%s > "${STATE_DIR}/tested-${SHA}"
