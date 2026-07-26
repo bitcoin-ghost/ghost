@@ -25,7 +25,7 @@ use stratum_apps::{
     utils::types::{DownstreamId, Hashrate},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Represents a downstream SV1 miner connection.
 ///
@@ -43,6 +43,11 @@ use tracing::{debug, error, info, warn};
 #[derive(Clone, Debug)]
 pub struct Downstream {
     pub downstream_id: DownstreamId,
+    /// Peer address of this connection. Carried purely so a disconnect can name WHO
+    /// disconnected: a miner losing its session, the mesh TCP proxy, and a port scanner
+    /// were previously indistinguishable in the log, which made connection churn
+    /// impossible to attribute.
+    pub peer_addr: std::net::SocketAddr,
     pub downstream_data: Arc<Mutex<DownstreamData>>,
     pub downstream_channel_state: DownstreamChannelState,
     // Flag to track if SV1 handshake is complete (subscribe + authorize)
@@ -55,6 +60,7 @@ impl Downstream {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         downstream_id: DownstreamId,
+        peer_addr: std::net::SocketAddr,
         downstream_sv1_sender: Sender<json_rpc::Message>,
         downstream_sv1_receiver: Receiver<json_rpc::Message>,
         sv1_server_sender: Sender<(DownstreamId, json_rpc::Message)>,
@@ -78,6 +84,7 @@ impl Downstream {
         );
         Self {
             downstream_id,
+            peer_addr,
             downstream_data,
             downstream_channel_state,
             sv1_handshake_complete: Arc::new(AtomicBool::new(false)),
@@ -103,6 +110,7 @@ impl Downstream {
         task_manager: Arc<TaskManager>,
     ) {
         let downstream_id = self.downstream_id;
+        let peer_addr = self.peer_addr;
         task_manager.spawn(async move {
             // we just spawned a new task that's relevant to fallback coordination
             // so register it with the fallback coordinator
@@ -125,7 +133,20 @@ impl Downstream {
                     // Handle downstream -> server message
                     res = self.handle_downstream_message() => {
                         if let Err(e) = res {
-                            error!("Downstream {downstream_id}: error in downstream message handler: {e:?}");
+                            // A client closing its socket is not an error — the handler
+                            // maps it to `action: Disconnect`, the expected outcome. Logging
+                            // it at ERROR made routine disconnects 86% of all ERROR output on
+                            // a live node, which buries real failures and makes
+                            // severity-based alerting useless (#465).
+                            if e.is_expected_disconnect() {
+                                debug!(
+                                    "Downstream {downstream_id} ({peer_addr}) disconnected: {e:?}"
+                                );
+                            } else {
+                                error!(
+                                    "Downstream {downstream_id} ({peer_addr}): error in downstream message handler: {e:?}"
+                                );
+                            }
                             if handle_error(&status_sender, e).await {
                                 break;
                             }
@@ -345,7 +366,9 @@ impl Downstream {
         {
             Ok(msg) => msg,
             Err(e) => {
-                error!("Error receiving downstream message: {:?}", e);
+                // Redundant with the handler's own line, which carries the downstream id
+                // and peer address. Kept at trace for anyone debugging the channel itself.
+                trace!("Error receiving downstream message: {:?}", e);
                 return Err(TproxyError::disconnect(e, downstream_id));
             }
         };
