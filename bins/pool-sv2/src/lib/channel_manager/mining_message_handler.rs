@@ -21,7 +21,7 @@ use stratum_apps::stratum_core::{
     parsers_sv2::{Mining, TemplateDistribution, Tlv, TlvField},
     template_distribution_sv2::SubmitSolution,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 
@@ -45,18 +45,6 @@ use crate::{
 /// the channel user_identity has no `.` we treat the whole thing as the address.
 fn build_webhook_user_identity(channel_uid: String, tlv_worker: Option<&str>) -> String {
     match tlv_worker.filter(|s| !s.is_empty()) {
-        // A TLV that already carries `<addr>.<worker>` is authoritative and used verbatim.
-        //
-        // This matters for miners whose SV2 channel had to be opened BEFORE their SV1
-        // `mining.authorize` arrived — proxies and rented-hashrate marketplaces wait for the
-        // `mining.subscribe` response before authorising, so the channel cannot carry their
-        // address at open time and holds the translator's provisional identity instead. Taking
-        // the address from the TLV rather than the channel keeps their payouts correct. The
-        // address is validated downstream by ghost-pool's `parse_user_identity` exactly as
-        // before, so a malformed TLV cannot redirect a payout to an unparseable target.
-        Some(worker) if worker.contains('.') => worker.to_string(),
-        // Worker-only TLV (the common case): splice it onto the address portion of the
-        // channel's identity, which is where the address lives for a normally-opened channel.
         Some(worker) => {
             let addr = channel_uid
                 .split_once('.')

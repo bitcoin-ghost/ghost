@@ -244,16 +244,14 @@ impl Sv1Server {
         downstream.downstream_data.super_safe_lock(|data| {
             data.suggested_hashrate = Some(clamped as Hashrate);
             data.hashrate = Some(clamped as Hashrate);
-            // Always stage the target, whether or not the channel exists yet.
-            //
-            // A declaration can land before the channel opens (`mining.suggest_difficulty`, in
-            // which case the open path reads `suggested_hashrate` directly), while the channel
-            // open is in flight (an authorize password, since the channel is now requested at
-            // subscribe), or after it is open. Only the middle case has no other pickup point,
-            // so the channel-open handler drains this staged target once the channel exists.
-            data.set_pending_hashrate(Some(clamped as Hashrate), downstream_id);
-            if let Some(target) = pending_target {
-                data.set_pending_target(target, downstream_id);
+            // Channel already open: the open path can no longer pick this up, so stage it for
+            // the vardiff loop, which pushes UpdateChannel upstream and mining.set_difficulty
+            // downstream on its next tick.
+            if data.channel_id.is_some() {
+                data.set_pending_hashrate(Some(clamped as Hashrate), downstream_id);
+                if let Some(target) = pending_target {
+                    data.set_pending_target(target, downstream_id);
+                }
             }
         });
     }
@@ -754,35 +752,65 @@ impl Sv1Server {
                         .push(downstream_message.clone())
                 });
 
-                // `mining.subscribe` opens the channel itself.
+                // mining.subscribe timeout fallback (serializer safety).
                 //
-                // The subscribe response carries `[subscriptions, extranonce1, extranonce2_size]`,
-                // and it must carry the REAL channel-allocated extranonce. Proxies and
-                // rented-hashrate marketplaces subdivide that extranonce across the miners they
-                // fan out to, then treat the allocation as fixed — so answering with a
-                // placeholder and correcting later via `mining.set_extranonce` does not work for
-                // them. The correction changes `extranonce1` from the 8-byte placeholder to the
-                // real 12-byte prefix, invalidating every sub-range they derived, and they drop
-                // the connection and retry forever.
-                //
-                // Those clients are also SERIALISERS: they wait for the subscribe response
-                // before sending `mining.authorize`. Opening the channel only on authorize
-                // therefore deadlocks them. Opening it here breaks the deadlock and lets the
-                // response carry the real extranonce first time, for every client.
-                //
-                // The channel opens under a provisional `user_identity` (the config prefix,
-                // since no username is known yet). `mining.authorize` does NOT re-open it —
-                // re-keying is precisely what these clients cannot tolerate. Attribution
-                // instead travels in the per-miner TLV, which carries the full
-                // `<address>.<worker>` once authorize lands; pool_sv2 prefers a dotted TLV over
-                // the channel identity, so payouts follow the miner, not the provisional value.
+                // PIPELINING miners (AxeOS/bitaxe) fire subscribe + authorize back-to-back, so
+                // the channel opens within ~100ms and the queued subscribe is answered with the
+                // REAL extranonce by the channel-open path (no set_extranonce needed). But
+                // SERIALIZING miners (cgminer / Avalon) wait for the subscribe RESPONSE before
+                // sending authorize — and the channel only opens on authorize. Queuing subscribe
+                // with no fallback deadlocks them: no response → no authorize → no channel → no
+                // response. After ~1.5s with no channel, answer subscribe with the placeholder
+                // extranonce so the serializer proceeds; the channel then opens and the existing
+                // set_extranonce path corrects the extranonce (serializing miners support that
+                // extension). The channel-open path and this timer both claim the queued subscribe
+                // atomically under the data lock, so exactly one of them answers it.
                 if is_mining_subscribe(&downstream_message) {
-                    debug!(
-                        "Down: opening channel for downstream {} on subscribe so the response \
-                         carries the real extranonce",
-                        downstream_id
-                    );
-                    self.handle_open_channel_request(downstream_id).await?;
+                    let server = self.clone();
+                    let did = downstream_id;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        let Some(downstream) =
+                            server.downstreams.get(&did).map(|r| r.value().clone())
+                        else {
+                            return;
+                        };
+                        // Claim the queued subscribe iff the channel still hasn't opened (i.e. the
+                        // open path hasn't already answered it — a pipelining miner).
+                        let subscribe_msg = downstream.downstream_data.super_safe_lock(|data| {
+                            if data.channel_id.is_some() {
+                                return None;
+                            }
+                            data.queued_sv1_handshake_messages
+                                .iter()
+                                .position(|m| is_mining_subscribe(m))
+                                .map(|pos| data.queued_sv1_handshake_messages.remove(pos))
+                        });
+                        if let Some(msg) = subscribe_msg {
+                            info!(
+                                "Down: subscribe-response timeout for downstream {} — serializing \
+                                 miner waiting on subscribe before authorize; answering with \
+                                 placeholder extranonce (set_extranonce corrects it on channel open)",
+                                did
+                            );
+                            match server.clone().handle_message(Some(did), msg) {
+                                Ok(Some(resp)) => {
+                                    if let Err(e) = downstream
+                                        .downstream_channel_state
+                                        .downstream_sv1_sender
+                                        .send(resp.into())
+                                        .await
+                                    {
+                                        warn!("Down: failed to send fallback subscribe response to downstream {}: {:?}", did, e);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    error!("Down: error building fallback subscribe response for downstream {}: {:?}", did, e);
+                                }
+                            }
+                        }
+                    });
                 }
 
                 return Ok(());
@@ -855,36 +883,6 @@ impl Sv1Server {
                 error!("Down: Error handling downstream message: {:?}", e);
                 return Err(TproxyError::disconnect(e, downstream_id));
             }
-        }
-
-        // Second pickup point for a declared difficulty: the channel was ALREADY open when the
-        // declaration arrived.
-        //
-        // Which of the two fires is a race between the miner's authorize and the pool's
-        // OpenExtendedMiningChannelSuccess, and it flips with pool latency — a co-located pool
-        // answers before authorize is processed, a remote one after. Draining the staged target
-        // in both places makes the outcome latency-independent; whichever runs first takes it
-        // and the other finds nothing.
-        let declared_update = downstream.downstream_data.super_safe_lock(|d| {
-            match (d.channel_id, d.pending_target, d.suggested_hashrate) {
-                (Some(channel_id), Some(target), Some(hashrate)) => {
-                    d.pending_target = None;
-                    Some((channel_id, target, hashrate))
-                }
-                _ => None,
-            }
-        });
-        if let Some((channel_id, target, hashrate)) = declared_update {
-            debug!(
-                "Down: applying declared difficulty for downstream {} post-authorize (channel {})",
-                downstream_id, channel_id
-            );
-            self.send_set_difficulty_to_specific_downstream(
-                channel_id,
-                target,
-                Some(hashrate as f64),
-            )
-            .await?;
         }
 
         // Check if there's a pending share to send to the Sv1Server
@@ -971,7 +969,7 @@ impl Sv1Server {
                 .downstream_data
                 .super_safe_lock(|d| d.user_identity.clone());
             // The downstream's user_identity is set during mining.authorize via
-            // tlv_compatible_username, so it is already within MAX_USER_IDENTITY_LENGTH
+            // extract_worker_name + tlv_compatible_username, so it's already capped at 32
             // bytes. If it somehow isn't (empty downstream pre-authorize), skip the TLV
             // gracefully rather than disconnecting the miner.
             if user_identity.is_empty() {
@@ -1029,30 +1027,6 @@ impl Sv1Server {
         &self,
         downstream_id: DownstreamId,
     ) -> TproxyResult<(), error::Sv1Server> {
-        // Exactly one open per downstream. Both `mining.subscribe` (which opens the channel so
-        // the response can carry the real extranonce) and `mining.authorize` (the historical
-        // trigger, still needed for clients that never subscribe first) reach here, and the
-        // window between sending the request and receiving the success is wide enough for both
-        // to fire. Test-and-set under the data lock so the loser is a no-op.
-        let already_requested = self
-            .downstreams
-            .get(&downstream_id)
-            .map(|d| {
-                d.downstream_data.super_safe_lock(|data| {
-                    let seen = data.channel_open_requested;
-                    data.channel_open_requested = true;
-                    seen
-                })
-            })
-            .unwrap_or(false);
-        if already_requested {
-            debug!(
-                "SV1 server: channel open already in flight for downstream {}, skipping",
-                downstream_id
-            );
-            return Ok(());
-        }
-
         info!(
             "SV1 server: opening extended mining channel for downstream {} after first message",
             downstream_id
@@ -1131,19 +1105,13 @@ impl Sv1Server {
                     let already_subscribed = downstream
                         .downstream_data
                         .safe_lock(|d| {
-                            // Send the corrective `mining.set_extranonce` ONLY to a miner whose
-                            // subscribe was actually answered with the placeholder by the ~1.5s
-                            // fallback (a serialiser). This used to be inferred by checking
-                            // whether `extranonce1` was still 8 zero bytes — but that is true of
-                            // EVERY downstream at channel open, including pipelining miners whose
-                            // queued subscribe is answered moments later, in this same handler,
-                            // with the real extranonce. Those miners were being sent an
-                            // unsolicited `mining.set_extranonce` BEFORE their subscribe reply.
-                            // `mining.set_extranonce` is an optional extension a client opts into
-                            // via `mining.extranonce.subscribe`; strict clients disconnect on
-                            // receiving one they never asked for, which is what rented-hashrate
-                            // clients were doing ~200ms after every handshake.
-                            let was_placeholder = d.subscribe_answered_with_placeholder;
+                            // Detect whether subscribe was already responded to with a placeholder
+                            // extranonce — i.e. the public-pool defer-open path. We treat the
+                            // initial DownstreamData::new value (8 bytes of zero) as the
+                            // placeholder. Any other prior value means we shouldn't send a
+                            // post-hoc set_extranonce (would be confusing for the miner).
+                            let was_placeholder = d.extranonce1.as_ref().len() == 8
+                                && d.extranonce1.as_ref().iter().all(|b| *b == 0);
                             d.extranonce1 = real_extranonce1.clone();
                             d.extranonce2_len = real_extranonce2_size;
                             d.channel_id = Some(m.channel_id);
@@ -1223,38 +1191,6 @@ impl Sv1Server {
                             info!(
                                 "Down: sent mining.set_extranonce to downstream {} (real extranonce={} bytes, extranonce2_size={})",
                                 downstream_id, real_extranonce1.as_ref().len(), real_extranonce2_size
-                            );
-                        }
-                    }
-
-                    // A difficulty declared while this channel's open was in flight (an authorize
-                    // password, which arrives after subscribe has already requested the open)
-                    // could not size the channel. Apply it now that the channel exists, rather
-                    // than leaving the miner at the pool floor until a vardiff tick up to 60s
-                    // later. `mining.suggest_difficulty` needs nothing here — it precedes
-                    // subscribe, so the open path already used it.
-                    let staged = downstream.downstream_data.super_safe_lock(|d| {
-                        match (d.pending_target.take(), d.suggested_hashrate) {
-                            (Some(t), Some(h)) => Some((t, h)),
-                            _ => None,
-                        }
-                    });
-                    if let Some((target, hashrate)) = staged {
-                        debug!(
-                            "Down: applying declared difficulty for downstream {} on channel open (channel {})",
-                            downstream_id, m.channel_id
-                        );
-                        if let Err(e) = self
-                            .send_set_difficulty_to_specific_downstream(
-                                m.channel_id,
-                                target,
-                                Some(hashrate as f64),
-                            )
-                            .await
-                        {
-                            warn!(
-                                "Down: failed to apply declared difficulty for downstream {}: {:?}",
-                                downstream_id, e
                             );
                         }
                     }
@@ -1517,9 +1453,8 @@ impl Sv1Server {
         };
 
         // NOTE: do NOT overwrite `data.user_identity` here — that field carries the per-share
-        // TLV identity (set by `mining.authorize`, carrying the full `<address>.<worker>`) and is bounded
-        // by MAX_USER_IDENTITY_LENGTH. It must stay independent of the channel-level
-        // user_identity.
+        // TLV worker-name (set by `mining.authorize` via `extract_worker_name`) and is bounded
+        // to 32 bytes by the spec. It must stay independent of the channel-level user_identity.
         let _ = downstream
             .downstream_data
             .safe_lock(|_d| ())
@@ -1809,6 +1744,10 @@ impl Sv1Server {
         Ok(())
     }
 
+    /// Spawns the job keepalive loop that sends periodic mining.notify messages.
+    ///
+    /// This prevents SV1 miners from timing out when there are no new jobs received from the
+    /// upstream for a while.
     pub async fn spawn_job_keepalive_loop(self: Arc<Self>) {
         let keepalive_interval_secs = self
             .config
