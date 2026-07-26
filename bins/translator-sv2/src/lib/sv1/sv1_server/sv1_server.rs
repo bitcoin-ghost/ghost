@@ -275,6 +275,12 @@ impl Sv1Server {
         status_sender: &Sender<Status>,
         task_manager: &Arc<TaskManager>,
         first_target: Target,
+        // Starting hashrate for this connection, in H/s. Differs per listener: the hobby port
+        // uses the configured floor, the farm port uses farm_tier.min_individual_miner_hashrate.
+        // Vardiff moves from here, so this only sets where the connection begins.
+        tier_floor_hs: Hashrate,
+        // Which listener accepted this connection.
+        on_farm_tier: bool,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -296,14 +302,17 @@ impl Sv1Server {
                 .clone(),
             sv1_server_receiver,
             first_target,
-            Some(
-                self.config
-                    .downstream_difficulty_config
-                    .min_individual_miner_hashrate,
-            ),
+            Some(tier_floor_hs),
             self.config.downstream_extranonce2_size as usize,
             connection_token.clone(),
         );
+        // Record which listener this connection arrived on, so the vardiff loop can tell an
+        // oversized hobby-port miner to move without disturbing farm-port miners.
+        if on_farm_tier {
+            downstream
+                .downstream_data
+                .super_safe_lock(|d| d.on_farm_tier = true);
+        }
         self.downstreams.insert(downstream_id, downstream.clone());
         // NB: vardiff state is intentionally NOT inserted here. The channel
         // is opened lazily after the first message, so a freshly accepted
@@ -465,14 +474,37 @@ impl Sv1Server {
     ) -> TproxyResult<(), error::Sv1Server> {
         info!("Starting SV1 server on {}", self.listener_addr);
 
-        // get the first target for the first set difficulty message
-        let first_target: Target = hash_rate_to_target(
-            self.config
-                .downstream_difficulty_config
-                .min_individual_miner_hashrate as f64,
-            self.config.downstream_difficulty_config.shares_per_minute as f64,
-        )
-        .unwrap();
+        // Starting difficulty for the hobby listener (`downstream_port`). Vardiff moves from
+        // here; this only sets where a connection begins.
+        let hobby_floor_hs = self
+            .config
+            .downstream_difficulty_config
+            .min_individual_miner_hashrate;
+        let shares_per_minute = self.config.downstream_difficulty_config.shares_per_minute as f64;
+        let first_target: Target =
+            hash_rate_to_target(hobby_floor_hs as f64, shares_per_minute).unwrap();
+
+        // Optional farm/rental listener. `None` leaves the single-listener behaviour exactly
+        // as it was, which is what every existing config produces.
+        let farm_tier = self.config.farm_tier.clone();
+        let (farm_listener, farm_first_target, farm_floor_hs) = match farm_tier.as_ref() {
+            Some(t) => {
+                let addr = SocketAddr::new(self.listener_addr.ip(), t.port);
+                let l = TcpListener::bind(addr).await.map_err(|e| {
+                    error!("Failed to bind farm listener to {}: {}", addr, e);
+                    TproxyError::shutdown(e)
+                })?;
+                let target =
+                    hash_rate_to_target(t.min_individual_miner_hashrate as f64, shares_per_minute)
+                        .unwrap();
+                info!(
+                    "Translator Proxy: farm/rental listening on {} (floor {} H/s)",
+                    addr, t.min_individual_miner_hashrate
+                );
+                (Some(l), target, t.min_individual_miner_hashrate)
+            }
+            None => (None, first_target.clone(), hobby_floor_hs),
+        };
 
         let vardiff_future = self.clone().spawn_vardiff_loop();
 
@@ -563,6 +595,8 @@ impl Sv1Server {
                                     &status_sender,
                                     &task_manager,
                                     first_target,
+                                    hobby_floor_hs,
+                                    false,
                                 ).await;
                             }
                             Err(e) => {
@@ -572,6 +606,30 @@ impl Sv1Server {
                     }
                     // Opt-in TLS listener. `accept_optional` resolves to `Pending` forever when no
                     // TLS listener is configured, so this arm is inert in the default deployment.
+                    // Farm/rental listener. Inert when `farm_tier` is unset, exactly like the
+                    // TLS arm: `accept_optional` never resolves on `None`.
+                    result = Self::accept_optional(farm_listener.as_ref()) => {
+                        match result {
+                            Ok((stream, addr)) => {
+                                info!("New SV1 downstream connection from {} on the farm port", addr);
+                                self.register_downstream(
+                                    stream,
+                                    addr,
+                                    &cancellation_token,
+                                    &fallback_coordinator,
+                                    &status_sender,
+                                    &task_manager,
+                                    farm_first_target.clone(),
+                                    farm_floor_hs,
+                                    true,
+                                ).await;
+                            }
+                            Err(e) => {
+                                warn!("Failed to accept farm-port connection: {:?}", e);
+                            }
+                        }
+                    }
+
                     result = Self::accept_optional(tls_listener.as_ref()) => {
                         match result {
                             Ok((tcp, addr)) => {
@@ -611,6 +669,8 @@ impl Sv1Server {
                                             &status_sender,
                                             &task_manager,
                                             first_target,
+                                            hobby_floor_hs,
+                                            false,
                                         ).await;
                                     }
                                     Err(e) => {
