@@ -29,31 +29,6 @@ pub struct DownstreamData {
     /// 1000% to ×3–×5 per 60s tick, so a farm or a rented-hashrate order spends minutes
     /// flooding shares before converging. A declared size skips the ramp entirely.
     pub suggested_hashrate: Option<Hashrate>,
-    /// True when this connection arrived on the farm/rental listener rather than the hobby
-    /// one. Only used to decide whether an oversized miner should be nudged to move: a large
-    /// miner on the hobby port is not stealing anything (payout is proportional to work, and
-    /// a share's work IS its difficulty), it just costs this node far more share validation,
-    /// bandwidth and database writes than it needs to.
-    pub on_farm_tier: bool,
-    /// True only when the ~1.5s subscribe-defer fallback actually answered `mining.subscribe`
-    /// with the PLACEHOLDER extranonce, i.e. a serialising miner was waiting on the response
-    /// before sending `mining.authorize`. Those miners — and only those — must be corrected
-    /// with `mining.set_extranonce` once the channel opens.
-    ///
-    /// A pipelining miner's queued subscribe is answered by the channel-open path with the REAL
-    /// extranonce, so it needs no correction. Sending one anyway is not merely redundant: it
-    /// puts an unsolicited `mining.set_extranonce` on the wire BEFORE the client's subscribe
-    /// reply, and `mining.set_extranonce` is an optional extension a client opts into via
-    /// `mining.extranonce.subscribe`. Strict clients hang up on it.
-    pub subscribe_answered_with_placeholder: bool,
-    /// Set as soon as an `OpenExtendedMiningChannel` has been SENT upstream, not when the
-    /// success comes back.
-    ///
-    /// `channel_id` stays `None` until the pool replies, so it cannot be used to decide whether
-    /// an open is already in flight: `mining.subscribe` requests the open, and a
-    /// `mining.authorize` arriving in that window would see `channel_id == None` and request a
-    /// second one, burning an extra upstream channel per miner.
-    pub channel_open_requested: bool,
     pub version_rolling_mask: Option<HexU32Be>,
     pub version_rolling_min_bit: Option<HexU32Be>,
     pub last_job_version_field: Option<u32>,
@@ -97,9 +72,6 @@ impl DownstreamData {
             target,
             hashrate,
             suggested_hashrate: None,
-            on_farm_tier: false,
-            subscribe_answered_with_placeholder: false,
-            channel_open_requested: false,
             version_rolling_mask: None,
             version_rolling_min_bit: None,
             last_job_version_field: None,

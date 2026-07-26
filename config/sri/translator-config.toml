@@ -65,29 +65,3 @@ address = "127.0.0.1"
 port = 34256
 # Must match the pool's authority_public_key
 authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
-
-# ── Port tiers (#410) ─────────────────────────────────────────────────────────
-# One difficulty cannot serve both a 500 GH/s bitaxe and a 1 PH/s rented order.
-# Sized for the bitaxe, a large order floods the pool for minutes while vardiff
-# ramps (it caps corrections above 1000% to x3-x5 per 60s tick) and marketplaces
-# reject the pool. Sized for the order, a bitaxe finds a share every ~200s and
-# looks dead — which is what made the dashboard flap after the floor was raised.
-#
-# Uncomment to run a SECOND listener for farm/rental traffic. The hobby tier keeps
-# `downstream_port`, so every miner already pointed here stays put and nobody has
-# to be told to move; only large miners need the new port advertised to them.
-#
-# BEFORE ENABLING: open the farm port on the firewall and the load balancer on
-# every node. A port that is advertised but unreachable is worse than no port.
-#
-# `hobby_max_individual_miner_hashrate` only logs a warning when a miner on the
-# hobby port measures above it. It is a CAPACITY control, not anti-fraud: payout
-# is proportional to work and a share's work IS its difficulty, so the same
-# hashrate earns the same on either port. A large miner on the hobby port is not
-# taking anything from anyone — it just costs this node ~20x the share
-# validation, bandwidth and database writes.
-#
-# [farm_tier]
-# port = 3334
-# min_individual_miner_hashrate = 10_000_000_000_000.0   # ~23,283 starting difficulty
-# hobby_max_individual_miner_hashrate = 50_000_000_000_000.0
