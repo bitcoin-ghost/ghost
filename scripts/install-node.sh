@@ -490,6 +490,38 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id "$SUDO_USER" >/de
     && log "Granted ${SUDO_USER} journal read access (takes effect on next login; use 'sudo journalctl' until then)"
 fi
 
+# Persistent journal. Without /var/log/journal, `Storage=auto` keeps the journal in
+# /run/log/journal — tmpfs — which means it is capped at 10% of RAM and, more to the
+# point, is DESTROYED on every reboot and on any journald restart.
+#
+# That is not a theoretical loss. While diagnosing an hourly OOM kill, each kill wiped
+# the run-up to the previous one, and the cause took four wrong guesses to find because
+# the evidence was being deleted by the thing under investigation. Measured retention on
+# the fleet was ~3-4.5 hours, which cannot show a daily pattern at all.
+#
+# Limits are set explicitly rather than inherited: the SystemMaxUse default is 10% of the
+# filesystem, which on a large disk would let the journal grow into space the node needs.
+log "Enabling persistent journald storage"
+mkdir -p /var/log/journal
+systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/10-ghost.conf <<'EOF'
+# Bitcoin Ghost — journal retention. Written by install-node.sh.
+#
+# Persistent so the journal survives the restart of whatever is being diagnosed,
+# and long enough to see a daily pattern rather than only the last few hours.
+[Journal]
+Storage=persistent
+SystemMaxUse=2G
+SystemKeepFree=1G
+MaxRetentionSec=2week
+EOF
+if systemctl restart systemd-journald >/dev/null 2>&1; then
+  log "Journal is now persistent (2G cap, 2 week retention)"
+else
+  log "WARNING: could not restart systemd-journald; journal may still be volatile"
+fi
+
 # ─────────────────────── 3. download + verify binaries ───────────────────────
 log "Downloading and verifying binaries (${GHOST_VERSION})"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
