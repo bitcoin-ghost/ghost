@@ -12267,7 +12267,14 @@ mod tests {
     }
 
     /// CRIT-6: Test that config POST with valid auth succeeds
+    ///
+    /// `#[serial]` because this mutates `GHOST_REAPER_APPLY_TEST_MODE`, which is
+    /// process-global. `test_config_reaper_post_auto_applies_ghostd` reads the same
+    /// variable and is already serial — but `#[serial]` only serialises against other
+    /// `#[serial]` tests, so leaving this one unmarked let it clear the variable while
+    /// that test was awaiting `post_reaper`, flipping it onto the non-test-mode path.
     #[tokio::test]
+    #[serial]
     async fn test_config_post_with_valid_auth_succeeds() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::types::NodeCapabilities;
