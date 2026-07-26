@@ -12,13 +12,27 @@
 # shows a large number; and a `systemctl daemon-reload` silently resets it to zero. What
 # matters is "how many restarts in the last N minutes", which is the delta between runs.
 #
-# Alerting: a webhook if one is configured, and always a journal entry at error priority.
-# The journal is only useful because it is now persistent (#414) — before that, a restart
-# loop erased its own evidence roughly every four hours.
+# Alerting goes through the node's own alert centre — `[alerts]` in pool.toml, configured
+# from the dashboard at Settings -> Alerts, delivering to email, push (ntfy-style) and
+# Telegram. This script POSTs to `/api/v1/alerts/internal/service-restart` and the node
+# dispatches it, honouring the master switch, the `service_restart_loop` event flag, the
+# rate limit and every channel the operator has enabled.
 #
-# Config, all optional, /etc/ghost/alerting.conf:
-#   ALERT_WEBHOOK=https://...     POST {"text": "..."} on alert. No default: without it
-#                                 this logs and nothing else. See the note in #412.
+# It previously POSTed to its own ALERT_WEBHOOK read from /etc/ghost/alerting.conf. That was
+# a second, parallel alerting system sitting beside a complete one, and it silently did
+# nothing unless an operator found and populated a file that nothing else referenced — so in
+# practice a crash loop alerted no one. Two sources of truth for the same job, which is the
+# same mistake as #431.
+#
+# A journal entry at error priority is always written regardless, which is only useful
+# because the journal is now persistent (#414) — before that a restart loop erased its own
+# evidence roughly every four hours.
+#
+# Config, all optional, /etc/ghost/restart-watch.conf:
+#   NODE_API=127.0.0.1:8080       where to POST the signal
+#   INTERNAL_AUTH_KEY=<hex>       shared secret; when the node has internal auth configured
+#                                 the signal must be HMAC-signed or it is rejected. Read from
+#                                 the node config automatically when not set here.
 #   RESTART_THRESHOLD=3           restarts within one window before alerting
 #   RESTART_RENOTIFY_SECS=3600    minimum gap between repeat alerts for the same unit
 #
@@ -28,15 +42,52 @@
 
 set -uo pipefail
 
-CONF=/etc/ghost/alerting.conf
+CONF=/etc/ghost/restart-watch.conf
 STATE_DIR=/var/lib/ghost/restart-watch
 UNITS="ghost-pool sri-pool sri-translator ghostd"
 
-ALERT_WEBHOOK=""
+NODE_API="127.0.0.1:8080"
+INTERNAL_AUTH_KEY=""
 RESTART_THRESHOLD=3
 RESTART_RENOTIFY_SECS=3600
 # shellcheck source=/dev/null
 [ -r "$CONF" ] && . "$CONF"
+
+# Fall back to the node's own configured secret so an operator does not have to copy it
+# into a second file — the whole point of this change is to stop duplicating config.
+if [ -z "$INTERNAL_AUTH_KEY" ]; then
+    for f in /etc/ghost/pool.toml /etc/ghost/ghost-pool.toml; do
+        [ -r "$f" ] || continue
+        INTERNAL_AUTH_KEY=$(grep -aoE '^[[:space:]]*internal_auth_key[[:space:]]*=[[:space:]]*"[^"]+"' "$f" 2>/dev/null \
+                            | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+        [ -n "$INTERNAL_AUTH_KEY" ] && break
+    done
+fi
+
+# POST a restart-loop signal to the node's alert centre.
+# Auth mirrors the dashboard proxy: HMAC-SHA256(secret, u64_le(timestamp) || body), hex,
+# in X-Ghost-Signature, with the unix timestamp in X-Ghost-Timestamp.
+send_alert() {
+    local unit="$1" restarts="$2" window="$3"
+    local body ts sig
+    body=$(printf '{"unit":"%s","restarts":%s,"window_secs":%s}' "$unit" "$restarts" "$window")
+    ts=$(date +%s)
+
+    local -a auth_headers=()
+    if [ -n "$INTERNAL_AUTH_KEY" ]; then
+        # u64 little-endian timestamp, then the raw body, HMAC'd with the hex secret.
+        sig=$( { printf '%016x' "$ts" | sed -E 's/(..)(..)(..)(..)(..)(..)(..)(..)/\8\7\6\5\4\3\2\1/' | xxd -r -p
+                 printf '%s' "$body"
+               } | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$INTERNAL_AUTH_KEY" -binary 2>/dev/null | xxd -p -c 256 )
+        [ -n "$sig" ] && auth_headers=(-H "X-Ghost-Signature: $sig" -H "X-Ghost-Timestamp: $ts")
+    fi
+
+    curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+         "${auth_headers[@]}" -d "$body" \
+         "http://${NODE_API}/api/v1/alerts/internal/service-restart" >/dev/null 2>&1 \
+      || logger -t ghost-restart-watch -p daemon.warning -- \
+           "alert POST failed for ${unit}; see journal for the restart itself" 2>/dev/null || true
+}
 
 CHECK_ONLY=false
 [ "${1:-}" = "--check" ] && CHECK_ONLY=true
@@ -80,13 +131,7 @@ for unit in $UNITS; do
         if [ $(( now - last_alert )) -ge "$RESTART_RENOTIFY_SECS" ]; then
             logger -t ghost-restart-watch -p daemon.err -- "$msg" 2>/dev/null || true
             echo "ALERT: $msg" >&2
-            if [ -n "$ALERT_WEBHOOK" ]; then
-                payload=$(printf '{"text":"Ghost alert: %s"}' "$msg")
-                curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
-                     -d "$payload" "$ALERT_WEBHOOK" >/dev/null 2>&1 \
-                  || logger -t ghost-restart-watch -p daemon.warning -- \
-                       "webhook POST failed for: $msg" 2>/dev/null || true
-            fi
+            send_alert "$unit" "$delta" "$elapsed"
             last_alert=$now
         fi
         problems+=("$msg")

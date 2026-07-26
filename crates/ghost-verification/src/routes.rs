@@ -549,6 +549,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_alerts_failed_login_post_handler),
         )
         .route(
+            "/api/v1/alerts/internal/service-restart",
+            post(api_alerts_service_restart_post_handler),
+        )
+        .route(
             "/api/v1/config/ghost_pay",
             post(api_config_ghost_pay_post_handler),
         )
@@ -7890,6 +7894,11 @@ async fn api_alerts_test_post_handler(
 /// burst of signals — at most one `FailedLogin` alert per this interval.
 const FAILED_LOGIN_ALERT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+/// Minimum gap between service-restart alerts. A crash loop restarts every few
+/// seconds; without this the operator gets a message per restart, which is how
+/// alerting gets muted and then ignored.
+const SERVICE_RESTART_ALERT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
+
 /// Body of the internal failed-login signal from the dashboard login route.
 /// Carries only the failed-attempt count (and the window it was measured over) —
 /// never the attempted password or any credential material.
@@ -7962,6 +7971,107 @@ async fn api_alerts_failed_login_post_handler(
             .fire_rate_limited(
                 crate::alerts::AlertEvent::FailedLogin,
                 FAILED_LOGIN_ALERT_MIN_INTERVAL,
+                &detail,
+            )
+            .await
+    } else {
+        false
+    };
+
+    Json(serde_json::json!({ "success": true, "dispatched": dispatched })).into_response()
+}
+
+/// Payload from the restart watchdog. Carries only what the operator needs to
+/// act: which unit, how many restarts, over what window. No paths, no logs.
+#[derive(Debug, Deserialize)]
+struct ServiceRestartSignal {
+    /// systemd unit that restarted, e.g. `ghost-pool`.
+    unit: String,
+    /// Restarts observed within the window.
+    restarts: u32,
+    /// Window (seconds) the restarts were counted over.
+    #[serde(default)]
+    window_secs: Option<u64>,
+}
+
+/// Whether a string is a plausible systemd unit name.
+///
+/// The watchdog's payload ends up in an operator's inbox, push notification or
+/// Telegram chat verbatim, so it must not carry arbitrary text. systemd unit
+/// names are alphanumerics plus `-`, `_`, `.` and `@`; anything else is either a
+/// bug in the caller or an attempt to inject content into an alert.
+fn is_plausible_unit_name(unit: &str) -> bool {
+    !unit.is_empty()
+        && unit.len() <= 64
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+}
+
+/// API v1 internal service-restart signal handler — dispatches a
+/// `ServiceRestartLoop` operator alert through the shared dispatcher.
+///
+/// `scripts/ghost-restart-watch.sh` runs from a systemd timer and posts here.
+/// It previously POSTed to its own `ALERT_WEBHOOK` read from
+/// `/etc/ghost/alerting.conf`, which was a second, parallel alerting system that
+/// duplicated `[alerts]` and silently did nothing unless an operator discovered
+/// and populated a file nothing else referenced. Routing through the dispatcher
+/// means the watchdog honours the master switch, the per-event flag, the
+/// rate limit, and every configured channel — email, push and Telegram — with no
+/// separate configuration to keep in step.
+///
+/// Authenticated with the same internal HMAC as the failed-login signal: the
+/// watchdog is a root-owned timer, not an operator session, so it cannot use the
+/// dashboard cookie.
+async fn api_alerts_service_restart_post_handler(
+    State(state): State<Arc<VerificationState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Some(auth) = state.internal_auth.as_ref() {
+        if let Err((code, _)) = verify_internal_auth(auth, &headers, &body) {
+            return (
+                code,
+                Json(serde_json::json!({ "success": false, "message": "unauthorized" })),
+            )
+                .into_response();
+        }
+    }
+
+    let payload: ServiceRestartSignal = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "success": false, "message": "invalid request body" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !is_plausible_unit_name(&payload.unit) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "success": false, "message": "invalid unit" })),
+        )
+            .into_response();
+    }
+
+    let detail = match payload.window_secs {
+        Some(w) if w >= 60 => format!(
+            "{} restarted {} times in the last {} minutes.",
+            payload.unit,
+            payload.restarts,
+            w / 60
+        ),
+        _ => format!("{} restarted {} times.", payload.unit, payload.restarts),
+    };
+
+    let dispatched = if let Some(dispatcher) = state.alert_dispatcher.get() {
+        dispatcher
+            .fire_rate_limited(
+                crate::alerts::AlertEvent::ServiceRestartLoop,
+                SERVICE_RESTART_ALERT_MIN_INTERVAL,
                 &detail,
             )
             .await
@@ -14159,5 +14269,45 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json.is_null());
+    }
+
+    /// The watchdog's `unit` reaches an operator's inbox verbatim, so it is the one
+    /// field an alert must not accept freely. Real unit names pass; anything that
+    /// could inject markup, newlines or a URL into a message does not.
+    #[test]
+    fn service_restart_unit_names_are_restricted_to_real_units() {
+        for ok in [
+            "ghost-pool",
+            "sri-pool",
+            "sri-translator",
+            "ghostd",
+            "ghost-restart-watch.service",
+            "getty@tty1",
+            "a",
+        ] {
+            assert!(
+                super::is_plausible_unit_name(ok),
+                "should accept real unit name: {ok}"
+            );
+        }
+
+        for bad in [
+            "",                          // nothing to report
+            "ghost pool",                // space
+            "ghost-pool\nX-Injected: 1", // header/line injection
+            "<b>ghost-pool</b>",         // markup into an email body
+            "https://evil.example/x",    // a link into a push notification
+            "ghost-pool; rm -rf /",      // shell-looking payload
+            "ghost\u{202E}loop",         // bidi override
+        ] {
+            assert!(
+                !super::is_plausible_unit_name(bad),
+                "should reject: {bad:?}"
+            );
+        }
+
+        // Bounded length, so a huge body cannot be laundered through the unit field.
+        assert!(!super::is_plausible_unit_name(&"a".repeat(65)));
+        assert!(super::is_plausible_unit_name(&"a".repeat(64)));
     }
 }

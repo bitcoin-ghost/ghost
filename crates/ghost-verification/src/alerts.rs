@@ -68,6 +68,10 @@ pub enum AlertEvent {
     FeeSpike,
     /// A burst of consecutive failed dashboard login attempts was detected.
     FailedLogin,
+    /// A service restarted repeatedly in a short window — a crash loop. Distinct
+    /// from `NodeOffline`: the node answers, but something under it keeps dying,
+    /// which is exactly the shape the hourly OOM had before it was diagnosed.
+    ServiceRestartLoop,
 }
 
 impl AlertEvent {
@@ -87,6 +91,7 @@ impl AlertEvent {
             AlertEvent::MempoolCongestion => e.mempool_congestion,
             AlertEvent::FeeSpike => e.fee_spike,
             AlertEvent::FailedLogin => e.failed_login,
+            AlertEvent::ServiceRestartLoop => e.service_restart_loop,
         }
     }
 
@@ -105,6 +110,7 @@ impl AlertEvent {
             AlertEvent::MempoolCongestion => "Mempool congestion",
             AlertEvent::FeeSpike => "Fee spike",
             AlertEvent::FailedLogin => "Failed login attempts",
+            AlertEvent::ServiceRestartLoop => "Service restart loop",
         }
     }
 }
@@ -533,6 +539,7 @@ mod tests {
                 mempool_congestion: false,
                 fee_spike: false,
                 failed_login: false,
+                service_restart_loop: false,
             };
             pick(&mut events);
             c.events = events;
