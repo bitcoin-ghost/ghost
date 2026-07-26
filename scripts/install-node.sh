@@ -932,6 +932,42 @@ address = "127.0.0.1"
 port = 34255
 authority_pubkey = "${SV2_AUTH_PUB}"
 
+
+# ── Port tiers (#410) ─────────────────────────────────────────────────────────
+# One difficulty cannot serve both a 500 GH/s bitaxe and a 1 PH/s rented order.
+# Sized for the bitaxe, a large order floods the pool for minutes while vardiff
+# ramps (it caps corrections above 1000% to x3-x5 per 60s tick) and marketplaces
+# reject the pool. Sized for the order, a bitaxe finds a share every ~200s and
+# looks dead — which is what made the dashboard flap after the floor was raised.
+#
+# Uncomment to run a SECOND listener for farm/rental traffic. The hobby tier keeps
+# `downstream_port`, so every miner already pointed here stays put and nobody has
+# to be told to move; only large miners need the new port advertised to them.
+#
+# BEFORE ENABLING: open the farm port on the firewall and the load balancer on
+# every node. A port that is advertised but unreachable is worse than no port.
+#
+# 4444 is a conventional stratum alternate and was verified free on every node. 6666 was
+# considered and rejected: it is IRC-associated and blocked by default on some ISPs,
+# corporate firewalls and AV suites, which is a poor property for the port you hand to a
+# paying customer.
+#
+# The farm floor of ~232,827 is not a guess. avalonQ, a ~95 TH/s miner, vardiffed itself to
+# 233,672 on this fleet without prompting — the pool has already measured the right starting
+# difficulty for that size of miner, so the tier simply starts there instead of climbing.
+#
+# `hobby_max_individual_miner_hashrate` only logs a warning when a miner on the
+# hobby port measures above it. It is a CAPACITY control, not anti-fraud: payout
+# is proportional to work and a share's work IS its difficulty, so the same
+# hashrate earns the same on either port. A large miner on the hobby port is not
+# taking anything from anyone — it just costs this node ~20x the share
+# validation, bandwidth and database writes.
+#
+# [farm_tier]
+# port = 4444
+# min_individual_miner_hashrate = 100_000_000_000_000.0  # ~232,827 starting difficulty
+# hobby_max_individual_miner_hashrate = 50_000_000_000_000.0
+
 [load_balancer]
 ghost_pool_url = "127.0.0.1:8080"
 poll_interval_secs = 30
