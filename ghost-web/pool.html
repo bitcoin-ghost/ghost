@@ -607,6 +607,26 @@
     if (rlNotice) rlNotice.classList.toggle('show', !!on);
   }
 
+  // Have we ever had a real answer from a node? Until we have, the tiles keep the
+  // `—` they ship with, because a measured 0 and an unknown are different claims and
+  // only one of them is ours to make. `failedPolls` counts consecutive empty polls
+  // from a cold start so we can say "unreachable" instead of dashing forever.
+  var haveData = false;
+  var failedPolls = 0;
+  function setPoolUnreachable(on) {
+    var el = document.getElementById('m-hashrate');
+    if (!el) return;
+    // Only ever touches the tiles while haveData is false, so this cannot overwrite
+    // real numbers with an error state.
+    if (on) {
+      document.getElementById('m-hashrate').textContent = '—';
+      document.getElementById('m-miners').textContent = '—';
+      document.getElementById('m-blocks').textContent = '—';
+      document.getElementById('m-height').textContent = '—';
+      dbg('all nodes unreachable — tiles left blank rather than zeroed');
+    }
+  }
+
   function fetchNode(node) {
     var ctl = new AbortController();
     var t = setTimeout(function () { ctl.abort(); }, 5000);
@@ -652,13 +672,37 @@
       // we were throttled this tick and have no fresh data to show.
       if (okCount > 0) setRateLimited(false);
       else if (rateLimited) setRateLimited(true);
-      // No usable responses (throttled or transient) — don't blank the tiles.
-      // Keep the last good numbers; the notice explains the pause.
-      if (okCount === 0 && lastStats.height) {
-        dbg(rateLimited ? 'poll skip · rate-limited — preserving last view'
-                        : 'poll skip · 0/4 nodes — preserving last view');
+      // No usable responses (throttled or transient) — don't blank the tiles, and
+      // never paint zeros we have not measured.
+      //
+      // This used to be gated on `lastStats.height`, i.e. "only preserve if we have
+      // something to preserve". That inverted the intent on the very first poll:
+      // lastStats starts all-zero, so height was falsy, the guard did not fire, and
+      // the code fell through and rendered `0 TH/s · 0 MINERS · 0 BLOCKS`. The one
+      // moment we have nothing to show was the one moment we claimed the pool was
+      // dead — on the public page a prospective miner lands on. Zero is a factual
+      // claim about the pool; we must not make it while we simply do not know yet.
+      //
+      // The markup ships the tiles as `—`, so returning early on a first-poll
+      // failure leaves them in their loading state, which is the honest answer.
+      if (okCount === 0) {
+        if (haveData) {
+          dbg(rateLimited ? 'poll skip · rate-limited — preserving last view'
+                          : 'poll skip · 0/4 nodes — preserving last view');
+        } else {
+          // Nothing measured yet AND nobody answered. Distinguish "still connecting"
+          // from "every node is unreachable" rather than showing a bare dash forever.
+          failedPolls++;
+          dbg('poll skip · 0/' + POOL_NODES.length + ' nodes, no data yet (attempt ' + failedPolls + ')');
+          if (failedPolls >= 3) setPoolUnreachable(true);
+        }
         return;
       }
+      // Somebody answered: we now have measured numbers, so the tiles may show them.
+      // No need to clear an unreachable state — renderMetrics below overwrites every
+      // tile with a real value on this same tick.
+      haveData = true;
+      failedPolls = 0;
       var hashrate = 0, meshHashrate = null, sumLocal = 0, blocks = 0, height = 0, mesh = null, maxActive = 0;
       good.forEach(function (r) {
         if (!r) return;
