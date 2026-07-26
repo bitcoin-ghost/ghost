@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::prelude::*;
 
 use ghost_common::config::{MiningMode, NodeConfig, ReaperSettings};
+use ghost_common::constants::ACTIVE_MINER_WINDOW_SECS;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
@@ -2884,7 +2885,7 @@ async fn main() -> Result<()> {
     let db_for_active_hashes = Arc::clone(&db);
     mesh_inner.set_active_miner_hashes_provider(Arc::new(move || {
         db_for_active_hashes
-            .active_miner_id_hashes(300)
+            .active_miner_id_hashes(ACTIVE_MINER_WINDOW_SECS)
             .unwrap_or_default()
     }));
 
@@ -6379,14 +6380,14 @@ async fn main() -> Result<()> {
 
     // Wire pool-peers callback for the translator load-balancer endpoint.
     // `deduped_miner_count` is the per-node share of the mesh-wide active-miner
-    // total (attributed over the same 300s window as `mesh_active_miners`), so
+    // total (attributed over the same active-miner window as `mesh_active_miners`), so
     // the Capacity page's per-node rows sum to the deduped grand total instead
     // of over-counting miners that fail over between nodes. The raw
     // `miner_count` is left untouched for the LB's utilisation routing.
     let mesh_for_pool_peers = Arc::clone(&mesh);
     verification_state = verification_state.with_pool_peers(move || {
         use ghost_verification::PoolPeerInfo;
-        let deduped = mesh_for_pool_peers.deduped_miner_counts(300);
+        let deduped = mesh_for_pool_peers.deduped_miner_counts(ACTIVE_MINER_WINDOW_SECS as u64);
         mesh_for_pool_peers
             .peers()
             .get_connected_peers(30)
@@ -6412,9 +6413,9 @@ async fn main() -> Result<()> {
     let mesh_for_node_list = Arc::clone(&mesh);
     verification_state = verification_state.with_mesh_nodes(move || {
         use ghost_verification::MeshNodeInfo;
-        // Deduped per-node counts over the 300s active-miner window (matching
+        // Deduped per-node counts over the shared active-miner window (matching
         // the mesh grand total) so the mesh-nodes list sums consistently.
-        let deduped = mesh_for_node_list.deduped_miner_counts(300);
+        let deduped = mesh_for_node_list.deduped_miner_counts(ACTIVE_MINER_WINDOW_SECS as u64);
         mesh_for_node_list
             .peers()
             .get_connected_peers(120)
@@ -6452,8 +6453,8 @@ async fn main() -> Result<()> {
     // Mesh-wide deduplicated active miner count. Unions local active miner_id
     // hashes with the most-recent set from each connected peer.
     //
-    // The freshness window must match the 300s miner-activity window the local
-    // and gossiped sets are computed over (`active_miner_id_hashes(300)`), NOT a
+    // The freshness window must match the shared miner-activity window the local
+    // and gossiped sets are computed over (`ACTIVE_MINER_WINDOW_SECS`), NOT a
     // tight 60s. At 60s a peer that simply missed a few ~10s health pings (jitter,
     // GC, momentary load) was excluded entirely, dropping ALL of its active miners
     // from the union — so a node would report e.g. 4 of 5 miners, and since the
@@ -6462,15 +6463,16 @@ async fn main() -> Result<()> {
     // still ages out at the source node's 300s `last_seen`, so the count stays
     // honest while becoming robust to transient ping loss.
     let mesh_for_active = Arc::clone(&mesh);
-    verification_state = verification_state
-        .with_mesh_active_miners(move || mesh_for_active.mesh_active_miner_count(300) as u32);
+    verification_state = verification_state.with_mesh_active_miners(move || {
+        mesh_for_active.mesh_active_miner_count(ACTIVE_MINER_WINDOW_SECS as u64) as u32
+    });
 
     // This node's (self) deduped share of that mesh-wide total, from the same
     // attribution that fills each peer's `deduped_miner_count`. Surfaced on the
     // self/`this_node` entries so `self + peers` sum to `mesh_active_miners`.
     let mesh_for_self_deduped = Arc::clone(&mesh);
     verification_state = verification_state.with_self_deduped_miner_count(move || {
-        let counts = mesh_for_self_deduped.deduped_miner_counts(300);
+        let counts = mesh_for_self_deduped.deduped_miner_counts(ACTIVE_MINER_WINDOW_SECS as u64);
         counts
             .get(&mesh_for_self_deduped.peers().our_node_id())
             .copied()
