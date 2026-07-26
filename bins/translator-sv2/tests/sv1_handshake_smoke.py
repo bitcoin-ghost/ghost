@@ -11,6 +11,19 @@ Cases:
   pipeliner       AxeOS/Bitaxe: subscribe+authorize together. Must get the REAL
                   extranonce in the subscribe response (the extranonce-subscribe-OFF
                   fix), not the 8-byte placeholder.
+  probe-no-auth   Braiins/marketplace probe shape: subscribe -> read reply -> disconnect
+                  WITHOUT authorizing. Must be answered and cleaned up, and the next
+                  connection must still be served. A probe that hangs looks to the
+                  marketplace like an unreachable pool and nothing in our logs says why.
+  default-diff    The floor a miner gets when it asks for NOTHING. Every other difficulty
+                  case requests a value, so all of them pass identically on a correctly
+                  and an incorrectly configured node — which is how four production nodes
+                  came to serve 1,164 while the canaries served 23,283 with this file
+                  fully green. Override with GHOST_EXPECT_DEFAULT_DIFFICULTY.
+  attribution     authorize as `<address>.<worker>` -> must be accepted AND get a real
+                  per-miner extranonce, not the placeholder. That is the wire-visible
+                  precondition for share attribution, which was silently crediting the
+                  operator address for months because nothing asserted any of it.
   bare-username   authorize without a `.worker` -> must be rejected (per-miner payout
                   policy), not silently accepted.
   version-rolling mining.configure (BIP310/AsicBoost, Antminer S19) -> must negotiate
@@ -158,6 +171,119 @@ def test_suggest_difficulty():
     )
 
 
+def test_default_difficulty():
+    """Assert the floor a miner gets when it asks for NOTHING.
+
+    Every other difficulty case here *requests* a value and asserts the pool honours it,
+    which passes identically on a node with the right config and one with the wrong one.
+    That gap is not theoretical: after v1.11.18's binaries were rolled, all four
+    production nodes were still serving a floor of 1,164 while the canaries served
+    23,283, every case in this file passed on both, and the drift was only found by
+    reading config files by hand.
+
+    Expected value comes from min_individual_miner_hashrate: difficulty =
+    hashrate * (2^48 / 0xFFFF) / 2^32 / shares_per_minute-normalised — in practice
+    10 TH/s -> ~23,283. Override for a node deliberately configured otherwise.
+    """
+    expected = float(os.environ.get("GHOST_EXPECT_DEFAULT_DIFFICULTY", "23282.7"))
+    tol = float(os.environ.get("GHOST_DEFAULT_DIFFICULTY_TOLERANCE", "0.02"))
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
+    send(s, {"id": 2, "method": "mining.authorize", "params": [USER, "x"]})
+    got = _first_set_difficulty(s)
+    s.close()
+    ok = got is not None and abs(got - expected) / expected < tol
+    detail = f"pool set {got if got is None else f'{got:,.1f}'} (expected ~{expected:,.0f})"
+    if got is not None and not ok:
+        detail += " — config drift: this node is not serving the fleet floor"
+    print(f"  [default-diff]    {'PASS' if ok else 'FAIL'} — asked for nothing, {detail}")
+    return ok
+
+
+def test_serializer_no_authorize():
+    """The Braiins shape: subscribe, wait for the reply, then disconnect without authorizing.
+
+    Rented-hashrate marketplaces probe a pool this way before dispatching — they open a
+    connection, read the subscribe response to check extranonce2_size, and drop it. The
+    pool must answer and then clean up without wedging the accept loop, and a second
+    connection straight afterwards must still be served.
+
+    This is the shape that matters because a probe that hangs looks to the marketplace
+    like an unreachable pool, and nothing in our logs would say why.
+    """
+    t0 = time.time()
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["braiins-probe/1.0"]})
+    msgs = recv_until(s, 8.0, lambda m: m.get("id") == 1 and "result" in m)
+    sub = [m for m in msgs if m.get("id") == 1 and "result" in m]
+    answered = bool(sub)
+    s.close()  # disconnect WITHOUT authorize
+
+    # The pool must still serve the next connection — a leaked session or a blocked
+    # accept loop shows up here and nowhere else.
+    ok_second = False
+    try:
+        s2 = socket.create_connection((HOST, PORT), timeout=10)
+        send(s2, {"id": 1, "method": "mining.subscribe", "params": ["braiins-probe/1.0"]})
+        m2 = recv_until(s2, 8.0, lambda m: m.get("id") == 1 and "result" in m)
+        ok_second = any(m.get("id") == 1 and "result" in m for m in m2)
+        s2.close()
+    except OSError:
+        ok_second = False
+
+    elapsed = time.time() - t0
+    ok = answered and ok_second
+    print(f"  [probe-no-auth]   {'PASS' if ok else 'FAIL'} — subscribe answered={answered}, "
+          f"reconnect served={ok_second} ({elapsed:.2f}s)")
+    return ok
+
+
+def test_worker_attribution():
+    """Assert the pool accepts `<address>.<worker>` and opens a channel for it.
+
+    Attribution is only observable end-to-end by reading the share row on the node, which
+    this test cannot do from outside — see the note in main(). What IS observable over the
+    wire is the precondition: the address.worker identity is accepted, and the connection
+    gets a real extranonce rather than the placeholder, meaning a channel was opened for
+    this specific miner rather than the connection being aggregated.
+
+    Shares from named workers were credited to the operator address for months because
+    nothing asserted any part of this path.
+    """
+    worker = "attribtest"
+    addr = USER.split(".")[0]
+    ident = f"{addr}.{worker}"
+    s = socket.create_connection((HOST, PORT), timeout=10)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
+    send(s, {"id": 2, "method": "mining.authorize", "params": [ident, "x"]})
+
+    # Wait for BOTH replies, not whichever lands first. recv_until returns the moment
+    # its predicate matches, and the translator may answer authorize before it answers
+    # the deferred subscribe — so a predicate on id==2 alone drops the subscribe result
+    # and the extranonce reads as missing when it was merely not waited for.
+    seen = set()
+
+    def both(m):
+        if m.get("id") in (1, 2) and "result" in m:
+            seen.add(m["id"])
+        return {1, 2} <= seen
+
+    msgs = recv_until(s, 8.0, both)
+    s.close()
+
+    auth = [m for m in msgs if m.get("id") == 2 and "result" in m]
+    authorized = bool(auth) and auth[0].get("result") is True
+    sub = [m for m in msgs if m.get("id") == 1 and "result" in m]
+    en1 = sub[0]["result"][1] if sub and isinstance(sub[0].get("result"), list) else None
+    real_extranonce = en1 is not None and en1 != PLACEHOLDER
+
+    ok = authorized and real_extranonce
+    print(f"  [attribution]     {'PASS' if ok else 'FAIL'} — authorized {ident} as "
+          f"{authorized}, per-miner extranonce1={en1}"
+          f"{'' if real_extranonce else ' (PLACEHOLDER — no per-miner channel)'}")
+    return ok
+
+
 def test_pipeliner():
     s = socket.create_connection((HOST, PORT), timeout=10)
     send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
@@ -231,8 +357,11 @@ def main():
     results = {
         "serializer": test_serializer(),
         "probe-en2-size": test_placeholder_extranonce2_size(),
+        "probe-no-auth": test_serializer_no_authorize(),
+        "default-diff": test_default_difficulty(),
         "pw-difficulty": test_password_difficulty(),
         "suggest-diff": test_suggest_difficulty(),
+        "attribution": test_worker_attribution(),
         "pipeliner": test_pipeliner(),
         "bare-username": test_bare_username(),
         "version-rolling": test_version_rolling(),
