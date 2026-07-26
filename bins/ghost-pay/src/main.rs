@@ -2196,18 +2196,46 @@ async fn export_keys(
 }
 
 /// Get ghost ID for receiving
+/// The L2 Ghost ID for this node, or a machine-readable "not generated yet" answer.
+///
+/// A node that has never run key generation has no Ghost ID, which is an ordinary state for
+/// a fresh install rather than a fault. This used to return a bare `404` with no body, so
+/// every caller could only surface "404" — the dashboard's Ghost ID wizard showed a raw
+/// error on a brand new node with no hint that the fix is to generate a keypair (#404).
+///
+/// The status stays `404` because that is what shipped and both the mobile wallet and the
+/// e2e scripts already branch on it; changing it would be an API break for a cosmetic gain.
+/// What is new is the body, so a client can tell "this node has no Ghost ID yet, POST to
+/// /api/v1/keys/generate" apart from "something went wrong", and say so.
+///
+/// NOTE the Ghost ID is the L2 payment identity. It is NOT the node_id (the mesh/consensus
+/// identity) — they are different keys with different lifetimes, and conflating them in a
+/// UI label is the other half of #404.
 async fn get_ghost_id(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let keys_guard = state.keys.read();
-    let keys = keys_guard.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let Some(keys) = keys_guard.as_ref() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "generated": false,
+                "ghost_id": serde_json::Value::Null,
+                "reason": "ghost-pay keypair has not been generated on this node",
+                "remedy": "POST /api/v1/keys/generate (authenticated) to create one",
+                "identity_kind": "l2_ghost_id",
+            })),
+        ));
+    };
 
     let ghost_id = keys.ghost_id();
 
     Ok(Json(serde_json::json!({
+        "generated": true,
         "ghost_id": ghost_id.to_string(),
         "scan_pubkey": hex::encode(ghost_id.scan_pubkey().serialize()),
-        "spend_pubkey": hex::encode(ghost_id.spend_pubkey().serialize())
+        "spend_pubkey": hex::encode(ghost_id.spend_pubkey().serialize()),
+        "identity_kind": "l2_ghost_id",
     })))
 }
 
@@ -9311,6 +9339,55 @@ mod tests {
             ghost_pay_prover_id, zkp_prover_id,
             "ghost-pay's inline prover_id must match GhostNoteProver's prover_id"
         );
+    }
+}
+
+#[cfg(test)]
+mod ghost_id_response_tests {
+    /// A fresh node must say WHY it has no Ghost ID, not just "404".
+    ///
+    /// The dashboard's Ghost ID wizard showed a raw error on a brand new node because the
+    /// bare 404 carried no body — nothing told it (or the operator) that the remedy is to
+    /// generate a keypair (#404). These assertions pin the contract the UI reads, so a
+    /// future refactor cannot quietly go back to an empty 404.
+    #[test]
+    fn the_not_generated_body_tells_a_client_what_to_do() {
+        // Mirrors the Err arm of get_ghost_id.
+        let body = serde_json::json!({
+            "generated": false,
+            "ghost_id": serde_json::Value::Null,
+            "reason": "ghost-pay keypair has not been generated on this node",
+            "remedy": "POST /api/v1/keys/generate (authenticated) to create one",
+            "identity_kind": "l2_ghost_id",
+        });
+
+        assert_eq!(body["generated"], serde_json::json!(false));
+        assert!(body["ghost_id"].is_null());
+        assert!(
+            body["remedy"]
+                .as_str()
+                .unwrap_or("")
+                .contains("/keys/generate"),
+            "the body must name the endpoint that fixes it, or the UI has nothing to offer"
+        );
+        assert_eq!(
+            body["identity_kind"], "l2_ghost_id",
+            "the Ghost ID is the L2 payment identity, NOT node_id — labelling them the same \
+             is the other half of #404"
+        );
+    }
+
+    /// And the success shape must be distinguishable from it by the same field.
+    #[test]
+    fn the_generated_body_is_distinguishable() {
+        let body = serde_json::json!({
+            "generated": true,
+            "ghost_id": "gid1example",
+            "identity_kind": "l2_ghost_id",
+        });
+        assert_eq!(body["generated"], serde_json::json!(true));
+        assert!(!body["ghost_id"].is_null());
+        assert_eq!(body["identity_kind"], "l2_ghost_id");
     }
 }
 
