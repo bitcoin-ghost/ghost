@@ -15,7 +15,7 @@ min_supported_version = 2
 
 # Extranonce size for downstream miners
 # Max value for CGminer: 8, Min value: 2
-downstream_extranonce2_size = 4
+downstream_extranonce2_size = 8
 
 # User identity prefix (miner usernames will be username.miner1, username.miner2, etc.)
 user_identity = "ghost_miner"
@@ -23,7 +23,7 @@ user_identity = "ghost_miner"
 # Channel aggregation
 # true = all miners share one upstream channel (recommended for many small miners)
 # false = each miner gets its own channel
-aggregate_channels = true
+aggregate_channels = false
 
 # Protocol extensions
 supported_extensions = []

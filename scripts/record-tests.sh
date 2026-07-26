@@ -33,6 +33,9 @@ echo "==> workflow line continuations"
 echo "==> inlined installer copies"
 ./scripts/check-inlined-copies.sh || { echo "FAILED: inlined copies drifted" >&2; exit 1; }
 
+echo "==> stratum config agreement"
+./scripts/check-stratum-config-agreement.sh || { echo "FAILED: stratum config sources disagree" >&2; exit 1; }
+
 # NB: do NOT write these as `cmd | grep ... && { fail }`. With `set -o pipefail` a failing
 # cargo makes the whole pipeline non-zero, the `&&` short-circuits, the failure branch never
 # runs — and the gate reports success while not gating. That exact bug let a commit with two

@@ -43,6 +43,11 @@ jobs:
       # vardiff floor was fixed in one copy and not the other (#431).
       - name: Check inlined installer copies
         run: ./scripts/check-inlined-copies.sh
+      # The stratum config is defined twice — the installer heredoc and
+      # config/sri/translator-config.toml — because the installer is fetched standalone
+      # and has no repo to read. They had silently diverged (#431).
+      - name: Check stratum config agreement
+        run: ./scripts/check-stratum-config-agreement.sh
 
   # Clippy lints
   clippy:
