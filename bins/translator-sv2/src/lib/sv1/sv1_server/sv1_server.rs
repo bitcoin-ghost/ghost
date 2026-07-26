@@ -480,7 +480,6 @@ impl Sv1Server {
 
         // Compute-protection miner shedding (opt-in; inert unless enabled). Fire-and-forget,
         // like the zombie-connection reaper.
-        tokio::spawn(self.clone().spawn_shed_loop());
 
         let listener = TcpListener::bind(self.listener_addr).await.map_err(|e| {
             error!("Failed to bind to {}: {}", self.listener_addr, e);
@@ -975,7 +974,7 @@ impl Sv1Server {
                 .downstream_data
                 .super_safe_lock(|d| d.user_identity.clone());
             // The downstream's user_identity is set during mining.authorize via
-            // extract_worker_name + tlv_compatible_username, so it's already capped at 32
+            // tlv_compatible_username, so it is already within MAX_USER_IDENTITY_LENGTH
             // bytes. If it somehow isn't (empty downstream pre-authorize), skip the TLV
             // gracefully rather than disconnecting the miner.
             if user_identity.is_empty() {
@@ -1521,8 +1520,9 @@ impl Sv1Server {
         };
 
         // NOTE: do NOT overwrite `data.user_identity` here — that field carries the per-share
-        // TLV worker-name (set by `mining.authorize` via `extract_worker_name`) and is bounded
-        // to 32 bytes by the spec. It must stay independent of the channel-level user_identity.
+        // TLV identity (set by `mining.authorize`, carrying the full `<address>.<worker>`) and is bounded
+        // by MAX_USER_IDENTITY_LENGTH. It must stay independent of the channel-level
+        // user_identity.
         let _ = downstream
             .downstream_data
             .safe_lock(|_d| ())
@@ -1810,56 +1810,6 @@ impl Sv1Server {
             }
         }
         Ok(())
-    }
-
-    /// Spawns the job keepalive loop that sends periodic mining.notify messages.
-    ///
-    /// This prevents SV1 miners from timing out when there are no new jobs received from the
-    /// upstream for a while.
-    /// Compute-protection miner shedding (opt-in via `[load_balancer].compute_shed_enabled`).
-    /// When this node is `Critical` — its per-core 1-minute load average is at/over
-    /// `compute_evict_pct`, or it is over its miner-capacity evict threshold — evict up to
-    /// `shed_batch_size` miners per tick by cancelling their connection token, so they reconnect
-    /// via DNS to a less-loaded node. Returns immediately (inert) unless compute-protection is on,
-    /// so the default build is behaviour-neutral. Same eviction primitive as the zombie reaper
-    /// (`connection_token.cancel()` + idempotent `handle_downstream_disconnect`).
-    pub async fn spawn_shed_loop(self: Arc<Self>) {
-        let Some(lb) = self.load_balancer.clone() else {
-            return;
-        };
-        if !lb.compute_shed_enabled() {
-            return;
-        }
-        let check_interval = Duration::from_secs(15);
-        info!("Starting compute-protection miner-shed loop");
-        loop {
-            tokio::time::sleep(check_interval).await;
-            if !lb.should_shed().await {
-                continue;
-            }
-            // Shed the lowest-id (oldest) downstreams first, a small batch per tick; we
-            // re-evaluate each tick so shedding stops as soon as pressure drops.
-            let mut victims: Vec<DownstreamId> =
-                self.downstreams.iter().map(|e| *e.key()).collect();
-            victims.sort_unstable();
-            victims.truncate(lb.shed_batch_size());
-            for id in victims {
-                // Extract + drop the DashMap ref BEFORE handle_downstream_disconnect (which
-                // removes from the same map) to avoid holding a guard across the removal.
-                let token = self
-                    .downstreams
-                    .get(&id)
-                    .map(|ds| ds.downstream_channel_state.connection_token.clone());
-                if let Some(token) = token {
-                    token.cancel();
-                }
-                self.handle_downstream_disconnect(id).await;
-                warn!(
-                    "Shed downstream {} — node under compute pressure (miner will reconnect via DNS)",
-                    id
-                );
-            }
-        }
     }
 
     pub async fn spawn_job_keepalive_loop(self: Arc<Self>) {

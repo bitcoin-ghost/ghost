@@ -62,7 +62,8 @@ impl TlvField for UserIdentity {
             return Err(UserIdentityError::InvalidFieldType(tlv.r#type.field_type).into());
         }
 
-        // Enforce 32-byte maximum
+        // Enforce the identity length cap (MAX_USER_IDENTITY_LENGTH, owned by
+        // extensions_sv2). It was 32, which truncated a full `<address>.<worker>`.
         if tlv.value.len() > MAX_USER_IDENTITY_LENGTH {
             return Err(UserIdentityError::TooLong(tlv.value.len()).into());
         }

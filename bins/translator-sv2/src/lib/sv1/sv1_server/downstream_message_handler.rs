@@ -238,7 +238,7 @@ impl IsServer<'static> for Sv1Server {
                 data.authorized_worker_name = name.to_string();
             }
             // Extract the worker-name portion of `<addr>.<worker>` so the TLV carries the
-            // per-device identifier (which fits in 32 bytes) rather than the wallet address
+            // per-device identifier rather than the wallet address
             // (which doesn't and would duplicate the channel-level user_identity anyway).
             // Carry the FULL `<address>.<worker>` in the TLV, not just the worker name.
             //

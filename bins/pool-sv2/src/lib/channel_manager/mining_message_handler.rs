@@ -21,7 +21,7 @@ use stratum_apps::stratum_core::{
     parsers_sv2::{Mining, TemplateDistribution, Tlv, TlvField},
     template_distribution_sv2::SubmitSolution,
 };
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 
