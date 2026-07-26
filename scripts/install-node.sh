@@ -896,8 +896,10 @@ downstream_port = 3333
 max_supported_version = 2
 min_supported_version = 2
 
-# Extranonce size for downstream miners (CGminer max 8, min 2)
-downstream_extranonce2_size = 4
+# Extranonce size for downstream miners (CGminer max 8, min 2).
+# Must be >= 7: rented-hashrate marketplaces subdivide extranonce2 across their
+# fan-out connections and reject a pool that advertises less. Braiins requires 7.
+downstream_extranonce2_size = 8
 
 # Default miner-username prefix (this node's payout address). Miners may override
 # per connection by authorising as <address>.<worker>.
@@ -915,7 +917,7 @@ monitoring_address = "0.0.0.0:9092"
 
 # Difficulty configuration for SV1 miners
 [downstream_difficulty_config]
-min_individual_miner_hashrate = 500_000_000_000.0
+min_individual_miner_hashrate = 10_000_000_000_000.0
 shares_per_minute = 6.0
 enable_vardiff = true
 idle_timeout_secs = 600
