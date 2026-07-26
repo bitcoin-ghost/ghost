@@ -478,9 +478,6 @@ impl Sv1Server {
 
         let keepalive_future = self.clone().spawn_job_keepalive_loop();
 
-        // Compute-protection miner shedding (opt-in; inert unless enabled). Fire-and-forget,
-        // like the zombie-connection reaper.
-
         let listener = TcpListener::bind(self.listener_addr).await.map_err(|e| {
             error!("Failed to bind to {}: {}", self.listener_addr, e);
             TproxyError::shutdown(e)
