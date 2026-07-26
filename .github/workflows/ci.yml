@@ -31,6 +31,13 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      # Runs here rather than in Coverage: this job is fast, needs no build, and
+      # runs on pull requests, so a workflow that only breaks after merge (as the
+      # Coverage job did for six commits) gets caught before it lands.
+      - name: Check workflow line continuations
+        run: |
+          python3 -m pip install --quiet pyyaml
+          ./scripts/check-workflow-scalars.sh
 
   # Clippy lints
   clippy:
@@ -176,7 +183,12 @@ jobs:
         # external infrastructure (a real bitcoin-core/ghostd node, a running
         # stratum server, a live cluster) that isn't available in CI — those
         # are exercised separately, not in the coverage gate.
-        run: cargo llvm-cov $WORKSPACE_EXCLUDES --exclude integration_tests_sv2 \
+        # Block scalar (`|`), not a plain one: a plain multi-line scalar is folded
+        # onto a single line joined with a space, and YAML leaves the backslash
+        # alone, so the shell sees `\ ` — an escaped space — and `--lib` arrives as
+        # one token with a leading space rather than as a flag.
+        run: |
+          cargo llvm-cov $WORKSPACE_EXCLUDES --exclude integration_tests_sv2 \
             --lib --bins --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
