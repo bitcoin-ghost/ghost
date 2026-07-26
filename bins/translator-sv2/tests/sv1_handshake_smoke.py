@@ -134,27 +134,89 @@ def _first_set_difficulty(sock, timeout=8.0):
     return None
 
 
-def _declared_difficulty_case(label, requested, pre_subscribe=None, password="x"):
-    """Assert a miner-declared difficulty is honoured on the initial set_difficulty.
+def _set_difficulty_until(sock, timeout, wanted):
+    """(elapsed, difficulty) pairs in arrival order, stopping once `wanted` matches one.
+
+    Reads past the FIRST message deliberately: the declaration can arrive *behind* the floor
+    rather than instead of it, and only a transcript tells those two apart. Stopping on the
+    match rather than at the deadline keeps the healthy path as fast as it was — only a genuine
+    failure pays the full window.
+    """
+    sock.settimeout(timeout)
+    buf, out, t0 = b"", [], time.time()
+    try:
+        while time.time() - t0 < timeout:
+            data = sock.recv(4096)
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("method") == "mining.set_difficulty":
+                    params = msg.get("params") or []
+                    if params and isinstance(params[0], (int, float)):
+                        d = float(params[0])
+                        out.append((time.time() - t0, d))
+                        if wanted(d):
+                            return out
+    except (socket.timeout, OSError):
+        pass
+    return out
+
+
+def _declared_difficulty_case(label, requested, pre_subscribe=None, password="x", window=None):
+    """Assert a miner-declared difficulty REACHES THE MINER, and say how long it took.
 
     Without this, every connection starts at the configured floor (sized for the smallest
     expected miner) and vardiff needs several 60s ticks to climb — it caps corrections above
     1000% to x3-x5 per tick — so a farm or a rented-hashrate order floods shares for minutes
     before converging. Marketplaces reject a pool whose starting difficulty is far below the
     hashrate they are pointing at it.
+
+    Reads the whole window rather than just the first `set_difficulty`, because #455 was
+    *delay*, not refusal: the declaration was applied internally and then queued behind the
+    floor waiting for a `mining.notify` that never came. Asserting on the first message alone
+    reported "pool set 23,282.7", which reads as "ignored" and sends you looking in the wrong
+    place. Whether the value is late or absent, the miner is at the wrong difficulty, so both
+    still fail — but the message now names which one it is.
     """
+    window = window or float(os.environ.get("GHOST_DIFFICULTY_WINDOW_SECS", "20"))
     s = socket.create_connection((HOST, PORT), timeout=10)
     if pre_subscribe is not None:
         send(s, pre_subscribe)
     send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
     send(s, {"id": 2, "method": "mining.authorize", "params": [USER, password]})
-    got = _first_set_difficulty(s)
-    s.close()
     # Allow 1% for the target->difficulty rounding through the SV2 channel.
-    ok = got is not None and abs(got - requested) / requested < 0.01
-    print(f"  [{label}]{' ' * max(0, 16 - len(label))}{'PASS' if ok else 'FAIL'} — "
-          f"asked for difficulty {requested:,.0f}, pool set {got if got is None else f'{got:,.1f}'}")
-    return ok
+    def matches(d):
+        return abs(d - requested) / requested < 0.01
+
+    seen = _set_difficulty_until(s, window, matches)
+    s.close()
+
+    hit = next(((i, t, d) for i, (t, d) in enumerate(seen) if matches(d)), None)
+    pad = " " * max(0, 16 - len(label))
+    if hit is None:
+        if not seen:
+            detail = f"pool sent NO set_difficulty within {window:.0f}s"
+        else:
+            got = ", ".join(f"{d:,.1f}@{t:.1f}s" for t, d in seen)
+            detail = (f"pool set {got} and never sent the declared value within {window:.0f}s"
+                      " — applied internally but not delivered, see #455")
+        print(f"  [{label}]{pad}FAIL — asked for difficulty {requested:,.0f}, {detail}")
+        return False
+
+    idx, t, d = hit
+    when = "on the first set_difficulty" if idx == 0 else f"only after {idx} other value(s)"
+    late = "" if idx == 0 else "  ** DELAYED — the miner mined at the wrong difficulty until then **"
+    print(f"  [{label}]{pad}PASS — asked for difficulty {requested:,.0f}, pool set "
+          f"{d:,.1f} {when} at {t:.1f}s{late}")
+    return True
 
 
 def test_password_difficulty():
