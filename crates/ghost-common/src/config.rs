@@ -2146,6 +2146,10 @@ pub struct AlertEvents {
     /// A burst of consecutive failed dashboard login attempts was detected.
     #[serde(default = "default_true")]
     pub failed_login: bool,
+    /// A service restarted repeatedly in a short window (crash loop), reported by
+    /// the restart watchdog.
+    #[serde(default = "default_true")]
+    pub service_restart_loop: bool,
 }
 
 impl Default for AlertEvents {
@@ -2163,6 +2167,7 @@ impl Default for AlertEvents {
             mempool_congestion: true,
             fee_spike: true,
             failed_login: true,
+            service_restart_loop: true,
         }
     }
 }
