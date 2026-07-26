@@ -287,6 +287,7 @@ impl Sv1Server {
 
         let downstream = Downstream::new(
             downstream_id,
+            addr,
             connection.sender().clone(),
             connection.receiver().clone(),
             self.sv1_server_channel_state

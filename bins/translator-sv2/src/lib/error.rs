@@ -59,6 +59,30 @@ pub enum Action {
     Shutdown,
 }
 
+impl<Owner> TproxyError<Owner> {
+    /// Whether this error is an ordinary peer disconnect rather than a fault.
+    ///
+    /// A miner closing its socket, the mesh TCP proxy dropping a probe, or a port scanner
+    /// hanging up all surface as a receiver/IO error whose action is already `Disconnect` —
+    /// the handled, expected outcome. Logging those at ERROR made routine disconnects **86%
+    /// of all ERROR output** on a live production node (454 of 526 lines in 24h), which
+    /// buries genuine failures and makes any severity-based alerting fire constantly on
+    /// noise. See #465.
+    ///
+    /// Deliberately conservative: it requires BOTH that the action is `Disconnect` AND that
+    /// the kind is one that a peer going away actually produces. Anything else stays an
+    /// error, so a real handler fault is never quietly downgraded.
+    pub fn is_expected_disconnect(&self) -> bool {
+        matches!(self.action, Action::Disconnect(_))
+            && matches!(
+                self.kind,
+                TproxyErrorKind::ChannelErrorReceiver(_)
+                    | TproxyErrorKind::ChannelErrorSender
+                    | TproxyErrorKind::Io(_)
+            )
+    }
+}
+
 impl CanDisconnect for Downstream {}
 impl CanDisconnect for Sv1Server {}
 impl CanDisconnect for ChannelManager {}
@@ -412,5 +436,44 @@ impl<Owner> HandlerErrorType for TproxyError<Owner> {
 impl<Owner> std::fmt::Display for TproxyError<Owner> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "[{:?}/{:?}]", self.kind, self.action)
+    }
+}
+
+#[cfg(test)]
+mod expected_disconnect_tests {
+    use super::*;
+
+    /// A miner closing its socket must not be logged as an error, and a genuine handler
+    /// fault must still be. Getting this wrong in either direction is costly: too loud and
+    /// the 86% noise floor comes back (#465); too quiet and a real failure disappears.
+    #[test]
+    fn only_peer_went_away_errors_count_as_expected_disconnects() {
+        // What a peer going away actually produces, with the handled Disconnect action.
+        let recv: TproxyError<Downstream> = TproxyError::disconnect(async_channel::RecvError, 1);
+        assert!(
+            recv.is_expected_disconnect(),
+            "a receiver error on a disconnecting downstream is routine"
+        );
+
+        let io: TproxyError<Downstream> =
+            TproxyError::disconnect(std::io::Error::from(std::io::ErrorKind::BrokenPipe), 2);
+        assert!(io.is_expected_disconnect(), "broken pipe is routine");
+
+        // Same kind, but NOT a disconnect action — the connection is staying, so whatever
+        // happened is a fault worth reporting.
+        let logged: TproxyError<Downstream> = TproxyError::log(async_channel::RecvError);
+        assert!(
+            !logged.is_expected_disconnect(),
+            "action Log means this was not a disconnect"
+        );
+
+        // A disconnect for a reason that is NOT a peer going away stays an error, so a
+        // genuine bug on the disconnect path is never quietly downgraded.
+        let parser: TproxyError<Downstream> =
+            TproxyError::disconnect(TproxyErrorKind::UnexpectedMessage(0, 0), 3);
+        assert!(
+            !parser.is_expected_disconnect(),
+            "an unexpected message is a fault, not a routine disconnect"
+        );
     }
 }
