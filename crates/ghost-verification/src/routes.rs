@@ -35,7 +35,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use ghost_buds::{BudsClassifier, BudsTier};
-use ghost_common::constants::{SV1_STRATUM_PORT, SV2_AUTHORITY_PUBLIC_KEY, SV2_STRATUM_PORT};
+use ghost_common::constants::{
+    ACTIVE_MINER_WINDOW_SECS, SV1_STRATUM_PORT, SV2_AUTHORITY_PUBLIC_KEY, SV2_STRATUM_PORT,
+};
 use ghost_common::rpc::MempoolFilterStats;
 
 use crate::auth::{verify_internal_auth, InternalAuth};
@@ -1801,7 +1803,7 @@ async fn api_mining_status_handler(
     let active_miners = state
         .database
         .as_ref()
-        .and_then(|db| db.count_active_miners(300).ok())
+        .and_then(|db| db.count_active_miners(ACTIVE_MINER_WINDOW_SECS).ok())
         .unwrap_or(0);
     let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
     // Pool-wide hashrate (sum of every node's own realized hashrate) is the
@@ -3532,7 +3534,7 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
     let active_miners = state
         .database
         .as_ref()
-        .and_then(|db| db.count_active_miners(300).ok())
+        .and_then(|db| db.count_active_miners(ACTIVE_MINER_WINDOW_SECS).ok())
         .unwrap_or(0);
     let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
 
