@@ -244,10 +244,13 @@ def test_default_difficulty():
     reading config files by hand.
 
     Expected value comes from min_individual_miner_hashrate: difficulty =
-    hashrate * (2^48 / 0xFFFF) / 2^32 / shares_per_minute-normalised — in practice
-    10 TH/s -> ~23,283. Override for a node deliberately configured otherwise.
+    hashrate * 60 / (shares_per_minute * 2^32) — in practice the hobby floor of
+    1 TH/s -> ~2,328, and the farm tier (:4444) at 100 TH/s -> ~232,831. Override for a
+    node deliberately configured otherwise, and note this case only ever covers the port
+    it is pointed at: with a second listener running it must be run once per port or it
+    silently stops checking half the surface.
     """
-    expected = float(os.environ.get("GHOST_EXPECT_DEFAULT_DIFFICULTY", "23282.7"))
+    expected = float(os.environ.get("GHOST_EXPECT_DEFAULT_DIFFICULTY", "2328.27"))
     tol = float(os.environ.get("GHOST_DEFAULT_DIFFICULTY_TOLERANCE", "0.02"))
     s = socket.create_connection((HOST, PORT), timeout=10)
     send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
