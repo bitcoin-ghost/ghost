@@ -30,6 +30,9 @@ cargo fmt --all -- --check || { echo "FAILED: formatting" >&2; exit 1; }
 echo "==> workflow line continuations"
 ./scripts/check-workflow-scalars.sh || { echo "FAILED: workflow scalars" >&2; exit 1; }
 
+echo "==> inlined installer copies"
+./scripts/check-inlined-copies.sh || { echo "FAILED: inlined copies drifted" >&2; exit 1; }
+
 # NB: do NOT write these as `cmd | grep ... && { fail }`. With `set -o pipefail` a failing
 # cargo makes the whole pipeline non-zero, the `&&` short-circuits, the failure branch never
 # runs — and the gate reports success while not gating. That exact bug let a commit with two

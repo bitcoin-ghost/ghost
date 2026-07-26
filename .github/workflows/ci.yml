@@ -38,6 +38,11 @@ jobs:
         run: |
           python3 -m pip install --quiet pyyaml
           ./scripts/check-workflow-scalars.sh
+      # install-node.sh embeds copies of scripts it installs (it is fetched standalone
+      # and has no repo to read). Nothing checked they stayed in step, which is how the
+      # vardiff floor was fixed in one copy and not the other (#431).
+      - name: Check inlined installer copies
+        run: ./scripts/check-inlined-copies.sh
 
   # Clippy lints
   clippy:

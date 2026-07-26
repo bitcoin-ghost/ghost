@@ -1727,6 +1727,163 @@ GHOST_AUTOUPDATE_SH_EOF
 chmod 755 /opt/ghost/bin/ghost-auto-update.sh
 chown root:root /opt/ghost/bin/ghost-auto-update.sh
 
+# ── restart-loop watchdog ────────────────────────────────────────────────────
+# systemd restarts a crashing service forever and reports it `active` between
+# crashes, so `is-active` and every dashboard say the node is healthy while it is
+# dying on a loop. sri-pool reached 84-88 restarts on three nodes and nothing
+# surfaced it (#412). This watches the restart RATE and complains.
+#
+# Canonical source: scripts/ghost-restart-watch.sh — kept in step by hand, same as
+# ghost-auto-update.sh above. The installer is fetched standalone over curl and has
+# no repo to read from, which is why these are duplicated; see #431.
+cat > /opt/ghost/bin/ghost-restart-watch.sh <<'GHOST_RESTART_WATCH_SH_EOF'
+#!/usr/bin/env bash
+#
+# Restart-loop watchdog.
+#
+# sri-pool reached 84-88 restarts on three nodes and nothing surfaced it — it was found
+# by accident, long after the fact. systemd restarts a crashing service forever and
+# reports it `active` between crashes, so every dashboard and every `is-active` check
+# says the node is fine while it is in fact dying on a loop.
+#
+# This watches the RATE, not the total. NRestarts is cumulative since the last
+# daemon-reload, so a node that crash-looped last week and has been stable since still
+# shows a large number; and a `systemctl daemon-reload` silently resets it to zero. What
+# matters is "how many restarts in the last N minutes", which is the delta between runs.
+#
+# Alerting: a webhook if one is configured, and always a journal entry at error priority.
+# The journal is only useful because it is now persistent (#414) — before that, a restart
+# loop erased its own evidence roughly every four hours.
+#
+# Config, all optional, /etc/ghost/alerting.conf:
+#   ALERT_WEBHOOK=https://...     POST {"text": "..."} on alert. No default: without it
+#                                 this logs and nothing else. See the note in #412.
+#   RESTART_THRESHOLD=3           restarts within one window before alerting
+#   RESTART_RENOTIFY_SECS=3600    minimum gap between repeat alerts for the same unit
+#
+# Usage:
+#   ghost-restart-watch.sh          # normal run, intended for the timer
+#   ghost-restart-watch.sh --check  # report current state, never alert, never persist
+
+set -uo pipefail
+
+CONF=/etc/ghost/alerting.conf
+STATE_DIR=/var/lib/ghost/restart-watch
+UNITS="ghost-pool sri-pool sri-translator ghostd"
+
+ALERT_WEBHOOK=""
+RESTART_THRESHOLD=3
+RESTART_RENOTIFY_SECS=3600
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+CHECK_ONLY=false
+[ "${1:-}" = "--check" ] && CHECK_ONLY=true
+
+$CHECK_ONLY || mkdir -p "$STATE_DIR"
+now=$(date +%s)
+problems=()
+
+for unit in $UNITS; do
+    systemctl list-unit-files "${unit}.service" >/dev/null 2>&1 || continue
+    systemctl cat "$unit" >/dev/null 2>&1 || continue
+
+    n=$(systemctl show -p NRestarts --value "$unit" 2>/dev/null)
+    [ -n "$n" ] || continue
+
+    f="$STATE_DIR/$unit"
+    prev_n=""; prev_t=""; last_alert=0
+    [ -r "$f" ] && read -r prev_n prev_t last_alert < "$f" 2>/dev/null
+    : "${last_alert:=0}"
+
+    if $CHECK_ONLY; then
+        printf "  %-16s NRestarts=%s active=%s\n" "$unit" "$n" "$(systemctl is-active "$unit")"
+        continue
+    fi
+
+    # First run for this unit, or the counter went backwards because something ran
+    # daemon-reload. Either way there is no meaningful delta — record and move on
+    # rather than inventing one.
+    if [ -z "$prev_n" ] || [ "$n" -lt "$prev_n" ]; then
+        printf '%s %s %s\n' "$n" "$now" "$last_alert" > "$f"
+        continue
+    fi
+
+    delta=$(( n - prev_n ))
+    elapsed=$(( now - ${prev_t:-$now} ))
+
+    if [ "$delta" -ge "$RESTART_THRESHOLD" ]; then
+        mins=$(( elapsed / 60 )); [ "$mins" -lt 1 ] && mins=1
+        msg="$(hostname -s): ${unit} restarted ${delta} times in ${mins}m (total ${n})"
+
+        if [ $(( now - last_alert )) -ge "$RESTART_RENOTIFY_SECS" ]; then
+            logger -t ghost-restart-watch -p daemon.err -- "$msg" 2>/dev/null || true
+            echo "ALERT: $msg" >&2
+            if [ -n "$ALERT_WEBHOOK" ]; then
+                payload=$(printf '{"text":"Ghost alert: %s"}' "$msg")
+                curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+                     -d "$payload" "$ALERT_WEBHOOK" >/dev/null 2>&1 \
+                  || logger -t ghost-restart-watch -p daemon.warning -- \
+                       "webhook POST failed for: $msg" 2>/dev/null || true
+            fi
+            last_alert=$now
+        fi
+        problems+=("$msg")
+    fi
+
+    printf '%s %s %s\n' "$n" "$now" "$last_alert" > "$f"
+done
+
+# Non-zero when something is looping, so this is usable as a check from elsewhere
+# (a fleet script, a CI job, a human) and not only as a timer that mails itself.
+[ ${#problems[@]} -eq 0 ]
+GHOST_RESTART_WATCH_SH_EOF
+chmod 755 /opt/ghost/bin/ghost-restart-watch.sh
+chown root:root /opt/ghost/bin/ghost-restart-watch.sh
+mkdir -p /var/lib/ghost/restart-watch
+
+cat > /etc/systemd/system/ghost-restart-watch.service <<'GHOST_RESTART_WATCH_SERVICE_EOF'
+[Unit]
+Description=Bitcoin Ghost restart-loop watchdog
+Documentation=https://github.com/bitcoin-ghost/ghost/issues/412
+# Only meaningful once the node is up; never block boot on it.
+After=network-online.target ghostd.service ghost-pool.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ghost/bin/ghost-restart-watch.sh
+# systemctl show and the state directory under /var/lib both need root.
+User=root
+# The script exits non-zero when a service is looping — that is a finding, not a
+# failure of the check. Without this, the thing that reports problems would itself
+# show up as a failed unit, which is exactly the noise that gets ignored.
+SuccessExitStatus=0 1
+GHOST_RESTART_WATCH_SERVICE_EOF
+
+cat > /etc/systemd/system/ghost-restart-watch.timer <<'GHOST_RESTART_WATCH_TIMER_EOF'
+[Unit]
+Description=Run the Bitcoin Ghost restart-loop watchdog every 5 minutes
+Documentation=https://github.com/bitcoin-ghost/ghost/issues/412
+
+[Timer]
+# Five minutes: short enough that a loop is caught while it is still happening rather
+# than reconstructed afterwards, long enough that the restart delta is meaningful.
+OnBootSec=5min
+OnUnitActiveSec=5min
+# Do not let every node in the fleet fire at the same instant and stampede a webhook.
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+GHOST_RESTART_WATCH_TIMER_EOF
+
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable --now ghost-restart-watch.timer >/dev/null 2>&1 \
+  && log "Restart-loop watchdog enabled (every 5 min)" \
+  || log "WARNING: could not enable ghost-restart-watch.timer"
+
 # The privileged toggle the dashboard may sudo (scoped to on|off only).
 cat > /opt/ghost/bin/ghost-autoupdate-toggle <<'GHOST_AUTOUPDATE_TOGGLE_EOF'
 #!/usr/bin/env bash

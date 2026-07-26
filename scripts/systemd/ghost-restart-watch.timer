@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the Bitcoin Ghost restart-loop watchdog every 5 minutes
+Documentation=https://github.com/bitcoin-ghost/ghost/issues/412
+
+[Timer]
+# Five minutes: short enough that a loop is caught while it is still happening rather
+# than reconstructed afterwards, long enough that the restart delta is meaningful.
+OnBootSec=5min
+OnUnitActiveSec=5min
+# Do not let every node in the fleet fire at the same instant and stampede a webhook.
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

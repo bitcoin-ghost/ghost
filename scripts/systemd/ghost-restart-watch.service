@@ -1,0 +1,16 @@
+[Unit]
+Description=Bitcoin Ghost restart-loop watchdog
+Documentation=https://github.com/bitcoin-ghost/ghost/issues/412
+# Only meaningful once the node is up; never block boot on it.
+After=network-online.target ghostd.service ghost-pool.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ghost/bin/ghost-restart-watch.sh
+# systemctl show and the state directory under /var/lib both need root.
+User=root
+# The script exits non-zero when a service is looping — that is a finding, not a
+# failure of the check. Without this, the thing that reports problems would itself
+# show up as a failed unit, which is exactly the noise that gets ignored.
+SuccessExitStatus=0 1
