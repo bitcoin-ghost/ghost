@@ -36,11 +36,21 @@ fn main() {
         .unwrap_or_default();
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
 
-    // Capture build timestamp (ISO 8601 UTC)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // Capture build timestamp (ISO 8601 UTC).
+    //
+    // Honours SOURCE_DATE_EPOCH (the reproducible-builds convention) so a byte-identical
+    // binary can be produced on demand. Without it this stamp is the only thing that differs
+    // between two builds of the same commit, which is enough to make a SHA256 comparison
+    // useless for proving a deployed binary came from a given tag.
+    let now = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
     // Format as ISO 8601 manually (no chrono dependency needed)
     let secs_per_day = 86400u64;
     let secs_per_hour = 3600u64;
@@ -61,8 +71,40 @@ fn main() {
     );
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
 
-    // Only rerun if git HEAD changes
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // Only rerun when git HEAD changes, or when the reproducible-build stamp is overridden.
+    //
+    // This previously hard-coded `../../.git/HEAD`, which silently does nothing in a git
+    // WORKTREE: there `.git` is a FILE containing `gitdir: …`, not a directory, so the path
+    // does not exist, cargo cannot watch it, and the build script re-runs on EVERY build —
+    // giving a new timestamp and a new binary hash each time. All release builds here are
+    // done in worktrees, so the guard was off precisely where it mattered.
+    //
+    // `git rev-parse --git-common-dir` resolves correctly for a plain clone, a worktree and a
+    // submodule alike. It is relative to the current directory, which cargo sets to the crate
+    // root, so make it absolute before handing it to cargo.
+    let git_common_dir = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(dir) = git_common_dir {
+        let path = std::path::Path::new(&dir);
+        let head = if path.is_absolute() {
+            path.join("HEAD")
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(path)
+                .join("HEAD")
+        };
+        if head.exists() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
+    }
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 }
 
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {

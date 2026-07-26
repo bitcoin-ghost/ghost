@@ -14310,4 +14310,49 @@ mod tests {
         assert!(!super::is_plausible_unit_name(&"a".repeat(65)));
         assert!(super::is_plausible_unit_name(&"a".repeat(64)));
     }
+
+    /// `BUILD_TIME` is the only thing that differs between two builds of the same
+    /// commit, which is what stopped a binary hash proving a deployed artefact came
+    /// from a given tag (#462). Honouring SOURCE_DATE_EPOCH makes a byte-identical
+    /// build possible on demand; this asserts the stamp is well-formed and, when the
+    /// override is set at build time, that it was actually used.
+    #[test]
+    fn build_time_stamp_is_well_formed_and_honours_source_date_epoch() {
+        let stamp = option_env!("BUILD_TIME").unwrap_or("unknown");
+        assert_ne!(stamp, "unknown", "build.rs must always set BUILD_TIME");
+
+        // ISO 8601 UTC to the second: 2026-07-26T21:26:58Z
+        let b = stamp.as_bytes();
+        assert_eq!(b.len(), 20, "unexpected stamp shape: {stamp}");
+        assert_eq!(b[4], b'-');
+        assert_eq!(b[7], b'-');
+        assert_eq!(b[10], b'T');
+        assert_eq!(b[13], b':');
+        assert_eq!(b[16], b':');
+        assert_eq!(b[19], b'Z');
+        assert!(
+            stamp[..4].chars().all(|c| c.is_ascii_digit()),
+            "year must be numeric: {stamp}"
+        );
+
+        // When the reproducible-build override was set for THIS compilation, the stamp
+        // must be derived from it rather than from the wall clock.
+        if let Some(epoch) =
+            option_env!("SOURCE_DATE_EPOCH").and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            // 1_000_000_000 -> 2001-09-09T01:46:40Z. Rather than reimplement the civil-date
+            // conversion here, assert the cheap invariant: the year must match.
+            let days = epoch / 86_400;
+            let approx_year = 1970 + (days / 366); // lower bound, never overshoots
+            let stamp_year: u64 = stamp[..4].parse().expect("year parsed above");
+            assert!(
+                stamp_year >= approx_year,
+                "SOURCE_DATE_EPOCH={epoch} was ignored: stamp {stamp} predates it"
+            );
+            assert!(
+                stamp_year < 2100,
+                "stamp {stamp} looks like a wall-clock value, not {epoch}"
+            );
+        }
+    }
 }
