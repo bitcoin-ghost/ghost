@@ -194,8 +194,8 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// Which nodes qualify is consensus-visible (it decides the coinbase node split), so this is a
 /// height gate, not a feature flag: both counting paths exist in the new binary and every node
 /// switches at the same block, so a mixed-version fleet computes an identical node split during
-/// the roll. DORMANT until the voter set + per-node subnet map are converged fleet-wide; SET
-/// comfortably past the roll window.
+/// the roll. Was held dormant until the voter set + per-node subnet map had converged fleet-wide,
+/// then set comfortably past the roll window. ARMED — this height is in the past.
 pub const VOTER_SET_QUALIFICATION_HEIGHT: u64 = 959_116;
 
 /// Multi-operator consensus-drawn challenger assignment (Surface A-2b). At and above this
@@ -210,8 +210,9 @@ pub const VOTER_SET_QUALIFICATION_HEIGHT: u64 = 959_116;
 /// rubber-stamps. Which verdicts count is consensus-visible (it decides the coinbase node
 /// split), so this is a height gate: every node recomputes the identical assignment at the
 /// checkpoint cutoff, so a mixed-version fleet agrees on the node split during the roll.
-/// DORMANT until challenges have been issued+recorded against their assigned round for a full
-/// lookback window; SET comfortably past the roll window.
+/// Was held dormant until challenges had been issued+recorded against their assigned round for a
+/// full lookback window, then set comfortably past the roll window. ARMED — this height is in the
+/// past.
 pub const CHALLENGER_ASSIGNMENT_HEIGHT: u64 = 959_161;
 
 /// Finality lag (in blocks) between a round and the block whose hash seeds it: a round at tip
@@ -223,9 +224,8 @@ pub const CHALLENGER_ASSIGNMENT_SEED_LAG: u64 = ghost_verification::challenger_a
 /// Active-voter-set scaffolding (Phase 4, v1.x). At and above this height, BFT payout voting
 /// draws its eligible-voter set from the QUALIFIED ACTIVE nodes at the block's cutoff (the same
 /// converged resolver Component E uses) instead of the static genesis MPC elder set — letting the
-/// voting membership track the fleet as it grows/shrinks. Below it, the MPC elder set is used
-/// (current behaviour), so with this gate DORMANT (`u64::MAX`) the binary is byte-identical to
-/// today. Which nodes vote is consensus-visible, so this is a height gate: every node resolves the
+/// voting membership track the fleet as it grows/shrinks. Below it, the MPC elder set is used.
+/// Which nodes vote is consensus-visible, so this is a height gate: every node resolves the
 /// identical set at the checkpoint cutoff. ARMED @959_200 — the checkpoint-path voter set was
 /// proven byte-identical fleet-wide first (`checkpoint_voter_set.hash` `98100ee8…` on all 8,
 /// count=8, floored=false), and the redesign soaked clean gate-off on v1.11.9. Revert = restore
@@ -355,8 +355,9 @@ pub fn share_pow_verify_height() -> u64 {
 }
 
 /// The height at which BFT payout voting draws its eligible-voter set from the qualified active
-/// nodes at the block's cutoff instead of the static MPC elder set (Phase 4 scaffolding). DORMANT
-/// (`u64::MAX`) — below it the MPC elder set is used, so the binary is behaviour-neutral today.
+/// nodes at the block's cutoff instead of the static MPC elder set (Phase 4). Below it the MPC
+/// elder set is used. See `ACTIVE_VOTER_SET_HEIGHT` for the height and the arming record — this
+/// doc deliberately does not restate the value, so it cannot go stale when the gate moves.
 pub fn active_voter_set_height() -> u64 {
     *gates::ACTIVE_VOTER_SET.get_or_init(|| ACTIVE_VOTER_SET_HEIGHT)
 }

@@ -6169,13 +6169,16 @@ async fn main() -> Result<()> {
         vote_handler.set_proposal_validator(validator);
     }
 
-    // Phase 4 (DORMANT scaffolding): install the active-voter-set resolver. Below
-    // ACTIVE_VOTER_SET_HEIGHT (u64::MAX on mainnet today) it returns None and the vote handler
-    // keeps using the static MPC elder set — byte-identical to current behaviour. When armed in
-    // v1.x, the eligible-voter set becomes the qualified active nodes at the cutoff of the latest
-    // finalised payout checkpoint at/below the block — resolved identically fleet-wide via the
-    // same converged resolver + height scoping the payout root uses (so voters and the node split
-    // agree). The gate lives inside the closure, so this wiring is behaviour-neutral until armed.
+    // Phase 4: install the active-voter-set resolver. Below ACTIVE_VOTER_SET_HEIGHT it returns
+    // None and the vote handler keeps using the static MPC elder set. At and above it, the
+    // eligible-voter set becomes the qualified active nodes at the cutoff of the latest finalised
+    // payout checkpoint at/below the block — resolved identically fleet-wide via the same
+    // converged resolver + height scoping the payout root uses (so voters and the node split
+    // agree). The gate lives inside the closure, so the wiring itself is inert below the height.
+    //
+    // This gate is ARMED and has fired; see ACTIVE_VOTER_SET_HEIGHT for the value and the arming
+    // record. Do not describe it as dormant or restate the height here — that is how this comment
+    // came to claim `u64::MAX` long after the gate went live.
     {
         let db_c = Arc::clone(&db);
         let oracle_c = block_hash_oracle.clone();
