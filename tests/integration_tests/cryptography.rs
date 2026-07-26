@@ -286,12 +286,33 @@ fn test_021_pow_verify_rejects_wrong_nonce() {
 #[test]
 fn test_022_pow_verify_rejects_wrong_public_key() {
     let identity1 = NodeIdentity::generate();
-    let identity2 = NodeIdentity::generate();
-
     let proof = NodeIdProof::mine(&identity1.node_id(), 8).unwrap();
 
+    // A proof is (key, nonce) -> hash, and difficulty 8 means 8 leading ZERO BITS. So a
+    // second, unrelated key reused with this nonce satisfies the difficulty by chance
+    // 1 time in 256 — and then it verifies legitimately, because it genuinely is a valid
+    // proof for that key. Asserting `!verify` unconditionally therefore fails ~0.39% of
+    // runs on correct code. That is what happened on macOS in CI, on a pull request that
+    // changed nothing but a shell script.
+    //
+    // test_021 above and the unit test in ghost-common/src/identity.rs both guard against
+    // this exact coincidence; this one did not.
+    //
+    // Rather than skip the assertion on the unlucky draw (which leaves the test asserting
+    // nothing ~0.39% of the time), draw until we have a key that does NOT coincidentally
+    // satisfy the difficulty. Expected iterations: 1.004.
+    let wrong_key = loop {
+        let candidate = NodeIdentity::generate().node_id();
+        let hash = NodeIdProof::compute_hash(&candidate, proof.nonce);
+        if NodeIdProof::leading_zeros(&hash) < 8 {
+            break candidate;
+        }
+        // Landed on a key for which this nonce is a genuinely valid proof. Not a bug —
+        // draw again so the assertion below stays meaningful.
+    };
+
     // Verify against wrong key should fail
-    assert!(!proof.verify(&identity2.node_id(), 8));
+    assert!(!proof.verify(&wrong_key, 8));
 }
 
 #[test]
