@@ -45,8 +45,13 @@ CANARY="${3:-}"
 CANARY_NODES="ghost-vm5 ghost-vm6 ghost-vm7 ghost-vm8"
 PRODUCTION_NODES="ghost-vm1 ghost-vm2 ghost-vm3 ghost-vm4"
 SOAK_MINUTES="${SOAK_MINUTES:-60}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATE_DIR="${HOME}/.ghost-deploy"
+# Overridable alongside STATE_DIR so scripts/test-deploy-gate.sh can drive the gate against a
+# clean throwaway checkout while running THIS copy of the script. A guard nobody can drive is a
+# guard nobody has checked, which is how #459 went unnoticed.
+REPO_ROOT="${GHOST_DEPLOY_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Overridable so the gate can be exercised against throwaway state by
+# scripts/test-deploy-gate.sh. A guard nobody can drive is a guard nobody has checked.
+STATE_DIR="${STATE_DIR:-${HOME}/.ghost-deploy}"
 mkdir -p "$STATE_DIR"
 
 die()  { echo "REFUSED: $*" >&2; exit 1; }
@@ -81,19 +86,63 @@ MARKER="$STATE_DIR/tested-$SHA"
 [ -f "$MARKER" ] || die "no passing test record for $SHORT
        run: scripts/deploy-node.sh --record-tests   (after a green suite)"
 
+# 3b. The commit must still be what main says, not merely something main once contained.
+#
+#     `git merge-base --is-ancestor` above stays true FOREVER once a commit is merged, so a
+#     REVERTED commit passes it happily. That is not theoretical: 7706f2870 sat on main with a
+#     full tested+soaked record while carrying the #455 regression that #456 reverted, and this
+#     script would have deployed it to production reporting every gate satisfied (#459).
+#
+#     Cheapest sound check: the paths this deploy actually ships must match current main. If a
+#     revert (or anything else) has moved them, the built binary no longer represents main.
+if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
+    case "$BINARY" in
+        ghost-pool)      SRC_PATHS="bins/ghost-pool crates" ;;
+        pool_sv2)        SRC_PATHS="bins/pool-sv2 crates" ;;
+        translator_sv2)  SRC_PATHS="bins/translator-sv2 crates" ;;
+        *)               SRC_PATHS="" ;;
+    esac
+    if [ -n "$SRC_PATHS" ] && ! git diff --quiet "$SHA" origin/main -- $SRC_PATHS 2>/dev/null; then
+        die "$SHORT no longer matches origin/main for: $SRC_PATHS
+       main has moved (a revert, or newer commits) — rebuild from current main.
+       This is the guard that would have caught the #447 revert (#459)."
+    fi
+fi
+
 # 4. Canary soak before production. The bugs that hurt were behavioural and only showed
 #    under real traffic over time — an hourly livelock, and attribution that looked fine
 #    until a share was actually mined and its DB row inspected.
+#
+#    The marker is per-BINARY as well as per-commit. It used to be per-commit-per-node only,
+#    which meant soaking `ghost-pool` alone on a canary satisfied this gate for
+#    `translator_sv2` — a binary that had then never run on any canary (#459).
+#
+#    It also records the deployed binary's hash ON THE NODE. A soak asserts "this build ran
+#    here for N minutes"; if the node no longer runs that build the claim is void, which is
+#    exactly what a mid-roll rollback produces.
 if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
     SOAKED=""
     for c in $CANARY_NODES; do
-        if [ -f "$STATE_DIR/soaked-$SHA-$c" ]; then
-            started=$(cat "$STATE_DIR/soaked-$SHA-$c")
-            elapsed=$(( ( $(date +%s) - started ) / 60 ))
-            [ "$elapsed" -ge "$SOAK_MINUTES" ] && SOAKED="$c (${elapsed}m)" && break
+        f="$STATE_DIR/soaked-$SHA-$c-$BINARY"
+        [ -f "$f" ] || continue
+        read -r started recorded_hash < "$f" 2>/dev/null || continue
+        elapsed=$(( ( $(date +%s) - started ) / 60 ))
+        [ "$elapsed" -ge "$SOAK_MINUTES" ] || continue
+
+        # Still running what it soaked? A rollback restores the .bak and the hash changes.
+        if [ -n "${recorded_hash:-}" ]; then
+            live_hash=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$c" \
+                "sha256sum /opt/ghost/bin/$BINARY 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)
+            if [ -n "$live_hash" ] && [ "$live_hash" != "$recorded_hash" ]; then
+                info "ignoring soak on $c: $BINARY no longer matches what soaked (rolled back?)"
+                rm -f "$f"
+                continue
+            fi
         fi
+        SOAKED="$c (${elapsed}m)"
+        break
     done
-    [ -n "$SOAKED" ] || die "$SHORT has not soaked ${SOAK_MINUTES}m on a canary
+    [ -n "$SOAKED" ] || die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on a canary
        deploy to a canary first: scripts/deploy-node.sh <canary> $BINARY --canary"
     info "soak satisfied: $SOAKED"
 fi
@@ -191,14 +240,21 @@ S=$SUDO
 \$S mv /opt/ghost/bin/$BINARY.staged /opt/ghost/bin/$BINARY
 \$S systemctl restart $SERVICE
 "
-    echo "rolled back to $BINARY.bak.$TS" >&2
+    # The node no longer runs this build, so any soak record claiming it does is a lie.
+    # Leaving it is how a half-rolled canary went on vouching for a commit (#459).
+    rm -f "$STATE_DIR/soaked-$SHA-$NODE-$BINARY"
+    echo "rolled back to $BINARY.bak.$TS (soak record for $BINARY @ $SHORT on $NODE cleared)" >&2
     exit 3
 fi
 
 # Start the soak clock for this commit on this node.
 if echo "$CANARY_NODES" | grep -qw "$NODE"; then
-    date +%s > "$STATE_DIR/soaked-$SHA-$NODE"
-    info "soak clock started for $SHORT on $NODE (${SOAK_MINUTES}m required before production)"
+    # Record WHAT soaked, not just when. The hash lets the production gate confirm the node is
+    # still running this build rather than something a rollback restored underneath it.
+    LIVE_HASH=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" \
+        "sha256sum /opt/ghost/bin/$BINARY 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)
+    printf '%s %s\n' "$(date +%s)" "${LIVE_HASH:-}" > "$STATE_DIR/soaked-$SHA-$NODE-$BINARY"
+    info "soak clock started for $BINARY @ $SHORT on $NODE (${SOAK_MINUTES}m required before production)"
 fi
 
 info "OK: $BINARY @ $SHORT live on $NODE (backup: $BINARY.bak.$TS)"
