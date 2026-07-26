@@ -113,7 +113,7 @@ function L1Card() {
           <div className="p-3 bg-[var(--surface)] rounded-lg">
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Ghost Pool Hashrate</div>
             <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-              {isLoading ? "..." : mining ? formatHashrate((mining.hashrate_th ?? 0) * 1e12) : "0 H/s"}
+              {isLoading ? "..." : mining ? formatHashrate((mining.hashrate_th ?? 0) * 1e12) : "--"}
             </div>
           </div>
         </Tooltip>
@@ -121,7 +121,7 @@ function L1Card() {
           <div className="p-3 bg-[var(--surface)] rounded-lg">
             <div className="text-xs text-[color:var(--fainter)] mb-1 flex items-center gap-1"><InfoIcon /> Your Hashrate</div>
             <div className="text-lg font-mono font-semibold text-[color:var(--fg)]">
-              {isLoading ? "..." : mining ? formatHashrate((mining.local_hashrate_th ?? 0) * 1e12) : "0 H/s"}
+              {isLoading ? "..." : mining ? formatHashrate((mining.local_hashrate_th ?? 0) * 1e12) : "--"}
             </div>
           </div>
         </Tooltip>

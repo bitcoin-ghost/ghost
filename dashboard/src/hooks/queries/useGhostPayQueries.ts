@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import {
   getGhostPayStatus,
   getWraithSessions,
@@ -9,9 +9,6 @@ import {
   getL2FeeDistributionContext,
   getL2TreeState,
   getGhostPayPayoutHistory,
-  joinWraithSession,
-  requestLockSettlement,
-  useLockInMix as apiUseLockInMix,
 } from '@/lib/api/ghostpay';
 import type { PayoutHistoryTimeFilter } from '@/types/api';
 
@@ -60,45 +57,6 @@ export function useSettlement(options?: { refetchInterval?: number }) {
     queryKey: ghostPayKeys.settlement(),
     queryFn: getSettlement,
     refetchInterval: options?.refetchInterval ?? 5_000,
-  });
-}
-
-// Mutations
-export function useJoinWraithSession() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: ({ sessionId, lockId }: { sessionId: string; lockId: string }) =>
-      joinWraithSession(sessionId, lockId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ghostPayKeys.wraith() });
-      queryClient.invalidateQueries({ queryKey: ghostPayKeys.locks() });
-    },
-  });
-}
-
-export function useRequestLockSettlement() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (lockId: string) => requestLockSettlement(lockId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ghostPayKeys.locks() });
-      queryClient.invalidateQueries({ queryKey: ghostPayKeys.settlement() });
-    },
-  });
-}
-
-export function useUseLockInMix() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: ({ lockId, sessionId }: { lockId: string; sessionId: string }) =>
-      apiUseLockInMix(lockId, sessionId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ghostPayKeys.locks() });
-      queryClient.invalidateQueries({ queryKey: ghostPayKeys.wraith() });
-    },
   });
 }
 

@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   Gauge,
   Boxes,
+  Blocks,
   Network as NetworkIcon,
   Crown,
   Shield,
@@ -111,6 +112,7 @@ const GROUPS: NavGroup[] = [
     label: "ghost pool",
     items: [
       { href: "/mining", label: "Mining", icon: <Pickaxe {...ICON} /> },
+      { href: "/block-template", label: "Block Template", icon: <Blocks {...ICON} /> },
       { href: "/capacity", label: "Capacity", icon: <Gauge {...ICON} /> },
       { href: "/pool", label: "Node Pool", icon: <Boxes {...ICON} /> },
       { href: "/mempool", label: "Mempool", icon: <Activity {...ICON} /> },

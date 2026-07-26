@@ -20,10 +20,9 @@ import { fetchApi } from "@/lib/api/client";
  * the current mempool — the node-local vantage point a stock explorer can't
  * give — plus the same-origin mempool.space embed of this node's own mempool.
  *
- * The "Reaper impact" panel is the exception: it reads the pool's cumulative
- * block-template reaper counters from `/api/v1/reaper/status` (real reaped-tx
- * and dead-byte totals), so it reports what the reaper has actually kept out of
- * this node's blocks rather than estimating from the live mempool sample.
+ * This page is observability only; it has no policy controls. The tier/policy
+ * settings and the reaper filter breakdown live on the Filtering page
+ * (`/filtering` and `/filtering/advanced`), linked from the header here.
  */
 
 // ─── types ────────────────────────────────────────────────────────────────
@@ -140,12 +139,19 @@ export default function MempoolPage() {
       <PageHeader
         eyebrow="mempool"
         title="Your node's mempool."
-        actions={<Badge variant="success">rpc · lightweight</Badge>}
+        actions={
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <a href="/filtering" className="bare t-caption" style={{ color: "var(--accent)" }}>
+              Tier &amp; policy controls →
+            </a>
+            <Badge variant="success">rpc · lightweight</Badge>
+          </div>
+        }
       />
 
       {/* The real mempool.space UI of THIS node's own mempool, served
           same-origin through the dashboard, at the very top. The lightweight
-          RPC cards and the Reaper filter breakdown follow below. */}
+          RPC stat cards and tier-composition view follow below. */}
       <SectionErrorBoundary section="Node mempool explorer">
         <NodeMempoolExplorer />
       </SectionErrorBoundary>

@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { getRewardsCurrent, getRewardsHistory, getRewardsFull, getNodePayoutHistory, getNodeBalances } from '@/lib/api/rewards';
+import { getRewardsCurrent, getRewardsHistory, getRewardsFull, getNodePayoutHistory, getNodeBalances, getNodePayoutEvents } from '@/lib/api/rewards';
 import type { PayoutHistoryTimeFilter } from '@/types/api';
 
 export const rewardsKeys = {
@@ -9,6 +9,8 @@ export const rewardsKeys = {
   full: () => [...rewardsKeys.all, 'full'] as const,
   nodeHistory: (timeFilter: PayoutHistoryTimeFilter, payoutType?: string) =>
     [...rewardsKeys.all, 'node-history', timeFilter, payoutType] as const,
+  nodePayoutEvents: (timeFilter: PayoutHistoryTimeFilter) =>
+    [...rewardsKeys.all, 'node-payout-events', timeFilter] as const,
   nodeBalances: () => [...rewardsKeys.all, 'node-balances'] as const,
 };
 
@@ -48,6 +50,22 @@ export function useNodePayoutHistory(
     queryKey: rewardsKeys.nodeHistory(timeFilter, payoutType),
     queryFn: () => getNodePayoutHistory(timeFilter, payoutType),
     refetchInterval: options?.refetchInterval ?? 60_000, // 1 minute
+  });
+}
+
+// Per-event node payout history. Served only by node binaries new enough to
+// expose /api/v1/rewards/node-payout-events; on older nodes this 404s and the
+// query lands in `isError`, so the pool page falls back to the balance ledger.
+// We don't retry (a 404 won't fix itself) to avoid hammering the endpoint.
+export function useNodePayoutEvents(
+  timeFilter: PayoutHistoryTimeFilter = '7d',
+  options?: { refetchInterval?: number }
+) {
+  return useQuery({
+    queryKey: rewardsKeys.nodePayoutEvents(timeFilter),
+    queryFn: () => getNodePayoutEvents(timeFilter),
+    refetchInterval: options?.refetchInterval ?? 60_000,
+    retry: false,
   });
 }
 

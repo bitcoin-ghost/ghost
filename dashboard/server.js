@@ -527,6 +527,16 @@ if (require.main === module) {
         ? app.getUpgradeHandler()
         : null;
     const server = http.createServer((req, res) => {
+      // Stamp the REAL TCP peer address as a trusted header. Next does not
+      // populate `request.ip` under a custom server, so downstream routes (the
+      // login rate-limiter) have no other way to see the true source. We delete
+      // any client-supplied value first, then set it from the socket, so a
+      // remote client cannot forge it to dodge (or frame another IP for) the
+      // per-source login throttle.
+      delete req.headers["x-ghost-peer-addr"];
+      const peerAddr = req.socket && req.socket.remoteAddress;
+      if (peerAddr) req.headers["x-ghost-peer-addr"] = peerAddr;
+
       // The embedded mempool app (static assets + its API/WS proxy) is served
       // here, ahead of Next, so it can be gated on the session and proxied to
       // the node-local backend without colliding with the dashboard's own

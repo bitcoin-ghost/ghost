@@ -54,7 +54,7 @@ function SectionTitle({ title, subtitle, action }: { title: string; subtitle?: s
 
 export default function WraithPage() {
   const { data: status, isLoading: statusLoading, error: statusError } = useGhostPayStatus();
-  const { data: wraithStats, isLoading: wraithLoading } = useWraithStats();
+  const { data: wraithStats, isLoading: wraithLoading, error: wraithError } = useWraithStats();
   const setWraith = useSetWraith();
   const { success, error } = useToast();
 
@@ -99,13 +99,22 @@ export default function WraithPage() {
   const wraithEnabled = status?.wraith_enabled ?? false;
   const hostsMixing = status?.ghostpay_hosts_mixing ?? false;
 
+  // The node's Ghost-Pay status is reachable but the mixing-stats endpoint
+  // itself failed. Distinguish this from a genuine idle node — otherwise the
+  // counts below would read a misleading 0, indistinguishable from "no activity".
+  const statsUnavailable = !wraithLoading && !!wraithError;
+  const NO_VALUE = "—";
+
   const activeSessions = wraithStats?.active_sessions ?? 0;
   const totalSessions = wraithStats?.total_sessions ?? 0;
   const sessionsCompleted = wraithStats?.sessions_completed ?? 0;
   const sessionsExpired = wraithStats?.sessions_expired ?? 0;
   const totalParticipants = wraithStats?.total_participants ?? 0;
 
-  const noActivity = totalSessions === 0 && activeSessions === 0 && sessionsCompleted === 0 && totalParticipants === 0;
+  // A stat value for display: em-dash when the stats call failed, else the number.
+  const stat = (n: number) => (statsUnavailable ? NO_VALUE : n.toLocaleString());
+
+  const noActivity = !statsUnavailable && totalSessions === 0 && activeSessions === 0 && sessionsCompleted === 0 && totalParticipants === 0;
 
   return (
     <div className="space-y-6">
@@ -159,19 +168,20 @@ export default function WraithPage() {
           />
           <StatCard
             label="Active Sessions"
-            value={activeSessions}
-            sublabel="mixing now"
+            value={stat(activeSessions)}
+            sublabel={statsUnavailable ? "unavailable" : "mixing now"}
             loading={statusLoading || wraithLoading}
           />
           <StatCard
             label="Completed"
-            value={sessionsCompleted.toLocaleString()}
-            sublabel={`${totalSessions.toLocaleString()} total`}
+            value={stat(sessionsCompleted)}
+            sublabel={statsUnavailable ? "unavailable" : `${totalSessions.toLocaleString()} total`}
             loading={statusLoading || wraithLoading}
           />
           <StatCard
             label="Participants Served"
-            value={totalParticipants.toLocaleString()}
+            value={stat(totalParticipants)}
+            sublabel={statsUnavailable ? "unavailable" : undefined}
             loading={statusLoading || wraithLoading}
           />
         </div>
@@ -190,15 +200,20 @@ export default function WraithPage() {
             }
           />
           <div>
-            <Field label="Active sessions">{activeSessions.toLocaleString()}</Field>
-            <Field label="Total sessions">{totalSessions.toLocaleString()}</Field>
-            <Field label="Completed">{sessionsCompleted.toLocaleString()}</Field>
-            <Field label="Expired">{sessionsExpired.toLocaleString()}</Field>
+            <Field label="Active sessions">{stat(activeSessions)}</Field>
+            <Field label="Total sessions">{stat(totalSessions)}</Field>
+            <Field label="Completed">{stat(sessionsCompleted)}</Field>
+            <Field label="Expired">{stat(sessionsExpired)}</Field>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "12px 0" }}>
               <span className="t-label-mono" style={{ color: "var(--dim)" }}>Participants served</span>
-              <span className="t-body" style={{ color: "var(--fg)", fontFamily: "var(--font-mono)" }}>{totalParticipants.toLocaleString()}</span>
+              <span className="t-body" style={{ color: "var(--fg)", fontFamily: "var(--font-mono)" }}>{stat(totalParticipants)}</span>
             </div>
           </div>
+          {statsUnavailable && (
+            <p className="t-caption" style={{ color: "var(--warning, var(--fainter))", marginTop: "4px" }}>
+              Mixing statistics are currently unavailable — the node&apos;s Wraith status endpoint isn&apos;t responding. These counts are not zero; they could not be read.
+            </p>
+          )}
           {noActivity && (
             <p className="t-caption" style={{ color: "var(--fainter)", marginTop: "4px" }}>
               {wraithEnabled

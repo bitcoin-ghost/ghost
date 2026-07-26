@@ -37,6 +37,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const callbacksRef = useRef(options);
   callbacksRef.current = options;
 
+  // Holds the latest `connect` so the reconnect timer can call it without a
+  // forward self-reference (kept in sync just below the declaration).
+  const connectRef = useRef<() => void>(() => {});
+
   const connect = useCallback(() => {
     if (typeof window === "undefined") return;
     if (authDeadRef.current) return; // session is gone; stop trying until reload
@@ -88,7 +92,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         const delay = reconnectDelayRef.current;
         reconnectDelayRef.current = Math.min(delay * 2, MAX_RECONNECT_DELAY);
         reconnectTimeoutRef.current = setTimeout(() => {
-          if (mountedRef.current) connect();
+          if (mountedRef.current) connectRef.current();
         }, delay);
       };
 
@@ -131,6 +135,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       setConnectionState("error");
     }
   }, [autoReconnect]);
+  connectRef.current = connect;
 
   const disconnect = useCallback(() => {
     if (reconnectTimeoutRef.current) {

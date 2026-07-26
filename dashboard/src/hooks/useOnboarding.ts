@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 
 // ---------------------------------------------------------------------------
 // First-run onboarding completion flag
@@ -18,6 +18,8 @@ import { useCallback, useEffect, useState } from 'react';
 // idempotent (it only confirms the node's already-applied config), so re-running
 // it is harmless. The "Onboarding" entry under Settings re-opens it any time.
 // ---------------------------------------------------------------------------
+
+const ONBOARDING_EVENT = 'ghost-onboarding-change';
 
 export const ONBOARDED_KEY = 'ghost_dashboard_onboarded';
 // Per-tab marker so a "skip for now" doesn't re-trap the operator on every
@@ -62,25 +64,39 @@ export function setOnboarded(value: boolean): void {
   }
 }
 
+// localStorage is external mutable state; subscribe to it (plus our own
+// change event and cross-tab `storage` events) via useSyncExternalStore rather
+// than copying it into local state inside an effect.
+function subscribeOnboarding(onChange: () => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  window.addEventListener(ONBOARDING_EVENT, onChange);
+  window.addEventListener('storage', onChange);
+  return () => {
+    window.removeEventListener(ONBOARDING_EVENT, onChange);
+    window.removeEventListener('storage', onChange);
+  };
+}
+
 /**
- * React hook exposing the completion flag. `onboarded` is `null` until the
- * client has read localStorage (avoids an SSR/first-paint flash).
+ * React hook exposing the completion flag. `onboarded` is `null` during SSR /
+ * hydration (avoids a first-paint flash), then reflects localStorage on the
+ * client.
  */
 export function useOnboarding() {
-  const [onboarded, setOnboardedState] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    setOnboardedState(isOnboarded());
-  }, []);
+  const onboarded = useSyncExternalStore<boolean | null>(
+    subscribeOnboarding,
+    () => isOnboarded(),
+    () => null,
+  );
 
   const complete = useCallback(() => {
     setOnboarded(true);
-    setOnboardedState(true);
+    if (typeof window !== 'undefined') window.dispatchEvent(new Event(ONBOARDING_EVENT));
   }, []);
 
   const reset = useCallback(() => {
     setOnboarded(false);
-    setOnboardedState(false);
+    if (typeof window !== 'undefined') window.dispatchEvent(new Event(ONBOARDING_EVENT));
   }, []);
 
   return { onboarded, complete, reset };

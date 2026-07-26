@@ -1260,3 +1260,27 @@ export interface TorModeStatus {
   tor_pid?: number;
   tor_running?: boolean;
 }
+
+// Coinbase payout breakdown for the block currently being built.
+// One agreed recipient's slice of the miner pool.
+export interface CoinbaseRecipient { address: string; amount_sat: number }
+// One node's slice of the node reward pool.
+export interface CoinbaseNode { node_id: string; address?: string; amount_sat: number }
+export interface MiningCoinbaseResponse {
+  available: boolean;
+  height?: number;
+  round_id?: number;
+  subsidy_sat?: number;
+  tx_fees_to_finder_sat?: number;
+  treasury_sat?: number;
+  miner_pool_sat?: number;
+  node_reward_pool_sat?: number;
+  total_coinbase_sat?: number;
+  miner_count?: number;
+  node_count?: number;
+  // When the request is not operator-authed the node redacts per-recipient
+  // addresses (amounts still present, `address` fields omitted).
+  addresses_redacted?: boolean;
+  miners?: CoinbaseRecipient[];
+  nodes?: CoinbaseNode[];
+}
