@@ -29,12 +29,6 @@ pub struct DownstreamData {
     /// 1000% to ×3–×5 per 60s tick, so a farm or a rented-hashrate order spends minutes
     /// flooding shares before converging. A declared size skips the ramp entirely.
     pub suggested_hashrate: Option<Hashrate>,
-    /// True when this connection arrived on the farm/rental listener rather than the hobby
-    /// one. Only used to decide whether an oversized miner should be nudged to move: a large
-    /// miner on the hobby port is not stealing anything (payout is proportional to work, and
-    /// a share's work IS its difficulty), it just costs this node far more share validation,
-    /// bandwidth and database writes than it needs to.
-    pub on_farm_tier: bool,
     /// True only when the ~1.5s subscribe-defer fallback actually answered `mining.subscribe`
     /// with the PLACEHOLDER extranonce, i.e. a serialising miner was waiting on the response
     /// before sending `mining.authorize`. Those miners — and only those — must be corrected
@@ -97,7 +91,6 @@ impl DownstreamData {
             target,
             hashrate,
             suggested_hashrate: None,
-            on_farm_tier: false,
             subscribe_answered_with_placeholder: false,
             channel_open_requested: false,
             version_rolling_mask: None,
