@@ -36,6 +36,13 @@ echo "==> inlined installer copies"
 echo "==> stratum config agreement"
 ./scripts/check-stratum-config-agreement.sh || { echo "FAILED: stratum config sources disagree" >&2; exit 1; }
 
+# The pre-deploy SV1 smoke test asserts a declared difficulty reaches the miner. Its first
+# form could not tell "delivered late" from "never delivered" — both printed the floor — which
+# is what misdirected the #455 investigation. This checks the check.
+echo "==> SV1 smoke self-test"
+python3 bins/translator-sv2/tests/sv1_handshake_smoke_selftest.py \
+    || { echo "FAILED: SV1 smoke self-test" >&2; exit 1; }
+
 # NB: do NOT write these as `cmd | grep ... && { fail }`. With `set -o pipefail` a failing
 # cargo makes the whole pipeline non-zero, the `&&` short-circuits, the failure branch never
 # runs — and the gate reports success while not gating. That exact bug let a commit with two

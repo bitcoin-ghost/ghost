@@ -48,6 +48,12 @@ jobs:
       # and has no repo to read. They had silently diverged (#431).
       - name: Check stratum config agreement
         run: ./scripts/check-stratum-config-agreement.sh
+      # The pre-deploy SV1 smoke test's declared-difficulty case could not distinguish
+      # "delivered late" from "never delivered" — both printed the floor — which is what
+      # misdirected the #455 investigation. This runs that case against fake pools with known
+      # behaviour, so the check stays able to tell those apart. No node, no build.
+      - name: SV1 smoke self-test
+        run: python3 bins/translator-sv2/tests/sv1_handshake_smoke_selftest.py
 
   # Clippy lints
   clippy:

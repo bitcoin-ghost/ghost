@@ -86,3 +86,7 @@ fuzz/artifacts/
 # wraithd binaries (target-triple-suffixed), never committed.
 apps/wraith-wallet/gui/src-tauri/binaries/
 build/
+
+# Python bytecode (the SV1 smoke self-test imports the smoke module)
+__pycache__/
+*.pyc
