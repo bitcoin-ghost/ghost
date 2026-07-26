@@ -63,7 +63,7 @@ impl Sv1Server {
             let Some(downstream) = self.downstreams.get(downstream_id) else {
                 continue;
             };
-            let (channel_id, hashrate, target, upstream_target) =
+            let (channel_id, hashrate, target, upstream_target, on_farm_tier) =
                 downstream.downstream_data.super_safe_lock(|data| {
                     // It's safe to unwrap hashrate because we know that
                     // the downstream has a hashrate (we are
@@ -73,8 +73,35 @@ impl Sv1Server {
                         data.hashrate.unwrap(),
                         data.target,
                         data.upstream_target,
+                        data.on_farm_tier,
                     )
                 });
+
+            // Capacity nudge: a miner far larger than the hobby port is sized for costs this
+            // node share validation, bandwidth and database writes out of proportion to what it
+            // needs — the same database growth that caused the hourly OOM kills. It is NOT
+            // earning more by being here: payout is proportional to work and a share's work IS
+            // its difficulty, so the same hashrate earns the same on either port.
+            //
+            // So this warns rather than disconnects. Vardiff raises them to a sane difficulty
+            // within a few ticks regardless; the log is for the operator to follow up.
+            if !on_farm_tier {
+                if let Some(tier) = self.config.farm_tier.as_ref() {
+                    if let Some(ceiling) = tier.hobby_max_individual_miner_hashrate {
+                        if hashrate > ceiling {
+                            warn!(
+                                downstream_id = %downstream_id,
+                                measured_hs = hashrate,
+                                ceiling_hs = ceiling,
+                                farm_port = tier.port,
+                                "miner on the hobby port is above the hobby ceiling — it should \
+                                 connect to the farm port instead; it earns the same either way, \
+                                 but costs this node far more share validation here"
+                            );
+                        }
+                    }
+                }
+            }
 
             let Some(channel_id) = channel_id else {
                 // Unreachable in normal operation: vardiff entries are now inserted only at

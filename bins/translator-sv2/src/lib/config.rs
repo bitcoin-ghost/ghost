@@ -40,6 +40,24 @@ pub struct TranslatorConfig {
     pub user_identity: String,
     /// Configuration settings for managing difficulty on the downstream connection.
     pub downstream_difficulty_config: DownstreamDifficultyConfig,
+    /// Optional second listener for farm-scale and rented hashrate.
+    ///
+    /// One difficulty cannot serve both a 500 GH/s bitaxe and a 1 PH/s order. Sized for the
+    /// bitaxe, a large order floods the pool for minutes while vardiff ramps (it caps
+    /// corrections above 1000% to x3-x5 per 60s tick), and marketplaces reject a pool whose
+    /// starting difficulty is far below the hashrate they are pointing at it. Sized for the
+    /// order, a bitaxe finds a share every few minutes and looks dead.
+    ///
+    /// `None` (the default, and the shape of every existing config file) leaves the single
+    /// listener exactly as it was.
+    ///
+    /// Note this is a CAPACITY control, not an anti-fraud one. Payout is proportional to
+    /// work, and a share's work IS its difficulty (see `round.rs`), so 20 shares at
+    /// difficulty 1,164 and one share at 23,283 are worth the same. A large miner on the
+    /// hobby port gains nothing; it just costs the node 20x the share validation, bandwidth
+    /// and database writes.
+    #[serde(default)]
+    pub farm_tier: Option<FarmTierConfig>,
     /// Whether to aggregate all downstream connections into a single upstream channel.
     /// If true, all miners share one channel. If false, each miner gets its own channel.
     pub aggregate_channels: bool,
@@ -137,6 +155,9 @@ impl TranslatorConfig {
             monitoring_address,
             monitoring_cache_refresh_secs,
             load_balancer: None,
+            // Optional like the TLS listener: absent means the single hobby listener only,
+            // which is what every existing config file produces.
+            farm_tier: None,
             tls_port: None,
             tls_cert_path: None,
             tls_key_path: None,
@@ -181,6 +202,24 @@ pub struct DownstreamDifficultyConfig {
     pub job_keepalive_interval_secs: u16,
 }
 
+/// Second listener for farm-scale and rented hashrate, on its own port with its own floor.
+#[derive(Debug, Deserialize, Clone)]
+pub struct FarmTierConfig {
+    /// Port for the farm/rental listener. The hobby listener keeps `downstream_port`, so every
+    /// miner already pointed at this node stays where it is and nobody has to be told to move.
+    pub port: u16,
+    /// Starting hashrate assumed for a connection arriving on this port, in H/s. Applied as the
+    /// per-connection floor exactly as a miner-declared `mining.suggest_difficulty` would be, so
+    /// it reuses a path that is already exercised rather than adding a second one.
+    pub min_individual_miner_hashrate: Hashrate,
+    /// Hashrate above which a connection on the HOBBY port is told to move here, in H/s.
+    /// `None` disables the nudge. This is the capacity control described on `farm_tier`: it
+    /// exists because a large miner on the hobby port costs the node share-validation and
+    /// database load, not because it could earn more.
+    #[serde(default)]
+    pub hobby_max_individual_miner_hashrate: Option<Hashrate>,
+}
+
 impl DownstreamDifficultyConfig {
     /// Creates a new `DownstreamDifficultyConfig` instance.
     pub fn new(
@@ -195,6 +234,69 @@ impl DownstreamDifficultyConfig {
             enable_vardiff,
             job_keepalive_interval_secs,
         }
+    }
+}
+
+#[cfg(test)]
+mod farm_tier_tests {
+    use super::*;
+
+    /// The whole point of two ports is that they hand out DIFFERENT starting difficulties.
+    /// A config where both tiers resolve to the same floor is a misconfiguration that would
+    /// otherwise look fine — two listeners, no benefit.
+    #[test]
+    fn the_two_tiers_produce_different_starting_difficulties() {
+        // Same arithmetic vardiff uses: difficulty = hashrate * target_interval / (2^48/0xFFFF).
+        const HASHES_PER_DIFFICULTY: f64 = ((1u64 << 48) as f64) / (0xFFFF as f64);
+        let shares_per_minute = 6.0_f64;
+        let interval = 60.0 / shares_per_minute;
+
+        let hobby_hs = 500_000_000_000.0_f64; // a ~500 GH/s bitaxe
+        let farm_hs = 10_000_000_000_000.0_f64; // rented hashrate
+
+        let hobby_diff = hobby_hs * interval / HASHES_PER_DIFFICULTY;
+        let farm_diff = farm_hs * interval / HASHES_PER_DIFFICULTY;
+
+        assert!(
+            farm_diff > hobby_diff * 10.0,
+            "farm tier must start far above the hobby tier, else the two ports are pointless \
+             (hobby {hobby_diff:.0}, farm {farm_diff:.0})"
+        );
+
+        // And the hobby tier must stay low enough that a bitaxe still submits often enough to
+        // look alive — the failure that made the dashboard flap when the single floor was
+        // raised for rented hashrate.
+        let bitaxe_interval_s = hobby_diff * HASHES_PER_DIFFICULTY / hobby_hs;
+        assert!(
+            bitaxe_interval_s <= 30.0,
+            "a bitaxe on the hobby port would only submit every {bitaxe_interval_s:.0}s"
+        );
+    }
+
+    /// Absent `farm_tier` must leave the single-listener behaviour untouched, because every
+    /// config file currently deployed omits it. `#[serde(default)]` gives that for parsing;
+    /// this pins the constructor, which is the other way a config is built.
+    #[test]
+    fn farm_tier_defaults_to_absent() {
+        let cfg = TranslatorConfig::new(
+            vec![],
+            "0.0.0.0".to_string(),
+            3333,
+            DownstreamDifficultyConfig::new(500_000_000_000.0, 6.0, true, 60),
+            2,
+            2,
+            8,
+            "bc1qexample".to_string(),
+            false,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        assert!(
+            cfg.farm_tier.is_none(),
+            "farm_tier must default to None so existing single-listener configs are unchanged"
+        );
     }
 }
 
