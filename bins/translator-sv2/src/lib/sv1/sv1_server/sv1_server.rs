@@ -609,6 +609,27 @@ impl Sv1Server {
                     result = Self::accept_optional(farm_listener.as_ref()) => {
                         match result {
                             Ok((stream, addr)) => {
+                                // Capacity gate, same as the hobby arm. The farm port carries the
+                                // LARGEST clients, so a node at its reject threshold has more
+                                // reason to turn them away here, not less. Without this a node at
+                                // 95% capacity keeps accepting rented-hashrate orders.
+                                if let Some(ref lb) = self.load_balancer {
+                                    if lb.should_reject_for_capacity().await {
+                                        warn!(
+                                            "Rejecting farm-port connection from {}: local capacity at/above reject threshold",
+                                            addr
+                                        );
+                                        lb.record_capacity_rejection();
+                                        drop(stream);
+                                        continue;
+                                    }
+                                }
+                                // Deliberately NOT utilisation-routed. The load balancer's proxy
+                                // target is hard-coded to `{peer}:3333` (load_balancer.rs), so
+                                // proxying a farm connection would hand a large miner to a peer's
+                                // HOBBY listener and its small floor — the exact flood this tier
+                                // exists to prevent. Until the balancer learns per-tier targets,
+                                // farm connections are served locally or rejected.
                                 info!("New SV1 downstream connection from {} on the farm port", addr);
                                 self.register_downstream(
                                     stream,
