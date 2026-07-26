@@ -20,6 +20,21 @@
 #             but NOT the clean-tree or test requirements.
 #
 # Exit codes: 0 ok, 1 precondition failed, 2 deploy failed, 3 smoke failed (rolled back).
+#
+# A CALLER LOOPING OVER BINARIES MUST STOP ON ANY NON-ZERO EXIT. These three binaries talk
+# to each other and are not independently deployable. Rolling v1.11.18 to vm8, pool_sv2
+# failed its smoke test and rolled back correctly — but the surrounding `for` loop carried
+# on to translator_sv2, leaving the node on new ghost-pool + new translator + OLD pool_sv2.
+# A combination nobody chose, that happened to work. Write:
+#
+#   for b in ghost-pool pool_sv2 translator_sv2; do
+#       scripts/deploy-node.sh "$NODE" "$b" || break     # <- the `|| break` is not optional
+#   done
+#
+# Note also that a mid-roll smoke failure is ambiguous: "this binary is broken" and "this
+# node is only half rolled" produce the same signal. That vm8 failure was the latter — the
+# new pool_sv2 was being tested against an old translator that existed on no other node,
+# and it deployed cleanly once the translator was current.
 
 set -euo pipefail
 
@@ -92,10 +107,49 @@ SUDO='$(command -v sudo >/dev/null && echo sudo || echo)'
 TS="$(date +%Y%m%d-%H%M%S)"
 info "deploying $BINARY @ $SHORT to $NODE"
 
-scp -q -o ConnectTimeout=10 "$BIN_PATH" "$NODE:/tmp/$BINARY.new" || exit 2
+# ConnectTimeout only bounds ESTABLISHING the connection. A session that stalls
+# mid-transfer hangs forever. That happened rolling v1.11.18 to vm3: the copy stopped
+# at 7,733,248 of 24,974,600 bytes and sat there — no progress, no error, no exit,
+# leaving the node with a new ghost-pool against an old pool_sv2 and nothing saying so.
+#
+# ServerAliveInterval makes a dead peer detectable; the hard `timeout` bounds the rest.
+SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes)
+XFER_TIMEOUT="${XFER_TIMEOUT:-300}"
+REMOTE_TIMEOUT="${REMOTE_TIMEOUT:-120}"
+
+LOCAL_SHA="$(sha256sum "$BIN_PATH" | cut -d' ' -f1)"
+LOCAL_SIZE="$(stat -c%s "$BIN_PATH")"
+
+copied=""
+for attempt in 1 2 3; do
+    if timeout "$XFER_TIMEOUT" scp -q "${SSH_OPTS[@]}" "$BIN_PATH" "$NODE:/tmp/$BINARY.new"; then
+        # Verify what landed. A transfer that dies at the wrong moment leaves a truncated
+        # file that would otherwise go straight into chmod + mv. The only reason that did
+        # not happen on vm3 is that the copy stalled rather than exited.
+        remote="$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" \
+                    "sha256sum /tmp/$BINARY.new 2>/dev/null | cut -d' ' -f1; stat -c%s /tmp/$BINARY.new 2>/dev/null" || true)"
+        rsha="$(printf '%s' "$remote" | sed -n 1p)"
+        rsize="$(printf '%s' "$remote" | sed -n 2p)"
+        if [ "$rsha" = "$LOCAL_SHA" ] && [ "$rsize" = "$LOCAL_SIZE" ]; then
+            copied=yes
+            break
+        fi
+        echo "  attempt $attempt: staged copy does not match (${rsize:-?}/$LOCAL_SIZE bytes) — retrying" >&2
+    else
+        echo "  attempt $attempt: transfer failed or timed out after ${XFER_TIMEOUT}s — retrying" >&2
+    fi
+    timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
+done
+
+if [ -z "$copied" ]; then
+    echo "REFUSED: could not place a verified copy of $BINARY on $NODE after 3 attempts." >&2
+    echo "         $NODE is UNCHANGED for this binary, but if you are mid-roll it may be" >&2
+    echo "         running a MIXED set. Check: ssh $NODE 'sha256sum /opt/ghost/bin/*'" >&2
+    exit 2
+fi
 
 # Backup, atomic swap, restart. Atomic mv so a partially-copied binary is never executable.
-ssh -o ConnectTimeout=10 "$NODE" "
+timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
 set -e
 S=$SUDO
 \$S cp /opt/ghost/bin/$BINARY /opt/ghost/bin/$BINARY.bak.$TS
@@ -110,18 +164,18 @@ case "$BINARY" in
   translator_sv2)  SERVICE=sri-translator ;;
 esac
 
-ssh -o ConnectTimeout=10 "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2
+timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2
 sleep 20
 
 # ---------------------------------------------------------------- verify
 
-ACTIVE=$(ssh -o ConnectTimeout=10 "$NODE" "systemctl is-active $SERVICE" || echo failed)
+ACTIVE=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "systemctl is-active $SERVICE" || echo failed)
 [ "$ACTIVE" = "active" ] || { echo "SERVICE NOT ACTIVE — rolling back" >&2; ROLLBACK=1; }
 
 # Smoke test the stratum path for anything that serves miners. A green service that
 # cannot complete a handshake is not a successful deploy.
 if [ -z "${ROLLBACK:-}" ] && [ "$BINARY" != "ghost-pool" ]; then
-    IP=$(ssh -o ConnectTimeout=10 "$NODE" "hostname -I | awk '{print \$1}'")
+    IP=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "hostname -I | awk '{print \$1}'")
     if ! python3 "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py" "$IP" 3333 >/dev/null 2>&1; then
         echo "SMOKE TEST FAILED — rolling back" >&2
         ROLLBACK=1
@@ -129,7 +183,7 @@ if [ -z "${ROLLBACK:-}" ] && [ "$BINARY" != "ghost-pool" ]; then
 fi
 
 if [ -n "${ROLLBACK:-}" ]; then
-    ssh -o ConnectTimeout=10 "$NODE" "
+    timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "
 set -e
 S=$SUDO
 \$S cp /opt/ghost/bin/$BINARY.bak.$TS /opt/ghost/bin/$BINARY.staged
