@@ -154,14 +154,22 @@ jobs:
       - name: Run security audit
         run: cargo audit
 
-  # Minimum Supported Rust Version
+  # Minimum Supported Rust Version.
+  #
+  # Pinned to the version Cargo.toml declares, NOT stable. On @stable this job was a
+  # second stable build wearing a different name — it could never have caught a
+  # too-new feature slipping in, which is the only thing it exists to catch.
+  #
+  # If this job fails, the choice is to fix the code or to raise rust-version in
+  # Cargo.toml. Do not quietly put it back to stable: that restores a green tick that
+  # means nothing.
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
       - run: cargo check $WORKSPACE_EXCLUDES
