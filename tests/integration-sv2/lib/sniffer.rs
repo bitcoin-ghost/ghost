@@ -74,6 +74,30 @@ impl<'a> Sniffer<'a> {
         }
     }
 
+    /// Builds a sniffer wired to a supplied downstream queue, without binding any sockets.
+    ///
+    /// Only for testing the poll loop's own liveness — constructing a real sniffer needs
+    /// listeners and a live upstream, which is far more than is needed to prove that a held
+    /// queue lock cannot postpone the timeout.
+    #[cfg(test)]
+    pub(crate) fn for_timeout_test(
+        messages_from_downstream: MessagesAggregator,
+        timeout: Option<u64>,
+    ) -> Sniffer<'static> {
+        let unused: SocketAddr = "127.0.0.1:1".parse().expect("static addr");
+        Sniffer {
+            identifier: "timeout-test",
+            listening_address: unused,
+            upstream_address: unused,
+            messages_from_downstream,
+            messages_from_upstream: MessagesAggregator::new(),
+            check_on_drop: false,
+            action: Vec::new(),
+            timeout,
+            negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     /// Starts the sniffer.
     ///
     /// The sniffer should be started after the upstream role have been initialized and is ready to
@@ -171,14 +195,42 @@ impl<'a> Sniffer<'a> {
     ) {
         let now = std::time::Instant::now();
         loop {
-            let has_message_type = match message_direction {
-                MessageDirection::ToDownstream => {
-                    self.messages_from_upstream.has_message_type(message_type)
-                }
-                MessageDirection::ToUpstream => {
-                    self.messages_from_downstream.has_message_type(message_type)
-                }
+            // The queue read takes a BLOCKING std::sync::Mutex. `#[tokio::test]` gives a
+            // current-thread runtime, so taking it inline blocks the only executor thread —
+            // and then neither the elapsed check below nor tokio's timer can ever run. That
+            // is why the 1-minute timeout did not fire when a coverage run hung for six
+            // hours: the timeout is checked AFTER this read, so a read that never returns
+            // makes it unreachable.
+            //
+            // Doing it on the blocking pool keeps the executor free no matter what the lock
+            // does, so the timeout below is always reachable. This does not fix a deadlock
+            // if one exists — it guarantees the test FAILS in a minute with a message rather
+            // than burning a CI run to the 6h cap.
+            let agg = match message_direction {
+                MessageDirection::ToDownstream => self.messages_from_upstream.clone(),
+                MessageDirection::ToUpstream => self.messages_from_downstream.clone(),
             };
+            // Two separate things are needed here, and only doing one of them is a trap.
+            //
+            // spawn_blocking keeps the BLOCKING lock off the executor thread — a
+            // `#[tokio::test]` runs on a current-thread runtime, so taking it inline stops
+            // the timer as well.
+            //
+            // The timeout around it keeps the LOOP moving. On its own, spawn_blocking still
+            // leaves this `.await` stalled for as long as the lock is held, and the elapsed
+            // check below sits after it — so a stuck read still postpones the timeout
+            // indefinitely. That is the shape that let a coverage run hang for six hours
+            // instead of failing in one minute (#408).
+            //
+            // A read that does not answer within a second is treated as "no message yet";
+            // the loop re-checks its own deadline and gives up on schedule.
+            let has_message_type = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || agg.has_message_type(message_type)),
+            )
+            .await
+            .map(|joined| joined.unwrap_or(false))
+            .unwrap_or(false);
 
             // ready to unblock test runtime
             if has_message_type {
@@ -442,5 +494,60 @@ impl Drop for Sniffer<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod poll_loop_liveness_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A held queue lock must not be able to postpone the sniffer's own timeout.
+    ///
+    /// The queue sits behind a blocking `std::sync::Mutex` and the elapsed check runs AFTER
+    /// the read, so a read that does not return makes the timeout unreachable. That is why a
+    /// coverage run hung for six hours rather than failing in one minute (#408).
+    ///
+    /// This holds the lock from a separate OS thread for far longer than the sniffer timeout
+    /// and asserts `wait_for_message_type` still gives up roughly on schedule. Without the
+    /// bounded read it gives up only once the lock is released, which is the bug.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_queue_lock_cannot_postpone_the_timeout() {
+        const SNIFFER_TIMEOUT_S: u64 = 2;
+        const LOCK_HELD_S: u64 = 12;
+
+        let agg = MessagesAggregator::new();
+        let holder = agg.clone();
+        std::thread::spawn(move || {
+            holder
+                .messages_for_test()
+                .safe_lock(|_| std::thread::sleep(Duration::from_secs(LOCK_HELD_S)))
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let sniffer = Sniffer::for_timeout_test(agg, Some(SNIFFER_TIMEOUT_S));
+
+        // wait_for_message_type panics on timeout, so run it in a task: a panicking task
+        // comes back as a JoinError rather than unwinding the test.
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            sniffer
+                .wait_for_message_type(MessageDirection::ToUpstream, 0x00)
+                .await;
+        });
+        let result = tokio::time::timeout(Duration::from_secs(LOCK_HELD_S + 6), handle).await;
+        let elapsed = started.elapsed();
+
+        let joined = result.expect("wait_for_message_type never returned while the lock was held");
+        assert!(
+            joined.is_err(),
+            "expected the sniffer timeout to fire (it panics on timeout)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(LOCK_HELD_S - 2),
+            "gave up after {elapsed:?}, i.e. only once the lock was released after \
+             {LOCK_HELD_S}s — the read is still postponing the timeout"
+        );
     }
 }

@@ -43,6 +43,14 @@ impl MessagesAggregator {
             .unwrap();
     }
 
+    /// Direct access to the inner lock, for tests that need to hold it deliberately.
+    #[cfg(test)]
+    pub(crate) fn messages_for_test(
+        &self,
+    ) -> &Arc<Mutex<VecDeque<(MsgType, AnyMessage<'static>, Option<Vec<Tlv>>)>>> {
+        &self.messages
+    }
+
     /// Returns false if the queue is empty, true otherwise.
     pub fn is_empty(&self) -> bool {
         self.messages
