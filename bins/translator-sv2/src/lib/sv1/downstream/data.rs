@@ -29,6 +29,12 @@ pub struct DownstreamData {
     /// 1000% to ×3–×5 per 60s tick, so a farm or a rented-hashrate order spends minutes
     /// flooding shares before converging. A declared size skips the ramp entirely.
     pub suggested_hashrate: Option<Hashrate>,
+    /// True when this connection arrived on the farm/rental listener rather than the hobby
+    /// one. Only used to decide whether an oversized miner should be nudged to move: a large
+    /// miner on the hobby port is not stealing anything (payout is proportional to work, and
+    /// a share's work IS its difficulty), it just costs this node far more share validation,
+    /// bandwidth and database writes than it needs to.
+    pub on_farm_tier: bool,
     pub version_rolling_mask: Option<HexU32Be>,
     pub version_rolling_min_bit: Option<HexU32Be>,
     pub last_job_version_field: Option<u32>,
@@ -72,6 +78,7 @@ impl DownstreamData {
             target,
             hashrate,
             suggested_hashrate: None,
+            on_farm_tier: false,
             version_rolling_mask: None,
             version_rolling_min_bit: None,
             last_job_version_field: None,
