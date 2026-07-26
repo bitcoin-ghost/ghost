@@ -15,24 +15,27 @@ set -uo pipefail
 
 SRC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 
-# Gate 1 is "clean working tree", and it fires before everything else — so running this from a
-# dirty checkout would mask every gate under test and report a false pass. Drive the gate from a
-# throwaway worktree at HEAD, which is clean by construction.
-REPO_ROOT="$TMP/wt"
-git -C "$SRC_ROOT" worktree add -q --detach "$REPO_ROOT" origin/main 2>/dev/null || {
-    echo "could not create a test worktree" >&2; exit 1; }
-# Run the script being EDITED (otherwise this passes while the change under review is broken)
-# against the CLEAN worktree. Copying it into the worktree would make that tree dirty, and
-# committing it there would put HEAD off origin/main — either way an earlier gate fires first
-# and every later assertion becomes vacuous. Hence GHOST_DEPLOY_REPO_ROOT.
-DEPLOY="$SRC_ROOT/scripts/deploy-node.sh"
-
-cleanup() {
-    git -C "$SRC_ROOT" worktree remove --force "$REPO_ROOT" >/dev/null 2>&1
-    rm -rf "$TMP"
-}
-trap cleanup EXIT
+# Build a HERMETIC repo to drive the gate against, rather than borrowing the real one.
+#
+# Two reasons. First, gate 1 is "clean working tree" and gate 2 is "commit is on origin/main";
+# either fires before anything under test, so a dirty checkout or a missing ref makes every
+# later assertion pass for the wrong reason. Second, CI checks out shallow and without an
+# `origin/main` ref at all, so a worktree-based harness dies there — which is exactly how this
+# first failed.
+#
+# So: a throwaway repo, committed clean, with refs/remotes/origin/main pointed at that commit.
+REPO_ROOT="$TMP/repo"
+mkdir -p "$REPO_ROOT/scripts" "$REPO_ROOT/bins/translator-sv2/tests" "$REPO_ROOT/crates"
+cp "$SRC_ROOT/scripts/deploy-node.sh" "$REPO_ROOT/scripts/deploy-node.sh"
+: > "$REPO_ROOT/crates/.keep"
+git -C "$REPO_ROOT" init -q
+git -C "$REPO_ROOT" add -A
+git -C "$REPO_ROOT" -c user.email=t@t -c user.name=t commit -qm "gate under test"
+# Make the commit look like current main so gate 2 and the revert check both pass cleanly.
+git -C "$REPO_ROOT" update-ref refs/remotes/origin/main HEAD
+DEPLOY="$REPO_ROOT/scripts/deploy-node.sh"
 
 pass=0
 fail=0
