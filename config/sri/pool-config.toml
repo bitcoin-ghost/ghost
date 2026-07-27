@@ -6,10 +6,26 @@
 # Architecture:
 #   ghost-pool (TDP:8442) -> SRI Pool (SV2:34255) -> SRI Translator (SV1:3333) -> BitAxe
 
-# Pool identity keypair (Ed25519)
-# Generate new keypair with: openssl rand -hex 32
-authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
-authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+# Pool identity keypair — GENERATE YOUR OWN. Do not use a value from this file.
+#
+# This is the SV2 Noise authority keypair: it is how this pool proves it is itself to
+# connecting translators and SV2 miners, which pin the public half. Anyone holding the
+# secret half can present as your pool.
+#
+#     /opt/ghost/bin/pool_sv2 --generate-key
+#
+# prints both lines ready to paste. `install-node.sh` does this automatically, so a node
+# provisioned by the installer already has a unique keypair and needs no action here.
+#
+# The placeholders below are deliberately not a valid keypair, so a config copied verbatim
+# fails loudly at startup rather than silently running an identity somebody else knows.
+#
+# This file previously carried a REAL keypair — and the same one that ships as a test fixture
+# in the upstream SRI project, so its secret half was public in two repositories. Any node
+# provisioned from this file was authenticating with an identity anyone could assume. The
+# affected nodes have been rotated to unique keys.
+authority_public_key = "<GENERATE-WITH-pool_sv2---generate-key>"
+authority_secret_key = "<GENERATE-WITH-pool_sv2---generate-key>"
 cert_validity_sec = 3600
 
 # Listen for SV2 miners/translators (port 34256 - different from ghost-pool's native stratum on 34255)
