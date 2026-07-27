@@ -54,6 +54,11 @@ jobs:
       # behaviour, so the check stays able to tell those apart. No node, no build.
       - name: SV1 smoke self-test
         run: python3 bins/translator-sv2/tests/sv1_handshake_smoke_selftest.py
+      # deploy-node.sh gates every production deploy and its whole value is refusing. It once
+      # would have deployed a reverted commit reporting all four gates satisfied (#459), so the
+      # gate is driven against deliberately-bad state here. No ssh, no deploy.
+      - name: Deploy-gate self-test
+        run: ./scripts/test-deploy-gate.sh
 
   # Clippy lints
   clippy:

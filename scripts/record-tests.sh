@@ -39,6 +39,11 @@ echo "==> stratum config agreement"
 # The pre-deploy SV1 smoke test asserts a declared difficulty reaches the miner. Its first
 # form could not tell "delivered late" from "never delivered" — both printed the floor — which
 # is what misdirected the #455 investigation. This checks the check.
+# The deploy gate's only value is that it refuses. Drive it against deliberately-bad state.
+echo "==> deploy-gate self-test"
+./scripts/test-deploy-gate.sh \
+    || { echo "FAILED: deploy-gate self-test" >&2; exit 1; }
+
 echo "==> SV1 smoke self-test"
 python3 bins/translator-sv2/tests/sv1_handshake_smoke_selftest.py \
     || { echo "FAILED: SV1 smoke self-test" >&2; exit 1; }
