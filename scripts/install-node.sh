@@ -1290,8 +1290,16 @@ ufw --force enable      >/dev/null 2>&1
 # whenever the config changes — so toggling public mining later (dashboard /
 # ghost-setup / hand edit) updates the firewall live, with no manual ufw step.
 log "Installing mining-firewall reconcile (stratum + coordinator ports follow pool.toml)"
-cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'EOF'
+cat > /opt/ghost/bin/reconcile-mining-firewall.sh <<'RECONCILE_MINING_FW_EOF'
 #!/usr/bin/env bash
+# Reconcile the Stratum and Wraith coordinator firewall ports to the node's config.
+#
+# Run by `ghost-mining-firewall.service`, triggered at boot and by
+# `ghost-mining-firewall.path` whenever pool.toml changes. Idempotent.
+#
+# This file is inlined VERBATIM in scripts/install-node.sh, which is fetched
+# standalone over curl and has no repo to read from. check-inlined-copies.sh
+# compares the two byte-for-byte — edit both, or neither.
 set -euo pipefail
 CONF="${GHOST_POOL_CONF:-/etc/ghost/pool.toml}"
 PORTS=(3333 34255)
@@ -1327,7 +1335,7 @@ else
   ufw delete allow 9100/tcp >/dev/null 2>&1 || true
   logger -t ghost-mining-firewall "coordinator role OFF -> Wraith 9100 CLOSED"
 fi
-EOF
+RECONCILE_MINING_FW_EOF
 chmod 755 /opt/ghost/bin/reconcile-mining-firewall.sh
 
 cat > /etc/systemd/system/ghost-mining-firewall.service <<'EOF'
