@@ -33,6 +33,8 @@
 //!
 //! Uses SQLite with WAL mode for performance and crash safety.
 
+#![deny(unreachable_pub)]
+
 pub mod audit_log;
 pub mod database;
 pub mod encryption;
@@ -52,8 +54,6 @@ pub use queries::L2StateInfo;
 pub use queries::MpcContributionRecord;
 pub use queries::PayoutLedgerCheckpointRecord;
 pub use queries::{ConfidentialNoteRecord, ConfidentialTransferRecord};
-pub use queries::{
-    L2CheckpointRecord, L2EpochRecord, L2NoteRecord, L2NullifierRecord, L2ValidRootRecord,
-};
+pub use queries::{L2CheckpointRecord, L2EpochRecord, L2NoteRecord, L2ValidRootRecord};
 pub use snapshot::*;
 // Note: queries module adds methods to Database via impl blocks

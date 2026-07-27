@@ -54,6 +54,8 @@
 //! let json = serde_json::to_string(&request).unwrap();
 //! ```
 
+#![deny(unreachable_pub)]
+
 mod auth;
 mod error;
 mod lock;
@@ -86,9 +88,6 @@ pub const PROTOCOL_VERSION: &str = "1.0.0";
 
 /// Maximum message size in bytes (1 MB)
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
-
-/// Default session expiry in seconds (24 hours)
-pub const DEFAULT_SESSION_EXPIRY_SECS: u64 = 86400;
 
 /// WalletProof timestamp tolerance in seconds (5 minutes)
 pub const PROOF_TIMESTAMP_TOLERANCE_SECS: i64 = 300;

@@ -33,7 +33,7 @@ use thiserror::Error;
 
 /// Database errors
 #[derive(Debug, Error)]
-pub enum DbError {
+pub(crate) enum DbError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("Node not found: {0}")]
@@ -44,7 +44,7 @@ pub enum DbError {
 
 /// Pool node record stored in database
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolNode {
+pub(crate) struct PoolNode {
     /// Unique node identifier (secp256k1 public key hex)
     pub node_id: String,
     /// Public IP address or hostname
@@ -83,7 +83,7 @@ pub struct PoolNode {
 
 impl PoolNode {
     /// Calculate a score for load balancing (lower is better)
-    pub fn load_score(&self) -> f64 {
+    pub(crate) fn load_score(&self) -> f64 {
         if !self.healthy || !self.accepting_miners {
             return f64::MAX;
         }
@@ -151,18 +151,18 @@ impl Drop for UmaskGuard {
 }
 
 /// Database handle
-pub struct RegistryDb {
+pub(crate) struct RegistryDb {
     conn: Arc<Mutex<Connection>>,
 }
 
 impl RegistryDb {
     /// Maximum rows returned by unbounded queries (M-23: OOM prevention)
-    pub const MAX_QUERY_RESULTS: u32 = 10000;
+    pub(crate) const MAX_QUERY_RESULTS: u32 = 10000;
 
     /// Open or create database at path
     ///
     /// H-17 FIX: Uses UmaskGuard to create files with restrictive permissions (0o600).
-    pub fn open(path: &Path) -> Result<Self, DbError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, DbError> {
         // H-17 FIX: Set restrictive umask before creating any files.
         // Uses RAII guard to ensure umask is restored even on panic.
         // umask 0o077 means: remove all permissions for group and others
@@ -267,7 +267,7 @@ impl RegistryDb {
     }
 
     /// Register or update a node
-    pub fn upsert_node(&self, node: &PoolNode) -> Result<(), DbError> {
+    pub(crate) fn upsert_node(&self, node: &PoolNode) -> Result<(), DbError> {
         let conn = self.conn.lock();
 
         conn.execute(
@@ -312,7 +312,7 @@ impl RegistryDb {
     }
 
     /// Update node heartbeat data
-    pub fn update_heartbeat(
+    pub(crate) fn update_heartbeat(
         &self,
         node_id: &str,
         miner_count: u32,
@@ -354,7 +354,7 @@ impl RegistryDb {
     }
 
     /// Get a node by ID
-    pub fn get_node(&self, node_id: &str) -> Result<Option<PoolNode>, DbError> {
+    pub(crate) fn get_node(&self, node_id: &str) -> Result<Option<PoolNode>, DbError> {
         let conn = self.conn.lock();
 
         let mut stmt = conn.prepare(
@@ -398,7 +398,7 @@ impl RegistryDb {
     /// Get all nodes
     ///
     /// M-23 FIX: Limited to MAX_QUERY_RESULTS rows to prevent OOM attacks
-    pub fn get_all_nodes(&self) -> Result<Vec<PoolNode>, DbError> {
+    pub(crate) fn get_all_nodes(&self) -> Result<Vec<PoolNode>, DbError> {
         let conn = self.conn.lock();
 
         let mut stmt = conn.prepare(
@@ -443,7 +443,10 @@ impl RegistryDb {
     /// Excludes nodes that are marked as excluded_for_load (hysteresis)
     ///
     /// M-23 FIX: Limited to MAX_QUERY_RESULTS rows to prevent OOM attacks
-    pub fn get_healthy_nodes_by_region(&self, region: Region) -> Result<Vec<PoolNode>, DbError> {
+    pub(crate) fn get_healthy_nodes_by_region(
+        &self,
+        region: Region,
+    ) -> Result<Vec<PoolNode>, DbError> {
         let conn = self.conn.lock();
 
         let mut stmt = conn.prepare(
@@ -496,7 +499,7 @@ impl RegistryDb {
     ///
     /// M-24 FIX: Wrapped in transaction for atomicity. Both updates succeed
     /// or both fail together, preventing inconsistent state.
-    pub fn update_load_exclusions(
+    pub(crate) fn update_load_exclusions(
         &self,
         max_load_percent: u8,
         resume_load_percent: u8,
@@ -525,7 +528,7 @@ impl RegistryDb {
     }
 
     /// Mark stale nodes as unhealthy
-    pub fn mark_stale_nodes_unhealthy(&self, timeout_secs: i64) -> Result<usize, DbError> {
+    pub(crate) fn mark_stale_nodes_unhealthy(&self, timeout_secs: i64) -> Result<usize, DbError> {
         let conn = self.conn.lock();
         let cutoff = Utc::now() - chrono::Duration::seconds(timeout_secs);
 
@@ -541,7 +544,7 @@ impl RegistryDb {
     }
 
     /// Delete a node
-    pub fn delete_node(&self, node_id: &str) -> Result<bool, DbError> {
+    pub(crate) fn delete_node(&self, node_id: &str) -> Result<bool, DbError> {
         let conn = self.conn.lock();
 
         let rows = conn.execute("DELETE FROM nodes WHERE node_id = ?1", params![node_id])?;
@@ -550,7 +553,7 @@ impl RegistryDb {
     }
 
     /// Get region statistics
-    pub fn get_region_stats(&self) -> Result<Vec<RegionStats>, DbError> {
+    pub(crate) fn get_region_stats(&self) -> Result<Vec<RegionStats>, DbError> {
         let conn = self.conn.lock();
 
         let mut stmt = conn.prepare(
@@ -583,7 +586,7 @@ impl RegistryDb {
     /// Get count of all nodes
     ///
     /// L-25 FIX: Validates count is non-negative before converting to usize.
-    pub fn get_node_count(&self) -> Result<usize, DbError> {
+    pub(crate) fn get_node_count(&self) -> Result<usize, DbError> {
         let conn = self.conn.lock();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
         // L-25 FIX: Validate non-negative before usize cast
@@ -599,7 +602,7 @@ impl RegistryDb {
     /// Get count of healthy nodes
     ///
     /// L-25 FIX: Validates count is non-negative before converting to usize.
-    pub fn get_healthy_node_count(&self) -> Result<usize, DbError> {
+    pub(crate) fn get_healthy_node_count(&self) -> Result<usize, DbError> {
         let conn = self.conn.lock();
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM nodes WHERE healthy = 1", [], |row| {
@@ -616,7 +619,7 @@ impl RegistryDb {
     }
 
     /// Get node status with rank information
-    pub fn get_node_status(&self, node_id: &str) -> Result<Option<NodeStatus>, DbError> {
+    pub(crate) fn get_node_status(&self, node_id: &str) -> Result<Option<NodeStatus>, DbError> {
         let conn = self.conn.lock();
 
         // Get the node first
@@ -703,7 +706,7 @@ impl RegistryDb {
 
 /// Node status with rank information
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeStatus {
+pub(crate) struct NodeStatus {
     pub registered: bool,
     pub in_dns: bool,
     pub healthy: bool,
@@ -720,7 +723,7 @@ pub struct NodeStatus {
 
 /// Region statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegionStats {
+pub(crate) struct RegionStats {
     pub region: Region,
     pub total_nodes: u32,
     pub healthy_nodes: u32,

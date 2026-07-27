@@ -7,7 +7,7 @@ use crate::verdict::{AnalysisLocation, DeadCodeRegion, DeadCodeType};
 /// Analyze transaction outputs for dead code patterns:
 /// - Oversized OP_RETURN outputs
 /// - Bare multisig with fake (invalid) pubkeys
-pub fn analyze_outputs(tx: &Transaction, config: &ReaperConfig) -> Vec<DeadCodeRegion> {
+pub(crate) fn analyze_outputs(tx: &Transaction, config: &ReaperConfig) -> Vec<DeadCodeRegion> {
     let mut regions = Vec::new();
 
     for (idx, output) in tx.output.iter().enumerate() {

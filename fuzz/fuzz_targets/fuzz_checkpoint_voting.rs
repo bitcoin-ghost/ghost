@@ -22,7 +22,7 @@
 
 //! Fuzz target for checkpoint vote deserialization and signature verification
 //!
-//! Tests that Vote deserialization and verify_vote_signature never panic
+//! Tests that Vote deserialization and signature verification never panic
 //! on arbitrary input. The Vote struct uses custom serde for [u8; 64]
 //! signatures and [u8; 32] node IDs which are worth exercising.
 
@@ -31,10 +31,8 @@
 use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
 
-#[allow(deprecated)]
-use ghost_consensus::voting::{
-    Vote, compute_vote_signing_message, verify_vote_signature,
-};
+use ghost_common::identity::verify_signature;
+use ghost_consensus::voting::{compute_vote_signing_message, Vote};
 
 #[derive(Arbitrary, Debug)]
 struct FuzzVoteInput {
@@ -60,8 +58,15 @@ fuzz_target!(|input: FuzzVoteInput| {
         input.approve,
     );
 
-    // 3. Signature verification with arbitrary data — must never panic
+    // 3. Signature verification with arbitrary data — must never panic.
+    //    Replicates the current round-bound verification path (compute the
+    //    signing message, then verify the signature) using public APIs.
     let vote = Vote::new(input.voter, input.approve, input.signature);
-    #[allow(deprecated)]
-    let _ = verify_vote_signature(&vote, &input.proposal_hash);
+    let message = compute_vote_signing_message(
+        input.round_id,
+        &input.proposal_hash,
+        &vote.voter,
+        vote.approve,
+    );
+    let _ = verify_signature(&vote.voter, &message, &vote.signature);
 });

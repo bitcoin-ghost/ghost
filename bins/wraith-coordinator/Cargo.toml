@@ -50,8 +50,6 @@ bitcoin = { workspace = true }
 # HTTP server
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
-hyper = { workspace = true }
 
 # Bitcoind RPC (BitcoindBroadcaster) + ghost-pay BondLedger HTTP
 # client (GhostPayBondLedger). Both Broadcaster and BondLedger are
@@ -74,7 +72,6 @@ tokio = { workspace = true }
 # Serialisation / config
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
 
 # CLI + logging
 clap = { workspace = true }

@@ -1043,21 +1043,6 @@ impl ClientMessage {
                 | ClientMessage::GetRecentL2Transactions { .. }
         )
     }
-
-    /// Check if this message includes a WalletProof
-    pub fn has_proof(&self) -> bool {
-        matches!(
-            self,
-            ClientMessage::PreparePayment { .. }
-                | ClientMessage::CancelPayment { .. }
-                | ClientMessage::ConfirmGhostLockFunding { .. }
-                | ClientMessage::RegisterScanKey { .. }
-                | ClientMessage::RequestJump { .. }
-                | ClientMessage::AcceptInstantPayment { .. }
-                | ClientMessage::ShieldBalance { .. }
-                | ClientMessage::SendL2Payment { .. }
-        )
-    }
 }
 
 #[cfg(test)]

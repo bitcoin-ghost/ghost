@@ -35,7 +35,7 @@ const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
 /// Cloudflare API errors
 #[derive(Debug, Error)]
-pub enum CloudflareError {
+pub(crate) enum CloudflareError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("API error: {0}")]
@@ -46,7 +46,7 @@ pub enum CloudflareError {
 
 /// DNS A record from Cloudflare
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsRecord {
+pub(crate) struct DnsRecord {
     pub id: String,
     #[serde(rename = "type")]
     pub record_type: String,
@@ -83,7 +83,7 @@ struct CreateRecordRequest {
 }
 
 /// Cloudflare DNS client
-pub struct CloudflareClient {
+pub(crate) struct CloudflareClient {
     client: Client,
     config: CloudflareConfig,
     dns_config: DnsConfig,
@@ -91,7 +91,10 @@ pub struct CloudflareClient {
 
 impl CloudflareClient {
     /// Create a new Cloudflare client
-    pub fn new(config: CloudflareConfig, dns_config: DnsConfig) -> Result<Self, CloudflareError> {
+    pub(crate) fn new(
+        config: CloudflareConfig,
+        dns_config: DnsConfig,
+    ) -> Result<Self, CloudflareError> {
         if config.enabled && (config.zone_id.is_empty() || config.api_token.is_empty()) {
             return Err(CloudflareError::Config(
                 "zone_id and api_token required when Cloudflare is enabled".to_string(),
@@ -108,18 +111,18 @@ impl CloudflareClient {
     }
 
     /// Check if Cloudflare integration is enabled
-    pub fn is_enabled(&self) -> bool {
+    pub(crate) fn is_enabled(&self) -> bool {
         self.config.enabled
     }
 
     /// Get the subdomain for a region (e.g., "eu.pool" for EU)
-    pub fn region_subdomain(&self, region: Region) -> String {
+    pub(crate) fn region_subdomain(&self, region: Region) -> String {
         let prefix = region_prefix(region);
         format!("{}.{}", prefix, self.dns_config.subdomain_prefix)
     }
 
     /// Get the full domain name for a region
-    pub fn region_fqdn(&self, region: Region) -> String {
+    pub(crate) fn region_fqdn(&self, region: Region) -> String {
         format!(
             "{}.{}",
             self.region_subdomain(region),
@@ -128,7 +131,7 @@ impl CloudflareClient {
     }
 
     /// List all A records for a region
-    pub async fn list_region_records(
+    pub(crate) async fn list_region_records(
         &self,
         region: Region,
     ) -> Result<Vec<DnsRecord>, CloudflareError> {
@@ -165,7 +168,7 @@ impl CloudflareClient {
     }
 
     /// Create an A record
-    pub async fn create_record(
+    pub(crate) async fn create_record(
         &self,
         region: Region,
         ip: &str,
@@ -216,7 +219,7 @@ impl CloudflareClient {
     }
 
     /// Delete an A record by ID
-    pub async fn delete_record(&self, record_id: &str) -> Result<(), CloudflareError> {
+    pub(crate) async fn delete_record(&self, record_id: &str) -> Result<(), CloudflareError> {
         if !self.config.enabled {
             return Err(CloudflareError::Config(
                 "Cloudflare not enabled".to_string(),
@@ -253,7 +256,7 @@ impl CloudflareClient {
     /// Sync DNS records for a region with desired IPs
     ///
     /// Returns (added, removed) counts
-    pub async fn sync_region_records(
+    pub(crate) async fn sync_region_records(
         &self,
         region: Region,
         desired_ips: &[String],
@@ -338,7 +341,7 @@ impl CloudflareClient {
     }
 
     /// Sync all regions
-    pub async fn sync_all_regions(
+    pub(crate) async fn sync_all_regions(
         &self,
         region_ips: &[(Region, Vec<String>)],
     ) -> Result<(usize, usize), CloudflareError> {
@@ -380,7 +383,7 @@ fn region_prefix(region: Region) -> &'static str {
 
 /// Get all active regions
 #[allow(dead_code)]
-pub fn all_regions() -> Vec<Region> {
+pub(crate) fn all_regions() -> Vec<Region> {
     vec![
         Region::UsEast,
         Region::UsWest,
@@ -395,7 +398,7 @@ pub fn all_regions() -> Vec<Region> {
 }
 
 /// Group regions by DNS prefix (multiple regions can share a prefix)
-pub fn group_regions_by_prefix() -> Vec<(String, Vec<Region>)> {
+pub(crate) fn group_regions_by_prefix() -> Vec<(String, Vec<Region>)> {
     vec![
         ("us".to_string(), vec![Region::UsEast, Region::UsWest]),
         ("eu".to_string(), vec![Region::EuWest, Region::EuCentral]),

@@ -56,6 +56,8 @@
 //! - Minimum settlement: 10,000 sats
 //! - Dispute window: 144 blocks (1 day)
 
+#![deny(unreachable_pub)]
+
 pub mod batch;
 pub mod broadcaster;
 pub mod commitment;

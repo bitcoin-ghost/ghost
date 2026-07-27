@@ -35,15 +35,12 @@ bellperson = "0.26"
 
 # Finite field and curve arithmetic
 ff = "0.13"
-group = "0.13"
 
 # Pairing-friendly curves for Groth16
 blstrs = "0.7"
-pairing = "0.23"
 
 # Hashing
 sha2 = "0.10"
-blake2 = "0.10"
 
 # Note: For full Poseidon hash support, add neptune crate when bellperson
 # version compatibility is resolved. Currently using MiMC-style hash.
@@ -54,7 +51,6 @@ serde = { version = "1.0", features = ["derive"] }
 
 # Random number generation
 rand = "0.8"
-getrandom = "0.2"
 
 # Error handling
 thiserror = "1.0"
@@ -63,7 +59,6 @@ thiserror = "1.0"
 tracing = "0.1"
 
 # Parallelism for proof generation
-rayon = "1.8"
 
 # Hex encoding for display
 hex = "0.4"

@@ -37,6 +37,8 @@
 //! assert_eq!(tier.denomination_sats(), 100_000);
 //! ```
 
+#![deny(unreachable_pub)]
+
 mod blind;
 pub mod coordinator_redundancy;
 mod error;
@@ -74,19 +76,9 @@ pub use lite_session::{
 
 pub mod remix;
 
-pub mod beacon;
-pub mod beacon_schedule;
 pub mod epoch;
 pub mod service;
 pub mod sortition;
-pub use beacon::{
-    beacon_from_round, commit_for, compute_beacon, reveal_is_valid, BeaconRound, BeaconRoundState,
-    Commitment, Reveal,
-};
-pub use beacon_schedule::{
-    anchor_height_for_epoch, is_commit_height, is_reveal_height, phase_for_height, BeaconPhase,
-    COMMIT_BLOCKS, REVEAL_BLOCKS,
-};
 pub use epoch::{
     canonical_roster, epoch_for_height, snapshot_height_for_epoch, EpochCoordinators, EPOCH_BLOCKS,
 };

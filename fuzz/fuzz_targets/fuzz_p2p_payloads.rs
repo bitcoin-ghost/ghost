@@ -38,19 +38,11 @@ fuzz_target!(|data: &[u8]| {
     let _ = serde_json::from_slice::<PayoutProposalMessage>(data);
     let _ = serde_json::from_slice::<VoteMessage>(data);
     let _ = serde_json::from_slice::<ShareProofMessage>(data);
-    let _ = serde_json::from_slice::<BlockFoundMessage>(data);
 
     // Health & discovery
     let _ = serde_json::from_slice::<HealthPingMessage>(data);
     let _ = serde_json::from_slice::<DiscoveryMessage>(data);
     let _ = serde_json::from_slice::<PeerInfo>(data);
-
-    // Elder management
-    let _ = serde_json::from_slice::<ElderUpdateMessage>(data);
-    let _ = serde_json::from_slice::<ElderRegistrationProposalMessage>(data);
-    let _ = serde_json::from_slice::<ElderListProposalMessage>(data);
-    let _ = serde_json::from_slice::<ElderListApprovalMessage>(data);
-    let _ = serde_json::from_slice::<ElderRegistrationVoteMessage>(data);
 
     // Share convergence
     let _ = serde_json::from_slice::<ShareConvergenceMessage>(data);
@@ -78,7 +70,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = serde_json::from_slice::<L2TransferBroadcastMessage>(data);
     let _ = serde_json::from_slice::<L2CheckpointBlockMessage>(data);
     let _ = serde_json::from_slice::<L2CheckpointVoteMessage>(data);
-    let _ = serde_json::from_slice::<L2TreeSyncMessage>(data);
     let _ = serde_json::from_slice::<L2TreeSyncRequest>(data);
     let _ = serde_json::from_slice::<L2TreeSyncResponse>(data);
 

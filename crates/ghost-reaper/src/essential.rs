@@ -33,7 +33,7 @@ use crate::witness::SpendType;
 /// Takes the original script and dead regions identified by `detect_dead_code()`.
 /// Removes those regions and concatenates the remaining bytes.
 /// The stripped script executes identically for validation purposes.
-pub fn strip_to_essential(
+pub(crate) fn strip_to_essential(
     script_bytes: &[u8],
     dead_regions: &[DeadCodeRegion],
 ) -> (Vec<u8>, usize) {
@@ -79,7 +79,7 @@ pub fn strip_to_essential(
 /// For tapscript: OP_CHECKSIG/CHECKSIGADD consume 1 sig from the stack (pubkey is in-script).
 /// For P2WSH (non-tapscript): OP_CHECKSIG consumes 1 sig from the stack.
 /// OP_CHECKMULTISIG consumes m+1 items (m sigs + 1 dummy).
-pub fn count_stack_consumption(script_bytes: &[u8], is_tapscript: bool) -> usize {
+pub(crate) fn count_stack_consumption(script_bytes: &[u8], is_tapscript: bool) -> usize {
     let len = script_bytes.len();
     let mut pos = 0;
     let mut count: usize = 0;
@@ -243,7 +243,7 @@ fn find_multisig_m(script_bytes: &[u8], checkmultisig_pos: usize) -> usize {
 /// 3. Comparing actual witness items against the essential count
 ///
 /// Returns None for spend types that are inherently minimal (key-path, P2WPKH, legacy, empty).
-pub fn compute_witness_breakdown(
+pub(crate) fn compute_witness_breakdown(
     input: &TxIn,
     spend_type: &SpendType,
     dead_regions: &[DeadCodeRegion],

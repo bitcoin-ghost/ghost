@@ -3,6 +3,8 @@
 //! Permanent 16x16 pixel ghost bitmaps bound to Ghost IDs.
 //! Registration completes when a Ghost Lock is funded via Wraith deposit.
 
+#![deny(unreachable_pub)]
+
 pub mod error;
 pub mod glyph;
 pub mod palette;

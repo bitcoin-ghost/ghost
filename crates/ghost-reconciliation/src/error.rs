@@ -163,11 +163,4 @@ pub enum ReconciliationError {
     InternalError { details: String },
 }
 
-// Simplified BatchNotFound that takes a String directly
-impl ReconciliationError {
-    pub fn batch_not_found(id: impl Into<String>) -> Self {
-        ReconciliationError::BatchNotFound { id: id.into() }
-    }
-}
-
 pub type ReconciliationResult<T> = Result<T, ReconciliationError>;

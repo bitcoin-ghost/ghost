@@ -155,11 +155,6 @@ pub enum CoordinatorStatus {
 }
 
 impl CoordinatorStatus {
-    /// Check if coordinator can handle new sessions
-    pub fn can_accept_sessions(&self) -> bool {
-        matches!(self, Self::Active | Self::Standby)
-    }
-
     /// Check if coordinator is healthy
     pub fn is_healthy(&self) -> bool {
         !matches!(self, Self::Failed | Self::Disabled)
@@ -813,14 +808,6 @@ impl CoordinatorPool {
 
         Ok(event)
         // _session_lock dropped here, releasing the lock
-    }
-
-    /// Acquire session lock for operations that need to prevent concurrent session changes
-    ///
-    /// Returns a guard that must be held during the protected operation.
-    /// Use this when registering sessions to ensure atomicity with failover.
-    pub fn acquire_session_lock(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
-        self.session_lock.read()
     }
 
     /// Record heartbeat from a coordinator

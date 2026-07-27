@@ -33,6 +33,8 @@
 //!
 //! Run with: ghost-pool --config ghost.toml
 
+#![deny(unreachable_pub)]
+
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
@@ -681,30 +683,6 @@ struct Args {
     /// With --ledger-import: report what WOULD change and write nothing.
     #[arg(long)]
     dry_run: bool,
-}
-
-/// Pool state shared across components
-pub struct PoolState {
-    /// Node identity
-    pub identity: Arc<NodeIdentity>,
-    /// Node capabilities
-    pub capabilities: NodeCapabilities,
-    /// Policy profile
-    pub policy: PolicyProfile,
-    /// Bitcoin RPC client
-    pub rpc: Arc<BitcoinRpc>,
-    /// Database
-    pub db: Arc<Database>,
-    /// Round manager
-    pub round_manager: Arc<RoundManager>,
-    /// Template processor
-    pub template_processor: Arc<TemplateProcessor>,
-    /// P2P mesh network
-    pub mesh: Arc<MeshNetwork>,
-    /// Vote handler for consensus
-    pub vote_handler: Arc<VoteHandler>,
-    /// Shutdown signal
-    pub shutdown_tx: broadcast::Sender<()>,
 }
 
 /// Handle --status command: query and display node status from registry
@@ -6097,20 +6075,6 @@ async fn main() -> Result<()> {
 
     // Create shutdown channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
-    // Create pool state (will be used for API handlers)
-    let _pool_state = Arc::new(PoolState {
-        identity: Arc::clone(&identity),
-        capabilities,
-        policy: policy.clone(),
-        rpc: Arc::clone(&rpc),
-        db: Arc::clone(&db),
-        round_manager: Arc::clone(&round_manager),
-        template_processor: Arc::clone(&template_processor),
-        mesh: Arc::clone(&mesh),
-        vote_handler: Arc::clone(&vote_handler),
-        shutdown_tx: shutdown_tx.clone(),
-    });
 
     // Create payout handler for block found events
     // This wires BlockFound -> PayoutProposal -> VoteHandler (BFT consensus)

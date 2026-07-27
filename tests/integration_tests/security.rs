@@ -828,33 +828,8 @@ async fn test_658_noise_connection_pool_establishment() {
     assert_eq!(received, b"test message");
 }
 
-#[test]
-fn test_659_noise_receiver_stats() {
-    use ghost_consensus::noise_receiver::NoiseReceiverStats;
-    use std::sync::atomic::Ordering;
-
-    let stats = NoiseReceiverStats::default();
-
-    // Initial values should be zero
-    let snapshot = stats.snapshot();
-    assert_eq!(snapshot.messages_received, 0);
-    assert_eq!(snapshot.messages_rejected, 0);
-    assert_eq!(snapshot.identity_mismatch, 0);
-    assert_eq!(snapshot.receive_errors, 0);
-
-    // Increment counters
-    stats.messages_received.fetch_add(10, Ordering::Relaxed);
-    stats.messages_rejected.fetch_add(2, Ordering::Relaxed);
-    stats.identity_mismatch.fetch_add(1, Ordering::Relaxed);
-    stats.receive_errors.fetch_add(3, Ordering::Relaxed);
-
-    // Verify snapshot reflects updates
-    let snapshot = stats.snapshot();
-    assert_eq!(snapshot.messages_received, 10);
-    assert_eq!(snapshot.messages_rejected, 2);
-    assert_eq!(snapshot.identity_mismatch, 1);
-    assert_eq!(snapshot.receive_errors, 3);
-}
+// test_659_noise_receiver_stats removed — it covered the dead `noise_receiver` module
+// (never wired into the mesh), which was removed in this cleanup.
 
 #[test]
 fn test_660_noise_mesh_config_defaults() {

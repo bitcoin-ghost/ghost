@@ -33,13 +33,10 @@ description = "Ghost Service Provider (GSP) server library for light wallet supp
 ghost-gsp-proto = { path = "../ghost-gsp-proto" }
 ghost-common = { workspace = true }
 ghost-consensus = { workspace = true }
-ghost-keys = { workspace = true }
-ghost-locks = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
 futures = { workspace = true }
-async-trait = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -71,11 +68,9 @@ rusqlite = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Utilities
 chrono = { workspace = true }
-uuid = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 

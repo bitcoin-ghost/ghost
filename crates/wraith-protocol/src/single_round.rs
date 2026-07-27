@@ -175,12 +175,6 @@ impl LiteRoundBuilder {
         }
     }
 
-    /// Override the mining-fee rate for this round.
-    pub fn with_fee_rate(mut self, sats_per_vb: u64) -> Self {
-        self.fee_rate_sats_per_vb = sats_per_vb;
-        self
-    }
-
     /// Register a participant's input + destination addresses. Validates:
     /// - Input amount ≥ `min_participant_input()` (denom + fee shares).
     /// - If surplus exceeds dust, change_address is set.

@@ -241,15 +241,6 @@ fn parse_withdrawal_status_strict(
     })
 }
 
-/// Type alias for node rotation data: (is_elder, elder_order, pow_proof, capabilities, first_seen)
-type NodeRotationData = (
-    bool,
-    Option<u32>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-);
-
 // =============================================================================
 // L-16: BLOB SIZE LIMITS FOR INSERT OPERATIONS
 // =============================================================================
@@ -263,11 +254,6 @@ pub const MAX_EQUIVOCATION_PROOF_SIZE: usize = 100 * 1024;
 /// Rotation proofs contain two signatures and node IDs.
 /// At most this should be ~500 bytes, so 10KB provides generous headroom.
 pub const MAX_ROTATION_PROOF_SIZE: usize = 10 * 1024;
-
-/// LOW-STOR-4: Maximum signature size (hex-encoded Ed25519 signature: 128 hex chars = 64 bytes)
-/// Ed25519 signatures are exactly 64 bytes (128 hex characters).
-/// Set to 128 to match the actual Ed25519 signature size.
-pub const MAX_SIGNATURE_SIZE: usize = 128;
 
 /// M-2: Maximum size for kv_store values (1 MB)
 /// Prevents storage exhaustion attacks through the key-value store API.
@@ -1492,26 +1478,6 @@ impl Database {
         })
     }
 
-    /// Count of distinct miners currently carrying unpaid shares. Useful
-    /// for the payout endpoint's "miners waiting" tile so the frontend
-    /// can show how many miners are in the ledger vs how many get paid
-    /// in a single block.
-    pub fn count_unpaid_miners(&self, cutoff_ts: i64) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let count: u64 = conn
-                .query_row(
-                    "SELECT COUNT(DISTINCT miner_id) FROM shares
-                     WHERE paid_in_proposal_hash IS NULL
-                       AND timestamp <= ?1
-                       AND valid = 1",
-                    params![cutoff_ts],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count)
-        })
-    }
-
     /// Commit a block's payout: mark every unpaid share belonging to the
     /// paid miners (up to `cutoff_ts`) with this proposal's hash. Shares
     /// submitted after the cutoff stay NULL and roll into the next block's
@@ -2453,38 +2419,6 @@ impl Database {
         })
     }
 
-    /// Register a node and check if it should be an elder
-    /// Returns (is_elder, elder_order) - elder_order is Some(n) if node is elder
-    ///
-    /// Uses deterministic elder selection: lowest node_id (lexicographically) wins ties.
-    /// This prevents race conditions at genesis where multiple nodes register simultaneously.
-    ///
-    /// **Sybil Resistance**: Nodes must provide valid PoW proof to be eligible for elder status.
-    /// Call `register_node_with_elder_check_and_pow` for the full-featured version.
-    ///
-    /// The algorithm:
-    /// 1. Insert the node if it doesn't exist (IGNORE on conflict)
-    /// 2. Within an IMMEDIATE transaction (exclusive write lock):
-    ///    - Count current elders
-    ///    - If < MAX_ELDERS, promote eligible non-elder nodes by node_id order
-    /// 3. Return the node's final elder status
-    pub fn register_node_with_elder_check(
-        &self,
-        node_id: &str,
-        public_address: Option<&str>,
-        display_name: Option<&str>,
-        capabilities: &str,
-    ) -> GhostResult<(bool, Option<u32>)> {
-        // Delegate to the version with PoW (using None for backwards compatibility)
-        self.register_node_with_elder_check_and_pow(
-            node_id,
-            public_address,
-            display_name,
-            capabilities,
-            None,
-        )
-    }
-
     /// Register a node with PoW proof for Sybil-resistant elder eligibility
     ///
     /// **IMPORTANT**: Nodes without valid PoW proofs will NOT be eligible for elder status.
@@ -2653,23 +2587,6 @@ impl Database {
             }
 
             result
-        })
-    }
-
-    /// Get elder status for a node (queries database)
-    /// Returns (is_elder, elder_order)
-    pub fn get_node_elder_status(&self, node_id: &str) -> GhostResult<(bool, Option<u32>)> {
-        self.with_connection(|conn| {
-            let result: Option<(bool, Option<u32>)> = conn
-                .query_row(
-                    "SELECT is_elder, elder_order FROM nodes WHERE node_id = ?1",
-                    [node_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            Ok(result.unwrap_or((false, None)))
         })
     }
 
@@ -3171,18 +3088,6 @@ impl Database {
                     last_seen = ?3
                  WHERE miner_id = ?4",
                 params![shares, work, now, miner_id],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Increment miner's blocks_won counter
-    pub fn increment_miner_blocks_won(&self, miner_id: &str) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "UPDATE miners SET blocks_won = blocks_won + 1, last_seen = ?1 WHERE miner_id = ?2",
-                params![chrono::Utc::now().timestamp(), miner_id],
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
@@ -3869,18 +3774,6 @@ impl Database {
             Ok(peers)
         })
     }
-
-    /// Ban a peer
-    pub fn ban_peer(&self, peer_id: &str, ban_until: i64) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "UPDATE peers SET is_banned = 1, ban_until = ?1 WHERE peer_id = ?2",
-                params![ban_until, peer_id],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
 }
 
 fn peer_from_row(row: &rusqlite::Row) -> rusqlite::Result<PeerRecord> {
@@ -4184,34 +4077,6 @@ fn reconciliation_from_row(row: &rusqlite::Row) -> rusqlite::Result<Reconciliati
 // =============================================================================
 
 impl Database {
-    /// Insert a new withdrawal request
-    pub fn insert_withdrawal_request(&self, request: &WithdrawalRequest) -> GhostResult<i64> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT INTO withdrawal_requests (
-                    ghost_id, lock_id, destination_address, amount_sats, fee_sats,
-                    status, batch_id, l1_txid, settlement_class, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    request.ghost_id,
-                    request.lock_id,
-                    request.destination_address,
-                    request.amount_sats,
-                    request.fee_sats,
-                    request.status.as_str(),
-                    request.batch_id,
-                    request.l1_txid,
-                    request.settlement_class,
-                    request.created_at,
-                    request.updated_at,
-                ],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            Ok(conn.last_insert_rowid())
-        })
-    }
-
     /// Atomically insert a withdrawal request if no pending/batched withdrawal exists for the lock
     ///
     /// This prevents double-spend race conditions (C-PAY-3) by:
@@ -4326,59 +4191,6 @@ impl Database {
         })
     }
 
-    /// Get all pending withdrawal requests (for batch processing)
-    ///
-    /// H-7: Limited to MAX_QUERY_RESULTS rows to prevent OOM attacks
-    pub fn get_all_pending_withdrawals(&self) -> GhostResult<Vec<WithdrawalRequest>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, ghost_id, lock_id, destination_address, amount_sats, fee_sats,
-                            status, batch_id, l1_txid, settlement_class, created_at, updated_at
-                     FROM withdrawal_requests
-                     WHERE status = 'pending'
-                     ORDER BY created_at ASC LIMIT ?1",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let requests = stmt
-                .query_map([Self::MAX_QUERY_RESULTS], withdrawal_from_row)
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            Ok(requests)
-        })
-    }
-
-    /// Get withdrawal requests by lock ID
-    ///
-    /// H-7: Limited to MAX_QUERY_RESULTS rows to prevent OOM attacks
-    pub fn get_withdrawals_by_lock(&self, lock_id: &str) -> GhostResult<Vec<WithdrawalRequest>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, ghost_id, lock_id, destination_address, amount_sats, fee_sats,
-                            status, batch_id, l1_txid, settlement_class, created_at, updated_at
-                     FROM withdrawal_requests
-                     WHERE lock_id = ?1
-                     ORDER BY created_at DESC LIMIT ?2",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let requests = stmt
-                .query_map(
-                    params![lock_id, Self::MAX_QUERY_RESULTS],
-                    withdrawal_from_row,
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            Ok(requests)
-        })
-    }
-
     /// Get pending withdrawals filtered by settlement class
     ///
     /// H-7: Limited to MAX_QUERY_RESULTS rows to prevent OOM attacks
@@ -4433,19 +4245,6 @@ impl Database {
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
             Ok(requests)
-        })
-    }
-
-    /// Update withdrawal request status
-    pub fn update_withdrawal_status(&self, id: i64, status: WithdrawalStatus) -> GhostResult<()> {
-        let now = chrono::Utc::now().timestamp();
-        self.with_connection(|conn| {
-            conn.execute(
-                "UPDATE withdrawal_requests SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                params![status.as_str(), now, id],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
         })
     }
 
@@ -4932,353 +4731,6 @@ impl Database {
     // =========================================================================
     // KEY ROTATION WITH ELDER STATUS TRANSFER
     // =========================================================================
-
-    /// Check if a node_id has been retired (rotated away from)
-    ///
-    /// Returns the new node_id if the node was rotated, None if still active.
-    pub fn is_node_retired(&self, node_id: &str) -> GhostResult<Option<String>> {
-        self.with_connection(|conn| {
-            let result: Option<String> = conn
-                .query_row(
-                    "SELECT new_node_id FROM retired_nodes WHERE old_node_id = ?1",
-                    [node_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(result)
-        })
-    }
-
-    /// Check if a rotation proof has been used (prevent replay)
-    fn is_rotation_proof_used(
-        &self,
-        conn: &Connection,
-        old_node_id: &str,
-        new_node_id: &str,
-    ) -> GhostResult<bool> {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rotation_history
-                 WHERE old_node_id = ?1 AND new_node_id = ?2 AND status = 'completed'",
-                params![old_node_id, new_node_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-        Ok(count > 0)
-    }
-
-    /// Transfer elder status from old node_id to new node_id using a rotation proof
-    ///
-    /// This is the ONLY way to preserve elder status during key rotation.
-    ///
-    /// Security checks performed:
-    /// 1. Rotation proof is cryptographically valid (both signatures)
-    /// 2. Old node_id is not already retired
-    /// 3. New node_id is not already in use as someone else's identity
-    /// 4. The rotation proof hasn't been used before (prevent replay)
-    /// 5. The rotation proof is recent (not expired)
-    ///
-    /// Returns (success, elder_transferred)
-    ///
-    /// # L-16 Size Limit
-    /// The serialized rotation_proof must not exceed MAX_ROTATION_PROOF_SIZE (10 KB).
-    /// Returns an error if the proof is too large.
-    pub fn transfer_elder_with_rotation(
-        &self,
-        rotation_proof: &ghost_common::key_rotation::KeyRotationProof,
-    ) -> GhostResult<(bool, bool)> {
-        // Step 1: Verify the rotation proof cryptographically (includes expiration check)
-        rotation_proof.verify().map_err(|e| {
-            GhostError::SignatureVerification(format!("Invalid rotation proof: {}", e))
-        })?;
-
-        let old_node_id = hex::encode(rotation_proof.old_node_id);
-        let new_node_id = hex::encode(rotation_proof.new_node_id);
-        let now = chrono::Utc::now().timestamp();
-        let proof_bytes = rotation_proof.to_bytes();
-
-        // L-16: Validate rotation proof size before INSERT to prevent storage DoS
-        if proof_bytes.len() > MAX_ROTATION_PROOF_SIZE {
-            return Err(GhostError::InvalidInput(format!(
-                "Rotation proof too large: {} bytes (max {} bytes)",
-                proof_bytes.len(),
-                MAX_ROTATION_PROOF_SIZE
-            )));
-        }
-
-        self.with_connection(|conn| {
-            // Step 2: Check if old node is already retired
-            let already_retired: Option<String> = conn
-                .query_row(
-                    "SELECT new_node_id FROM retired_nodes WHERE old_node_id = ?1",
-                    [&old_node_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if already_retired.is_some() {
-                return Err(GhostError::SignatureVerification(format!(
-                    "Node {} is already retired",
-                    &old_node_id[..16]
-                )));
-            }
-
-            // Step 3: Check if this rotation proof was already used
-            if self.is_rotation_proof_used(conn, &old_node_id, &new_node_id)? {
-                return Err(GhostError::SignatureVerification(
-                    "Rotation proof has already been used".to_string()
-                ));
-            }
-
-            // Step 4: Check if new_node_id is already in use by someone else
-            let existing_new: Option<String> = conn
-                .query_row(
-                    "SELECT node_id FROM nodes WHERE node_id = ?1 AND rotated_from IS NULL",
-                    [&new_node_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if existing_new.is_some() {
-                // New node_id exists and wasn't from a rotation - could be hijack attempt
-                return Err(GhostError::SignatureVerification(format!(
-                    "New node_id {} is already registered by another identity",
-                    &new_node_id[..16]
-                )));
-            }
-
-            // Step 5: Start transaction for atomic elder transfer
-            conn.execute("BEGIN IMMEDIATE", [])
-                .map_err(|e| GhostError::Database(format!("Failed to start transaction: {}", e)))?;
-
-            let result: GhostResult<(bool, bool)> = (|| {
-                // Get old node's elder status and other transferable attributes
-                let old_node: Option<NodeRotationData> = conn
-                    .query_row(
-                        "SELECT is_elder, elder_order, pow_proof, capabilities, first_seen
-                         FROM nodes WHERE node_id = ?1",
-                        [&old_node_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-                    )
-                    .optional()
-                    .map_err(|e| GhostError::Database(e.to_string()))?;
-
-                let (is_elder, elder_order, pow_proof, capabilities, first_seen) = match old_node {
-                    Some(data) => data,
-                    None => {
-                        return Err(GhostError::SignatureVerification(format!(
-                            "Old node {} not found in database",
-                            &old_node_id[..16]
-                        )));
-                    }
-                };
-
-                // Insert new node (or update if it exists from a previous incomplete rotation)
-                conn.execute(
-                    "INSERT INTO nodes (node_id, first_seen, last_seen, is_elder, elder_order,
-                                       pow_proof, capabilities, rotated_from)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT(node_id) DO UPDATE SET
-                         is_elder = excluded.is_elder,
-                         elder_order = excluded.elder_order,
-                         pow_proof = COALESCE(excluded.pow_proof, pow_proof),
-                         capabilities = COALESCE(excluded.capabilities, capabilities),
-                         rotated_from = excluded.rotated_from,
-                         last_seen = excluded.last_seen",
-                    params![
-                        &new_node_id,
-                        first_seen.unwrap_or(now),  // Preserve original first_seen
-                        now,
-                        is_elder,
-                        elder_order,
-                        pow_proof,
-                        capabilities,
-                        &old_node_id,
-                    ],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-                // Mark old node as retired (remove elder status)
-                conn.execute(
-                    "UPDATE nodes SET is_elder = 0, elder_order = NULL, rotated_to = ?1
-                     WHERE node_id = ?2",
-                    params![&new_node_id, &old_node_id],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-                // Add to retired_nodes table (permanent record)
-                conn.execute(
-                    "INSERT INTO retired_nodes (old_node_id, new_node_id, rotation_timestamp, rotation_proof)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![&old_node_id, &new_node_id, now, &proof_bytes],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-                // Add to rotation history
-                conn.execute(
-                    "INSERT INTO rotation_history (old_node_id, new_node_id, rotation_timestamp,
-                                                   finalized_timestamp, status, rotation_proof, elder_transferred)
-                     VALUES (?1, ?2, ?3, ?4, 'completed', ?5, ?6)",
-                    params![
-                        &old_node_id,
-                        &new_node_id,
-                        rotation_proof.timestamp as i64,
-                        now,
-                        &proof_bytes,
-                        if is_elder { 1 } else { 0 },
-                    ],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-                Ok((true, is_elder))
-            })();
-
-            // Commit or rollback
-            match &result {
-                Ok(_) => {
-                    conn.execute("COMMIT", [])
-                        .map_err(|e| GhostError::Database(format!("Failed to commit: {}", e)))?;
-                }
-                Err(_) => {
-                    let _ = conn.execute("ROLLBACK", []);
-                }
-            }
-
-            result
-        })
-    }
-
-    /// Get the rotation history for a node (follows the chain of rotations)
-    ///
-    /// L-12 FIX: Limited to MAX_QUERY_RESULTS total rows (combined from both queries).
-    /// Previously each query had its own limit, allowing up to 2x MAX_QUERY_RESULTS total.
-    pub fn get_rotation_chain(&self, node_id: &str) -> GhostResult<Vec<(String, String, i64)>> {
-        self.with_connection(|conn| {
-            // L-12 FIX: Pre-allocate with max capacity to enforce combined limit
-            let mut chain = Vec::with_capacity(Self::MAX_QUERY_RESULTS as usize);
-
-            // First, find all rotations FROM this node
-            // L-12 FIX: Use full limit for first query
-            let mut stmt = conn
-                .prepare(
-                    "SELECT old_node_id, new_node_id, finalized_timestamp
-                     FROM rotation_history
-                     WHERE old_node_id = ?1 AND status = 'completed'
-                     ORDER BY finalized_timestamp DESC LIMIT ?2",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let rotations = stmt
-                .query_map(params![node_id, Self::MAX_QUERY_RESULTS], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            chain.extend(rotations);
-
-            // L-12 FIX: Calculate remaining capacity for second query
-            let remaining = (Self::MAX_QUERY_RESULTS as usize).saturating_sub(chain.len());
-            if remaining == 0 {
-                // Already at limit, skip second query
-                return Ok(chain);
-            }
-
-            // Also find rotations TO this node (to build full chain)
-            // L-12 FIX: Only fetch up to remaining capacity
-            let mut stmt = conn
-                .prepare(
-                    "SELECT old_node_id, new_node_id, finalized_timestamp
-                     FROM rotation_history
-                     WHERE new_node_id = ?1 AND status = 'completed'
-                     ORDER BY finalized_timestamp DESC LIMIT ?2",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let rotations = stmt
-                .query_map(params![node_id, remaining as u32], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            chain.extend(rotations);
-
-            Ok(chain)
-        })
-    }
-
-    /// Store a pending rotation (before finalization)
-    /// This allows for grace period revocation
-    pub fn store_pending_rotation(
-        &self,
-        rotation_proof: &ghost_common::key_rotation::KeyRotationProof,
-    ) -> GhostResult<i64> {
-        let old_node_id = hex::encode(rotation_proof.old_node_id);
-        let new_node_id = hex::encode(rotation_proof.new_node_id);
-        let proof_bytes = rotation_proof.to_bytes();
-
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT INTO rotation_history (old_node_id, new_node_id, rotation_timestamp,
-                                               status, rotation_proof, elder_transferred)
-                 VALUES (?1, ?2, ?3, 'pending', ?4, 0)",
-                params![
-                    &old_node_id,
-                    &new_node_id,
-                    rotation_proof.timestamp as i64,
-                    &proof_bytes,
-                ],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            Ok(conn.last_insert_rowid())
-        })
-    }
-
-    /// Revoke a pending rotation (during grace period)
-    pub fn revoke_pending_rotation(
-        &self,
-        rotation_id: i64,
-        revocation_proof: &ghost_common::key_rotation::RotationRevocation,
-    ) -> GhostResult<()> {
-        // Serialize revocation proof to JSON
-        let revocation_bytes = serde_json::to_vec(revocation_proof)
-            .map_err(|e| GhostError::Database(format!("Failed to serialize revocation: {}", e)))?;
-        let now = chrono::Utc::now().timestamp();
-
-        self.with_connection(|conn| {
-            let rows_affected = conn
-                .execute(
-                    "UPDATE rotation_history
-                     SET status = 'revoked', finalized_timestamp = ?1, revocation_proof = ?2
-                     WHERE id = ?3 AND status = 'pending'",
-                    params![now, &revocation_bytes, rotation_id],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if rows_affected == 0 {
-                return Err(GhostError::Database(
-                    "Rotation not found or already finalized".to_string(),
-                ));
-            }
-
-            Ok(())
-        })
-    }
 }
 
 fn withdrawal_from_row(row: &rusqlite::Row) -> rusqlite::Result<WithdrawalRequest> {
@@ -5391,11 +4843,6 @@ impl Database {
         }
     }
 
-    /// Set the current treasury balance in satoshis
-    pub fn set_treasury_balance(&self, balance: u64) -> GhostResult<()> {
-        self.kv_set(TREASURY_BALANCE_KEY, &balance.to_string())
-    }
-
     /// Get the timestamp when treasury threshold was reached (if ever)
     pub fn get_treasury_threshold_reached(&self) -> GhostResult<Option<i64>> {
         match self.kv_get(TREASURY_THRESHOLD_REACHED_KEY)? {
@@ -5410,11 +4857,6 @@ impl Database {
             }
             None => Ok(None),
         }
-    }
-
-    /// Set the timestamp when treasury threshold was reached
-    pub fn set_treasury_threshold_reached(&self, timestamp: i64) -> GhostResult<()> {
-        self.kv_set(TREASURY_THRESHOLD_REACHED_KEY, &timestamp.to_string())
     }
 
     /// Add funds to treasury and check if threshold was crossed
@@ -6508,79 +5950,6 @@ impl Database {
         })
     }
 
-    /// H-2 SECURITY: Get uptime percentage as integer (0-100)
-    ///
-    /// Returns the uptime as a percentage (0-100), or None if no samples exist.
-    /// This is used for elder registration verification where we compare against
-    /// claimed uptime values.
-    pub fn get_node_uptime_percent(&self, node_id: &str, since: i64) -> GhostResult<Option<u32>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT
-                        SUM(CASE WHEN was_online = 1 THEN 1 ELSE 0 END) as online,
-                        COUNT(*) as total
-                     FROM uptime_samples
-                     WHERE node_id = ?1 AND sample_time >= ?2",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let result = stmt
-                .query_row(params![node_id, since], |row| {
-                    let online: Option<i64> = row.get(0)?;
-                    let total: i64 = row.get(1)?;
-                    Ok((online.unwrap_or(0), total))
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let (online, total) = result;
-            if total == 0 {
-                return Ok(None);
-            }
-            // GHOST-10: time-based expected denominator, not online/total.
-            let percent = (Self::uptime_ratio(online, since) * 100.0).round() as u32;
-            Ok(Some(percent.min(100)))
-        })
-    }
-
-    /// H-2 SECURITY: Get first seen timestamp for a node
-    ///
-    /// Returns the earliest timestamp when this node was first observed.
-    /// Used to verify elder registration uptime claims.
-    pub fn get_node_first_seen(&self, node_id: &str) -> GhostResult<Option<i64>> {
-        self.with_connection(|conn| {
-            // First check the nodes table
-            let from_nodes: Option<i64> = conn
-                .query_row(
-                    "SELECT first_seen FROM nodes WHERE node_id = ?1",
-                    [node_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .flatten();
-
-            // Also check uptime_samples for earliest sample
-            let from_samples: Option<i64> = conn
-                .query_row(
-                    "SELECT MIN(sample_time) FROM uptime_samples WHERE node_id = ?1",
-                    [node_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .flatten();
-
-            // Return the earliest of the two
-            match (from_nodes, from_samples) {
-                (Some(n), Some(s)) => Ok(Some(n.min(s))),
-                (Some(n), None) => Ok(Some(n)),
-                (None, Some(s)) => Ok(Some(s)),
-                (None, None) => Ok(None),
-            }
-        })
-    }
-
     /// Check if a node has elder status
     ///
     /// Elder status is granted to the first 101 registered nodes.
@@ -6874,36 +6243,6 @@ impl Database {
 // =============================================================================
 
 impl Database {
-    /// Get current L2 state (height and state root)
-    ///
-    /// Returns (height, state_root) or (0, [0u8; 32]) if not initialized.
-    pub fn get_l2_state(&self) -> GhostResult<(u64, [u8; 32])> {
-        self.with_connection(|conn| {
-            let result: Option<(i64, Vec<u8>)> = conn
-                .query_row(
-                    "SELECT height, state_root FROM l2_state WHERE id = 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            match result {
-                Some((height_i64, root_bytes)) => {
-                    // M-10 FIX: Use safe conversion
-                    let height = i64_to_u64(height_i64, "l2_height")
-                        .map_err(|e| GhostError::Database(e.to_string()))?;
-                    let mut state_root = [0u8; 32];
-                    if root_bytes.len() == 32 {
-                        state_root.copy_from_slice(&root_bytes);
-                    }
-                    Ok((height, state_root))
-                }
-                None => Ok((0, [0u8; 32])),
-            }
-        })
-    }
-
     /// Save block proposer record for L2 block tracking
     pub fn save_block_proposer(
         &self,
@@ -6920,94 +6259,6 @@ impl Database {
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
-        })
-    }
-
-    /// Save current L2 state
-    pub fn save_l2_state(&self, height: u64, state_root: [u8; 32]) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            let now = chrono::Utc::now().timestamp_millis();
-            conn.execute(
-                "INSERT OR REPLACE INTO l2_state (id, height, state_root, updated_at)
-                 VALUES (1, ?1, ?2, ?3)",
-                params![height as i64, state_root.as_slice(), now],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Save L2 state snapshot for reorg recovery
-    pub fn save_l2_snapshot(&self, height: u64, state_root: [u8; 32]) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            let now = chrono::Utc::now().timestamp_millis();
-            conn.execute(
-                "INSERT OR REPLACE INTO l2_snapshots (height, state_root, created_at)
-                 VALUES (?1, ?2, ?3)",
-                params![height as i64, state_root.as_slice(), now],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Get L2 snapshot at or before a given height (for reorg recovery)
-    pub fn get_l2_snapshot_at_or_before(
-        &self,
-        height: u64,
-    ) -> GhostResult<Option<(u64, [u8; 32])>> {
-        self.with_connection(|conn| {
-            let result: Option<(i64, Vec<u8>)> = conn
-                .query_row(
-                    "SELECT height, state_root FROM l2_snapshots
-                     WHERE height <= ?1 ORDER BY height DESC LIMIT 1",
-                    params![height as i64],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            match result {
-                Some((snap_height, root_bytes)) => {
-                    let mut state_root = [0u8; 32];
-                    if root_bytes.len() == 32 {
-                        state_root.copy_from_slice(&root_bytes);
-                    }
-                    // 4.19 SECURITY: Use safe conversion
-                    let height = i64_to_u64(snap_height, "snapshot_height")
-                        .map_err(|e| GhostError::Database(e.to_string()))?;
-                    Ok(Some((height, state_root)))
-                }
-                None => Ok(None),
-            }
-        })
-    }
-
-    /// Prune old L2 snapshots, keeping the most recent N
-    pub fn prune_l2_snapshots(&self, keep_count: usize) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            // First count how many we have
-            let total: i64 = conn
-                .query_row("SELECT COUNT(*) FROM l2_snapshots", [], |row| row.get(0))
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            if total <= keep_count as i64 {
-                return Ok(0);
-            }
-
-            // Delete oldest snapshots beyond keep_count
-            let delete_count = total - keep_count as i64;
-            conn.execute(
-                "DELETE FROM l2_snapshots WHERE height IN (
-                    SELECT height FROM l2_snapshots ORDER BY height ASC LIMIT ?1
-                )",
-                params![delete_count],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            // 4.19 SECURITY: Use safe conversion (defensive, should never fail given the guard above)
-            i64_to_u64(delete_count, "delete_count")
-                .map_err(|e| GhostError::Database(e.to_string()))
         })
     }
 }
@@ -7083,16 +6334,6 @@ pub struct MpcVerificationVote {
     pub approve: bool,
     pub signature: Vec<u8>,
     pub voted_at: u64,
-}
-
-/// MPC parameter file metadata
-#[derive(Debug, Clone)]
-pub struct MpcParamsFile {
-    pub params_hash: [u8; 32],
-    pub file_path: String,
-    pub size_bytes: u64,
-    pub contribution_count: u32,
-    pub created_at: u64,
 }
 
 impl Database {
@@ -7568,107 +6809,6 @@ impl Database {
         })
     }
 
-    /// Save MPC parameter file metadata
-    pub fn save_mpc_params_file(&self, params_file: &MpcParamsFile) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT INTO mpc_params_files (params_hash, file_path, size_bytes, contribution_count, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(params_hash) DO UPDATE SET
-                    file_path = excluded.file_path,
-                    size_bytes = excluded.size_bytes",
-                params![
-                    &params_file.params_hash[..],
-                    params_file.file_path,
-                    params_file.size_bytes as i64,
-                    params_file.contribution_count as i64,
-                    params_file.created_at as i64,
-                ],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Get MPC parameter file by hash
-    pub fn get_mpc_params_file(
-        &self,
-        params_hash: &[u8; 32],
-    ) -> GhostResult<Option<MpcParamsFile>> {
-        self.with_connection(|conn| {
-            let result: Option<(String, i64, i64, i64)> = conn
-                .query_row(
-                    "SELECT file_path, size_bytes, contribution_count, created_at
-                     FROM mpc_params_files WHERE params_hash = ?1",
-                    params![&params_hash[..]],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            match result {
-                Some((path, size, count, created)) => {
-                    // M-10 FIX: Use safe conversions
-                    Ok(Some(MpcParamsFile {
-                        params_hash: *params_hash,
-                        file_path: path,
-                        size_bytes: i64_to_u64(size, "mpc_size_bytes")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                        contribution_count: i64_to_u32_count(count, "mpc_contribution_count")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                        created_at: i64_to_u64(created, "mpc_created_at")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                    }))
-                }
-                None => Ok(None),
-            }
-        })
-    }
-
-    /// Get the latest MPC parameter file (highest contribution count)
-    pub fn get_latest_mpc_params_file(&self) -> GhostResult<Option<MpcParamsFile>> {
-        self.with_connection(|conn| {
-            let result: Option<(Vec<u8>, String, i64, i64, i64)> = conn
-                .query_row(
-                    "SELECT params_hash, file_path, size_bytes, contribution_count, created_at
-                     FROM mpc_params_files ORDER BY contribution_count DESC LIMIT 1",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            match result {
-                Some((hash_bytes, path, size, count, created)) => {
-                    let mut params_hash = [0u8; 32];
-                    if hash_bytes.len() == 32 {
-                        params_hash.copy_from_slice(&hash_bytes);
-                    }
-                    // M-10 FIX: Use safe conversions
-                    Ok(Some(MpcParamsFile {
-                        params_hash,
-                        file_path: path,
-                        size_bytes: i64_to_u64(size, "mpc_size_bytes")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                        contribution_count: i64_to_u32_count(count, "mpc_contribution_count")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                        created_at: i64_to_u64(created, "mpc_created_at")
-                            .map_err(|e| GhostError::Database(e.to_string()))?,
-                    }))
-                }
-                None => Ok(None),
-            }
-        })
-    }
-
     // =========================================================================
     // ELDER STATUS (MPC-BASED)
     // =========================================================================
@@ -7869,145 +7009,6 @@ pub struct InstantReservationRecord {
     pub expires_at: u64,
 }
 
-impl Database {
-    /// Save an instant payment reservation
-    ///
-    /// L-24 FIX: Persists reservations so they survive restarts
-    pub fn save_instant_reservation(
-        &self,
-        reservation: &InstantReservationRecord,
-    ) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO instant_payment_reservations
-                 (payment_id, lock_id, amount_sats, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    reservation.payment_id.as_slice(),
-                    reservation.lock_id,
-                    reservation.amount_sats as i64,
-                    reservation.created_at as i64,
-                    reservation.expires_at as i64,
-                ],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Get all active reservations for a lock
-    ///
-    /// L-24 FIX: Returns reservations that haven't expired yet
-    pub fn get_active_reservations_for_lock(
-        &self,
-        lock_id: &str,
-        current_time_millis: u64,
-    ) -> GhostResult<Vec<InstantReservationRecord>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT payment_id, lock_id, amount_sats, created_at, expires_at
-                     FROM instant_payment_reservations
-                     WHERE lock_id = ?1 AND expires_at > ?2",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let reservations = stmt
-                .query_map(params![lock_id, current_time_millis as i64], |row| {
-                    let payment_id_bytes: Vec<u8> = row.get(0)?;
-                    let mut payment_id = [0u8; 32];
-                    if payment_id_bytes.len() == 32 {
-                        payment_id.copy_from_slice(&payment_id_bytes);
-                    }
-                    Ok(InstantReservationRecord {
-                        payment_id,
-                        lock_id: row.get(1)?,
-                        amount_sats: i64_to_u64_sats(row.get::<_, i64>(2)?, "amount_sats")?,
-                        created_at: i64_to_u64(row.get::<_, i64>(3)?, "created_at")?,
-                        expires_at: i64_to_u64(row.get::<_, i64>(4)?, "expires_at")?,
-                    })
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            Ok(reservations)
-        })
-    }
-
-    /// Get total reserved amount for a lock
-    ///
-    /// L-24 FIX: Efficiently sums all active reservations
-    pub fn get_total_reserved_for_lock(
-        &self,
-        lock_id: &str,
-        current_time_millis: u64,
-    ) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let total: Option<i64> = conn
-                .query_row(
-                    "SELECT SUM(amount_sats) FROM instant_payment_reservations
-                     WHERE lock_id = ?1 AND expires_at > ?2",
-                    params![lock_id, current_time_millis as i64],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            match total {
-                Some(sats) => i64_to_u64_sats(sats, "total_reserved")
-                    .map_err(|e| GhostError::Database(e.to_string())),
-                None => Ok(0),
-            }
-        })
-    }
-
-    /// Delete a reservation (e.g., when settled or cancelled)
-    ///
-    /// L-24 FIX: Removes reservation after it's no longer needed
-    pub fn delete_instant_reservation(&self, payment_id: &[u8; 32]) -> GhostResult<bool> {
-        self.with_connection(|conn| {
-            let affected = conn
-                .execute(
-                    "DELETE FROM instant_payment_reservations WHERE payment_id = ?1",
-                    [payment_id.as_slice()],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(affected > 0)
-        })
-    }
-
-    /// Prune expired reservations
-    ///
-    /// L-24 FIX: Clean up expired reservations to prevent unbounded growth
-    pub fn prune_expired_reservations(&self, current_time_millis: u64) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let deleted = conn
-                .execute(
-                    "DELETE FROM instant_payment_reservations WHERE expires_at <= ?1",
-                    [current_time_millis as i64],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(deleted as u64)
-        })
-    }
-
-    /// Check if a reservation exists
-    ///
-    /// L-24 FIX: Quick check without loading full record
-    pub fn has_instant_reservation(&self, payment_id: &[u8; 32]) -> GhostResult<bool> {
-        self.with_connection(|conn| {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM instant_payment_reservations WHERE payment_id = ?1",
-                    [payment_id.as_slice()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count > 0)
-        })
-    }
-}
-
 // =============================================================================
 // L2 STATE QUERIES (GhostPay Verification)
 // =============================================================================
@@ -8026,101 +7027,6 @@ pub struct L2StateInfo {
 }
 
 impl Database {
-    /// Get the latest L2 state from block_proposers table
-    ///
-    /// Returns the most recent block proposer record which contains:
-    /// - L2 block height
-    /// - State root hash
-    /// - Timestamp
-    ///
-    /// Used by GhostPay verification to prove L2 capability.
-    pub fn get_latest_l2_state(&self) -> GhostResult<Option<L2StateInfo>> {
-        self.with_connection(|conn| {
-            let result = conn.query_row(
-                "SELECT height, state_root, timestamp FROM block_proposers
-                 ORDER BY height DESC LIMIT 1",
-                [],
-                |row| {
-                    let h: i64 = row.get(0)?;
-                    let state_root: String = row.get(1)?;
-                    let timestamp: i64 = row.get(2)?;
-                    Ok((h, state_root, timestamp))
-                },
-            );
-
-            match result {
-                Ok((h, state_root, timestamp)) => {
-                    // Validate height is non-negative
-                    if h < 0 {
-                        return Err(GhostError::Database(format!(
-                            "Invalid negative L2 height: {}",
-                            h
-                        )));
-                    }
-                    let height = h as u64;
-                    // Epoch = height / 2160 (L2 blocks per epoch)
-                    let epoch = height / 2160;
-                    Ok(Some(L2StateInfo {
-                        height,
-                        epoch,
-                        state_root,
-                        timestamp,
-                    }))
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(GhostError::Database(e.to_string())),
-            }
-        })
-    }
-
-    /// Get L2 state at a specific epoch
-    ///
-    /// Returns the block proposer record at the last block of the specified epoch.
-    /// Epoch N ends at block height ((N + 1) * 2160 - 1).
-    pub fn get_l2_state_at_epoch(&self, epoch: u64) -> GhostResult<Option<L2StateInfo>> {
-        // Find the highest block in this epoch
-        // Epoch N contains blocks [N * 2160, (N+1) * 2160 - 1]
-        let epoch_start = epoch.saturating_mul(2160);
-        let epoch_end = epoch
-            .saturating_add(1)
-            .saturating_mul(2160)
-            .saturating_sub(1);
-
-        self.with_connection(|conn| {
-            let result = conn.query_row(
-                "SELECT height, state_root, timestamp FROM block_proposers
-                 WHERE height >= ?1 AND height <= ?2
-                 ORDER BY height DESC LIMIT 1",
-                params![epoch_start as i64, epoch_end as i64],
-                |row| {
-                    let h: i64 = row.get(0)?;
-                    let state_root: String = row.get(1)?;
-                    let timestamp: i64 = row.get(2)?;
-                    Ok((h, state_root, timestamp))
-                },
-            );
-
-            match result {
-                Ok((h, state_root, timestamp)) => {
-                    if h < 0 {
-                        return Err(GhostError::Database(format!(
-                            "Invalid negative L2 height: {}",
-                            h
-                        )));
-                    }
-                    Ok(Some(L2StateInfo {
-                        height: h as u64,
-                        epoch,
-                        state_root,
-                        timestamp,
-                    }))
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(GhostError::Database(e.to_string())),
-            }
-        })
-    }
-
     // =========================================================================
     // PAYOUT PROPOSAL PERSISTENCE
     // =========================================================================
@@ -8211,25 +7117,6 @@ impl Database {
             Ok(result)
         })
     }
-
-    /// Clean up old unapproved proposals, keeping at most `keep_count`
-    ///
-    /// Prevents unbounded growth of the payout_proposals table.
-    /// Approved proposals are never deleted by this method.
-    pub fn cleanup_old_proposals(&self, keep_count: u32) -> GhostResult<usize> {
-        self.with_connection(|conn| {
-            let deleted = conn
-                .execute(
-                    "DELETE FROM payout_proposals WHERE is_approved = 0 AND rowid NOT IN (
-                        SELECT rowid FROM payout_proposals WHERE is_approved = 0
-                        ORDER BY created_at DESC LIMIT ?1
-                    )",
-                    params![keep_count],
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(deleted)
-        })
-    }
 }
 
 // =============================================================================
@@ -8238,9 +7125,6 @@ impl Database {
 
 /// Maximum proof size: Groth16 proofs are exactly 192 bytes
 pub const MAX_CONFIDENTIAL_PROOF_SIZE: usize = 192;
-
-/// Maximum commitment/nullifier size: 32 bytes (BLS12-381 scalar field element)
-pub const MAX_COMMITMENT_SIZE: usize = 32;
 
 /// Confidential note record for query results
 #[derive(Debug, Clone)]
@@ -8289,18 +7173,6 @@ impl Database {
                 "INSERT INTO confidential_notes (tree_index, commitment, owner_pubkey, created_at_height)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![index as i64, commitment.as_slice(), owner_pubkey.as_slice(), height as i64],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Mark a confidential note as spent at a given height
-    pub fn mark_note_spent(&self, index: u64, height: u64) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "UPDATE confidential_notes SET spent_at_height = ?1 WHERE tree_index = ?2",
-                params![height as i64, index as i64],
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
@@ -8403,28 +7275,6 @@ impl Database {
         })
     }
 
-    /// Get the next available tree index (one past the highest existing)
-    pub fn get_next_confidential_note_index(&self) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let result: Option<i64> = conn
-                .query_row(
-                    "SELECT MAX(tree_index) FROM confidential_notes",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?
-                .flatten();
-
-            match result {
-                Some(max_idx) => Ok(i64_to_u64_sats(max_idx, "max_tree_index")
-                    .map_err(|e| GhostError::Database(e.to_string()))?
-                    + 1),
-                None => Ok(0),
-            }
-        })
-    }
-
     // =========================================================================
     // NULLIFIERS
     // =========================================================================
@@ -8486,50 +7336,6 @@ impl Database {
         })
     }
 
-    /// Get count of nullifiers (for tree state reporting)
-    pub fn get_nullifier_count(&self) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM nullifiers", [], |row| row.get(0))
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count as u64)
-        })
-    }
-
-    /// Get nullifiers in a block height range (for settlement batch merkle root)
-    pub fn get_nullifiers_in_range(
-        &self,
-        start_height: u64,
-        end_height: u64,
-    ) -> GhostResult<Vec<[u8; 32]>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT nullifier FROM nullifiers
-                     WHERE block_height >= ?1 AND block_height <= ?2
-                     ORDER BY block_height ASC, created_at ASC",
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let rows = stmt
-                .query_map(params![start_height as i64, end_height as i64], |row| {
-                    let nullifier: Vec<u8> = row.get(0)?;
-                    Ok(nullifier)
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-
-            let mut nullifiers = Vec::new();
-            for row in rows {
-                let nullifier = row.map_err(|e| GhostError::Database(e.to_string()))?;
-                let nullifier: [u8; 32] = nullifier.try_into().map_err(|_| {
-                    GhostError::Database("Invalid nullifier size in DB".to_string())
-                })?;
-                nullifiers.push(nullifier);
-            }
-            Ok(nullifiers)
-        })
-    }
-
     // =========================================================================
     // CONFIDENTIAL TRANSFERS
     // =========================================================================
@@ -8572,30 +7378,6 @@ impl Database {
                     record.epoch as i64,
                 ],
             )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    /// Update confidential transfer status and optionally set block height
-    pub fn update_confidential_transfer_status(
-        &self,
-        transfer_id: &str,
-        status: &str,
-        block_height: Option<u64>,
-    ) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            match block_height {
-                Some(h) => conn.execute(
-                    "UPDATE confidential_transfers SET status = ?1, block_height = ?2
-                         WHERE transfer_id = ?3",
-                    params![status, h as i64, transfer_id],
-                ),
-                None => conn.execute(
-                    "UPDATE confidential_transfers SET status = ?1 WHERE transfer_id = ?2",
-                    params![status, transfer_id],
-                ),
-            }
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
         })
@@ -8701,18 +7483,6 @@ impl Database {
             Ok(transfers)
         })
     }
-
-    /// Get count of confidential notes (for tree state reporting)
-    pub fn get_confidential_note_count(&self) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM confidential_notes", [], |row| {
-                    row.get(0)
-                })
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count as u64)
-        })
-    }
 }
 
 // =============================================================================
@@ -8727,14 +7497,6 @@ pub struct L2NoteRecord {
     pub commitment: [u8; 32],
     pub block_height: u64,
     pub spent: bool,
-}
-
-/// L2 nullifier record (epoch-scoped double-spend prevention)
-#[derive(Debug, Clone)]
-pub struct L2NullifierRecord {
-    pub nullifier: [u8; 32],
-    pub epoch: u64,
-    pub block_height: u64,
 }
 
 /// L2 checkpoint block record
@@ -8931,20 +7693,6 @@ impl Database {
         })
     }
 
-    /// Get count of L2 notes for an epoch
-    pub fn get_l2_note_count(&self, epoch: u64) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM l2_notes WHERE epoch = ?1",
-                    params![epoch as i64],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count as u64)
-        })
-    }
-
     /// Delete L2 notes with note_index above a threshold for a given epoch.
     /// Used during phantom note pruning to remove notes not included in any checkpoint.
     pub fn delete_l2_notes_above_index(&self, epoch: u64, max_index: u64) -> GhostResult<usize> {
@@ -8995,20 +7743,6 @@ impl Database {
         })
     }
 
-    /// Check if an L2 nullifier has been spent in a given epoch
-    pub fn is_l2_nullifier_spent(&self, nullifier: &[u8; 32], epoch: u64) -> GhostResult<bool> {
-        self.with_connection(|conn| {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM l2_nullifiers WHERE nullifier = ?1 AND epoch = ?2",
-                    params![nullifier.as_slice(), epoch as i64],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count > 0)
-        })
-    }
-
     /// Load all L2 nullifiers for an epoch (for in-memory set reconstruction)
     pub fn load_l2_nullifiers_for_epoch(&self, epoch: u64) -> GhostResult<Vec<[u8; 32]>> {
         self.with_connection(|conn| {
@@ -9032,20 +7766,6 @@ impl Database {
                 nullifiers.push(nullifier);
             }
             Ok(nullifiers)
-        })
-    }
-
-    /// Get count of L2 nullifiers for an epoch
-    pub fn get_l2_nullifier_count(&self, epoch: u64) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM l2_nullifiers WHERE epoch = ?1",
-                    params![epoch as i64],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count as u64)
         })
     }
 
@@ -9314,28 +8034,6 @@ impl Database {
     // =========================================================================
     // L2 CHECKPOINTS
     // =========================================================================
-
-    /// Insert an L2 checkpoint block
-    pub fn insert_l2_checkpoint(&self, record: &L2CheckpointRecord) -> GhostResult<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT INTO l2_checkpoints
-                 (height, epoch, commitment_root, tx_count, proposer_id, active_node_count, block_data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    record.height as i64,
-                    record.epoch as i64,
-                    record.commitment_root.as_slice(),
-                    record.tx_count as i64,
-                    record.proposer_id,
-                    record.active_node_count as i64,
-                    record.block_data.as_slice(),
-                ],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
 
     /// Atomically persist checkpoint data: nullifiers + checkpoint record in a single transaction.
     ///
@@ -9952,20 +8650,6 @@ impl Database {
         })
     }
 
-    /// Check if a commitment root is valid (exists in recent valid roots)
-    pub fn is_l2_root_valid(&self, commitment_root: &[u8; 32]) -> GhostResult<bool> {
-        self.with_connection(|conn| {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM l2_valid_roots WHERE commitment_root = ?1",
-                    params![commitment_root.as_slice()],
-                    |row| row.get(0),
-                )
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(count > 0)
-        })
-    }
-
     /// Get all valid roots (for both epochs during transition window)
     pub fn get_l2_valid_roots(&self) -> GhostResult<Vec<L2ValidRootRecord>> {
         self.with_connection(|conn| {
@@ -10418,21 +9102,6 @@ impl Database {
                 epoch_fee_pool_sats: epoch_fee_pool,
                 unspent_notes,
             })
-        })
-    }
-
-    /// Get the accumulated fee total for an epoch.
-    pub fn get_epoch_fee_total(&self, epoch: u64) -> GhostResult<u64> {
-        self.with_connection(|conn| {
-            let result: Option<i64> = conn
-                .query_row(
-                    "SELECT fee_total_sats FROM l2_epoch_fees WHERE epoch = ?1",
-                    params![epoch as i64],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(result.unwrap_or(0) as u64)
         })
     }
 
@@ -11522,12 +10191,12 @@ mod tests {
             .expect("LOW-STOR-8: Failed to attempt second withdrawal request");
         assert!(result.is_none(), "Second withdrawal should be rejected");
 
-        // Verify only one withdrawal exists
-        let withdrawals = db
-            .get_withdrawals_by_lock("lock_atomic_test")
-            .expect("LOW-STOR-8: Failed to get withdrawals by lock");
-        assert_eq!(withdrawals.len(), 1);
-        assert_eq!(withdrawals[0].destination_address, "bc1qtest1");
+        // Verify the persisted withdrawal is the first one (dedup held)
+        let stored = db
+            .get_withdrawal_request(first_id)
+            .expect("LOW-STOR-8: Failed to get withdrawal by id")
+            .expect("LOW-STOR-8: First withdrawal should exist");
+        assert_eq!(stored.destination_address, "bc1qtest1");
     }
 
     #[test]
@@ -11583,9 +10252,14 @@ mod tests {
             .expect("LOW-STOR-8: Failed to insert first withdrawal");
         let first_id = result.expect("LOW-STOR-8: First withdrawal should return ID");
 
-        // Mark the first withdrawal as completed
-        db.update_withdrawal_status(first_id, WithdrawalStatus::Confirmed)
-            .expect("LOW-STOR-8: Failed to update withdrawal status");
+        // Move the first withdrawal through its lifecycle to a confirmed
+        // (non-active) state so it no longer blocks the lock.
+        db.update_withdrawal_batched(first_id, "batch_complete")
+            .expect("LOW-STOR-8: Failed to batch withdrawal");
+        db.update_withdrawal_submitted(first_id, "txid_complete")
+            .expect("LOW-STOR-8: Failed to submit withdrawal");
+        db.update_withdrawal_confirmed(first_id)
+            .expect("LOW-STOR-8: Failed to confirm withdrawal");
 
         // Now a second withdrawal should succeed (since the first is confirmed)
         let withdrawal2 = WithdrawalRequest {
@@ -11730,129 +10404,6 @@ mod tests {
     // =========================================================================
     // L-24 FIX TESTS: Instant Payment Reservation Persistence
     // =========================================================================
-
-    #[test]
-    fn test_instant_reservation_persistence() {
-        let db = Database::in_memory().expect("MED-STOR-2: Failed to create in-memory database");
-        let current_time = 1700000000000u64;
-
-        let reservation = InstantReservationRecord {
-            payment_id: [1u8; 32],
-            lock_id: "lock123".to_string(),
-            amount_sats: 50_000,
-            created_at: current_time,
-            expires_at: current_time + 30_000, // 30 seconds
-        };
-
-        // Save reservation
-        db.save_instant_reservation(&reservation)
-            .expect("LOW-STOR-8: Failed to save instant reservation");
-
-        // Verify it exists
-        assert!(db
-            .has_instant_reservation(&[1u8; 32])
-            .expect("LOW-STOR-8: Failed to check reservation existence"));
-
-        // Get active reservations
-        let active = db
-            .get_active_reservations_for_lock("lock123", current_time)
-            .expect("LOW-STOR-8: Failed to get active reservations");
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].amount_sats, 50_000);
-
-        // Get total reserved
-        let total = db
-            .get_total_reserved_for_lock("lock123", current_time)
-            .expect("LOW-STOR-8: Failed to get total reserved");
-        assert_eq!(total, 50_000);
-    }
-
-    #[test]
-    fn test_instant_reservation_expiry() {
-        let db = Database::in_memory().expect("MED-STOR-2: Failed to create in-memory database");
-        let start_time = 1700000000000u64;
-
-        let reservation = InstantReservationRecord {
-            payment_id: [2u8; 32],
-            lock_id: "lock456".to_string(),
-            amount_sats: 25_000,
-            created_at: start_time,
-            expires_at: start_time + 30_000,
-        };
-
-        db.save_instant_reservation(&reservation)
-            .expect("LOW-STOR-8: Failed to save instant reservation");
-
-        // Before expiry - should be active
-        let active = db
-            .get_active_reservations_for_lock("lock456", start_time + 15_000)
-            .expect("LOW-STOR-8: Failed to get active reservations before expiry");
-        assert_eq!(active.len(), 1);
-
-        // After expiry - should not be returned
-        let active = db
-            .get_active_reservations_for_lock("lock456", start_time + 31_000)
-            .expect("LOW-STOR-8: Failed to get active reservations after expiry");
-        assert_eq!(active.len(), 0);
-
-        // Prune expired
-        let pruned = db
-            .prune_expired_reservations(start_time + 31_000)
-            .expect("LOW-STOR-8: Failed to prune expired reservations");
-        assert_eq!(pruned, 1);
-
-        // Should no longer exist
-        assert!(!db
-            .has_instant_reservation(&[2u8; 32])
-            .expect("LOW-STOR-8: Failed to check reservation existence"));
-    }
-
-    #[test]
-    fn test_instant_reservation_multiple_locks() {
-        let db = Database::in_memory().expect("MED-STOR-2: Failed to create in-memory database");
-        let current_time = 1700000000000u64;
-
-        // Create reservations for different locks
-        for i in 0..3 {
-            let reservation = InstantReservationRecord {
-                payment_id: [i as u8; 32],
-                lock_id: format!("lock{}", i),
-                amount_sats: 10_000 * (i as u64 + 1),
-                created_at: current_time,
-                expires_at: current_time + 30_000,
-            };
-            db.save_instant_reservation(&reservation)
-                .expect("LOW-STOR-8: Failed to save instant reservation");
-        }
-
-        // Verify each lock has correct total
-        assert_eq!(
-            db.get_total_reserved_for_lock("lock0", current_time)
-                .expect("LOW-STOR-8: Failed to get reserved for lock0"),
-            10_000
-        );
-        assert_eq!(
-            db.get_total_reserved_for_lock("lock1", current_time)
-                .expect("LOW-STOR-8: Failed to get reserved for lock1"),
-            20_000
-        );
-        assert_eq!(
-            db.get_total_reserved_for_lock("lock2", current_time)
-                .expect("LOW-STOR-8: Failed to get reserved for lock2"),
-            30_000
-        );
-
-        // Delete one reservation
-        db.delete_instant_reservation(&[1u8; 32])
-            .expect("LOW-STOR-8: Failed to delete reservation");
-
-        // lock1 should now have 0 reserved
-        assert_eq!(
-            db.get_total_reserved_for_lock("lock1", current_time)
-                .expect("LOW-STOR-8: Failed to get reserved for lock1 after delete"),
-            0
-        );
-    }
 
     #[test]
     fn test_active_miner_count_excludes_gossiped_ledger_rows() {
@@ -12513,11 +11064,6 @@ mod tests {
         assert_eq!(notes[0].owner_pubkey, owner);
         assert_eq!(notes[0].created_at_height, 100);
         assert!(notes[0].spent_at_height.is_none());
-
-        // Mark spent
-        db.mark_note_spent(0, 200).expect("Failed to mark spent");
-        let notes = db.get_notes_for_owner(&owner).expect("Failed to get notes");
-        assert_eq!(notes[0].spent_at_height, Some(200));
     }
 
     #[test]
@@ -12538,11 +11084,6 @@ mod tests {
         assert_eq!(all.len(), 5);
         assert_eq!(all[0].0, 0);
         assert_eq!(all[4].0, 4);
-
-        let next = db
-            .get_next_confidential_note_index()
-            .expect("Failed to get next");
-        assert_eq!(next, 5);
     }
 
     #[test]
@@ -12566,7 +11107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nullifier_load_all_and_count() {
+    fn test_nullifier_load_all() {
         let db = Database::in_memory().expect("Failed to create in-memory database");
 
         for i in 0u8..3 {
@@ -12578,31 +11119,10 @@ mod tests {
 
         let all = db.load_all_nullifiers().expect("Failed to load all");
         assert_eq!(all.len(), 3);
-
-        let count = db.get_nullifier_count().expect("Failed to get count");
-        assert_eq!(count, 3);
     }
 
     #[test]
-    fn test_nullifiers_in_range() {
-        let db = Database::in_memory().expect("Failed to create in-memory database");
-
-        for i in 0u8..10 {
-            let mut nullifier = [0u8; 32];
-            nullifier[0] = i;
-            db.insert_nullifier(&nullifier, (i as u64) * 10, &format!("tx-{}", i))
-                .expect("Failed to insert nullifier");
-        }
-
-        // Get nullifiers in range [30, 60]
-        let range = db
-            .get_nullifiers_in_range(30, 60)
-            .expect("Failed to get range");
-        assert_eq!(range.len(), 4); // heights 30, 40, 50, 60
-    }
-
-    #[test]
-    fn test_confidential_transfer_insert_and_update() {
+    fn test_confidential_transfer_insert() {
         let db = Database::in_memory().expect("Failed to create in-memory database");
 
         let record = ConfidentialTransferRecord {
@@ -12624,16 +11144,6 @@ mod tests {
 
         db.insert_confidential_transfer(&record)
             .expect("Failed to insert transfer");
-
-        // Update status with height
-        db.update_confidential_transfer_status("ct-001", "confirmed", Some(500))
-            .expect("Failed to update status");
-
-        // Verify note count
-        let count = db
-            .get_confidential_note_count()
-            .expect("Failed to get count");
-        assert_eq!(count, 0); // No notes inserted directly, only transfer record
     }
 
     #[test]
@@ -12658,15 +11168,6 @@ mod tests {
         };
 
         assert!(db.insert_confidential_transfer(&record).is_err());
-    }
-
-    #[test]
-    fn test_next_index_empty_table() {
-        let db = Database::in_memory().expect("Failed to create in-memory database");
-        let next = db
-            .get_next_confidential_note_index()
-            .expect("Failed to get next");
-        assert_eq!(next, 0);
     }
 
     // =========================================================================

@@ -33,7 +33,7 @@ use crate::verdict::{AnalysisLocation, DeadCodeRegion, DeadCodeType};
 /// - P2SH redeemScript (last push containing opcodes — checked for dead code)
 ///
 /// Anything else exceeding `config.legacy_max_push_bytes` is flagged as data stuffing.
-pub fn analyze_legacy_scriptsig(
+pub(crate) fn analyze_legacy_scriptsig(
     script_sig_bytes: &[u8],
     input_index: usize,
     config: &ReaperConfig,

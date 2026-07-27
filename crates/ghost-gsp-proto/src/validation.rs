@@ -75,20 +75,6 @@ impl ValidationResult {
     pub fn add_warning(&mut self, warning: impl Into<String>) {
         self.warnings.push(warning.into());
     }
-
-    /// Check if there are any errors
-    pub fn has_errors(&self) -> bool {
-        !self.errors.is_empty()
-    }
-
-    /// Convert to Result
-    pub fn to_result(&self) -> Result<(), GspProtoError> {
-        if self.valid {
-            Ok(())
-        } else {
-            Err(GspProtoError::InvalidMessageFormat(self.errors.join("; ")))
-        }
-    }
 }
 
 /// Validate a raw message (before parsing)

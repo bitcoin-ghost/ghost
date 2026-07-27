@@ -57,7 +57,6 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use ghost_common::error::{GhostError, GhostResult};
-use zeroize::Zeroizing;
 
 /// Nonce size for ChaCha20-Poly1305 (12 bytes)
 const NONCE_SIZE: usize = 12;
@@ -172,57 +171,6 @@ pub fn is_likely_encrypted(value: &str) -> bool {
     could_be_encrypted(value)
 }
 
-/// Get encryption key from environment or return None.
-///
-/// For production, the key should be set via GHOST_ENCRYPTION_KEY environment variable.
-/// Returns None if not configured, allowing callers to decide how to handle.
-///
-/// LOW-STOR-7: Validates key has sufficient entropy before accepting.
-/// DB-2 FIX: Uses Zeroizing wrapper and clears environment variable after reading.
-pub fn get_encryption_key_from_env() -> Option<[u8; 32]> {
-    // DB-2 FIX: Use Zeroizing wrapper for the key string to ensure it's cleared from memory
-    let key_string: Option<Zeroizing<String>> = std::env::var("GHOST_ENCRYPTION_KEY")
-        .ok()
-        .map(Zeroizing::new);
-
-    let key_string = key_string?;
-
-    // DB-2 FIX: Clear the environment variable immediately after reading.
-    // This prevents the key from lingering in the process environment where
-    // it could be accessed via /proc/<pid>/environ or similar.
-    // Note: std::env::remove_var is safe here as we've already captured the value.
-    std::env::remove_var("GHOST_ENCRYPTION_KEY");
-    tracing::debug!("DB-2: Cleared GHOST_ENCRYPTION_KEY from environment after reading");
-
-    // Key should be 64 hex chars (32 bytes)
-    if key_string.len() != 64 {
-        tracing::warn!("GHOST_ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes)");
-        return None;
-    }
-
-    // DB-2 FIX: Use Zeroizing for the decoded bytes
-    let bytes: Zeroizing<Vec<u8>> = match hex::decode(key_string.as_str()) {
-        Ok(b) => Zeroizing::new(b),
-        Err(_) => return None,
-    };
-
-    let key_array: [u8; 32] = match bytes.as_slice().try_into() {
-        Ok(arr) => arr,
-        Err(_) => return None,
-    };
-
-    // LOW-STOR-7: Validate entropy - reject keys with insufficient randomness
-    if !has_sufficient_entropy(&key_array) {
-        tracing::error!(
-            "GHOST_ENCRYPTION_KEY rejected: insufficient entropy. \
-             Key must be cryptographically random (e.g., from `openssl rand -hex 32`)"
-        );
-        return None;
-    }
-
-    Some(key_array)
-}
-
 /// LOW-STOR-7: Check if a key has sufficient entropy
 ///
 /// Rejects keys that are clearly non-random:
@@ -244,6 +192,7 @@ pub fn get_encryption_key_from_env() -> Option<[u8; 32]> {
 /// A key that passes this check is NOT necessarily secure - it simply isn't
 /// obviously weak. Always use proper key generation, never derive keys from
 /// passwords without a proper KDF (Argon2, scrypt), and never reuse keys.
+#[cfg(test)]
 fn has_sufficient_entropy(key: &[u8; 32]) -> bool {
     // Reject all zeros
     if key.iter().all(|&b| b == 0) {

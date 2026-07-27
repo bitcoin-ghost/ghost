@@ -30,21 +30,14 @@ description = "L1 settlement and reconciliation for Ghost Pay"
 
 [dependencies]
 ghost-common = { workspace = true }
-ghost-consensus = { workspace = true }
-ghost-keys = { workspace = true }
-ghost-locks = { workspace = true }
-ghost-storage = { workspace = true }
 
 # Async
-tokio = { workspace = true }
-async-trait = { workspace = true }
 
 # Bitcoin
 bitcoin = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 # Utilities
 hex = { workspace = true }
@@ -59,7 +52,5 @@ getrandom = { workspace = true }
 secp256k1 = { version = "0.29", features = ["rand", "global-context"] }
 
 # H-4: Parallel batch verification
-futures = { workspace = true }
 
 # M-8: Scopeguard for cleanup on drop
-scopeguard = "1.2"

@@ -726,45 +726,6 @@ impl VerificationTask {
         })
     }
 
-    /// H-1 FIX: Create a verification task with cryptographic identity binding
-    ///
-    /// This constructor verifies that `our_node_id` matches the public key derived
-    /// from the provided `NodeIdentity`. This cryptographic binding prevents:
-    /// - Attackers from spoofing challenger IDs in DB writes
-    /// - Nodes from claiming verification results they didn't perform
-    ///
-    /// # Arguments
-    /// * `db` - Database for storing challenge results
-    /// * `identity` - Node's cryptographic identity (must derive to our_node_id)
-    /// * `peer_provider` - Provider for peers to verify
-    ///
-    /// # Errors
-    /// Returns `IdentityMismatch` if the identity's public key doesn't match our_node_id
-    pub fn new_with_identity(
-        db: Arc<Database>,
-        identity: &ghost_common::identity::NodeIdentity,
-        peer_provider: Arc<dyn PeerProvider>,
-    ) -> Result<Self, VerificationTaskError> {
-        let client = VerificationClient::new()
-            .map_err(|e| VerificationTaskError::ClientInit(e.to_string()))?;
-
-        // H-1: Derive node_id from identity and verify binding
-        let our_node_id = identity.node_id();
-
-        Ok(Self {
-            client,
-            db,
-            our_node_id,
-            identity_verified: true, // H-1: Cryptographically verified
-            peer_provider,
-            config: VerificationTaskConfig::default(),
-            broadcast_tx: None,
-            rpc: None,
-            policy: PolicyProfile::bitcoin_pure(),
-            challenge_tracker: std::sync::Mutex::new(ChallengeTracker::new()),
-        })
-    }
-
     /// Mainnet-correct constructor: HTTPS with identity-pinned TLS verification.
     ///
     /// This is the path you want when peers serve identity-derived certs (cert
@@ -832,33 +793,6 @@ impl VerificationTask {
         })
     }
 
-    /// H-1 FIX: Verify identity binding and enable DB writes
-    ///
-    /// Call this method to cryptographically verify that `our_node_id` matches
-    /// the provided identity. After successful verification, DB writes are allowed.
-    ///
-    /// # Errors
-    /// Returns error if the identity's node_id doesn't match our_node_id
-    pub fn with_verified_identity(
-        mut self,
-        identity: &ghost_common::identity::NodeIdentity,
-    ) -> Result<Self, VerificationTaskError> {
-        let derived_node_id = identity.node_id();
-        if derived_node_id != self.our_node_id {
-            return Err(VerificationTaskError::IdentityMismatch(format!(
-                "NodeId mismatch: expected {}, got {} from identity",
-                hex::encode(&self.our_node_id[..8]),
-                hex::encode(&derived_node_id[..8])
-            )));
-        }
-        self.identity_verified = true;
-        info!(
-            node_id = %hex::encode(&self.our_node_id[..8]),
-            "H-1: Identity verification successful - DB writes enabled"
-        );
-        Ok(self)
-    }
-
     /// Set the broadcast channel for verification results
     pub fn with_broadcast(mut self, tx: VerificationBroadcastSender) -> Self {
         self.broadcast_tx = Some(tx);
@@ -895,7 +829,7 @@ impl VerificationTask {
     fn require_identity_verified(&self) -> Result<(), String> {
         if !self.identity_verified {
             return Err("H-1: Cannot write to DB without verified identity. \
-                 Call with_verified_identity() or use new_with_identity() constructor."
+                 Construct via new_with_identity_pinned()."
                 .to_string());
         }
         Ok(())

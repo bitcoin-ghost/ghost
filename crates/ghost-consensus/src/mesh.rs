@@ -22,7 +22,8 @@
 
 //! P2P mesh network implementation
 //!
-//! Uses ZMQ for efficient message propagation across the node network.
+//! ZMQ PUB/SUB carries discovery and health pings; sensitive traffic (shares, blocks,
+//! votes, payouts) goes over point-to-point Noise-encrypted TCP (see below + `noise_pool`).
 //!
 //! ## Architecture
 //!
@@ -188,14 +189,6 @@ pub trait MessageHandler: Send + Sync {
     /// Handle a received message
     async fn handle_message(&self, envelope: Arc<MessageEnvelope>) -> GhostResult<()>;
 }
-
-/// Channel for outbound messages
-pub type OutboundSender = mpsc::Sender<(String, Vec<u8>)>;
-pub type OutboundReceiver = mpsc::Receiver<(String, Vec<u8>)>;
-
-/// Channel for inbound messages
-pub type InboundSender = mpsc::Sender<Vec<u8>>;
-pub type InboundReceiver = mpsc::Receiver<Vec<u8>>;
 
 /// Mesh network manager
 pub struct MeshNetwork {
@@ -2279,8 +2272,8 @@ impl MeshNetwork {
     /// reaches the peer's TCP stack but is never dispatched to a handler.
     ///
     /// This loop was previously hand-rolled in `bins/ghost-pool` and the
-    /// `MeshNetwork` owned no receive path of its own (the `NoiseReceiver` /
-    /// `NoiseMessageHandler` types were never wired in). Making it a first-class
+    /// `MeshNetwork` owned no receive path of its own (a `noise_receiver` module
+    /// existed but was never wired in — since removed). Making it a first-class
     /// `MeshNetwork` method keeps the send and receive sides symmetric and lets
     /// integration tests exercise the REAL dispatch path.
     ///
@@ -3105,18 +3098,6 @@ impl MeshNetwork {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Get mesh statistics
-    pub fn stats(&self) -> MeshStats {
-        MeshStats {
-            peer_entries: self.peers.peer_count(),
-            zmq_connections: self.peers.connected_count(),
-            elder_peers: self.peers.get_elder_peers().len(),
-            messages_sent: self.messages_sent.load(Ordering::Relaxed),
-            messages_received: self.messages_received.load(Ordering::Relaxed),
-            seen_message_count: self.seen_messages.read().len(),
-        }
-    }
-
     /// M-9: Map topic name to primary MessageType for pre-deserialization validation.
     /// Returns None for multi-type topics (elder, mpc) which need post-deser checking.
     fn primary_message_type_for_topic(topic: &str) -> Option<MessageType> {
@@ -3334,21 +3315,6 @@ impl MeshNetwork {
 
         Ok(())
     }
-}
-
-/// Mesh network statistics
-///
-/// Note: `peer_entries` and `zmq_connections` count ZMQ subscriber entries,
-/// not unique physical nodes. Each node may have multiple entries across
-/// different port groups (share, discovery, etc).
-#[derive(Debug, Clone, Default)]
-pub struct MeshStats {
-    pub peer_entries: usize,
-    pub zmq_connections: usize,
-    pub elder_peers: usize,
-    pub messages_sent: u64,
-    pub messages_received: u64,
-    pub seen_message_count: usize,
 }
 
 /// C-1: Result of an encrypted broadcast operation

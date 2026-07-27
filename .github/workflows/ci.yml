@@ -80,6 +80,21 @@ jobs:
       # L-01: Removed needless_borrows_for_generic_args and useless_vec allows
       - run: cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -W clippy::all -A clippy::derivable_impls -A clippy::clone_on_copy -A clippy::match_like_matches_macro -A clippy::manual_flatten -A clippy::redundant_slicing -A clippy::skip_while_next
 
+  # Unused-dependency gate: fails if a crate declares a dependency it does not use.
+  # Pairs with the per-crate `#![deny(unreachable_pub)]` ratchet — together they stop
+  # dead code and dead deps from silently accumulating (see tasks/dead_code_audit_*.md).
+  # Verified false-positives are marked `[package.metadata.cargo-machete] ignored` per crate.
+  deps:
+    name: Unused deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+      - name: Check for unused dependencies
+        run: cargo machete
+
   # Build and test
   test:
     name: Test (${{ matrix.os }})

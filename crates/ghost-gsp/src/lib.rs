@@ -59,6 +59,8 @@
 //! }
 //! ```
 
+#![deny(unreachable_pub)]
+
 pub mod api;
 pub mod auth;
 mod error;

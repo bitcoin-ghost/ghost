@@ -24,7 +24,7 @@
 //!
 //! This crate provides the consensus layer for Bitcoin Ghost:
 //!
-//! - **P2P Mesh**: ZMQ-based peer-to-peer network
+//! - **P2P Mesh**: ZMQ PUB/SUB for discovery/health, Noise-encrypted TCP for sensitive traffic
 //! - **Peer Discovery**: Gossip-based peer discovery
 //! - **Share Propagation**: Distribute shares across nodes
 //! - **Block Announcements**: Notify peers of block found events
@@ -32,7 +32,10 @@
 //! - **Payout Consensus**: Pre-consensus on coinbase before mining
 //! - **Health Monitoring**: Peer health pings and liveness
 //!
-//! Uses ZMQ PUB/SUB for efficient message propagation.
+//! Discovery and health pings use ZMQ PUB/SUB; sensitive messages (shares, blocks,
+//! votes, payouts) go over point-to-point Noise-encrypted TCP (see `mesh` / `noise_pool`).
+
+#![deny(unreachable_pub)]
 
 pub mod ban_manager;
 pub mod discovery_handler;
@@ -46,7 +49,6 @@ pub mod message_validator;
 pub mod noise;
 pub mod noise_fragment;
 pub mod noise_pool;
-pub mod noise_receiver;
 #[cfg(feature = "zk-consensus")]
 pub mod nullifier_route_handler;
 pub mod peer;
@@ -69,7 +71,6 @@ pub use message::*;
 pub use message_validator::*;
 pub use noise::*;
 pub use noise_pool::*;
-pub use noise_receiver::*;
 #[cfg(feature = "zk-consensus")]
 pub use nullifier_route_handler::*;
 pub use peer::*;

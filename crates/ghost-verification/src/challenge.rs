@@ -328,9 +328,6 @@ pub struct PolicyClassification {
 /// M-11: Minimum allowed stratum port (well-known ports reserved)
 pub const MIN_STRATUM_PORT: u16 = 1024;
 
-/// M-11: Maximum allowed stratum port
-pub const MAX_STRATUM_PORT: u16 = 65535;
-
 /// Stratum challenge request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StratumChallenge {
@@ -972,11 +969,6 @@ impl<T> VerificationRequest<T> {
             request,
             nonce: hex::encode(nonce_bytes),
         }
-    }
-
-    /// Create a verification request with a specific nonce
-    pub fn with_nonce(request: T, nonce: String) -> Self {
-        Self { request, nonce }
     }
 }
 

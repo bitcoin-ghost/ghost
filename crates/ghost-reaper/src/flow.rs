@@ -33,7 +33,7 @@ const MIN_DROP_DATA_SIZE: usize = 76;
 /// 1. Dead branches — constant-conditional IF/NOTIF with provably untaken paths
 /// 2. Dead push-drop pairs — large pushes immediately consumed by DROP/2DROP
 /// 3. Post-OP_RETURN code — unreachable bytes after top-level OP_RETURN
-pub fn analyze_script_flow(script: &[u8], input_index: usize) -> Vec<DeadCodeRegion> {
+pub(crate) fn analyze_script_flow(script: &[u8], input_index: usize) -> Vec<DeadCodeRegion> {
     let ops = parse_ops(script);
     let mut regions = Vec::new();
 

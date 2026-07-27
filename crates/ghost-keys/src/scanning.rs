@@ -36,7 +36,7 @@ use crate::GhostKeys;
 
 /// Transaction data for batch scanning: (ephemeral_pubkey, outputs)
 /// where outputs are (output_pubkey, optional_amount)
-pub type TransactionOutputs = (PublicKey, Vec<(PublicKey, Option<u64>)>);
+pub(crate) type TransactionOutputs = (PublicKey, Vec<(PublicKey, Option<u64>)>);
 
 // Re-export constants for convenience
 // (Users should prefer using ScanConfig directly)
@@ -45,14 +45,14 @@ pub type TransactionOutputs = (PublicKey, Vec<(PublicKey, Option<u64>)>);
 mod pubkey_hex {
     use super::*;
 
-    pub fn serialize<S>(data: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<S>(data: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(data))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
     where
         D: Deserializer<'de>,
     {

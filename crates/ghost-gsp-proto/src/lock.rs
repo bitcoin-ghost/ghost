@@ -56,11 +56,6 @@ pub enum GhostLockStatus {
 }
 
 impl GhostLockStatus {
-    /// Check if lock can accept funds
-    pub fn can_fund(&self) -> bool {
-        matches!(self, GhostLockStatus::Pending)
-    }
-
     /// Check if lock can be spent
     pub fn can_spend(&self) -> bool {
         matches!(self, GhostLockStatus::Active)

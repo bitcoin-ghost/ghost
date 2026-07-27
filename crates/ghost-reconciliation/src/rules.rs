@@ -164,14 +164,6 @@ impl BatchRules {
 
         false
     }
-
-    /// Calculate priority score for batch formation
-    pub fn batch_priority(&self, pending_count: usize, pending_total_sats: u64) -> f64 {
-        let count_factor = pending_count as f64 / self.max_settlements as f64;
-        let value_factor = pending_total_sats as f64 / self.force_batch_threshold_sats as f64;
-
-        (count_factor * 0.4 + value_factor * 0.6).min(1.0)
-    }
 }
 
 /// Dispute rules

@@ -557,12 +557,12 @@ pub struct WindowBestRecord {
 mod ghost_common_active_hashes {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &[[u8; 16]], s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(v: &[[u8; 16]], s: S) -> Result<S::Ok, S::Error> {
         let hex_strs: Vec<String> = v.iter().map(hex::encode).collect();
         serde::Serialize::serialize(&hex_strs, s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 16]>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 16]>, D::Error> {
         let hex_strs: Vec<String> = Vec::deserialize(d)?;
         let mut out = Vec::with_capacity(hex_strs.len());
         for s in hex_strs {

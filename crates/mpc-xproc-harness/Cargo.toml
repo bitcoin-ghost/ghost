@@ -36,10 +36,8 @@ ghost-policy = { path = "../ghost-policy" }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
-anyhow = { workspace = true }
 
 [dev-dependencies]
 # The driver test generates ONE shared genesis (like fleet node 1) then spawns

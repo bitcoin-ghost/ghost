@@ -31,7 +31,6 @@ k256.workspace = true
 sha2.workspace = true
 ripemd.workspace = true
 aes-gcm.workspace = true
-rand.workspace = true
 getrandom.workspace = true
 
 # Networking
@@ -39,9 +38,6 @@ reqwest.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
-
-# Time
-chrono.workspace = true
 
 # Concurrency
 parking_lot.workspace = true
@@ -66,7 +62,6 @@ hex.workspace = true
 
 # Error handling
 thiserror.workspace = true
-anyhow.workspace = true
 
 # Logging
 tracing.workspace = true

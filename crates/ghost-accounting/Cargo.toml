@@ -30,10 +30,5 @@ description = "Economics and payout calculations for Bitcoin Ghost"
 
 [dependencies]
 ghost-common = { workspace = true }
-ghost-storage = { workspace = true }
 bitcoin = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-hex = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }

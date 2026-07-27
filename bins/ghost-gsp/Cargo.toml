@@ -40,7 +40,6 @@ doc = false
 [dependencies]
 # Workspace crates
 ghost-gsp = { path = "../../crates/ghost-gsp" }
-ghost-gsp-proto = { path = "../../crates/ghost-gsp-proto" }
 ghost-common = { path = "../../crates/ghost-common" }
 
 # Async runtime
@@ -62,7 +61,6 @@ anyhow = "1.0"
 
 # Crypto/encoding
 getrandom = "0.2"
-hex = "0.4"
 
 # Bitcoin
 bitcoin = "0.32"

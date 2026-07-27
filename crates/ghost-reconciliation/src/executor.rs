@@ -52,7 +52,7 @@ use crate::error::ReconciliationError;
 use crate::rules::BatchRules;
 use crate::settlement::{Settlement, SettlementRequest};
 use crate::transaction::{ReconciliationTx, TxOutput};
-use crate::{DISPUTE_WINDOW_BLOCKS, MAX_BATCH_SIZE, MIN_BATCH_SIZE};
+use crate::{MAX_BATCH_SIZE, MIN_BATCH_SIZE};
 
 /// H-15: Minimum confirmations required before a UTXO can be used as input
 pub const MIN_INPUT_CONFIRMATIONS: u32 = 6;
@@ -271,12 +271,6 @@ impl BatchExecutor {
     /// H-FUND-3: Get reference to global reservations for external monitoring
     pub fn global_reservations(&self) -> &GlobalInputReservations {
         &self.global_reservations
-    }
-
-    /// Set batch rules
-    pub fn with_rules(mut self, rules: BatchRules) -> Self {
-        self.rules = rules;
-        self
     }
 
     /// Update current block height
@@ -851,71 +845,6 @@ impl BatchExecutor {
         if let Some(ref mut batch) = self.current_batch {
             if batch.id_hex() == batch_id {
                 batch.mark_confirmed(block_height)?;
-                return Ok(());
-            }
-        }
-        Err(ReconciliationError::BatchNotFound {
-            id: batch_id.to_string(),
-        })
-    }
-
-    /// Finalize batch after dispute window
-    ///
-    /// H-FUND-3: Releases all input reservations for this batch
-    pub fn finalize_batch(&mut self, batch_id: &str) -> Result<(), ReconciliationError> {
-        if let Some(ref mut batch) = self.current_batch {
-            if batch.id_hex() == batch_id {
-                // Check dispute window has passed
-                if let Some(confirm_height) = batch.l1_height() {
-                    let dispute_end = confirm_height + DISPUTE_WINDOW_BLOCKS;
-                    if self.current_height < dispute_end {
-                        return Err(ReconciliationError::DisputeWindowActive {
-                            ends_at: dispute_end as u64,
-                            current: self.current_height as u64,
-                        });
-                    }
-                }
-
-                batch.mark_finalized()?;
-
-                // H-FUND-3: Release all input reservations for this batch
-                let released = self.global_reservations.release_batch(batch_id);
-                tracing::info!(
-                    batch_id = batch_id,
-                    released_count = released,
-                    remaining = self.global_reservations.count(),
-                    "H-FUND-3: Batch finalized, input reservations released"
-                );
-
-                // Clear current batch
-                self.current_batch = None;
-                self.current_batch_settlements.clear();
-                return Ok(());
-            }
-        }
-        Err(ReconciliationError::BatchNotFound {
-            id: batch_id.to_string(),
-        })
-    }
-
-    /// Cancel a batch (e.g., on failure or rejection)
-    ///
-    /// H-FUND-3: Releases all input reservations for this batch
-    pub fn cancel_batch(&mut self, batch_id: &str) -> Result<(), ReconciliationError> {
-        if let Some(ref batch) = self.current_batch {
-            if batch.id_hex() == batch_id {
-                // H-FUND-3: Release all input reservations for this batch
-                let released = self.global_reservations.release_batch(batch_id);
-                tracing::warn!(
-                    batch_id = batch_id,
-                    released_count = released,
-                    remaining = self.global_reservations.count(),
-                    "H-FUND-3: Batch cancelled, input reservations released"
-                );
-
-                // Clear current batch
-                self.current_batch = None;
-                self.current_batch_settlements.clear();
                 return Ok(());
             }
         }

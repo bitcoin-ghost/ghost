@@ -553,21 +553,6 @@ fn validate_timestamps(
     Ok(())
 }
 
-/// Quick pre-validation before expensive signature verification
-pub fn quick_validate(proposal: &PayoutProposal) -> Result<(), PayoutValidationError> {
-    // Just check structure, not amounts
-    if proposal.miner_payouts.is_empty() {
-        return Err(PayoutValidationError::NoMinerPayouts);
-    }
-
-    let total_outputs = proposal.miner_payouts.len() + proposal.node_payouts.len();
-    if total_outputs > MAX_PAYOUT_OUTPUTS {
-        return Err(PayoutValidationError::TooManyOutputs(total_outputs));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

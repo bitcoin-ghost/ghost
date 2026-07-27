@@ -56,7 +56,6 @@ thiserror = { workspace = true }
 
 # Utilities
 chrono = { workspace = true }
-uuid = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

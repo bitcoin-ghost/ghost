@@ -75,6 +75,8 @@
 //! let witness_script = lock.witness_script();
 //! ```
 
+#![deny(unreachable_pub)]
+
 mod affordability;
 mod denomination;
 mod error;

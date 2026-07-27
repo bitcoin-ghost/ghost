@@ -55,8 +55,3 @@ colored = "2"
 
 # Error handling
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-
-# Utilities
-chrono = { workspace = true }
-hex = { workspace = true }

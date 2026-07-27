@@ -30,3 +30,9 @@ dirs = "6"
 reqwest.workspace = true
 secp256k1.workspace = true
 getrandom.workspace = true
+
+# Tauri desktop crate is excluded from the Rust workspace build (needs a JS
+# frontend), so these cannot be verified with `cargo build`. cargo-machete
+# flags them from static analysis alone; keep them pending a real frontend build.
+[package.metadata.cargo-machete]
+ignored = ["tokio", "tracing"]

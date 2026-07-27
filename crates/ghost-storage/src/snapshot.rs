@@ -90,68 +90,6 @@ pub struct BlockProposerRecord {
     pub timestamp: i64,
 }
 
-/// Epoch settlement record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochSettlementRecord {
-    /// Epoch ID
-    pub epoch_id: u64,
-    /// Primary settler node ID (hex)
-    pub settler_id: String,
-    /// Fallback settler node ID (hex)
-    pub fallback_settler_id: Option<String>,
-    /// Batch ID if settlement has started
-    pub batch_id: Option<String>,
-    /// Settlement status
-    pub status: EpochSettlementStatus,
-    /// Deadline timestamp for settlement
-    pub settlement_deadline: i64,
-    /// When settlement started
-    pub started_at: Option<i64>,
-    /// When settlement completed
-    pub completed_at: Option<i64>,
-    /// Failure reason if any
-    pub failure_reason: Option<String>,
-}
-
-/// Epoch settlement status
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EpochSettlementStatus {
-    /// Waiting for epoch end
-    Pending,
-    /// Settlement in progress
-    InProgress,
-    /// Settlement completed successfully
-    Completed,
-    /// Primary settler failed, fallback taking over
-    Fallback,
-    /// Settlement failed
-    Failed,
-}
-
-impl EpochSettlementStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-            Self::Fallback => "fallback",
-            Self::Failed => "failed",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "pending" => Some(Self::Pending),
-            "in_progress" => Some(Self::InProgress),
-            "completed" => Some(Self::Completed),
-            "fallback" => Some(Self::Fallback),
-            "failed" => Some(Self::Failed),
-            _ => None,
-        }
-    }
-}
-
 /// Manages state snapshots for ZK-BFT rollback
 pub struct SnapshotManager {
     db: Database,

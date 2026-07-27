@@ -217,23 +217,6 @@ impl VerificationClient {
         Ok(Self { client, config })
     }
 
-    /// Create an insecure client for testing only
-    ///
-    /// WARNING: This client uses HTTP without TLS, allowing MITM attacks.
-    /// Do not use in production.
-    ///
-    /// L-29: This method is only available when the `allow-insecure` feature is enabled.
-    /// In release builds without this feature, this method does not exist, making it
-    /// impossible to accidentally create an insecure client.
-    ///
-    /// # Errors
-    /// Returns an error if the HTTP client cannot be created
-    #[cfg(feature = "allow-insecure")]
-    pub fn new_insecure() -> GhostResult<Self> {
-        warn!("Creating INSECURE verification client - for testing only!");
-        Self::with_config(VerificationClientConfig::insecure_for_testing())
-    }
-
     /// Get the URL scheme based on configuration
     fn scheme(&self) -> &'static str {
         if self.config.use_https {
@@ -1145,7 +1128,7 @@ impl VerificationSuiteResult {
 
 // URL encoding helper
 mod urlencoding {
-    pub fn encode(s: &str) -> String {
+    pub(super) fn encode(s: &str) -> String {
         let mut result = String::new();
         for c in s.chars() {
             match c {

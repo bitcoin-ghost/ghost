@@ -7,7 +7,7 @@ use crate::verdict::{AnalysisLocation, DeadCodeRegion, DeadCodeType};
 /// - Unreachable code after OP_RETURN
 ///
 /// Returns byte-offset regions of detected dead code.
-pub fn detect_dead_code(
+pub(crate) fn detect_dead_code(
     script_bytes: &[u8],
     input_index: usize,
     config: &ReaperConfig,
