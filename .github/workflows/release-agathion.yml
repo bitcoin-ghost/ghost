@@ -145,10 +145,59 @@ jobs:
 
           ## Deploying as a service
 
-          On the production fleet the unit is historically named
-          `ghost-dashboard.service` and launches `node server.js` from the
-          install directory. Keep that name for compatibility; only the
-          user-facing product is "Agathion Node".
+          The unit is named `ghost-dashboard.service` for historical reasons —
+          keep that name for compatibility; only the user-facing product is
+          "Agathion Node". Install it at
+          `/etc/systemd/system/ghost-dashboard.service`, replacing
+          `WorkingDirectory` with wherever you unpacked this tarball:
+
+          ```ini
+          [Unit]
+          Description=Ghost Node Dashboard
+          After=ghost-node.service
+          Wants=ghost-node.service
+
+          [Service]
+          Type=simple
+          User=ghost
+          Group=ghost
+          WorkingDirectory=/home/ghost/agathion-node
+          ExecStart=/usr/bin/node server.js
+          Environment=NODE_ENV=production
+          Environment=PORT=3000
+          Environment=HOSTNAME=127.0.0.1
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          ```
+
+          `ExecStart` must be `node server.js`. Neither `npm start` nor
+          `next start` works here: this is a standalone build, so its minimal
+          `node_modules` has no `package.json` scripts for `npm start` to run,
+          and `next start` does not serve the authenticated WS relay.
+
+          Put `DASHBOARD_PASSWORD` and any other secrets in a root-only drop-in
+          rather than in the unit itself:
+
+          ```bash
+          sudo install -d -m 700 /etc/systemd/system/ghost-dashboard.service.d
+          sudo tee /etc/systemd/system/ghost-dashboard.service.d/override.conf >/dev/null <<'EOF'
+          [Service]
+          Environment=DASHBOARD_PASSWORD=your-password-here
+          EOF
+          sudo chmod 600 /etc/systemd/system/ghost-dashboard.service.d/override.conf
+          sudo systemctl daemon-reload && sudo systemctl enable --now ghost-dashboard
+          ```
+
+          After any redeploy, confirm the unit is running the tree you just
+          installed — a stale `WorkingDirectory` is the usual cause of
+          "I deployed but nothing changed":
+
+          ```bash
+          systemctl show -p WorkingDirectory --value ghost-dashboard
+          ```
           RUNEOF
 
           # Convenience launcher.

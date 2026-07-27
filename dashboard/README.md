@@ -180,13 +180,56 @@ const { data } = useRewards({ refetchInterval: 60_000 });
 
 ### Systemd Service
 
-The dashboard runs as a systemd service on Ghost nodes:
+This is the canonical unit — `/etc/systemd/system/ghost-dashboard.service`,
+matching what runs on the fleet:
+
+```ini
+[Unit]
+Description=Ghost Node Dashboard
+After=ghost-node.service
+Wants=ghost-node.service
+
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+WorkingDirectory=/home/ghost/agathion-node
+ExecStart=/usr/bin/node server.js
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Three details are load-bearing, and each has bitten us:
+
+- **`ExecStart=/usr/bin/node server.js`, never `npm start` or `next start`.**
+  The standalone build ships a minimal `node_modules` with no `package.json`
+  scripts, so `npm start` cannot run there at all, and `next start` does not
+  run the WS relay. See the deployment note above.
+- **`WorkingDirectory=/home/ghost/agathion-node`.** A stale value here is the
+  classic "I deployed but nothing changed" symptom — the unit runs an older
+  tree. Always confirm the *effective* value rather than trusting the unit
+  file, since drop-ins override it:
+  ```bash
+  systemctl show -p WorkingDirectory --value ghost-dashboard
+  ```
+- **`HOSTNAME=127.0.0.1`.** The dashboard must stay loopback-bound; it is
+  reached over an SSH tunnel. Auth does not depend on this (the JWT fails
+  closed regardless), but binding publicly removes a layer for no benefit.
+
+Secrets do **not** belong in this unit — keep them in a root-only drop-in at
+`/etc/systemd/system/ghost-dashboard.service.d/override.conf`, which is where
+`DASHBOARD_PASSWORD`, `DASHBOARD_TOKEN_TTL_SECS`, `INTERNAL_AUTH_KEY`,
+`GHOST_PAY_URL` and `GHOST_PAY_API_SECRET` live:
 
 ```ini
 [Service]
-ExecStart=/usr/bin/npm start
-WorkingDirectory=/home/ghost/ghost/ghost-node/dashboard
-User=ghost
+Environment=DASHBOARD_PASSWORD=<value>
 ```
 
 ### With ghost-node
