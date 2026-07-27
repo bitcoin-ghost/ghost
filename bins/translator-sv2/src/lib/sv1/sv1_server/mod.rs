@@ -154,13 +154,24 @@ pub(super) fn parse_suggest_difficulty(msg: &Message) -> Option<f64> {
 ///
 /// Public-pool convention is `<payout_address>.<worker_name>` (e.g.
 /// `bc1qabc...xyz.bitaxe1`). The address part is too long for the 32-byte TLV cap and would
-/// duplicate information already carried in the channel-level `user_identity` (which the
-/// translator config sources from the operator's wallet). The worker part — the bit that
-/// actually distinguishes one device from another behind the same wallet — is short and fits.
+/// duplicate information already carried in the channel-level `user_identity`, which
+/// `handle_open_channel_request` builds from `authorized_worker_name` — i.e. the miner's own
+/// full `<address>.<worker>` as sent to `mining.authorize`, not anything from operator config.
+/// The worker part — the bit that actually distinguishes one device from another behind the
+/// same wallet — is short and fits.
+///
+/// The pool recombines the two halves: `build_webhook_user_identity` takes the address from the
+/// channel identity and the worker from this TLV. So this function deliberately returns only the
+/// worker; the address is never expected to travel in the TLV.
 ///
 /// If the username has no `.` separator, the whole string is treated as the worker name and
 /// returned. The caller still passes the result through [`tlv_compatible_username`] to enforce
 /// the 32-byte ceiling for safety against pathological inputs.
+///
+/// HAZARD: a username with an empty final segment (`bc1qabc...xyz.`) yields `""`, which makes the
+/// caller omit the TLV entirely. Where the pool has the extension negotiated as *required* that
+/// share is marked unattributable and silently earns nothing, while the miner still receives
+/// `SubmitSharesSuccess`. `mining.authorize` does not currently reject that shape.
 pub(super) fn extract_worker_name(name: &str) -> &str {
     name.rsplit_once('.').map(|(_, w)| w).unwrap_or(name)
 }
@@ -333,6 +344,36 @@ mod username_difficulty_tests {
         let (name, _) = split_username_difficulty(&username);
         assert!(name.contains('.'));
         assert_eq!(extract_worker_name(name), "braiins");
+    }
+
+    /// Pins what the per-share TLV identity actually is on `main`: the WORKER SEGMENT ONLY.
+    ///
+    /// #447 briefly made the TLV carry the full `<address>.<worker>`; #456 reverted it. The
+    /// stale description outlived the code and #416 was filed against it, asserting this
+    /// function was dead and should be deleted — it is neither dead nor safe to delete. This
+    /// test exists so the next reader learns the contract from an assertion rather than a
+    /// comment: the address travels in the channel-level identity, the worker in the TLV, and
+    /// the pool recombines them.
+    #[test]
+    fn tlv_identity_is_the_worker_segment_only() {
+        let username = format!("{ADDR}.bitaxe1");
+        let identity = tlv_compatible_username(extract_worker_name(&username));
+        assert_eq!(identity, "bitaxe1");
+        assert!(
+            !identity.contains(ADDR),
+            "TLV must not carry the payout address; the channel identity does"
+        );
+    }
+
+    /// An empty final segment yields an empty identity, which makes the caller omit the TLV.
+    ///
+    /// Where the pool has extension 0x0002 negotiated as *required* — which the live fleet does
+    /// (`required_extensions = [0x0002]` in the installed translator config) — such a share is
+    /// marked unattributable and earns nothing, while the miner still gets `SubmitSharesSuccess`.
+    /// `mining.authorize` accepts this shape today because it only checks for a `.`.
+    #[test]
+    fn an_empty_worker_segment_yields_no_tlv_identity() {
+        assert_eq!(extract_worker_name(&format!("{ADDR}.")), "");
     }
 }
 

@@ -15,12 +15,16 @@ use alloc::{
 /// the `Str0255` limit used for identity strings elsewhere in SV2.
 ///
 /// This was 32, which fits a bare worker name but not a full `<address>.<worker>` — a bech32
-/// address is 42 bytes by itself. That mattered once the TLV became the authoritative source of
-/// a miner's payout address: `UserIdentity::new` returns `Err` past the cap and the caller
-/// discards it with `.ok()`, so an over-long identity did not truncate, it silently sent NO TLV
-/// at all, and the pool fell back to the channel's identity. For a channel opened before
-/// `mining.authorize` that identity is the translator's provisional config value, so shares
-/// were credited to the operator's configured address instead of the miner's.
+/// address is 42 bytes by itself. It was raised because `UserIdentity::new` returns `Err` past
+/// the cap and the caller discards that error with `.ok()`, so an over-long identity did not
+/// truncate — it silently sent NO TLV at all and the pool fell back to the channel identity.
+/// The cap staying generous is what keeps that failure mode out of reach.
+///
+/// NOTE: this is the *wire* ceiling for the extension, not what the translator actually sends.
+/// Since the revert of #447 the translator puts only the worker segment in the TLV, capped at 32
+/// bytes by its own `tlv_compatible_username`; the payout address travels in the channel-level
+/// identity and the pool recombines the two in `build_webhook_user_identity`. Do not read this
+/// constant as evidence that the TLV carries a payout address — on `main` it does not.
 pub const MAX_USER_IDENTITY_LENGTH: usize = 255;
 
 /// Extension type for Worker-Specific Hashrate Tracking
