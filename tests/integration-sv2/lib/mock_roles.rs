@@ -256,8 +256,38 @@ mod tests {
         mining_sv2::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
     };
 
+    /// Upper bound on any single test here.
+    ///
+    /// The queue reads have their own internal deadlines, but those are the thing most likely
+    /// to regress — #408 was exactly an unbounded read making its own timeout unreachable, and
+    /// it burned a CI run to the six-hour cap. `timeout-minutes: 45` in the workflow caps the
+    /// damage; this turns it into a test failure that names which test, which the job timeout
+    /// cannot do.
+    ///
+    /// Generous on purpose: these tests stand up real sockets and are slower under coverage
+    /// instrumentation, which is where the hang appeared. It is a backstop, not a performance
+    /// assertion.
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    async fn with_timeout<F: std::future::Future<Output = ()>>(name: &str, fut: F) {
+        if tokio::time::timeout(TEST_TIMEOUT, fut).await.is_err() {
+            panic!(
+                "{name} exceeded {}s — most likely an unbounded queue read; see #408",
+                TEST_TIMEOUT.as_secs()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_implicit_setup_connection() {
+        with_timeout(
+            "test_implicit_setup_connection",
+            test_implicit_setup_connection_body(),
+        )
+        .await;
+    }
+
+    async fn test_implicit_setup_connection_body() {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -301,6 +331,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_assert_message_not_present() {
+        with_timeout(
+            "test_assert_message_not_present",
+            test_assert_message_not_present_body(),
+        )
+        .await;
+    }
+
+    /// This is the test that hung for 5h38m under `cargo llvm-cov` in the v1.11.17 run.
+    /// It exercises all three queue-read paths — `wait_for_message_type`,
+    /// `has_message_type` and `assert_message_not_present` — which is why hardening only the
+    /// first one in #450 did not settle it.
+    async fn test_assert_message_not_present_body() {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -365,6 +407,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_setup_connection_wrong_protocol() {
+        with_timeout(
+            "test_setup_connection_wrong_protocol",
+            test_setup_connection_wrong_protocol_body(),
+        )
+        .await;
+    }
+
+    async fn test_setup_connection_wrong_protocol_body() {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()

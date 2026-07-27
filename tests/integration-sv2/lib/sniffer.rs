@@ -269,7 +269,32 @@ impl<'a> Sniffer<'a> {
         let start = std::time::Instant::now();
 
         while start.elapsed() < deadline {
-            if self.has_message_type(message_direction, message_type) {
+            // Same trap as `wait_for_message_type`, and for the same reason: the queue read
+            // takes a BLOCKING std::sync::Mutex, and `#[tokio::test]` is a current-thread
+            // runtime. Taking it inline here blocks the only executor thread, so neither the
+            // `start.elapsed()` check above nor tokio's timer can run — and `deadline` becomes
+            // unreachable rather than an upper bound.
+            //
+            // #450 hardened only `wait_for_message_type`. This path and
+            // `wait_for_message_type_and_clean_queue` kept the original shape, which is how
+            // `test_assert_message_not_present` — a test that exercises all three — could still
+            // hang for six hours instead of failing on its own deadline (#408).
+            //
+            // A read that does not answer within a second counts as "not present"; the loop
+            // re-checks its deadline and returns on schedule.
+            let agg = match message_direction {
+                MessageDirection::ToDownstream => self.messages_from_upstream.clone(),
+                MessageDirection::ToUpstream => self.messages_from_downstream.clone(),
+            };
+            let has_message_type = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || agg.has_message_type(message_type)),
+            )
+            .await
+            .map(|joined| joined.unwrap_or(false))
+            .unwrap_or(false);
+
+            if has_message_type {
                 return false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -287,14 +312,26 @@ impl<'a> Sniffer<'a> {
     ) -> bool {
         let now = std::time::Instant::now();
         loop {
-            let has_message_type = match message_direction {
-                MessageDirection::ToDownstream => self
-                    .messages_from_upstream
-                    .has_message_type_with_remove(message_type),
-                MessageDirection::ToUpstream => self
-                    .messages_from_downstream
-                    .has_message_type_with_remove(message_type),
+            // Blocking lock off the executor thread, plus a bound on the read itself, so the
+            // elapsed check below stays reachable. See the note in `wait_for_message_type`;
+            // this path had the same unbounded shape until #408.
+            //
+            // Note this read MUTATES — `has_message_type_with_remove` drains the queue up to
+            // and including the match. If the timeout fires, the read may still be running and
+            // may still remove messages. That is acceptable here because a timing-out read
+            // means the test is failing anyway, but it is the reason this cannot simply be
+            // retried in a tight loop.
+            let agg = match message_direction {
+                MessageDirection::ToDownstream => self.messages_from_upstream.clone(),
+                MessageDirection::ToUpstream => self.messages_from_downstream.clone(),
             };
+            let has_message_type = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || agg.has_message_type_with_remove(message_type)),
+            )
+            .await
+            .map(|joined| joined.unwrap_or(false))
+            .unwrap_or(false);
 
             // ready to unblock test runtime
             if has_message_type {
@@ -540,6 +577,95 @@ mod poll_loop_liveness_tests {
         let elapsed = started.elapsed();
 
         let joined = result.expect("wait_for_message_type never returned while the lock was held");
+        assert!(
+            joined.is_err(),
+            "expected the sniffer timeout to fire (it panics on timeout)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(LOCK_HELD_S - 2),
+            "gave up after {elapsed:?}, i.e. only once the lock was released after \
+             {LOCK_HELD_S}s — the read is still postponing the timeout"
+        );
+    }
+
+    /// Same guarantee for `assert_message_not_present`.
+    ///
+    /// #450 hardened only `wait_for_message_type`, leaving this path with the original
+    /// unbounded shape. `test_assert_message_not_present` exercises both, so the test could
+    /// still hang — which is why #408 stayed open after that fix.
+    ///
+    /// Unlike its sibling this returns a bool rather than panicking, so the assertion is that
+    /// it returns `true` (no message seen) on roughly its own deadline instead of waiting out
+    /// the lock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_lock_cannot_postpone_assert_message_not_present() {
+        const DEADLINE_S: u64 = 2;
+        const LOCK_HELD_S: u64 = 12;
+
+        let agg = MessagesAggregator::new();
+        let holder = agg.clone();
+        std::thread::spawn(move || {
+            holder
+                .messages_for_test()
+                .safe_lock(|_| std::thread::sleep(Duration::from_secs(LOCK_HELD_S)))
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let sniffer = Sniffer::for_timeout_test(agg, None);
+
+        let started = Instant::now();
+        let absent = sniffer
+            .assert_message_not_present(
+                MessageDirection::ToUpstream,
+                0x00,
+                Duration::from_secs(DEADLINE_S),
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            absent,
+            "no message was ever queued, so this must report the type as absent"
+        );
+        assert!(
+            elapsed < Duration::from_secs(LOCK_HELD_S - 2),
+            "returned after {elapsed:?}, i.e. only once the lock was released after \
+             {LOCK_HELD_S}s — the read is still postponing the deadline"
+        );
+    }
+
+    /// Same guarantee for `wait_for_message_type_and_clean_queue`, the third read path.
+    ///
+    /// Like `wait_for_message_type` it panics on timeout, so it runs in a task and the
+    /// `JoinError` is the signal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_lock_cannot_postpone_the_clean_queue_timeout() {
+        const SNIFFER_TIMEOUT_S: u64 = 2;
+        const LOCK_HELD_S: u64 = 12;
+
+        let agg = MessagesAggregator::new();
+        let holder = agg.clone();
+        std::thread::spawn(move || {
+            holder
+                .messages_for_test()
+                .safe_lock(|_| std::thread::sleep(Duration::from_secs(LOCK_HELD_S)))
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let sniffer = Sniffer::for_timeout_test(agg, Some(SNIFFER_TIMEOUT_S));
+
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            sniffer
+                .wait_for_message_type_and_clean_queue(MessageDirection::ToUpstream, 0x00)
+                .await;
+        });
+        let result = tokio::time::timeout(Duration::from_secs(LOCK_HELD_S + 6), handle).await;
+        let elapsed = started.elapsed();
+
+        let joined = result.expect("the clean-queue read never returned while the lock was held");
         assert!(
             joined.is_err(),
             "expected the sniffer timeout to fire (it panics on timeout)"

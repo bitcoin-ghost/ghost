@@ -94,7 +94,7 @@ fn assert_payout_percentage(payout_info: &PayoutInfo, expected_percentages: &[(S
             .addresses
             .iter()
             .position(|a| a == addr)
-            .expect(&format!("Address {} not found in coinbase", addr));
+            .unwrap_or_else(|| panic!("Address {} not found in coinbase", addr));
         let actual_pct = (payout_info.amounts[idx] as f64 / payout_info.total as f64) * 100.0;
         assert!(
             (actual_pct - expected_pct).abs() < 0.1,
