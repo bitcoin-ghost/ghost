@@ -166,14 +166,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
 
     // Public routes (no authentication required)
     let public_router = Router::new()
-        // WebSocket for real-time updates (AUTH4-M3: supports optional authentication)
-        .route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade, auth: Query<WsAuthQuery>| {
-                let ws_state = Arc::clone(&ws_state);
-                async move { ws_handler(ws, auth, State(ws_state)).await }
-            }),
-        )
+        // `/ws` used to be here. It is now in `localhost_router`: production wires
+        // `WsState::new()`, i.e. `require_auth: false`, so the socket was reachable from
+        // anywhere that could reach :8080 — which on a default install is the internet.
+        //
         // Health and node info
         .route("/health", get(health_handler))
         .route("/node-info", get(node_info_handler))
@@ -457,6 +453,18 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
     // SRI Pool runs on localhost and doesn't support HMAC auth headers.
     // These are protected by a localhost-only middleware instead.
     let localhost_router = Router::new()
+        // Live event stream. Loopback only: the dashboard reaches it through its own
+        // authenticated `/api/ws` relay, which dials `127.0.0.1:8080` server-side (see
+        // `dashboard/server.js` — `NEXT_PUBLIC_API_URL` defaults to loopback), so nothing
+        // legitimate connects to this from off-box. No mesh peer uses it either; the
+        // peer-to-peer surface is `/health`, `/verify/*` and `/api/v1/mpc/*`.
+        .route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade, auth: Query<WsAuthQuery>| {
+                let ws_state = Arc::clone(&ws_state);
+                async move { ws_handler(ws, auth, State(ws_state)).await }
+            }),
+        )
         .route("/api/internal/share", post(share_notification_handler))
         .route("/api/internal/shares", post(share_batch_handler))
         .route("/api/internal/pool-nodes", get(pool_nodes_handler))
@@ -13586,6 +13594,38 @@ mod tests {
                 endpoint
             );
         }
+    }
+
+    /// The live event socket must not be reachable from off-box.
+    ///
+    /// Production wires `WsState::new()`, i.e. `require_auth: false`, so anything that could
+    /// reach :8080 could subscribe — and on a default install `ufw allow 8080/tcp` makes that
+    /// the internet. It is now in the loopback-only tier, where the dashboard's authenticated
+    /// `/api/ws` relay still reaches it because that relay dials 127.0.0.1 server-side.
+    ///
+    /// A request with no `ConnectInfo` (which is what `oneshot` produces) is treated as
+    /// non-loopback and refused, so a 403 here is the gate working.
+    #[tokio::test]
+    async fn ws_is_not_reachable_from_off_box() {
+        let state = create_test_state_with_auth();
+        let app = super::create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ws")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "/ws must be loopback-only — it streams live node events with no authentication"
+        );
     }
 
     /// Read endpoints carrying payout identities must not be readable unauthenticated.

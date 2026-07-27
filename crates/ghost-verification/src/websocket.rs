@@ -135,11 +135,20 @@ impl WsEvent {
     ///
     /// Public events are safe to broadcast to anyone (no sensitive info).
     /// Sensitive events (shares, votes, wraith, peer details) require auth.
+    /// Events an UNAUTHENTICATED subscriber may receive.
+    ///
+    /// `BlockFound` was on this list and is not any more: it carries `miner_id`, the exact
+    /// value `redact_miner_id` and the M-11/M-13 work exist to keep off public responses.
+    /// Publishing it on a socket while redacting it on every REST route would have undone
+    /// that the first time a block was found.
+    ///
+    /// It was latent rather than live — nothing constructs `BlockFound` outside tests today,
+    /// so no such event has ever been broadcast. That is a property of current callers, not
+    /// of the allowlist, and it is the wrong thing to rely on.
     pub fn is_public(&self) -> bool {
         matches!(
             self,
             WsEvent::HealthUpdate { .. }
-                | WsEvent::BlockFound { .. }
                 | WsEvent::RoundStarted { .. }
                 | WsEvent::RoundEnded { .. }
                 | WsEvent::Error { .. }
@@ -895,12 +904,18 @@ mod tests {
             uptime_secs: 1,
         }
         .is_public());
-        assert!(WsEvent::BlockFound {
-            height: 1,
-            hash: "".to_string(),
-            miner_id: "".to_string(),
-        }
-        .is_public());
+        // BlockFound is NOT public: it carries `miner_id`. This assertion was the other way
+        // round, which is how the leak survived — the allowlist and its test agreed with each
+        // other and disagreed with `redact_miner_id` everywhere else.
+        assert!(
+            !WsEvent::BlockFound {
+                height: 1,
+                hash: "".to_string(),
+                miner_id: "".to_string(),
+            }
+            .is_public(),
+            "BlockFound carries miner_id and must not reach an unauthenticated subscriber"
+        );
         assert!(WsEvent::RoundStarted {
             round_id: 1,
             height: 1
