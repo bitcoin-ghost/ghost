@@ -44,6 +44,10 @@ echo "==> deploy-gate self-test"
 ./scripts/test-deploy-gate.sh \
     || { echo "FAILED: deploy-gate self-test" >&2; exit 1; }
 
+echo "==> fuzz targets build"
+./scripts/check-fuzz-targets.sh \
+    || { echo "FAILED: fuzz targets" >&2; exit 1; }
+
 echo "==> SV1 smoke self-test"
 python3 bins/translator-sv2/tests/sv1_handshake_smoke_selftest.py \
     || { echo "FAILED: SV1 smoke self-test" >&2; exit 1; }
