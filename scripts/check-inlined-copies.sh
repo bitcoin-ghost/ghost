@@ -31,6 +31,11 @@ PAIRS = {
     "GHOST_RESTART_WATCH_SH_EOF":      "scripts/ghost-restart-watch.sh",
     "GHOST_RESTART_WATCH_SERVICE_EOF": "scripts/systemd/ghost-restart-watch.service",
     "GHOST_RESTART_WATCH_TIMER_EOF":   "scripts/systemd/ghost-restart-watch.timer",
+    # Added after the two copies were found implementing DIFFERENT RULES (#488): the repo
+    # copy closed the Stratum ports on private_pool and keyed off `public_mining`, a config
+    # field that no longer exists. Running it on a private pool would have dropped every
+    # miner. It had also never gained the Wraith coordinator block the installer copy has.
+    "RECONCILE_MINING_FW_EOF":         "scripts/reconcile-mining-firewall.sh",
 }
 
 src = open(INSTALLER).read()
