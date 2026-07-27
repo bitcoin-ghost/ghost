@@ -139,6 +139,31 @@ test_endpoint() {
     sleep 0.5  # Stay under 5 req/s rate limit
 }
 
+# Endpoints that carry payout identities are served from the authenticated tier, so an
+# unsigned probe must be REFUSED. Asserting 401 checks the property that matters — the gate
+# is holding — without this script needing to hold the operator secret. A 200 here means the
+# route has fallen back onto the public tier and the payout ledger is world-readable again.
+test_endpoint_gated() {
+    local id="$1" name="$2" url="$3"
+    run_test "$id" "$name (must require auth)"
+    local http_code attempt
+    for attempt in 1 2 3; do
+        http_code=$(curl -s -o /dev/null --connect-timeout 5 --max-time 15 -w "%{http_code}" "$url" 2>/dev/null)
+        if [[ "$attempt" -lt 3 ]] && { [[ "$http_code" == "429" ]] || [[ "$http_code" == "000" ]]; }; then
+            sleep 3  # Back off and retry on rate limit or connection failure
+            continue
+        fi
+        break
+    done
+    case "$http_code" in
+        000) fail "Connection failed" ;;
+        401) pass ;;
+        200) fail "HTTP 200 — endpoint is PUBLIC but must require auth" ;;
+        *)   fail "HTTP $http_code — expected 401" ;;
+    esac
+    sleep 0.5  # Stay under 5 req/s rate limit
+}
+
 # Test endpoint that may return non-JSON (health, metrics)
 test_endpoint_raw() {
     local id="$1" name="$2" url="$3"
@@ -179,7 +204,7 @@ run_all_tests() {
     test_endpoint "1.3" "/api/v1/rewards/current"           "$pool/api/v1/rewards/current"
     test_endpoint "1.4" "/api/v1/mesh/status"               "$pool/api/v1/mesh/status"
     test_endpoint "1.5" "/api/v1/ghostpay/status"           "$pool/api/v1/ghostpay/status"
-    test_endpoint "1.6" "/api/v1/ghostpay/payout-history"   "$pool/api/v1/ghostpay/payout-history"
+    test_endpoint_gated "1.6" "/api/v1/ghostpay/payout-history"   "$pool/api/v1/ghostpay/payout-history"
 
     # ── Group 2: Mining (7 endpoints) ────────────────────────────────
 
@@ -190,7 +215,7 @@ run_all_tests() {
     test_endpoint "2.3" "/api/v1/mining/payout_address"     "$pool/api/v1/mining/payout_address"
     test_endpoint "2.4" "/api/v1/mining/private"            "$pool/api/v1/mining/private"
     test_endpoint "2.5" "/api/v1/mining/public"             "$pool/api/v1/mining/public"
-    test_endpoint "2.6" "/shares"                           "$pool/shares"
+    test_endpoint_gated "2.6" "/shares"                           "$pool/shares"
     test_endpoint "2.7" "/api/v1/node/shares"               "$pool/api/v1/node/shares"
 
     # ── Group 3: Network/Peers (6 endpoints) ─────────────────────────
@@ -202,13 +227,13 @@ run_all_tests() {
     test_endpoint "3.3" "/api/v1/network/pool"              "$pool/api/v1/network/pool"
     test_endpoint "3.4" "/api/v1/network/public-nodes"      "$pool/api/v1/network/public-nodes"
     test_endpoint "3.5" "/api/v1/network/treasury"          "$pool/api/v1/network/treasury"
-    test_endpoint "3.6" "/api/v1/network/payout-history"    "$pool/api/v1/network/payout-history"
+    test_endpoint_gated "3.6" "/api/v1/network/payout-history"    "$pool/api/v1/network/payout-history"
 
     # ── Group 4: Settings/Config (13 endpoints) ──────────────────────
 
     group_header 4 "Settings/Config" 13
 
-    test_endpoint "4.01" "/api/v1/config/full"              "$pool/api/v1/config/full"
+    test_endpoint_gated "4.01" "/api/v1/config/full"              "$pool/api/v1/config/full"
     test_endpoint "4.02" "/api/v1/config/archive_mode"      "$pool/api/v1/config/archive_mode"
     test_endpoint "4.03" "/api/v1/config/ghost_mode"        "$pool/api/v1/config/ghost_mode"
     test_endpoint "4.04" "/api/v1/config/mempool_profile"   "$pool/api/v1/config/mempool_profile"
@@ -267,7 +292,7 @@ run_all_tests() {
     group_header 10 "Locks/Payments" 2
 
     test_endpoint "10.1" "/api/v1/locks"                    "$pool/api/v1/locks"
-    test_endpoint "10.2" "/api/v1/payments"                 "$pool/api/v1/payments"
+    test_endpoint_gated "10.2" "/api/v1/payments"                 "$pool/api/v1/payments"
 
     # ── Group 11: Swarm (2 endpoints) ────────────────────────────────
 

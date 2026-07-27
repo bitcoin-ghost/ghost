@@ -179,9 +179,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/node-info", get(node_info_handler))
         // Informational endpoints
         .route("/peers", get(peers_handler))
-        .route("/shares", get(shares_handler))
-        .route("/rounds", get(rounds_handler))
-        .route("/payouts", get(payouts_handler))
+        // `/shares`, `/rounds` and `/payouts` used to sit here. They emit raw miner
+        // identities, payout addresses and txids, so they are now in `internal_router`.
         .route("/consensus-state", get(consensus_state_handler))
         // Verification challenges
         .route("/verify/archive", get(archive_handler))
@@ -320,7 +319,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/filtering/activity",
             get(api_filtering_activity_handler),
         )
-        .route("/api/v1/payments", get(api_payments_handler))
+        // `/api/v1/payments` moved to `internal_router` — it emits payout addresses and txids.
         .route("/api/v1/backup/history", get(api_backup_history_handler))
         .route("/api/v1/wraith/sessions", get(api_wraith_sessions_handler))
         .route("/api/v1/network/elder", get(api_network_elder_handler))
@@ -337,14 +336,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/mining/best-hash",
             get(api_mining_best_hash_handler),
         )
-        .route(
-            "/api/v1/network/payout-history",
-            get(api_payout_history_handler),
-        )
-        .route(
-            "/api/v1/ghostpay/payout-history",
-            get(api_ghostpay_payout_history_handler),
-        )
+        // `/api/v1/network/payout-history` and `/api/v1/ghostpay/payout-history` moved to
+        // `internal_router` — they emit recipient addresses, destinations and L1 txids.
         .route(
             "/api/v1/rewards/node-history",
             get(api_rewards_node_history_handler),
@@ -363,7 +356,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         // Config endpoints (GET only - reading is public, POST requires auth via internal router)
         // CRIT-6: POST handlers moved to internal_router to require authentication
-        .route("/api/v1/config/full", get(api_config_full_handler))
+        // `/api/v1/config/full` moved to `internal_router` — it carries `payout.address` and
+        // `payout.ghostpay_address`.
         .route(
             "/api/v1/config/archive_mode",
             get(api_config_archive_mode_handler),
@@ -378,7 +372,8 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         .route("/api/v1/config/reaper", get(api_config_reaper_handler))
         .route("/api/v1/config/daemon", get(api_config_daemon_handler))
-        .route("/api/v1/config/alerts", get(api_config_alerts_handler))
+        // `/api/v1/config/alerts` GET moved to `internal_router` alongside its POST — it carries
+        // notification destinations and webhook URLs, which routinely embed their own tokens.
         .route(
             "/api/v1/config/backup_schedule",
             get(api_config_backup_schedule_handler),
@@ -485,6 +480,32 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
     // Internal/admin endpoints with HMAC authentication (AUTH4-1 fix)
     // CRIT-6: All config POST endpoints moved here to require authentication
     let internal_router = Router::new()
+        // Read endpoints carrying payout identities, moved off the public tier.
+        //
+        // These were served unauthenticated on the same listener as the mesh protocol, so the
+        // pool's recent payout ledger — miner ids, raw payout addresses and L1 txids — was
+        // readable by anyone who could reach the port, which on a default install is the whole
+        // internet (`scripts/install-node.sh` opens 8080/tcp, and the node binds 0.0.0.0).
+        // Publishing raw addresses here also nullified `redact_miner_id`, since a pseudonymous
+        // miner id in one response could be resolved against a real address in another.
+        //
+        // The dashboard is unaffected: its proxy signs GET requests as well as mutations
+        // (`dashboard/src/app/api/proxy/[...path]/route.ts`). None of these is on the
+        // peer-to-peer path, so mesh verification, discovery and gossip are untouched.
+        .route("/shares", get(shares_handler))
+        .route("/rounds", get(rounds_handler))
+        .route("/payouts", get(payouts_handler))
+        .route("/api/v1/payments", get(api_payments_handler))
+        .route(
+            "/api/v1/network/payout-history",
+            get(api_payout_history_handler),
+        )
+        .route(
+            "/api/v1/ghostpay/payout-history",
+            get(api_ghostpay_payout_history_handler),
+        )
+        .route("/api/v1/config/full", get(api_config_full_handler))
+        .route("/api/v1/config/alerts", get(api_config_alerts_handler))
         // Admin endpoints for testing
         .route("/admin/test-consensus", post(admin_test_consensus_handler))
         // Internal API for dashboard config updates (triggers graceful restart)
@@ -12908,14 +12929,20 @@ mod tests {
                 PolicyProfile::default(),
                 NodeCapabilities::default(),
             )
-            .with_full_node_config(cfg, path.clone()),
+            .with_full_node_config(cfg, path.clone())
+            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
 
+        // `/api/v1/config/full` carries the operator's payout addresses, so it is served from
+        // the authenticated tier. Sign the read the way the dashboard proxy does.
+        let (signature, timestamp) = operator_get_signature();
         let response = super::create_router(Arc::clone(&state))
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri("/api/v1/config/full")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -12968,14 +12995,21 @@ mod tests {
                 PolicyProfile::default(),
                 NodeCapabilities::default(),
             )
-            .with_full_node_config(cfg, path.clone()),
+            .with_full_node_config(cfg, path.clone())
+            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
 
+        // This test asserts the response carries `node_payout_address` and the Ghost Pay
+        // payout address — which is precisely why the route is no longer public. Sign the
+        // read the way the dashboard proxy does.
+        let (signature, timestamp) = operator_get_signature();
         let response = super::create_router(Arc::clone(&state))
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri("/api/v1/config/full")
+                    .header("X-Ghost-Signature", signature)
+                    .header("X-Ghost-Timestamp", timestamp.to_string())
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -13541,6 +13575,82 @@ mod tests {
                 response.status(),
                 StatusCode::UNAUTHORIZED,
                 "CRIT-6: {} POST without auth must return 401",
+                endpoint
+            );
+        }
+    }
+
+    /// Read endpoints carrying payout identities must not be readable unauthenticated.
+    ///
+    /// These were public. Anyone able to reach `:8080` — the whole internet on a default
+    /// install — could pull the pool's recent payout ledger with raw addresses and txids,
+    /// which also defeated `redact_miner_id` elsewhere by making pseudonymous ids resolvable.
+    #[tokio::test]
+    async fn test_payout_identity_get_endpoints_require_auth() {
+        let state = create_test_state_with_auth();
+
+        let locked_endpoints = [
+            "/shares",
+            "/rounds",
+            "/payouts",
+            "/api/v1/payments",
+            "/api/v1/network/payout-history",
+            "/api/v1/ghostpay/payout-history",
+            "/api/v1/config/full",
+            "/api/v1/config/alerts",
+        ];
+
+        for endpoint in locked_endpoints {
+            let app = super::create_router(Arc::clone(&state));
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} GET without auth must return 401 — it carries payout identities",
+                endpoint
+            );
+        }
+    }
+
+    /// The same endpoints must still answer a correctly signed GET, because that is exactly
+    /// what the dashboard proxy sends: it signs reads as well as mutations, over an empty body.
+    /// If this regresses, every dashboard payouts/treasury/settings page breaks at once.
+    #[tokio::test]
+    async fn test_payout_identity_get_endpoints_accept_operator_signature() {
+        let state = create_test_state_with_auth();
+
+        for endpoint in ["/payouts", "/api/v1/config/full"] {
+            let app = super::create_router(Arc::clone(&state));
+            let (signature, timestamp) = operator_get_signature();
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(endpoint)
+                        .header("X-Ghost-Signature", signature)
+                        .header("X-Ghost-Timestamp", timestamp.to_string())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} must accept the operator GET signature the dashboard proxy sends",
                 endpoint
             );
         }
