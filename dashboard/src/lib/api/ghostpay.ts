@@ -23,6 +23,32 @@ function getGhostPayProxyBase(): string {
   return 'http://localhost:3000';
 }
 
+/// Error that preserves the backend's response body.
+///
+/// ghost-pay answers failures with a structured payload (`reason`, `remedy`), not an
+/// `error` string. Collapsing that to `API error: <status>` threw the useful half away and
+/// left the UI showing a bare status code — which is what #404 was reporting.
+export class GhostPayApiError extends Error {
+  readonly status: number;
+  readonly body: Record<string, unknown>;
+
+  constructor(status: number, body: Record<string, unknown>) {
+    const detail =
+      (typeof body.reason === 'string' && body.reason) ||
+      (typeof body.error === 'string' && body.error) ||
+      `API error: ${status}`;
+    super(detail);
+    this.name = 'GhostPayApiError';
+    this.status = status;
+    this.body = body;
+  }
+
+  /// The operator-facing next step, when the backend supplied one.
+  get remedy(): string | null {
+    return typeof this.body.remedy === 'string' ? this.body.remedy : null;
+  }
+}
+
 async function fetchGhostPay<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const proxyUrl = `${getGhostPayProxyBase()}/api/ghostpay-proxy${endpoint}`;
 
@@ -35,20 +61,43 @@ async function fetchGhostPay<T>(endpoint: string, options?: RequestInit): Promis
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(err.error || `API error: ${response.status}`);
+    const body = await response.json().catch(() => ({}));
+    throw new GhostPayApiError(response.status, body as Record<string, unknown>);
   }
 
   return response.json();
 }
 
 // Node Ghost ID (the node's single derived L2 receive address).
+//
+// `generated: false` is a legitimate state, not a failure: a node that has never had a
+// keypair created answers 404 with that body. It is surfaced as data so the wizard can offer
+// to generate one, rather than as an exception the UI can only render as red text.
 export interface GhostIdResponse {
-  ghost_id: string;
+  generated: boolean;
+  ghost_id: string | null;
+  scan_pubkey?: string;
+  spend_pubkey?: string;
+  identity_kind?: string;
+  reason?: string;
+  remedy?: string;
 }
 
 export async function getGhostId(): Promise<GhostIdResponse> {
-  return fetchGhostPay<GhostIdResponse>('/api/v1/keys/ghost-id');
+  try {
+    return await fetchGhostPay<GhostIdResponse>('/api/v1/keys/ghost-id');
+  } catch (err) {
+    // Only the specific "no keypair yet" 404 is a state; anything else is a real error.
+    if (err instanceof GhostPayApiError && err.status === 404 && err.body.generated === false) {
+      return err.body as unknown as GhostIdResponse;
+    }
+    throw err;
+  }
+}
+
+/// Create the node's ghost-pay keypair. Mutating, so the proxy HMAC-signs it.
+export async function generateGhostKeys(): Promise<GhostIdResponse> {
+  return fetchGhostPay<GhostIdResponse>('/api/v1/keys/generate', { method: 'POST' });
 }
 
 // Ghost Pay Status
