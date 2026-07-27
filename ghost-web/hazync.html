@@ -207,17 +207,17 @@
   <section class="hz-hero"><div class="container hz-hero-grid">
     <div>
       <span class="hz-status" id="hz-status">Chain-state proof · connecting…</span>
-      <h1>Prove the whole chain is valid. Verify <span class="a">one small proof.</span></h1>
+      <h1>Bitcoin consensus, proven with Core's own code. Verify <span class="a">one small proof.</span></h1>
       <p class="hz-lead" style="margin-top:22px">Hazync runs Bitcoin Core's own unmodified consensus code inside a zero-knowledge VM, script by script, signature by signature, and folds it into a single succinct proof. Not a reimplementation. The exact code the network already trusts.</p>
       <div class="hz-actions">
-        <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.5.2">Get the release <span class="arrow">→</span></a>
+        <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.10.0">Get the release <span class="arrow">→</span></a>
         <a class="btn btn-ghost" href="#run">Run it <span class="arrow">→</span></a>
       </div>
     </div>
     <aside class="hz-panel" aria-label="Chain-state proof result">
       <div class="h"><span id="hz-pn-head">Chain-state proof</span><span class="hz-verdict no" id="hz-pn-verdict">LIVE</span></div>
       <dl>
-        <div class="row"><dt>Blocks proven</dt><dd id="hz-pn-height">, </dd></div>
+        <div class="row"><dt>Proven &amp; chained</dt><dd id="hz-pn-height">, </dd></div>
         <div class="row"><dt>Tip hash</dt><dd class="hash" id="hz-pn-tip">, </dd></div>
         <div class="row"><dt>Cumulative work</dt><dd id="hz-pn-work">, </dd></div>
         <div class="row"><dt>UTXO leaves</dt><dd id="hz-pn-leaves">, </dd></div>
@@ -278,7 +278,7 @@
     <h2 class="hz-h2">Claim a block. Prove it. Put your name on Bitcoin’s history.</h2>
     <p class="hz-lead">Every proof is verified by the coordinator, nobody can fake it, chained onto the genesis-anchored frontier, and credited to you on an open, signed ledger. Take a single block or a range, prove it on your GPU, and submit.</p>
     <div class="pp">
-<div class="preview-bar" id="preview-bar"><div class="wrap"><span class="dot"></span><span>Preview · sample data. The live proof party begins once the prover network is running, this is a look at how it works: claim a range, prove it on your GPU, and put your name on Bitcoin's history.</span></div></div>
+<div class="preview-bar" id="preview-bar"><div class="wrap"><span class="dot"></span><span>Board temporarily unavailable — reconnecting to the coordinator. Numbers will reappear once it responds.</span></div></div>
   <div class="metrics" id="metrics"></div>
   <div class="progress"><div class="pt"><span>Proof frontier</span><span id="pct">, </span></div><div class="track"><div class="fill" id="fill" style="width:0"></div></div><div class="frontier"><span>◂ genesis · 0</span><span id="frontier">, </span><span id="tip">tip</span></div></div>
   <div class="timeline"><div class="tl-head"><span>Timeline · genesis → tip</span><span id="tl-count">, </span></div>
@@ -370,9 +370,9 @@
 
   <!-- AUDIT -->
   <section class="hz-sec" id="audit"><div class="container">
-    <p class="hz-eyebrow">Self-audited, adversarially, seven rounds</p>
+    <p class="hz-eyebrow">Self-audited, adversarially, eight rounds</p>
     <h2 class="hz-h2">Every finding fixed, validated, and negative-tested.</h2>
-    <p class="hz-lead">Seven rounds of hostile self-review, each one attacking the fixes from the round before, until a round turned up nothing. The serious ones assumed a prover who can mine: downgrading a block's height to switch every soft-fork off and mint a 50 BTC subsidy, and inflating the fee on a multi-input transaction toward 21M BTC. Both are closed, alongside the segmented-proof binding, the recursion image-id, and the coordinator's cross-range seam. Every fix ships with a negative test that rejects the bad case, and a replayable suite runs them all. The full list, round by round, is in SECURITY.md.</p>
+    <p class="hz-lead">Eight rounds of hostile self-review, each one attacking the fixes from the round before, until a round turned up nothing. The serious ones assumed a prover who can mine: downgrading a block's height to switch every soft-fork off and mint a 50 BTC subsidy, and inflating the fee on a multi-input transaction toward 21M BTC. Both are closed, alongside the segmented-proof binding, the recursion image-id, and the coordinator's cross-range seam. Every fix ships with a negative test that rejects the bad case, and a replayable suite runs them all. The full list, round by round, is in SECURITY.md.</p>
     <div class="hz-mal" aria-label="Merkle mutation negative test">
       <div class="r"><span class="l">honest [A,B,C]</span><span class="hsh">cacd895c…a0f3f5e6</span><span class="hz-verdict">merkle_ok</span></div>
       <div class="r"><span class="l">malleated [A,B,C,C]</span><span class="hsh">cacd895c…a0f3f5e6</span><span class="hz-verdict no">REJECTED · mutated</span></div>
@@ -393,9 +393,14 @@
 
 <span class="c"># 2 · download a proof by block number and verify it</span>
 <span class="p">$</span> curl https://bitcoinghost.org/hazync/api/proof/1 -o proof.bin
-<span class="p">$</span> ./host verify-any proof.bin        <span class="c"># → RANGE-OK</span></pre>
+<span class="p">$</span> ./host verify-any proof.bin        <span class="c"># → RANGE-OK</span>
+
+<span class="c"># 3 · confirm the binary IS the canonical guest — the id you're verifying against</span>
+<span class="c">#     (reproducible byte-for-byte via reproduce/Dockerfile)</span>
+<span class="p">$</span> ./host method-id
+3f52baff7e7d4adaa328b832d6f15fffb1b35968b6636760f9d50e045bbae67e</pre>
     </div>
-    <p class="hz-lead" style="font-size:14.5px;margin-top:16px"><strong>Want to prove blocks?</strong> Grab the CUDA prover binary (NVIDIA GPU + CUDA 12.6) and join the <a class="hz-inline-a" href="/hazync-party.html">Proof Party</a>; full steps in <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">CONTRIBUTING</a>. Building from source or reproducing the image id is in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository</a>; the tagged release is <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.5.2">v0.5.2</a>.</p>
+    <p class="hz-lead" style="font-size:14.5px;margin-top:16px"><strong>Want to prove blocks?</strong> Grab the CUDA prover binary (NVIDIA GPU + CUDA 12.6) and join the <a class="hz-inline-a" href="/hazync-party.html">Proof Party</a>; full steps in <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">CONTRIBUTING</a>. Building from source or reproducing the image id is in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository</a>; the tagged release is <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.10.0">v0.10.0</a>.</p>
   </div></section>
 
   <!-- WHO ELSE CAN USE IT -->
@@ -478,7 +483,7 @@
       <h4>Hazync</h4>
       <ul>
         <li><a href="https://github.com/bitcoin-ghost/hazync">GitHub</a></li>
-        <li><a href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.5.2">v0.5.2 release</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.10.0">v0.10.0 release</a></li>
         <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SOUNDNESS.md">Soundness</a></li>
         <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SECURITY.md">Security</a></li>
       </ul>
@@ -613,44 +618,21 @@
   // API base: same-origin by default; set window.HAZYNC_API to point at the coordinator when it's live.
   var API=(typeof window!=='undefined'&&window.HAZYNC_API!=null)?window.HAZYNC_API:'/hazync';
   function showBanner(on){var b=$('preview-bar');if(b)b.classList.toggle('show',!!on);}
-  function sampleData(){
-    var now=Math.floor(Date.now()/1000);
-    var per=new Array(240).fill(0);
-    per[0]=3;                 // genesis frontier (proven & chained)
-    per[1]=2;per[5]=2;        // out-of-order ranges already verified
-    per[2]=1;per[8]=1;        // ranges being proved right now (pick-any-block)
+  // Board temporarily unreachable: render an honest EMPTY state (no fabricated participants) behind
+  // the "unavailable" banner — never invented handles/numbers.
+  function unavailableData(){
     return {
-      progress:{proven:4000,frontier:2000,tip:958301,pct:0.209,contributors:3},
-      timeline:{segs:240,per_seg:per,frontier_seg:0},
-      frontier_proof:{height:2000,tip_hash:"75a5ad37b74e9126e265eece6af8b0e41c9594803b3a57773cf44f3100000000",cum_work:2366563090983,leaves:555},
-      range_size:1000,
-      vranges:[
-        {lo:0,hi:1999,handle:"earlybird"},
-        {lo:5000,hi:5999,handle:"aria"},
-        {lo:20000,hi:20999,handle:"ghostnode"}
-      ],
-      claims:[
-        {lo:2000,hi:2999,handle:"coldboot",elapsed:1320,stale:false},
-        {lo:3000,hi:3999,handle:"driftwood",elapsed:480,stale:true},
-        {lo:764321,hi:764321,handle:"solo",elapsed:210,stale:false}
-      ],
-      leaderboard:[
-        {id:"9f2a7c1b3d",handle:"earlybird",blocks:2000},
-        {id:"4d8e0a2f91",handle:"aria",blocks:1000},
-        {id:"1a2b3c4d5e",handle:"ghostnode",blocks:1000}
-      ],
-      recent:[
-        {range:"20000-20999",handle:"ghostnode",verified:true,ts:now-240,note:"verified"},
-        {range:"764321",handle:"solo",verified:false,ts:now-210,note:"proving one block"},
-        {range:"0-1999",handle:"earlybird",verified:true,ts:now-1500,note:"verified"}
-      ],
+      progress:{proven:0,frontier:0,tip:958301,pct:0,contributors:0},
+      timeline:{segs:240,per_seg:new Array(240).fill(0),frontier_seg:0},
+      frontier_proof:{height:0,tip_hash:"",cum_work:0,leaves:0},
+      range_size:1000, vranges:[], claims:[], leaderboard:[], recent:[],
       signatures:"ed25519",verify_mode:"real"
     };
   }
   function poll(){
     fetch(API+'/api/state').then(function(r){if(!r.ok)throw 0;return r.json()})
       .then(function(d){showBanner(false);render(d);})
-      .catch(function(){showBanner(true);render(sampleData());});   // no backend yet → show the preview
+      .catch(function(){showBanner(true);render(unavailableData());});   // coordinator unreachable → empty state + banner
   }
   poll();setInterval(poll,10000);
 </script>
