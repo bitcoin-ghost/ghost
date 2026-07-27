@@ -2,6 +2,7 @@ use crate::{
     config::TranslatorConfig,
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
     is_aggregated, is_non_aggregated,
+    load_balancer::Tier,
     status::{handle_error, Status, StatusSender},
     sv1::{
         downstream::{downstream::Downstream, SubmitShareWithChannelId},
@@ -502,7 +503,7 @@ impl Sv1Server {
                 );
                 (Some(l), target, t.min_individual_miner_hashrate)
             }
-            None => (None, first_target.clone(), hobby_floor_hs),
+            None => (None, first_target, hobby_floor_hs),
         };
 
         let vardiff_future = self.clone().spawn_vardiff_loop();
@@ -579,7 +580,7 @@ impl Sv1Server {
                                     }
                                     // Step 2: utilisation-based routing for new arrivals.
                                     let local_count = self.downstreams.len();
-                                    if let Some(target) = lb.should_proxy(local_count, addr.ip()).await {
+                                    if let Some(target) = lb.should_proxy(local_count, addr.ip(), Tier::Hobby).await {
                                         info!("Proxying new connection from {} to {}", addr, target);
                                         lb.spawn_proxy(stream, target);
                                         continue;
@@ -624,13 +625,23 @@ impl Sv1Server {
                                         drop(stream);
                                         continue;
                                     }
+                                    // Utilisation-routed as of #472, to a peer's FARM port.
+                                    // Peers that do not advertise one are not candidates, so a
+                                    // farm miner can never be handed to a peer's hobby floor —
+                                    // that misrouting is worse than not balancing at all, which
+                                    // is why this arm previously served locally or rejected.
+                                    let local_count = self.downstreams.len();
+                                    if let Some(target) =
+                                        lb.should_proxy(local_count, addr.ip(), Tier::Farm).await
+                                    {
+                                        info!(
+                                            "Proxying new farm-port connection from {} to {}",
+                                            addr, target
+                                        );
+                                        lb.spawn_proxy(stream, target);
+                                        continue;
+                                    }
                                 }
-                                // Deliberately NOT utilisation-routed. The load balancer's proxy
-                                // target is hard-coded to `{peer}:3333` (load_balancer.rs), so
-                                // proxying a farm connection would hand a large miner to a peer's
-                                // HOBBY listener and its small floor — the exact flood this tier
-                                // exists to prevent. Until the balancer learns per-tier targets,
-                                // farm connections are served locally or rejected.
                                 info!("New SV1 downstream connection from {} on the farm port", addr);
                                 self.register_downstream(
                                     stream,
@@ -639,7 +650,7 @@ impl Sv1Server {
                                     &fallback_coordinator,
                                     &status_sender,
                                     &task_manager,
-                                    farm_first_target.clone(),
+                                    farm_first_target,
                                     farm_floor_hs,
                                     true,
                                 ).await;
@@ -668,7 +679,7 @@ impl Sv1Server {
                                         continue;
                                     }
                                     let local_count = self.downstreams.len();
-                                    if let Some(target) = lb.should_proxy(local_count, addr.ip()).await {
+                                    if let Some(target) = lb.should_proxy(local_count, addr.ip(), Tier::Hobby).await {
                                         info!("Proxying new TLS connection from {} to {}", addr, target);
                                         lb.spawn_proxy(tcp, target);
                                         continue;
@@ -865,7 +876,7 @@ impl Sv1Server {
                             }
                             data.queued_sv1_handshake_messages
                                 .iter()
-                                .position(|m| is_mining_subscribe(m))
+                                .position(is_mining_subscribe)
                                 .map(|pos| data.queued_sv1_handshake_messages.remove(pos))
                         });
                         if let Some(msg) = subscribe_msg {
@@ -1234,7 +1245,7 @@ impl Sv1Server {
                         let vardiff = VardiffState::new_with_min(
                             self.config
                                 .downstream_difficulty_config
-                                .min_individual_miner_hashrate as f32,
+                                .min_individual_miner_hashrate,
                         )
                         .expect("Failed to create vardiffstate");
                         self.vardiff

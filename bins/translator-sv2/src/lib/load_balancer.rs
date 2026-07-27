@@ -104,6 +104,19 @@ struct ThisNode {
     max_capacity: u32,
 }
 
+/// Which listener a connection arrived on, and therefore which listener it may be sent to.
+///
+/// These are NOT interchangeable. The tiers exist because one difficulty cannot serve both a
+/// bitaxe and a rented petahash order, so proxying a farm connection to a peer's hobby port
+/// hands a large miner a floor sized for a small one — the exact flood the tier prevents. A
+/// 100 TH/s miner on a 2,328 floor produces ~896 shares in four minutes against the ~24 it
+/// should, so misrouting one is worse than not balancing it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Hobby,
+    Farm,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct PeerInfo {
     public_address: String,
@@ -117,7 +130,47 @@ struct PeerInfo {
     /// flood them with traffic on stale assumptions.
     #[serde(default)]
     max_capacity: u32,
+    /// The peer's SV1 hobby listener. `None` on a peer that predates tier advertisement;
+    /// such a peer is assumed to serve hobby on the default port, which is what every node
+    /// did before the farm tier existed.
+    #[serde(default)]
+    hobby_port: Option<u16>,
+    /// The peer's SV1 farm/rental listener, if it runs one.
+    ///
+    /// `None` means either "no farm tier" or "too old to say", and both must be treated the
+    /// same way: NOT a farm routing target. Assuming a port here is how a farm miner ends up
+    /// on a hobby floor, so absence disqualifies the peer rather than defaulting.
+    #[serde(default)]
+    farm_port: Option<u16>,
 }
+
+impl PeerInfo {
+    /// The peer's listener for `tier`, or `None` if it does not advertise one.
+    fn port_for(&self, tier: Tier) -> Option<u16> {
+        match tier {
+            Tier::Hobby => Some(self.hobby_port.unwrap_or(DEFAULT_HOBBY_PORT)),
+            Tier::Farm => self.farm_port,
+        }
+    }
+
+    /// Host half of `public_address`, which peers report as `ip:port`.
+    fn host(&self) -> &str {
+        self.public_address
+            .split(':')
+            .next()
+            .unwrap_or(&self.public_address)
+    }
+
+    /// Routing target for `tier`, or `None` if this peer cannot serve it.
+    fn target_for(&self, tier: Tier) -> Option<SocketAddr> {
+        let port = self.port_for(tier)?;
+        format!("{}:{}", self.host(), port).parse().ok()
+    }
+}
+
+/// Where hobby miners have always been served. Used only for peers that predate tier
+/// advertisement — a peer that DOES advertise is believed rather than assumed.
+const DEFAULT_HOBBY_PORT: u16 = 3333;
 
 struct Cache {
     this_node: ThisNode,
@@ -216,6 +269,7 @@ impl LoadBalancer {
         &self,
         local_downstream_count: usize,
         source_addr: std::net::IpAddr,
+        tier: Tier,
     ) -> Option<SocketAddr> {
         let cache = self.cache.read().await;
         let cache = cache.as_ref()?;
@@ -246,7 +300,7 @@ impl LoadBalancer {
         if my_capacity == 0 {
             // No capacity reported — fall back to absolute-count comparison
             // so the LB still does *something* during early boot.
-            return self.fallback_pick_by_count(local_downstream_count, cache);
+            return self.fallback_pick_by_count(local_downstream_count, cache, tier);
         }
         let my_util_pct =
             ((local_downstream_count as u32).saturating_mul(100)) / my_capacity.max(1);
@@ -261,6 +315,10 @@ impl LoadBalancer {
                     && !p.public_address.is_empty()
                     && p.max_capacity > 0
                     && peer_util_pct(p) < self.config.reject_pct
+                    // A peer that does not serve this tier is not a candidate for it. For
+                    // Farm this excludes every peer that has not advertised a farm port,
+                    // including all peers running a build from before tier advertisement.
+                    && p.port_for(tier).is_some()
             })
             .collect();
         if candidates.is_empty() {
@@ -286,36 +344,28 @@ impl LoadBalancer {
             return None;
         }
 
-        let ip = best
-            .public_address
-            .split(':')
-            .next()
-            .unwrap_or(&best.public_address);
-        let target: SocketAddr = format!("{}:3333", ip).parse().ok()?;
-        Some(target)
+        best.target_for(tier)
     }
 
     fn fallback_pick_by_count(
         &self,
         local_downstream_count: usize,
         cache: &Cache,
+        tier: Tier,
     ) -> Option<SocketAddr> {
         let local_count = local_downstream_count as u32;
         let best = cache
             .peers
             .iter()
-            .filter(|p| p.public_mining && !p.public_address.is_empty())
+            .filter(|p| {
+                p.public_mining && !p.public_address.is_empty() && p.port_for(tier).is_some()
+            })
             .min_by_key(|p| p.miner_count)?;
         // Conservative fallback threshold: only divert if local exceeds peer by 2.
         if local_count < best.miner_count + 2 {
             return None;
         }
-        let ip = best
-            .public_address
-            .split(':')
-            .next()
-            .unwrap_or(&best.public_address);
-        format!("{}:3333", ip).parse().ok()
+        best.target_for(tier)
     }
 
     /// Spawn a background task that pipes bytes between the miner and the target node.
@@ -443,10 +493,81 @@ mod tests {
                     public_mining: true,
                     last_seen: 0,
                     max_capacity: cap,
+                    hobby_port: None,
+                    farm_port: None,
                 })
                 .collect(),
             updated_at: Instant::now(),
         }
+    }
+
+    fn peer(addr: &str, hobby: Option<u16>, farm: Option<u16>) -> PeerInfo {
+        PeerInfo {
+            public_address: addr.into(),
+            miner_count: 0,
+            public_mining: true,
+            last_seen: 0,
+            max_capacity: 100,
+            hobby_port: hobby,
+            farm_port: farm,
+        }
+    }
+
+    /// A peer too old to advertise ports is still a valid HOBBY target — that is where every
+    /// node served SV1 before the farm tier existed, so assuming it preserves old behaviour.
+    #[test]
+    fn a_peer_that_advertises_nothing_is_still_a_hobby_target() {
+        let p = peer("10.0.0.1:8080", None, None);
+        assert_eq!(
+            p.target_for(Tier::Hobby),
+            Some("10.0.0.1:3333".parse().unwrap())
+        );
+    }
+
+    /// ...but it is NOT a farm target. This is the whole point of #472: guessing a farm port
+    /// is how a 100 TH/s miner lands on a 2,328 hobby floor, which is worse than not
+    /// balancing it at all.
+    #[test]
+    fn a_peer_that_advertises_no_farm_port_is_never_a_farm_target() {
+        let p = peer("10.0.0.1:8080", None, None);
+        assert_eq!(p.target_for(Tier::Farm), None);
+
+        // Advertising a hobby port does not imply a farm one either.
+        let hobby_only = peer("10.0.0.2:8080", Some(3333), None);
+        assert_eq!(hobby_only.target_for(Tier::Farm), None);
+    }
+
+    /// An advertised port is believed rather than assumed, for both tiers.
+    #[test]
+    fn advertised_ports_are_used_verbatim() {
+        let p = peer("10.0.0.3:8080", Some(3400), Some(4444));
+        assert_eq!(
+            p.target_for(Tier::Hobby),
+            Some("10.0.0.3:3400".parse().unwrap())
+        );
+        assert_eq!(
+            p.target_for(Tier::Farm),
+            Some("10.0.0.3:4444".parse().unwrap())
+        );
+    }
+
+    /// Farm routing stays inert on a fleet where nobody advertises, which is the state this
+    /// change ships in — so it cannot alter behaviour until the gossip half lands.
+    #[tokio::test]
+    async fn farm_routing_is_inert_until_peers_advertise() {
+        let lb = LoadBalancer::new(cfg());
+        // A wildly under-utilised peer that would certainly win hobby routing.
+        *lb.cache.write().await = Some(cache_with(900, 1000, vec![(0, 1000, "10.0.0.9:8080")]));
+
+        let src: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(
+            lb.should_proxy(900, src, Tier::Hobby).await.is_some(),
+            "hobby routing must still work"
+        );
+        assert!(
+            lb.should_proxy(900, src, Tier::Farm).await.is_none(),
+            "farm routing must not fall back to a hobby port"
+        );
     }
 
     #[tokio::test]
@@ -494,7 +615,7 @@ mod tests {
         // than C in % terms — wait, all three peers have less util than me,
         // but C has the LOWEST util.
         let target = lb
-            .should_proxy(200, "8.8.8.8".parse().unwrap())
+            .should_proxy(200, "8.8.8.8".parse().unwrap(), Tier::Hobby)
             .await
             .expect("should propose a target");
         assert!(
@@ -510,7 +631,7 @@ mod tests {
         // me: 100/1000 = 10%, peer: 80/1000 = 8% — gap 2%, threshold 5% → no
         *lb.cache.write().await = Some(cache_with(100, 1000, vec![(80, 1000, "10.0.0.1:8559")]));
         assert!(lb
-            .should_proxy(100, "8.8.8.8".parse().unwrap())
+            .should_proxy(100, "8.8.8.8".parse().unwrap(), Tier::Hobby)
             .await
             .is_none());
     }
@@ -521,7 +642,7 @@ mod tests {
         // me: 200/1000 = 20%; only peer is at 91% (over reject_pct 90)
         *lb.cache.write().await = Some(cache_with(200, 1000, vec![(910, 1000, "10.0.0.1:8559")]));
         assert!(lb
-            .should_proxy(200, "8.8.8.8".parse().unwrap())
+            .should_proxy(200, "8.8.8.8".parse().unwrap(), Tier::Hobby)
             .await
             .is_none());
     }
@@ -532,7 +653,7 @@ mod tests {
         // me: 100/1000 = 10%; peer reports 0 capacity (legacy)
         *lb.cache.write().await = Some(cache_with(500, 1000, vec![(0, 0, "10.0.0.1:8559")]));
         assert!(
-            lb.should_proxy(500, "8.8.8.8".parse().unwrap())
+            lb.should_proxy(500, "8.8.8.8".parse().unwrap(), Tier::Hobby)
                 .await
                 .is_none(),
             "legacy peers shouldn't be routed to before they upgrade"
@@ -554,7 +675,10 @@ mod tests {
         ));
         let mut hits = std::collections::HashSet::new();
         for _ in 0..6 {
-            if let Some(t) = lb.should_proxy(200, "8.8.8.8".parse().unwrap()).await {
+            if let Some(t) = lb
+                .should_proxy(200, "8.8.8.8".parse().unwrap(), Tier::Hobby)
+                .await
+            {
                 hits.insert(t.to_string());
             }
         }
