@@ -879,6 +879,18 @@ SV2_AUTH_PUB="$(sed -n 's/^authority_public_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEY
 SV2_AUTH_SEC="$(sed -n 's/^authority_secret_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEYPAIR")"
 [[ -n "$SV2_AUTH_PUB" && -n "$SV2_AUTH_SEC" ]] || err "Could not parse the generated SV2 authority keypair."
 
+# Farm/rental tier (#410). Emitted ONLY for public_pool: a private or solo node has a
+# known set of miners and no rented hashrate to serve, so a second public listener is
+# surface it does not need. `reconcile-mining-firewall.sh` opens 4444 on the same
+# condition, so the port and the listener can never disagree.
+FARM_TIER_BLOCK=""
+if [[ "$MINING_MODE" == "public_pool" ]]; then
+  FARM_TIER_BLOCK="[farm_tier]
+port = 4444
+min_individual_miner_hashrate = 100_000_000_000_000.0  # ~232,827 starting difficulty
+hobby_max_individual_miner_hashrate = 50_000_000_000_000.0"
+fi
+
 # translator_sv2 — accepts SV1 miners on :3333 and forwards SV2 to the local pool.
 # user_identity is this node's own payout address (public, not a secret): it is
 # the default miner-username prefix, and each SV1 miner may still authorise as
@@ -979,10 +991,10 @@ authority_pubkey = "${SV2_AUTH_PUB}"
 # taking anything from anyone — it just costs this node ~20x the share
 # validation, bandwidth and database writes.
 #
-# [farm_tier]
-# port = 4444
-# min_individual_miner_hashrate = 100_000_000_000_000.0  # ~232,827 starting difficulty
-# hobby_max_individual_miner_hashrate = 50_000_000_000_000.0
+# Enabled by default on public mining nodes (operator decision, 2026-07-27); the block
+# below is emitted only for mining_mode = "public_pool". Private and solo nodes get no
+# farm listener and no 4444 firewall rule.
+${FARM_TIER_BLOCK}
 
 [load_balancer]
 ghost_pool_url = "127.0.0.1:8080"
@@ -1319,6 +1331,26 @@ if [[ "$accept_miners" == "yes" ]]; then
 else
   for p in "${PORTS[@]}"; do ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true; done
   logger -t ghost-mining-firewall "external miners OFF (private_solo) -> Stratum 3333+34255 CLOSED"
+fi
+
+# Farm/rental tier (#410) listens on 4444 and is enabled ONLY for public_pool — a private
+# or solo node has a known miner set and no rented hashrate to serve. This deliberately uses
+# a narrower condition than the Stratum ports above, which also open for private_pool.
+#
+# It must track `install-node.sh`, which emits the [farm_tier] block on the same condition.
+# If these two ever disagree the node either advertises a port nothing listens on, or listens
+# on a port nothing can reach — the second is what the config comment warns about.
+farm_tier="no"
+if [[ -r "$CONF" ]] \
+ && grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?public_pool"?' "$CONF" 2>/dev/null; then
+  farm_tier="yes"
+fi
+if [[ "$farm_tier" == "yes" ]]; then
+  ufw allow 4444/tcp >/dev/null 2>&1 || true
+  logger -t ghost-mining-firewall "farm tier ON (public_pool) -> Stratum 4444 OPEN"
+else
+  ufw delete allow 4444/tcp >/dev/null 2>&1 || true
+  logger -t ghost-mining-firewall "farm tier OFF -> Stratum 4444 CLOSED"
 fi
 
 # Wraith coordinator listen port (9100) follows [coordinator]

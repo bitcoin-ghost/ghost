@@ -3605,8 +3605,12 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         "total_shares": health.capabilities.total_shares,
         "current_round_duration_secs": current_round_duration_secs,
         "estimated_time_to_block_secs": estimated_time_to_block_secs,
-        "stratum_sv2_port": 4444,
-        "stratum_sv1_port": 3333,
+        // 4444 was hard-coded here and is NOT the SV2 port — it is the SV1 farm/rental tier
+        // (#410). The real SV2 listener is SV2_STRATUM_PORT (34255), which the rest of this
+        // file already reports correctly. Advertising 4444 as SV2 sent anyone reading the API
+        // to a port speaking the wrong protocol.
+        "stratum_sv2_port": SV2_STRATUM_PORT,
+        "stratum_sv1_port": SV1_STRATUM_PORT,
         "http_port": 8080
     }))
 }
@@ -5862,8 +5866,12 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
         "block_priority": block_priority_key(&state),
         "template_refresh_secs": state.template_refresh_secs(),
         "network": state.network.as_str(),
-        "stratum_sv2_port": 4444,
-        "stratum_sv1_port": 3333,
+        // 4444 was hard-coded here and is NOT the SV2 port — it is the SV1 farm/rental tier
+        // (#410). The real SV2 listener is SV2_STRATUM_PORT (34255), which the rest of this
+        // file already reports correctly. Advertising 4444 as SV2 sent anyone reading the API
+        // to a port speaking the wrong protocol.
+        "stratum_sv2_port": SV2_STRATUM_PORT,
+        "stratum_sv1_port": SV1_STRATUM_PORT,
         "http_port": 8080,
         "node_id": health.node_id,
         "version": health.version

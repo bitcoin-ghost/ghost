@@ -75,11 +75,12 @@ The username format is: `address.workername`
 
 | Protocol | Port | Status |
 | --- | --- | --- |
-| Stratum V1 | 3333 | Supported |
+| Stratum V1 — hobby | 3333 | Supported |
+| Stratum V1 — farm/rental | 4444 | Supported (public mining nodes) |
 | Stratum V2 | 34255 | Supported |
 
 :::warning Firewall Configuration
-If running public mining, ensure port 3333 is open in your firewall. For private mining (only your own hardware), keep it closed.
+If running public mining, ensure ports 3333 and 4444 are open in your firewall. For private mining (only your own hardware), keep them closed. `reconcile-mining-firewall.sh` does this automatically from `mining_mode`, so a hand edit is only needed if you manage the firewall yourself.
 :::
 
 ## Share System

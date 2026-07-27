@@ -131,9 +131,21 @@ Total time from "peer goes down" to "load balancer stops routing to it": worst c
 
 | Protocol | Port | Notes |
 |---|---|---|
-| Stratum V1 | 3333 | SV1 miners. Translator runs SV1↔SV2 bridge here |
+| Stratum V1 — hobby | 3333 | SV1 miners. Translator runs the SV1↔SV2 bridge here. Starting difficulty ~2,328 (1 TH/s floor) |
+| Stratum V1 — farm/rental | 4444 | SV1, same bridge, higher floor: ~232,827 (100 TH/s). Public mining nodes only |
 | Stratum V2 (native) | 34255 | Modern SV2 miners. Direct to pool_sv2 |
-| Stratum V2 (alt) | 4444 | Alternative SV2 port (some firewalls block 34255) |
+
+**4444 is Stratum V1, not an alternate SV2 port.** It was previously documented as
+"Alternative SV2 port (some firewalls block 34255)", which was wrong: there is one SV2
+listener and it is 34255 (`SV2_STRATUM_PORT`). 4444 is the farm/rental tier added in #410 —
+the same SV1 protocol as 3333, differing only in starting difficulty. Pointing an SV2 miner
+at it will not work.
+
+Which SV1 port to use is about miner size, not capability. One difficulty cannot serve both
+a 500 GH/s bitaxe and a 1 PH/s rented order: sized for the bitaxe, a large order floods the
+pool while vardiff ramps; sized for the order, a bitaxe finds a share every few minutes and
+looks dead. Payout is unaffected either way — it is proportional to work, and a share's work
+IS its difficulty, so the same hashrate earns the same on either port.
 
 Miners can connect via:
 
