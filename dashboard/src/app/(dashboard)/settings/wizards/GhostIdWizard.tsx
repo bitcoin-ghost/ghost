@@ -5,11 +5,27 @@ import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-import { getGhostId } from '@/lib/api/ghostpay';
+import { getGhostId, generateGhostKeys, GhostPayApiError } from '@/lib/api/ghostpay';
 
 interface GhostIdWizardProps {
   isOpen: boolean;
   onClose: () => void;
+}
+
+/// Render a failure using whatever the backend actually said.
+///
+/// The ghostpay proxy answers 503 when `GHOST_PAY_API_SECRET` is unset, which is a deployment
+/// problem rather than a node problem — worth naming, because otherwise it looks identical to
+/// ghost-pay being down.
+function describeError(err: unknown): string {
+  if (err instanceof GhostPayApiError) {
+    if (err.status === 503) {
+      return 'The dashboard cannot reach Ghost Pay: no API secret is configured for the proxy.';
+    }
+    return err.remedy ? `${err.message} — ${err.remedy}` : err.message;
+  }
+  if (err instanceof Error) return err.message;
+  return 'Unable to retrieve the node Ghost ID.';
 }
 
 export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
@@ -20,6 +36,11 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [prevOpen, setPrevOpen] = useState(false);
+  // A node that has never had a keypair created is not an error state — it has a next step.
+  const [notGenerated, setNotGenerated] = useState<{ reason?: string; remedy?: string } | null>(
+    null
+  );
+  const [isGenerating, setIsGenerating] = useState(false);
 
   // Reset the transient UI state the moment the dialog opens, during render
   // (guarded on the open transition so it can't loop) rather than in the effect.
@@ -31,6 +52,7 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
       setIsLoading(true);
       setError(null);
       setCopied(false);
+      setNotGenerated(null);
     }
   }
 
@@ -42,9 +64,14 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
     getGhostId()
       .then((result) => {
         if (cancelled) return;
+        if (!result.generated) {
+          setNotGenerated({ reason: result.reason, remedy: result.remedy });
+          setGhostId(null);
+          return;
+        }
         const id = result.ghost_id?.trim();
         if (!id) {
-          setError('The node did not return a Ghost ID.');
+          setError('The node reported a generated keypair but returned no Ghost ID.');
           setGhostId(null);
         } else {
           setGhostId(id);
@@ -52,7 +79,7 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Unable to retrieve the node Ghost ID.');
+        setError(describeError(err));
         setGhostId(null);
       })
       .finally(() => {
@@ -63,6 +90,27 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
       cancelled = true;
     };
   }, [isOpen]);
+
+  const handleGenerate = async () => {
+    setIsGenerating(true);
+    setError(null);
+    try {
+      const result = await generateGhostKeys();
+      const id = result.ghost_id?.trim();
+      if (!id) {
+        setError('The node generated a keypair but returned no Ghost ID.');
+        return;
+      }
+      setGhostId(id);
+      setNotGenerated(null);
+      toast.success('Ghost ID created', 'The node keypair has been generated.');
+    } catch (err) {
+      setError(describeError(err));
+      toast.error('Generation failed', describeError(err));
+    } finally {
+      setIsGenerating(false);
+    }
+  };
 
   const handleCopy = async () => {
     if (!ghostId) return;
@@ -117,7 +165,25 @@ export default function GhostIdWizard({ isOpen, onClose }: GhostIdWizardProps) {
             </div>
           )}
 
-          {!isLoading && !error && ghostId && (
+          {!isLoading && !error && notGenerated && (
+            <div className="space-y-3">
+              <div className="p-3 rounded-lg bg-[var(--surface)]/70 border border-[var(--rule-strong)]">
+                <p className="text-sm text-[color:var(--fg)]">
+                  {notGenerated.reason ??
+                    'This node does not have a Ghost Pay keypair yet.'}
+                </p>
+                <p className="mt-2 text-sm text-[color:var(--dim)]">
+                  Generating one creates the node&apos;s L2 identity. It is a one-time action and
+                  does not move any funds.
+                </p>
+              </div>
+              <Button variant="primary" onClick={handleGenerate} disabled={isGenerating}>
+                {isGenerating ? 'Generating...' : 'Generate keypair'}
+              </Button>
+            </div>
+          )}
+
+          {!isLoading && !error && !notGenerated && ghostId && (
             <div className="flex items-center gap-2">
               <code className="flex-1 break-all rounded bg-[var(--surface)]/70 px-3 py-2 text-sm text-[color:var(--accent)]">
                 {ghostId}
