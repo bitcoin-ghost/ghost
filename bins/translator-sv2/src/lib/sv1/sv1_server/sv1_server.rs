@@ -1534,13 +1534,13 @@ impl Sv1Server {
             format!("{}.miner{}", self.config.user_identity, miner_id)
         };
 
-        // NOTE: do NOT overwrite `data.user_identity` here — that field carries the per-share
-        // TLV worker-name (set by `mining.authorize` via `extract_worker_name`) and is bounded
-        // to 32 bytes by the spec. It must stay independent of the channel-level user_identity.
-        let _ = downstream
-            .downstream_data
-            .safe_lock(|_d| ())
-            .map_err(TproxyError::shutdown)?;
+        // NOTE: do NOT overwrite `data.user_identity` here. That field carries the per-share TLV
+        // worker-name — set during `mining.authorize` by `extract_worker_name` +
+        // `tlv_compatible_username` — and must stay independent of the channel-level
+        // `user_identity` built above, which carries the full `<address>.<worker>`. The pool
+        // recombines the two: the address comes from the channel, the worker from the TLV.
+        // The 32-byte bound is ours (`MAX_USER_IDENTITY_BYTES`), not a spec limit; the SV2 wire
+        // type is `Str0255`.
 
         if let Ok(open_channel_msg) = build_sv2_open_extended_mining_channel(
             request_id,
