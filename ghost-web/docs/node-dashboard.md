@@ -177,9 +177,14 @@ Tailscale uses WireGuard under the hood for encrypted connections. It handles NA
 
 The dashboard is powered by a REST API that you can also use directly:
 
+Note which service you are talking to. Port `8080` is the **node backend**
+(`ghost-verification`), a different process from the dashboard on port `3000`.
+The dashboard's authentication does not apply to it, and never did — the
+examples below work because these particular backend routes are unauthenticated
+in their own right, not because of any localhost exemption.
+
 ```bash
-# From the node itself (localhost requests bypass auth via the
-# isLocalhost check in dashboard middleware), you can call the API directly:
+# Against the node backend on :8080 (not the dashboard):
 
 # Example: Get node status
 $ curl http://localhost:8080/api/v1/node/status
@@ -194,9 +199,12 @@ $ curl -X PATCH \
      http://localhost:8080/api/v1/config
 ```
 
-For remote access (e.g. via SSH tunnel), authenticate at `/login` with the
-configured `DASHBOARD_PASSWORD` to receive the `ghost-session` JWT cookie;
-subsequent requests include the cookie automatically.
+The dashboard's own API (port `3000`, including the `/api/v1/*` proxy) is a
+different matter: it requires a session on **every** request, including from
+localhost. Authenticate at `/login` with the configured `DASHBOARD_PASSWORD` to
+receive the `ghost-session` JWT cookie; subsequent requests include the cookie
+automatically. A request without one is redirected to `/login` (pages) or
+answered `401` (API) — there is no local exemption.
 
 Full API documentation: [docs.ghostpool.io/api](https://docs.ghostpool.io/api)
 
@@ -210,11 +218,17 @@ Full API documentation: [docs.ghostpool.io/api](https://docs.ghostpool.io/api)
 - **JWT session cookie** — On successful login at `/login`, the dashboard
   issues a signed cookie named `ghost-session`. Middleware
   (`dashboard/src/middleware.ts`) verifies the JWT on every request.
-- **Localhost bypass** — Requests originating from `127.0.0.1` / `::1` /
-  `localhost` skip authentication entirely. The dashboard is per-operator
-  and assumes anything reaching it from localhost is the operator. Remote
-  access (via SSH tunnel with `X-Forwarded-For` set, or any non-localhost
-  origin) requires the password.
+- **No localhost bypass** — there is no origin-based exemption. An earlier
+  version of the dashboard skipped authentication for `127.0.0.1` / `::1` /
+  `localhost`; that was removed. The middleware deliberately does not consult
+  `X-Forwarded-For` or `Host` for any auth decision, because both are
+  client-spoofable and the old bypass they powered let a direct connection to a
+  mis-bound dashboard skip authentication entirely. Auth is the JWT cookie and
+  nothing else, and it fails closed even if the server is mis-bound to
+  `0.0.0.0`.
+- **Access model: SSH tunnel only** — the dashboard binds to `127.0.0.1:3000`
+  and is reached with `ssh -L 3000:localhost:3000 <node>`. The loopback bind and
+  the JWT are independent layers; neither is relied upon to cover the other.
 
 ### Network Security
 
