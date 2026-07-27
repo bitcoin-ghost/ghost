@@ -1,10 +1,29 @@
 #!/usr/bin/env python3
 """Submit a REAL share as `<address>.<worker>` and let the operator check who got credited.
 
-This is the test that was missing the two times channel-open-on-subscribe was deployed and
-misattributed ~395 shares. Both times the failure was silent: shares kept flowing, they
-simply landed on the translator's configured operator address instead of the miner. Nothing
-on the wire says which identity a share was credited to — only the node's database does.
+⚠ READ THIS BEFORE RELYING ON IT: at production difficulty this CANNOT SUCCEED.
+
+It mines in pure Python at roughly 750k H/s. A share needs `difficulty * 2^32` hashes on
+average, so at the hobby floor (~2,328) that is about 151 DAYS, and at the farm floor
+(~232,831) about 41 years. It was previously described here as "the test that was missing"
+when misattribution shipped — it could not have been that test, because it never finishes.
+See #464.
+
+It now measures its own hash rate against the difficulty the pool actually grants and refuses
+immediately, with the arithmetic, rather than burning its 900s budget to reach the same
+conclusion silently.
+
+A `d=<difficulty>` directive in the password does NOT help: a declared difficulty is clamped
+UP to the pool floor and never below it, so it can raise a miner above the floor but cannot
+lower it for probing. Verified against a live node.
+
+It is therefore useful only where a node can be made to grant a tiny difficulty — a canary
+configured for it. On a production node, use `verify_attribution.sh` against REAL miner
+traffic instead; that is the check that actually works.
+
+Both times misattribution shipped, the failure was silent: shares kept flowing, they simply
+landed on the translator's configured operator address instead of the miner. Nothing on the
+wire says which identity a share was credited to — only the node's database does.
 
 So this deliberately mines a share that is genuinely valid rather than asserting on
 handshake fields. It behaves as a SERIALISING client (subscribe -> wait for reply ->
@@ -18,7 +37,7 @@ Usage:
 Exits 0 once a share is accepted. The caller then reads the node's `miners` table and checks
 the credited miner_id.
 """
-import hashlib, json, socket, struct, sys, time
+import hashlib, json, os, socket, struct, sys, time
 
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
@@ -120,6 +139,29 @@ def main():
     print(f"  job {job_id} difficulty={difficulty} re_keyed={re_keyed}")
 
     target = difficulty_to_target(difficulty)
+
+    # Calibrate against THIS machine before committing to a 15-minute wait, and say plainly
+    # when the arithmetic makes success impossible. A check that fails silently after a long
+    # wait teaches nobody anything; one that says "this needs 151 days" is actionable.
+    budget = float(os.environ.get("PROBE_MAX_SECONDS", "900"))
+    cal_start = time.time()
+    cal_head = b"\x00" * 76
+    cal_n = 200_000
+    for i in range(cal_n):
+        sha256d(cal_head + struct.pack("<I", i))
+    rate = cal_n / max(time.time() - cal_start, 1e-9)
+    expected_s = difficulty * (2 ** 32) / rate
+    print(f"  calibrated at {rate:,.0f} H/s; a share at difficulty {difficulty:,.1f} "
+          f"needs ~{difficulty * (2 ** 32):,.0f} hashes")
+    if expected_s > budget:
+        print(f"REFUSING: expected time to find a share is ~{expected_s / 86400:,.1f} days "
+              f"({expected_s:,.0f}s), far beyond the {budget:,.0f}s budget.")
+        print("  This prober cannot verify attribution at this difficulty — see #464.")
+        print("  Use scripts/ops/verify_attribution.sh against real miner traffic instead,")
+        print("  or point this at a canary configured to grant a tiny difficulty.")
+        s.close()
+        return 2
+
     print(f"  mining for a share at difficulty {difficulty} ...")
 
     # --- actually mine ---
@@ -162,8 +204,9 @@ def main():
                 return 1
             if attempts % 2_000_000 == 0:
                 print(f"    {attempts:,} hashes, {time.time()-started:.0f}s ...")
-            if time.time() - started > 900:
-                print("FAIL: no share found in 900s — difficulty too high for this prober")
+            if time.time() - started > budget:
+                print(f"FAIL: no share found in {budget:,.0f}s — difficulty too high for this "
+                      f"prober (expected ~{expected_s / 86400:,.1f} days)")
                 return 1
     return 1
 

@@ -6,6 +6,10 @@
 # — only the shares ledger does. That is how ~395 shares (6,913 on vm8) were misattributed
 # twice before anyone noticed.
 #
+# Exit: 0 = verified clean, 1 = misattribution detected, 2 = INCONCLUSIVE (no shares to judge).
+# The 2 matters: it used to return 0 on a node with no miners, which is every canary, so the
+# post-deploy check reported PASS having examined nothing (#461, #464).
+#
 # Usage: verify_attribution.sh <node> [window_secs]
 set -uo pipefail
 NODE="${1:?usage: verify_attribution.sh <node> [window_secs]}"
@@ -25,12 +29,29 @@ BAD=$(ssh -o ConnectTimeout=10 "$NODE" "$SQL_PREFIX /home/ghost/.ghost/ghost.db 
   and timestamp > strftime('%s','now') - $WINDOW;\"" 2>/dev/null)
 BAD="${BAD:-0}"
 
+# Total locally-submitted shares in the window. Without this the check passes VACUOUSLY on any
+# node with no miners — "0 credited to the operator identity" is trivially true when nothing was
+# credited to anyone. Every canary (vm5-8) is in exactly that state, which is why a 60-minute
+# soak there proves nothing about attribution (#461, #464). Say so rather than reporting PASS.
+TOTAL=$(ssh -o ConnectTimeout=10 "$NODE" "$SQL_PREFIX /home/ghost/.ghost/ghost.db \
+  \"select count(*) from shares where timestamp > strftime('%s','now') - $WINDOW
+     and length(received_by) > 8;\"" 2>/dev/null)
+TOTAL="${TOTAL:-0}"
+
 echo
+if [ "$TOTAL" = "0" ]; then
+    echo "  INCONCLUSIVE: no locally-submitted shares on $NODE in the last ${WINDOW}s."
+    echo "  There is nothing to attribute, so this proves nothing either way."
+    echo "  Attribution can only be checked on a node carrying real miners (vm3/vm4 today)."
+    exit 2
+fi
+
 if [ "$BAD" = "0" ]; then
-    echo "  PASS: 0 shares credited to the operator identity in the last ${WINDOW}s"
+    echo "  PASS: 0 of $TOTAL locally-submitted shares credited to the operator identity"
+    echo "        in the last ${WINDOW}s"
     exit 0
 fi
-echo "  *** FAIL: $BAD share(s) credited to $OP in the last ${WINDOW}s ***"
+echo "  *** FAIL: $BAD of $TOTAL share(s) credited to $OP in the last ${WINDOW}s ***"
 echo "  *** This is the misattribution failure. ROLL BACK NOW: ***"
 echo "  ***   ssh $NODE 'ls -t /opt/ghost/bin/*.bak.* | head -3' ***"
 exit 1
