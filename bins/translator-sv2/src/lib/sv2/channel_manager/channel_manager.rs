@@ -885,7 +885,7 @@ mod tests {
         let update_channel = UpdateChannel {
             channel_id: 1,
             nominal_hash_rate: 2000.0,
-            maximum_target: [0xFFu8; 32].try_into().unwrap(),
+            maximum_target: [0xFFu8; 32].into(),
         };
 
         // Test that the message can be handled
