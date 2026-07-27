@@ -34,8 +34,14 @@ if [ -n "$orphans" ]; then
 fi
 
 echo "check-fuzz-targets: ${#files[@]} targets, ${#registered[@]} registered — building"
-if ! ( cd fuzz && cargo check --bins --quiet ); then
-    echo "check-fuzz-targets: a fuzz target no longer builds against current APIs" >&2
+# `--locked` because `fuzz/` is a SEPARATE cargo workspace with its own lockfile, and
+# `cargo update --workspace` at the repo root does not reach it. Without this flag a version
+# bump leaves fuzz/Cargo.lock stale, this build silently rewrites it, and the rewrite dirties
+# the tree — which then trips `deploy-node.sh`'s clean-tree check AFTER the gate has already
+# reported success. That is a confusing way to discover a stale lockfile; failing here names it.
+if ! ( cd fuzz && cargo check --bins --quiet --locked ); then
+    echo "check-fuzz-targets: a fuzz target no longer builds, or fuzz/Cargo.lock is stale" >&2
+    echo "  if the workspace version changed, run: ( cd fuzz && cargo update --workspace )" >&2
     exit 1
 fi
 echo "check-fuzz-targets: all ${#files[@]} fuzz targets build"
