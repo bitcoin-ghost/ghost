@@ -214,19 +214,67 @@ case "$BINARY" in
 esac
 
 timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2
-sleep 20
+
+# Wait for the service to be SERVING, not merely started.
+#
+# This was `sleep 20`, and 20s is not enough for pool_sv2: it does not bind :34255 until it
+# has completed a Noise handshake with the template provider on :8442, which takes ~60s.
+# systemd reports the unit active almost immediately, and its monitoring port :9090 comes up
+# early too, so neither is a readiness signal.
+#
+# The cost of getting this wrong is not a slow deploy, it is a WRONG VERDICT: the smoke test
+# ran against a pool that was not serving yet, failed, and rolled back a binary that was in
+# fact fine — leaving the node half-rolled, which this script's own header calls out as
+# indistinguishable from a genuinely broken binary. Measured on ghost-vm5: rolled back, then
+# the identical build passed all 11 smoke cases once given time.
+#
+# So wait on the port the service is supposed to answer on.
+case "$BINARY" in
+  ghost-pool)      READY_PORT=8442 ;;   # TDP, what pool_sv2 connects to
+  pool_sv2)        READY_PORT=34255 ;;  # SV2, what the translator connects to
+  translator_sv2)  READY_PORT=3333 ;;   # SV1, what miners connect to
+esac
+
+READY_TIMEOUT="${READY_TIMEOUT:-180}"
+echo "  waiting for $SERVICE to listen on :$READY_PORT (up to ${READY_TIMEOUT}s)"
+READY=no
+for _ in $(seq 1 "$READY_TIMEOUT"); do
+    if timeout 10 ssh "${SSH_OPTS[@]}" "$NODE" \
+         "ss -ltn 2>/dev/null | grep -q ':${READY_PORT}'" 2>/dev/null; then
+        READY=yes
+        break
+    fi
+    sleep 1
+done
 
 # ---------------------------------------------------------------- verify
 
 ACTIVE=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "systemctl is-active $SERVICE" || echo failed)
 [ "$ACTIVE" = "active" ] || { echo "SERVICE NOT ACTIVE — rolling back" >&2; ROLLBACK=1; }
 
+if [ -z "${ROLLBACK:-}" ] && [ "$READY" != "yes" ]; then
+    echo "SERVICE NEVER LISTENED ON :$READY_PORT after ${READY_TIMEOUT}s — rolling back" >&2
+    ROLLBACK=1
+fi
+
 # Smoke test the stratum path for anything that serves miners. A green service that
 # cannot complete a handshake is not a successful deploy.
 if [ -z "${ROLLBACK:-}" ] && [ "$BINARY" != "ghost-pool" ]; then
     IP=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "hostname -I | awk '{print \$1}'")
-    if ! python3 "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py" "$IP" 3333 >/dev/null 2>&1; then
-        echo "SMOKE TEST FAILED — rolling back" >&2
+    # Retry rather than judge on one attempt. A listening port means the process is accepting,
+    # not that the whole SV1 -> SV2 -> TDP chain has settled — the translator can be listening
+    # while its upstream handshake is still in progress. One failed attempt used to roll back a
+    # working binary and leave the node half-rolled.
+    SMOKE_OK=no
+    for attempt in 1 2 3; do
+        if python3 "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py" "$IP" 3333 >/dev/null 2>&1; then
+            SMOKE_OK=yes
+            break
+        fi
+        [ "$attempt" -lt 3 ] && { echo "  smoke attempt $attempt failed, retrying in 20s"; sleep 20; }
+    done
+    if [ "$SMOKE_OK" != "yes" ]; then
+        echo "SMOKE TEST FAILED after 3 attempts — rolling back" >&2
         ROLLBACK=1
     fi
 fi
