@@ -1542,8 +1542,7 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
         .await
         .unwrap();
 
-    let (_minerd_process, _minerd_addr) =
-        start_minerd(tproxy_addr.clone(), None, None, false).await;
+    let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
 
     sniffer_a
         .wait_for_message_type(

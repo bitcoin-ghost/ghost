@@ -6,10 +6,16 @@ use stratum_apps::{
 
 use crate::types::MsgType;
 
-#[allow(clippy::type_complexity)]
+/// The intercepted-message queue: message type, the message itself, and any TLV extension
+/// fields that rode along with it.
+///
+/// Named rather than repeated so the accessors can return it without each needing its own
+/// `#[allow(clippy::type_complexity)]`.
+type MessageQueue = Arc<Mutex<VecDeque<(MsgType, AnyMessage<'static>, Option<Vec<Tlv>>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct MessagesAggregator {
-    messages: Arc<Mutex<VecDeque<(MsgType, AnyMessage<'static>, Option<Vec<Tlv>>)>>>,
+    messages: MessageQueue,
 }
 
 impl Default for MessagesAggregator {
@@ -45,9 +51,7 @@ impl MessagesAggregator {
 
     /// Direct access to the inner lock, for tests that need to hold it deliberately.
     #[cfg(test)]
-    pub(crate) fn messages_for_test(
-        &self,
-    ) -> &Arc<Mutex<VecDeque<(MsgType, AnyMessage<'static>, Option<Vec<Tlv>>)>>> {
+    pub(crate) fn messages_for_test(&self) -> &MessageQueue {
         &self.messages
     }
 

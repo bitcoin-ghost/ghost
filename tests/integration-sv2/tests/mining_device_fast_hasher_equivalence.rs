@@ -31,7 +31,7 @@ fn fast_hasher_matches_baseline() {
     for _ in 0..1000 {
         // Advance nonce, occasionally tweak time
         h.nonce = h.nonce.wrapping_add(1);
-        if h.nonce % 128 == 0 {
+        if h.nonce.is_multiple_of(128) {
             h.time = h.time.wrapping_add(1);
         }
         let fast_hash = fast.hash_with_nonce_time(h.nonce, h.time);

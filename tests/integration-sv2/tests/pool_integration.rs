@@ -555,7 +555,7 @@ async fn pool_group_extended_channels() {
         // send OpenExtendedMiningChannel message to the pool
         let open_extended_mining_channel = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
             OpenExtendedMiningChannel {
-                request_id: i.into(),
+                request_id: i,
                 user_identity: b"user_identity".to_vec().try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
                 max_target: vec![0xff; 32].try_into().unwrap(),
