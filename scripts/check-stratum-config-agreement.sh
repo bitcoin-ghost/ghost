@@ -62,18 +62,82 @@ INVARIANTS = {
     "aggregate_channels": inv_aggregate,
 }
 
+# The farm tier (#410) repeats `min_individual_miner_hashrate` with a deliberately different
+# value, so a naive first-match comparison pairs the hobby floor in one file against the farm
+# floor in the other and reports a disagreement that is not one. Keys are therefore collected
+# per section, and the two tiers are compared separately.
+#
+# A TOML section header, but not bash `[[ -n "$x" ]]` — the installer is a shell script and is
+# full of those. Anchored and closed to the end of the line, which `[[ -n ... ]]` never is.
+SECTION_RE = re.compile(r"^\s*\[\[?[a-z0-9_.]+\]\]?\s*$")
+
+# `install-node.sh` builds the farm block as a shell assignment, so its header is not on a
+# line of its own.
+FARM_OPENS_RE = re.compile(r"\[farm_tier\]")
+
+FARM_SHARED = [
+    "port",
+    "min_individual_miner_hashrate",
+    "hobby_max_individual_miner_hashrate",
+]
+
 def values(path):
-    out = {}
+    """Return (hobby_keys, farm_keys). Farm-tier keys are kept out of the hobby set."""
+    out, farm = {}, {}
+    in_farm = False
     with open(path) as fh:
         for line in fh:
+            if FARM_OPENS_RE.search(line):
+                in_farm = True
+                continue
+            # The block ends at the next TOML section in the reference file, and at the end of
+            # the shell assignment (`fi`, or a blank line) in the installer.
+            if in_farm and (SECTION_RE.match(line) or re.match(r"^\s*(fi)?\s*$", line)):
+                in_farm = False
             m = re.match(r"^\s*([a-z0-9_]+)\s*=\s*(.+?)\s*$", line)
-            if m and m.group(1) in SHARED:
-                out.setdefault(m.group(1), m.group(2))
-    return out
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2)
+            # Strip a trailing TOML comment so `100.0  # ~232,827` compares as `100.0`, and the
+            # closing quote of the installer's shell assignment so the last key of the block
+            # is not `50_000_000_000_000.0"`.
+            val = re.sub(r"\s+#.*$", "", val).rstrip('"')
+            if in_farm:
+                if key in FARM_SHARED:
+                    farm.setdefault(key, val)
+            elif key in SHARED:
+                out.setdefault(key, val)
+    return out, farm
 
-a, b = values(INSTALLER), values(REFERENCE)
+(a, a_farm), (b, b_farm) = values(INSTALLER), values(REFERENCE)
 
 problems = []
+
+# The farm tier is emitted only for public_pool, but both files must describe the SAME tier.
+# A mismatch here means a node listens on one port while the firewall opens another, or
+# starts farm miners at a floor the reference says is something else.
+for k in FARM_SHARED:
+    va, vb = a_farm.get(k), b_farm.get(k)
+    if va is None or vb is None:
+        missing = INSTALLER if va is None else REFERENCE
+        problems.append(f"[farm_tier] {k}: not found in {missing} — cannot verify agreement")
+        continue
+    if va != vb:
+        problems.append(f"[farm_tier] {k}: {INSTALLER} = {va!r} but {REFERENCE} = {vb!r}")
+
+# The farm floor must sit above the hobby floor, or the tiers are inverted and a large miner
+# routed to 4444 gets an EASIER target than one left on 3333.
+try:
+    hobby = float(b.get("min_individual_miner_hashrate", "nan").replace("_", ""))
+    farm = float(b_farm.get("min_individual_miner_hashrate", "nan").replace("_", ""))
+    if farm <= hobby:
+        problems.append(
+            f"[farm_tier] min_individual_miner_hashrate ({farm:g}) must exceed the hobby "
+            f"floor ({hobby:g}) — otherwise the tiers are inverted"
+        )
+except ValueError:
+    pass
+
 for k in SHARED:
     va, vb = a.get(k), b.get(k)
     # A key we cannot find in both files is not "in agreement" — it is unchecked, and

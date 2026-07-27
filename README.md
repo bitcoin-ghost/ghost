@@ -76,7 +76,8 @@ selects its own transactions according to its configured mempool policy.
 
 | Port | Purpose |
 |------|---------|
-| 3333 | Stratum V1 — native miner connections |
+| 3333 | Stratum V1 — hobby tier, ~2,328 starting difficulty |
+| 4444 | Stratum V1 — farm/rental tier, ~232,827 starting difficulty (public mining nodes) |
 | 34255 | Stratum V2 — via SRI pool |
 | 8080 | REST API |
 | 8555–8562 | P2P consensus mesh (shares, blocks, voting, health, discovery, elders, payouts) |

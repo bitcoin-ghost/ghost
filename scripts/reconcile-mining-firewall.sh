@@ -28,6 +28,26 @@ else
   logger -t ghost-mining-firewall "external miners OFF (private_solo) -> Stratum 3333+34255 CLOSED"
 fi
 
+# Farm/rental tier (#410) listens on 4444 and is enabled ONLY for public_pool — a private
+# or solo node has a known miner set and no rented hashrate to serve. This deliberately uses
+# a narrower condition than the Stratum ports above, which also open for private_pool.
+#
+# It must track `install-node.sh`, which emits the [farm_tier] block on the same condition.
+# If these two ever disagree the node either advertises a port nothing listens on, or listens
+# on a port nothing can reach — the second is what the config comment warns about.
+farm_tier="no"
+if [[ -r "$CONF" ]] \
+ && grep -qE '^[[:space:]]*mining_mode[[:space:]]*=[[:space:]]*"?public_pool"?' "$CONF" 2>/dev/null; then
+  farm_tier="yes"
+fi
+if [[ "$farm_tier" == "yes" ]]; then
+  ufw allow 4444/tcp >/dev/null 2>&1 || true
+  logger -t ghost-mining-firewall "farm tier ON (public_pool) -> Stratum 4444 OPEN"
+else
+  ufw delete allow 4444/tcp >/dev/null 2>&1 || true
+  logger -t ghost-mining-firewall "farm tier OFF -> Stratum 4444 CLOSED"
+fi
+
 # Wraith coordinator listen port (9100) follows [coordinator]
 # coordinator_role_enabled, exactly as the Stratum ports follow public mining.
 coord="no"

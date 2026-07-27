@@ -68,7 +68,8 @@ source mainnet.env && ghost-pool --config mainnet.toml
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 3333 | TCP | Stratum V1 (miners) |
+| 3333 | TCP | Stratum V1 — hobby tier (miners) |
+| 4444 | TCP | Stratum V1 — farm/rental tier (public mining nodes only) |
 | 34255 | TCP | Stratum V2 (miners) |
 | 8080 | TCP | HTTP API |
 | 8555-8562 | TCP | P2P consensus mesh |

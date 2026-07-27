@@ -298,6 +298,49 @@ mod farm_tier_tests {
             "farm_tier must default to None so existing single-listener configs are unchanged"
         );
     }
+
+    /// The SHIPPED config must enable the farm tier, which the Rust default deliberately does
+    /// not (above). Those are different claims, and only this one is what a node actually runs.
+    ///
+    /// #410 sat "done" for a while on the strength of the listener existing, while every
+    /// shipped config still had `[farm_tier]` commented out — so no node ever opened 4444.
+    /// A test on the default value cannot catch that; this reads the file itself.
+    #[test]
+    fn shipped_config_enables_the_farm_tier() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/sri/translator-config.toml"
+        );
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read the shipped translator config at {path}: {e}"));
+        let cfg: toml::Value = toml::from_str(&raw).expect("shipped translator config must parse");
+
+        let farm = cfg
+            .get("farm_tier")
+            .unwrap_or_else(|| panic!("[farm_tier] missing from {path} — no node will open 4444"));
+
+        assert_eq!(
+            farm.get("port").and_then(|v| v.as_integer()),
+            Some(4444),
+            "the farm tier must listen on 4444; the firewall and docs are written against it"
+        );
+
+        let hobby = cfg
+            .get("downstream_difficulty_config")
+            .and_then(|d| d.get("min_individual_miner_hashrate"))
+            .and_then(|v| v.as_float())
+            .expect("hobby floor must be set");
+        let farm_floor = farm
+            .get("min_individual_miner_hashrate")
+            .and_then(|v| v.as_float())
+            .expect("farm floor must be set");
+
+        assert!(
+            farm_floor > hobby,
+            "farm floor {farm_floor:e} must exceed the hobby floor {hobby:e}, or a large miner \
+             routed to 4444 gets an EASIER target than one left on 3333"
+        );
+    }
 }
 
 #[cfg(test)]

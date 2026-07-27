@@ -112,7 +112,12 @@ authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
 # taking anything from anyone — it just costs this node ~20x the share
 # validation, bandwidth and database writes.
 #
-# [farm_tier]
-# port = 4444
-# min_individual_miner_hashrate = 100_000_000_000_000.0  # ~232,827 starting difficulty
-# hobby_max_individual_miner_hashrate = 50_000_000_000_000.0
+# ENABLED BY DEFAULT on public mining nodes (operator decision, 2026-07-27). The hobby
+# tier keeps `downstream_port`, so every miner already pointed at 3333 stays put; only
+# large miners need 4444 advertised to them. Private/solo nodes do not get this listener:
+# `install-node.sh` emits the block only for `mining_mode = "public_pool"`, and
+# `reconcile-mining-firewall.sh` opens 4444 on the same condition.
+[farm_tier]
+port = 4444
+min_individual_miner_hashrate = 100_000_000_000_000.0  # ~232,827 starting difficulty
+hobby_max_individual_miner_hashrate = 50_000_000_000_000.0
