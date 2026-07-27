@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-accounting"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-common",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-buds"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-common",
@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-common"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -1703,7 +1703,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-consensus"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-glyph"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "hex",
  "serde",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-gsp-proto"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-keys"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-locks"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-policy"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-pool"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reaper"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "serde",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reconciliation"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-storage"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-template"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-verification"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3988,7 +3988,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-apps"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "async-channel 1.9.0",
  "bs58",
@@ -5277,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-coordinator"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "wraith-protocol"
-version = "1.11.19"
+version = "1.11.20"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
