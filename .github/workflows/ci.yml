@@ -59,6 +59,11 @@ jobs:
       # gate is driven against deliberately-bad state here. No ssh, no deploy.
       - name: Deploy-gate self-test
         run: ./scripts/test-deploy-gate.sh
+      # Fuzz targets depend on internal APIs and rot silently when a signature changes.
+      # One had been importing a module that no longer existed, unnoticed, because no job
+      # built them (#468). Build only — running the fuzzers belongs in a scheduled job.
+      - name: Fuzz targets build
+        run: ./scripts/check-fuzz-targets.sh
 
   # Clippy lints
   clippy:
