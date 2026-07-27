@@ -917,7 +917,23 @@ monitoring_address = "0.0.0.0:9092"
 
 # Difficulty configuration for SV1 miners
 [downstream_difficulty_config]
-min_individual_miner_hashrate = 10_000_000_000_000.0
+# Hobby-tier floor: 1 TH/s -> starting difficulty ~2,328.
+#
+# Was 10 TH/s (~23,283), which is a bar set for a machine 10x larger than anything that
+# actually connects here. Measured on a live Bitaxe Gamma: its ASIC finds results averaging
+# 688 difficulty and peaking around 1,386, so at a 23,283 floor it had to get ~34x luckier
+# than its typical result to submit ANYTHING. It found a share about every 267s, which left
+# AxeOS estimating hashrate from two or three samples and displaying 26 TH/s for a 1.13 TH/s
+# machine — the operator reasonably read that as a broken miner.
+#
+# The control group is bitaxe4, which reaches pool_sv2 directly at difficulty 2,215 and reads
+# stable and truthful on the same hardware class.
+#
+# Payout is unaffected: it is proportional to work, and a share's work IS its difficulty, so
+# the same hashrate earns the same at any floor. The cost is share VOLUME (~10x more rows,
+# each gossiped to 8 nodes), which is why large miners belong on the farm tier (:4444) rather
+# than here.
+min_individual_miner_hashrate = 1_000_000_000_000.0
 shares_per_minute = 6.0
 enable_vardiff = true
 idle_timeout_secs = 600
