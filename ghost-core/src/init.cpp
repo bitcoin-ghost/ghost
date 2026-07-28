@@ -97,6 +97,7 @@
 #include <walletinitinterface.h>
 
 #include <haze/exorcist.h>
+#include <haze/hazync_proof.h>
 #include <haze/legal_packet.h>
 #include <haze/mode_selector.h>
 
@@ -546,6 +547,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-haze-status", "Print Ghost Haze status and exit", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-legal-packet", "Generate legal compliance packet JSON and exit", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-exorcist", "Convert existing full archive to hazed format (irreversible) and exit", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-hazyncproof=<file>", "Verify a genesis-anchored Hazync range proof at startup and log the chain state it commits to. REPORTING ONLY: nothing is skipped and no chainstate is adopted \u2014 every block is still validated in full. Requires a build with -DWITH_HAZYNC_VERIFY=ON.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-loadtxoutset=<path>", "Load a UTXO snapshot on startup and exit. The snapshot must match a hardcoded assumeutxo entry. Use with -hazemode=hazed to bootstrap a hazed node without a full archive peer. (default: disabled)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-coinstatsindex", strprintf("Maintain coinstats index used by the gettxoutsetinfo RPC (default: %u)", DEFAULT_COINSTATSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-conf=<file>", strprintf("Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useable from command line, not configuration file) (default: %s)", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -2099,6 +2101,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         node.exit_status = EXIT_SUCCESS;
         return false; // Clean shutdown
     }
+
+    // Hazync proof adoption (inbound): verify -hazyncproof=<file> and report the chain state it
+    // commits to. REPORTING ONLY in this increment — see haze/hazync_proof.h.
+    haze::HazyncProofStartupCheck(args);
 
     if (args.GetBoolArg("-haze-status", false)) {
         const fs::path datadir = args.GetDataDirNet();
