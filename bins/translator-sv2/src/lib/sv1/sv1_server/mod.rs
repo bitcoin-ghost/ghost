@@ -173,7 +173,9 @@ pub(super) fn parse_suggest_difficulty(msg: &Message) -> Option<f64> {
 /// share is marked unattributable and silently earns nothing, while the miner still receives
 /// `SubmitSharesSuccess`. `mining.authorize` does not currently reject that shape.
 pub(super) fn extract_worker_name(name: &str) -> &str {
-    name.rsplit_once('.').map(|(_, w)| w).unwrap_or(name)
+    // FIRST dot: the worker is everything after it, so `addr.farm1.rig1` keeps `farm1.rig1`
+    // rather than collapsing to `rig1` (#481).
+    name.split_once('.').map(|(_, w)| w).unwrap_or(name)
 }
 
 /// Why an SV1 username cannot be attributed to a payout target.
@@ -215,7 +217,7 @@ impl UsernameRejection {
 ///
 /// Callers pass the name with any `.d=<difficulty>` directive already stripped.
 pub(super) fn check_username_attributable(name: &str) -> Result<(), UsernameRejection> {
-    let Some((address, worker)) = name.rsplit_once('.') else {
+    let Some((address, worker)) = name.split_once('.') else {
         return Err(UsernameRejection::NoSeparator);
     };
     if worker.is_empty() {
@@ -459,6 +461,33 @@ mod username_difficulty_tests {
         // Refused: no separator at all, which was already the case before #479.
         assert_eq!(check_username_attributable(ADDR), Err(NoSeparator));
         assert_eq!(check_username_attributable(""), Err(NoSeparator));
+    }
+
+    /// The address/worker split is on the FIRST dot, so a multi-dot worker survives intact.
+    ///
+    /// `bc1qAAA.farm1.rig1` and `bc1qAAA.farm2.rig1` used to collapse to the same identity,
+    /// because the worker was taken from the LAST dot and both yielded `rig1`. Worse, the
+    /// consumer took the address from everything BEFORE the last dot — `bc1qAAA.farm1` — which
+    /// is not a valid Bitcoin address at all (#481).
+    #[test]
+    fn a_multi_dot_worker_keeps_its_full_name() {
+        let a = format!("{ADDR}.farm1.rig1");
+        let b = format!("{ADDR}.farm2.rig1");
+        assert_eq!(extract_worker_name(&a), "farm1.rig1");
+        assert_eq!(extract_worker_name(&b), "farm2.rig1");
+        assert_ne!(
+            extract_worker_name(&a),
+            extract_worker_name(&b),
+            "two rigs under different farms must not collapse to one identity"
+        );
+    }
+
+    /// Single-dot usernames — every miner in production — are completely unaffected, because
+    /// the first and last dot are the same dot.
+    #[test]
+    fn a_single_dot_username_is_unchanged_by_the_convention() {
+        assert_eq!(extract_worker_name(&format!("{ADDR}.rig1")), "rig1");
+        assert_eq!(check_username_attributable(&format!("{ADDR}.rig1")), Ok(()));
     }
 
     /// A `.d=` directive is stripped before the check, so declaring a difficulty must not
