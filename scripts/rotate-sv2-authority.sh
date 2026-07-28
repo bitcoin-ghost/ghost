@@ -22,6 +22,7 @@ set -euo pipefail
 
 POOL_CONF=/etc/ghost/pool-config.toml
 TRAN_CONF=/etc/ghost/translator-config.toml
+NODE_CONF=/etc/ghost/pool.toml
 STAMP=$(date +%Y%m%d-%H%M%S)
 SV2_PORT=34255
 POOL_READY_TIMEOUT=240
@@ -30,12 +31,18 @@ TRAN_READY_TIMEOUT=180
 restore() {
     cp -a "${POOL_CONF}.bak.${STAMP}" "$POOL_CONF"
     cp -a "${TRAN_CONF}.bak.${STAMP}" "$TRAN_CONF"
+    # pool.toml too, and ghost-pool below to reload it. A rollback that restores the
+    # SERVED key but leaves the ADVERTISED one rolled forward is the exact drift this
+    # script exists to prevent — the pool would answer on the old key while the API
+    # told miners to pin the new one.
+    cp -a "${NODE_CONF}.bak.${STAMP}" "$NODE_CONF"
     systemctl restart sri-pool || true
     for _ in $(seq 1 "$POOL_READY_TIMEOUT"); do
         ss -ltn 2>/dev/null | grep -q ":${SV2_PORT}" && break
         sleep 1
     done
     systemctl restart sri-translator || true
+    systemctl restart ghost-pool || true
 }
 
 # REFUSE if anything outside this box is connected to the SV2 port.
@@ -71,7 +78,7 @@ if [ "${EXTERNAL:-0}" -gt 0 ]; then
     echo "  WARNING: proceeding — the miners above will stay down until reconfigured." >&2
 fi
 
-for f in "$POOL_CONF" "$TRAN_CONF"; do
+for f in "$POOL_CONF" "$TRAN_CONF" "$NODE_CONF"; do
     [[ -r "$f" ]] || { echo "REFUSED: cannot read $f" >&2; exit 1; }
     cp -a "$f" "${f}.bak.${STAMP}"
 done
@@ -91,6 +98,15 @@ sed -i "s|^authority_public_key *= *\".*\"|authority_public_key = \"${NEW_PUB}\"
 sed -i "s|^authority_secret_key *= *\".*\"|authority_secret_key = \"${NEW_SEC}\"|" "$POOL_CONF"
 sed -i "s|^authority_pubkey *= *\".*\"|authority_pubkey = \"${NEW_PUB}\"|" "$TRAN_CONF"
 
+# Third file: what the node ADVERTISES on /api/v1/mining/status. Miss it and the API keeps
+# naming the old key, so the website and dashboard hand miners a pin that no longer works —
+# and the old key's secret is, by definition, the one we are rotating away from (#516).
+if grep -q '^sv2_authority_public_key' "$NODE_CONF"; then
+    sed -i "s|^sv2_authority_public_key.*|sv2_authority_public_key = \"${NEW_PUB}\"|" "$NODE_CONF"
+else
+    sed -i "/^\[network\]/a sv2_authority_public_key = \"${NEW_PUB}\"" "$NODE_CONF"
+fi
+
 # Verify the two agree BEFORE restarting anything — a mismatch here is a dead node.
 P=$(sed -n 's/^authority_public_key *= *"\(.*\)"$/\1/p' "$POOL_CONF")
 T=$(sed -n 's/^authority_pubkey *= *"\(.*\)"$/\1/p' "$TRAN_CONF")
@@ -98,6 +114,7 @@ if [[ "$P" != "$T" || "$P" != "$NEW_PUB" ]]; then
     echo "REFUSED: pool/translator keys disagree after edit — restoring" >&2
     cp -a "${POOL_CONF}.bak.${STAMP}" "$POOL_CONF"
     cp -a "${TRAN_CONF}.bak.${STAMP}" "$TRAN_CONF"
+    cp -a "${NODE_CONF}.bak.${STAMP}" "$NODE_CONF"
     exit 1
 fi
 

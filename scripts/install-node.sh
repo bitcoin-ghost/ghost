@@ -890,6 +890,22 @@ SV2_AUTH_PUB="$(sed -n 's/^authority_public_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEY
 SV2_AUTH_SEC="$(sed -n 's/^authority_secret_key *= *"\(.*\)"$/\1/p' <<<"$SV2_KEYPAIR")"
 [[ -n "$SV2_AUTH_PUB" && -n "$SV2_AUTH_SEC" ]] || err "Could not parse the generated SV2 authority keypair."
 
+# Tell the node its OWN authority key, so /api/v1/mining/status advertises the key this
+# node's pool_sv2 actually presents. pool.toml was written earlier — before the keypair
+# existed — so it is patched here rather than templated above.
+#
+# There is no default to fall back on and there must not be one: an SV2 miner that pins a
+# wrong key cannot reach this pool, but WOULD authenticate anyone holding the secret half
+# of whatever key it was told to trust (#516). Unset, the API says `null`, which is the
+# honest answer.
+if grep -q '^sv2_authority_public_key' /etc/ghost/pool.toml; then
+  sed -i "s|^sv2_authority_public_key.*|sv2_authority_public_key = \"${SV2_AUTH_PUB}\"|" /etc/ghost/pool.toml
+else
+  sed -i "/^\[network\]/a sv2_authority_public_key = \"${SV2_AUTH_PUB}\"" /etc/ghost/pool.toml
+fi
+grep -q "^sv2_authority_public_key = \"${SV2_AUTH_PUB}\"$" /etc/ghost/pool.toml \
+  || err "Failed to record the SV2 authority public key in pool.toml."
+
 # Farm/rental tier (#410). Emitted ONLY for public_pool: a private or solo node has a
 # known set of miners and no rented hashrate to serve, so a second public listener is
 # surface it does not need. `reconcile-mining-firewall.sh` opens 4444 on the same

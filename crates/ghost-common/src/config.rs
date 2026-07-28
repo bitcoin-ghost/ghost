@@ -1358,14 +1358,19 @@ pub struct NetworkConfig {
     /// Ghost Shroud: random relay delay (0-5s) to prevent origin analysis
     #[serde(default)]
     pub shroud_enabled: bool,
-    /// SV2 pool authority public key advertised on `/api/v1/mining/status`.
+    /// This node's OWN SV2 authority public key, advertised on
+    /// `/api/v1/mining/status`.
     ///
-    /// SV2/Noise miners must pin the pool's authority public key to connect.
-    /// This is the `authority_public_key` that the colocated `pool_sv2` instance
-    /// publishes in its own pool config; it is identical across every node on
-    /// the public pool. Leave unset to advertise the network-wide default
-    /// (`constants::SV2_AUTHORITY_PUBLIC_KEY`); set this only when running a
-    /// bespoke authority keypair so the dashboard reports the correct value.
+    /// SV2/Noise miners pin it to authenticate the pool, and it must match the
+    /// `authority_public_key` that the colocated `pool_sv2` presents. Every node
+    /// has its own keypair — `install-node.sh` generates one per node — so there
+    /// is no network-wide value and nothing to default to.
+    ///
+    /// Left unset, the API advertises `null`. That is deliberate: a wrong pin is
+    /// worse than a missing one, because the miner cannot reach the real pool but
+    /// WOULD authenticate anyone holding the secret half of the advertised key
+    /// (#516). Keep it in step with `pool-config.toml` whenever the keypair is
+    /// rotated — `rotate-sv2-authority.sh` does this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sv2_authority_public_key: Option<String>,
     /// HTTP rate-limiter trusted-IP allowlist.
