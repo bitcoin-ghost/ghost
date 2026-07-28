@@ -166,6 +166,11 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                     debug!("Applied last_new_prev_hash to new extended channel");
                 }
 
+                // Same as the template handler: the token must only be popped when ALL three
+                // are present, so the `is_some()` guards cannot be folded into `if let`
+                // bindings without leaking an allocation token when one is absent. Edition
+                // 2021, so no let-chains. The `expect`s are guarded directly above.
+                #[allow(clippy::unnecessary_unwrap)]
                 let set_custom_job = if get_jd_mode() == JdMode::CoinbaseOnly
                     && data.job_factory.is_some()
                     && data.last_future_template.is_some()
