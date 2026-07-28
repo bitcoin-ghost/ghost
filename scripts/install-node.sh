@@ -642,7 +642,18 @@ zmqpubhashblock=tcp://127.0.0.1:28332
 zmqpubhashtx=tcp://127.0.0.1:28333
 zmqpubsequence=tcp://127.0.0.1:28334
 dbcache=1024
-maxconnections=50
+# Core's default is 125. This was 50, which sounds merely conservative but is not: Core
+# reserves the outbound slots, so 50 leaves roughly 40 inbound, and a settled node sits at
+# ~39 of them. The node is then FULL, and a full node REFUSES new peers — including
+# crawlers, which then record it as unreachable and drop it from public listings. The fleet
+# vanished from node directories for exactly this reason while every node was healthy,
+# listening on 0.0.0.0:8333 and externally reachable.
+#
+# It also means the node contributes far less relay capacity than the hardware allows.
+#
+# Raise this only with the box's memory in mind. ghost-pool already holds a large working
+# set on the smaller nodes (#417/#418), and connections are not free.
+maxconnections=125
 fallbackfee=0.00001
 assumevalid=${ASSUMEVALID}
 EOF
