@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 46;
+const SCHEMA_VERSION: u32 = 47;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -123,6 +123,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (44, migrate_v44),
         (45, migrate_v45),
         (46, migrate_v46),
+        (47, migrate_v47),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2250,6 +2251,34 @@ fn migrate_v46(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v47: storage for the signed mesh node-list checkpoint (#402, #467).
+///
+/// Cherry-picked verbatim from `pool-hardening`, which is where this migration was written and
+/// where vm6 and vm8 already ran it. Their live table is byte-identical to this statement, so
+/// landing it here converges them rather than leaving two nodes claiming version 47 for a
+/// migration `main` never had (#523).
+///
+/// The checkpoint gate is dormant, so this creates the table and nothing writes to it yet.
+fn migrate_v47(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v47: mesh_node_list_checkpoints");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mesh_node_list_checkpoints (
+            height             INTEGER PRIMARY KEY,
+            cutoff_ts          INTEGER NOT NULL,
+            list_root          BLOB    NOT NULL,
+            signer_set_root    BLOB    NOT NULL,
+            proposer_id        TEXT    NOT NULL,
+            active_node_count  INTEGER NOT NULL,
+            proposer_signature BLOB    NOT NULL,
+            detail             BLOB    NOT NULL,
+            created_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+        );",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v47: created mesh_node_list_checkpoints");
+    Ok(())
+}
+
 /// v41: rewrite legacy locally-received shares into canonical INTERNAL byte order.
 ///
 /// The SV1/SV2 layer reports `share_hash` in big-endian DISPLAY order (PoW zeros at the front).
@@ -2324,6 +2353,42 @@ fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> 
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// v47 creates the mesh node-list checkpoint table, and doing so must be idempotent —
+    /// vm6 and vm8 already have it from a `pool-hardening` build, so this migration meets an
+    /// existing table on those nodes (#523).
+    #[test]
+    fn v47_creates_the_checkpoint_table_and_tolerates_an_existing_one() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+        assert_eq!(get_schema_version(&conn).unwrap(), 47);
+
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'mesh_node_list_checkpoints'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("table must exist after migrating");
+        // The columns the checkpoint blob is stored under. Pinned because vm6/vm8 already hold
+        // this exact shape; a divergence here would split the fleet's schema silently.
+        for col in [
+            "height",
+            "cutoff_ts",
+            "list_root",
+            "signer_set_root",
+            "proposer_id",
+            "active_node_count",
+            "proposer_signature",
+            "detail",
+            "created_at",
+        ] {
+            assert!(sql.contains(col), "v47 table is missing `{col}`: {sql}");
+        }
+
+        // Running it again against the existing table must not error.
+        migrate_v47(&conn).expect("v47 must be idempotent");
+    }
 
     /// A database from a NEWER build must be left alone, and must not be mistaken for one
     /// that is up to date.
