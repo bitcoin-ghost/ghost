@@ -204,7 +204,7 @@ fn main() {
         "  Encrypted change note: {} bytes (value={}, blinding={}...)",
         encrypted_change.len(),
         change_value,
-        &hex::encode(&change_blinding[..4])
+        hex::encode(&change_blinding[..4])
     );
     assert!(
         encrypted_change.len() >= 109,
@@ -226,7 +226,7 @@ fn main() {
         "  Encrypted recipient note: {} bytes (value={}, blinding={}...)",
         encrypted_recipient.len(),
         transfer_amount,
-        &hex::encode(&recipient_new_blinding[..4])
+        hex::encode(&recipient_new_blinding[..4])
     );
     assert!(
         encrypted_recipient.len() >= 109,
@@ -276,7 +276,7 @@ fn main() {
     println!(
         "  Decrypted change: value={}, blinding={}..., index={}",
         decrypted_change.value,
-        &hex::encode(&decrypted_change.blinding[..4]),
+        hex::encode(&decrypted_change.blinding[..4]),
         decrypted_change.note_index
     );
 
@@ -290,7 +290,7 @@ fn main() {
     println!(
         "  Decrypted recipient: value={}, blinding={}..., index={}",
         decrypted_recipient.value,
-        &hex::encode(&decrypted_recipient.blinding[..4]),
+        hex::encode(&decrypted_recipient.blinding[..4]),
         decrypted_recipient.note_index
     );
 

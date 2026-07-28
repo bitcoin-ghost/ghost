@@ -274,7 +274,7 @@ pub fn sign_owned_inputs(
         let psbt_in = psbt
             .inputs
             .get(i)
-            .ok_or_else(|| PsbtError::InputMissingPrevout { input_index: i })?;
+            .ok_or(PsbtError::InputMissingPrevout { input_index: i })?;
         if let Some(wu) = &psbt_in.witness_utxo {
             prev_txouts.push(wu.clone());
         } else if let Some(nwu) = &psbt_in.non_witness_utxo {
@@ -617,7 +617,7 @@ pub fn create_psbt(
             let residual = total_in - amount_sats - fee;
             if residual <= DUST {
                 // Drop the change output: residual rolls into fee.
-                let est_no_change = 11 + n_inputs * 58 + 1 * 31;
+                let est_no_change = 11 + n_inputs * 58 + 31;
                 let fee_no_change = est_no_change.saturating_mul(fee_rate_sats_per_vb);
                 if total_in >= amount_sats.saturating_add(fee_no_change) {
                     fee = total_in - amount_sats; // entire residual = fee
@@ -807,7 +807,7 @@ pub fn bump_fee(
     }
     let total_in: u64 = prev_txouts.iter().map(|o| o.value.to_sat()).sum();
     let total_out: u64 = unsigned.output.iter().map(|o| o.value.to_sat()).sum();
-    let old_fee = total_in.checked_sub(total_out).unwrap_or(0);
+    let old_fee = total_in.saturating_sub(total_out);
 
     // Old fee rate (rough): old_fee / vbytes. We over-estimate
     // vbytes the same way `create_psbt` does (n_inputs × 58 + 11 +
@@ -869,7 +869,7 @@ pub fn bump_fee(
         .unwrap_or(&owned_outs[0]);
 
     let old_change = unsigned.output[change_idx].value.to_sat();
-    let new_change = old_change.checked_sub(extra_fee).unwrap_or(0);
+    let new_change = old_change.saturating_sub(extra_fee);
     if new_change < DUST {
         return Err(BumpError::ChangeBelowDust { dust: DUST });
     }
@@ -1266,8 +1266,8 @@ mod tests {
 
         // Build the 2-of-2 multisig redeemScript (sortedmulti
         // ordering by lexicographic pubkey serialisation).
-        let mut pubkeys = vec![PublicKey::new(pk_a), PublicKey::new(pk_b)];
-        pubkeys.sort_by(|x, y| x.to_bytes().cmp(&y.to_bytes()));
+        let mut pubkeys = [PublicKey::new(pk_a), PublicKey::new(pk_b)];
+        pubkeys.sort_by_key(|x| x.to_bytes());
         use bitcoin::blockdata::opcodes;
         use bitcoin::blockdata::script::Builder;
         let redeem = Builder::new()

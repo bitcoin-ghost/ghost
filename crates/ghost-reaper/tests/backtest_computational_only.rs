@@ -40,19 +40,21 @@ fn fetch_raw_block(hash: &str) -> Option<Vec<u8>> {
 #[ignore]
 fn backtest_computational_only() {
     // Disable ALL pattern filters — only computational checks active
-    let mut config = ReaperConfig::default();
-    config.reject_inscription_envelope = false;
-    config.reject_drop_stuffing = false;
-    config.reject_unreachable_code = false;
-    config.reject_fake_pubkeys = false;
-    config.reject_annex = false;
-    config.max_op_return_bytes = usize::MAX; // effectively disable OP_RETURN check
-    config.reject_legacy_data_stuffing = false;
-    // Keep computational checks ON
-    config.reject_excess_witness = true;
-    config.min_excess_witness_bytes = 500;
-    // Keep EC validation ON (it's output-level, independent of witness patterns)
-    config.validate_pubkey_curve_point = true;
+    let config = ReaperConfig {
+        reject_inscription_envelope: false,
+        reject_drop_stuffing: false,
+        reject_unreachable_code: false,
+        reject_fake_pubkeys: false,
+        reject_annex: false,
+        max_op_return_bytes: usize::MAX, // effectively disable OP_RETURN check
+        reject_legacy_data_stuffing: false,
+        // Keep computational checks ON
+        reject_excess_witness: true,
+        min_excess_witness_bytes: 500,
+        // Keep EC validation ON (it's output-level, independent of witness patterns)
+        validate_pubkey_curve_point: true,
+        ..Default::default()
+    };
 
     let tip_output = Command::new("curl")
         .args(["-sf", "https://mempool.space/api/blocks/tip/height"])

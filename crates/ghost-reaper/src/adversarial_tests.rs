@@ -130,8 +130,10 @@ fn test_novel_excess_stack_items_bypass() {
 
     let tx = tx_with_tapscript(&script, &[&junk1, &junk2, &sig]);
 
-    let mut config = ReaperConfig::default();
-    config.min_excess_witness_bytes = 100; // lower threshold
+    let config = ReaperConfig {
+        min_excess_witness_bytes: 100, // lower threshold
+        ..Default::default()
+    };
     let verdict = analyze(&tx, &config);
 
     // The pattern filters find nothing (no envelope, no DROP, no OP_RETURN)
@@ -193,8 +195,10 @@ fn test_novel_excess_stack_p2wsh_multisig() {
 
     let tx = tx_with_witness_script(&ws, &[&junk1, &junk2, &dummy, &sig1, &sig2]);
 
-    let mut config = ReaperConfig::default();
-    config.min_excess_witness_bytes = 100;
+    let config = ReaperConfig {
+        min_excess_witness_bytes: 100,
+        ..Default::default()
+    };
     let verdict = analyze(&tx, &config);
 
     let analysis = &verdict.input_analyses[0];
@@ -852,8 +856,10 @@ fn test_ec_validation_disabled_fallback() {
         script_pubkey: ScriptBuf::from(script),
     }];
     let tx = tx_with_outputs(outputs);
-    let mut config = ReaperConfig::default();
-    config.validate_pubkey_curve_point = false;
+    let config = ReaperConfig {
+        validate_pubkey_curve_point: false,
+        ..Default::default()
+    };
     let verdict = analyze(&tx, &config);
 
     // With EC validation off, 0x02 prefix passes
@@ -965,8 +971,10 @@ fn test_legacy_disabled() {
             script_pubkey: p2wpkh_script(),
         }],
     };
-    let mut config = ReaperConfig::default();
-    config.reject_legacy_data_stuffing = false;
+    let config = ReaperConfig {
+        reject_legacy_data_stuffing: false,
+        ..Default::default()
+    };
     let verdict = analyze(&tx, &config);
 
     assert!(

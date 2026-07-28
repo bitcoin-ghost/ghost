@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(tx.inputs[0].txid, "tx1");
         assert!(tx.fee > 0);
         // Should have recipient + change outputs
-        assert!(tx.outputs.len() >= 1);
+        assert!(!tx.outputs.is_empty());
     }
 
     #[test]

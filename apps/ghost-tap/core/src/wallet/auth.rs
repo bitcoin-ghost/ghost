@@ -198,7 +198,7 @@ mod tests {
         assert!(!pm.has_pin());
         pm.set_pin("123456").unwrap();
         assert!(pm.has_pin());
-        assert_eq!(pm.verify_pin("123456").unwrap(), true);
+        assert!(pm.verify_pin("123456").unwrap());
         assert_eq!(pm.remaining_attempts(), 5);
     }
 
@@ -206,7 +206,7 @@ mod tests {
     fn test_wrong_pin() {
         let pm = test_pm("wrong");
         pm.set_pin("111111").unwrap();
-        assert_eq!(pm.verify_pin("000000").unwrap(), false);
+        assert!(!pm.verify_pin("000000").unwrap());
         assert_eq!(pm.remaining_attempts(), 4);
     }
 
@@ -216,7 +216,7 @@ mod tests {
         pm.set_pin("999999").unwrap();
 
         for i in 0..4u32 {
-            assert_eq!(pm.verify_pin("000000").unwrap(), false);
+            assert!(!pm.verify_pin("000000").unwrap());
             assert_eq!(pm.remaining_attempts(), 4 - i);
         }
         // 5th failure triggers lockout
@@ -231,12 +231,12 @@ mod tests {
     fn test_correct_pin_resets_counter() {
         let pm = test_pm("reset");
         pm.set_pin("123456").unwrap();
-        assert_eq!(pm.verify_pin("000000").unwrap(), false);
-        assert_eq!(pm.verify_pin("000000").unwrap(), false);
+        assert!(!pm.verify_pin("000000").unwrap());
+        assert!(!pm.verify_pin("000000").unwrap());
         assert_eq!(pm.remaining_attempts(), 3);
 
         // Correct PIN resets counter
-        assert_eq!(pm.verify_pin("123456").unwrap(), true);
+        assert!(pm.verify_pin("123456").unwrap());
         assert_eq!(pm.remaining_attempts(), 5);
     }
 

@@ -5566,7 +5566,7 @@ async fn api_rewards_node_history_handler(
         let nodes = db.get_nodes_with_balance(0).unwrap_or_default();
         let history_json: Vec<_> = nodes
             .iter()
-            .filter(|n| cutoff.map_or(true, |c| n.updated_at as i64 >= c))
+            .filter(|n| cutoff.is_none_or(|c| n.updated_at >= c))
             .map(|n| {
                 serde_json::json!({
                     "node_id": n.node_id,
@@ -5720,7 +5720,7 @@ async fn api_qualification_scoped_set_handler(
     // Deterministic hash of a qualified set: sort by node id, then fold in (id ‖ shares_le).
     let hash_set = |set: &[([u8; 32], i32)]| -> String {
         let mut v = set.to_vec();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.sort_by_key(|a| a.0);
         let mut h = Sha256::new();
         for (id, shares) in &v {
             h.update(id);
@@ -6439,8 +6439,7 @@ pub fn run_ghostd_apply_reaper() -> Result<String, String> {
         let detail = stderr
             .lines()
             .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .last()
+            .rfind(|l| !l.is_empty())
             .unwrap_or("no error output");
         Err(format!(
             "`ghost-setup apply-reaper` failed ({}): {detail}",

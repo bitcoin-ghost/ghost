@@ -166,7 +166,7 @@ impl ParsedDescriptor {
         }
         // sortedmulti: lexicographic sort of compressed pubkey
         // serialisation.
-        child_pubkeys.sort_by(|a, b| a.to_bytes().cmp(&b.to_bytes()));
+        child_pubkeys.sort_by_key(|a| a.to_bytes());
         let redeem = build_multisig_redeem(self.k, &child_pubkeys);
         let p2wsh_spk = ScriptBuf::new_p2wsh(&redeem.wscript_hash());
         Address::from_script(&p2wsh_spk, network)
@@ -223,7 +223,7 @@ impl ParsedDescriptor {
                 .map_err(|e| DescriptorError::Derivation(format!("derive_pub: {e}")))?;
             child_pubkeys.push(PublicKey::new(derived.public_key));
         }
-        child_pubkeys.sort_by(|a, b| a.to_bytes().cmp(&b.to_bytes()));
+        child_pubkeys.sort_by_key(|a| a.to_bytes());
         Ok(build_multisig_redeem(self.k, &child_pubkeys))
     }
 }

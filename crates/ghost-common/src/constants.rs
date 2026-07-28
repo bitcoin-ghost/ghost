@@ -358,8 +358,10 @@ pub fn l2_epoch_from_height(block_height: u64) -> u64 {
 /// - Economy: every 28 epochs (~7d) — 0.5x fee
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SettlementClass {
     Express,
+    #[default]
     Standard,
     Economy,
 }
@@ -393,7 +395,7 @@ impl SettlementClass {
 
     /// Returns true if this class should settle at the given epoch number.
     pub fn is_due_at_epoch(self, epoch: u64) -> bool {
-        epoch > 0 && epoch % self.epoch_multiplier() == 0
+        epoch > 0 && epoch.is_multiple_of(self.epoch_multiplier())
     }
 
     /// Parse from string (case-insensitive).
@@ -413,12 +415,6 @@ impl SettlementClass {
             Self::Standard => "standard",
             Self::Economy => "economy",
         }
-    }
-}
-
-impl Default for SettlementClass {
-    fn default() -> Self {
-        Self::Standard
     }
 }
 

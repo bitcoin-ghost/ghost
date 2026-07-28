@@ -2181,20 +2181,15 @@ impl Default for AlertEvents {
 /// Serialises to a single compact string so it round-trips cleanly through both
 /// pool.toml (`interval = "daily"`) and the dashboard JSON API: `Daily`→`"daily"`,
 /// `Weekly`→`"weekly"`, and a custom period →`"<n>h"` (e.g. `"6h"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackupInterval {
     /// Every 24 hours.
+    #[default]
     Daily,
     /// Every 7 days.
     Weekly,
     /// Every N hours (clamped to a 1-hour floor).
     Hours(u32),
-}
-
-impl Default for BackupInterval {
-    fn default() -> Self {
-        BackupInterval::Daily
-    }
 }
 
 impl BackupInterval {
