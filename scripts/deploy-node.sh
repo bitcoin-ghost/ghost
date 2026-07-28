@@ -119,6 +119,35 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
     fi
 fi
 
+# Exercise the SHARE-SUBMISSION path against a node, synthetically.
+#
+# A canary has no miners (#461), so "healthy for 60 minutes" says nothing about the code path
+# where both of the regressions that motivated this gate actually lived: attribution, and a
+# declared difficulty that never reached the wire. A node can sit green for the whole window
+# with either bug fully present and the soak will still report satisfied — the same
+# can't-fail-shape as #459.
+#
+# The smoke suite synthesises a real SV1 client, so it works on a node with zero miners. It is
+# the only part of the soak that touches submission at all, which is why it is mandatory here
+# rather than a remembered manual step.
+#
+# Returns 0 if the submission path answered correctly.
+exercise_submission_path() {
+    local node="$1" host
+    host=$(ssh_host_for "$node") || return 1
+    [ -n "$host" ] || return 1
+
+    timeout 120 python3 "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py" \
+        "$host" 3333 2>&1 | sed 's/^/      /'
+    return "${PIPESTATUS[0]}"
+}
+
+# Resolve a node alias to something the smoke client can connect to. The probes run from HERE,
+# not on the node, so `localhost` is wrong — it needs the address ssh would dial.
+ssh_host_for() {
+    ssh -G "$1" 2>/dev/null | awk '/^hostname /{print $2; exit}'
+}
+
 # 4. Canary soak before production. The bugs that hurt were behavioural and only showed
 #    under real traffic over time — an hourly livelock, and attribution that looked fine
 #    until a share was actually mined and its DB row inspected.
@@ -149,7 +178,17 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
                 continue
             fi
         fi
-        SOAKED="$c (${elapsed}m)"
+        # Re-run at the END of the window, not only at the start. A one-shot check at minute
+        # zero cannot see anything that emerges under sustained traffic — drift, a leak, a
+        # livelock, vardiff misbehaving over many ticks. The hourly OOM took hours to show.
+        info "re-checking the submission path on $c after ${elapsed}m"
+        if ! exercise_submission_path "$c"; then
+            info "ignoring soak on $c: submission path FAILS at the end of the window"
+            rm -f "$f"
+            continue
+        fi
+
+        SOAKED="$c (${elapsed}m, submission path verified)"
         break
     done
     [ -n "$SOAKED" ] || die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on a canary
@@ -308,6 +347,16 @@ if echo "$CANARY_NODES" | grep -qw "$NODE"; then
     # still running this build rather than something a rollback restored underneath it.
     LIVE_HASH=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" \
         "sha256sum /opt/ghost/bin/$BINARY 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)
+
+    # Do not start a clock on a build whose submission path is already broken. Waiting an hour
+    # to discover that is an hour spent proving nothing (#461).
+    info "exercising the share-submission path on $NODE before starting the clock"
+    if ! exercise_submission_path "$NODE"; then
+        die "submission-path smoke FAILED on $NODE — no soak clock started for $BINARY @ $SHORT
+       a canary cannot vouch for a build whose miners cannot handshake"
+    fi
+    info "submission path OK on $NODE"
+
     printf '%s %s\n' "$(date +%s)" "${LIVE_HASH:-}" > "$STATE_DIR/soaked-$SHA-$NODE-$BINARY"
     info "soak clock started for $BINARY @ $SHORT on $NODE (${SOAK_MINUTES}m required before production)"
 fi
