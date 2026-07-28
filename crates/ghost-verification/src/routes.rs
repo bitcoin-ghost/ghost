@@ -35,9 +35,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use ghost_buds::{BudsClassifier, BudsTier};
-use ghost_common::constants::{
-    ACTIVE_MINER_WINDOW_SECS, SV1_STRATUM_PORT, SV2_AUTHORITY_PUBLIC_KEY, SV2_STRATUM_PORT,
-};
+use ghost_common::constants::{ACTIVE_MINER_WINDOW_SECS, SV1_STRATUM_PORT, SV2_STRATUM_PORT};
 use ghost_common::rpc::MempoolFilterStats;
 
 use crate::auth::{verify_internal_auth, InternalAuth};
@@ -1853,17 +1851,23 @@ async fn api_mining_status_handler(
     let mesh_hashrate_th = state.mesh_total_hashrate().unwrap_or(total_hashrate_th);
     let local_hashrate_th = state.local_hashrate().unwrap_or(total_hashrate_th);
 
-    // SV2/Noise miners must pin the pool's authority public key to connect.
-    // Source it from the node's own pool config when the operator set a bespoke
-    // `[network] sv2_authority_public_key`; otherwise advertise the network-wide
-    // default so the dashboard can stop hardcoding it as a frontend constant.
+    // SV2/Noise miners must pin the pool's authority public key to connect, and
+    // every node has its OWN keypair — so this is read from this node's
+    // `[network] sv2_authority_public_key` and NEVER defaulted.
+    //
+    // There used to be a network-wide `SV2_AUTHORITY_PUBLIC_KEY` constant to fall
+    // back on. It stopped matching any node once per-node keypairs shipped, and a
+    // wrong pin is worse than a missing one: the miner cannot reach the real pool,
+    // but WOULD authenticate anyone holding the secret half of the advertised key.
+    // A node that does not know its own key must say so (#516).
+    //
     // (Reading full_node_config is a non-async lock, safe alongside the config
     // guard held above — no await points follow.)
-    let authority_public_key = state
+    let authority_public_key: Option<String> = state
         .full_node_config
         .as_ref()
         .and_then(|c| c.read().network.sv2_authority_public_key.clone())
-        .unwrap_or_else(|| SV2_AUTHORITY_PUBLIC_KEY.to_string());
+        .filter(|k| !k.trim().is_empty());
 
     // Source the operator's pool name and node-reward payout address from the
     // REAL persisted config (pool.toml) so the dashboard round-trips the saved
@@ -11137,9 +11141,10 @@ async fn api_settings_ghostpay_payout_address_post_handler(
     let persist = persist_full_config(&state, |cfg| match cfg.ghost_pay {
         Some(ref mut gp) => gp.payout_address = new_address.clone(),
         None => {
-            let mut gp = ghost_common::config::GhostPayConfig::default();
-            gp.payout_address = new_address.clone();
-            cfg.ghost_pay = Some(gp);
+            cfg.ghost_pay = Some(ghost_common::config::GhostPayConfig {
+                payout_address: new_address.clone(),
+                ..Default::default()
+            });
         }
     });
     if let Err((code, msg)) = persist {
@@ -14287,16 +14292,20 @@ mod tests {
         assert_eq!(data["miners"].as_array().unwrap().len(), 1);
     }
 
-    /// `/api/v1/mining/status` exposes the SV2 authority public key so the
-    /// dashboard can source it dynamically. Defaults to the network-wide
-    /// constant, and honours a per-node `[network] sv2_authority_public_key`.
+    /// `/api/v1/mining/status` exposes this node's OWN SV2 authority public key,
+    /// and `null` when it does not know it.
+    ///
+    /// It must never substitute a default. Every node has its own keypair, so a
+    /// defaulted key matches nobody — and a miner that pins a wrong key cannot
+    /// reach the real pool while still authenticating whoever holds that key's
+    /// secret half (#516).
     #[tokio::test]
     async fn test_mining_status_exposes_authority_key() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::types::NodeCapabilities;
         use ghost_policy::PolicyProfile;
 
-        async fn authority(state: Arc<crate::server::VerificationState>) -> String {
+        async fn authority(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
             let app = super::create_router(state);
             let response = app
                 .oneshot(
@@ -14313,13 +14322,15 @@ mod tests {
                 .await
                 .unwrap();
             let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            data["authority_public_key"]
-                .as_str()
-                .expect("authority_public_key must be present")
-                .to_string()
+            assert!(
+                data.get("authority_public_key").is_some(),
+                "the field must always be present, even when the value is null"
+            );
+            data["authority_public_key"].clone()
         }
 
-        // Default: the network-wide constant.
+        // Unconfigured: null, NOT a guess. This is the whole point of #516 — a
+        // plausible-but-wrong pin is more dangerous than an absent one.
         let default_state = Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
@@ -14328,8 +14339,27 @@ mod tests {
         ));
         assert_eq!(
             authority(default_state).await,
-            SV2_AUTHORITY_PUBLIC_KEY,
-            "status must advertise the default SV2 authority key"
+            serde_json::Value::Null,
+            "a node that does not know its own authority key must advertise null"
+        );
+
+        // An empty or whitespace-only setting is "not configured", not a key.
+        let dir_blank = tempfile::tempdir().unwrap();
+        let mut blank_cfg = FullNodeConfig::default();
+        blank_cfg.network.sv2_authority_public_key = Some("   ".to_string());
+        let blank_state = Arc::new(
+            crate::server::VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+            .with_full_node_config(blank_cfg, dir_blank.path().join("pool.toml")),
+        );
+        assert_eq!(
+            authority(blank_state).await,
+            serde_json::Value::Null,
+            "a blank setting must read as unconfigured, not as an empty key"
         );
 
         // Operator override via pool.toml wins.
@@ -14346,7 +14376,11 @@ mod tests {
             )
             .with_full_node_config(cfg, path),
         );
-        assert_eq!(authority(override_state).await, "customAuthorityKey123");
+        assert_eq!(
+            authority(override_state).await,
+            serde_json::Value::String("customAuthorityKey123".to_string()),
+            "the node's own configured key must be advertised verbatim"
+        );
     }
 
     /// The self-check endpoint must serialise a FAILING snapshot so the

@@ -235,18 +235,6 @@ pub const SV1_STRATUM_PORT: u16 = 3333;
 /// provider without duplicating the literal.
 pub const TDP_PORT: u16 = 8442;
 
-/// SV2 pool authority public key (the Noise static key SV2/Noise clients pin).
-///
-/// This is the network-wide authority key that every `pool_sv2` instance
-/// publishes as `authority_public_key` in its pool config — it is identical
-/// across all pool nodes, so a miner pins this single value to authenticate any
-/// node it connects to. Surfaced on `/api/v1/mining/status` so the dashboard
-/// can source it dynamically instead of hardcoding it in the frontend.
-///
-/// Operators running a bespoke authority keypair can override this per-node via
-/// `[network] sv2_authority_public_key` in `pool.toml`.
-pub const SV2_AUTHORITY_PUBLIC_KEY: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
-
 /// HTTP API port (plain HTTP — used by SRI share webhook on loopback, the
 /// nginx public-API upstream, and the local dashboard).
 pub const HTTP_API_PORT: u16 = 8080;
