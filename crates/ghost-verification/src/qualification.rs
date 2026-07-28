@@ -30,7 +30,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use ghost_common::types::{NodeCapabilities, NodeId};
-use ghost_storage::Database;
+use ghost_storage::{queries::VerificationProofInsert, Database};
 
 /// Seconds in a day
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -1443,8 +1443,16 @@ mod tests {
     ) {
         for i in 0..n {
             let challenger = hex_id(first_challenger + i);
-            db.insert_verification_proof(&challenger, target, "archive", passed, ts, b"p", None)
-                .unwrap();
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: &challenger,
+                target_node_id: target,
+                capability: "archive",
+                passed: passed,
+                timestamp: ts,
+                proof: b"p",
+                round_height: None,
+            })
+            .unwrap();
         }
     }
 
@@ -1524,26 +1532,26 @@ mod tests {
 
         // 4 distinct challengers pass, 1 distinct challenger fails.
         for i in 0..4u8 {
-            db.insert_verification_proof(
-                &hex_id(0x30 + i),
-                &target,
-                "stratum",
-                true,
-                cutoff - 100,
-                b"p",
-                None,
-            )
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: &hex_id(0x30 + i),
+                target_node_id: &target,
+                capability: "stratum",
+                passed: true,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: None,
+            })
             .unwrap();
         }
-        db.insert_verification_proof(
-            &hex_id(0x40),
-            &target,
-            "stratum",
-            false,
-            cutoff - 100,
-            b"p",
-            None,
-        )
+        db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: &hex_id(0x40),
+            target_node_id: &target,
+            capability: "stratum",
+            passed: false,
+            timestamp: cutoff - 100,
+            proof: b"p",
+            round_height: None,
+        })
         .unwrap();
 
         let provider = QualifiedCapabilityProvider::new(db);
@@ -1629,8 +1637,16 @@ mod tests {
         ];
         for (c, a) in chs.iter().zip(clustered.iter()) {
             register_voter(&db, c, a);
-            db.insert_verification_proof(c, &target, "archive", true, cutoff - 100, b"p", None)
-                .unwrap();
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &target,
+                capability: "archive",
+                passed: true,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: None,
+            })
+            .unwrap();
         }
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
         assert!(
@@ -1667,20 +1683,28 @@ mod tests {
         ];
         for (c, a) in passers.iter() {
             register_voter(&db, c, a);
-            db.insert_verification_proof(c, &target, "stratum", true, cutoff - 100, b"p", None)
-                .unwrap();
+            db.insert_verification_proof(VerificationProofInsert {
+                challenger_id: c,
+                target_node_id: &target,
+                capability: "stratum",
+                passed: true,
+                timestamp: cutoff - 100,
+                proof: b"p",
+                round_height: None,
+            })
+            .unwrap();
         }
         // One voter-set griefer on its own subnet signs a FAIL.
         register_voter(&db, &hex_id(0x25), "10.5.0.1:3333");
-        db.insert_verification_proof(
-            &hex_id(0x25),
-            &target,
-            "stratum",
-            false,
-            cutoff - 100,
-            b"p",
-            None,
-        )
+        db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: &hex_id(0x25),
+            target_node_id: &target,
+            capability: "stratum",
+            passed: false,
+            timestamp: cutoff - 100,
+            proof: b"p",
+            round_height: None,
+        })
         .unwrap();
 
         let provider = QualifiedCapabilityProvider::new(Arc::clone(&db));
@@ -1748,15 +1772,15 @@ mod tests {
 
         for &rh in &[100u64, 200, 300, 400, 500] {
             for ch in assigned_for(&pool, &target, rh) {
-                db.insert_verification_proof(
-                    &ch,
-                    &target,
-                    "archive",
-                    true,
-                    cutoff - 100,
-                    b"p",
-                    Some(rh as i64),
-                )
+                db.insert_verification_proof(VerificationProofInsert {
+                    challenger_id: &ch,
+                    target_node_id: &target,
+                    capability: "archive",
+                    passed: true,
+                    timestamp: cutoff - 100,
+                    proof: b"p",
+                    round_height: Some(rh as i64),
+                })
                 .unwrap();
             }
         }
@@ -1790,15 +1814,15 @@ mod tests {
                 if id == &target || assigned.contains(id) {
                     continue; // insert ONLY from challengers not drawn this round
                 }
-                db.insert_verification_proof(
-                    id,
-                    &target,
-                    "archive",
-                    true,
-                    cutoff - 100,
-                    b"p",
-                    Some(rh as i64),
-                )
+                db.insert_verification_proof(VerificationProofInsert {
+                    challenger_id: id,
+                    target_node_id: &target,
+                    capability: "archive",
+                    passed: true,
+                    timestamp: cutoff - 100,
+                    proof: b"p",
+                    round_height: Some(rh as i64),
+                })
                 .unwrap();
             }
         }

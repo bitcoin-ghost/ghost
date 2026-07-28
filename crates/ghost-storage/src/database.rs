@@ -1628,6 +1628,10 @@ mod tests {
         assert!(stats.page_count > 0);
     }
 
+    // Both sides ARE constants — that is the point. This guards the constant against being
+    // lowered, so it must not be "fixed" by making it dynamic or deleted for being trivially
+    // true. It fails only when someone changes VACUUM_MIN_RECLAIMABLE_BYTES.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn vacuum_threshold_is_large_enough_to_matter() {
         // The threshold exists so a rebuild only happens when it recovers meaningful disk.
