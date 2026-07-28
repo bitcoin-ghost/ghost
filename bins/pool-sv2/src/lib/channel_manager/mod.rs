@@ -360,6 +360,7 @@ impl ChannelManager {
                                         task_manager_inner.clone(),
                                         this.supported_extensions.clone(),
                                         this.required_extensions.clone(),
+                                    socket_address,
                                     );
 
                                     this.channel_manager_channel.downstream_sender.super_safe_lock(|map| map.insert(downstream_id, channel_manager_sender));

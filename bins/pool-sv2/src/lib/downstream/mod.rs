@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::{
     collections::HashMap,
     sync::{
@@ -93,6 +94,14 @@ pub struct Downstream {
     /// Cancelled when this downstream's message loop exits, causing
     /// the associated I/O tasks to shut down.
     downstream_connection_token: CancellationToken,
+    /// Peer address, carried purely so failures can name who failed.
+    ///
+    /// Without it, `Failed to set up downstream connection` identifies the peer only by an
+    /// incrementing downstream id, which is useless once the peer is reconnecting in a loop.
+    /// Diagnosing #511 — one SV2-direct miner rejecting the pool's rotated authority key —
+    /// meant grepping raw journald output for an address cycling source ports, because the
+    /// error itself named nobody.
+    peer_addr: SocketAddr,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -110,6 +119,7 @@ impl Downstream {
         task_manager: Arc<TaskManager>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        peer_addr: SocketAddr,
     ) -> Self {
         let (noise_stream_reader, noise_stream_writer) = noise_stream.into_split();
         let (inbound_tx, inbound_rx) = unbounded::<Sv2Frame>();
@@ -152,6 +162,7 @@ impl Downstream {
             supported_extensions,
             required_extensions,
             downstream_connection_token,
+            peer_addr,
         }
     }
 
@@ -169,7 +180,7 @@ impl Downstream {
     ) {
         // Setup initial connection
         if let Err(e) = self.setup_connection_with_downstream().await {
-            error!(?e, "Failed to set up downstream connection");
+            error!(?e, peer = %self.peer_addr, "Failed to set up downstream connection");
 
             // sleep to make sure SetupConnectionError is sent
             // before we break the TCP connection
