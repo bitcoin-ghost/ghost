@@ -11259,10 +11259,7 @@ mod tests {
     // =========================================================================
 
     fn test_glyph_pixels() -> Vec<u8> {
-        let mut pixels = vec![0u8; 256];
-        for i in 0..256 {
-            pixels[i] = (i % 26) as u8;
-        }
+        let pixels: Vec<u8> = (0..256).map(|i| (i % 26) as u8).collect();
         pixels
     }
 
@@ -11418,10 +11415,7 @@ mod tests {
         db.insert_glyph_claim("ghost1alice", &pixels1, &bh1, &cm1, 1000)
             .expect("Insert should succeed");
 
-        let mut pixels2 = vec![1u8; 256];
-        for i in 0..256 {
-            pixels2[i] = ((i + 1) % 26) as u8;
-        }
+        let pixels2: Vec<u8> = (0..256).map(|i| ((i + 1) % 26) as u8).collect();
         let bh2 = test_bitmap_hash(&pixels2);
         let cm2 = test_commitment(&pixels2, "ghost1bob");
         db.insert_glyph_claim("ghost1bob", &pixels2, &bh2, &cm2, 1001)

@@ -267,7 +267,7 @@ pub fn select_utxos(utxos: &[Utxo], target: u64) -> Result<Vec<Utxo>, Transactio
 
     // 3. Largest-first fallback (should be unreachable given the total check
     //    above, but included for completeness).
-    confirmed.sort_by(|a, b| b.amount.cmp(&a.amount));
+    confirmed.sort_by_key(|u| std::cmp::Reverse(u.amount));
     let mut selected = Vec::new();
     let mut total = 0u64;
     for utxo in confirmed {

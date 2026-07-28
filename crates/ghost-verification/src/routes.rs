@@ -2614,7 +2614,7 @@ async fn api_pool_recent_shares_handler(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let limit = params.limit.unwrap_or(500).min(2000).max(1);
+    let limit = params.limit.unwrap_or(500).clamp(1, 2000);
     // No watermark → start from a short look-back so the quasar has a
     // few particles to render immediately instead of waiting for the
     // next incoming share. 30 seconds is one emit-cycle at most rates.
@@ -3324,7 +3324,7 @@ async fn api_pool_leaderboard_handler(
         .as_deref()
         .unwrap_or("day")
         .to_ascii_lowercase();
-    let limit = params.limit.unwrap_or(10).min(50).max(1);
+    let limit = params.limit.unwrap_or(10).clamp(1, 50);
 
     // "lifetime" queries the `miners` table directly and ignores the
     // pruned shares timeline. Only the shares-contributed tab is useful

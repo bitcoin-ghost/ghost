@@ -727,8 +727,8 @@ mod tests {
         let addrs = test_addrs();
         let mut b = mix_builder_with_addrs(&addrs);
         let p_amt = b.min_participant_input();
-        for i in 0..5 {
-            let mut p = fake_input(i as u32, p_amt, &addrs[i]);
+        for (i, addr) in addrs.iter().enumerate().take(5) {
+            let mut p = fake_input(i as u32, p_amt, addr);
             p.change_address = None; // exact amount, no surplus
             b.add_participant(p).unwrap();
         }
