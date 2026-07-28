@@ -1319,6 +1319,18 @@ pub struct L2TreeSyncResponse {
     /// Responding node ID
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub responding_node: NodeId,
+    /// Who asked. Responses go out over the broadcast transport, so without an addressee every
+    /// node processes every response in the mesh — with N nodes that is N(N-1) handler runs for
+    /// (N-1) real answers, and each run recomputes a Merkle root. On the 8-node fleet each node
+    /// was processing ~175 responses per 10 minutes of which ~150 were answers to somebody
+    /// else's question (#517).
+    ///
+    /// `Option` + `#[serde(default)]` for wire-compat: a peer that predates this field sends
+    /// `None`, which the handler treats as "cannot tell, process it" — the old behaviour. The
+    /// amplification only disappears once both ends are upgraded, which is the honest ordering
+    /// for a mixed-version fleet.
+    #[serde(default, with = "ghost_common::serde_hex::opt_bytes32")]
+    pub requesting_node: Option<NodeId>,
     /// Checkpoint blocks (batched, max 100 per response)
     pub checkpoints: Vec<L2CheckpointBlockMessage>,
     /// Current epoch number

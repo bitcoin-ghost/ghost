@@ -56,6 +56,43 @@ pub mod bytes32 {
     }
 }
 
+/// Serialize/deserialize `Option<[u8; 32]>` as hex, or null.
+///
+/// For fields added to an existing wire type: a peer that predates the field omits it and
+/// deserialises to `None`, so the receiver can tell "not sent" from a real value instead of
+/// having to invent a sentinel.
+pub mod opt_bytes32 {
+    use super::*;
+
+    pub fn serialize<S>(bytes: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match bytes {
+            Some(b) => serializer.serialize_some(&hex::encode(b)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        let Some(s) = opt else { return Ok(None) };
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(Some(arr))
+    }
+}
+
 /// Serialize/deserialize [u8; 64] as hex
 pub mod bytes64 {
     use super::*;

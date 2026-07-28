@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity;
@@ -1609,6 +1609,9 @@ impl NullifierRouteHandler {
 
         let response = L2TreeSyncResponse {
             responding_node: self.our_id,
+            // Address it. Responses go out over the broadcast transport, so without this every
+            // node in the mesh processes every response (#517).
+            requesting_node: Some(request.requesting_node),
             checkpoints: checkpoint_blocks,
             current_epoch: self.epoch_manager.current_epoch(),
             commitment_root: canonical_root,
@@ -1629,6 +1632,31 @@ impl NullifierRouteHandler {
 
     /// Handle a tree sync response (replay checkpoints to catch up)
     fn handle_tree_sync_response(&self, response: &L2TreeSyncResponse) -> GhostResult<()> {
+        // Answers to somebody else's question are not ours to process.
+        //
+        // Responses are broadcast, so before this every node ran the full handler on every
+        // response in the mesh: with N nodes, N(N-1) runs for (N-1) real answers, each
+        // recomputing a Merkle root. On the 8-node fleet that was ~175 responses processed per
+        // node per 10 minutes against ~25 actually sent — and the surplus is what starved the
+        // runtime until the HTTP listener stopped being scheduled at all (#517).
+        //
+        // Worse than the wasted CPU: the pagination path below calls `request_tree_sync()` and
+        // mutates `sync_requests` keyed on `responding_node`, so a foreign response could drive
+        // this node into re-requesting and corrupt its own tracking state.
+        //
+        // `None` means the peer predates the field — process it, as before. The amplification
+        // only clears once both ends are upgraded, which is the honest ordering here.
+        if let Some(addressee) = response.requesting_node {
+            if addressee != self.our_id {
+                trace!(
+                    responder = %hex::encode(&response.responding_node[..8]),
+                    addressee = %hex::encode(&addressee[..8]),
+                    "Ignoring tree sync response addressed to another node"
+                );
+                return Ok(());
+            }
+        }
+
         if response.checkpoints.is_empty() {
             debug!("Empty tree sync response, nothing to replay");
             // Even with no checkpoints to replay, check root convergence.
@@ -2873,9 +2901,13 @@ mod tests {
         // B needs sign_fn to verify incoming checkpoint signatures
         handler_b.set_sign_fn(Arc::new(move |msg: &[u8]| identity_b.sign(msg)));
 
-        // Build a sync response from A's persisted checkpoint data
+        // Build a sync response from A's persisted checkpoint data.
+        //
+        // The request must carry B's real id: responses are addressed to their requester (#517)
+        // and B replays this one below. The fixture previously used a placeholder that matched
+        // no node, which only worked because every node processed every response regardless.
         let request = L2TreeSyncRequest {
-            requesting_node: [0x02; 32],
+            requesting_node: handler_b.our_id,
             from_height: 0,
             timestamp: 0,
         };
@@ -3126,6 +3158,7 @@ mod tests {
         );
         let response = L2TreeSyncResponse {
             responding_node: proposer_id,
+            requesting_node: Some(handler_ok.our_id),
             checkpoints: vec![block.clone()],
             current_epoch: 5,
             commitment_root: block.new_commitment_root,
@@ -3157,10 +3190,78 @@ mod tests {
             "re-replay must not duplicate the checkpoint"
         );
 
+        // --- A response addressed to ANOTHER node must be ignored entirely (#517) ---
+        //
+        // Responses are broadcast, so before the addressee field every node ran this handler on
+        // every response in the mesh: with N nodes, N(N-1) runs for (N-1) real answers, each
+        // recomputing a Merkle root. On the 8-node fleet that was ~175 responses processed per
+        // node per 10 minutes against ~25 actually sent, and the surplus starved the runtime
+        // until the HTTP listener stopped being scheduled at all.
+        let (db_other, handler_other) = make_node();
+        let someone_else = [0xABu8; 32];
+        assert_ne!(someone_else, handler_other.our_id);
+        let foreign = L2TreeSyncResponse {
+            responding_node: proposer_id,
+            requesting_node: Some(someone_else),
+            checkpoints: vec![block.clone()],
+            current_epoch: 5,
+            commitment_root: block.new_commitment_root,
+            epochs: vec![epoch5.clone()],
+            has_more: false,
+            timestamp: 0,
+        };
+        handler_other
+            .handle_tree_sync_response(&foreign)
+            .expect("ignoring a foreign response is not an error");
+        assert!(
+            db_other.get_l2_epoch(5).unwrap().is_none(),
+            "a response addressed to another node must not be replayed at all"
+        );
+        assert_eq!(
+            db_other
+                .get_l2_checkpoints_from_height(550, 10)
+                .unwrap()
+                .len(),
+            0,
+            "no checkpoint may be persisted from somebody else's answer"
+        );
+
+        // ...and the SAME payload addressed to us IS processed, so the filter is a filter and
+        // not a blanket refusal.
+        let (db_mine, handler_mine) = make_node();
+        let mine = L2TreeSyncResponse {
+            requesting_node: Some(handler_mine.our_id),
+            ..foreign.clone()
+        };
+        handler_mine
+            .handle_tree_sync_response(&mine)
+            .expect("our own answer must still be processed");
+        assert!(
+            db_mine.get_l2_epoch(5).unwrap().is_some(),
+            "a response addressed to us must be replayed"
+        );
+
+        // A peer that predates the field sends None. That must still be processed, or upgrading
+        // one node would cut it out of sync with every older peer in the fleet.
+        let (db_legacy, handler_legacy) = make_node();
+        let _ = handler_legacy;
+        let legacy = L2TreeSyncResponse {
+            requesting_node: None,
+            ..foreign.clone()
+        };
+        handler_legacy
+            .handle_tree_sync_response(&legacy)
+            .expect("a legacy response must still be processed");
+        assert!(
+            db_legacy.get_l2_epoch(5).unwrap().is_some(),
+            "an unaddressed response from an older peer must not be dropped"
+        );
+
         // --- Case 2: epoch missing from payload -> deferred, not force-inserted ---
         let (db_defer, handler_defer) = make_node();
         let response_no_epoch = L2TreeSyncResponse {
             responding_node: proposer_id,
+            requesting_node: Some(handler_defer.our_id),
             checkpoints: vec![block.clone()],
             current_epoch: 5,
             commitment_root: block.new_commitment_root,
