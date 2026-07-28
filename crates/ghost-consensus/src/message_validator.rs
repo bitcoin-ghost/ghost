@@ -589,6 +589,67 @@ fn check_json_depth(data: &[u8]) -> Result<(), MessageValidationError> {
     Ok(())
 }
 
+/// Extract the envelope timestamp from raw JSON without deserializing.
+///
+/// Same technique as `extract_message_type_fast`, for the same reason: so a message can be
+/// judged before paying to parse it.
+///
+/// This exists because the drift check sat *downstream* of deserialization. A node that had
+/// fallen behind would fully parse a message, discover it had waited 40 seconds, and throw it
+/// away — burning CPU on work it was about to discard, which lengthened the queue, which made
+/// the next message later still. The check could not protect anything; it converted a backlog
+/// into wasted work (#517).
+///
+/// Measured on the fleet: nodes with a clean queue answered `/health` in under a millisecond,
+/// while a node rejecting 854 stale messages in ten minutes could not answer at all.
+///
+/// Returns `None` when the timestamp cannot be read cheaply — an unreadable timestamp must fall
+/// through to the full pipeline rather than be treated as stale, or a format change would
+/// silently drop every message on the floor.
+pub fn extract_timestamp_fast(data: &[u8]) -> Option<u64> {
+    // Only the JSON format is scannable; binary envelopes fall through to full validation.
+    if data.first() != Some(&b'{') {
+        return None;
+    }
+    let data_str = std::str::from_utf8(data).ok()?;
+
+    // `"timestamp":<digits>` — the envelope's own field. Payloads may carry their own
+    // `timestamp`, so take the FIRST occurrence: serde writes envelope fields in declaration
+    // order and `timestamp` precedes `payload`.
+    let marker = r#""timestamp":"#;
+    let start = data_str.find(marker)? + marker.len();
+    let rest = &data_str[start..];
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Is this message too old to be worth parsing?
+///
+/// Deliberately more lenient than `validate_timestamp_with_drift`: this is a cheap pre-filter,
+/// and the authoritative check still runs afterwards on everything that survives. A message
+/// rejected here would have been rejected there anyway.
+///
+/// Only the PAST direction is checked. A future-dated timestamp is a correctness concern that
+/// belongs with the real validator, not a backlog symptom.
+pub fn is_stale_before_deser(data: &[u8], drift_ms: u64) -> bool {
+    let drift_ms = drift_ms.clamp(MIN_TIMESTAMP_DRIFT_MS, MAX_TIMESTAMP_DRIFT_LIMIT_MS);
+    match extract_timestamp_fast(data) {
+        Some(ts) => {
+            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+            now_ms > ts.saturating_add(drift_ms)
+        }
+        // Unreadable: not our call to make here.
+        None => false,
+    }
+}
+
 /// Full validation pipeline for incoming messages
 ///
 /// 1. Validate raw bytes (size, version, type)
@@ -598,6 +659,21 @@ fn check_json_depth(data: &[u8]) -> Result<(), MessageValidationError> {
 pub fn validate_and_verify(data: &[u8]) -> Result<MessageEnvelope, MessageValidationError> {
     // Step 1: Header validation (fast, no alloc)
     validate_envelope_header(data)?;
+
+    // Step 1.2: cheap staleness check, BEFORE the depth scan and the parse (#517).
+    //
+    // The authoritative drift check is in `validate_envelope` below, but it only runs after a
+    // full JSON parse. On a node that has fallen behind, that meant paying to walk and parse
+    // every message just to discard it — the backlog feeding itself. Judging it here costs one
+    // substring scan and an integer parse, and it runs ahead of `check_json_depth` so a stale
+    // message does not even pay for that O(n) pass.
+    if is_stale_before_deser(data, DEFAULT_TIMESTAMP_DRIFT_MS) {
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let drift = extract_timestamp_fast(data)
+            .map(|ts| now_ms.saturating_sub(ts))
+            .unwrap_or(0);
+        return Err(MessageValidationError::TimestampInPast(drift));
+    }
 
     // Step 1.5: JSON depth check (O(n), prevents stack overflow from deeply nested payloads)
     check_json_depth(data)?;
@@ -785,6 +861,81 @@ impl ValidationStats {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole point of #517: a stale message must be rejected WITHOUT paying to parse it.
+    ///
+    /// The drift check used to sit after deserialization, so a node that had fallen behind
+    /// fully parsed every message just to discard it — burning CPU on work it was about to
+    /// throw away, which lengthened the queue and made the next message later still.
+    #[test]
+    fn a_stale_message_is_rejected_before_deserialization() {
+        let old_ms = (chrono::Utc::now().timestamp_millis() as u64)
+            .saturating_sub(DEFAULT_TIMESTAMP_DRIFT_MS + 60_000);
+        // Deliberately UNPARSEABLE past the timestamp, and padded past MIN_ENVELOPE_SIZE so
+        // the size gate cannot be what rejects it. If this comes back TimestampInPast, nothing
+        // downstream of the cheap scan can have run — the JSON never closes.
+        let data = format!(
+            r#"{{"msg_type":"HealthPing","sender":"00","timestamp":{old_ms},"garbage{}"#,
+            "x".repeat(MIN_ENVELOPE_SIZE)
+        );
+        assert!(
+            is_stale_before_deser(data.as_bytes(), DEFAULT_TIMESTAMP_DRIFT_MS),
+            "a 90s-old message must be judged stale from the raw bytes alone"
+        );
+        let got = validate_and_verify(data.as_bytes());
+        assert!(
+            matches!(got, Err(MessageValidationError::TimestampInPast(_))),
+            "expected TimestampInPast from the pre-filter, got {got:?}"
+        );
+    }
+
+    /// A fresh message must NOT be caught by the pre-filter — otherwise the node silently stops
+    /// participating in the mesh and everything still looks healthy.
+    #[test]
+    fn a_fresh_message_passes_the_prefilter() {
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let data = format!(r#"{{"msg_type":"HealthPing","timestamp":{now_ms},"sequence":1}}"#);
+        assert!(!is_stale_before_deser(
+            data.as_bytes(),
+            DEFAULT_TIMESTAMP_DRIFT_MS
+        ));
+    }
+
+    /// An unreadable timestamp must fall THROUGH to the real validator, never be assumed stale.
+    ///
+    /// Treating "cannot read" as "too old" would turn any envelope format change into a node
+    /// that silently drops every message on the floor while reporting itself healthy.
+    #[test]
+    fn an_unreadable_timestamp_is_not_assumed_stale() {
+        assert_eq!(extract_timestamp_fast(b"not json at all"), None);
+        assert!(!is_stale_before_deser(
+            b"not json at all",
+            DEFAULT_TIMESTAMP_DRIFT_MS
+        ));
+
+        // Present but not a number.
+        let odd = br#"{"msg_type":"HealthPing","timestamp":"soon"}"#;
+        assert_eq!(extract_timestamp_fast(odd), None);
+        assert!(!is_stale_before_deser(odd, DEFAULT_TIMESTAMP_DRIFT_MS));
+
+        // Absent entirely.
+        assert!(!is_stale_before_deser(
+            br#"{"msg_type":"HealthPing"}"#,
+            DEFAULT_TIMESTAMP_DRIFT_MS
+        ));
+    }
+
+    /// The scan must read the ENVELOPE's timestamp, not one that happens to appear inside the
+    /// payload — reading a payload field would judge the message on the wrong clock.
+    #[test]
+    fn the_envelope_timestamp_is_read_not_a_payload_one() {
+        let envelope_ts = 1_700_000_000_000u64;
+        let payload_ts = 1_600_000_000_000u64;
+        let data = format!(
+            r#"{{"msg_type":"HealthPing","sender":"00","timestamp":{envelope_ts},"sequence":1,"payload":{{"timestamp":{payload_ts}}}}}"#
+        );
+        assert_eq!(extract_timestamp_fast(data.as_bytes()), Some(envelope_ts));
+    }
     use super::*;
 
     #[test]
