@@ -663,8 +663,10 @@ fn test_toggle_inscription_off() {
 
     let sig = [0x30; 64];
     let tx = tx_with_tapscript(&script, &[&sig]);
-    let mut config = ReaperConfig::default();
-    config.reject_inscription_envelope = false;
+    let config = ReaperConfig {
+        reject_inscription_envelope: false,
+        ..Default::default()
+    };
     let verdict = analyze(&tx, &config);
 
     // Pattern toggle off → no pattern-detected InscriptionEnvelope
@@ -687,8 +689,10 @@ fn test_toggle_drop_off() {
 
     let sig = [0x30; 64];
     let tx = tx_with_tapscript(&script, &[&sig]);
-    let mut config = ReaperConfig::default();
-    config.reject_drop_stuffing = false;
+    let config = ReaperConfig {
+        reject_drop_stuffing: false,
+        ..Default::default()
+    };
     let verdict = analyze(&tx, &config);
 
     // Pattern toggle off → no pattern-detected DropStuffing
@@ -872,8 +876,10 @@ fn test_excess_stack_items() {
     let item3 = [0x30; 64]; // "signature" (on top where CHECKSIG consumes it)
     let tx = tx_with_tapscript(&script, &[&item1, &item2, &item3]);
 
-    let mut config = ReaperConfig::default();
-    config.min_excess_witness_bytes = 100; // lower threshold for test
+    let config = ReaperConfig {
+        min_excess_witness_bytes: 100, // lower threshold for test
+        ..Default::default()
+    };
     let verdict = analyze(&tx, &config);
 
     let analysis = &verdict.input_analyses[0];

@@ -81,9 +81,11 @@ enum CorpseClass {
 #[ignore]
 fn backtest_simulator_delta() {
     // Config A: patterns only (no computational checks, no EC)
-    let mut patterns_only = ReaperConfig::default();
-    patterns_only.reject_excess_witness = false;
-    patterns_only.validate_pubkey_curve_point = false;
+    let patterns_only = ReaperConfig {
+        reject_excess_witness: false,
+        validate_pubkey_curve_point: false,
+        ..Default::default()
+    };
 
     // Config B: full (patterns + computational + EC validation)
     let full = ReaperConfig::default();

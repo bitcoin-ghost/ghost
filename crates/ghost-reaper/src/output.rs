@@ -208,8 +208,10 @@ mod tests {
         script.push(0xae); // OP_CHECKMULTISIG
 
         // With EC validation off, valid prefixes pass
-        let mut config = ReaperConfig::default();
-        config.validate_pubkey_curve_point = false;
+        let config = ReaperConfig {
+            validate_pubkey_curve_point: false,
+            ..Default::default()
+        };
         assert!(detect_fake_multisig_pubkeys(&script, 0, &config).is_none());
     }
 }
