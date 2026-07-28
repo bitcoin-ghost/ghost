@@ -1735,7 +1735,6 @@ dependencies = [
  "libfuzzer-sys",
  "serde",
  "serde_json",
- "wraith-protocol",
 ]
 
 [[package]]
