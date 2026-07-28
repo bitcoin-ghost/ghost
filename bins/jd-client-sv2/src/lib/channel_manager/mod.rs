@@ -1147,21 +1147,21 @@ impl ChannelManager {
                     let mut downstream_hashrate = 0.0;
                     let mut min_target = [0xff; 32];
 
-                    for (_, downstream) in channel_manager_data.downstream.iter() {
+                    for downstream in channel_manager_data.downstream.values() {
                         downstream.downstream_data.super_safe_lock(|data| {
                             let mut update_from_channel = |hashrate: f32, target: &Target| {
                                 downstream_hashrate += hashrate;
                                 min_target = std::cmp::min(target.to_le_bytes(), min_target);
                             };
 
-                            for (_, channel) in data.standard_channels.iter() {
+                            for channel in data.standard_channels.values() {
                                 update_from_channel(
                                     channel.get_nominal_hashrate(),
                                     channel.get_target(),
                                 );
                             }
 
-                            for (_, channel) in data.extended_channels.iter() {
+                            for channel in data.extended_channels.values() {
                                 update_from_channel(
                                     channel.get_nominal_hashrate(),
                                     channel.get_target(),

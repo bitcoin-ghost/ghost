@@ -607,7 +607,8 @@ mod tests {
             let back: RefundReason = serde_json::from_str(&serialised).unwrap();
             assert_eq!(reason, back);
         }
-        for reason in [SlashReason::NoSignDuringSigning] {
+        {
+            let reason = SlashReason::NoSignDuringSigning;
             let serialised = serde_json::to_string(&reason).unwrap();
             let back: SlashReason = serde_json::from_str(&serialised).unwrap();
             assert_eq!(reason, back);

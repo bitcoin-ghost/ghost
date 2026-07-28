@@ -641,8 +641,7 @@ mod server {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let bytes = serde_json::to_vec_pretty(locks)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec_pretty(locks).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("json.tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
@@ -1906,7 +1905,7 @@ mod server {
             })
             .collect();
         let contains_us = cosigners.iter().any(|c| c.is_us);
-        let count = address_count.min(64) as u32; // hard cap so a typo can't DoS the daemon
+        let count = address_count.min(64); // hard cap so a typo can't DoS the daemon
         let mut addresses = Vec::with_capacity(count as usize);
         for i in 0..count {
             match parsed.derive_address(i, false, state.network) {
@@ -2452,7 +2451,7 @@ mod server {
                 // out of initial block download.
                 let chain_synced = ghost_pay_reachable
                     && chain_height.is_some()
-                    && chain_headers.map_or(true, |h| chain_height.unwrap_or(0) >= h)
+                    && chain_headers.is_none_or(|h| chain_height.unwrap_or(0) >= h)
                     && chain_ibd == Some(false);
                 let (gsp_have_token, gsp_phase) = {
                     let guard = state.session.read().await;

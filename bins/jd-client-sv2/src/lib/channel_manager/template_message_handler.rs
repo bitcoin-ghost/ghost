@@ -530,7 +530,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
 
                         // Update job ID to template ID mapping for all channels using the group channel
                         // This is critical when a future template becomes active
-                        for (channel_id, _) in data.standard_channels.iter() {
+                        for channel_id in data.standard_channels.keys() {
                             channel_manager_data
                                 .downstream_channel_id_and_job_id_to_template_id
                                 .insert(
@@ -538,7 +538,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                     msg.template_id,
                                 );
                         }
-                        for (channel_id, _) in data.extended_channels.iter() {
+                        for channel_id in data.extended_channels.keys() {
                             channel_manager_data
                                 .downstream_channel_id_and_job_id_to_template_id
                                 .insert(

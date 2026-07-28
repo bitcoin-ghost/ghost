@@ -1257,7 +1257,7 @@ mod tests {
 
         // An older node's ping omits the field entirely → defaults to None,
         // proving the wire change is additive.
-        let mut v = serde_json::to_value(&sample_health_ping()).unwrap();
+        let mut v = serde_json::to_value(sample_health_ping()).unwrap();
         v.as_object_mut().unwrap().remove("coordinator_endpoint");
         let back: HealthPing = serde_json::from_value(v).unwrap();
         assert_eq!(back.coordinator_endpoint, None);

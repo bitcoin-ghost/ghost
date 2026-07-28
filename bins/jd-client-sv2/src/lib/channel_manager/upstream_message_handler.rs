@@ -222,7 +222,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 self.upstream_state.set(UpstreamState::Connected);
 
                 // set the full extranonce size for the group channel of all downstream clients
-                for (_downstream_id, downstream) in data.downstream.iter_mut() {
+                for downstream in data.downstream.values_mut() {
                     downstream
                         .downstream_data
                         .super_safe_lock(|downstream_data| {

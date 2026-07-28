@@ -89,9 +89,9 @@ pub fn analyze(tx: &Transaction, config: &ReaperConfig) -> ReaperVerdict {
 
                 input_dead_bytes = dedup_dead_bytes(&input_regions);
             }
-            SpendType::Legacy => {
+            SpendType::Legacy
                 // Legacy scriptSig data stuffing analysis
-                if config.reject_legacy_data_stuffing {
+                if config.reject_legacy_data_stuffing => {
                     let legacy_regions =
                         analyze_legacy_scriptsig(input.script_sig.as_bytes(), idx, config);
                     for region in &legacy_regions {
@@ -99,7 +99,6 @@ pub fn analyze(tx: &Transaction, config: &ReaperConfig) -> ReaperVerdict {
                     }
                     input_regions.extend(legacy_regions);
                 }
-            }
             _ => {
                 // P2TR key path, P2WPKH, Empty — no script to analyze
             }

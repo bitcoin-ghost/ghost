@@ -55,7 +55,6 @@ async fn handle_ws(mut socket: WebSocket) {
             ClientMessage::SendL2Payment {
                 recipient,
                 amount_sats,
-                memo: _,
                 ..
             } => {
                 // Mirror what ghost-gsp does on the wire: synthesize a
