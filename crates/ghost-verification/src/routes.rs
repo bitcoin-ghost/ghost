@@ -516,6 +516,13 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             get(api_ghostpay_payout_history_handler),
         )
         .route("/api/v1/config/full", get(api_config_full_handler))
+        // maxconnections (#499). Both verbs are on the internal tier: the POST mutates node
+        // config, and the GET exposes the node's peer-slot headroom — useful to an operator,
+        // and equally useful to someone deciding how few connections it takes to fill it.
+        .route(
+            "/api/v1/config/maxconnections",
+            get(api_config_maxconnections_handler).post(api_config_maxconnections_post_handler),
+        )
         .route("/api/v1/config/alerts", get(api_config_alerts_handler))
         // Admin endpoints for testing
         .route("/admin/test-consensus", post(admin_test_consensus_handler))
@@ -4874,6 +4881,229 @@ async fn api_watchdog_status_handler(
             .as_secs(),
         "uptime_secs": health.uptime_secs
     }))
+}
+
+/// GET the node's peer-connection limit, what it is actually using, and what its memory supports.
+///
+/// The headline `maxconnections` is not the number that matters — Core reserves outbound slots
+/// out of it, so a node at 50 has 40 inbound to give and a settled node fills them. It is then
+/// full and refuses new peers, including crawlers, which is how the whole fleet disappeared from
+/// public node listings while every node was healthy (#497, #498). Nothing surfaced that, so this
+/// returns inbound capacity and utilisation rather than making an operator infer them.
+async fn api_config_maxconnections_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    let configured = match crate::maxconnections::read_configured() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("cannot read {}: {e}", crate::maxconnections::conf_path().display()),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let effective = configured.effective();
+    let inbound_capacity = crate::maxconnections::inbound_capacity(effective);
+
+    // Live counts. Absent when ghostd cannot be reached — reported as null rather than 0, which
+    // would read as "no peers" instead of "we do not know".
+    let (connections, connections_in, connections_out) = match state.rpc {
+        Some(ref rpc) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_network_info())
+                .await
+            {
+                Ok(Ok(info)) => (
+                    Some(info.connections),
+                    Some(info.connections_in),
+                    Some(info.connections_out),
+                ),
+                _ => (None, None, None),
+            }
+        }
+        None => (None, None, None),
+    };
+
+    let utilisation = connections_in
+        .and_then(|inb| (inbound_capacity > 0).then(|| inb as f64 / inbound_capacity as f64));
+    let near_ceiling = utilisation.map(|u| u >= crate::maxconnections::NEAR_CEILING_FRACTION);
+
+    let mem_available_mb = crate::maxconnections::mem_available_mb();
+    let recommended_max = crate::maxconnections::recommended_max(mem_available_mb);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "configured": configured.value,
+            "effective": effective,
+            "is_core_default": configured.value.is_none(),
+            // More than one setting in the file means we will not write to it, so say so here
+            // rather than letting the POST be the first time anyone finds out.
+            "ambiguous": configured.is_ambiguous(),
+            "all_configured_values": configured.all_values,
+            "inbound_capacity": inbound_capacity,
+            "reserved_outbound": crate::maxconnections::RESERVED_OUTBOUND,
+            "connections": connections,
+            "connections_in": connections_in,
+            "connections_out": connections_out,
+            "inbound_utilisation": utilisation,
+            "near_ceiling": near_ceiling,
+            "recommended_max": recommended_max,
+            "hard_max": crate::maxconnections::HARD_MAX,
+            // The recommendation is a judgement, not a measurement. Return what produced it so
+            // an operator can disagree with it on the evidence rather than on faith.
+            "recommendation_basis": {
+                "mem_available_mb": mem_available_mb,
+                "per_peer_mb": crate::maxconnections::PER_PEER_MB,
+                "headroom_mb": crate::maxconnections::HEADROOM_MB,
+            },
+            "requires_restart": true,
+            "config_path": crate::maxconnections::conf_path().display().to_string(),
+        })),
+    )
+        .into_response()
+}
+
+/// Request body for changing `maxconnections`.
+#[derive(serde::Deserialize)]
+struct MaxConnectionsUpdate {
+    value: u32,
+    /// Set to accept a value above what this node's available memory supports. Without it, such
+    /// a value is refused — a control that ignores memory is worse than no control, because it
+    /// invites an operator to OOM a node from a web page.
+    #[serde(default)]
+    force: bool,
+}
+
+/// POST a new `maxconnections`, persisted to ghostd's config file.
+///
+/// It does NOT take effect until ghostd restarts, and this does not restart it: that drops the
+/// TDP template feed `pool_sv2` depends on, so pausing mining is the operator's call to make
+/// deliberately, not a side effect of saving a setting. The response says so explicitly.
+async fn api_config_maxconnections_post_handler(
+    Json(payload): Json<MaxConnectionsUpdate>,
+) -> impl IntoResponse {
+    apply_maxconnections_update(&crate::maxconnections::conf_path(), payload)
+}
+
+/// The body of the POST, with the config path passed in.
+///
+/// Separated so tests can drive it against a temporary file. Reaching it through the env var
+/// instead would mean three tests mutating one process-wide variable while the harness runs them
+/// in parallel — a race that shows up as an occasional failure and gets re-run rather than fixed.
+fn apply_maxconnections_update(
+    path: &std::path::Path,
+    payload: MaxConnectionsUpdate,
+) -> axum::response::Response {
+    let bad = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+
+    // Below the outbound reserve there is no inbound capacity at all, which is not a setting
+    // anyone means to choose.
+    if payload.value <= crate::maxconnections::RESERVED_OUTBOUND {
+        return bad(format!(
+            "{} leaves no inbound capacity — Core reserves {} outbound slots",
+            payload.value,
+            crate::maxconnections::RESERVED_OUTBOUND
+        ));
+    }
+    if payload.value > crate::maxconnections::HARD_MAX {
+        return bad(format!(
+            "{} exceeds the hard maximum of {}",
+            payload.value,
+            crate::maxconnections::HARD_MAX
+        ));
+    }
+
+    let mem_available_mb = crate::maxconnections::mem_available_mb();
+    let recommended = crate::maxconnections::recommended_max(mem_available_mb);
+    if let Some(rec) = recommended {
+        if payload.value > rec && !payload.force {
+            return bad(format!(
+                "{} is above this node's memory-derived maximum of {rec} \
+                 ({}MB available, {}MB per peer, {}MB headroom); pass force=true to override",
+                payload.value,
+                mem_available_mb.unwrap_or(0),
+                crate::maxconnections::PER_PEER_MB,
+                crate::maxconnections::HEADROOM_MB,
+            ));
+        }
+    } else if !payload.force {
+        // Unknown memory. Refusing is the safe default — we cannot say the value is survivable.
+        return bad(
+            "cannot read available memory, so this node's maximum is unknown; \
+             pass force=true to set it anyway"
+                .to_string(),
+        );
+    }
+
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "error": format!("cannot read {}: {e}", path.display()) }),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let previous = crate::maxconnections::parse(&contents);
+    let updated = match crate::maxconnections::rewrite(&contents, payload.value) {
+        Ok(u) => u,
+        Err(e) => return bad(e),
+    };
+
+    // Write through a temporary file in the same directory and rename, so an interrupted write
+    // cannot leave ghostd with a truncated config it will refuse to start on.
+    let tmp = path.with_extension("conf.tmp");
+    if let Err(e) = std::fs::write(&tmp, &updated) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("cannot write {}: {e}", tmp.display()) })),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("cannot replace {}: {e}", path.display()) })),
+        )
+            .into_response();
+    }
+
+    info!(
+        previous = ?previous.value,
+        new = payload.value,
+        forced = payload.force,
+        "maxconnections updated in ghostd config (restart required)"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "previous": previous.value,
+            "value": payload.value,
+            "inbound_capacity": crate::maxconnections::inbound_capacity(payload.value),
+            "forced": payload.force,
+            "requires_restart": true,
+            "message": "saved to ghostd's config. It takes effect on the next ghostd restart, \
+                        which briefly interrupts mining — restart when you are ready.",
+        })),
+    )
+        .into_response()
 }
 
 /// API v1 System version handler
@@ -14290,6 +14520,115 @@ mod tests {
         let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(data["total"].as_u64(), Some(1));
         assert_eq!(data["miners"].as_array().unwrap().len(), 1);
+    }
+
+    /// The POST must not let an operator set a value this node's memory cannot support.
+    ///
+    /// A control that ignores memory is worse than no control: it invites someone to OOM a node
+    /// from a web page, and vm6 is exactly the node that would go — ~1376MB available against a
+    /// ghostd RSS of ~1441MB (#417, #418). Overriding must be possible but deliberate.
+    #[test]
+    fn maxconnections_post_refuses_a_value_memory_cannot_support() {
+        use crate::maxconnections;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "server=1\nmaxconnections=50\nrpcuser=x\n").unwrap();
+        // Whatever this host reports, a value one above its own ceiling must be refused and the
+        // file left untouched. Derive the target rather than hardcoding one, so the test says the
+        // same thing on a laptop and on a 1GB VM.
+        let ceiling = maxconnections::recommended_max(maxconnections::mem_available_mb());
+        let too_big = ceiling.map(|c| c + 1).unwrap_or(maxconnections::HARD_MAX);
+
+        let resp = super::apply_maxconnections_update(
+            &conf,
+            MaxConnectionsUpdate {
+                value: too_big,
+                force: false,
+            },
+        );
+
+        // With a readable /proc/meminfo the ceiling exists and `too_big` exceeds it; without one
+        // the handler refuses for the other reason. Either way it must refuse.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "server=1\nmaxconnections=50\nrpcuser=x\n",
+            "a refused update must not have touched the config file"
+        );
+    }
+
+    /// A value below Core's outbound reserve leaves zero inbound capacity, which is never a
+    /// setting anyone means to choose — and is the failure mode this whole endpoint exists for.
+    #[test]
+    fn maxconnections_post_refuses_a_value_with_no_inbound_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "maxconnections=125\n").unwrap();
+        let resp = super::apply_maxconnections_update(
+            &conf,
+            MaxConnectionsUpdate {
+                value: crate::maxconnections::RESERVED_OUTBOUND,
+                force: true, // even forced: this is arithmetic, not a judgement call
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "maxconnections=125\n"
+        );
+    }
+
+    /// An accepted update rewrites the value in place and leaves every other line alone —
+    /// this is ghostd's config, and a setting lost here does not surface until a restart.
+    #[test]
+    fn maxconnections_post_rewrites_in_place_and_preserves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("bitcoin.conf");
+        std::fs::write(&conf, "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n").unwrap();
+        // 40 is under any plausible memory ceiling — but only a host that can MEASURE its
+        // memory accepts it unforced. macOS has no /proc/meminfo, so there the handler
+        // correctly refuses rather than claiming a value is survivable that it cannot check.
+        // Assert the real behaviour on each platform instead of assuming Linux: this test
+        // failed CI on macOS when it assumed.
+        let measurable = crate::maxconnections::mem_available_mb().is_some();
+        let resp = super::apply_maxconnections_update(
+            &conf,
+            MaxConnectionsUpdate {
+                value: 40,
+                force: !measurable,
+            },
+        );
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "40 is below any plausible ceiling and must be accepted (forced only where memory \
+             cannot be read)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "# ghostd\nserver=1\nmaxconnections=40\nrpcuser=x\n"
+        );
+
+        // Where memory is unreadable, the same update WITHOUT force must be refused — else
+        // that branch would go silently untested on exactly the platform that exercises it.
+        if !measurable {
+            std::fs::write(&conf, "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n").unwrap();
+            let refused = super::apply_maxconnections_update(
+                &conf,
+                MaxConnectionsUpdate {
+                    value: 40,
+                    force: false,
+                },
+            );
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                std::fs::read_to_string(&conf).unwrap(),
+                "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n",
+                "a refused update must not have touched the file"
+            );
+        }
     }
 
     /// `/api/v1/mining/status` exposes this node's OWN SV2 authority public key,
