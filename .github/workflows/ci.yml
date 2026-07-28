@@ -140,6 +140,28 @@ jobs:
       - name: Run unit tests
         run: cargo test $WORKSPACE_EXCLUDES --lib --bins
 
+      # Feature-gated modules, which the run above does NOT compile (#530).
+      #
+      # `ghost-consensus` has `default = []` and gates two modules behind features:
+      #
+      #   #[cfg(feature = "zk-consensus")]  pub mod nullifier_route_handler;   <- L2 tree sync
+      #   #[cfg(feature = "mpc-ceremony")]  pub mod mpc_handler;
+      #
+      # so plain `cargo test -p ghost-consensus` reports 267 passed while 72 tests are not even
+      # compiled — including every test for the L2 tree-sync and nullifier-routing code that is
+      # live on all 8 production nodes. A change to that module could be syntactically invalid
+      # and still show a green suite; that is not hypothetical, it happened while fixing #517.
+      #
+      # The clippy job already uses `--all-features`, so this code IS type-checked. Only its
+      # tests were missing, which is why nothing ever went red.
+      #
+      # NOT `--all-features`, deliberately. That would also switch on `ghost-verification`'s
+      # `allow-insecure` (changing what the security tests actually assert) and `zk-production`
+      # (which needs trusted-setup params a runner does not have). Naming the features keeps the
+      # gain without either surprise.
+      - name: Run unit tests (feature-gated consensus modules)
+        run: cargo test -p ghost-consensus --lib --features zk-consensus,mpc-ceremony
+
       # Run integration tests
       - name: Run integration tests
         run: cargo test --test integration
