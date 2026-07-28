@@ -42,6 +42,13 @@ NODE="${1:-}"
 BINARY="${2:-}"
 CANARY="${3:-}"
 
+# Order matters: the soak gate below takes the FIRST canary with a valid marker, so whichever
+# is listed first is the one that gets soaked in practice.
+#
+# ghost-vm5 leads because it is the only canary carrying a real miner (bitaxe3, ~60 shares per
+# 30 minutes). Real submitted traffic is the one thing a synthetic probe cannot reproduce, and
+# soaking on a canary with none is how the gate stayed blind to the submission path (#461).
+# vm5 is also at schema 46 like production, where vm6 and vm8 carry the drift from #523.
 CANARY_NODES="ghost-vm5 ghost-vm6 ghost-vm7 ghost-vm8"
 PRODUCTION_NODES="ghost-vm1 ghost-vm2 ghost-vm3 ghost-vm4"
 SOAK_MINUTES="${SOAK_MINUTES:-60}"
@@ -188,7 +195,27 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
             continue
         fi
 
-        SOAKED="$c (${elapsed}m, submission path verified)"
+        # How much REAL traffic this canary took while it soaked.
+        #
+        # A share submitted here carries a plaintext `address.worker` miner_id; one that arrived
+        # by gossip carries a 16-hex hash, because peers only ever see the hashed form. That is
+        # the reliable discriminator — `received_by` length is NOT, since it is a concatenation
+        # of 8-character node-id prefixes and length 8 merely means one node has recorded it.
+        #
+        # This does not gate: the synthetic probe above already covers the submission path, and
+        # blocking every deploy on a miner being connected would be worse than the problem. It
+        # exists so "this soak observed no real traffic" is stated rather than assumed.
+        local_shares=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$c" \
+            "sudo -u ghost sqlite3 /home/ghost/.ghost/ghost.db \
+             \"select count(*) from shares where timestamp > $started and miner_id like '%.%';\"" \
+            2>/dev/null || true)
+        if [ "${local_shares:-0}" -gt 0 ] 2>/dev/null; then
+            SOAKED="$c (${elapsed}m, submission path verified, ${local_shares} real shares)"
+        else
+            info "note: $c took NO real submitted shares while soaking — the synthetic probe passed,"
+            info "      but nothing that needs sustained real traffic was exercised (#461)"
+            SOAKED="$c (${elapsed}m, submission path verified, no real traffic)"
+        fi
         break
     done
     [ -n "$SOAKED" ] || die "$BINARY @ $SHORT has not soaked ${SOAK_MINUTES}m on a canary
