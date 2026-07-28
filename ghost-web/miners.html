@@ -281,15 +281,27 @@
         var SV2_PORT = '34255';
         var proto = 'sv1';
 
-        // SV2 pins the pool's Noise authority key, and every node has its OWN keypair —
-        // so there is no single key that works behind the load-balanced name. An SV2
-        // miner must therefore target a SPECIFIC node and pin THAT node's key. SV1
-        // miners pin nothing, so they keep using pool.bitcoinghost.org.
+        // SV2 pins the pool's Noise AUTHORITY key. That key is per-POOL, not per-node:
+        // each node generates its own short-lived STATIC key at startup and certifies it
+        // with the shared authority key, which is exactly what lets one pinned key work
+        // behind a load-balanced name. So the SV2 panel points at the pool, same as SV1.
         //
-        // The keys are read live from each node, never hardcoded here: a stale hardcoded
-        // key is not merely broken, it tells miners to trust a key we no longer hold.
-        var sv2Nodes = [];      // [{host, key, sv2Port}] — only nodes whose key we know
+        // The key is read live from the nodes, never hardcoded here. A stale hardcoded key
+        // is not merely broken: it tells miners to trust a key we no longer hold, and
+        // whoever does hold it can then present as this pool (#516).
+        //
+        // If the nodes ever DISAGREE about the authority key — a half-finished rotation —
+        // the panel degrades to a per-node picker rather than publishing one node's key as
+        // though it spoke for the pool.
+        var sv2Nodes = [];      // [{host, key, sv2Port}] — one entry per node that answered
         var sv2Choice = 0;
+        function sv2Agreed() {
+          if (!sv2Nodes.length) return null;
+          for (var i = 1; i < sv2Nodes.length; i++) {
+            if (sv2Nodes[i].key !== sv2Nodes[0].key) return null;
+          }
+          return sv2Nodes[0];
+        }
 
         var addrEl = document.getElementById('qsg-addr');
         var workerEl = document.getElementById('qsg-worker');
@@ -320,8 +332,17 @@
             html += row('Password', 'x');
             html += '<p class="qsg-foot">Works on any ASIC — set the pool/URL, username and password fields in your miner’s web UI. The password is ignored; <code>x</code> is fine.</p>';
           } else {
+            var agreed = sv2Agreed();
             if (!sv2Nodes.length) {
-              html += '<p class="qsg-foot">Loading the live node list… SV2 settings are read from the nodes themselves, so they are never stale.</p>';
+              html += '<p class="qsg-foot">Loading… the SV2 settings are read from the nodes themselves, so they are never stale.</p>';
+            } else if (agreed) {
+              html += row('Host', POOL);
+              html += row('Port', String(agreed.sv2Port));
+              html += row('Username', user);
+              html += row('Protocol', 'Stratum V2');
+              html += row('Channel type', 'Extended');
+              html += row('Authority public key', agreed.key);
+              html += '<p class="qsg-foot">For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). SV2 authenticates the pool by pinning its <strong>authority key</strong> — one key for the whole pool, so this works against any node and you can keep using <code>' + POOL + '</code>. Each node proves itself with its own short-lived key signed by that authority key, which is why one pin covers them all. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
             } else {
               var n = sv2Nodes[Math.min(sv2Choice, sv2Nodes.length - 1)];
               var opts = '';
@@ -337,7 +358,7 @@
               html += row('Protocol', 'Stratum V2');
               html += row('Channel type', 'Extended');
               html += row('Authority public key', n.key);
-              html += '<p class="qsg-foot">For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). SV2 authenticates the pool by pinning its <strong>authority key</strong>, and every Ghost node has its own — so pick a node above and use <em>that</em> node\u2019s host and key together. Point an SV2 miner at <code>' + POOL + '</code> and the pin will not match, because the name balances across several nodes. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
+              html += '<p class="qsg-foot"><strong>The nodes currently disagree about the pool\u2019s authority key</strong>, which usually means a key rotation is still in progress. Until they agree, pin a specific node: use the host and key shown together above, not <code>' + POOL + '</code>, because the balanced name could send you to a node with a different key. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
             }
           }
           outEl.innerHTML = html;
