@@ -1095,6 +1095,16 @@ pub struct PoolPeerInfo {
     /// miner that fails over between nodes.
     #[serde(default)]
     pub deduped_miner_count: u32,
+    /// The peer's SV1 hobby listener, or `None` if it does not advertise one. The translator
+    /// treats absence as "serves the default 3333", which is what every node did before the farm
+    /// tier existed (#495).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hobby_port: Option<u16>,
+    /// The peer's SV1 farm listener. `None` means "no farm tier" OR "too old to say", and both
+    /// disqualify it as a farm routing target — assuming a port is how a farm miner ends up on a
+    /// hobby floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub farm_port: Option<u16>,
 }
 
 /// One mesh node as surfaced by the public `/api/v1/pool/mesh-nodes`

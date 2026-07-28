@@ -475,6 +475,26 @@ pub struct HealthPing {
     /// empty Vec, and newer nodes simply ignore peers that omit it.
     #[serde(default)]
     pub best_records: Vec<WindowBestRecord>,
+    /// This node's SV1 **hobby** stratum listener, and its **farm** listener when it runs one.
+    ///
+    /// The load balancer became tier-aware in #494 but nothing advertised which listeners a node
+    /// actually runs, so no peer was ever a farm-routing candidate and the busiest node could not
+    /// shed a farm miner. This is the half that switches it on (#495).
+    ///
+    /// Deliberately NOT in `NodeCapabilities`: every field there feeds `total_shares()` for the
+    /// 5-4-3-2-1 scoring model, and a port number would corrupt the score.
+    ///
+    /// `None` on a peer that predates this field. The consumer treats absent-hobby as "serves the
+    /// default 3333", which is what every node did before the farm tier existed, and absent-farm
+    /// as "not a farm target" — assuming a farm port is how a farm miner lands on a hobby floor,
+    /// so absence disqualifies rather than defaults. A partial rollout therefore degrades to
+    /// "no farm routing", never to misrouting.
+    #[serde(default)]
+    pub hobby_port: Option<u16>,
+    /// See `hobby_port`. `None` means either "no farm tier" or "too old to say", and both must be
+    /// treated identically: not a farm routing target.
+    #[serde(default)]
+    pub farm_port: Option<u16>,
     /// If this node has opted in as a Wraith coordinator
     /// (`capabilities.coordinator`), the reachable endpoint a wallet should dial
     /// to mix with it: a public `host:port` or a `.onion`. This is a DELIBERATE,
@@ -1167,6 +1187,8 @@ mod tests {
             active_miner_id_hashes: vec![[1u8; 16], [2u8; 16]],
             local_hashrate_th: 4.0,
             max_capacity: 0,
+            hobby_port: None,
+            farm_port: None,
             best_records: vec![WindowBestRecord {
                 window: "day".to_string(),
                 share_hash: "0".repeat(8) + &"f".repeat(56),
