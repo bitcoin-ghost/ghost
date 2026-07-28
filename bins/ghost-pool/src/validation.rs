@@ -292,7 +292,8 @@ impl ValidatedCredentials {
         let _password = validate_password(password)?;
 
         // Parse username into address.worker
-        let (address, worker) = if let Some(dot_pos) = username.rfind('.') {
+        // FIRST dot, matching parse_user_identity and pool_sv2's PayoutMode (#481).
+        let (address, worker) = if let Some(dot_pos) = username.find('.') {
             let addr = &username[..dot_pos];
             let worker = &username[dot_pos + 1..];
             (addr, worker)

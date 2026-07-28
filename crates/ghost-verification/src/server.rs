@@ -961,9 +961,13 @@ pub struct L2TreeStateInfo {
 /// Format: <payout_address>.<worker_name>
 /// Returns (payout_address, worker_name) or (user_identity, "default") if no dot found.
 fn parse_user_identity(user_identity: &str) -> (String, String) {
-    if let Some(last_dot) = user_identity.rfind('.') {
-        let address = &user_identity[..last_dot];
-        let worker = &user_identity[last_dot + 1..];
+    // Address is everything before the FIRST dot; the worker is the rest (#481). `a.b.c` is
+    // addr=a, worker=b.c — the public-pool convention, and what pool_sv2's PayoutMode and
+    // build_webhook_user_identity already assumed. Splitting on the LAST dot yielded
+    // addr="a.b" for multi-dot names, which is not a valid Bitcoin address.
+    if let Some(first_dot) = user_identity.find('.') {
+        let address = &user_identity[..first_dot];
+        let worker = &user_identity[first_dot + 1..];
         (address.to_string(), worker.to_string())
     } else {
         // No dot found - treat entire string as address with default worker
@@ -3144,6 +3148,36 @@ mod tests {
     use super::*;
     use ghost_common::types::NodeCapabilities;
     use ghost_policy::PolicyProfile;
+
+    /// The payout address is everything before the FIRST dot.
+    ///
+    /// This is the half of #481 that was actually broken. Splitting on the LAST dot gave
+    /// `bc1qAAA.farm1` as the payout address for `bc1qAAA.farm1.rig1` — not a valid Bitcoin
+    /// address, and disagreeing with pool_sv2, which already derived the address from the
+    /// first dot in both `PayoutMode::try_from` and `build_webhook_user_identity`.
+    #[test]
+    fn payout_address_is_taken_from_the_first_dot() {
+        // Multi-dot: the address must be the address, and the worker keeps its full name.
+        let (addr, worker) = parse_user_identity("bc1qAAA.farm1.rig1");
+        assert_eq!(
+            addr, "bc1qAAA",
+            "the address must not absorb part of the worker name"
+        );
+        assert_eq!(worker, "farm1.rig1");
+
+        // Two rigs under different farms stay distinct.
+        let (_, w1) = parse_user_identity("bc1qAAA.farm1.rig1");
+        let (_, w2) = parse_user_identity("bc1qAAA.farm2.rig1");
+        assert_ne!(w1, w2);
+
+        // Single dot — every miner in production — is unchanged.
+        let (addr, worker) = parse_user_identity("bc1qAAA.rig1");
+        assert_eq!((addr.as_str(), worker.as_str()), ("bc1qAAA", "rig1"));
+
+        // No dot at all keeps the documented fallback.
+        let (addr, worker) = parse_user_identity("bc1qAAA");
+        assert_eq!((addr.as_str(), worker.as_str()), ("bc1qAAA", "default"));
+    }
 
     fn test_secret() -> [u8; 32] {
         let mut secret = [0u8; 32];

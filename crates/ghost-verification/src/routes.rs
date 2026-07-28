@@ -2856,7 +2856,7 @@ async fn api_miners_by_address_handler(
             // Extract the worker suffix from `address.worker` for display
             let worker = m
                 .miner_id
-                .rsplit_once('.')
+                .split_once('.')
                 .map(|(_, w)| w.to_string())
                 .unwrap_or_else(|| "".to_string());
             serde_json::json!({
@@ -3516,7 +3516,7 @@ pub fn internal_hex_to_display_hex(internal_hex: &str) -> String {
 }
 
 fn is_system_miner(miner_id: &str) -> bool {
-    let worker = miner_id.rsplit_once('.').map(|(_, w)| w).unwrap_or("");
+    let worker = miner_id.split_once('.').map(|(_, w)| w).unwrap_or("");
     let lower = worker.to_ascii_lowercase();
     lower.contains("translator") || lower == "proxy"
 }
