@@ -313,6 +313,11 @@ pub async fn post(
 /// for the conditions the caller can't recover from (Mix round with no
 /// fee address configured — the round can't be built later, so we fail
 /// the input now).
+// `Err = axum::http::Response` is the idiomatic axum early-return: the helper hands back the
+// exact response the caller should send. Boxing it to satisfy result_large_err would make
+// every call site unwrap a Box to return a Response, which is worse code for 128 bytes on a
+// path that is already building an HTTP response.
+#[allow(clippy::result_large_err)]
 fn minimum_participant_input(
     session: &LiteSession,
     state: &CoordinatorState,

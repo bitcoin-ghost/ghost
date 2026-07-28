@@ -1,4 +1,7 @@
 #![allow(rustdoc::all)] // imported SV2 crate: relax strict rustdoc policy (SRI upstream doc style)
+#![allow(clippy::result_large_err)] // Err variant sits AT clippy's 128-byte threshold, not past
+                                    // it. Boxing would change signatures across a crate imported from SRI upstream, so the churn is
+                                    // paid twice: once now, and again at every upstream sync. Revisit if the variant grows.
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
