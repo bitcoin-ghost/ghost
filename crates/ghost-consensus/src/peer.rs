@@ -357,7 +357,35 @@ impl PeerManager {
     ) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
             peer.miner_count = miner_count;
-            peer.capabilities = capabilities;
+            // Do not let a ping that claims NOTHING erase what a peer has already told us.
+            //
+            // `NodeCapabilities` is a struct of plain bools, so "not reported" and "reported all
+            // false" are identical on the wire. Taking an all-default value at face value made
+            // the flags flap: at any moment an observer had a peer or two reading
+            // `public_mining = false` that were demonstrably public, and it was a different peer
+            // each time (#518). Nodes then blinked in and out of the public list, and anything
+            // routing on the bit skipped healthy peers intermittently.
+            //
+            // Every neighbouring field here is already guarded this way — the coordinator
+            // endpoint below, and L1 height / uptime / peer count / L2 in `update_node_telemetry`.
+            // Capabilities was the one that was not.
+            //
+            // The limit, stated plainly: an operator genuinely turning EVERY capability off is
+            // indistinguishable from a ping that reports none, so that transition needs a
+            // restart to take effect. A node advertising nothing is not a useful peer anyway,
+            // and it ages out of the connected set on its own. Representing it properly means
+            // making absence explicit on the wire, which is a protocol change.
+            let claims_nothing = capabilities == ghost_common::types::NodeCapabilities::default();
+            let we_know_better =
+                peer.capabilities != ghost_common::types::NodeCapabilities::default();
+            if claims_nothing && we_know_better {
+                debug!(
+                    node_id = %hex::encode(&node_id[..8]),
+                    "Health ping reported no capabilities; keeping the last known set"
+                );
+            } else {
+                peer.capabilities = capabilities;
+            }
             // Only overwrite a known endpoint with a freshly-advertised one;
             // never clobber a good endpoint with `None` (a ping where the peer
             // momentarily omitted it / hasn't re-advertised yet).
@@ -987,6 +1015,67 @@ mod tests {
             vec![[9u8; 16]],
             "a real ping update must still overwrite"
         );
+    }
+
+    /// A ping that reports NO capabilities must not erase what a peer already told us.
+    ///
+    /// `NodeCapabilities` is all bools, so "not reported" and "reported all false" look
+    /// identical on the wire. Believing an all-default ping made the flags flap — a peer or two
+    /// reading `public_mining = false` at any moment while demonstrably public, a different peer
+    /// each time (#518). Nodes blinked out of the public mining list, and anything routing on
+    /// the bit skipped healthy peers.
+    #[test]
+    fn a_ping_claiming_no_capabilities_does_not_erase_known_ones() {
+        use ghost_common::types::NodeCapabilities;
+        let mgr = PeerManager::new([0xFFu8; 32], 100);
+        let pid = [11u8; 32];
+        mgr.upsert_peer(Peer::new(pid, "10.0.0.11:8080".to_string()));
+
+        let mut caps = NodeCapabilities::default();
+        caps.public_mining = true;
+        caps.reaper = true;
+        mgr.update_health_metrics(&pid, 5, caps, None, 0);
+        assert!(mgr.get_peer(&pid).unwrap().capabilities.public_mining);
+
+        // The flap: a ping carrying nothing.
+        mgr.update_health_metrics(&pid, 6, NodeCapabilities::default(), None, 0);
+        let got = mgr.get_peer(&pid).unwrap();
+        assert!(
+            got.capabilities.public_mining,
+            "a ping that claims nothing must not clear a known capability"
+        );
+        assert_eq!(
+            got.miner_count, 6,
+            "the rest of the ping must still be applied — only capabilities are held"
+        );
+    }
+
+    /// The guard must not freeze capabilities: a ping that reports a REAL set still wins,
+    /// including one that turns an individual capability off.
+    #[test]
+    fn a_ping_with_real_capabilities_still_updates_them() {
+        use ghost_common::types::NodeCapabilities;
+        let mgr = PeerManager::new([0xFFu8; 32], 100);
+        let pid = [12u8; 32];
+        mgr.upsert_peer(Peer::new(pid, "10.0.0.12:8080".to_string()));
+
+        let mut caps = NodeCapabilities::default();
+        caps.public_mining = true;
+        caps.reaper = true;
+        mgr.update_health_metrics(&pid, 1, caps, None, 0);
+
+        // Operator turns public mining off but the node still runs the reaper: a real claim,
+        // not an empty one, so it must be believed.
+        let mut narrowed = NodeCapabilities::default();
+        narrowed.reaper = true;
+        mgr.update_health_metrics(&pid, 1, narrowed, None, 0);
+
+        let got = mgr.get_peer(&pid).unwrap();
+        assert!(
+            !got.capabilities.public_mining,
+            "a real claim must be applied"
+        );
+        assert!(got.capabilities.reaper);
     }
 
     /// A health ping that omits the tier ports must not blank what the peer already told us.
