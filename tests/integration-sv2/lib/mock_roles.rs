@@ -1,4 +1,6 @@
-use crate::utils::{create_downstream, create_upstream, message_from_frame, wait_for_client};
+use crate::utils::{
+    accept_one, bind_listener, create_downstream, create_upstream, message_from_frame,
+};
 use async_channel::Sender;
 use std::{convert::TryInto, net::SocketAddr};
 use stratum_apps::{
@@ -141,9 +143,17 @@ impl MockUpstream {
 
         let (proxy_sender, proxy_receiver) = async_channel::unbounded::<AnyMessage<'static>>();
 
+        // Bind BEFORE spawning, so the socket exists the moment `start()` returns.
+        //
+        // This used to bind inside the spawned task, so a caller could dial the address before
+        // anything was listening on it — and since callers probe a port with a temporary
+        // `TcpListener` and drop it, a third party could take the port in between. Invisible on
+        // a fast machine, wide open under `cargo llvm-cov` (#408).
+        let listener = bind_listener(listening_address).await;
+
         tokio::spawn(async move {
             let (downstream_receiver, downstream_sender) =
-                create_downstream(wait_for_client(listening_address).await)
+                create_downstream(accept_one(listener).await)
                     .await
                     .expect("Failed to connect to downstream");
 

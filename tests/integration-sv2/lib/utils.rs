@@ -58,13 +58,31 @@ fn get_available_port() -> u16 {
     }
 }
 pub async fn wait_for_client(listen_socket: SocketAddr) -> tokio::net::TcpStream {
-    let listener = tokio::net::TcpListener::bind(listen_socket)
+    accept_one(bind_listener(listen_socket).await).await
+}
+
+/// Bind the listener, separately from accepting on it.
+///
+/// Callers that spawn their accept loop MUST bind before returning, or nothing guarantees the
+/// socket exists when the peer dials it. `MockUpstream::start` used to do both inside
+/// `tokio::spawn`, so a test could connect to an address nobody was listening on yet — and the
+/// port had already been probed-and-released by the caller, so a third party could take it in
+/// between (#408).
+///
+/// The window is invisible on a fast machine and wide under `cargo llvm-cov`, which is exactly
+/// where the hang showed up: 5h38m in one test under instrumentation, 22 minutes without.
+pub async fn bind_listener(listen_socket: SocketAddr) -> tokio::net::TcpListener {
+    tokio::net::TcpListener::bind(listen_socket)
         .await
-        .expect("Impossible to listen on given address");
+        .expect("Impossible to listen on given address")
+}
+
+/// Accept a single connection from an already-bound listener.
+pub async fn accept_one(listener: tokio::net::TcpListener) -> tokio::net::TcpStream {
     if let Ok((stream, _)) = listener.accept().await {
         stream
     } else {
-        panic!("Impossible to accept dowsntream connection")
+        panic!("Impossible to accept downstream connection")
     }
 }
 

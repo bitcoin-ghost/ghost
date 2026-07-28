@@ -3,8 +3,8 @@ use crate::{
     message_aggregator::MessagesAggregator,
     types::MsgType,
     utils::{
-        create_downstream, create_upstream, recv_from_down_send_to_up, recv_from_up_send_to_down,
-        wait_for_client,
+        accept_one, create_downstream, create_upstream, recv_from_down_send_to_up,
+        recv_from_up_send_to_down,
     },
 };
 use std::{
@@ -110,9 +110,29 @@ impl<'a> Sniffer<'a> {
         let action = self.action.clone();
         let identifier = self.identifier.to_string();
         let negotiated_extensions = self.negotiated_extensions.clone();
+
+        // Bind BEFORE spawning. `start()` is not async, so this uses the std listener and hands
+        // it to tokio — the point is that the socket exists the instant `start()` returns.
+        //
+        // It used to bind inside the spawned task. The doc comment above states the required
+        // ordering ("started after the upstream role ... and before the downstream role starts
+        // sending"), but nothing enforced it: a caller could dial this address before anything
+        // was listening. Callers also probe a free port with a temporary `TcpListener` and drop
+        // it, so the port was unowned in between and a third party could take it.
+        //
+        // Invisible on a fast machine, wide open under `cargo llvm-cov` — which is where it
+        // showed up as 5h38m in a single test against 22 minutes uninstrumented (#408).
+        let std_listener =
+            std::net::TcpListener::bind(listening_address).expect("Sniffer: cannot bind");
+        std_listener
+            .set_nonblocking(true)
+            .expect("Sniffer: cannot set nonblocking");
+
         tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener)
+                .expect("Sniffer: cannot adopt listener");
             let (downstream_receiver, downstream_sender) =
-                create_downstream(wait_for_client(listening_address).await)
+                create_downstream(accept_one(listener).await)
                     .await
                     .expect("Failed to create downstream");
             let (upstream_receiver, upstream_sender) = create_upstream(loop {
