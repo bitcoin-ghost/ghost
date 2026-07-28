@@ -581,20 +581,24 @@ mod tests {
 
     #[tokio::test]
     async fn ghost_pay_check_unclaimed_short_circuits() {
-        let mut cfg = NodeConfig::default();
-        cfg.ghost_pay = None;
+        let cfg = NodeConfig {
+            ghost_pay: None,
+            ..Default::default()
+        };
         let r = check_ghost_pay(&cfg).await;
         assert!(!r.claimed && !r.passed && r.reason.is_none());
     }
 
     #[tokio::test]
     async fn ghost_pay_check_failure_carries_remediation_hint() {
-        let mut cfg = NodeConfig::default();
         // ghost-pay ENABLED (claimed) but not running — the remediation scenario.
-        cfg.ghost_pay = Some(GhostPayConfig {
-            enabled: true,
+        let cfg = NodeConfig {
+            ghost_pay: Some(GhostPayConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         // 127.0.0.1:8800 almost certainly not bound in test env
         let r = check_ghost_pay(&cfg).await;
         assert!(r.claimed);
