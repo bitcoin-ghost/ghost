@@ -139,7 +139,7 @@ fn seed_divergent(db: &Database, node: usize, now: i64) {
 
     for (i, (hash, m, round, work, ts)) in all_shares(now).into_iter().enumerate() {
         // Drop ~5% — a different slice on each node, as real gossip loss would.
-        if (i + node * 7) % 20 == 0 {
+        if (i + node * 7).is_multiple_of(20) {
             continue;
         }
         db.insert_share(&ShareRecord {

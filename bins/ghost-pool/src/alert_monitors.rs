@@ -649,6 +649,10 @@ mod tests {
         assert!(evaluate_mempool_congestion(u64::MAX, 0, MEMPOOL_CONGESTION_HIGH_PCT).is_none());
     }
 
+    // Both sides are constants deliberately: this guards the hysteresis band against being
+    // inverted or collapsed by a future edit. It fails only when someone changes those
+    // constants, which is the entire point — do not "fix" it by making it dynamic.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn congestion_rearm_is_below_high() {
         // Sanity: hysteresis band is non-empty and ordered.

@@ -1450,7 +1450,7 @@ mod tests {
                 challenger_id: &challenger,
                 target_node_id: target,
                 capability: "archive",
-                passed: passed,
+                passed,
                 timestamp: ts,
                 proof: b"p",
                 round_height: None,

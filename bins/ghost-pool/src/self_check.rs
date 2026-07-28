@@ -288,10 +288,7 @@ fn check_archive(config: &NodeConfig) -> CapabilityCheck {
     let configured = config.storage.db_path.as_path();
     let probe_path = data_probe_path(config);
     let free = free_bytes(&probe_path);
-    let passed = match free {
-        Some(b) if b >= ARCHIVE_MIN_FREE_BYTES => true,
-        _ => false,
-    };
+    let passed = matches!(free, Some(b) if b >= ARCHIVE_MIN_FREE_BYTES);
     let reason = match free {
         None => Some(format!(
             "could not stat data_dir {} (probed {})",

@@ -818,8 +818,8 @@ pub fn bump_fee(
     let n_inputs = unsigned.input.len() as u64;
     let n_outputs = unsigned.output.len() as u64;
     let est_vbytes = 11 + n_inputs * 58 + n_outputs * 31;
-    let old_rate = if est_vbytes > 0 {
-        old_fee / est_vbytes
+    let old_rate = if let Some(r) = old_fee.checked_div(est_vbytes) {
+        r
     } else {
         0
     };
