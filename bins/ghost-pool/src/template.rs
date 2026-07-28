@@ -4923,7 +4923,7 @@ mod tests {
 
         let mut strict = PolicyProfile::full_open();
         strict.max_tx_outputs = 5;
-        let (kept, _) = make_processor(strict).filter_transactions(&[tx.clone()]);
+        let (kept, _) = make_processor(strict).filter_transactions(std::slice::from_ref(&tx));
         assert!(
             kept.is_empty(),
             "tx exceeding max_tx_outputs must be dropped"
@@ -5038,7 +5038,7 @@ mod tests {
 
         let mut strict = PolicyProfile::full_open();
         strict.max_tx_size = 500; // vbytes; a 50-output tx is larger
-        let (kept, _) = make_processor(strict).filter_transactions(&[tx.clone()]);
+        let (kept, _) = make_processor(strict).filter_transactions(std::slice::from_ref(&tx));
         assert!(kept.is_empty(), "tx exceeding max_tx_size must be dropped");
 
         let mut loose = PolicyProfile::full_open();
