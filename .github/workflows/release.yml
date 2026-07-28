@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  # Dry run without cutting a tag. Everything builds and the artifacts are
+  # uploaded, but the release itself is skipped (see the `release` job's `if`).
+  #
+  # Until this existed the only way to exercise this workflow was to tag, which
+  # is why a glibc floor sat in the Linux artifact unnoticed across every release
+  # (#540): nobody could run it to find out.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,8 +23,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 22.04, deliberately, NOT ubuntu-latest.
+          #
+          # glibc is backward compatible but not forward compatible: a binary
+          # linked on 24.04 (glibc 2.39) demands >= 2.38 at runtime and will not
+          # start on anything older. The released ghost-pool did exactly that,
+          # excluding Ubuntu 22.04 LTS (2.35, supported to 2027) and Debian 12
+          # (2.36) — and our own fleet is all 24.04, so it was invisible (#540).
+          #
+          # Building on 22.04 lowers the floor to 2.35, which still runs on
+          # 24.04. Nothing is lost by building older; reach is lost by building
+          # newer. Verify with:
+          #   objdump -T ghost-pool | grep GLIBC_ | sed 's/.*GLIBC_//' | sort -V | tail -1
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             suffix: ""
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -116,6 +135,36 @@ jobs:
           test -x ghost-core/build/bin/ghostd
 
       # Package binaries
+      # Fail the build if the Linux artifact demands a newer glibc than we target.
+      #
+      # This is the check that did not exist: the floor was only discoverable by
+      # downloading a published release and watching it fail to start on an older
+      # distro. Asserting it here means a runner-image bump cannot quietly raise
+      # the requirement again (#540).
+      - name: Assert glibc floor (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          MAX_ALLOWED=2.35
+          worst=""
+          for bin in target/${{ matrix.target }}/release/*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            v=$(objdump -T "$bin" 2>/dev/null \
+                  | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' \
+                  | sort -V | tail -1)
+            [ -n "$v" ] || continue
+            echo "  $(basename "$bin"): needs glibc $v"
+            if [ -z "$worst" ] || [ "$(printf '%s\n%s\n' "$worst" "$v" | sort -V | tail -1)" = "$v" ]; then
+              worst="$v"
+            fi
+          done
+          echo "highest requirement: ${worst:-none}"
+          if [ -n "$worst" ] && \
+             [ "$(printf '%s\n%s\n' "$MAX_ALLOWED" "$worst" | sort -V | tail -1)" != "$MAX_ALLOWED" ]; then
+            echo "::error::release binaries require glibc $worst, above the $MAX_ALLOWED floor."
+            echo "::error::That excludes Ubuntu 22.04 (2.35) and Debian 12 (2.36). See #540."
+            exit 1
+          fi
+
       - name: Package
         shell: bash
         run: |
@@ -158,6 +207,9 @@ jobs:
   release:
     name: Create Release
     needs: build
+    # Tag pushes only. A dispatch run is for testing the build, and must not
+    # produce a release named after a branch.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -195,6 +247,48 @@ jobs:
           echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
             --armor --detach-sign --output SHA256SUMS.txt.asc SHA256SUMS.txt
           gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
+
+      # Refuse to publish a release whose signature or checksums do not hold.
+      #
+      # The step above signs and verifies, but only when it runs — and it is gated on
+      # `env.GPG_PRIVATE_KEY != ''`, where the variable comes from that step's OWN env block.
+      # That works, and was verified against v1.11.19, but it works by a subtlety of when
+      # step-level env enters scope for `if`. It reads like a bug, so a well-meaning refactor
+      # that moves the env or rewrites the condition would silently skip signing and publish an
+      # unsigned release with nothing to catch it.
+      #
+      # This gate does not care how the signing step is written. It asserts the OUTCOME on a tag
+      # push: the detached signature exists, verifies, and covers the manifest that matches the
+      # artifacts actually being uploaded. (Private board SEC-3.)
+      - name: Verify the release is signed and the checksums match
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ ! -f SHA256SUMS.txt.asc ]; then
+            echo "::error::no SHA256SUMS.txt.asc — this tag would publish UNSIGNED."
+            echo "::error::The signing step was skipped or failed. See private board SEC-3."
+            exit 1
+          fi
+          gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt \
+            || { echo "::error::signature does not verify against the manifest"; exit 1; }
+          # And the manifest must describe the artifacts actually being uploaded, not a
+          # stale copy of itself. Check each listed file by name, wherever it landed under
+          # artifacts/ — no copying, so nothing depends on cp/find quoting.
+          rc=0
+          while read -r want name; do
+            [ -n "$name" ] || continue
+            path=$(find artifacts -type f -name "$name" | head -1)
+            if [ -z "$path" ]; then
+              echo "::error::manifest lists $name but no such artifact was built"; rc=1; continue
+            fi
+            got=$(sha256sum "$path" | cut -d" " -f1)
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name checksum mismatch: manifest $want, artifact $got"; rc=1
+            else
+              echo "  ok  $name"
+            fi
+          done < SHA256SUMS.txt
+          [ "$rc" -eq 0 ] || { echo "::error::manifest does not match the artifacts"; exit 1; }
+          echo "signed and checksums verified"
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
