@@ -26,8 +26,13 @@ user_identity = "ghost_miner"
 aggregate_channels = false
 
 # Protocol extensions
+# Worker-Specific Hashrate Tracking (0x0002) carries the per-share worker identity that the
+# pool recombines with the channel-level address for attribution. REQUIRED here, and the pool
+# must list it under `supported_extensions` — check-stratum-config-agreement.sh enforces that
+# pairing, because a translator requiring an extension the pool does not support fails the
+# handshake, and the reverse silently drops attribution.
 supported_extensions = []
-required_extensions = []
+required_extensions = [0x0002]
 
 # Monitoring endpoint
 monitoring_address = "0.0.0.0:9092"

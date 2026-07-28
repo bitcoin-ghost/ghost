@@ -47,7 +47,8 @@ shares_per_minute = 6.0
 share_batch_size = 10
 
 # Protocol extensions
-supported_extensions = []
+# Must SUPPORT what the translator REQUIRES (0x0002, worker-specific hashrate tracking).
+supported_extensions = [0x0002]
 required_extensions = []
 
 # Monitoring endpoint

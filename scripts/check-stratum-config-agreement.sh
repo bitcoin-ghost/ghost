@@ -33,6 +33,7 @@ import re, sys
 
 INSTALLER = "scripts/install-node.sh"
 REFERENCE = "config/sri/translator-config.toml"
+POOL_REFERENCE = "config/sri/pool-config.toml"
 
 # Keys that must be identical in both files.
 SHARED = [
@@ -44,6 +45,12 @@ SHARED = [
     "downstream_port",
     "max_supported_version",
     "min_supported_version",
+    # Extension negotiation. These diverged silently: the installer set
+    # required_extensions = [0x0002] on the translator while the reference config said [], so
+    # which attribution path a node took depended on which file provisioned it. Nothing
+    # reported that, because these keys were not compared (#480).
+    "supported_extensions",
+    "required_extensions",
 ]
 
 # Invariants that must hold regardless of whether the two files agree.
@@ -137,6 +144,50 @@ try:
         )
 except ValueError:
     pass
+
+# The pool must SUPPORT every extension the translator REQUIRES.
+#
+# This spans two files, so no amount of per-file agreement catches it. Both directions break
+# something, and neither breaks loudly:
+#   - translator requires what the pool does not support -> the SV2 handshake fails and the
+#     translator falls through to the next upstream.
+#   - pool supports what the translator does not require -> the TLV is never negotiated, so
+#     per-worker attribution silently stops and shares fall back to the channel identity.
+def parse_ext_list(v):
+    """`[0x0002, 0x0003]` -> {2, 3}. Returns None if it cannot be parsed."""
+    if v is None:
+        return None
+    inner = v.strip().strip("[]").strip()
+    if not inner:
+        return set()
+    out = set()
+    for item in inner.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            out.add(int(item, 16) if item.lower().startswith("0x") else int(item))
+        except ValueError:
+            return None
+    return out
+
+pool_vals, _ = values(POOL_REFERENCE)
+tran_required = parse_ext_list(b.get("required_extensions"))
+pool_supported = parse_ext_list(pool_vals.get("supported_extensions"))
+
+if tran_required is None or pool_supported is None:
+    problems.append(
+        "could not parse supported_extensions/required_extensions as a list — "
+        "the pool-supports-what-the-translator-requires invariant was NOT checked"
+    )
+else:
+    missing = tran_required - pool_supported
+    if missing:
+        problems.append(
+            f"{REFERENCE} requires extension(s) {sorted(hex(x) for x in missing)} that "
+            f"{POOL_REFERENCE} does not list under supported_extensions — the SV2 handshake "
+            f"will fail and the translator will fall through to another upstream"
+        )
 
 for k in SHARED:
     va, vb = a.get(k), b.get(k)
