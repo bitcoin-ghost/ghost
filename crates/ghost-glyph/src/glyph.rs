@@ -106,8 +106,8 @@ mod tests {
 
     fn test_pixels() -> [u8; GLYPH_SIZE] {
         let mut pixels = [0u8; GLYPH_SIZE];
-        for i in 0..GLYPH_SIZE {
-            pixels[i] = (i % PALETTE_SIZE) as u8;
+        for (i, px) in pixels.iter_mut().enumerate() {
+            *px = (i % PALETTE_SIZE) as u8;
         }
         pixels
     }

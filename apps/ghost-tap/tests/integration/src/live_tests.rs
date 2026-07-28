@@ -12,6 +12,10 @@
 //! ```
 
 #![cfg(feature = "live-tests")]
+// Every helper below is used only from the `#[tokio::test]` functions in this file, which the
+// LIB target does not compile — so a lib-only build reports them dead. They are not: removing
+// them breaks the live tests the moment anyone runs them with `--features live-tests`.
+#![allow(dead_code)]
 
 use ghost_tap_core::network::ghost_pay::ShieldRequest;
 use std::env;

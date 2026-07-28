@@ -247,7 +247,7 @@ impl RoundShares {
             .iter()
             .map(|(id, info)| (*id, info.shares_received))
             .collect();
-        nodes.sort_by(|a, b| b.1.cmp(&a.1));
+        nodes.sort_by_key(|x| std::cmp::Reverse(x.1));
 
         // Collect top 100 node IDs
         let top_100_ids: Vec<NodeId> = nodes.iter().take(100).map(|(id, _)| *id).collect();
@@ -327,7 +327,7 @@ impl RoundShares {
             .map(|(id, work)| (id.as_str(), *work))
             .collect();
 
-        miners.sort_by(|a, b| b.1.cmp(&a.1));
+        miners.sort_by_key(|x| std::cmp::Reverse(x.1));
         miners.truncate(n);
         miners
     }

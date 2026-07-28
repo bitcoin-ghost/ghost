@@ -201,7 +201,7 @@ pub fn compute_ledger_root(
     let mut m = miners.to_vec();
     m.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut n = nodes.to_vec();
-    n.sort_by(|a, b| a.0.cmp(&b.0));
+    n.sort_by_key(|x| x.0);
 
     let mut h = Sha256::new();
     h.update(LEDGER_ROOT_DOMAIN);
@@ -250,7 +250,7 @@ pub fn ledger_root_diag(
     let mdig = mh.finalize();
 
     let mut n = nodes.to_vec();
-    n.sort_by(|a, b| a.0.cmp(&b.0));
+    n.sort_by_key(|x| x.0);
     let mut nh = Sha256::new();
     for (node_id, shares) in &n {
         nh.update(&node_id[..]);
@@ -1460,7 +1460,7 @@ impl PayoutProposalCreator {
 
         // Sort by work descending, take top N (using scaled integer comparison)
         let mut sorted = scaled_work;
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
         sorted.truncate(self.config.max_miner_outputs);
 
         // Recalculate total work for top miners
