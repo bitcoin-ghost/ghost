@@ -757,7 +757,7 @@ impl CoordinatorPool {
         }
 
         // Sort by trust score (descending)
-        candidates.sort_by(|a, b| b.1.trust_score.cmp(&a.1.trust_score));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.1.trust_score));
 
         // CRIT-PANIC-2: Use .first() instead of [0] indexing
         candidates

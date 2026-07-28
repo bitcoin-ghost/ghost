@@ -455,8 +455,7 @@ mod tests {
             let ch = contribution_hash(&c.contributor, pos, &c.new_params_hash);
             let msg = vote_signing_message(&ch, true);
             let mut row = Vec::new();
-            for elder_idx in 0..(pos - 1) as usize {
-                let elder = &identities[elder_idx];
+            for elder in identities.iter().take((pos - 1) as usize) {
                 row.push(VoteLineageRow {
                     voter: elder.node_id(),
                     approve: true,

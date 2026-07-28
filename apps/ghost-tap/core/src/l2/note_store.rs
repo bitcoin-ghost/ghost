@@ -153,7 +153,7 @@ impl NoteStore {
 
         // Greedy selection: largest notes first, up to 4
         let mut unspent: Vec<&OwnedNote> = self.notes.values().filter(|n| !n.spent).collect();
-        unspent.sort_by(|a, b| b.value.cmp(&a.value));
+        unspent.sort_by_key(|n| std::cmp::Reverse(n.value));
 
         let mut selected_indices = Vec::new();
         let mut running_total = 0u64;

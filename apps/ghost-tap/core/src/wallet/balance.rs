@@ -149,7 +149,7 @@ impl UtxoSet {
             })
             .collect();
 
-        sorted.sort_by(|a, b| b.amount.cmp(&a.amount));
+        sorted.sort_by_key(|e| std::cmp::Reverse(e.amount));
 
         let mut selected = Vec::new();
         let mut total = 0u64;
