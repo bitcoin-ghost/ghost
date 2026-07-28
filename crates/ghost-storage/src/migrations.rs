@@ -34,7 +34,28 @@ const SCHEMA_VERSION: u32 = 46;
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
     let current_version = get_schema_version(conn)?;
 
-    if current_version >= SCHEMA_VERSION {
+    // A database AHEAD of the binary is always a mistake, and it used to be completely silent.
+    //
+    // It happens when a node runs an unreleased build: its migrations apply irreversibly, and
+    // rolling the binary back does not roll the schema back. vm6 and vm8 sit at 47 against a
+    // binary at 46 for exactly that reason, from a branch test (#523).
+    //
+    // The danger is not today. It is that the check below is `>=`, so when THIS binary later
+    // gains its own migration 47 — almost certainly a different one — those nodes skip it while
+    // reporting themselves up to date. The defect then surfaces far from its cause, as a missing
+    // table on two nodes only, and those two are the canaries we deploy to first.
+    if current_version > SCHEMA_VERSION {
+        warn!(
+            database_version = current_version,
+            binary_version = SCHEMA_VERSION,
+            "Database schema is AHEAD of this binary — it has run a newer build. Migration \
+             {SCHEMA_VERSION}..={current_version} will be SKIPPED if this binary later defines \
+             one, because the version number cannot tell them apart"
+        );
+        return Ok(());
+    }
+
+    if current_version == SCHEMA_VERSION {
         debug!(version = current_version, "Database schema up to date");
         return Ok(());
     }
@@ -2303,6 +2324,43 @@ fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> 
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// A database from a NEWER build must be left alone, and must not be mistaken for one
+    /// that is up to date.
+    ///
+    /// vm6 and vm8 are in this state: 47 against a binary at 46, from a branch test whose
+    /// migration applied irreversibly. The risk is not present-tense — it is that this binary
+    /// will one day define its own 47, and a `>=` check cannot tell the two apart.
+    #[test]
+    fn a_database_ahead_of_the_binary_is_not_treated_as_up_to_date() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate to current");
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Simulate the node having run a newer build.
+        set_schema_version(&conn, SCHEMA_VERSION + 1).unwrap();
+
+        // Running again must succeed and must NOT rewind the version — a binary that
+        // "corrected" a newer database down to its own number would destroy the record of
+        // what had actually been applied.
+        run_migrations(&conn).expect("must not fail on a newer database");
+        assert_eq!(
+            get_schema_version(&conn).unwrap(),
+            SCHEMA_VERSION + 1,
+            "an older binary must not rewind a newer database's version"
+        );
+    }
+
+    /// The ordinary case: a database already at this binary's version is a no-op.
+    #[test]
+    fn a_database_at_the_binary_version_is_a_no_op() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("first");
+        let after_first = get_schema_version(&conn).unwrap();
+        run_migrations(&conn).expect("second");
+        assert_eq!(get_schema_version(&conn).unwrap(), after_first);
+        assert_eq!(after_first, SCHEMA_VERSION);
+    }
 
     /// v41 must rewrite display-order share hashes into canonical internal order, leave
     /// already-internal rows alone, and delete a row that collides (a genuine double-count).
