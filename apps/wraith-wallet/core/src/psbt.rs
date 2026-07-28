@@ -550,9 +550,10 @@ pub enum CreateError {
 ///   - tx overhead: 11 vbytes
 ///   - per P2TR input (key-path):  ~58 vbytes (witness ~16.25 vB + outpoint + sequence)
 ///   - per output (P2TR / P2WPKH): ~31 vbytes
-/// We round generously to keep the fee sufficient when the
-/// selected mix has different output script types. Dust threshold
-/// for outputs is 330 sats (BIP125 / Bitcoin Core P2TR dust).
+///
+/// We round generously to keep the fee sufficient when the selected mix has
+/// different output script types. Dust threshold for outputs is 330 sats
+/// (BIP125 / Bitcoin Core P2TR dust).
 pub fn create_psbt(
     available: &[AvailableUtxo],
     recipient_address: &str,

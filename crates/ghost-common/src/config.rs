@@ -1000,6 +1000,17 @@ impl NodeConfig {
         }
     }
 
+    /// Load a `NodeConfig` from a TOML file.
+    ///
+    /// # Returns
+    /// * `Ok(Self)` on success
+    /// * `Err` describing the path if the file cannot be read or parsed
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        toml::from_str(&content).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+
     /// Save configuration to file atomically using temp file + rename pattern
     ///
     /// This ensures crash safety: the config file is never left in a partial state.
@@ -1011,13 +1022,6 @@ impl NodeConfig {
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if serialization, writing, or renaming fails
-    /// Load a `NodeConfig` from a TOML file.
-    pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        toml::from_str(&content).map_err(|e| format!("parse {}: {e}", path.display()))
-    }
-
     pub fn save_atomic(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
 

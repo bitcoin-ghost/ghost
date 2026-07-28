@@ -514,9 +514,9 @@ pub struct LiteOutputProvenance {
     pub amount_sats: u64,
 }
 
-/// Result of `LiteRoundBuilder::build()`. The unsigned round transaction
-/// + structural metadata participants use to verify their interest is
-/// represented correctly before they sign.
+/// Result of `LiteRoundBuilder::build()`: the unsigned round transaction, plus the
+/// structural metadata participants use to verify their interest is represented
+/// correctly before they sign.
 #[derive(Debug, Clone)]
 pub struct LiteRound {
     pub session_id: String,

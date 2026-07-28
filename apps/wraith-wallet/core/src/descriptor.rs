@@ -49,10 +49,9 @@ pub enum DescriptorError {
     Bitcoin(String),
 }
 
-/// One cosigner key inside a parsed descriptor. Origin (fingerprint
-/// + path-from-master) is what BIP-380 calls "key origin info" and
-/// is what lets a signer identify whether they own this key without
-/// guessing.
+/// One cosigner key inside a parsed descriptor. Origin — fingerprint plus
+/// path-from-master — is what BIP-380 calls "key origin info", and is what
+/// lets a signer identify whether they own this key without guessing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CosignerKey {
     pub fingerprint: [u8; 4],

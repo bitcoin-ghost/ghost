@@ -5797,9 +5797,8 @@ async fn api_qualification_scoped_set_handler(
 ///   * `public_mining`            ← `network.mining_mode == PublicPool`
 ///   * `pool_name`                ← `pool.pool_name`
 ///   * `archive_mode`             ← `storage.archive_mode`
-///   * `pruning`                  ← VW/OW/AW model from `storage` (VW floor is a
-///                                  read-only consensus constant, OW = `prune_height`,
-///                                  AW = `archive_mode`)
+///   * `pruning`                  ← VW/OW/AW model from `storage`. VW floor is a
+///     read-only consensus constant, OW = `prune_height`, AW = `archive_mode`.
 async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
     let config = state.dashboard_config.read();
