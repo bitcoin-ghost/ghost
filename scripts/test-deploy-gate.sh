@@ -30,6 +30,19 @@ REPO_ROOT="$TMP/repo"
 mkdir -p "$REPO_ROOT/scripts" "$REPO_ROOT/bins/translator-sv2/tests" "$REPO_ROOT/crates"
 cp "$SRC_ROOT/scripts/deploy-node.sh" "$REPO_ROOT/scripts/deploy-node.sh"
 : > "$REPO_ROOT/crates/.keep"
+
+# Stand-in for the SV1 smoke suite, which the soak gate now runs against a canary (#461).
+# Committed here rather than written mid-test, because creating a file later would dirty the
+# tree and trip the clean-tree gate before the case under test is reached.
+#
+# Its exit code is driven by GATE_SMOKE_EXIT so a single committed file can play both a healthy
+# and a broken submission path.
+cat > "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py" <<'SMOKE_STUB'
+#!/usr/bin/env python3
+import os, sys
+sys.exit(int(os.environ.get("GATE_SMOKE_EXIT", "0")))
+SMOKE_STUB
+chmod +x "$REPO_ROOT/bins/translator-sv2/tests/sv1_handshake_smoke.py"
 git -C "$REPO_ROOT" init -q
 git -C "$REPO_ROOT" add -A
 git -C "$REPO_ROOT" -c user.email=t@t -c user.name=t commit -qm "gate under test"
@@ -45,6 +58,7 @@ run_gate() {
     local node="$1" binary="$2"
     ( cd "$REPO_ROOT" \
         && GHOST_DEPLOY_REPO_ROOT="$REPO_ROOT" STATE_DIR="$TMP/state" SOAK_MINUTES=60 \
+        GATE_SMOKE_EXIT="${GATE_SMOKE_EXIT:-0}" \
         timeout 60 bash "$DEPLOY" "$node" "$binary" 2>&1 )
 }
 
@@ -106,7 +120,45 @@ out="$(run_gate ghost-vm1 translator_sv2)"
 check "a 5-minute soak does not satisfy a 60-minute requirement" "has not soaked" "$out"
 
 # ---------------------------------------------------------------------------
-# 5. Canary deploys must NOT require a soak — that is the point of a canary.
+# 5. A LONG ENOUGH soak whose submission path is broken must NOT satisfy the gate.
+#
+#    This is the #461 case. A canary has no miners, so "healthy for 60 minutes" says nothing
+#    about the path where both motivating regressions lived. Before this, the gate accepted a
+#    soak purely on elapsed time and a matching hash — a build could handshake-deadlock every
+#    miner and still be waved into production.
+# ---------------------------------------------------------------------------
+printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
+    > "$TMP/state/soaked-$SHA-ghost-vm5-translator_sv2"
+out="$(GATE_SMOKE_EXIT=1 run_gate ghost-vm1 translator_sv2)"
+check "a 2-hour soak with a FAILING submission path does not satisfy the gate" \
+    "has not soaked" "$out"
+
+# The refused record must also be cleared, so a later run cannot inherit the same bad vouch.
+if [ -f "$TMP/state/soaked-$SHA-ghost-vm5-translator_sv2" ]; then
+    printf "  [BAD] a soak refused for a broken submission path was left on disk\n"
+    fail=$((fail+1))
+else
+    printf "  [ok ] a refused soak record is cleared, not left to be re-read\n"
+    pass=$((pass+1))
+fi
+
+# ---------------------------------------------------------------------------
+# 6. The same soak with a PASSING submission path DOES satisfy the gate — so the
+#    check above is a real gate and not a blanket refusal.
+# ---------------------------------------------------------------------------
+printf '%s %s\n' "$(( $(date +%s) - 7200 ))" "" \
+    > "$TMP/state/soaked-$SHA-ghost-vm5-translator_sv2"
+out="$(run_gate ghost-vm1 translator_sv2)"
+if grep -qi "has not soaked" <<<"$out"; then
+    printf "  [BAD] a good soak with a passing submission path was still refused\n"
+    fail=$((fail+1))
+else
+    printf "  [ok ] a soak with a verified submission path satisfies the gate\n"
+    pass=$((pass+1))
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Canary deploys must NOT require a soak — that is the point of a canary.
 #    It should get past the soak gate and fail later (on ssh or a missing binary).
 # ---------------------------------------------------------------------------
 rm -f "$TMP/state/soaked-$SHA"-*
@@ -128,4 +180,4 @@ if [ "$fail" -ne 0 ]; then
     echo "*** $fail of $((pass+fail)) deploy-gate checks FAILED — the gate is not refusing what it must ***"
     exit 1
 fi
-echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary and short soaks."
+echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks."
