@@ -166,11 +166,12 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
 
     // Public routes (no authentication required)
     let public_router = Router::new()
-        // `/ws` used to be here. It is now in `localhost_router`: production wires
-        // `WsState::new()`, i.e. `require_auth: false`, so the socket was reachable from
-        // anywhere that could reach :8080 — which on a default install is the internet.
-        //
-        // Health and node info
+        // `/ws` used to live here. It is now in `localhost_router`, AND the handler itself
+        // refuses non-loopback callers (`WsState::loopback_only`, default true). Two
+        // independent guards on purpose: the routing one disappears if anyone re-registers
+        // this route on the public router, which is an easy mistake to make and a silent one
+        // to suffer. The state-level check survives that.
+        //        // Health and node info
         .route("/health", get(health_handler))
         .route("/node-info", get(node_info_handler))
         // Informational endpoints
@@ -460,10 +461,14 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // peer-to-peer surface is `/health`, `/verify/*` and `/api/v1/mpc/*`.
         .route(
             "/ws",
-            get(move |ws: WebSocketUpgrade, auth: Query<WsAuthQuery>| {
-                let ws_state = Arc::clone(&ws_state);
-                async move { ws_handler(ws, auth, State(ws_state)).await }
-            }),
+            get(
+                move |ws: WebSocketUpgrade,
+                      peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+                      auth: Query<WsAuthQuery>| {
+                    let ws_state = Arc::clone(&ws_state);
+                    async move { ws_handler(ws, peer, auth, State(ws_state)).await }
+                },
+            ),
         )
         .route("/api/internal/share", post(share_notification_handler))
         .route("/api/internal/shares", post(share_batch_handler))

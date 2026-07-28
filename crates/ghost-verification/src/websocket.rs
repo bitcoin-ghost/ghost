@@ -291,6 +291,13 @@ pub struct WsState {
     require_auth: bool,
     /// L-30 FIX: Whether running on mainnet (blocks format-only validation fallback)
     is_mainnet: bool,
+    /// Restrict this stream to loopback callers.
+    ///
+    /// The node's own dashboard reaches the backend over 127.0.0.1 and relays to browsers
+    /// behind its own session auth, so loopback is all this stream needs to serve. Defaults
+    /// to true: the listener binds 0.0.0.0 for the public REST API, and without this the
+    /// event stream is reachable by anyone who can reach the port.
+    loopback_only: bool,
 }
 
 impl WsState {
@@ -302,7 +309,20 @@ impl WsState {
             auth_secret: None,
             require_auth: false,
             is_mainnet: false,
+            loopback_only: true,
         }
+    }
+
+    /// Whether this stream only serves loopback callers.
+    pub fn loopback_only(&self) -> bool {
+        self.loopback_only
+    }
+
+    /// Allow non-loopback callers. Opt-in, for a deployment that genuinely terminates the
+    /// relay off-box; the caller takes on providing an auth boundary in front of it.
+    pub fn allow_remote(mut self) -> Self {
+        self.loopback_only = false;
+        self
     }
 
     /// Create new WebSocket state with HMAC authentication (VF-C1)
@@ -317,6 +337,7 @@ impl WsState {
             auth_secret: Some(secret),
             require_auth,
             is_mainnet: false,
+            loopback_only: true,
         }
     }
 
@@ -333,6 +354,7 @@ impl WsState {
             auth_secret: Some(secret),
             require_auth: true, // Always required on all networks (HIGH-API-2)
             is_mainnet,
+            loopback_only: true,
         }
     }
 
@@ -418,9 +440,36 @@ impl Default for WsState {
 /// - Authenticated connections receive all events
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     Query(auth): Query<WsAuthQuery>,
     State(ws_state): State<Arc<WsState>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // Refuse non-loopback callers before completing the upgrade, so a remote client never
+    // reaches the stream at all rather than being handed a socket and then closed.
+    //
+    // The peer address comes from ConnectInfo — the real TCP socket source injected by
+    // `into_make_service_with_connect_info` — and NEVER from a request header, which a remote
+    // client fully controls. `rate_limit_middleware` already establishes that precedent and
+    // spells out why: matching X-Forwarded-For here would let anyone forge their way in.
+    //
+    // Absent ConnectInfo we refuse rather than allow. That only happens in test servers built
+    // without connect info, and failing closed on an unknown peer is the right default for a
+    // stream that is otherwise unauthenticated.
+    if ws_state.loopback_only() {
+        let is_loopback = peer.as_ref().map(|ci| ci.0.ip().is_loopback());
+        if is_loopback != Some(true) {
+            match peer.as_ref() {
+                Some(ci) => warn!(peer = %ci.0.ip(), "WebSocket connection refused: non-loopback"),
+                None => warn!("WebSocket connection refused: peer address unavailable"),
+            }
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                "this endpoint serves loopback callers only",
+            )
+                .into_response();
+        }
+    }
+
     // VF-C1: Check if authentication is required but not provided
     if ws_state.requires_auth() && !auth.has_auth() {
         warn!("WebSocket connection rejected: authentication required");
@@ -933,5 +982,46 @@ mod tests {
             participants: 0,
         }
         .is_public());
+    }
+
+    /// The event stream is reachable on the same listener as the public REST API, which binds
+    /// 0.0.0.0. Its own auth is optional and off by default, so the loopback restriction is the
+    /// only thing standing between a remote caller and the stream. Assert both directions, and
+    /// that an unknown peer fails CLOSED rather than open.
+    #[test]
+    fn stream_defaults_to_loopback_only_and_fails_closed() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        // Secure by default on every constructor, not just the plain one.
+        assert!(WsState::new().loopback_only());
+        assert!(WsState::with_auth([7u8; 32], false).loopback_only());
+        assert!(WsState::with_required_auth([7u8; 32], true).loopback_only());
+
+        // The decision the handler makes, expressed the same way: Some(true) admits,
+        // everything else refuses. `None` models a peer address we could not determine.
+        let admits = |ip: Option<IpAddr>| ip.map(|i| i.is_loopback()) == Some(true);
+
+        assert!(admits(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+        assert!(admits(Some(IpAddr::V6(Ipv6Addr::LOCALHOST))));
+        assert!(admits(Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)))));
+
+        // Anything routable is refused, including addresses that merely look internal.
+        for ip in [
+            Ipv4Addr::new(77, 22, 112, 180), // a real external caller seen on the port
+            Ipv4Addr::new(192, 168, 1, 10),  // LAN is not loopback
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(0, 0, 0, 0),
+        ] {
+            assert!(!admits(Some(IpAddr::V4(ip))), "must refuse {ip}");
+        }
+
+        // Unknown peer must fail closed.
+        assert!(
+            !admits(None),
+            "an undeterminable peer must be refused, not admitted"
+        );
+
+        // And the opt-out is available for a deployment that knowingly needs it.
+        assert!(!WsState::new().allow_remote().loopback_only());
     }
 }
