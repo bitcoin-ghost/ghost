@@ -29,7 +29,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 python3 - <<'PY'
-import re, sys
+import os, re, sys
 
 INSTALLER = "scripts/install-node.sh"
 REFERENCE = "config/sri/translator-config.toml"
@@ -211,6 +211,74 @@ for k, check in INVARIANTS.items():
         ok, why = check(v)
         if not ok:
             problems.append(f"{k} = {v} in {path} — {why}")
+
+# ---------------------------------------------------------------------------
+# Cross-file: the farm port ghost-pool GOSSIPS must equal the one the translator LISTENS on.
+#
+# translator_sv2 owns the listener (`[farm_tier] port`); ghost-pool owns the advertisement
+# (`[network] farm_port` in pool.toml), because they are different processes and ghost-pool
+# must not read another service's config file. So the value is duplicated, and duplication
+# drifts.
+#
+# Drift here is not cosmetic: a node advertising a farm port it does not listen on turns a
+# routing decision into a dropped connection, and the sender reads that as an unreachable peer
+# rather than a misconfiguration (#495).
+farm_listen = None
+in_farm = False
+for line in open(REFERENCE, encoding="utf-8"):
+    t = line.strip()
+    if t.startswith("["):
+        in_farm = t == "[farm_tier]"
+        continue
+    if in_farm and t.startswith("port"):
+        m = re.match(r"port\s*=\s*(\d+)", t)
+        if m:
+            farm_listen = int(m.group(1))
+        break
+
+farm_advertise = None
+for line in open("config/sri/pool.toml", encoding="utf-8") if os.path.exists("config/sri/pool.toml") else []:
+    m = re.match(r"\s*farm_port\s*=\s*(\d+)", line)
+    if m:
+        farm_advertise = int(m.group(1))
+        break
+
+# The installer writes both files, so it is the copy that actually reaches a node.
+installer_src = open(INSTALLER, encoding="utf-8").read()
+inst_farm_listen = None
+m = re.search(r"\[farm_tier\]\s*\nport\s*=\s*(\d+)", installer_src)
+if m:
+    inst_farm_listen = int(m.group(1))
+inst_farm_advertise = None
+m = re.search(r"^\s*farm_port\s*=\s*(\d+)", installer_src, re.M)
+if m:
+    inst_farm_advertise = int(m.group(1))
+
+if inst_farm_listen is not None and inst_farm_advertise is None:
+    problems.append(
+        f"{INSTALLER} configures a farm listener on {inst_farm_listen} but never sets "
+        "[network] farm_port in pool.toml — the node listens and never tells anyone, "
+        "so farm routing stays inert (#495)"
+    )
+elif (
+    inst_farm_listen is not None
+    and inst_farm_advertise is not None
+    and inst_farm_listen != inst_farm_advertise
+):
+    problems.append(
+        f"{INSTALLER} listens for farm traffic on {inst_farm_listen} but advertises "
+        f"{inst_farm_advertise} — peers would route farm connections to a closed port"
+    )
+
+if (
+    farm_listen is not None
+    and farm_advertise is not None
+    and farm_listen != farm_advertise
+):
+    problems.append(
+        f"{REFERENCE} listens for farm traffic on {farm_listen} but config/sri/pool.toml "
+        f"advertises {farm_advertise}"
+    )
 
 if problems:
     print("Stratum config sources disagree, or an invariant is broken:\n", file=sys.stderr)

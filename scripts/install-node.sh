@@ -704,6 +704,19 @@ log "Writing /etc/ghost/pool.toml"
 # ghost-pool REQUIRES: a miner password for both, plus the operator's solo
 # payout address for private_solo (99% subsidy + all fees route there).
 MINING_BLOCK="mining_mode = \"${MINING_MODE}\""
+# Tell peers about the farm listener, on exactly the nodes that run one.
+#
+# The listener itself is the translator's ([farm_tier] port, emitted below for public_pool
+# only); this is ghost-pool's advertisement of it. They are separate processes, so the port is
+# duplicated — `scripts/check-stratum-config-agreement.sh` keeps the two in step, because a node
+# advertising a port it does not listen on turns a routing decision into a dropped connection.
+#
+# Without this the listener is open and nobody is told, which is why farm routing has been inert
+# since #494 shipped (#495).
+if [[ "$MINING_MODE" == "public_pool" ]]; then
+  MINING_BLOCK="${MINING_BLOCK}
+farm_port = 4444"
+fi
 case "$MINING_MODE" in
   private_pool)
     MINING_BLOCK="${MINING_BLOCK}

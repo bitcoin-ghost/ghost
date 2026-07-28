@@ -2828,6 +2828,19 @@ async fn main() -> Result<()> {
         } else {
             None
         },
+        // SV1 tier listeners, so peers can route by tier (#495).
+        //
+        // Only advertised when this node actually accepts outside hashpower. A private or solo
+        // node advertising a listener would invite connections it will refuse, and the failure
+        // reads to the sender as an unreachable peer rather than a deliberate policy.
+        //
+        // The farm port is `None` unless the operator configured one. A node that advertises a
+        // farm port it does not listen on turns a routing decision into a dropped connection,
+        // so the safe direction is to say nothing.
+        advertised_hobby_port: is_public_mining.then_some(config.network.sv1_port),
+        advertised_farm_port: is_public_mining
+            .then_some(config.network.farm_port)
+            .flatten(),
         // Advertise our node-reward payout address so every peer's node registry
         // converges (payout-finalisation: without it get_all_node_ids_with_payout
         // returns {self} everywhere and the payout checkpoint can't finalise).
@@ -6364,6 +6377,11 @@ async fn main() -> Result<()> {
                 last_seen: p.last_seen,
                 max_capacity: p.max_capacity,
                 deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),
+                // Gossiped SV1 tier listeners (#495). Passed through verbatim, including None:
+                // the translator must be able to tell "no farm tier" from "farm tier on 4444",
+                // and only absence keeps a peer out of farm routing.
+                hobby_port: p.hobby_port,
+                farm_port: p.farm_port,
             })
             .collect()
     });

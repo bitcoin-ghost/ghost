@@ -872,6 +872,10 @@ impl HealthPingHandler {
         // Hardware-derived capacity used by the LB for utilisation routing.
         self.peers
             .update_max_capacity(&envelope.sender, ping.max_capacity);
+        // SV1 tier listeners, so the translator's load balancer can route farm traffic to a peer
+        // that actually runs a farm listener (#495).
+        self.peers
+            .update_tier_ports(&envelope.sender, ping.hobby_port, ping.farm_port);
         // Swarm-page telemetry: L1 height, trailing-7-day uptime %, this peer's
         // own peer count, and Ghost Pay L2 height. Older peers omit the Option
         // fields (→ None) and report block_height 0, all handled inside the

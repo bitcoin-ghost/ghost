@@ -1270,6 +1270,17 @@ pub struct NetworkConfig {
     pub sv2_port: u16,
     /// SV1 Stratum port (translator)
     pub sv1_port: u16,
+    /// This node's SV1 **farm/rental** listener, gossiped so peers can route farm traffic here
+    /// (#495). `None` = this node runs no farm tier and must never be sent farm connections.
+    ///
+    /// It duplicates the translator's `[farm_tier] port`, because the two live in different
+    /// processes: `translator_sv2` owns the listener, `ghost-pool` owns the gossip. Duplication
+    /// is the lesser evil against ghost-pool reading another service's config file, but it can
+    /// drift — and a node advertising a farm port it does not listen on turns a routing decision
+    /// into a dropped connection. `scripts/check-stratum-config-agreement.sh` holds the two in
+    /// step, in the same spirit as the extension-key invariant added for #480.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub farm_port: Option<u16>,
     /// HTTP API port (plain HTTP — SRI webhook, nginx upstream, dashboard).
     pub http_port: u16,
     /// HTTPS port for the inter-peer verification mesh.
@@ -1406,6 +1417,7 @@ impl Default for NetworkConfig {
             public_address: None,
             sv2_port: SV2_STRATUM_PORT,
             sv1_port: SV1_STRATUM_PORT,
+            farm_port: None,
             http_port: HTTP_API_PORT,
             verification_https_port: crate::constants::VERIFICATION_HTTPS_PORT,
             p2p: P2PPortConfig::default(),

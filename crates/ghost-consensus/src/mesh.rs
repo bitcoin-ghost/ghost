@@ -98,6 +98,12 @@ pub struct MeshConfig {
     /// `.onion`. `None` for nodes that haven't opted in — they advertise no
     /// endpoint and so are never elected.
     pub advertised_coordinator_endpoint: Option<String>,
+    /// SV1 hobby and farm listeners advertised to peers so the load balancer can route by tier
+    /// (#495). Both `None` until the operator configures them; a peer that advertises neither is
+    /// still a valid hobby target on the default port, but never a farm target.
+    pub advertised_hobby_port: Option<u16>,
+    /// See `advertised_hobby_port`.
+    pub advertised_farm_port: Option<u16>,
     /// This node's node-reward payout address, advertised in health pings so every
     /// peer learns it (see `HealthPing::payout_address`). Read from local config;
     /// `None` when no payout address is configured.
@@ -166,6 +172,8 @@ impl Default for MeshConfig {
             max_seen_messages: 100_000, // Cap at 100k messages (~3.2MB with 32-byte IDs)
             capabilities: ghost_common::types::NodeCapabilities::default(),
             advertised_coordinator_endpoint: None,
+            advertised_hobby_port: None,
+            advertised_farm_port: None,
             advertised_payout_address: None,
             // C-1: Enable Noise by default for secure-by-default operation
             noise_enabled: true,
@@ -3041,6 +3049,9 @@ impl MeshNetwork {
                 active_miner_id_hashes,
                 local_hashrate_th,
                 max_capacity: self.max_capacity.load(Ordering::Relaxed),
+                // Static, operator-chosen listeners read from config, never mutated at runtime.
+                hobby_port: self.config.advertised_hobby_port,
+                farm_port: self.config.advertised_farm_port,
                 best_records,
                 // Static, operator-chosen advertisement (read from config, never
                 // mutated at runtime), so reading from self.config is fine.

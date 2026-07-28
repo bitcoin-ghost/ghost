@@ -201,6 +201,14 @@ impl PeerManager {
             if merged.coordinator_endpoint.is_none() {
                 merged.coordinator_endpoint = existing.coordinator_endpoint.clone();
             }
+            // Same reasoning as the fields above: a bare re-announce carries no tier ports, and
+            // blanking them would drop the peer out of farm routing until its next full ping.
+            if merged.hobby_port.is_none() {
+                merged.hobby_port = existing.hobby_port;
+            }
+            if merged.farm_port.is_none() {
+                merged.farm_port = existing.farm_port;
+            }
             if merged.coordinator_sessions == 0 {
                 merged.coordinator_sessions = existing.coordinator_sessions;
             }
@@ -402,6 +410,27 @@ impl PeerManager {
     /// Update a peer's hardware-derived `max_capacity` (advertised in their
     /// most recent health ping). Used by the load balancer to compute
     /// utilisation for routing decisions.
+    /// Record the SV1 tier listeners a peer advertised in its health ping (#495).
+    ///
+    /// A ping that omits them leaves the cached values alone. Absence on the wire means "this
+    /// build does not say", not "this node has no listeners", and clearing on every such ping
+    /// would make farm routing flap for the whole mixed-version window.
+    pub fn update_tier_ports(
+        &self,
+        node_id: &NodeId,
+        hobby_port: Option<u16>,
+        farm_port: Option<u16>,
+    ) {
+        if let Some(peer) = self.peers.write().get_mut(node_id) {
+            if hobby_port.is_some() {
+                peer.hobby_port = hobby_port;
+            }
+            if farm_port.is_some() {
+                peer.farm_port = farm_port;
+            }
+        }
+    }
+
     pub fn update_max_capacity(&self, node_id: &NodeId, max_capacity: u32) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
             peer.max_capacity = max_capacity;
@@ -538,6 +567,11 @@ pub struct Peer {
     /// (legacy or pre-update node) — treated as "unknown" and excluded
     /// from utilisation-based routing.
     pub max_capacity: u32,
+    /// The peer's advertised SV1 tier listeners (#495). `None` = not advertised; for the farm
+    /// port that must be read as "not a farm target", never as a default.
+    pub hobby_port: Option<u16>,
+    /// See `hobby_port`.
+    pub farm_port: Option<u16>,
     /// This peer's best (rarest) valid share per records window, from its most
     /// recent health ping. Merged with the local DB best (and every other
     /// peer's) so the `/api/v1/pool/records` endpoint returns the mesh-wide
@@ -590,6 +624,8 @@ impl Peer {
             active_miner_id_hashes: Vec::new(),
             local_hashrate_th: 0.0,
             max_capacity: 0,
+            hobby_port: None,
+            farm_port: None,
             best_records: Vec::new(),
             coordinator_endpoint: None,
             coordinator_sessions: 0,
@@ -950,6 +986,52 @@ mod tests {
             mgr.get_peer(&pid).unwrap().active_miner_id_hashes,
             vec![[9u8; 16]],
             "a real ping update must still overwrite"
+        );
+    }
+
+    /// A health ping that omits the tier ports must not blank what the peer already told us.
+    ///
+    /// Absence on the wire means "this build does not say", not "this node has no listeners".
+    /// Clearing on every such ping would drop peers in and out of farm routing for the whole
+    /// mixed-version window — the same flap the other gossiped fields are guarded against (#495).
+    #[test]
+    fn a_ping_without_tier_ports_does_not_erase_known_ones() {
+        let mgr = PeerManager::new([0xFFu8; 32], 100);
+        let pid = [9u8; 32];
+        mgr.upsert_peer(Peer::new(pid, "10.0.0.9:8080".to_string()));
+
+        mgr.update_tier_ports(&pid, Some(3333), Some(4444));
+        let got = mgr.get_peer(&pid).expect("peer");
+        assert_eq!((got.hobby_port, got.farm_port), (Some(3333), Some(4444)));
+
+        // An older build's ping carries neither.
+        mgr.update_tier_ports(&pid, None, None);
+        let got = mgr.get_peer(&pid).expect("peer");
+        assert_eq!(
+            (got.hobby_port, got.farm_port),
+            (Some(3333), Some(4444)),
+            "a ping that says nothing about ports must leave the known ones alone"
+        );
+
+        // A node that genuinely moves its farm listener still updates.
+        mgr.update_tier_ports(&pid, None, Some(4455));
+        assert_eq!(mgr.get_peer(&pid).unwrap().farm_port, Some(4455));
+    }
+
+    /// A peer that has never advertised a farm port must stay `None` — the translator reads that
+    /// as "not a farm target", and a default here is how a farm miner lands on a hobby floor.
+    #[test]
+    fn an_unadvertised_farm_port_stays_absent_rather_than_defaulting() {
+        let mgr = PeerManager::new([0xFFu8; 32], 100);
+        let pid = [10u8; 32];
+        mgr.upsert_peer(Peer::new(pid, "10.0.0.10:8080".to_string()));
+
+        mgr.update_tier_ports(&pid, Some(3333), None);
+        let got = mgr.get_peer(&pid).expect("peer");
+        assert_eq!(got.hobby_port, Some(3333));
+        assert_eq!(
+            got.farm_port, None,
+            "a peer running no farm tier must never be presented as a farm target"
         );
     }
 
