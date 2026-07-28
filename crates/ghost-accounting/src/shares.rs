@@ -216,16 +216,6 @@ impl RoundShares {
         true
     }
 
-    /// Get miner work as scaled integer (for precise calculations)
-    pub fn miner_work_scaled(&self, miner_id: &str) -> u128 {
-        *self.miner_shares_scaled.get(miner_id).unwrap_or(&0)
-    }
-
-    /// Get total work as scaled integer (for precise calculations)
-    pub fn total_work_scaled(&self) -> u128 {
-        self.total_miner_work_scaled
-    }
-
     /// Register a node's capabilities
     pub fn register_node(&mut self, node_id: NodeId, capabilities: NodeCapabilities) {
         let shares = capabilities.total_shares();
@@ -345,14 +335,6 @@ impl RoundShares {
     /// Get top 100 nodes by shares received
     pub fn top_100_nodes(&self) -> Vec<&NodeShareInfo> {
         self.node_shares.values().filter(|n| n.in_top_100).collect()
-    }
-
-    /// Get nodes outside top 100 (for ledger credits)
-    pub fn nodes_outside_top_100(&self) -> Vec<&NodeShareInfo> {
-        self.node_shares
-            .values()
-            .filter(|n| !n.in_top_100)
-            .collect()
     }
 
     /// Get miner count
@@ -478,18 +460,6 @@ impl DifficultyCalculator {
         }
         // Reuse the 0.1% difficulty tolerance of the numeric check.
         Self::difficulty_from_hash(&computed) >= claimed_difficulty * 0.999
-    }
-
-    /// Verify that a share hash meets the pool's minimum difficulty
-    pub fn verify_share_meets_pool_target(&self, hash: &[u8; 32]) -> bool {
-        let actual_difficulty = Self::difficulty_from_hash(hash);
-        actual_difficulty >= self.share_difficulty
-    }
-
-    /// Verify that a hash meets network difficulty (is a valid block)
-    pub fn verify_block_hash(&self, hash: &[u8; 32]) -> bool {
-        let actual_difficulty = Self::difficulty_from_hash(hash);
-        actual_difficulty >= self.network_difficulty
     }
 }
 

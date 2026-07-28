@@ -33,7 +33,6 @@ description = "P2TR UTXO management with timelocks and key rotation for Ghost Pa
 bitcoin = { workspace = true }
 
 # Cryptography
-sha2 = { workspace = true }
 rand = "0.8"
 getrandom = { workspace = true }
 

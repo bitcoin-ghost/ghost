@@ -62,6 +62,8 @@
 //! - Parameters become immutable
 //! - New elders skip MPC step entirely
 
+#![deny(unreachable_pub)]
+
 pub mod contribution;
 pub mod errors;
 pub mod manager;

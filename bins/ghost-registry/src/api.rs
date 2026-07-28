@@ -45,7 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 /// Shared application state
-pub struct AppState {
+pub(crate) struct AppState {
     pub db: Arc<RegistryDb>,
     pub health_checker: Arc<HealthChecker>,
     pub health_config: HealthConfig,
@@ -57,7 +57,7 @@ pub struct AppState {
 
 /// Node registration request (matches ghost-pool registry.rs)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeRegistration {
+pub(crate) struct NodeRegistration {
     pub node_id: String,
     pub host: String,
     pub sv1_port: u16,
@@ -74,7 +74,7 @@ pub struct NodeRegistration {
 
 /// Node heartbeat request (matches ghost-pool registry.rs)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeHeartbeat {
+pub(crate) struct NodeHeartbeat {
     pub node_id: String,
     pub miner_count: u32,
     pub max_miners: u32,
@@ -91,7 +91,7 @@ pub struct NodeHeartbeat {
 
 /// Node deregistration request
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeDeregistration {
+pub(crate) struct NodeDeregistration {
     pub node_id: String,
     pub signature: String,
     pub timestamp: u64,
@@ -99,7 +99,7 @@ pub struct NodeDeregistration {
 
 /// API response
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiResponse {
+pub(crate) struct ApiResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -108,7 +108,7 @@ pub struct ApiResponse {
 }
 
 impl ApiResponse {
-    pub fn ok() -> Self {
+    pub(crate) fn ok() -> Self {
         Self {
             status: "ok".to_string(),
             error: None,
@@ -116,7 +116,7 @@ impl ApiResponse {
         }
     }
 
-    pub fn ok_with_data(data: impl Serialize) -> Self {
+    pub(crate) fn ok_with_data(data: impl Serialize) -> Self {
         Self {
             status: "ok".to_string(),
             error: None,
@@ -124,7 +124,7 @@ impl ApiResponse {
         }
     }
 
-    pub fn error(message: impl Into<String>) -> Self {
+    pub(crate) fn error(message: impl Into<String>) -> Self {
         Self {
             status: "error".to_string(),
             error: Some(message.into()),
@@ -134,7 +134,7 @@ impl ApiResponse {
 }
 
 /// Build the API router
-pub fn build_router(state: Arc<AppState>) -> Router {
+pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/nodes/register", post(handle_register))
         .route("/api/v1/nodes/heartbeat", post(handle_heartbeat))

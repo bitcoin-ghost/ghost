@@ -214,40 +214,6 @@ pub fn parse_request(line: &str) -> Result<RpcRequest, RpcError> {
     })
 }
 
-/// Helper to extract string parameter
-pub fn get_string_param(
-    params: &[Value],
-    index: usize,
-    name: &'static str,
-) -> Result<String, RpcError> {
-    params
-        .get(index)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or(RpcError::InvalidParamType(name, "string"))
-}
-
-/// Helper to extract optional string parameter
-pub fn get_optional_string_param(params: &[Value], index: usize) -> Option<String> {
-    params
-        .get(index)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Helper to extract array parameter
-pub fn get_array_param(
-    params: &[Value],
-    index: usize,
-    name: &'static str,
-) -> Result<Vec<Value>, RpcError> {
-    params
-        .get(index)
-        .and_then(|v| v.as_array())
-        .cloned()
-        .ok_or(RpcError::InvalidParamType(name, "array"))
-}
-
 /// Stratum error codes
 pub mod error_codes {
     /// Unknown error
@@ -281,35 +247,6 @@ pub fn notification(method: &str, params: Value) -> String {
 /// Create mining.set_difficulty notification
 pub fn set_difficulty(difficulty: f64) -> String {
     notification("mining.set_difficulty", serde_json::json!([difficulty]))
-}
-
-/// Create mining.notify notification
-#[allow(clippy::too_many_arguments)]
-pub fn mining_notify(
-    job_id: &str,
-    prev_hash: &str,
-    coinbase1: &str,
-    coinbase2: &str,
-    merkle_branches: &[String],
-    version: &str,
-    nbits: &str,
-    ntime: &str,
-    clean_jobs: bool,
-) -> String {
-    notification(
-        "mining.notify",
-        serde_json::json!([
-            job_id,
-            prev_hash,
-            coinbase1,
-            coinbase2,
-            merkle_branches,
-            version,
-            nbits,
-            ntime,
-            clean_jobs
-        ]),
-    )
 }
 
 #[cfg(test)]

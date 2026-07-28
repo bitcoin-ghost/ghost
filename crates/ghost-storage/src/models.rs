@@ -279,31 +279,6 @@ pub struct NodeRewardEntry {
     pub updated_at: i64,
 }
 
-/// Verification record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerificationRecord {
-    /// Auto-increment ID
-    pub id: Option<i64>,
-    /// Target node ID (hex)
-    pub node_id: String,
-    /// Challenger node ID (hex)
-    pub challenger_id: String,
-    /// Capability being verified
-    pub capability: String,
-    /// Challenge type
-    pub challenge_type: String,
-    /// Challenge data (JSON)
-    pub challenge_data: String,
-    /// Response data (JSON)
-    pub response_data: Option<String>,
-    /// Result
-    pub result: VerificationResult,
-    /// Started timestamp
-    pub started_at: i64,
-    /// Completed timestamp
-    pub completed_at: Option<i64>,
-}
-
 /// Verification result
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -336,42 +311,6 @@ impl VerificationResult {
             _ => None,
         }
     }
-}
-
-/// Health ping record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthPingRecord {
-    /// Node ID (hex)
-    pub node_id: String,
-    /// Block height
-    pub block_height: u64,
-    /// Round ID
-    pub round_id: u64,
-    /// Miner count
-    pub miner_count: u32,
-    /// Capabilities JSON
-    pub capabilities: String,
-    /// Timestamp
-    pub timestamp: i64,
-}
-
-/// Consensus vote record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VoteRecord {
-    /// Auto-increment ID
-    pub id: Option<i64>,
-    /// Round ID
-    pub round_id: u64,
-    /// Proposal hash (hex)
-    pub proposal_hash: String,
-    /// Voter node ID (hex)
-    pub voter_id: String,
-    /// Vote (true = approve, false = reject)
-    pub vote: bool,
-    /// Signature (hex)
-    pub signature: String,
-    /// Timestamp
-    pub timestamp: i64,
 }
 
 // =============================================================================
@@ -508,27 +447,6 @@ pub struct PeerRecord {
     pub capabilities: Option<String>,
     /// Protocol version
     pub protocol_version: Option<u32>,
-}
-
-/// Peer reputation record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerReputationRecord {
-    /// Peer ID
-    pub peer_id: String,
-    /// Reputation score (0-100)
-    pub reputation_score: f64,
-    /// Total shares relayed
-    pub shares_relayed: u64,
-    /// Invalid shares received
-    pub shares_invalid: u64,
-    /// Blocks relayed
-    pub blocks_relayed: u64,
-    /// Average latency in ms
-    pub latency_avg_ms: f64,
-    /// Uptime percentage
-    pub uptime_percent: f64,
-    /// Last calculation timestamp
-    pub last_calculated: i64,
 }
 
 // =============================================================================

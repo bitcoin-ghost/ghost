@@ -81,14 +81,14 @@ pub struct VoteEquivocationProof {
 mod hash_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         hex::encode(bytes).serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -672,14 +672,14 @@ pub struct Vote {
 mod signature_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         hex::encode(bytes).serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -769,25 +769,6 @@ fn verify_vote_signature_with_round(
                 round_id = round_id,
                 error = %e,
                 "Signature verification failed with error (not just invalid)"
-            );
-            false
-        }
-    }
-}
-
-/// Verify vote signature (legacy - only for backward compatibility)
-///
-/// DEPRECATED: Use verify_vote_signature_with_round instead
-#[deprecated(note = "Use verify_vote_signature_with_round for replay attack prevention")]
-pub fn verify_vote_signature(vote: &Vote, proposal_hash: &[u8; 32]) -> bool {
-    // SEC-VOTE-2: Log signature verification errors instead of silently failing
-    match verify_signature(&vote.voter, proposal_hash, &vote.signature) {
-        Ok(valid) => valid,
-        Err(e) => {
-            warn!(
-                voter = %hex::encode(&vote.voter[..8]),
-                error = %e,
-                "Legacy signature verification failed with error"
             );
             false
         }

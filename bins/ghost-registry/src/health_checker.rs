@@ -33,7 +33,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 /// Health checker that runs in the background
-pub struct HealthChecker {
+pub(crate) struct HealthChecker {
     db: Arc<RegistryDb>,
     cloudflare: Arc<CloudflareClient>,
     config: HealthConfig,
@@ -42,7 +42,7 @@ pub struct HealthChecker {
 
 impl HealthChecker {
     /// Create a new health checker
-    pub fn new(
+    pub(crate) fn new(
         db: Arc<RegistryDb>,
         cloudflare: Arc<CloudflareClient>,
         config: HealthConfig,
@@ -57,7 +57,7 @@ impl HealthChecker {
     }
 
     /// Start the health checker background task
-    pub async fn start(self: Arc<Self>, mut shutdown_rx: broadcast::Receiver<()>) {
+    pub(crate) async fn start(self: Arc<Self>, mut shutdown_rx: broadcast::Receiver<()>) {
         info!(
             interval_secs = self.config.check_interval_secs,
             timeout_secs = self.config.heartbeat_timeout_secs,
@@ -184,7 +184,7 @@ impl HealthChecker {
     }
 
     /// Get current health summary
-    pub fn get_health_summary(
+    pub(crate) fn get_health_summary(
         &self,
     ) -> Result<HealthSummary, Box<dyn std::error::Error + Send + Sync>> {
         let total_nodes = self.db.get_node_count()?;
@@ -211,7 +211,7 @@ impl HealthChecker {
 
 /// Health summary for API response
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct HealthSummary {
+pub(crate) struct HealthSummary {
     pub total_nodes: u32,
     pub healthy_nodes: u32,
     pub nodes_by_region: HashMap<String, u32>,

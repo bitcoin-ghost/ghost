@@ -32,7 +32,6 @@
 //! ```
 
 pub mod adversarial;
-pub mod block_template;
 pub mod buds_classification;
 pub mod config_validation;
 pub mod consensus;

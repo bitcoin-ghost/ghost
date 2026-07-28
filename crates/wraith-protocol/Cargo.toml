@@ -49,8 +49,6 @@ zeroize = { workspace = true }
 # this crate (and the Wraith Wallet that depends on it) builds for Windows. Node
 # builds re-enable zmq through their direct ghost-common dependency (Cargo unifies
 # features per build graph), so the node is unaffected.
-ghost-common = { path = "../ghost-common", default-features = false }
-tokio = { workspace = true }
 
 # Concurrency and timing
 parking_lot = { workspace = true }

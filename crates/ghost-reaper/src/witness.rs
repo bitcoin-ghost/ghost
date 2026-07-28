@@ -51,7 +51,7 @@ impl std::fmt::Display for SpendType {
 }
 
 /// Identify the spend type from a transaction input's witness data.
-pub fn identify_spend(input: &TxIn) -> SpendType {
+pub(crate) fn identify_spend(input: &TxIn) -> SpendType {
     let witness = &input.witness;
     let items: Vec<&[u8]> = witness.iter().collect();
 
@@ -119,7 +119,7 @@ pub fn identify_spend(input: &TxIn) -> SpendType {
 }
 
 /// Check if a witness element is a taproot annex (starts with 0x50).
-pub fn has_annex(input: &TxIn) -> bool {
+pub(crate) fn has_annex(input: &TxIn) -> bool {
     let witness = &input.witness;
     let items: Vec<&[u8]> = witness.iter().collect();
     if items.len() >= 2 {
@@ -136,7 +136,7 @@ pub fn has_annex(input: &TxIn) -> bool {
 
 /// Check if data is a valid taproot control block.
 /// Length must be 33 + 32*k (for k >= 0), first byte >= 0xc0.
-pub fn is_control_block(data: &[u8]) -> bool {
+pub(crate) fn is_control_block(data: &[u8]) -> bool {
     if data.len() < 33 {
         return false;
     }

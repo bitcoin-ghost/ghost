@@ -32,8 +32,4 @@ description = "BUDS (Bitcoin Unified Data Standard) transaction classification"
 ghost-common = { workspace = true }
 bitcoin = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }

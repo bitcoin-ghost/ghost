@@ -71,16 +71,6 @@ pub enum SettlementKind {
 }
 
 impl SettlementKind {
-    /// Whether this kind produces Ghost Lock outputs (vs external Bitcoin addresses)
-    pub fn produces_ghost_lock_outputs(&self) -> bool {
-        matches!(self, SettlementKind::Jump | SettlementKind::WraithJump)
-    }
-
-    /// Whether this kind routes through Wraith mixing
-    pub fn routes_through_wraith(&self) -> bool {
-        matches!(self, SettlementKind::WraithJump)
-    }
-
     /// Display name
     pub fn name(&self) -> &'static str {
         match self {

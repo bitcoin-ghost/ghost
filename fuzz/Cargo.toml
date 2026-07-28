@@ -41,7 +41,6 @@ ghost-zkp = { path = "../crates/ghost-zkp" }
 ghost-gsp-proto = { path = "../crates/ghost-gsp-proto" }
 ghost-reconciliation = { path = "../crates/ghost-reconciliation" }
 ghost-locks = { path = "../crates/ghost-locks" }
-wraith-protocol = { path = "../crates/wraith-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"

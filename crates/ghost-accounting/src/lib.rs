@@ -27,6 +27,8 @@
 //! - **Share Accounting**: Track miner shares per round
 //! - **Coinbase Construction**: Build payout transactions
 
+#![deny(unreachable_pub)]
+
 pub mod coinbase;
 pub mod shares;
 

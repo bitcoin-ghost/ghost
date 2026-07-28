@@ -54,7 +54,6 @@ ghost-verification = { workspace = true }
 wraith-protocol = { workspace = true }
 # Embedded in-process Wraith coordinator, run when this node is elected a seat.
 wraith-coordinator = { path = "../wraith-coordinator" }
-ghost-template = { workspace = true }
 ghost-glyph = { workspace = true }
 
 # Async runtime
@@ -64,7 +63,6 @@ axum = { workspace = true }
 
 # CLI
 clap = { workspace = true }
-config = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -83,7 +81,6 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 hex = { workspace = true }
-futures = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
 bitcoin = { workspace = true }

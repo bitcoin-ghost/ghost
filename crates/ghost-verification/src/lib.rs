@@ -37,6 +37,8 @@
 //! - `GET /health` - Node health status
 //! - `GET /ws` - WebSocket for real-time updates
 
+#![deny(unreachable_pub)]
+
 pub mod alerts;
 pub mod auth;
 pub mod chain_health;

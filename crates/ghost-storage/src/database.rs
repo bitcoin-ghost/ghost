@@ -825,69 +825,6 @@ impl Database {
         }
     }
 
-    /// L-15: Verify and fix auxiliary file (WAL/SHM) permissions.
-    ///
-    /// SQLite may create WAL and SHM files after the initial database open,
-    /// potentially with weaker permissions than intended. This method should
-    /// be called periodically (e.g., during maintenance or after checkpoints)
-    /// to ensure these files maintain restrictive permissions.
-    ///
-    /// Note: There is an inherent race condition window between when SQLite
-    /// creates these files and when this check runs. For maximum security,
-    /// call this method frequently or use system-level protections like
-    /// restrictive directory permissions (which we already set to 0o700).
-    ///
-    /// Returns the number of files that had permissions fixed.
-    #[cfg(unix)]
-    pub fn verify_aux_permissions(&self) -> GhostResult<usize> {
-        use std::os::unix::fs::PermissionsExt;
-
-        if self.inner.in_memory {
-            return Ok(0);
-        }
-
-        let path = Path::new(&self.inner.path);
-        let mut fixed_count = 0;
-
-        for ext in ["db-wal", "db-shm"] {
-            let aux_path = path.with_extension(ext);
-            if aux_path.exists() {
-                if let Ok(metadata) = std::fs::metadata(&aux_path) {
-                    let perms = metadata.permissions();
-                    // Check if group or others have any permissions
-                    if perms.mode() & 0o077 != 0 {
-                        warn!(
-                            path = %aux_path.display(),
-                            mode = format!("{:o}", perms.mode()),
-                            "L-15: Auxiliary file has weak permissions, fixing..."
-                        );
-                        let mut new_perms = perms;
-                        new_perms.set_mode(0o600);
-                        std::fs::set_permissions(&aux_path, new_perms).map_err(|e| {
-                            GhostError::Database(format!(
-                                "Failed to secure auxiliary file permissions: {}",
-                                e
-                            ))
-                        })?;
-                        fixed_count += 1;
-                    }
-                }
-            }
-        }
-
-        if fixed_count > 0 {
-            info!(fixed_count, "L-15: Fixed auxiliary file permissions");
-        }
-
-        Ok(fixed_count)
-    }
-
-    /// L-15: Non-Unix stub for verify_aux_permissions
-    #[cfg(not(unix))]
-    pub fn verify_aux_permissions(&self) -> GhostResult<usize> {
-        Ok(0)
-    }
-
     /// Checkpoint WAL (force writes to main database)
     pub fn checkpoint(&self) -> GhostResult<()> {
         self.with_connection(|conn| {

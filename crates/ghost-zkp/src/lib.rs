@@ -91,6 +91,8 @@
 //! assert!(verifier.verify(&proof)?);
 //! ```
 
+#![deny(unreachable_pub)]
+
 pub mod circuit;
 pub mod commitment_tree;
 pub mod consolidation_prover;

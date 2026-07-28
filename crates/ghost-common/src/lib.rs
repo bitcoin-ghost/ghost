@@ -29,6 +29,8 @@
 //! - Configuration structures
 //! - Clock utilities for distributed time handling
 
+#![deny(unreachable_pub)]
+
 pub mod circuit_breaker;
 pub mod clock;
 pub mod config;

@@ -362,18 +362,6 @@ impl ReconciliationTx {
             output: tx_outputs,
         })
     }
-
-    /// Compute the real Bitcoin txid
-    pub fn compute_real_txid(
-        &self,
-        input_outpoints: &[bitcoin::OutPoint],
-        network: Network,
-    ) -> Result<[u8; 32], ReconciliationError> {
-        let tx = self.to_bitcoin_transaction(input_outpoints, network)?;
-        // Use Hash trait to get bytes
-        use bitcoin::hashes::Hash;
-        Ok(tx.compute_txid().to_byte_array())
-    }
 }
 
 #[cfg(test)]

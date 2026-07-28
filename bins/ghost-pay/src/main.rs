@@ -36,6 +36,8 @@
 //! - Wraith session coordinator
 //! - L1 settlement watcher
 
+#![deny(unreachable_pub)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

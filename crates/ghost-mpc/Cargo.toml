@@ -36,7 +36,6 @@ ghost-zkp = { path = "../ghost-zkp" }
 
 # Cryptography
 sha2 = "0.10"
-blake2 = "0.10"
 rand = "0.8"
 getrandom = "0.2"
 
@@ -45,7 +44,6 @@ serde = { version = "1.0", features = ["derive"] }
 
 # Error handling
 thiserror = "1.0"
-anyhow = "1.0"
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -55,7 +53,6 @@ tracing = "0.1"
 
 # Async
 tokio = { version = "1.36", features = ["fs", "io-util", "sync"] }
-async-trait = "0.1"
 
 # Concurrency
 parking_lot = "0.12"

@@ -23,9 +23,8 @@
 //! The roster is the qualified set *as of the snapshot height*. A node that drops
 //! below the qualification gatekeeper after the snapshot keeps its seat for the
 //! current epoch (its rounds simply fail/refund if it goes dark — the bondless
-//! model) and is excluded from the *next* epoch's snapshot. Beacon withholders
-//! (`beacon::BeaconRound::withholders`) are likewise excluded next epoch by the
-//! caller. Membership therefore churns cleanly at epoch boundaries.
+//! model) and is excluded from the *next* epoch's snapshot. Membership therefore
+//! churns cleanly at epoch boundaries.
 
 use crate::sortition::{elect_coordinators, shard_for, CoordinatorNodeId, ElectedCoordinator};
 

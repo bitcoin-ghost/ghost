@@ -47,6 +47,8 @@
 //! let (address, ephemeral_pubkey) = ghost_id.derive_payment_address_v2(0).unwrap();
 //! ```
 
+#![deny(unreachable_pub)]
+
 mod config;
 mod derivation;
 pub mod encryption;

@@ -37,7 +37,7 @@ pub const VBYTES_PER_OUTPUT: usize = 43;
 /// Maximum transaction size budget in vbytes — 10% margin under Bitcoin's
 /// 100KB standardness limit.
 #[allow(dead_code)]
-pub const MAX_TX_VBYTES: usize = 90_000;
+pub(crate) const MAX_TX_VBYTES: usize = 90_000;
 
 // ---------------------------------------------------------------------------
 // LITE TIERS — single-round atomic CoinJoin (Wraith Lite v1, see DESIGN_LITE.md)

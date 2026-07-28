@@ -1755,22 +1755,6 @@ impl VoteHandler {
     pub fn check_timeouts(&self) -> Vec<ConsensusResult> {
         self.voting_manager.check_timeouts()
     }
-
-    /// Get voting status for a round
-    pub fn get_status(&self, round_id: RoundId, proposal_hash: [u8; 32]) -> Option<VotingStatus> {
-        self.voting_manager
-            .get_session(round_id, proposal_hash)
-            .map(|s| VotingStatus {
-                round_id: s.round_id,
-                proposal_hash: s.proposal_hash,
-                approvals: s.approvals,
-                rejections: s.rejections,
-                total_eligible: s.total_eligible,
-                threshold: s.threshold,
-                decided: s.is_decided,
-                result: s.result,
-            })
-    }
 }
 
 #[async_trait]
@@ -1852,19 +1836,6 @@ impl MessageHandler for VoteHandler {
 
         Ok(())
     }
-}
-
-/// Voting status summary
-#[derive(Debug, Clone)]
-pub struct VotingStatus {
-    pub round_id: RoundId,
-    pub proposal_hash: [u8; 32],
-    pub approvals: u32,
-    pub rejections: u32,
-    pub total_eligible: u32,
-    pub threshold: u32,
-    pub decided: bool,
-    pub result: Option<ConsensusResult>,
 }
 
 /// Compute hash of a payout proposal

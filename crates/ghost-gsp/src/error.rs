@@ -377,4 +377,4 @@ impl IntoResponse for GspError {
 }
 
 /// Result type for GSP operations
-pub type GspResult<T> = Result<T, GspError>;
+pub(crate) type GspResult<T> = Result<T, GspError>;

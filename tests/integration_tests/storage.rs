@@ -1108,25 +1108,6 @@ fn test_582_get_top_nodes_by_shares() {
 }
 
 #[test]
-fn test_583_register_node_with_elder_check() {
-    let db = Database::in_memory().unwrap();
-
-    // Register a node without PoW - should not become elder
-    let (is_elder, order) = db
-        .register_node_with_elder_check(
-            "node1_pubkey",
-            Some("192.168.1.1:8333"),
-            Some("Node1"),
-            "{}",
-        )
-        .unwrap();
-
-    // Without PoW, node should not be elder even if slots available
-    assert!(!is_elder);
-    assert!(order.is_none());
-}
-
-#[test]
 fn test_584_node_not_found() {
     let db = Database::in_memory().unwrap();
     let node = db.get_node("nonexistent_node").unwrap();

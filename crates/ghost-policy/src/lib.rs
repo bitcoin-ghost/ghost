@@ -31,6 +31,8 @@
 //! Each node has sovereignty over its policy - whatever policy a node
 //! runs is final for that node's block templates.
 
+#![deny(unreachable_pub)]
+
 pub mod policy;
 pub mod profile;
 pub mod validator;

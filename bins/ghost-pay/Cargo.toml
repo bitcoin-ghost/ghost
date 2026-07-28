@@ -67,7 +67,6 @@ tracing-subscriber = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 
 # Bitcoin
 bitcoin = { workspace = true }
@@ -99,7 +98,6 @@ reqwest = { workspace = true }
 # For E2E test example (ZK proof generation + encryption)
 bellperson = "0.26"
 blstrs = { workspace = true }
-ff = "0.13"
 secp256k1 = { workspace = true }
 
 [dev-dependencies]

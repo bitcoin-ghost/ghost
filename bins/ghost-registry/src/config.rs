@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 /// Main registry service configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RegistryServiceConfig {
+pub(crate) struct RegistryServiceConfig {
     /// Server configuration
     pub server: ServerConfig,
     /// Cloudflare DNS configuration
@@ -42,7 +42,7 @@ pub struct RegistryServiceConfig {
 
 /// HTTP server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
+pub(crate) struct ServerConfig {
     /// Listen address (e.g., "0.0.0.0:8333")
     pub listen: String,
     /// Request timeout in seconds
@@ -85,7 +85,7 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// Resolve environment variables in configuration
-    pub fn resolve_env(&mut self) {
+    pub(crate) fn resolve_env(&mut self) {
         // Resolve ${VAR} or $VAR patterns in api_secret
         if let Some(ref secret) = self.api_secret {
             if let Some(inner) = secret.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
@@ -112,7 +112,7 @@ impl ServerConfig {
 ///
 /// M-18 FIX: Custom Debug implementation to redact api_token
 #[derive(Clone, Serialize, Deserialize)]
-pub struct CloudflareConfig {
+pub(crate) struct CloudflareConfig {
     /// Cloudflare Zone ID for the domain
     pub zone_id: String,
     /// API token (scoped to DNS edit)
@@ -149,7 +149,7 @@ impl Default for CloudflareConfig {
 
 impl CloudflareConfig {
     /// Resolve environment variables in configuration
-    pub fn resolve_env(&mut self) {
+    pub(crate) fn resolve_env(&mut self) {
         // Resolve ${VAR} or $VAR patterns in api_token
         if self.api_token.starts_with("${") && self.api_token.ends_with('}') {
             let var_name = &self.api_token[2..self.api_token.len() - 1];
@@ -167,7 +167,7 @@ impl CloudflareConfig {
 
 /// DNS update configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DnsConfig {
+pub(crate) struct DnsConfig {
     /// TTL for DNS A records (seconds)
     pub ttl_seconds: u32,
     /// Maximum nodes per region to include in DNS
@@ -191,7 +191,7 @@ impl Default for DnsConfig {
 
 /// Health monitoring configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthConfig {
+pub(crate) struct HealthConfig {
     /// Heartbeat timeout in seconds (node considered offline after this)
     pub heartbeat_timeout_secs: u64,
     /// Number of missed heartbeats before removal
@@ -225,7 +225,7 @@ impl Default for HealthConfig {
 
 /// Database configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatabaseConfig {
+pub(crate) struct DatabaseConfig {
     /// Database file path
     pub path: PathBuf,
     /// Enable WAL mode for SQLite

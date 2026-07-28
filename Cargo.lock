@@ -843,7 +843,6 @@ dependencies = [
  "ghost-pool",
  "ghost-reconciliation",
  "ghost-storage",
- "ghost-template",
  "ghost-zkp",
  "hex",
  "parking_lot",
@@ -855,7 +854,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.21.0",
- "wraith-protocol",
 ]
 
 [[package]]
@@ -3166,11 +3164,6 @@ version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-common",
- "ghost-storage",
- "hex",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -3180,11 +3173,7 @@ version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-common",
- "hex",
  "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -3193,16 +3182,13 @@ name = "ghost-cli"
 version = "1.11.20"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
  "colored 2.2.0",
  "ghost-common",
- "hex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tabled",
- "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -3212,7 +3198,6 @@ version = "1.11.20"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
- "bytes",
  "chrono",
  "ed25519-dalek",
  "futures",
@@ -3224,7 +3209,6 @@ dependencies = [
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
- "rustls-pki-types",
  "secrecy",
  "serde",
  "serde_json",
@@ -3233,7 +3217,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tmq",
  "tokio",
- "tokio-rustls",
  "toml 0.8.2",
  "tracing",
  "zeroize",
@@ -3244,8 +3227,6 @@ name = "ghost-consensus"
 version = "1.11.20"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
- "bytes",
  "chrono",
  "futures",
  "getrandom 0.2.17",
@@ -3275,9 +3256,6 @@ dependencies = [
 name = "ghost-glyph"
 version = "1.11.20"
 dependencies = [
- "hex",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
 ]
@@ -3286,8 +3264,6 @@ dependencies = [
 name = "ghost-gsp"
 version = "1.11.20"
 dependencies = [
- "anyhow",
- "async-trait",
  "axum 0.7.9",
  "bitcoin",
  "chrono",
@@ -3296,8 +3272,6 @@ dependencies = [
  "ghost-common",
  "ghost-consensus",
  "ghost-gsp-proto",
- "ghost-keys",
- "ghost-locks",
  "governor",
  "hex",
  "hyper-util",
@@ -3320,7 +3294,6 @@ dependencies = [
  "tower-http 0.5.2",
  "tower_governor",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -3333,8 +3306,6 @@ dependencies = [
  "getrandom 0.2.17",
  "ghost-common",
  "ghost-gsp",
- "ghost-gsp-proto",
- "hex",
  "rustls",
  "serde",
  "tempfile",
@@ -3358,7 +3329,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
- "uuid",
 ]
 
 [[package]]
@@ -3366,7 +3336,6 @@ name = "ghost-keys"
 version = "1.11.20"
 dependencies = [
  "bech32",
- "bitcoin",
  "chacha20poly1305",
  "getrandom 0.2.17",
  "hex",
@@ -3392,7 +3361,6 @@ dependencies = [
  "hex",
  "rand 0.8.6",
  "serde",
- "sha2 0.10.9",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -3401,10 +3369,7 @@ dependencies = [
 name = "ghost-mpc"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
  "bellperson",
- "blake2",
  "blstrs",
  "ff",
  "getrandom 0.2.17",
@@ -3439,7 +3404,6 @@ dependencies = [
  "blstrs",
  "chrono",
  "clap",
- "ff",
  "getrandom 0.2.17",
  "ghost-common",
  "ghost-glyph",
@@ -3462,7 +3426,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
  "tower 0.4.13",
@@ -3483,8 +3446,6 @@ dependencies = [
  "ghost-buds",
  "ghost-common",
  "serde",
- "serde_json",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -3503,9 +3464,7 @@ dependencies = [
  "clap",
  "codec_sv2 4.0.1",
  "common_messages_sv2 6.0.2",
- "config",
  "framing_sv2 6.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures",
  "getrandom 0.2.17",
  "ghost-accounting",
  "ghost-buds",
@@ -3517,7 +3476,6 @@ dependencies = [
  "ghost-reaper",
  "ghost-reconciliation",
  "ghost-storage",
- "ghost-template",
  "ghost-verification",
  "ghost-zkp",
  "hex",
@@ -3552,7 +3510,6 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -3560,25 +3517,16 @@ dependencies = [
 name = "ghost-reconciliation"
 version = "1.11.20"
 dependencies = [
- "async-trait",
  "bitcoin",
  "chrono",
- "futures",
  "getrandom 0.2.17",
  "ghost-common",
- "ghost-consensus",
- "ghost-keys",
- "ghost-locks",
- "ghost-storage",
  "hex",
  "parking_lot",
- "scopeguard",
  "secp256k1 0.29.1",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
 ]
 
@@ -3594,14 +3542,11 @@ dependencies = [
  "ghost-common",
  "hex",
  "hmac",
- "hyper",
- "hyper-util",
  "libc",
  "parking_lot",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rusqlite",
- "rustls",
  "secp256k1 0.28.2",
  "serde",
  "serde_json",
@@ -3609,9 +3554,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-rustls",
  "toml 0.8.2",
- "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
@@ -3623,9 +3566,7 @@ version = "1.11.20"
 dependencies = [
  "clap",
  "dirs 5.0.1",
- "getrandom 0.2.17",
  "ghost-common",
- "hex",
 ]
 
 [[package]]
@@ -3644,9 +3585,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 1.0.69",
  "tracing",
- "zeroize",
 ]
 
 [[package]]
@@ -3654,14 +3593,12 @@ name = "ghost-tap-core"
 version = "1.11.20"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "argon2",
  "bellperson",
  "bip32",
  "bip39",
  "blstrs",
  "bs58 0.5.1",
- "chrono",
  "futures-util",
  "getrandom 0.2.17",
  "ghost-common",
@@ -3672,7 +3609,6 @@ dependencies = [
  "jni",
  "k256",
  "parking_lot",
- "rand 0.8.6",
  "reqwest 0.12.28",
  "ripemd",
  "rusqlite",
@@ -3728,23 +3664,6 @@ dependencies = [
  "secrecy",
  "serde_json",
  "tokio",
- "tokio-test",
-]
-
-[[package]]
-name = "ghost-template"
-version = "1.11.20"
-dependencies = [
- "bitcoin",
- "ghost-buds",
- "ghost-common",
- "ghost-policy",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
@@ -3794,16 +3713,11 @@ name = "ghost-zkp"
 version = "0.1.0"
 dependencies = [
  "bellperson",
- "blake2",
  "blstrs",
  "ff",
- "getrandom 0.2.17",
  "ghost-common",
- "group",
  "hex",
- "pairing",
  "rand 0.8.6",
- "rayon",
  "serde",
  "sha2 0.10.9",
  "tempfile",
@@ -5250,7 +5164,6 @@ dependencies = [
 name = "mpc-xproc-harness"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "axum 0.7.9",
  "bellperson",
  "blstrs",
@@ -5262,7 +5175,6 @@ dependencies = [
  "hex",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -10704,7 +10616,6 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
- "hyper",
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",
@@ -10716,9 +10627,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "toml 0.8.2",
  "tower 0.4.13",
- "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -10731,7 +10640,6 @@ version = "1.11.20"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
- "ghost-common",
  "hex",
  "parking_lot",
  "rand 0.8.6",
@@ -10741,7 +10649,6 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "zeroize",
 ]
@@ -10803,7 +10710,6 @@ version = "1.11.20"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
- "base64 0.22.1",
  "bitcoin",
  "ghost-gsp-proto",
  "ghost-keys",

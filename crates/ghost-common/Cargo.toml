@@ -51,7 +51,6 @@ base64 = { workspace = true }
 parking_lot = { workspace = true }
 once_cell = { workspace = true }
 futures = { workspace = true }
-bytes = { workspace = true }
 # H-AUTH-2: Secret management for RPC credentials
 secrecy = { workspace = true }
 zeroize = { workspace = true }
@@ -59,8 +58,6 @@ zeroize = { workspace = true }
 getrandom = { workspace = true }
 # TLS for HTTP servers (CRIT-API-1)
 rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
 
 [features]

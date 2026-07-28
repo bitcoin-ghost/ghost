@@ -29,7 +29,6 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::Txid;
 use std::sync::Arc;
 
-use crate::batch::{Batch, BatchState};
 use crate::error::{ReconciliationError, ReconciliationResult};
 use crate::executor::BatchTransaction;
 use crate::DISPUTE_WINDOW_BLOCKS;
@@ -167,99 +166,6 @@ impl<B: L1Broadcaster> SettlementBroadcaster<B> {
                 })
             }
             None => Ok(ConfirmationStatus::Pending),
-        }
-    }
-
-    /// Process batch lifecycle: broadcast -> confirm -> finalize
-    pub fn process_batch(
-        &self,
-        batch: &mut Batch,
-        batch_tx: &BatchTransaction,
-    ) -> ReconciliationResult<BatchLifecycleStatus> {
-        match batch.state() {
-            BatchState::Ready => {
-                // Broadcast the transaction
-                let result = self.broadcast_batch(batch_tx)?;
-                batch.mark_submitted(result.txid_str.clone())?;
-
-                Ok(BatchLifecycleStatus::Submitted {
-                    txid: result.txid_str,
-                })
-            }
-
-            BatchState::Submitted => {
-                // Check for confirmation
-                let txid = batch.l1_txid().ok_or_else(|| {
-                    ReconciliationError::InvalidState("Submitted batch has no txid".to_string())
-                })?;
-
-                let status = self.check_confirmation(txid)?;
-
-                match status {
-                    ConfirmationStatus::Confirmed {
-                        block_height,
-                        confirmations,
-                        ..
-                    } => {
-                        if confirmations >= self.min_confirmations {
-                            batch.mark_confirmed(block_height)?;
-                            Ok(BatchLifecycleStatus::Confirmed {
-                                block_height,
-                                confirmations,
-                            })
-                        } else {
-                            Ok(BatchLifecycleStatus::WaitingConfirmations {
-                                current: confirmations,
-                                required: self.min_confirmations,
-                            })
-                        }
-                    }
-                    ConfirmationStatus::Pending => Ok(BatchLifecycleStatus::WaitingConfirmations {
-                        current: 0,
-                        required: self.min_confirmations,
-                    }),
-                }
-            }
-
-            BatchState::Confirming => {
-                // Check if dispute window has passed
-                let txid = batch.l1_txid().ok_or_else(|| {
-                    ReconciliationError::InvalidState("Confirming batch has no txid".to_string())
-                })?;
-
-                let status = self.check_confirmation(txid)?;
-
-                match status {
-                    ConfirmationStatus::Confirmed {
-                        finalized,
-                        dispute_blocks_remaining,
-                        ..
-                    } => {
-                        if finalized {
-                            batch.mark_finalized()?;
-                            Ok(BatchLifecycleStatus::Finalized)
-                        } else {
-                            Ok(BatchLifecycleStatus::InDisputeWindow {
-                                blocks_remaining: dispute_blocks_remaining,
-                            })
-                        }
-                    }
-                    ConfirmationStatus::Pending => {
-                        // This shouldn't happen if we're in Confirming state
-                        Err(ReconciliationError::InvalidState(
-                            "Confirming batch transaction not found".to_string(),
-                        ))
-                    }
-                }
-            }
-
-            BatchState::Finalized => Ok(BatchLifecycleStatus::Finalized),
-
-            BatchState::Rejected => Ok(BatchLifecycleStatus::Rejected),
-
-            BatchState::Collecting => Err(ReconciliationError::InvalidState(
-                "Cannot process batch in Collecting state".to_string(),
-            )),
         }
     }
 }

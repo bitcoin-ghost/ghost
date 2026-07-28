@@ -54,3 +54,8 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+# Part of the out-of-workspace SV2 stack (path deps), so it can't be verified
+# with `--all-features`; cargo-machete flags `serde` from static analysis alone.
+[package.metadata.cargo-machete]
+ignored = ["serde"]

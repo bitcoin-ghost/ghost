@@ -44,7 +44,6 @@ hex = { workspace = true }
 rayon = "1.8"
 
 # Bitcoin
-bitcoin = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

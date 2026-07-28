@@ -27,6 +27,8 @@
 //!
 //! Run with: ghost-registry --config registry.toml
 
+#![deny(unreachable_pub)]
+
 mod api;
 mod auth;
 mod cloudflare;

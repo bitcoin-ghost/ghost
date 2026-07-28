@@ -35,8 +35,6 @@ use ghost_common::types::PayoutEntry;
 pub struct CoinbaseBuilder {
     /// Block height
     block_height: u64,
-    /// Block hash (for BIP34)
-    block_hash: Option<[u8; 32]>,
     /// Extra nonce space
     extra_nonce_size: usize,
     /// Pool identifier in coinbase
@@ -48,16 +46,9 @@ impl CoinbaseBuilder {
     pub fn new(block_height: u64) -> Self {
         Self {
             block_height,
-            block_hash: None,
             extra_nonce_size: 8,
             pool_tag: b"Ghost".to_vec(),
         }
-    }
-
-    /// Set block hash
-    pub fn with_block_hash(mut self, hash: [u8; 32]) -> Self {
-        self.block_hash = Some(hash);
-        self
     }
 
     /// Set extra nonce size
@@ -194,15 +185,6 @@ impl CoinbaseBuilder {
         }
 
         Ok(ScriptBuf::from(address.to_vec()))
-    }
-
-    /// Calculate coinbase commitment for merkle root
-    pub fn calculate_commitment(tx: &Transaction) -> [u8; 32] {
-        use bitcoin::hashes::{sha256d, Hash};
-
-        let serialized = bitcoin::consensus::serialize(tx);
-        let hash = sha256d::Hash::hash(&serialized);
-        hash.to_byte_array()
     }
 }
 

@@ -8,9 +8,6 @@ description = "GhostGlyph visual identity system - permanent 16x16 pixel ghost b
 
 [dependencies]
 sha2 = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]

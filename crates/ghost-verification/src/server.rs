@@ -1935,12 +1935,6 @@ impl VerificationState {
         self
     }
 
-    /// Set node identity for signing responses
-    pub fn with_identity(mut self, identity: Arc<NodeIdentity>) -> Self {
-        self.identity = Some(identity);
-        self
-    }
-
     /// Sign a response payload using node identity
     ///
     /// Returns a SignedResponse wrapper if identity is configured, otherwise returns None.
@@ -2403,15 +2397,6 @@ impl VerificationState {
         handler: impl ArchiveHandler + Send + Sync + 'static,
     ) -> Self {
         self.archive_handler = Some(Box::new(handler));
-        self
-    }
-
-    /// Set GhostPay handler
-    pub fn with_ghostpay_handler(
-        mut self,
-        handler: impl GhostPayHandler + Send + Sync + 'static,
-    ) -> Self {
-        self.ghostpay_handler = Some(Box::new(handler));
         self
     }
 

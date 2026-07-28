@@ -296,14 +296,14 @@ fn random_secret_key() -> Result<SecretKey, WraithError> {
 mod bytes33_hex {
     use super::*;
 
-    pub fn serialize<S>(data: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(data: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(data))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -320,14 +320,14 @@ mod bytes33_hex {
 mod bytes64_hex {
     use super::*;
 
-    pub fn serialize<S>(data: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(data: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(data))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -372,7 +372,7 @@ fn compute_challenge(pubkey: &PublicKey, nonce_point: &PublicKey, message: &[u8]
 /// This is sent to participants who want to obtain a blind signature.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct SigningNonce {
+pub(crate) struct SigningNonce {
     /// The secret nonce scalar (must be kept secret!)
     secret_nonce: SecretKey,
     /// The public nonce point R = k*G

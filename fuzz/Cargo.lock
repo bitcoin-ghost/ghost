@@ -1647,11 +1647,6 @@ version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-common",
- "ghost-storage",
- "hex",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1661,11 +1656,7 @@ version = "1.11.20"
 dependencies = [
  "bitcoin",
  "ghost-common",
- "hex",
  "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1675,7 +1666,6 @@ version = "1.11.20"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
- "bytes",
  "chrono",
  "ed25519-dalek",
  "futures",
@@ -1687,7 +1677,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
- "rustls-pki-types",
  "secrecy",
  "serde",
  "serde_json",
@@ -1695,7 +1684,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tmq",
  "tokio",
- "tokio-rustls",
  "toml",
  "tracing",
  "zeroize",
@@ -1706,8 +1694,6 @@ name = "ghost-consensus"
 version = "1.11.20"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
- "bytes",
  "chrono",
  "futures",
  "getrandom 0.2.17",
@@ -1749,16 +1735,12 @@ dependencies = [
  "libfuzzer-sys",
  "serde",
  "serde_json",
- "wraith-protocol",
 ]
 
 [[package]]
 name = "ghost-glyph"
 version = "1.11.20"
 dependencies = [
- "hex",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
 ]
@@ -1776,29 +1758,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "ghost-keys"
-version = "1.11.20"
-dependencies = [
- "bech32",
- "bitcoin",
- "chacha20poly1305",
- "getrandom 0.2.17",
- "hex",
- "hkdf",
- "rand 0.8.5",
- "rayon",
- "secp256k1 0.29.1",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "subtle",
- "thiserror 1.0.69",
- "tracing",
- "zeroize",
 ]
 
 [[package]]
@@ -1810,7 +1769,6 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "serde",
- "sha2 0.10.9",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -1819,10 +1777,7 @@ dependencies = [
 name = "ghost-mpc"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
  "bellperson",
- "blake2",
  "blstrs",
  "ff",
  "getrandom 0.2.17",
@@ -1851,8 +1806,6 @@ dependencies = [
  "ghost-buds",
  "ghost-common",
  "serde",
- "serde_json",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1871,9 +1824,7 @@ dependencies = [
  "clap",
  "codec_sv2 4.0.1",
  "common_messages_sv2 6.0.2",
- "config",
  "framing_sv2 6.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures",
  "getrandom 0.2.17",
  "ghost-accounting",
  "ghost-buds",
@@ -1885,7 +1836,6 @@ dependencies = [
  "ghost-reaper",
  "ghost-reconciliation",
  "ghost-storage",
- "ghost-template",
  "ghost-verification",
  "ghost-zkp",
  "hex",
@@ -1917,7 +1867,6 @@ dependencies = [
  "bitcoin",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1925,25 +1874,16 @@ dependencies = [
 name = "ghost-reconciliation"
 version = "1.11.20"
 dependencies = [
- "async-trait",
  "bitcoin",
  "chrono",
- "futures",
  "getrandom 0.2.17",
  "ghost-common",
- "ghost-consensus",
- "ghost-keys",
- "ghost-locks",
- "ghost-storage",
  "hex",
  "parking_lot",
- "scopeguard",
  "secp256k1 0.29.1",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
 ]
 
@@ -1963,24 +1903,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 1.0.69",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "ghost-template"
-version = "1.11.20"
-dependencies = [
- "bitcoin",
- "ghost-buds",
- "ghost-common",
- "ghost-policy",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -2027,16 +1949,11 @@ name = "ghost-zkp"
 version = "0.1.0"
 dependencies = [
  "bellperson",
- "blake2",
  "blstrs",
  "ff",
- "getrandom 0.2.17",
  "ghost-common",
- "group",
  "hex",
- "pairing",
  "rand 0.8.5",
- "rayon",
  "serde",
  "sha2 0.10.9",
  "thiserror 1.0.69",
@@ -2203,15 +2120,6 @@ name = "hex_lit"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3011d1213f159867b13cfd6ac92d2cd5f1345762c63be3554e84092d85a50bbd"
-
-[[package]]
-name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac",
-]
 
 [[package]]
 name = "hmac"
@@ -5289,7 +5197,6 @@ dependencies = [
  "ghost-common",
  "hex",
  "hmac",
- "hyper",
  "reqwest",
  "rustls",
  "serde",
@@ -5297,9 +5204,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
- "toml",
  "tower 0.4.13",
- "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -5312,7 +5217,6 @@ version = "1.11.20"
 dependencies = [
  "bitcoin",
  "getrandom 0.2.17",
- "ghost-common",
  "hex",
  "parking_lot",
  "rand 0.8.5",
@@ -5322,7 +5226,6 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "zeroize",
 ]

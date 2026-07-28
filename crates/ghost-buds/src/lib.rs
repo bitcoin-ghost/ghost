@@ -31,6 +31,8 @@
 //!
 //! Each policy profile can choose which tiers to accept.
 
+#![deny(unreachable_pub)]
+
 pub mod classifier;
 pub mod detector;
 pub mod tier;

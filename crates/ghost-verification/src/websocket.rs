@@ -569,23 +569,6 @@ async fn handle_socket(socket: WebSocket, ws_state: Arc<WsState>, authenticated:
     info!("WebSocket client disconnected");
 }
 
-/// Convenience function to create a health update event
-pub fn health_update(
-    block_height: u64,
-    round_id: u64,
-    miner_count: u32,
-    peer_count: u32,
-    uptime_secs: u64,
-) -> WsEvent {
-    WsEvent::HealthUpdate {
-        block_height,
-        round_id,
-        miner_count,
-        peer_count,
-        uptime_secs,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

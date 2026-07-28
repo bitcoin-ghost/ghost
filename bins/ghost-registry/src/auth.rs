@@ -57,7 +57,7 @@ const MAX_TIMESTAMP_DRIFT_SECS: u64 = 30;
 /// - Spoofed heartbeat updates
 /// - Malicious node deregistration (API-1 CRITICAL)
 #[derive(Clone)]
-pub struct InternalAuth {
+pub(crate) struct InternalAuth {
     secret: [u8; 32],
 }
 
@@ -67,7 +67,7 @@ impl InternalAuth {
     /// # Errors
     ///
     /// Returns error if secret is too short or has insufficient entropy
-    pub fn new(secret: &[u8]) -> Result<Self, AuthError> {
+    pub(crate) fn new(secret: &[u8]) -> Result<Self, AuthError> {
         // Require minimum 32 bytes for security
         if secret.len() < 32 {
             return Err(AuthError::WeakSecret(
@@ -88,7 +88,7 @@ impl InternalAuth {
     }
 
     /// Create from a hex-encoded secret string
-    pub fn from_hex(hex_secret: &str) -> Result<Self, AuthError> {
+    pub(crate) fn from_hex(hex_secret: &str) -> Result<Self, AuthError> {
         let bytes = hex::decode(hex_secret)
             .map_err(|_| AuthError::InvalidSecret("Invalid hex encoding".to_string()))?;
         Self::new(&bytes)
@@ -105,7 +105,12 @@ impl InternalAuth {
     /// # Returns
     ///
     /// Ok(()) if signature is valid and timestamp is within acceptable range
-    pub fn verify(&self, signature: &str, timestamp: u64, body: &[u8]) -> Result<(), AuthError> {
+    pub(crate) fn verify(
+        &self,
+        signature: &str,
+        timestamp: u64,
+        body: &[u8],
+    ) -> Result<(), AuthError> {
         // Check timestamp is within acceptable range (replay prevention)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -144,7 +149,7 @@ impl InternalAuth {
 
     /// Generate a signature for a request (for testing/client use)
     #[allow(dead_code)]
-    pub fn sign(&self, timestamp: u64, body: &[u8]) -> String {
+    pub(crate) fn sign(&self, timestamp: u64, body: &[u8]) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC can accept any key size");
         mac.update(&timestamp.to_le_bytes());
@@ -168,7 +173,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Authentication error types
 #[derive(Debug, Clone)]
-pub enum AuthError {
+pub(crate) enum AuthError {
     /// Invalid signature format or verification failed
     InvalidSignature(String),
     /// Timestamp outside acceptable range
@@ -215,7 +220,7 @@ impl std::error::Error for AuthError {}
 ///     // ... handler logic
 /// }
 /// ```
-pub fn verify_internal_auth(
+pub(crate) fn verify_internal_auth(
     auth: &InternalAuth,
     headers: &HeaderMap,
     body: &[u8],
@@ -268,7 +273,7 @@ pub fn verify_internal_auth(
 /// Rate limiter for status endpoint (API-3)
 ///
 /// Uses a sliding window approach with per-IP tracking.
-pub struct RateLimiter {
+pub(crate) struct RateLimiter {
     /// Maximum requests per window
     max_requests: u32,
     /// Window duration
@@ -284,7 +289,7 @@ impl RateLimiter {
     ///
     /// * `max_requests` - Maximum requests allowed per window
     /// * `window` - Duration of the sliding window
-    pub fn new(max_requests: u32, window: Duration) -> Self {
+    pub(crate) fn new(max_requests: u32, window: Duration) -> Self {
         Self {
             max_requests,
             window,
@@ -297,7 +302,7 @@ impl RateLimiter {
     /// # Returns
     ///
     /// Ok(()) if allowed, Err with retry-after seconds if rate limited
-    pub fn check(&self, ip: &str) -> Result<(), u64> {
+    pub(crate) fn check(&self, ip: &str) -> Result<(), u64> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
 

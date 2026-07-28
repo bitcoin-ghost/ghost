@@ -658,19 +658,6 @@ impl GhostPayL2Handler {
             epoch_proof_fn: None,
         }
     }
-
-    /// H-5: Set epoch proof lookup function for cryptographic verification
-    ///
-    /// When configured, the handler can provide cryptographic proofs that
-    /// the node has L2 state for specific epochs, preventing nodes from
-    /// claiming GhostPay capability without actually maintaining state.
-    pub fn with_epoch_proof<F>(mut self, epoch_proof: F) -> Self
-    where
-        F: Fn(u64) -> Option<EpochProof> + Send + Sync + 'static,
-    {
-        self.epoch_proof_fn = Some(Box::new(epoch_proof));
-        self
-    }
 }
 
 impl GhostPayHandler for GhostPayL2Handler {
