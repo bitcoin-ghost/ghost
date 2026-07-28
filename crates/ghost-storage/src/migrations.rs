@@ -2601,7 +2601,10 @@ mod tests {
         }
     }
 
-    fn read_singleton(conn: &Connection) -> Option<(i64, Vec<u8>, i64, Option<Vec<u8>>)> {
+    /// contribution_count, current_params_hash, is_ossified, ceremony_id
+    type CeremonySingleton = (i64, Vec<u8>, i64, Option<Vec<u8>>);
+
+    fn read_singleton(conn: &Connection) -> Option<CeremonySingleton> {
         conn.query_row(
             "SELECT contribution_count, current_params_hash, is_ossified, ceremony_id
              FROM mpc_ceremony WHERE id = 1",

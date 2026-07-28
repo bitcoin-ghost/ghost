@@ -1503,10 +1503,11 @@ impl NullifierRouteHandler {
             m.consensus_rounds_total.inc();
             let votes = m.consensus_votes_total.get();
             let rounds = m.consensus_rounds_total.get();
-            if rounds > 0 {
-                // Participation = votes / rounds * 100 (each round we should cast 1 vote)
-                let pct = ((votes * 100) / rounds).min(100);
-                m.consensus_participation_percent.set(pct as i64);
+            // Participation = votes / rounds * 100 (each round we should cast 1 vote).
+            // `checked_div` rather than a `rounds > 0` guard: same result, and it cannot be
+            // reintroduced as a divide-by-zero if the guard is ever moved.
+            if let Some(pct) = (votes * 100).checked_div(rounds) {
+                m.consensus_participation_percent.set(pct.min(100) as i64);
             }
         }
         debug!(height, tx_count, "Checkpoint finalized");

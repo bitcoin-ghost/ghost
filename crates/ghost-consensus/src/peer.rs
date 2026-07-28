@@ -1031,9 +1031,11 @@ mod tests {
         let pid = [11u8; 32];
         mgr.upsert_peer(Peer::new(pid, "10.0.0.11:8080".to_string()));
 
-        let mut caps = NodeCapabilities::default();
-        caps.public_mining = true;
-        caps.reaper = true;
+        let caps = NodeCapabilities {
+            public_mining: true,
+            reaper: true,
+            ..Default::default()
+        };
         mgr.update_health_metrics(&pid, 5, caps, None, 0);
         assert!(mgr.get_peer(&pid).unwrap().capabilities.public_mining);
 
@@ -1059,15 +1061,19 @@ mod tests {
         let pid = [12u8; 32];
         mgr.upsert_peer(Peer::new(pid, "10.0.0.12:8080".to_string()));
 
-        let mut caps = NodeCapabilities::default();
-        caps.public_mining = true;
-        caps.reaper = true;
+        let caps = NodeCapabilities {
+            public_mining: true,
+            reaper: true,
+            ..Default::default()
+        };
         mgr.update_health_metrics(&pid, 1, caps, None, 0);
 
         // Operator turns public mining off but the node still runs the reaper: a real claim,
         // not an empty one, so it must be believed.
-        let mut narrowed = NodeCapabilities::default();
-        narrowed.reaper = true;
+        let narrowed = NodeCapabilities {
+            reaper: true,
+            ..Default::default()
+        };
         mgr.update_health_metrics(&pid, 1, narrowed, None, 0);
 
         let got = mgr.get_peer(&pid).unwrap();

@@ -27,6 +27,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use ghost_storage::queries::VerificationProofInsert;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -455,15 +456,15 @@ impl VerificationResultHandler {
         let challenger_hex = hex::encode(msg.challenger_id);
         let target_hex = hex::encode(msg.target_node_id);
         self.db
-            .insert_verification_proof(
-                &challenger_hex,
-                &target_hex,
-                msg.capability.as_str(),
-                msg.passed,
-                msg.timestamp,
-                blob,
-                msg.round_height.map(|h| h as i64),
-            )
+            .insert_verification_proof(VerificationProofInsert {
+                challenger_id: &challenger_hex,
+                target_node_id: &target_hex,
+                capability: msg.capability.as_str(),
+                passed: msg.passed,
+                timestamp: msg.timestamp,
+                proof: blob,
+                round_height: msg.round_height.map(|h| h as i64),
+            })
             .unwrap_or(false)
     }
 
@@ -601,7 +602,7 @@ impl VerificationResultHandler {
         if let Some(ref peers) = self.peers {
             if peers.get_peer(&msg.challenger_id).is_none() {
                 // Peer not in memory — fall back to DB (nodes table persisted from health pings)
-                let challenger_hex = hex::encode(&msg.challenger_id);
+                let challenger_hex = hex::encode(msg.challenger_id);
                 let known_in_db = self.db.get_node(&challenger_hex).ok().flatten().is_some();
                 if !known_in_db {
                     warn!(
@@ -640,15 +641,15 @@ impl VerificationResultHandler {
         // MAJORITY applied at qualification: a colluding minority can neither fabricate a PASS nor
         // a FAIL. Re-derivation is still applied below as a live filter on the legacy
         // `*_challenges` tables (the pre-gate qualification path), where freshness holds.
-        if let Err(e) = self.db.insert_verification_proof(
-            &challenger_hex,
-            &target_hex,
-            msg.capability.as_str(),
-            msg.passed,
-            msg.timestamp,
-            &envelope.payload,
-            msg.round_height.map(|h| h as i64),
-        ) {
+        if let Err(e) = self.db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: &challenger_hex,
+            target_node_id: &target_hex,
+            capability: msg.capability.as_str(),
+            passed: msg.passed,
+            timestamp: msg.timestamp,
+            proof: &envelope.payload,
+            round_height: msg.round_height.map(|h| h as i64),
+        }) {
             warn!(error = %e, "Failed to persist verification proof to convergence ledger");
         }
 

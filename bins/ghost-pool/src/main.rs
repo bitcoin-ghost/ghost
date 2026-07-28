@@ -37,6 +37,7 @@
 
 use anyhow::Result;
 use clap::Parser;
+use ghost_storage::queries::VerificationProofInsert;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
@@ -8627,15 +8628,17 @@ async fn main() -> Result<()> {
             // qualification still governs the verdict.
             match serde_json::to_vec(&msg) {
                 Ok(blob) => {
-                    if let Err(e) = db_for_verification.insert_verification_proof(
-                        &hex::encode(msg.challenger_id),
-                        &hex::encode(msg.target_node_id),
-                        broadcast.capability.as_str(),
-                        msg.passed,
-                        msg.timestamp,
-                        &blob,
-                        msg.round_height.map(|h| h as i64),
-                    ) {
+                    if let Err(e) =
+                        db_for_verification.insert_verification_proof(VerificationProofInsert {
+                            challenger_id: &hex::encode(msg.challenger_id),
+                            target_node_id: &hex::encode(msg.target_node_id),
+                            capability: broadcast.capability.as_str(),
+                            passed: msg.passed,
+                            timestamp: msg.timestamp,
+                            proof: &blob,
+                            round_height: msg.round_height.map(|h| h as i64),
+                        })
+                    {
                         warn!(error = %e, "Failed to persist own verification proof to ledger");
                     }
                 }

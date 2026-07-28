@@ -30,6 +30,11 @@ use ghost_common::error::{GhostError, GhostResult};
 use crate::database::Database;
 use crate::models::*;
 
+/// Row shape for `mpc_contributions` lookups: elder position, contributor node id, previous
+/// params hash, contribution proof, epoch, created-at. Named so the query below reads as a
+/// row rather than a six-tuple.
+type MpcContributionRow = (i64, String, Vec<u8>, Vec<u8>, i64, i64);
+
 // =============================================================================
 // M-15: BLOB SIZE VALIDATION
 // =============================================================================
@@ -4989,7 +4994,30 @@ impl Database {
             Ok(conn.last_insert_rowid())
         })
     }
+}
 
+/// Arguments for [`Database::insert_verification_proof`].
+///
+/// A struct rather than eight positional parameters because `challenger_id` and
+/// `target_node_id` are adjacent `&str`s: transposing them compiles, stores a verification
+/// record against the wrong node, and every peer keys and grades that record identically —
+/// so the mistake would converge across the mesh rather than showing up as a local anomaly.
+/// Named fields make the call sites say which node is which.
+pub struct VerificationProofInsert<'a> {
+    /// Node that issued the challenge.
+    pub challenger_id: &'a str,
+    /// Node being verified.
+    pub target_node_id: &'a str,
+    pub capability: &'a str,
+    /// The recipient's derived verdict, not the challenger's claim.
+    pub passed: bool,
+    /// The CHALLENGE's own timestamp from the signed message, never `now()`.
+    pub timestamp: i64,
+    pub proof: &'a [u8],
+    pub round_height: Option<i64>,
+}
+
+impl Database {
     /// Persist a signed verification result into the verification ledger (schema v42).
     ///
     /// Idempotent: the PRIMARY KEY `(challenger, target, capability, timestamp)` means a
@@ -5000,16 +5028,16 @@ impl Database {
     /// and `passed` is the recipient's derived verdict — so every node keys and grades the
     /// same record identically, which is what convergence and deterministic node-reward
     /// qualification depend on. See `ghost-web/docs/node-reward-convergence.md`.
-    pub fn insert_verification_proof(
-        &self,
-        challenger_id: &str,
-        target_node_id: &str,
-        capability: &str,
-        passed: bool,
-        timestamp: i64,
-        proof: &[u8],
-        round_height: Option<i64>,
-    ) -> GhostResult<bool> {
+    pub fn insert_verification_proof(&self, p: VerificationProofInsert<'_>) -> GhostResult<bool> {
+        let VerificationProofInsert {
+            challenger_id,
+            target_node_id,
+            capability,
+            passed,
+            timestamp,
+            proof,
+            round_height,
+        } = p;
         if challenger_id.len() > MAX_CHALLENGE_ID_SIZE
             || target_node_id.len() > MAX_CHALLENGE_ID_SIZE
         {
@@ -6658,7 +6686,7 @@ impl Database {
         new_params_hash: &[u8; 32],
     ) -> GhostResult<Option<MpcContributionRecord>> {
         self.with_connection(|conn| {
-            let result: Option<(i64, String, Vec<u8>, Vec<u8>, i64, i64)> = conn
+            let result: Option<MpcContributionRow> = conn
                 .query_row(
                     "SELECT elder_position, contributor_node_id, prev_params_hash,
                             contribution_proof, epoch, created_at
@@ -11491,8 +11519,8 @@ mod tests {
             .expect("Insert should succeed");
 
         let mut pixels2 = vec![1u8; 256];
-        for i in 0..256 {
-            pixels2[i] = ((i + 1) % 26) as u8;
+        for (i, px) in pixels2.iter_mut().enumerate() {
+            *px = ((i + 1) % 26) as u8;
         }
         let bh2 = test_bitmap_hash(&pixels2);
         let cm2 = test_commitment(&pixels2, "ghost1bob");
@@ -12053,39 +12081,39 @@ mod tests {
 
         // A new (challenger, target, capability, timestamp) record is stored.
         assert!(db
-            .insert_verification_proof(
-                "challengerA",
-                "targetB",
-                "archive",
-                true,
-                1_000,
-                &blob,
-                None
-            )
+            .insert_verification_proof(VerificationProofInsert {
+                challenger_id: "challengerA",
+                target_node_id: "targetB",
+                capability: "archive",
+                passed: true,
+                timestamp: 1_000,
+                proof: &blob,
+                round_height: None,
+            })
             .expect("insert"));
         // Re-delivery of the SAME key is a no-op — the dedup the *_challenges tables lacked.
         assert!(!db
-            .insert_verification_proof(
-                "challengerA",
-                "targetB",
-                "archive",
-                true,
-                1_000,
-                &blob,
-                None
-            )
+            .insert_verification_proof(VerificationProofInsert {
+                challenger_id: "challengerA",
+                target_node_id: "targetB",
+                capability: "archive",
+                passed: true,
+                timestamp: 1_000,
+                proof: &blob,
+                round_height: None,
+            })
             .expect("insert dup"));
         // A different timestamp is a distinct record.
         assert!(db
-            .insert_verification_proof(
-                "challengerA",
-                "targetB",
-                "archive",
-                false,
-                2_000,
-                &blob,
-                None
-            )
+            .insert_verification_proof(VerificationProofInsert {
+                challenger_id: "challengerA",
+                target_node_id: "targetB",
+                capability: "archive",
+                passed: false,
+                timestamp: 2_000,
+                proof: &blob,
+                round_height: None,
+            })
             .expect("insert 2"));
 
         // Windowed read serves only in-range records (the convergence responder relies on this).
@@ -12113,10 +12141,26 @@ mod tests {
         let day = 86_400i64;
 
         // One row well inside retention, one well past it.
-        db.insert_verification_proof("cA", "tB", "policy", true, now - 2 * day, &blob, None)
-            .expect("recent");
-        db.insert_verification_proof("cA", "tB", "policy", true, now - 40 * day, &blob, None)
-            .expect("old");
+        db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: "cA",
+            target_node_id: "tB",
+            capability: "policy",
+            passed: true,
+            timestamp: now - 2 * day,
+            proof: &blob,
+            round_height: None,
+        })
+        .expect("recent");
+        db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: "cA",
+            target_node_id: "tB",
+            capability: "policy",
+            passed: true,
+            timestamp: now - 40 * day,
+            proof: &blob,
+            round_height: None,
+        })
+        .expect("old");
 
         let deleted = db.prune_old_verification_ledger(30).expect("prune");
         assert_eq!(
@@ -12132,12 +12176,36 @@ mod tests {
     fn verification_convergence_serves_only_missing() {
         let db = Database::in_memory().expect("create in-memory db");
         let blob = |n: u8| vec![n; 8];
-        db.insert_verification_proof("cA", "tB", "archive", true, 100, &blob(1), None)
-            .unwrap();
-        db.insert_verification_proof("cA", "tB", "policy", true, 200, &blob(2), None)
-            .unwrap();
-        db.insert_verification_proof("cC", "tB", "archive", false, 300, &blob(3), None)
-            .unwrap();
+        db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: "cA",
+            target_node_id: "tB",
+            capability: "archive",
+            passed: true,
+            timestamp: 100,
+            proof: &blob(1),
+            round_height: None,
+        })
+        .unwrap();
+        db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: "cA",
+            target_node_id: "tB",
+            capability: "policy",
+            passed: true,
+            timestamp: 200,
+            proof: &blob(2),
+            round_height: None,
+        })
+        .unwrap();
+        db.insert_verification_proof(VerificationProofInsert {
+            challenger_id: "cC",
+            target_node_id: "tB",
+            capability: "archive",
+            passed: false,
+            timestamp: 300,
+            proof: &blob(3),
+            round_height: None,
+        })
+        .unwrap();
 
         let keys = db.verification_keys_in(0, 1_000).expect("keys");
         assert_eq!(keys.len(), 3, "all three records' keys are advertised");
