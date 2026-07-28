@@ -18,7 +18,7 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
             let mut extended_channels = Vec::new();
             let mut standard_channels = Vec::new();
 
-            for (_channel_id, extended_channel) in dd.extended_channels.iter() {
+            for extended_channel in dd.extended_channels.values() {
                 let channel_id = extended_channel.get_channel_id();
                 let target = extended_channel.get_target();
                 let requested_max_target = extended_channel.get_requested_max_target();

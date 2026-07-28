@@ -11072,7 +11072,7 @@ mod tests {
         let map = parse_param_hashes(&format!("BLOCK:{}", block));
         // This is the exact key `try_fetch_params_from_seed` passes for note_spend.
         assert!(
-            map.get("BLOCK").is_some(),
+            map.contains_key("BLOCK"),
             "note_spend must resolve a pinned BLOCK hash, never None, in production"
         );
         // And a non-trivial blob with the None branch IS accepted — proving the

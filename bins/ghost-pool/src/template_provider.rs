@@ -348,8 +348,8 @@ impl TemplateDistributionServer {
                     let clients = Arc::clone(&self.clients);
                     let template_processor = Arc::clone(&self.template_processor);
                     let template_id_counter = Arc::clone(&self.template_id_counter);
-                    let authority_public_key = self.config.authority_public_key.clone();
-                    let authority_secret_key = self.config.authority_secret_key.clone();
+                    let authority_public_key = self.config.authority_public_key;
+                    let authority_secret_key = self.config.authority_secret_key;
                     let cert_validity_secs = self.config.cert_validity_secs;
 
                     // The Noise handshake runs INSIDE the spawned task, never on the accept
