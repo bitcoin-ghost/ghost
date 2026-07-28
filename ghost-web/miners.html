@@ -227,6 +227,8 @@
       .qsg-copy { flex: none; font-family: var(--font-sans); font-size: 12px; font-weight: 600; color: var(--dim); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 7px; padding: 9px 12px; cursor: pointer; transition: all 120ms; }
       .qsg-copy:hover { color: var(--fg); border-color: var(--fg); }
       .qsg-copy.done { color: var(--green); border-color: var(--green); }
+      .qsg-select { flex: 1; font-family: var(--font-mono); font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 7px; padding: 9px 11px; outline: none; cursor: pointer; }
+      .qsg-select:focus { border-color: var(--accent); }
       .qsg-foot { font-size: 12.5px; color: var(--dim); line-height: 1.55; margin-top: 4px; }
       .qsg-foot code { font-family: var(--font-mono); font-size: 12px; color: var(--fg); }
       .qsg-noacct { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--green); margin-bottom: 14px; }
@@ -277,8 +279,17 @@
         var POOL = 'pool.bitcoinghost.org';
         var SV1_PORT = '3333';
         var SV2_PORT = '34255';
-        var SV2_AUTHORITY = '9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72';
         var proto = 'sv1';
+
+        // SV2 pins the pool's Noise authority key, and every node has its OWN keypair —
+        // so there is no single key that works behind the load-balanced name. An SV2
+        // miner must therefore target a SPECIFIC node and pin THAT node's key. SV1
+        // miners pin nothing, so they keep using pool.bitcoinghost.org.
+        //
+        // The keys are read live from each node, never hardcoded here: a stale hardcoded
+        // key is not merely broken, it tells miners to trust a key we no longer hold.
+        var sv2Nodes = [];      // [{host, key, sv2Port}] — only nodes whose key we know
+        var sv2Choice = 0;
 
         var addrEl = document.getElementById('qsg-addr');
         var workerEl = document.getElementById('qsg-worker');
@@ -309,13 +320,25 @@
             html += row('Password', 'x');
             html += '<p class="qsg-foot">Works on any ASIC — set the pool/URL, username and password fields in your miner’s web UI. The password is ignored; <code>x</code> is fine.</p>';
           } else {
-            html += row('Host', POOL);
-            html += row('Port', SV2_PORT);
-            html += row('Username', user);
-            html += row('Protocol', 'Stratum V2');
-            html += row('Channel type', 'Extended');
-            html += row('Authority public key', SV2_AUTHORITY);
-            html += '<p class="qsg-foot">For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). The authority key is the same on every public Ghost node. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
+            if (!sv2Nodes.length) {
+              html += '<p class="qsg-foot">Loading the live node list… SV2 settings are read from the nodes themselves, so they are never stale.</p>';
+            } else {
+              var n = sv2Nodes[Math.min(sv2Choice, sv2Nodes.length - 1)];
+              var opts = '';
+              for (var i = 0; i < sv2Nodes.length; i++) {
+                opts += '<option value="' + i + '"' + (i === sv2Choice ? ' selected' : '') + '>' +
+                  esc(sv2Nodes[i].host) + '</option>';
+              }
+              html += '<div class="qsg-row"><span class="k">Node</span>' +
+                '<div class="qsg-val"><select id="qsg-node" class="qsg-select">' + opts + '</select></div></div>';
+              html += row('Host', n.host);
+              html += row('Port', String(n.sv2Port));
+              html += row('Username', user);
+              html += row('Protocol', 'Stratum V2');
+              html += row('Channel type', 'Extended');
+              html += row('Authority public key', n.key);
+              html += '<p class="qsg-foot">For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). SV2 authenticates the pool by pinning its <strong>authority key</strong>, and every Ghost node has its own — so pick a node above and use <em>that</em> node\u2019s host and key together. Point an SV2 miner at <code>' + POOL + '</code> and the pin will not match, because the name balances across several nodes. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
+            }
           }
           outEl.innerHTML = html;
         }
@@ -329,6 +352,12 @@
         });
         addrEl.addEventListener('input', render);
         workerEl.addEventListener('input', render);
+        outEl.addEventListener('change', function (e) {
+          if (e.target && e.target.id === 'qsg-node') {
+            sv2Choice = parseInt(e.target.value, 10) || 0;
+            render();
+          }
+        });
         outEl.addEventListener('click', function (e) {
           var b = e.target.closest('.qsg-copy');
           if (!b) return;
@@ -343,6 +372,221 @@
         });
 
         render();
+
+        // Read each seed's OWN authority key from its own status endpoint, and its public
+        // host from the `is_self` entry of its own mesh-node list. Pairing the two is what
+        // makes the key trustworthy-by-construction: it comes from the same node it
+        // authenticates, not from a constant in this file.
+        //
+        // Seeds are the four load-balancer proxies. Nodes beyond them have no per-node
+        // proxy yet, so their keys cannot be read from a browser; they still appear in the
+        // public node list below, and an operator can read their key from that node's own
+        // /api/v1/mining/status.
+        var QS_SEEDS = ['vm1', 'vm2', 'vm3', 'vm4'];
+        (function loadSv2Nodes() {
+          var pending = QS_SEEDS.length;
+          QS_SEEDS.forEach(function (vm) {
+            var base = '/api/pool/' + vm + '/api/v1/';
+            Promise.all([
+              fetch(base + 'mining/status').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+              fetch(base + 'pool/mesh-nodes').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; })
+            ]).then(function (res) {
+              var st = res[0], mesh = res[1];
+              if (st && mesh && st.authority_public_key && st.public_mining) {
+                var self = (mesh.nodes || []).filter(function (n) { return n && n.is_self; })[0];
+                var host = self ? String(self.address || '').replace(/:\d+$/, '') : '';
+                if (host && !sv2Nodes.some(function (n) { return n.host === host; })) {
+                  sv2Nodes.push({ host: host, key: st.authority_public_key, sv2Port: st.stratum_v2_port || 34255 });
+                }
+              }
+            }).catch(function () { /* a dead seed just contributes nothing */ })
+              .then(function () {
+                if (--pending === 0) {
+                  sv2Nodes.sort(function (a, b) { return a.host < b.host ? -1 : 1; });
+                  if (proto === 'sv2') render();
+                }
+              });
+          });
+        })();
+      })();
+    </script>
+  </div>
+</section>
+
+<!-- ───────── Public mining nodes ───────── -->
+<section class="block" id="nodes">
+  <div class="container">
+    <div class="section-label">the mesh</div>
+    <h2 class="section-title">Every public node, live.</h2>
+    <p class="section-lead">
+      <code>pool.bitcoinghost.org</code> is a convenience, not the pool — it
+      balances you across nodes. The pool is the mesh below, and you can point a
+      miner at any node in it directly. Nothing here is a hardcoded list: the
+      page asks a node, and the node reports itself and every peer it is
+      connected to, so a node that joins tonight appears here on its own.
+    </p>
+
+    <style>
+      .nodes-wrap { margin-top: 26px; overflow-x: auto; }
+      .nodes-tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 620px; }
+      .nodes-tbl th { text-align: left; font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--dim); padding: 0 14px 9px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+      .nodes-tbl td { padding: 11px 14px 11px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+      .nodes-tbl td.mono { font-family: var(--font-mono); font-size: 12.5px; white-space: nowrap; }
+      .nodes-tbl tr:last-child td { border-bottom: none; }
+      .node-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
+      .node-dot.up { background: var(--green); }
+      .node-dot.down { background: var(--dim); }
+      .nodes-note { font-size: 12.5px; color: var(--dim); line-height: 1.6; margin-top: 16px; }
+      .nodes-note code { font-family: var(--font-mono); font-size: 12px; color: var(--fg); }
+      .nodes-empty { font-size: 13.5px; color: var(--dim); padding: 18px 0; }
+    </style>
+
+    <div class="nodes-wrap">
+      <table class="nodes-tbl" id="nodes-tbl" hidden>
+        <thead>
+          <tr>
+            <th>Node</th>
+            <th>Stratum V1</th>
+            <th>Stratum V2</th>
+            <th>Miners</th>
+            <th>Hashrate</th>
+          </tr>
+        </thead>
+        <tbody id="nodes-body"></tbody>
+      </table>
+      <div class="nodes-empty" id="nodes-empty">Asking the mesh…</div>
+    </div>
+
+    <p class="nodes-note">
+      <strong>SV1</strong> works against any node on the list, and against
+      <code>pool.bitcoinghost.org</code> — it authenticates nothing, so the
+      address you point at does not have to be a specific machine.
+      <strong>SV2</strong> is different: it pins the node's authority key, every
+      node has its own, and so an SV2 miner has to name one node. The
+      <a href="#quickstart">quickstart</a> above will give you a node's host and
+      its matching key together.
+    </p>
+    <p class="nodes-note">
+      Picking a node yourself is the point, not a workaround — it is what keeps
+      the pool from depending on one name resolving. Your payouts are identical
+      wherever you connect: shares are pooled across the whole mesh and paid
+      against your address, not against the node that happened to take them.
+    </p>
+
+    <script>
+      (function () {
+        // Same bootstrap seeds as the rest of the site: enter through one of the four
+        // proxied nodes, then let that node's mesh-node list describe the WHOLE mesh —
+        // including nodes that have no proxy of their own.
+        var SEEDS = ['vm1', 'vm2', 'vm3', 'vm4'];
+        var SV1 = 3333, SV2 = 34255;
+        var tbl = document.getElementById('nodes-tbl');
+        var body = document.getElementById('nodes-body');
+        var empty = document.getElementById('nodes-empty');
+
+        function esc(s) {
+          return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+          });
+        }
+        function hashrate(th) {
+          if (!isFinite(th) || th <= 0) return '—';
+          if (th < 1) return (th * 1000).toFixed(1) + ' GH/s';
+          if (th < 1000) return th.toFixed(2) + ' TH/s';
+          return (th / 1000).toFixed(2) + ' PH/s';
+        }
+        // The mesh reports an API address (host:8080 / host:8559); the mining ports are
+        // fleet-wide, so the host is the only part we need from it.
+        function hostOf(addr) { return String(addr || '').replace(/:\d+$/, ''); }
+
+        // Ask EVERY seed, not just the first that answers.
+        //
+        // The gossiped `public_mining` bit flaps: at any moment an observer has a peer or
+        // two reading false that are demonstrably public, and which peers those are keeps
+        // changing (#518). Trusting one node's view would make real nodes blink out of the
+        // list, and a node that blinks out as someone loads the page is simply not offered.
+        // Four independent views, OR-ed together, make that vanishingly unlikely — and not
+        // depending on any single node's account of the mesh is the right shape anyway.
+        async function fetchMesh() {
+          var views = await Promise.all(SEEDS.map(function (vm) {
+            var ctl = new AbortController();
+            var t = setTimeout(function () { ctl.abort(); }, 6000);
+            return fetch('/api/pool/' + vm + '/api/v1/pool/mesh-nodes', { signal: ctl.signal })
+              .then(function (r) { clearTimeout(t); return r.ok ? r.json() : null; })
+              .catch(function () { clearTimeout(t); return null; });
+          }));
+          var merged = {}, any = false;
+          views.forEach(function (d) {
+            if (!d || !Array.isArray(d.nodes)) return;
+            any = true;
+            d.nodes.forEach(function (n) {
+              var h = hostOf(n && n.address);
+              if (!h) return;
+              var prev = merged[h];
+              if (!prev) { merged[h] = JSON.parse(JSON.stringify(n)); return; }
+              // OR the capability and health bits; take the highest reported
+              // hashrate and miner count, since a stale view under-reports.
+              var pm = (prev.capabilities && prev.capabilities.public_mining) ||
+                       (n.capabilities && n.capabilities.public_mining);
+              if (prev.capabilities) prev.capabilities.public_mining = !!pm;
+              prev.healthy = prev.healthy !== false || n.healthy !== false;
+              if ((n.hashrate_th || 0) > (prev.hashrate_th || 0)) prev.hashrate_th = n.hashrate_th;
+              var nc = (n.deduped_miner_count != null ? n.deduped_miner_count : n.miner_count) || 0;
+              var pc = (prev.deduped_miner_count != null ? prev.deduped_miner_count : prev.miner_count) || 0;
+              if (nc > pc) { prev.deduped_miner_count = n.deduped_miner_count; prev.miner_count = n.miner_count; }
+            });
+          });
+          if (!any) return null;
+          return Object.keys(merged).map(function (h) { return merged[h]; });
+        }
+
+        function render(nodes) {
+          // Only nodes that actually accept outside hashpower belong on a miner's list —
+          // a node mining solo or running a private pool is not an endpoint you can use.
+          var pub = nodes.filter(function (n) {
+            return n && n.capabilities && n.capabilities.public_mining && hostOf(n.address);
+          });
+          // One row per HOST: a restarting node briefly reports stale same-IP duplicates.
+          var seen = {}, rows = [];
+          pub.forEach(function (n) {
+            var h = hostOf(n.address);
+            if (seen[h]) return;
+            seen[h] = 1;
+            rows.push(n);
+          });
+          rows.sort(function (a, b) { return (b.hashrate_th || 0) - (a.hashrate_th || 0); });
+
+          if (!rows.length) {
+            empty.textContent = 'No public mining nodes are reporting right now.';
+            empty.hidden = false; tbl.hidden = true;
+            return;
+          }
+          body.innerHTML = rows.map(function (n) {
+            var h = hostOf(n.address);
+            var up = n.healthy !== false;
+            var miners = (n.deduped_miner_count != null ? n.deduped_miner_count : n.miner_count) || 0;
+            return '<tr>' +
+              '<td class="mono"><span class="node-dot ' + (up ? 'up' : 'down') + '"></span>' + esc(h) + '</td>' +
+              '<td class="mono">' + esc(h + ':' + SV1) + '</td>' +
+              '<td class="mono">' + esc(h + ':' + SV2) + '</td>' +
+              '<td>' + miners + '</td>' +
+              '<td>' + hashrate(n.hashrate_th) + '</td>' +
+              '</tr>';
+          }).join('');
+          empty.hidden = true; tbl.hidden = false;
+        }
+
+        async function refresh() {
+          var nodes = await fetchMesh();
+          if (!nodes) {
+            // Keep whatever is already on screen; only say something if we never had data.
+            if (tbl.hidden) { empty.textContent = 'Could not reach the mesh just now — retrying.'; }
+            return;
+          }
+          render(nodes);
+        }
+        refresh();
+        setInterval(refresh, 60000);
       })();
     </script>
   </div>
