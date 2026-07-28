@@ -45,6 +45,16 @@ CANARY="${3:-}"
 CANARY_NODES="ghost-vm5 ghost-vm6 ghost-vm7 ghost-vm8"
 PRODUCTION_NODES="ghost-vm1 ghost-vm2 ghost-vm3 ghost-vm4"
 SOAK_MINUTES="${SOAK_MINUTES:-60}"
+
+# Declared HERE, not further down: the soak-verification block below reaches for both to
+# ssh a canary and confirm it still runs the binary it soaked. They used to be defined
+# after that block, so a production deploy died with
+#   deploy-node.sh: line 135: REMOTE_TIMEOUT: unbound variable
+# the moment a soak record carried a recorded hash. Canary deploys skip the block, so it
+# only ever failed on the production path — the one that matters.
+SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes)
+XFER_TIMEOUT="${XFER_TIMEOUT:-300}"
+REMOTE_TIMEOUT="${REMOTE_TIMEOUT:-120}"
 # Overridable alongside STATE_DIR so scripts/test-deploy-gate.sh can drive the gate against a
 # clean throwaway checkout while running THIS copy of the script. A guard nobody can drive is a
 # guard nobody has checked, which is how #459 went unnoticed.
@@ -162,9 +172,6 @@ info "deploying $BINARY @ $SHORT to $NODE"
 # leaving the node with a new ghost-pool against an old pool_sv2 and nothing saying so.
 #
 # ServerAliveInterval makes a dead peer detectable; the hard `timeout` bounds the rest.
-SSH_OPTS=(-o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes)
-XFER_TIMEOUT="${XFER_TIMEOUT:-300}"
-REMOTE_TIMEOUT="${REMOTE_TIMEOUT:-120}"
 
 LOCAL_SHA="$(sha256sum "$BIN_PATH" | cut -d' ' -f1)"
 LOCAL_SIZE="$(stat -c%s "$BIN_PATH")"
