@@ -176,6 +176,57 @@ pub(super) fn extract_worker_name(name: &str) -> &str {
     name.rsplit_once('.').map(|(_, w)| w).unwrap_or(name)
 }
 
+/// Why an SV1 username cannot be attributed to a payout target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsernameRejection {
+    /// No `.` at all — `<address>` with no worker.
+    NoSeparator,
+    /// `bc1q….` — the worker half is empty, so the per-share TLV is omitted.
+    EmptyWorker,
+    /// `.worker` — the address half is empty, so there is no payout target.
+    EmptyAddress,
+}
+
+impl UsernameRejection {
+    pub(super) fn half(self) -> &'static str {
+        match self {
+            Self::NoSeparator => "separator",
+            Self::EmptyWorker => "worker",
+            Self::EmptyAddress => "address",
+        }
+    }
+}
+
+/// Check that an SV1 username can actually be paid.
+///
+/// Both halves of `<address>.<worker>` must be present and non-empty. The `.`-only check is
+/// not sufficient, and the failure is silent rather than loud:
+///
+/// - `bc1q….` yields an empty worker, so `extract_worker_name` returns `""` and the per-share
+///   TLV is omitted entirely. A pool with extension 0x0002 negotiated as *required* — which the
+///   live fleet has — then marks every such share unattributable and skips the payout webhook,
+///   while still answering `SubmitSharesSuccess`. The miner sees a healthy accept rate and is
+///   credited for none of it.
+/// - `.worker` yields an empty address, so there is no payout target even though the worker
+///   name looks well-formed.
+///
+/// `mining.authorize` is the only layer that can tell the miner. Below it, every component
+/// reports success. See #479.
+///
+/// Callers pass the name with any `.d=<difficulty>` directive already stripped.
+pub(super) fn check_username_attributable(name: &str) -> Result<(), UsernameRejection> {
+    let Some((address, worker)) = name.rsplit_once('.') else {
+        return Err(UsernameRejection::NoSeparator);
+    };
+    if worker.is_empty() {
+        return Err(UsernameRejection::EmptyWorker);
+    }
+    if address.is_empty() {
+        return Err(UsernameRejection::EmptyAddress);
+    }
+    Ok(())
+}
+
 /// Truncates a string to [`MAX_USER_IDENTITY_BYTES`], respecting UTF-8 character boundaries.
 ///
 /// If the input string exceeds the limit, it is truncated at the last valid UTF-8 character
@@ -370,7 +421,55 @@ mod username_difficulty_tests {
     /// Where the pool has extension 0x0002 negotiated as *required* — which the live fleet does
     /// (`required_extensions = [0x0002]` in the installed translator config) — such a share is
     /// marked unattributable and earns nothing, while the miner still gets `SubmitSharesSuccess`.
-    /// `mining.authorize` accepts this shape today because it only checks for a `.`.
+    ///
+    /// `mining.authorize` now REJECTS this shape (#479), so it should be unreachable in
+    /// practice. This still pins the underlying behaviour, because the rejection is the only
+    /// thing standing between it and a miner silently earning nothing — if that guard is ever
+    /// relaxed, this is what comes back.
+    /// The shapes `mining.authorize` must refuse, and the ones it must keep accepting.
+    ///
+    /// The refusals are the point of #479: each one produces a miner that submits shares,
+    /// receives `SubmitSharesSuccess` for every one of them, and is paid for none — because
+    /// the pool cannot derive an attribution target and every layer below authorize reports
+    /// success anyway.
+    #[test]
+    fn usernames_that_cannot_be_paid_are_refused() {
+        use UsernameRejection::*;
+
+        // Accepted: a normal address.worker, and multi-dot worker names.
+        for ok in [
+            &format!("{ADDR}.rig1")[..],
+            &format!("{ADDR}.farm1.rig1")[..],
+            "x.y",
+        ] {
+            assert_eq!(
+                check_username_attributable(ok),
+                Ok(()),
+                "{ok} should be accepted"
+            );
+        }
+
+        // Refused: empty worker — TLV omitted, shares unattributable, earns nothing.
+        assert_eq!(
+            check_username_attributable(&format!("{ADDR}.")),
+            Err(EmptyWorker)
+        );
+        // Refused: empty address — no payout target, however good the worker name looks.
+        assert_eq!(check_username_attributable(".rig1"), Err(EmptyAddress));
+        // Refused: no separator at all, which was already the case before #479.
+        assert_eq!(check_username_attributable(ADDR), Err(NoSeparator));
+        assert_eq!(check_username_attributable(""), Err(NoSeparator));
+    }
+
+    /// A `.d=` directive is stripped before the check, so declaring a difficulty must not
+    /// turn a payable username into a refused one.
+    #[test]
+    fn a_difficulty_directive_does_not_make_a_username_unpayable() {
+        let username = format!("{ADDR}.rig1.d=9300000");
+        let (stripped, _) = split_username_difficulty(&username);
+        assert_eq!(check_username_attributable(stripped), Ok(()));
+    }
+
     #[test]
     fn an_empty_worker_segment_yields_no_tlv_identity() {
         assert_eq!(extract_worker_name(&format!("{ADDR}.")), "");

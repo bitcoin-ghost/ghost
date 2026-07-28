@@ -97,10 +97,12 @@ impl IsServer<'static> for Sv1Server {
         // A trailing `.d=<difficulty>` is stripped here so the rest of the checks — and the
         // payout address / worker attribution downstream — see the plain `<address>.<worker>`.
         let (name, username_difficulty) = super::split_username_difficulty(request.name.as_str());
-        if !name.contains('.') {
+        if let Err(rejection) = super::check_username_attributable(name) {
             warn!(
-                "Down: Rejecting mining.authorize from downstream {} — username '{}' has no '.' separator; expected `<bitcoin_address>.<worker_name>`",
-                downstream_id, name
+                "Down: Rejecting mining.authorize from downstream {} — username '{}' has a missing or empty {} half; expected `<bitcoin_address>.<worker_name>`. Shares from this username could not be attributed and would earn nothing (#479).",
+                downstream_id,
+                name,
+                rejection.half()
             );
             return false;
         }
