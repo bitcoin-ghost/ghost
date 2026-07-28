@@ -14586,21 +14586,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("bitcoin.conf");
         std::fs::write(&conf, "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n").unwrap();
-        // 40 is under any plausible memory ceiling, so this exercises the success path
-        // regardless of the host it runs on.
+        // 40 is under any plausible memory ceiling — but only a host that can MEASURE its
+        // memory accepts it unforced. macOS has no /proc/meminfo, so there the handler
+        // correctly refuses rather than claiming a value is survivable that it cannot check.
+        // Assert the real behaviour on each platform instead of assuming Linux: this test
+        // failed CI on macOS when it assumed.
+        let measurable = crate::maxconnections::mem_available_mb().is_some();
         let resp = super::apply_maxconnections_update(
             &conf,
             MaxConnectionsUpdate {
                 value: 40,
-                force: false,
+                force: !measurable,
             },
         );
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "40 is below any plausible ceiling and must be accepted (forced only where memory \
+             cannot be read)"
+        );
         assert_eq!(
             std::fs::read_to_string(&conf).unwrap(),
             "# ghostd\nserver=1\nmaxconnections=40\nrpcuser=x\n"
         );
+
+        // Where memory is unreadable, the same update WITHOUT force must be refused — else
+        // that branch would go silently untested on exactly the platform that exercises it.
+        if !measurable {
+            std::fs::write(&conf, "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n").unwrap();
+            let refused = super::apply_maxconnections_update(
+                &conf,
+                MaxConnectionsUpdate {
+                    value: 40,
+                    force: false,
+                },
+            );
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                std::fs::read_to_string(&conf).unwrap(),
+                "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n",
+                "a refused update must not have touched the file"
+            );
+        }
     }
 
     /// `/api/v1/mining/status` exposes this node's OWN SV2 authority public key,
