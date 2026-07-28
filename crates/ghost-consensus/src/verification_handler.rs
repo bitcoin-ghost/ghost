@@ -601,7 +601,7 @@ impl VerificationResultHandler {
         if let Some(ref peers) = self.peers {
             if peers.get_peer(&msg.challenger_id).is_none() {
                 // Peer not in memory — fall back to DB (nodes table persisted from health pings)
-                let challenger_hex = hex::encode(&msg.challenger_id);
+                let challenger_hex = hex::encode(msg.challenger_id);
                 let known_in_db = self.db.get_node(&challenger_hex).ok().flatten().is_some();
                 if !known_in_db {
                     warn!(
