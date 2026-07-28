@@ -435,9 +435,18 @@ async fn shroud_max_ms_surfaces_in_daemon_env() {
     child.kill().await.ok();
 }
 
-/// Auto-lock: with WRAITHD_IDLE_LOCK_SECS=2 the daemon should lock all
-/// unlocked wallets after ~2s of no user-facing IPC activity. Health and
+/// Auto-lock: with WRAITHD_IDLE_LOCK_SECS=10 the daemon should lock all
+/// unlocked wallets after ~10s of no user-facing IPC activity. Health and
 /// DaemonEnv should NOT count as activity (would defeat the feature).
+///
+/// The threshold was 2s, which made this flaky (#502). The idle timer starts at wallet
+/// CREATION, and creation runs a passphrase KDF — so on a loaded runner the KDF alone could
+/// outlast the window, and the very next call would find the wallet already locked. The test
+/// then failed on `fresh wallet must be unlocked`, i.e. it was asserting "under two seconds of
+/// wall-clock elapsed", which is not a property the daemon controls.
+///
+/// 10s is chosen so a KDF would have to be pathologically slow to reach it, while still
+/// keeping the test's own runtime bounded.
 #[tokio::test]
 async fn idle_lock_locks_wallets_after_threshold() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -447,7 +456,7 @@ async fn idle_lock_locks_wallets_after_threshold() {
     let mut child = Command::new(wraithd_binary())
         .env("WRAITHD_SOCKET", &socket)
         .env("WRAITHD_WALLETS_DIR", &wallets)
-        .env("WRAITHD_IDLE_LOCK_SECS", "2")
+        .env("WRAITHD_IDLE_LOCK_SECS", "10")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -492,9 +501,9 @@ async fn idle_lock_locks_wallets_after_threshold() {
     // Sleep past the idle threshold without sending any IPC traffic. Health
     // wouldn't have counted, but to keep the test deterministic we just wait.
     // Threshold = 2s, tick = min(30, 2/2) = 1s. 6s gives the auto-lock task
-    // ~4 chances to fire — generous slack for parallel-test CI hosts where
-    // the tokio scheduler doesn't always wake on the dot.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Must exceed the 10s threshold with slack, for parallel-test CI hosts where the tokio
+    // scheduler doesn't always wake on the dot.
+    tokio::time::sleep(Duration::from_secs(14)).await;
 
     // WalletList now: should show the wallet as locked. (The list call itself
     // re-bumps the timer, but the auto-lock has already happened.)
