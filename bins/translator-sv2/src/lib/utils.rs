@@ -171,7 +171,18 @@ impl AtomicAggregatedState {
             0 => AggregatedState::NoChannel,
             1 => AggregatedState::Pending,
             2 => AggregatedState::Connected,
-            v => panic!("Invalid UpstreamState value: {v}"),
+            // Unreachable unless something wrote this atomic directly: `set` only ever stores
+            // a discriminant. It used to `panic!`, which in the translator takes the process
+            // down and disconnects every miner on the node — a poor trade for an invariant
+            // violation we can survive. Report it loudly and fall back to the state that makes
+            // the caller re-establish rather than assume a channel it may not have.
+            v => {
+                tracing::error!(
+                    value = v,
+                    "UpstreamState holds an invalid discriminant; treating as NoChannel"
+                );
+                AggregatedState::NoChannel
+            }
         }
     }
 
@@ -198,5 +209,37 @@ mod tests {
         assert_eq!(proxy_extranonce_prefix_len(8, 4), 4);
         assert_eq!(proxy_extranonce_prefix_len(10, 6), 4);
         assert_eq!(proxy_extranonce_prefix_len(4, 4), 0);
+    }
+}
+
+#[cfg(test)]
+mod upstream_state_tests {
+    use super::*;
+
+    /// An invalid discriminant must be reported and survived, not fatal.
+    ///
+    /// This is unreachable through `set`, which only ever stores an enum discriminant — but it
+    /// used to `panic!`, and a panic here takes the translator down and disconnects every miner
+    /// on the node. Surviving an impossible state costs nothing; crashing on it costs the
+    /// whole node.
+    #[test]
+    fn an_invalid_discriminant_is_survived_rather_than_fatal() {
+        let s = AtomicAggregatedState::new(AggregatedState::NoChannel);
+        s.inner.store(200, Ordering::SeqCst);
+        assert_eq!(s.get(), AggregatedState::NoChannel);
+    }
+
+    /// And the ordinary values still round-trip.
+    #[test]
+    fn valid_states_round_trip() {
+        let s = AtomicAggregatedState::new(AggregatedState::NoChannel);
+        for st in [
+            AggregatedState::NoChannel,
+            AggregatedState::Pending,
+            AggregatedState::Connected,
+        ] {
+            s.set(st);
+            assert_eq!(s.get(), st);
+        }
     }
 }
