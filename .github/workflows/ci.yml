@@ -78,7 +78,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
       # L-01: Removed needless_borrows_for_generic_args and useless_vec allows
-      - run: cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -W clippy::all -A clippy::derivable_impls -A clippy::clone_on_copy -A clippy::match_like_matches_macro -A clippy::manual_flatten -A clippy::redundant_slicing -A clippy::skip_while_next
+      #
+      # BLOCKING as of #401: `-D warnings`, not `-W`. The workspace carries zero clippy
+      # warnings in its own code, so anything new is a regression introduced by the change
+      # under review — which is the only moment it is cheap to fix.
+      #
+      # The six `-A` entries are pre-existing style choices, not new exemptions.
+      #
+      # One warning remains and is deliberately NOT covered: cargo reports that
+      # proc-macro-error2 v2.0.1 contains code a future rustc will reject. It arrives via
+      # ghost-cli -> tabled 0.20 -> tabled_derive, 2.0.1 is the latest published version, and
+      # it is a cargo future-incompat NOTE rather than a rustc lint — so it does not fail this
+      # gate and cannot be fixed here. It needs tabled to drop the dependency upstream.
+      - run: cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A clippy::derivable_impls -A clippy::clone_on_copy -A clippy::match_like_matches_macro -A clippy::manual_flatten -A clippy::redundant_slicing -A clippy::skip_while_next
 
   # Unused-dependency gate: fails if a crate declares a dependency it does not use.
   # Pairs with the per-crate `#![deny(unreachable_pub)]` ratchet — together they stop
