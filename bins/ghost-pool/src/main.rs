@@ -3501,6 +3501,9 @@ async fn main() -> Result<()> {
                 // On-demand backfill: if we lag the anchor (a missed proposal left a
                 // hole the once-only broadcast can't recover), pull it from peers.
                 mgr.maybe_request_backfill(height);
+                // Alarm if that backfill isn't keeping up — a sustained gap means the
+                // fleet is not converging and miners are not being paid (#548).
+                mgr.check_convergence_stall(height);
             }
         });
     }

@@ -31,6 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use ghost_common::error::GhostResult;
@@ -85,20 +86,96 @@ const REL_TOL_NUM: u128 = 2; // 2%
 const REL_TOL_DEN: u128 = 100;
 const ABS_TOL: u128 = 1_000_000_000_000; // ~one share of WORK_SCALE-quantised work
 
+/// Convergence-stall thresholds, in blocks behind the anchor. Checkpointing normally
+/// finalises every block, so `WARN` is already well outside normal; a missed proposal
+/// plus one backfill cooldown accounts for a handful of blocks, not eighteen.
+const STALL_WARN_BLOCKS: u64 = 18;
+/// Past this there is no transient explanation left: payouts have stopped.
+const STALL_ERROR_BLOCKS: u64 = 60;
+/// Rate limit for the stall alarm — the cadence runs every 30s and the condition
+/// persists for as long as the stall does.
+const STALL_ALARM_COOLDOWN_MS: u64 = 600_000; // 10 minutes
+
+/// Why a voter refused a proposal. Exists so the reject log names the check that
+/// actually failed: a set-shape mismatch and a genuine work disagreement need opposite
+/// responses (converge the share set vs. widen the tolerance), and for weeks every one
+/// of them logged the same "outside tolerance" line. The 2026-07-25 stall was a miner
+/// COUNT mismatch — rejected before the tolerance loop was ever reached. See #548.
+#[derive(Debug, PartialEq, Eq)]
+enum Disagreement {
+    /// Node share-count vectors differ — the node set itself has not converged.
+    NodeSet { local: usize, proposed: usize },
+    /// Different number of paid addresses. Neither side's work values are at fault.
+    MinerCount { local: usize, proposed: usize },
+    /// The proposal pays an address we have no work for at all.
+    UnknownAddress { addr_hash: String },
+    /// Both sides pay this address, but the work differs by more than tolerance.
+    WorkOutsideTolerance {
+        addr_hash: String,
+        local: u128,
+        proposed: u128,
+        tol: u128,
+    },
+}
+
+/// Short, cross-node-comparable handle for a payout address. Payout addresses are
+/// stored encrypted per-node, so the ciphertext differs everywhere and cannot be
+/// grepped across logs; this hash is derived from the decrypted address and so is
+/// identical on every node. It also keeps the address↔miner linkage out of the log.
+fn addr_handle(addr: &str) -> String {
+    hex::encode(&Sha256::digest(addr.as_bytes())[..6])
+}
+
+impl std::fmt::Display for Disagreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NodeSet { local, proposed } => {
+                write!(
+                    f,
+                    "node set differs (local {local} entries, proposed {proposed})"
+                )
+            }
+            Self::MinerCount { local, proposed } => write!(
+                f,
+                "miner count differs (local {local} addresses, proposed {proposed}) \
+                 — share sets have not converged; tolerance was never consulted"
+            ),
+            Self::UnknownAddress { addr_hash } => {
+                write!(
+                    f,
+                    "proposal pays address {addr_hash} which we have no work for"
+                )
+            }
+            Self::WorkOutsideTolerance {
+                addr_hash,
+                local,
+                proposed,
+                tol,
+            } => write!(
+                f,
+                "address {addr_hash} work {local} vs {proposed} exceeds tolerance {tol}"
+            ),
+        }
+    }
+}
+
 /// Does the proposer's canonical payout agree with our own within tolerance?
 /// Node set: exact (it converges via payout-address gossip). Miner set: identical
-/// address keys, each address's work within tolerance.
+/// address keys, each address's work within tolerance. `Ok(())` means agree.
 fn payouts_agree(
     local: &CanonicalPayout,
     proposed_miners: &[(String, u128)],
     proposed_nodes: &[(NodeId, i32)],
-) -> bool {
+) -> Result<(), Disagreement> {
     let mut ln = local.node_shares.clone();
     ln.sort();
     let mut pn = proposed_nodes.to_vec();
     pn.sort();
     if ln != pn {
-        return false;
+        return Err(Disagreement::NodeSet {
+            local: ln.len(),
+            proposed: pn.len(),
+        });
     }
 
     let lm: HashMap<&str, u128> = local
@@ -107,20 +184,30 @@ fn payouts_agree(
         .map(|(a, w)| (a.as_str(), *w))
         .collect();
     if lm.len() != proposed_miners.len() {
-        return false;
+        return Err(Disagreement::MinerCount {
+            local: lm.len(),
+            proposed: proposed_miners.len(),
+        });
     }
     for (addr, pw) in proposed_miners {
         let pw = *pw;
         let Some(&lw) = lm.get(addr.as_str()) else {
-            return false; // address only in the proposal
+            return Err(Disagreement::UnknownAddress {
+                addr_hash: addr_handle(addr),
+            });
         };
         let diff = lw.max(pw) - lw.min(pw);
         let tol = (lw / REL_TOL_DEN * REL_TOL_NUM).max(ABS_TOL);
         if diff > tol {
-            return false;
+            return Err(Disagreement::WorkOutsideTolerance {
+                addr_hash: addr_handle(addr),
+                local: lw,
+                proposed: pw,
+                tol,
+            });
         }
     }
-    true
+    Ok(())
 }
 
 /// Optional diagnostic: `(cutoff_ts, height) -> human breakdown` of the root inputs
@@ -179,6 +266,9 @@ pub struct PayoutCheckpointManager {
     pending: RwLock<HashMap<u64, Pending>>,
     /// Client-side backfill cooldown: last time we broadcast a sync request (ms; 0 = never).
     last_sync_request: RwLock<u64>,
+    /// Convergence-stall alarm: last time we raised it (ms; 0 = never). Rate-limits an
+    /// otherwise every-30s error to [`STALL_ALARM_COOLDOWN_MS`].
+    last_stall_alarm: RwLock<u64>,
     /// Server-side per-peer serve cooldown: requesting node -> last time we served it (ms).
     sync_serves: RwLock<HashMap<NodeId, u64>>,
 }
@@ -231,6 +321,7 @@ impl PayoutCheckpointManager {
             active_voter_set: None,
             pending: RwLock::new(HashMap::new()),
             last_sync_request: RwLock::new(0),
+            last_stall_alarm: RwLock::new(0),
             sync_serves: RwLock::new(HashMap::new()),
         }
     }
@@ -449,7 +540,8 @@ impl PayoutCheckpointManager {
         };
         // Approve if the proposer's payout is within tolerance of ours (attribution +
         // float-order noise is same-operator cosmetic); a real misallocation exceeds it.
-        let approve = payouts_agree(&local, &msg.miner_payouts, &msg.node_shares);
+        let disagreement = payouts_agree(&local, &msg.miner_payouts, &msg.node_shares).err();
+        let approve = disagreement.is_none();
         info!(height = msg.height, approve, "payout checkpoint: vote");
         {
             let mut pending = self.pending.write();
@@ -460,13 +552,14 @@ impl PayoutCheckpointManager {
                 e.approvers.insert(self.identity.node_id());
             }
         }
-        if !approve {
+        if let Some(reason) = &disagreement {
             warn!(
                 height = msg.height,
                 local_root = %hex::encode(&local.root[..8]),
                 proposed_root = %hex::encode(&msg.ledger_root[..8]),
                 proposer = %hex::encode(&msg.proposer[..4]),
-                "payout checkpoint: payout outside tolerance — voting reject"
+                %reason,
+                "payout checkpoint: disagrees with proposal — voting reject"
             );
             self.log_diag("reject", msg.height, msg.cutoff_ts);
         }
@@ -578,6 +671,62 @@ impl PayoutCheckpointManager {
                 );
             }
             Err(e) => error!(height, error = %e, "payout checkpoint: persist failed"),
+        }
+    }
+
+    /// Convergence-stall alarm. Called on the propose cadence by EVERY node, proposer or
+    /// not, and deliberately separate from [`Self::maybe_request_backfill`] — that returns
+    /// early on its own cooldown, which would silence the alarm exactly when it matters.
+    ///
+    /// Payout checkpointing normally finalises every block, so any sustained gap between
+    /// our latest finalised checkpoint and the anchor means the fleet is not converging
+    /// and miners are not being paid. That state held for **four days** (2026-07-25 →
+    /// 2026-07-29, 557 blocks) without producing a single alarm: proposals were rejected,
+    /// each reject logged at `warn`, and nothing aggregated them into "payouts are
+    /// stopped". This is that aggregation. → #548.
+    ///
+    /// Escalates rather than fires once: `warn` past `STALL_WARN_BLOCKS` (a hole the
+    /// backfill is still plausibly chasing), `error` past `STALL_ERROR_BLOCKS` (no
+    /// transient explanation left — payouts have stopped).
+    pub fn check_convergence_stall(&self, target_height: u64) {
+        let latest = self
+            .db
+            .get_latest_payout_ledger_checkpoint()
+            .ok()
+            .flatten()
+            .map(|r| r.height)
+            .unwrap_or(0);
+        // `latest == 0` means "no checkpoint ever" — a fresh node, not a stall.
+        if latest == 0 || latest >= target_height.saturating_sub(STALL_WARN_BLOCKS) {
+            return;
+        }
+        let behind = target_height.saturating_sub(latest);
+
+        let now = now_ms();
+        {
+            let mut last = self.last_stall_alarm.write();
+            if now.saturating_sub(*last) < STALL_ALARM_COOLDOWN_MS {
+                return;
+            }
+            *last = now;
+        }
+
+        if behind >= STALL_ERROR_BLOCKS {
+            error!(
+                latest_finalized = latest,
+                anchor_height = target_height,
+                blocks_behind = behind,
+                "PAYOUT CONVERGENCE FAILED: no payout checkpoint has finalised for \
+                 {behind} blocks — miners are NOT being paid. Check the 'voting reject' \
+                 warnings for the disagreeing field."
+            );
+        } else {
+            warn!(
+                latest_finalized = latest,
+                anchor_height = target_height,
+                blocks_behind = behind,
+                "payout checkpoint: convergence lagging {behind} blocks behind the anchor"
+            );
         }
     }
 
@@ -745,10 +894,11 @@ impl PayoutCheckpointManager {
         let Some(local) = (self.compute_root)(entry.cutoff_ts, entry.height) else {
             return false; // cannot validate yet — skip; a later cadence retries
         };
-        if !payouts_agree(&local, &entry.miner_payouts, &entry.node_shares) {
+        if let Err(reason) = payouts_agree(&local, &entry.miner_payouts, &entry.node_shares) {
             warn!(
                 height = entry.height,
-                "payout checkpoint: synced checkpoint outside tolerance — rejected"
+                %reason,
+                "payout checkpoint: synced checkpoint disagrees with ours — rejected"
             );
             return false;
         }
@@ -867,6 +1017,76 @@ mod tests {
             node_shares,
             root,
         }
+    }
+
+    /// Each disagreement must be classified as ITS OWN cause, not funnelled into
+    /// "outside tolerance". Reporting a count mismatch as a tolerance breach is what
+    /// hid the four-day 2026-07-25 stall: the operator kept widening a tolerance that
+    /// the code never reached. → #548.
+    #[test]
+    fn disagreement_names_the_check_that_actually_failed() {
+        let local = cp(&[("addr_a", 1_000_000_000_000_000), ("addr_b", 500)]);
+
+        // Agreement.
+        assert_eq!(
+            payouts_agree(&local, &local.miner_payouts, &local.node_shares),
+            Ok(())
+        );
+
+        // A DIFFERENT NUMBER of addresses — the 2026-07-25 case. Must NOT be reported
+        // as a tolerance breach: tolerance is never consulted.
+        let fewer = [("addr_a".to_string(), 1_000_000_000_000_000u128)];
+        assert_eq!(
+            payouts_agree(&local, &fewer, &local.node_shares),
+            Err(Disagreement::MinerCount {
+                local: 2,
+                proposed: 1
+            })
+        );
+
+        // Same COUNT, but one address we have no work for at all.
+        let swapped = vec![
+            ("addr_a".to_string(), 1_000_000_000_000_000u128),
+            ("addr_z".to_string(), 500u128),
+        ];
+        assert!(matches!(
+            payouts_agree(&local, &swapped, &local.node_shares),
+            Err(Disagreement::UnknownAddress { .. })
+        ));
+
+        // Node set differs.
+        assert!(matches!(
+            payouts_agree(&local, &local.miner_payouts, &[([9u8; 32], 1)]),
+            Err(Disagreement::NodeSet { .. })
+        ));
+
+        // A genuine work disagreement — the only case that should read as tolerance.
+        // 10% apart on a value far above ABS_TOL, so the 2% relative bound governs.
+        let skewed = vec![
+            ("addr_a".to_string(), 1_100_000_000_000_000u128),
+            ("addr_b".to_string(), 500u128),
+        ];
+        assert!(matches!(
+            payouts_agree(&local, &skewed, &local.node_shares),
+            Err(Disagreement::WorkOutsideTolerance { .. })
+        ));
+
+        // ...and a small one stays inside it (ABS_TOL floor covers addr_b's 500).
+        let nudged = vec![
+            ("addr_a".to_string(), 1_000_000_000_000_001u128),
+            ("addr_b".to_string(), 600u128),
+        ];
+        assert_eq!(payouts_agree(&local, &nudged, &local.node_shares), Ok(()));
+    }
+
+    /// The address handle must be identical on every node for a given address —
+    /// that is the whole point of it (payout addresses are encrypted per-node, so
+    /// the stored form is not comparable across logs).
+    #[test]
+    fn addr_handle_is_stable_and_short() {
+        assert_eq!(addr_handle("bc1qexample"), addr_handle("bc1qexample"));
+        assert_ne!(addr_handle("bc1qexample"), addr_handle("bc1qexampl3"));
+        assert_eq!(addr_handle("bc1qexample").len(), 12);
     }
 
     /// Build `n` nodes; node at SORTED elder position `i` computes `payouts[i]` from its
