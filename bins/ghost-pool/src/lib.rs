@@ -118,6 +118,24 @@ pub const CLUSTER_ENFORCEMENT_HEIGHT: u64 = 955_200;
 /// differently from the proposer would reject an honest split.
 pub const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
 
+/// At and above this height, the payout-checkpoint work tolerance is floored by a
+/// fraction of TOTAL pool work rather than measured only against each address's own
+/// work, and a cap on the aggregate difference is enforced. See `payouts_agree`.
+///
+/// Gated for the same reason as the grouping height above: a voter using a different
+/// tolerance from its peers rejects proposals they accept, which is a fleet split. Both
+/// sides of a vote must switch at the same block.
+///
+/// Set to land near **14:00 BST on 2026-07-29** (operator's target): tip was 960_070 at
+/// 07:51 that morning, and the measured interval over the preceding 1440 blocks was 616 s,
+/// so 36 blocks ≈ 6h10m.
+///
+/// Block arrival is Poisson, so ±1σ over 36 blocks is about an hour either way — treat
+/// 14:00 as the centre of a ~12:00–16:00 window, not a deadline. **Every node must be
+/// running this build before it fires**; one still on the old rule rejects what its peers
+/// accept, which is a fleet split. Move the height out if the rollout slips past noon.
+pub const PAYOUT_TOLERANCE_V2_HEIGHT: u64 = 960_106;
+
 /// At and above this height, TX fees are FOLDED INTO THE COINBASE REWARD and split like the
 /// subsidy — 99% to miners (by share/work), and the 1% pool fee levied on `subsidy + fees` and
 /// divided between treasury and node pool by the decay schedule — instead of the whole fee going
