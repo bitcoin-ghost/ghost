@@ -175,30 +175,6 @@ jobs:
       # downloading a published release and watching it fail to start on an older
       # distro. Asserting it here means a runner-image bump cannot quietly raise
       # the requirement again (#540).
-      - name: Assert glibc floor (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          MAX_ALLOWED=2.35
-          worst=""
-          for bin in target/${{ matrix.target }}/release/*; do
-            [ -f "$bin" ] && [ -x "$bin" ] || continue
-            v=$(objdump -T "$bin" 2>/dev/null \
-                  | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' \
-                  | sort -V | tail -1)
-            [ -n "$v" ] || continue
-            echo "  $(basename "$bin"): needs glibc $v"
-            if [ -z "$worst" ] || [ "$(printf '%s\n%s\n' "$worst" "$v" | sort -V | tail -1)" = "$v" ]; then
-              worst="$v"
-            fi
-          done
-          echo "highest requirement: ${worst:-none}"
-          if [ -n "$worst" ] && \
-             [ "$(printf '%s\n%s\n' "$MAX_ALLOWED" "$worst" | sort -V | tail -1)" != "$MAX_ALLOWED" ]; then
-            echo "::error::release binaries require glibc $worst, above the $MAX_ALLOWED floor."
-            echo "::error::That excludes Ubuntu 22.04 (2.35) and Debian 12 (2.36). See #540."
-            exit 1
-          fi
-
       - name: Package
         shell: bash
         run: |
@@ -231,6 +207,91 @@ jobs:
             echo "No binaries found to package"
             exit 1
           fi
+
+      # The floor check MUST run here, after Package, and MUST read dist/.
+      #
+      # The previous version scanned target/<target>/release/*, which holds only the RUST
+      # binaries — ghostd is built by CMake to ghost-core/build/bin/ghostd and is staged into
+      # dist/ by the Package step ABOVE. So the guard never once inspected ghostd. It also
+      # grepped 'GLIBC_', which cannot match 'GLIBCXX_' (that is GLIBC + XX_), so libstdc++
+      # floors were invisible even for the binaries it did scan.
+      #
+      # Those compounded: the one binary with a libstdc++ problem was the one binary the guard
+      # could not see. v1.11.21 shipped as Latest and does not start on Ubuntu 22.04 — ghostd
+      # wants GLIBCXX_3.4.32, ghost-pool wants GLIBC_2.39, and only ghost-cli runs (#555).
+      - name: Assert glibc and libstdc++ floors (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_GLIBC=2.35        # Ubuntu 22.04
+          MAX_GLIBCXX=3.4.30    # Ubuntu 22.04 libstdc++6 (GCC 12)
+
+          command -v objdump >/dev/null || { echo "::error::objdump missing — cannot verify floors"; exit 1; }
+
+          inspected=0
+          fail=0
+          for bin in dist/*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            # Skip anything that is not an ELF executable (scripts, notes).
+            head -c 4 "$bin" | grep -q $'\x7fELF' || continue
+            inspected=$((inspected + 1))
+
+            syms=$(objdump -T "$bin" 2>/dev/null || true)
+            g=$(printf '%s' "$syms"  | grep -oE 'GLIBC_[0-9.]+'   | sed 's/GLIBC_//'   | sort -V | tail -1)
+            gx=$(printf '%s' "$syms" | grep -oE 'GLIBCXX_[0-9.]+' | sed 's/GLIBCXX_//' | sort -V | tail -1)
+            echo "  $(basename "$bin"): glibc=${g:-none} libstdc++=${gx:-none}"
+
+            if [ -n "$g" ] && [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$g" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+              echo "::error::$(basename "$bin") needs glibc $g, above the $MAX_GLIBC floor"
+              fail=1
+            fi
+            if [ -n "$gx" ] && [ "$(printf '%s\n%s\n' "$MAX_GLIBCXX" "$gx" | sort -V | tail -1)" != "$MAX_GLIBCXX" ]; then
+              echo "::error::$(basename "$bin") needs libstdc++ GLIBCXX_$gx, above the $MAX_GLIBCXX floor"
+              fail=1
+            fi
+          done
+
+          # A guard that inspected nothing must FAIL, not pass. The previous one skipped a
+          # binary whenever objdump produced no output and then evaluated an empty "worst",
+          # so a broken or missing objdump would have reported success having checked nothing.
+          if [ "$inspected" -eq 0 ]; then
+            echo "::error::floor guard inspected 0 binaries in dist/ — refusing to certify"
+            exit 1
+          fi
+          echo "inspected $inspected binaries"
+          [ "$fail" -eq 0 ] || exit 1
+
+      # Symbol scanning is what failed for v1.11.21, so prove it by RUNNING the packaged
+      # binaries on the oldest supported distro rather than trusting the scan alone.
+      - name: Smoke-test packaged binaries on Ubuntu 22.04
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/smoke.sh <<'SMOKE'
+          set -u
+          apt-get update -qq >/dev/null 2>&1
+          apt-get install -y -qq libsqlite3-0 libevent-2.1-7 libzmq5 >/dev/null 2>&1 || true
+          rc=0
+          for bin in /dist/*; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            head -c 4 "$bin" | grep -q $'\x7fELF' || continue
+            out=$("$bin" --version 2>&1 || true)
+            # Only a symbol-version failure is fatal here. A binary may exit non-zero for
+            # its own reasons (missing config, needs a subcommand) and that is not our concern.
+            if printf '%s' "$out" | grep -qE "version \`(GLIBC|GLIBCXX)_[0-9.]+' not found"; then
+              echo "::error::$(basename "$bin") does not run on Ubuntu 22.04:"
+              printf '%s\n' "$out" | head -5
+              rc=1
+            else
+              echo "  $(basename "$bin"): starts OK"
+            fi
+          done
+          exit $rc
+          SMOKE
+          docker run --rm -v "$PWD/dist:/dist:ro" -v /tmp/smoke.sh:/smoke.sh:ro \
+            ubuntu:22.04 bash /smoke.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
