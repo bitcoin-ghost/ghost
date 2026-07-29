@@ -239,12 +239,16 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
       - run: cargo check $WORKSPACE_EXCLUDES
 
-  # Coverage (optional, runs on main only)
+  # Coverage. Runs on main, and on demand via workflow_dispatch.
+  #
+  # Main-only meant this job could not be exercised before merge — so a change that made it
+  # hang was only discoverable after landing, which is exactly how #408 reached main and took
+  # a run to GitHub's 6h cap. `workflow_dispatch` makes it testable on a branch first.
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -266,12 +270,18 @@ jobs:
         # external infrastructure (a real bitcoin-core/ghostd node, a running
         # stratum server, a live cluster) that isn't available in CI — those
         # are exercised separately, not in the coverage gate.
+        #
+        # `integration_tests_sv2` is no longer excluded. It was dropped when its
+        # sniffer test hung for 5h38m under instrumentation; the cause was mock and
+        # sniffer listeners binding inside `tokio::spawn`, so a caller could dial an
+        # address nothing was listening on yet. Fixed in #536 — this re-enables the
+        # crate so the fix is actually exercised rather than assumed (#408).
         # Block scalar (`|`), not a plain one: a plain multi-line scalar is folded
         # onto a single line joined with a space, and YAML leaves the backslash
         # alone, so the shell sees `\ ` — an escaped space — and `--lib` arrives as
         # one token with a leading space rather than as a flag.
         run: |
-          cargo llvm-cov $WORKSPACE_EXCLUDES --exclude integration_tests_sv2 \
+          cargo llvm-cov $WORKSPACE_EXCLUDES \
             --lib --bins --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
