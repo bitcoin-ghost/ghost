@@ -71,6 +71,40 @@ jobs:
             libsqlite3-dev capnproto libcapnp-dev \
             build-essential cmake pkgconf python3 libevent-dev libboost-dev libzmq3-dev
 
+      # Cap'n Proto >= 1.0 from source (Linux only).
+      #
+      # 22.04's apt ships capnproto 0.8.0, and libmultiprocess REFUSES it — CVE-2022-46149. So the
+      # move to 22.04 in #541, which existed to stop the artifact demanding glibc 2.38, made the
+      # Linux build fail outright at CMake configure (#549).
+      #
+      # Building 1.0.2 here rather than passing -DENABLE_IPC=OFF is deliberate: ENABLE_IPC is left ON
+      # on purpose so the released binary matches the fleet's reference binary. Turning it off would
+      # quietly ship an artifact without multiprocess support because of an apt version, which is a
+      # change to what we distribute, not a build detail.
+      #
+      # The apt capnproto above is still installed and still wanted — the Rust SV2 stratum-core dep
+      # uses it, and 0.8.0 is fine for that. This install goes to /usr/local, which pkgconf and CMake
+      # both prefer, so only the C++ ghostd build picks up 1.0.2.
+      - name: Cap'n Proto >= 1.0 for ghostd IPC (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://capnproto.org/capnproto-c++-1.0.2.tar.gz -o capnproto.tar.gz
+          # Pinned digest, verified against the tarball actually published at capnproto.org. No
+          # fallback: an unverified download that builds anyway is worse than no check at all.
+          echo "9057dbc0223366b74bbeca33a05de164a229b0377927f1b7ef3828cdd8cb1d7e  capnproto.tar.gz" \
+            | sha256sum -c -
+          tar xzf capnproto.tar.gz
+          cd capnproto-c++-1.0.2
+          ./configure --prefix=/usr/local
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+          # Assert we actually got >= 1.0, so a silent fallback to apt's 0.8.0 cannot pass.
+          ver=$(PKG_CONFIG_PATH=/usr/local/lib/pkgconfig pkg-config --modversion capnp)
+          echo "capnp now $ver"
+          case "$ver" in 1.*|2.*) ;; *) echo "capnp is $ver, expected >= 1.0"; exit 1 ;; esac
+
       # Install system dependencies (macOS) — capnproto for the SV2 stratum-core dep
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
