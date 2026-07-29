@@ -86,6 +86,32 @@ const REL_TOL_NUM: u128 = 2; // 2%
 const REL_TOL_DEN: u128 = 100;
 const ABS_TOL: u128 = 1_000_000_000_000; // ~one share of WORK_SCALE-quantised work
 
+/// Tolerance floor as a fraction of TOTAL pool work, active at/above
+/// [`crate::PAYOUT_TOLERANCE_V2_HEIGHT`]. 0.2%.
+///
+/// The per-address bound above measures error against the wrong denominator. What
+/// matters is the error in the COINBASE, which is per-address error over *total* work —
+/// so a dust address gets a bound proportional to its (negligible) payout impact rather
+/// than to its own tiny work. On 2026-07-25 an address holding 0.02% of pool work sat
+/// 101% away from its peers' view and vetoed every payout for four days, while the
+/// address holding 90% of the pool agreed to within 0.55%. → #548.
+///
+/// This is a FLOOR, not a replacement: `max(2% of own, 0.2% of pool)`. For any address
+/// large enough to matter the 2% relative bound is far larger and still governs (2% of a
+/// 90%-of-pool address is 45× this floor), so the check is not loosened where it carries
+/// economic weight.
+const POOL_REL_TOL_NUM: u128 = 2;
+const POOL_REL_TOL_DEN: u128 = 1000;
+
+/// Cap on the SUM of per-address differences, as a fraction of total pool work (1%).
+///
+/// Needed because the floor above is per-address: without it, N addresses could each sit
+/// 0.2% of the pool away in the same direction and compound into a large coinbase error.
+/// Bounding the aggregate makes the worst-case total misallocation explicit regardless of
+/// how many addresses are in the ledger.
+const AGG_TOL_NUM: u128 = 1;
+const AGG_TOL_DEN: u128 = 100;
+
 /// Convergence-stall thresholds, in blocks behind the anchor. Checkpointing normally
 /// finalises every block, so `WARN` is already well outside normal; a missed proposal
 /// plus one backfill cooldown accounts for a handful of blocks, not eighteen.
@@ -99,8 +125,9 @@ const STALL_ALARM_COOLDOWN_MS: u64 = 600_000; // 10 minutes
 /// Why a voter refused a proposal. Exists so the reject log names the check that
 /// actually failed: a set-shape mismatch and a genuine work disagreement need opposite
 /// responses (converge the share set vs. widen the tolerance), and for weeks every one
-/// of them logged the same "outside tolerance" line. The 2026-07-25 stall was a miner
-/// COUNT mismatch — rejected before the tolerance loop was ever reached. See #548.
+/// of them logged the same "outside tolerance" line — so the 2026-07-25 stall was chased
+/// through three wrong hypotheses before the log could be made to say which check it was.
+/// See #548.
 #[derive(Debug, PartialEq, Eq)]
 enum Disagreement {
     /// Node share-count vectors differ — the node set itself has not converged.
@@ -116,6 +143,9 @@ enum Disagreement {
         proposed: u128,
         tol: u128,
     },
+    /// Every address passed individually, but the differences sum past the aggregate cap
+    /// — many small same-direction skews compounding into a real coinbase error.
+    AggregateOutsideTolerance { total_diff: u128, tol: u128 },
 }
 
 /// Short, cross-node-comparable handle for a payout address. Payout addresses are
@@ -155,6 +185,10 @@ impl std::fmt::Display for Disagreement {
                 f,
                 "address {addr_hash} work {local} vs {proposed} exceeds tolerance {tol}"
             ),
+            Self::AggregateOutsideTolerance { total_diff, tol } => write!(
+                f,
+                "per-address differences sum to {total_diff}, over the aggregate cap {tol}"
+            ),
         }
     }
 }
@@ -162,10 +196,17 @@ impl std::fmt::Display for Disagreement {
 /// Does the proposer's canonical payout agree with our own within tolerance?
 /// Node set: exact (it converges via payout-address gossip). Miner set: identical
 /// address keys, each address's work within tolerance. `Ok(())` means agree.
+///
+/// At/above [`crate::PAYOUT_TOLERANCE_V2_HEIGHT`] the per-address bound gains a floor of
+/// [`POOL_REL_TOL_NUM`]/[`POOL_REL_TOL_DEN`] of total pool work and the aggregate
+/// difference is capped — see those constants. Below it the original rule applies
+/// unchanged, so a node running this build votes identically to one that is not until
+/// the gate fires.
 fn payouts_agree(
     local: &CanonicalPayout,
     proposed_miners: &[(String, u128)],
     proposed_nodes: &[(NodeId, i32)],
+    height: u64,
 ) -> Result<(), Disagreement> {
     let mut ln = local.node_shares.clone();
     ln.sort();
@@ -189,6 +230,18 @@ fn payouts_agree(
             proposed: proposed_miners.len(),
         });
     }
+    // Total pool work from OUR view. Both sides compute their own; they agree to within
+    // the aggregate cap enforced below, so the resulting tolerances cannot diverge enough
+    // to make one node accept what another rejects by more than that bound.
+    let v2 = height >= crate::PAYOUT_TOLERANCE_V2_HEIGHT;
+    let total_work: u128 = local.miner_payouts.iter().map(|(_, w)| *w).sum();
+    let pool_floor = if v2 {
+        total_work / POOL_REL_TOL_DEN * POOL_REL_TOL_NUM
+    } else {
+        0
+    };
+
+    let mut agg_diff: u128 = 0;
     for (addr, pw) in proposed_miners {
         let pw = *pw;
         let Some(&lw) = lm.get(addr.as_str()) else {
@@ -197,13 +250,29 @@ fn payouts_agree(
             });
         };
         let diff = lw.max(pw) - lw.min(pw);
-        let tol = (lw / REL_TOL_DEN * REL_TOL_NUM).max(ABS_TOL);
+        agg_diff = agg_diff.saturating_add(diff);
+        let tol = (lw / REL_TOL_DEN * REL_TOL_NUM)
+            .max(ABS_TOL)
+            .max(pool_floor);
         if diff > tol {
             return Err(Disagreement::WorkOutsideTolerance {
                 addr_hash: addr_handle(addr),
                 local: lw,
                 proposed: pw,
                 tol,
+            });
+        }
+    }
+
+    // The per-address floor is per-address: without this, many addresses could each sit
+    // just inside it in the same direction and compound. Only meaningful under v2 — below
+    // the gate the floor is 0 and every address already passed a bound of its own.
+    if v2 {
+        let agg_tol = (total_work / AGG_TOL_DEN * AGG_TOL_NUM).max(ABS_TOL);
+        if agg_diff > agg_tol {
+            return Err(Disagreement::AggregateOutsideTolerance {
+                total_diff: agg_diff,
+                tol: agg_tol,
             });
         }
     }
@@ -540,7 +609,8 @@ impl PayoutCheckpointManager {
         };
         // Approve if the proposer's payout is within tolerance of ours (attribution +
         // float-order noise is same-operator cosmetic); a real misallocation exceeds it.
-        let disagreement = payouts_agree(&local, &msg.miner_payouts, &msg.node_shares).err();
+        let disagreement =
+            payouts_agree(&local, &msg.miner_payouts, &msg.node_shares, msg.height).err();
         let approve = disagreement.is_none();
         info!(height = msg.height, approve, "payout checkpoint: vote");
         {
@@ -894,7 +964,12 @@ impl PayoutCheckpointManager {
         let Some(local) = (self.compute_root)(entry.cutoff_ts, entry.height) else {
             return false; // cannot validate yet — skip; a later cadence retries
         };
-        if let Err(reason) = payouts_agree(&local, &entry.miner_payouts, &entry.node_shares) {
+        if let Err(reason) = payouts_agree(
+            &local,
+            &entry.miner_payouts,
+            &entry.node_shares,
+            entry.height,
+        ) {
             warn!(
                 height = entry.height,
                 %reason,
@@ -1020,16 +1095,16 @@ mod tests {
     }
 
     /// Each disagreement must be classified as ITS OWN cause, not funnelled into
-    /// "outside tolerance". Reporting a count mismatch as a tolerance breach is what
-    /// hid the four-day 2026-07-25 stall: the operator kept widening a tolerance that
-    /// the code never reached. → #548.
+    /// "outside tolerance" — three of the four causes are not about tolerance at all,
+    /// and the single shared message is what kept the four-day 2026-07-25 stall
+    /// pointed at the wrong constant. → #548.
     #[test]
     fn disagreement_names_the_check_that_actually_failed() {
         let local = cp(&[("addr_a", 1_000_000_000_000_000), ("addr_b", 500)]);
 
         // Agreement.
         assert_eq!(
-            payouts_agree(&local, &local.miner_payouts, &local.node_shares),
+            payouts_agree(&local, &local.miner_payouts, &local.node_shares, H),
             Ok(())
         );
 
@@ -1037,7 +1112,7 @@ mod tests {
         // as a tolerance breach: tolerance is never consulted.
         let fewer = [("addr_a".to_string(), 1_000_000_000_000_000u128)];
         assert_eq!(
-            payouts_agree(&local, &fewer, &local.node_shares),
+            payouts_agree(&local, &fewer, &local.node_shares, H),
             Err(Disagreement::MinerCount {
                 local: 2,
                 proposed: 1
@@ -1050,13 +1125,13 @@ mod tests {
             ("addr_z".to_string(), 500u128),
         ];
         assert!(matches!(
-            payouts_agree(&local, &swapped, &local.node_shares),
+            payouts_agree(&local, &swapped, &local.node_shares, H),
             Err(Disagreement::UnknownAddress { .. })
         ));
 
         // Node set differs.
         assert!(matches!(
-            payouts_agree(&local, &local.miner_payouts, &[([9u8; 32], 1)]),
+            payouts_agree(&local, &local.miner_payouts, &[([9u8; 32], 1)], H),
             Err(Disagreement::NodeSet { .. })
         ));
 
@@ -1067,7 +1142,7 @@ mod tests {
             ("addr_b".to_string(), 500u128),
         ];
         assert!(matches!(
-            payouts_agree(&local, &skewed, &local.node_shares),
+            payouts_agree(&local, &skewed, &local.node_shares, H),
             Err(Disagreement::WorkOutsideTolerance { .. })
         ));
 
@@ -1076,7 +1151,105 @@ mod tests {
             ("addr_a".to_string(), 1_000_000_000_000_001u128),
             ("addr_b".to_string(), 600u128),
         ];
-        assert_eq!(payouts_agree(&local, &nudged, &local.node_shares), Ok(()));
+        assert_eq!(
+            payouts_agree(&local, &nudged, &local.node_shares, H),
+            Ok(())
+        );
+    }
+
+    /// The v2 tolerance, exercised on the ACTUAL fleet numbers that produced the
+    /// four-day stall (`/api/v1/pool/next_payout`, height 960070, work in raw units):
+    ///
+    /// | address       | min          | max          | apart   |
+    /// |---------------|--------------|--------------|---------|
+    /// | `bc1qm3…7s3h` | 9,705,821    | 19,521,705   | 101.13% |
+    /// | `bc1q9z…q0ej` | 2,412,193,347| 2,490,033,067|   3.23% |
+    /// | `bc1qhf…nre2` | 1,858,741,826| 1,879,203,185|   1.10% |
+    /// | `bc1q7z…y492` | 47,951,398,285| 48,216,728,458|  0.55% |
+    ///
+    /// Pre-gate the first two reject and payouts stop. Post-gate all four pass, because
+    /// the bound now tracks coinbase impact: the 101% row moves 0.019% of the pool.
+    #[test]
+    fn v2_floor_stops_a_dust_address_vetoing_the_fleet() {
+        // ABS_TOL (1e12) dwarfs these raw values, so scale up to where the RELATIVE
+        // bounds actually govern — the regime the live pool is in.
+        const S: u128 = 1_000_000;
+        let local = cp(&[
+            ("bc1qm3", 9_705_821 * S),
+            ("bc1q9z", 2_412_193_347 * S),
+            ("bc1qhf", 1_858_741_826 * S),
+            ("bc1q7z", 47_951_398_285 * S),
+        ]);
+        let proposed = vec![
+            ("bc1qm3".to_string(), 19_521_705 * S),
+            ("bc1q9z".to_string(), 2_490_033_067 * S),
+            ("bc1qhf".to_string(), 1_879_203_185 * S),
+            ("bc1q7z".to_string(), 48_216_728_458 * S),
+        ];
+
+        // Pre-gate: the DUST address is what rejects — not the one holding 90% of
+        // the pool, which is 0.55% off and passes. This is the live bug.
+        let pre = payouts_agree(&local, &proposed, &local.node_shares, H);
+        match pre {
+            Err(Disagreement::WorkOutsideTolerance { ref addr_hash, .. }) => {
+                assert_eq!(*addr_hash, addr_handle("bc1qm3"));
+            }
+            other => panic!("expected the dust address to veto pre-gate, got {other:?}"),
+        }
+
+        // Post-gate: every row passes, and the aggregate stays under its cap.
+        assert_eq!(
+            payouts_agree(
+                &local,
+                &proposed,
+                &local.node_shares,
+                crate::PAYOUT_TOLERANCE_V2_HEIGHT
+            ),
+            Ok(())
+        );
+    }
+
+    /// The v2 floor must not become a licence to misallocate: an address moved by far
+    /// more than the floor still rejects, and many small same-direction skews that each
+    /// clear the floor individually are caught by the aggregate cap.
+    #[test]
+    fn v2_still_rejects_real_misallocation() {
+        const S: u128 = 1_000_000;
+        const GATE: u64 = crate::PAYOUT_TOLERANCE_V2_HEIGHT;
+
+        // Single large misallocation: total 100e6*S, so the 0.2% floor is 200_000*S,
+        // but 2% of `a` (1_000_000*S) governs. Move `a` by 5% of itself.
+        let local = cp(&[
+            ("a", 50_000_000 * S),
+            ("b", 25_000_000 * S),
+            ("c", 25_000_000 * S),
+        ]);
+        let robbed = vec![
+            ("a".to_string(), 47_500_000 * S),
+            ("b".to_string(), 25_000_000 * S),
+            ("c".to_string(), 25_000_000 * S),
+        ];
+        assert!(matches!(
+            payouts_agree(&local, &robbed, &local.node_shares, GATE),
+            Err(Disagreement::WorkOutsideTolerance { .. })
+        ));
+
+        // Death by a thousand cuts: 40 dust addresses each moved just INSIDE the
+        // 0.2%-of-pool floor, all in the same direction. Every one passes its own
+        // bound; together they shift ~8% of the pool. Only the aggregate cap sees it.
+        let names: Vec<String> = (0..40).map(|i| format!("x{i}")).collect();
+        let mut rows: Vec<(&str, u128)> = names.iter().map(|n| (n.as_str(), 100 * S)).collect();
+        rows.push(("big", 100_000_000 * S));
+        let local2 = cp(&rows);
+
+        let floor = (100_000_000 * S + 4_000 * S) / POOL_REL_TOL_DEN * POOL_REL_TOL_NUM;
+        let mut skewed: Vec<(String, u128)> =
+            names.iter().map(|n| (n.clone(), 100 * S + floor)).collect();
+        skewed.push(("big".to_string(), 100_000_000 * S));
+        assert!(matches!(
+            payouts_agree(&local2, &skewed, &local2.node_shares, GATE),
+            Err(Disagreement::AggregateOutsideTolerance { .. })
+        ));
     }
 
     /// The address handle must be identical on every node for a given address —
