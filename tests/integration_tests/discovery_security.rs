@@ -18,8 +18,8 @@ fn make_node_id(discriminator: u8) -> [u8; 32] {
     let mut id = [0u8; 32];
     id[0] = discriminator;
     // Fill remaining bytes for uniqueness
-    for i in 1..32 {
-        id[i] = discriminator.wrapping_add(i as u8);
+    for (i, byte) in id.iter_mut().enumerate().skip(1) {
+        *byte = discriminator.wrapping_add(i as u8);
     }
     id
 }

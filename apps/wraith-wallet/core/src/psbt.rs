@@ -818,11 +818,9 @@ pub fn bump_fee(
     let n_inputs = unsigned.input.len() as u64;
     let n_outputs = unsigned.output.len() as u64;
     let est_vbytes = 11 + n_inputs * 58 + n_outputs * 31;
-    let old_rate = if let Some(r) = old_fee.checked_div(est_vbytes) {
-        r
-    } else {
-        0
-    };
+    // est_vbytes is a sum of positive terms so it cannot be zero, but divide defensively:
+    // a zero here would panic rather than merely mis-price the bump.
+    let old_rate = old_fee.checked_div(est_vbytes).unwrap_or_default();
     if new_fee_rate_sats_per_vb <= old_rate {
         return Err(BumpError::NotIncreasing {
             new_rate: new_fee_rate_sats_per_vb,

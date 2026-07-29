@@ -105,7 +105,7 @@ mod transaction_tests {
         assert!(result.is_ok());
         let tx = result.unwrap();
         assert_eq!(tx.inputs.len(), 1);
-        assert!(tx.outputs.len() >= 1);
+        assert!(!tx.outputs.is_empty());
     }
 }
 

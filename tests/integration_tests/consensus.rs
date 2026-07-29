@@ -421,7 +421,7 @@ fn test_elder_priority() {
         .collect();
 
     // Sort by tenure (descending) and mark top 5 as elders
-    nodes.sort_by(|a, b| b.tenure_days.cmp(&a.tenure_days));
+    nodes.sort_by_key(|n| std::cmp::Reverse(n.tenure_days));
     for node in nodes.iter_mut().take(5) {
         node.is_elder = true;
     }

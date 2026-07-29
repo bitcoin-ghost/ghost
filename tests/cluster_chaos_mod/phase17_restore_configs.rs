@@ -6,6 +6,9 @@
 
 use std::time::Duration;
 
+/// One config setting to restore: (file, key, value).
+type ConfigSetting = (&'static str, &'static str, &'static str);
+
 use super::client::ClusterClient;
 use super::config::ClusterConfig;
 use super::ssh::SshController;
@@ -47,7 +50,7 @@ async fn restore_01_restore_all_configs() {
     // If a backup exists, restore from it. Otherwise, force-patch the expected
     // original values — the backup may have been lost due to SSH timeouts in a
     // prior run, leaving the config in a modified state.
-    let original_values: &[(&str, &[(&str, &str, &str)])] = &[
+    let original_values: &[(&str, &[ConfigSetting])] = &[
         (
             "VM2",
             &[
