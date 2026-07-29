@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 47;
+const SCHEMA_VERSION: u32 = 48;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -124,6 +124,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (45, migrate_v45),
         (46, migrate_v46),
         (47, migrate_v47),
+        (48, migrate_v48),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2279,6 +2280,65 @@ fn migrate_v47(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v48: covering index for the unpaid-ledger scan (#554, #556).
+///
+/// `get_top_unpaid_addresses` is the hot query in the whole system — `compute_root` runs it on
+/// every payout-checkpoint propose AND every vote, on a 30 s cadence. It aggregates every unpaid
+/// share, and with payouts stalled since 2026-07-25 that is 2.66M rows reaching back to 06-02.
+///
+/// The existing `idx_shares_unpaid` covers only `(miner_id)`, so the planner walked the index and
+/// then did a **random row fetch per entry** to read `timestamp`, `valid` and `work`. That is 2.66M
+/// scattered reads against a 1.4 GB table, which only works while the table is in page cache.
+///
+/// Measured on vm5 (4 GB RAM, 2.5 GB database — i.e. it does NOT fit):
+///
+/// ```text
+///   before: 55.57 s wall,  3.42 s user   <- 52 s of pure I/O wait
+///   after:   4.04 s wall,  1.92 s user   <- 13.8x faster
+/// ```
+///
+/// The query runs every 30 s and took 55 s, so vm5 could never keep up: calls overlapped, the
+/// process read 4.35 TB from a 2.6 GB database in 15 h, and one tokio worker sat pinned in
+/// uninterruptible disk wait while `/health` timed out. After the index, `/health` on vm5 went
+/// from a 45 s timeout to 1.9 ms.
+///
+/// The index is ~126 MB against a ~1.4 GB table, so the scan's working set now fits in RAM on a
+/// 4 GB node, which is the whole point.
+///
+/// This was applied by hand to all eight nodes on 2026-07-29 to clear the live outage; this
+/// migration is what makes it survive a reinstall or a fresh node. `IF NOT EXISTS` means it is a
+/// no-op on those nodes.
+///
+/// NOTE this does not fix the underlying design: the query is still O(unpaid shares) and still
+/// costs ~2-4 s of CPU per call. Bounding that needs either memoisation by `(cutoff_ts, height)`
+/// or a maintained per-miner totals table — see #554.
+fn migrate_v48(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v48: covering index for the unpaid-ledger scan");
+
+    // Same guard as v41: a real pool DB always has `shares` (v1), but partial-schema
+    // fixtures do not, and a ledger-less database has no scan to accelerate.
+    let has_shares: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shares'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_shares {
+        debug!("v48: no `shares` table — nothing to index");
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_shares_unpaid_cover
+             ON shares(miner_id, timestamp, valid, work)
+             WHERE paid_in_proposal_hash IS NULL;",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v48: created idx_shares_unpaid_cover");
+    Ok(())
+}
+
 /// v41: rewrite legacy locally-received shares into canonical INTERNAL byte order.
 ///
 /// The SV1/SV2 layer reports `share_hash` in big-endian DISPLAY order (PoW zeros at the front).
@@ -2361,7 +2421,10 @@ mod tests {
     fn v47_creates_the_checkpoint_table_and_tolerates_an_existing_one() {
         let conn = Connection::open_in_memory().expect("conn");
         run_migrations(&conn).expect("migrate");
-        assert_eq!(get_schema_version(&conn).unwrap(), 47);
+        // Bind to the constant, not a literal: this test is about v47's table being
+        // idempotent, so pinning the version number here just breaks it on every
+        // subsequent migration (it did, on v48).
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
         let sql: String = conn
             .query_row(
@@ -2388,6 +2451,45 @@ mod tests {
 
         // Running it again against the existing table must not error.
         migrate_v47(&conn).expect("v47 must be idempotent");
+    }
+
+    /// The v48 index is only worth its ~126 MB if the planner actually chooses it for the
+    /// unpaid-ledger aggregate. Assert the plan, not just that the index exists — an index
+    /// the optimiser ignores is pure cost, and this one exists to stop a 55 s query.
+    #[test]
+    fn v48_covering_index_is_used_by_the_unpaid_ledger_scan() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+
+        let plan: String = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT s.miner_id, SUM(CAST(ROUND(s.work * 1000000) AS INTEGER)), m.payout_address
+                 FROM shares s INNER JOIN miners m ON m.miner_id = s.miner_id
+                 WHERE s.paid_in_proposal_hash IS NULL AND s.timestamp <= 1 AND s.valid = 1
+                 GROUP BY s.miner_id",
+            )
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(3))
+            .expect("plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows")
+            .join(" | ");
+
+        assert!(
+            plan.contains("idx_shares_unpaid_cover"),
+            "planner did not choose the covering index; plan was: {plan}"
+        );
+    }
+
+    /// Re-running v48 must be a no-op — it was applied by hand to all eight nodes before this
+    /// migration existed, so every one of them runs it against an index that is already there.
+    #[test]
+    fn v48_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+        migrate_v48(&conn).expect("v48 must be idempotent");
+        migrate_v48(&conn).expect("v48 must be idempotent twice");
     }
 
     /// A database from a NEWER build must be left alone, and must not be mistaken for one
