@@ -270,17 +270,20 @@ pub async fn post(
             .unwrap_or_default();
         let mut entropy = [0u8; 32];
         getrandom::getrandom(&mut entropy).expect("OS CSPRNG failed during round assembly");
+        let round_ctx = crate::assembly::RoundContext {
+            session_id: &session_id,
+            tier: session.tier,
+            session_type: session.session_type,
+            network: state.network,
+            coordinator_fee_address: state.coordinator_fee_address.as_deref(),
+            inputs: &inputs_snapshot,
+            outputs: &outputs_snapshot,
+            entropy: &entropy,
+        };
         match try_assemble_if_ready(
-            &session_id,
-            session.tier,
-            session.session_type,
+            round_ctx,
             session.state.clone(),
-            state.network,
-            state.coordinator_fee_address.as_deref(),
-            &inputs_snapshot,
-            &outputs_snapshot,
             enrolled_count as usize,
-            &entropy,
             now,
         ) {
             Some(Ok(assembled)) => {

@@ -467,6 +467,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
             if let Some(ref mut upstream_channel) = channel_manager_data.upstream_channel {
                 _ = upstream_channel.on_chain_tip_update(msg.clone().into());
 
+                // clippy::unnecessary_unwrap wants the `is_some()` checks folded into `if let`.
+                // Do not: the token must only be popped when BOTH are present. Moving the
+                // binding inside would pop and mark `token_consumed` before checking
+                // `job_factory`, leaking an allocation token whenever the factory is absent.
+                // Edition 2021 has no let-chains, and taking `job_factory.as_mut()` first
+                // borrows `channel_manager_data` for the `allocate_tokens.pop_front()` below.
+                // The two `expect`s are guarded on the line above and cannot fire.
+                #[allow(clippy::unnecessary_unwrap)]
                 if get_jd_mode() == JdMode::CoinbaseOnly
                     && channel_manager_data.job_factory.is_some()
                     && future_template.is_some()

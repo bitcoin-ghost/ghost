@@ -149,7 +149,6 @@ fn detect_ram_mb() -> u64 {
             for line in contents.lines() {
                 if let Some(rest) = line.strip_prefix("MemTotal:") {
                     let kb: u64 = rest
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|s| s.parse().ok())
@@ -178,7 +177,7 @@ fn detect_fd_limit() -> u64 {
     };
     let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
     if rc == 0 && rlim.rlim_cur > 0 {
-        rlim.rlim_cur as u64
+        rlim.rlim_cur
     } else {
         FALLBACK_FD_LIMIT
     }

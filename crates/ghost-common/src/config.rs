@@ -2819,9 +2819,12 @@ mod tests {
         .unwrap();
         assert!(core.enabled);
 
-        let mut config = NodeConfig::default();
-        config.ghost_pay = Some(pool_only);
+        let mut config = NodeConfig {
+            ghost_pay: Some(pool_only),
+            ..Default::default()
+        };
         assert!(!config.ghost_pay_enabled());
+        // The reassignment is the test: same node, block swapped for an enabled one.
         config.ghost_pay = Some(core);
         assert!(config.ghost_pay_enabled());
     }

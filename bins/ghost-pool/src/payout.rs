@@ -201,7 +201,7 @@ pub fn compute_ledger_root(
     let mut m = miners.to_vec();
     m.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut n = nodes.to_vec();
-    n.sort_by(|a, b| a.0.cmp(&b.0));
+    n.sort_by_key(|x| x.0);
 
     let mut h = Sha256::new();
     h.update(LEDGER_ROOT_DOMAIN);
@@ -250,7 +250,7 @@ pub fn ledger_root_diag(
     let mdig = mh.finalize();
 
     let mut n = nodes.to_vec();
-    n.sort_by(|a, b| a.0.cmp(&b.0));
+    n.sort_by_key(|x| x.0);
     let mut nh = Sha256::new();
     for (node_id, shares) in &n {
         nh.update(&node_id[..]);
@@ -310,6 +310,10 @@ pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> O
     }
 }
 
+/// The two halves of an adopted payout split: miner payouts as `(address, work)` and node
+/// shares as `(node_id, share_count)` — the same pair `compute_ledger_root` hashes.
+pub type AdoptedPayout = (Vec<(String, u128)>, Vec<(NodeId, i32)>);
+
 /// Option (c) adopt-CONSUMPTION: the BFT-finalised checkpoint's ADOPTED payout lists at
 /// or before `tip_height` — `(miner_payouts: (address, WORK_SCALE-quantised work),
 /// node_shares: (node_id, 5-4-3-2-1 shares))`.
@@ -325,10 +329,7 @@ pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> O
 /// `None` when no checkpoint has finalised at or before `tip_height` (the brief window at
 /// first activation) — the caller then builds NO split (treasury-only fallback, safe:
 /// there is nothing for validators to disagree on).
-pub fn read_adopted_payout(
-    db: &ghost_storage::Database,
-    tip_height: u64,
-) -> Option<(Vec<(String, u128)>, Vec<(NodeId, i32)>)> {
+pub fn read_adopted_payout(db: &ghost_storage::Database, tip_height: u64) -> Option<AdoptedPayout> {
     match db.get_payout_ledger_checkpoint_at_or_before(tip_height) {
         Ok(Some(cp)) => Some((cp.miner_payouts, cp.node_shares)),
         Ok(None) => None,
@@ -1460,7 +1461,7 @@ impl PayoutProposalCreator {
 
         // Sort by work descending, take top N (using scaled integer comparison)
         let mut sorted = scaled_work;
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
         sorted.truncate(self.config.max_miner_outputs);
 
         // Recalculate total work for top miners
@@ -3963,9 +3964,8 @@ mod tests {
 
         // One whale miner with 99% of work, 99 tiny miners with 1% total
         let mut miner_work: Vec<u128> = vec![99_000u128]; // whale
-        for _ in 0..99 {
-            miner_work.push(10u128); // tiny miners: 10 each = 990 total
-        }
+                                                          // tiny miners: 10 each = 990 total
+        miner_work.extend(std::iter::repeat_n(10u128, 99));
         let total_work: u128 = miner_work.iter().sum();
         assert_eq!(total_work, 99_990);
 

@@ -330,7 +330,7 @@ impl fmt::Display for GhostId {
                 // of exposing internal error details. This ensures Display never
                 // panics and always produces a usable (if degraded) representation.
                 let bytes = self.to_bytes();
-                write!(f, "ghost-invalid:{}", &hex::encode(&bytes[..16]))
+                write!(f, "ghost-invalid:{}", hex::encode(&bytes[..16]))
             }
         }
     }

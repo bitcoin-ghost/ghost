@@ -61,16 +61,37 @@ pub type AssembledRoundStore = Mutex<HashMap<String, AssembledRound>>;
 /// Build the assembled round from an arrival-order pairing of inputs
 /// and outputs. Pure function over the data — no shared state — so
 /// it's trivial to unit-test.
-pub fn assemble_round(
-    session_id: &str,
-    tier: wraith_protocol::LiteTier,
-    session_type: SessionType,
-    network: Network,
-    coordinator_fee_address: Option<&str>,
-    inputs: &[AcceptedInputs],
-    outputs: &[AcceptedOutput],
-    entropy: &[u8; 32],
-) -> Result<AssembledRound, AssembleError> {
+/// What a round needs to be assembled.
+///
+/// A struct rather than eight-then-eleven positional parameters. The list is mostly borrowed
+/// slices and newtypes that do not distinguish themselves at a call site — `inputs` and
+/// `outputs` are both `&[Accepted...]`, and `session_id` sits next to two enums — so the
+/// positional form is easy to get subtly wrong and impossible to read back.
+///
+/// `try_assemble_if_ready` takes the same context plus the readiness inputs, so both share this.
+#[derive(Clone, Copy)]
+pub struct RoundContext<'a> {
+    pub session_id: &'a str,
+    pub tier: wraith_protocol::LiteTier,
+    pub session_type: SessionType,
+    pub network: Network,
+    pub coordinator_fee_address: Option<&'a str>,
+    pub inputs: &'a [AcceptedInputs],
+    pub outputs: &'a [AcceptedOutput],
+    pub entropy: &'a [u8; 32],
+}
+
+pub fn assemble_round(ctx: RoundContext<'_>) -> Result<AssembledRound, AssembleError> {
+    let RoundContext {
+        session_id,
+        tier,
+        session_type,
+        network,
+        coordinator_fee_address,
+        inputs,
+        outputs,
+        entropy,
+    } = ctx;
     if inputs.len() != outputs.len() {
         return Err(AssembleError::CountMismatch {
             inputs: inputs.len(),
@@ -183,35 +204,20 @@ impl AssembleError {
 /// Returns `Some(Result<assembled, error>)` if assembly was attempted
 /// (success or failure), `None` if not yet ready.
 pub fn try_assemble_if_ready(
-    session_id: &str,
-    tier: wraith_protocol::LiteTier,
-    session_type: SessionType,
+    ctx: RoundContext<'_>,
     state: LiteSessionState,
-    network: Network,
-    coordinator_fee_address: Option<&str>,
-    inputs: &[AcceptedInputs],
-    outputs: &[AcceptedOutput],
     enrolled_count: usize,
-    entropy: &[u8; 32],
     now: u64,
 ) -> Option<Result<AssembledRound, AssembleError>> {
+    let session_id = ctx.session_id;
+    let (inputs, outputs) = (ctx.inputs, ctx.outputs);
     if !matches!(state, LiteSessionState::Signing) {
         return None;
     }
     if inputs.len() != enrolled_count || outputs.len() != enrolled_count {
         return None;
     }
-    let result = assemble_round(
-        session_id,
-        tier,
-        session_type,
-        network,
-        coordinator_fee_address,
-        inputs,
-        outputs,
-        entropy,
-    )
-    .map(|mut a| {
+    let result = assemble_round(ctx).map(|mut a| {
         a.assembled_at = now;
         a
     });

@@ -46,7 +46,7 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 });
             }
 
-            for (_channel_id, standard_channel) in dd.standard_channels.iter() {
+            for standard_channel in dd.standard_channels.values() {
                 let channel_id = standard_channel.get_channel_id();
                 let target = standard_channel.get_target();
                 let requested_max_target = standard_channel.get_requested_max_target();

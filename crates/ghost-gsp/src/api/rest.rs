@@ -367,11 +367,8 @@ pub async fn admin_inject_candidate_tx(
         block_height: req.block_height,
     };
 
-    let n = match state.silent_payments_tx.send(msg) {
-        Ok(n) => n,
-        // No subscribers yet — that's fine, just nobody to notify.
-        Err(_) => 0,
-    };
+    // No subscribers yet is fine — nobody to notify, so zero.
+    let n = state.silent_payments_tx.send(msg).unwrap_or_default();
     info!(subscribers = n, "admin: candidate-tx injected");
     Json(InjectCandidateTxResponse {
         success: true,

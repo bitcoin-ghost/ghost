@@ -118,16 +118,13 @@ fn test_930_deeply_nested_json_rejected() {
     let ok_json = "{\"a\":".repeat(MAX_JSON_DEPTH) + "1" + &"}".repeat(MAX_JSON_DEPTH);
     let ok_data = ok_json.as_bytes();
     let result = validate_and_verify(ok_data);
-    match result {
-        Err(MessageValidationError::ExcessiveNesting(_)) => {
-            panic!(
-                "{}-level nesting should NOT trigger ExcessiveNesting",
-                MAX_JSON_DEPTH
-            );
-        }
-        // Any other error (TooSmall, DeserializationFailed, etc.) is acceptable
-        // -- we only care that the depth check itself passes.
-        _ => {}
+    // Any other error (TooSmall, DeserializationFailed, etc.) is acceptable — we only care
+    // that the depth check itself passes.
+    if let Err(MessageValidationError::ExcessiveNesting(_)) = result {
+        panic!(
+            "{}-level nesting should NOT trigger ExcessiveNesting",
+            MAX_JSON_DEPTH
+        );
     }
 }
 

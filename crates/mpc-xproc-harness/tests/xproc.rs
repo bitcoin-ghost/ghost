@@ -353,8 +353,8 @@ fn cross_process_contribution_flow() {
 
         // ---- (2) VOTERS (separate processes) FETCH by hash + real verify ------
         let mut approvals = 0u32;
-        for v in 1..COMMITTEE {
-            let r = nodes[v].send(json!({
+        for node in nodes.iter_mut().take(COMMITTEE).skip(1) {
+            let r = node.send(json!({
                 "cmd": "fetch_verify",
                 "url": contributor_url,
                 "new_hash": new_hash,
@@ -378,7 +378,7 @@ fn cross_process_contribution_flow() {
             approvals += 1;
             println!(
                 "  [{}] fetched {} bytes via ?new_hash=, verify_ok=true",
-                nodes[v].name, r["size"]
+                node.name, r["size"]
             );
         }
         // The contributor holds valid params it generated -> counts as an approval.

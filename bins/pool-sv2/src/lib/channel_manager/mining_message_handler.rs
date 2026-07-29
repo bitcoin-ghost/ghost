@@ -453,7 +453,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 }
                                 e => {
                                     error!("error in handle_open_extended_mining_channel: {:?}", e);
-                                    return Err(PoolError::disconnect(e, downstream_id).into());
+                                    return Err(PoolError::disconnect(e, downstream_id));
                                 }
                             },
                         };
@@ -765,7 +765,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         messages.push((downstream_id, Mining::SubmitSharesError(error)).into());
                     }
                     Err(e) => {
-                        return Err(PoolError::disconnect(e, downstream_id).into());
+                        return Err(PoolError::disconnect(e, downstream_id));
                     }
                 }
 
@@ -1045,7 +1045,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         messages.push((downstream_id, Mining::SubmitSharesError(error)).into());
                     }
                     Err(e) => {
-                        return Err(PoolError::disconnect(e, downstream_id).into());
+                        return Err(PoolError::disconnect(e, downstream_id));
                     }
                 }
 

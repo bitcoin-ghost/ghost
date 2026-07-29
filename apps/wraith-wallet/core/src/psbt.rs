@@ -585,7 +585,7 @@ pub fn create_psbt(
     // as few inputs as possible — keeps fee predictable and avoids
     // slicing tiny coins for big sends.
     let mut sorted: Vec<&AvailableUtxo> = available.iter().collect();
-    sorted.sort_by(|a, b| b.value_sats.cmp(&a.value_sats));
+    sorted.sort_by_key(|u| std::cmp::Reverse(u.value_sats));
 
     let recipient_spk = recipient.script_pubkey();
     let change_spk = change_address.script_pubkey();
@@ -818,11 +818,9 @@ pub fn bump_fee(
     let n_inputs = unsigned.input.len() as u64;
     let n_outputs = unsigned.output.len() as u64;
     let est_vbytes = 11 + n_inputs * 58 + n_outputs * 31;
-    let old_rate = if est_vbytes > 0 {
-        old_fee / est_vbytes
-    } else {
-        0
-    };
+    // est_vbytes is a sum of positive terms so it cannot be zero, but divide defensively:
+    // a zero here would panic rather than merely mis-price the bump.
+    let old_rate = old_fee.checked_div(est_vbytes).unwrap_or_default();
     if new_fee_rate_sats_per_vb <= old_rate {
         return Err(BumpError::NotIncreasing {
             new_rate: new_fee_rate_sats_per_vb,

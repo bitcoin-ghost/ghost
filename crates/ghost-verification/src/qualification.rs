@@ -30,7 +30,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use ghost_common::types::{NodeCapabilities, NodeId};
-use ghost_storage::{queries::VerificationProofInsert, Database};
+use ghost_storage::Database;
 
 /// Seconds in a day
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -1093,6 +1093,9 @@ impl QualificationStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests construct verification proofs; keeping this here rather than at module
+    // level is what stops the lib build reporting it unused.
+    use ghost_storage::queries::VerificationProofInsert;
 
     #[test]
     fn test_default_config() {
@@ -1447,7 +1450,7 @@ mod tests {
                 challenger_id: &challenger,
                 target_node_id: target,
                 capability: "archive",
-                passed: passed,
+                passed,
                 timestamp: ts,
                 proof: b"p",
                 round_height: None,
