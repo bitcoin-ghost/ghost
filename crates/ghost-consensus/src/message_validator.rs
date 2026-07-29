@@ -63,6 +63,19 @@ pub const MAX_VERIFICATION_SIZE: usize = 5_000;
 /// 1MB envelope tier; the per-response proof count (`MAX_CONVERGENCE_PROOFS`) is
 /// sized so a full batch of worst-case proofs stays under this.
 pub const MAX_CHALLENGE_CONVERGENCE_SIZE: usize = 1_000_000;
+
+/// GHOST-03 share/ledger convergence carries a BATCH of share proofs, not one proof, so it
+/// cannot share `MAX_SHARE_PROOF_SIZE` — which bounds a SINGLE proof at 10 KB.
+///
+/// It did, and that is what #558 was. A real share proof averages ~1169 bytes, and the payload
+/// expands ~3.1x as JSON (`proofs: Vec<Vec<u8>>` encodes each byte as a decimal integer), so a
+/// 10 KB ceiling could not carry even **one** proof. Every window-convergence response was
+/// rejected as oversized, historical divergence was never repaired, and the canaries sat 52-62k
+/// shares short for nine days with payouts stalled behind them.
+///
+/// Mirrors `MAX_CHALLENGE_CONVERGENCE_SIZE` — the other batch-carrying convergence type, which
+/// was correctly given its own limit.
+pub const MAX_SHARE_CONVERGENCE_SIZE: usize = 1_000_000;
 /// P2P-H3: Equivocation proof (two votes + metadata)
 pub const MAX_EQUIVOCATION_PROOF_SIZE: usize = 10_000;
 /// P2P-C1: Elder registration proposal (candidate + PoW + signatures)
@@ -368,7 +381,7 @@ pub fn validate_topic_before_deser(
 pub fn max_payload_size(msg_type: MessageType) -> usize {
     match msg_type {
         MessageType::ShareProof => MAX_SHARE_PROOF_SIZE,
-        MessageType::ShareConvergence => MAX_SHARE_PROOF_SIZE,
+        MessageType::ShareConvergence => MAX_SHARE_CONVERGENCE_SIZE,
         MessageType::BlockFound => MAX_BLOCK_FOUND_SIZE,
         MessageType::Vote => MAX_VOTE_SIZE,
         MessageType::HealthPing => MAX_HEALTH_PING_SIZE,
@@ -861,6 +874,33 @@ impl ValidationStats {
 
 #[cfg(test)]
 mod tests {
+
+    /// A convergence BATCH must not be bounded by the SINGLE-proof limit.
+    ///
+    /// #558: `ShareConvergence` mapped to `MAX_SHARE_PROOF_SIZE` (10 KB). A real share proof
+    /// averages ~1169 bytes and the payload expands ~3.1x as JSON, so that ceiling could not
+    /// carry even one proof — every window-convergence response was rejected as oversized and
+    /// historical ledger divergence was never repaired.
+    #[test]
+    fn share_convergence_is_not_bounded_by_the_single_proof_limit() {
+        assert_ne!(
+            max_payload_size(MessageType::ShareConvergence),
+            MAX_SHARE_PROOF_SIZE,
+            "ShareConvergence carries a batch; bounding it by the single-proof limit makes \
+             window convergence structurally impossible (#558)"
+        );
+
+        // Headroom for a realistic batch: ~1169 raw bytes per proof, ~3.1x JSON expansion.
+        const REAL_PROOF_BYTES: usize = 1169;
+        const JSON_EXPANSION: usize = 4; // conservative
+        let one_proof = REAL_PROOF_BYTES * JSON_EXPANSION;
+        assert!(
+            max_payload_size(MessageType::ShareConvergence) >= one_proof * 50,
+            "limit {} cannot carry a useful batch (one proof is ~{} bytes encoded)",
+            max_payload_size(MessageType::ShareConvergence),
+            one_proof
+        );
+    }
 
     /// The whole point of #517: a stale message must be rejected WITHOUT paying to parse it.
     ///
