@@ -44,8 +44,14 @@ pub enum SubscriptionType {
 }
 
 impl SubscriptionType {
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a subscription name, case-insensitively.
+    ///
+    /// Named `from_name` rather than `from_str`: the latter shadows
+    /// `std::str::FromStr::from_str`, so a caller with the trait in scope could reach a
+    /// different method than they meant. Implementing `FromStr` properly is not the answer
+    /// either — it returns `Result`, and an unknown subscription name is an ordinary `None`
+    /// here, not an error worth a type.
+    pub fn from_name(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "balance" => Some(SubscriptionType::Balance),
             "payments" => Some(SubscriptionType::Payments),
@@ -99,7 +105,7 @@ impl SubscriptionManager {
 
     /// Add a subscription for a wallet
     pub fn subscribe(&self, wallet_id: &WalletId, subscription: &str) {
-        if let Some(sub_type) = SubscriptionType::from_str(subscription) {
+        if let Some(sub_type) = SubscriptionType::from_name(subscription) {
             let mut subs = self.subscriptions.write();
             subs.entry(wallet_id.to_string())
                 .or_default()
@@ -109,7 +115,7 @@ impl SubscriptionManager {
 
     /// Remove a subscription for a wallet
     pub fn unsubscribe(&self, wallet_id: &WalletId, subscription: &str) {
-        if let Some(sub_type) = SubscriptionType::from_str(subscription) {
+        if let Some(sub_type) = SubscriptionType::from_name(subscription) {
             let mut subs = self.subscriptions.write();
             if let Some(wallet_subs) = subs.get_mut(&wallet_id.to_string()) {
                 wallet_subs.remove(&sub_type);

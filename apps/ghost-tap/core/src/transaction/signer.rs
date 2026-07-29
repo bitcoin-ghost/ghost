@@ -763,9 +763,9 @@ mod tests {
         signed.raw_tx = hex::encode(&raw_bytes);
 
         // Should either return Ok(false) or Err (invalid DER)
-        match verify_transaction(&signed, &tx) {
-            Ok(valid) => assert!(!valid, "tampered signature must not verify"),
-            Err(_) => {} // also acceptable (parse error from bad DER)
+        // Err is equally acceptable — a tampered signature can fail DER parsing outright.
+        if let Ok(valid) = verify_transaction(&signed, &tx) {
+            assert!(!valid, "tampered signature must not verify");
         }
     }
 

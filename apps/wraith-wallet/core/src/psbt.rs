@@ -585,7 +585,7 @@ pub fn create_psbt(
     // as few inputs as possible — keeps fee predictable and avoids
     // slicing tiny coins for big sends.
     let mut sorted: Vec<&AvailableUtxo> = available.iter().collect();
-    sorted.sort_by(|a, b| b.value_sats.cmp(&a.value_sats));
+    sorted.sort_by_key(|u| std::cmp::Reverse(u.value_sats));
 
     let recipient_spk = recipient.script_pubkey();
     let change_spk = change_address.script_pubkey();

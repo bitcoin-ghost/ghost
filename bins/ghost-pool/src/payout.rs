@@ -310,6 +310,10 @@ pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> O
     }
 }
 
+/// The two halves of an adopted payout split: miner payouts as `(address, work)` and node
+/// shares as `(node_id, share_count)` — the same pair `compute_ledger_root` hashes.
+pub type AdoptedPayout = (Vec<(String, u128)>, Vec<(NodeId, i32)>);
+
 /// Option (c) adopt-CONSUMPTION: the BFT-finalised checkpoint's ADOPTED payout lists at
 /// or before `tip_height` — `(miner_payouts: (address, WORK_SCALE-quantised work),
 /// node_shares: (node_id, 5-4-3-2-1 shares))`.
@@ -325,10 +329,7 @@ pub fn resolve_payout_cutoff(db: &ghost_storage::Database, tip_height: u64) -> O
 /// `None` when no checkpoint has finalised at or before `tip_height` (the brief window at
 /// first activation) — the caller then builds NO split (treasury-only fallback, safe:
 /// there is nothing for validators to disagree on).
-pub fn read_adopted_payout(
-    db: &ghost_storage::Database,
-    tip_height: u64,
-) -> Option<(Vec<(String, u128)>, Vec<(NodeId, i32)>)> {
+pub fn read_adopted_payout(db: &ghost_storage::Database, tip_height: u64) -> Option<AdoptedPayout> {
     match db.get_payout_ledger_checkpoint_at_or_before(tip_height) {
         Ok(Some(cp)) => Some((cp.miner_payouts, cp.node_shares)),
         Ok(None) => None,
