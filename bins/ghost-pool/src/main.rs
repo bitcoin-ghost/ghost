@@ -3663,8 +3663,27 @@ async fn main() -> Result<()> {
                 let since = until - LEDGER_BUCKET_SECS;
                 bucket = (bucket + 1) % LEDGER_BUCKETS;
 
-                if let Ok(bytes) = conv_handler.ledger_request_bytes(since, until) {
-                    let _ = conv_tx.send(bytes).await;
+                // #558: log the outbound sweep request. A silent client and a client whose
+                // requests are all answered "nothing to serve" produced identical logs, so
+                // there was no way to tell a broken sweep from a converged one.
+                match conv_handler.build_ledger_request(since, until) {
+                    Ok(req) => {
+                        let advertised = req.share_hashes.len();
+                        if let Ok(bytes) = conv_handler.ledger_request_bytes(since, until) {
+                            tracing::debug!(
+                                bucket,
+                                since,
+                                until,
+                                advertised,
+                                "GHOST-03: window convergence request sent"
+                            );
+                            let _ = conv_tx.send(bytes).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, since, until,
+                            "GHOST-03: could not build window convergence request");
+                    }
                 }
             }
         });
