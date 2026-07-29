@@ -85,11 +85,22 @@ pub struct LedgerConvergenceResponse {
 /// cheap secondary guard.
 const MAX_PROOFS_PER_RESPONSE: usize = 200;
 
-/// Byte bound on the RAW proof blobs in one response. They travel as `Vec<Vec<u8>>` in a JSON
-/// envelope, where serde encodes each byte as a decimal integer plus a comma — a measured ~3.1x
-/// expansion — so this must sit well under `MAX_ENVELOPE_SIZE` (1 MB) once expanded.
-/// 256 KiB raw is roughly 800 KB on the wire, leaving room for envelope and signature overhead.
-const MAX_PROOF_BYTES_PER_RESPONSE: usize = 256 * 1024;
+/// Byte bound on the RAW proof blobs in one response, sized against the **measured
+/// end-to-end expansion of 9.4x** (see `measure_two_layer_expansion`).
+///
+/// The expansion compounds across TWO serialisation layers, which is easy to under-count:
+///
+/// 1. `ConvergencePayload::LedgerResponse` -> JSON. `proofs: Vec<Vec<u8>>`, and serde encodes
+///    each byte as a decimal integer plus a comma: ~3.1x.
+/// 2. That JSON becomes `MessageEnvelope.payload`, which is a plain `Vec<u8>` with no
+///    `serde_bytes`, so the whole thing is encoded as an integer array **again**: ~3.0x more.
+///
+/// Measured: 155,223 raw proof bytes -> 484,759 inner -> **1,454,617** on the wire.
+///
+/// 64 KiB raw is ~616 KB as an envelope, leaving real headroom under the 1 MB cap. Getting
+/// this wrong is silent — the transport drops the message and convergence simply never
+/// happens, which is what #558 was.
+const MAX_PROOF_BYTES_PER_RESPONSE: usize = 64 * 1024;
 
 /// Broadcasts a serialized [`ConvergencePayload`] to the mesh under
 /// `MessageType::ShareConvergence`. Supplied by production wiring; `None` in
@@ -736,38 +747,59 @@ mod tests {
 
     /// A forged backfill must never be credited, even over the ledger path — convergence bypasses
     /// the normal share-receive gate, so it has to verify GHOST-09 itself.
-    /// A full window-convergence response must FIT ON THE WIRE.
+    /// A full window-convergence response must FIT ON THE WIRE — measured through BOTH
+    /// serialisation layers, not just the inner payload.
     ///
-    /// `MAX_PROOFS_PER_RESPONSE` bounds the response by COUNT, but the transport bounds it by
-    /// BYTES (`MAX_ENVELOPE_SIZE` = 1 MB). `proofs` is `Vec<Vec<u8>>`, and serde_json encodes
-    /// each byte as a decimal integer plus a comma — roughly 4 characters per byte — so a
-    /// count that looks modest becomes a multi-megabyte message that the receiver drops.
-    ///
-    /// This is #558: vm5/6/7 have been stuck 52-62k shares short since 2026-07-20 with the
-    /// window path applying exactly zero, while the (much smaller) round path works fine.
+    /// This is #558. The first attempt at this fix bounded only the inner layer and still
+    /// produced a 1.45 MB envelope against a 1 MB cap, so responses kept being dropped and
+    /// the canaries stayed 52-62k shares divergent. Asserting the inner size alone would
+    /// have passed while production stayed broken.
     #[test]
     fn a_full_window_convergence_response_fits_in_one_envelope() {
         const MAX_ENVELOPE_SIZE: usize = 1_000_000; // ghost_consensus::message_validator
 
+        // Worst case the server can emit: fill the byte budget exactly.
         let producer = NodeIdentity::generate();
-        let proofs: Vec<Vec<u8>> = (0..MAX_PROOFS_PER_RESPONSE)
-            .map(|i| serde_json::to_vec(&signed_share(&producer, i as u64)).unwrap())
-            .collect();
-        let raw: usize = proofs.iter().map(|p| p.len()).sum();
+        let mut proofs: Vec<Vec<u8>> = Vec::new();
+        let mut raw = 0usize;
+        for i in 0.. {
+            let p = serde_json::to_vec(&signed_share(&producer, i as u64)).unwrap();
+            if raw + p.len() > MAX_PROOF_BYTES_PER_RESPONSE
+                || proofs.len() >= MAX_PROOFS_PER_RESPONSE
+            {
+                break;
+            }
+            raw += p.len();
+            proofs.push(p);
+        }
 
-        let resp = LedgerConvergenceResponse {
-            since_ts: 0,
-            until_ts: i64::MAX,
-            proofs,
-            unservable: 0,
-        };
-        let wire = serde_json::to_vec(&ConvergencePayload::LedgerResponse(resp)).unwrap();
+        let inner = serde_json::to_vec(&ConvergencePayload::LedgerResponse(
+            LedgerConvergenceResponse {
+                since_ts: 0,
+                until_ts: i64::MAX,
+                proofs,
+                unservable: 0,
+            },
+        ))
+        .unwrap();
+
+        // MessageEnvelope.payload is a bare Vec<u8> — the inner JSON expands a SECOND time.
+        let envelope = serde_json::json!({
+            "msg_type": "ShareConvergence",
+            "sender": "00".repeat(32),
+            "timestamp": 0u64,
+            "sequence": 0u64,
+            "signature": "00".repeat(64),
+            "payload": inner,
+            "ttl": 3u8,
+        });
+        let wire = serde_json::to_vec(&envelope).unwrap();
 
         assert!(
             wire.len() <= MAX_ENVELOPE_SIZE,
-            "a full response is {} bytes on the wire ({} raw proof bytes, {:.1}x expansion) \
-             but the envelope cap is {} — every such response is dropped, which is why \
-             window convergence repairs nothing",
+            "a budget-full response is {} bytes as an envelope ({} raw proof bytes, {:.1}x \
+             end-to-end expansion) against a {} cap — the transport drops it and convergence \
+             silently never happens",
             wire.len(),
             raw,
             wire.len() as f64 / raw as f64,
