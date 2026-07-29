@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use ghost_common::error::GhostResult;
 use ghost_common::types::RoundId;
@@ -77,7 +77,19 @@ pub struct LedgerConvergenceResponse {
 }
 
 /// Cap on proofs served in one response, so a wide window cannot produce an enormous message.
-const MAX_PROOFS_PER_RESPONSE: usize = 2_000;
+/// Count bound on one window-convergence response.
+///
+/// Was 2_000, which is where #558 came from: bounded by count alone, a full response measured
+/// 4.8 MB on the wire against a 1 MB envelope cap, so every one was dropped and the unpaid
+/// ledger never converged. `MAX_PROOF_BYTES_PER_RESPONSE` is the real bound; this stays as a
+/// cheap secondary guard.
+const MAX_PROOFS_PER_RESPONSE: usize = 200;
+
+/// Byte bound on the RAW proof blobs in one response. They travel as `Vec<Vec<u8>>` in a JSON
+/// envelope, where serde encodes each byte as a decimal integer plus a comma — a measured ~3.1x
+/// expansion — so this must sit well under `MAX_ENVELOPE_SIZE` (1 MB) once expanded.
+/// 256 KiB raw is roughly 800 KB on the wire, leaving room for envelope and signature overhead.
+const MAX_PROOF_BYTES_PER_RESPONSE: usize = 256 * 1024;
 
 /// Broadcasts a serialized [`ConvergencePayload`] to the mesh under
 /// `MessageType::ShareConvergence`. Supplied by production wiring; `None` in
@@ -89,6 +101,25 @@ pub struct ConvergenceHandler {
     round_manager: Arc<RoundManager>,
     send: Option<ConvergenceSendFn>,
     db: Option<Arc<ghost_storage::Database>>,
+}
+
+/// Outcome of applying one window-convergence response.
+///
+/// Exists so the discard reasons are a VALUE, not just a log line: `applied` alone cannot
+/// distinguish "the peer served nothing" from "the peer served 2000 proofs and we rejected
+/// every one", and that ambiguity is what made #558 undiagnosable.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerApplyOutcome {
+    /// Proofs credited to the `shares` table.
+    pub applied: usize,
+    /// Blobs that would not deserialise as a `ShareProof`.
+    pub bad_json: usize,
+    /// Proofs whose `received_by` signature did not verify — a protocol bug if the
+    /// serving node holds them as valid.
+    pub bad_sig: usize,
+    /// Verified proofs we already held (UNIQUE(share_hash) dedup). Expected to be
+    /// non-zero in normal operation.
+    pub already_held: usize,
 }
 
 impl ConvergenceHandler {
@@ -151,6 +182,7 @@ impl ConvergenceHandler {
                     req.until_ts,
                     &theirs,
                     MAX_PROOFS_PER_RESPONSE,
+                    MAX_PROOF_BYTES_PER_RESPONSE,
                 )
                 .unwrap_or_default(),
             None => (Vec::new(), 0),
@@ -165,17 +197,59 @@ impl ConvergenceHandler {
 
     /// Apply served proofs to our ledger. Each is GHOST-09 verified before it is credited —
     /// convergence bypasses the normal share-receive gate, so a forged backfill must not pass.
-    pub fn apply_ledger_response(&self, resp: &LedgerConvergenceResponse) -> usize {
+    pub fn apply_ledger_response(&self, resp: &LedgerConvergenceResponse) -> LedgerApplyOutcome {
         let mut applied = 0;
+        // Discard reasons are counted, not silently dropped. Every one of these three
+        // branches used to `continue` with no log at any level, and the caller only logged
+        // when `applied > 0` — so "peer served nothing" and "peer served 2000 proofs and we
+        // rejected every one" were indistinguishable from outside the process. That
+        // ambiguity is what made #558 (vm5/6/7 frozen 52-62k shares short since 07-20)
+        // undiagnosable from the logs alone.
+        let mut bad_json = 0usize;
+        let mut bad_sig = 0usize;
+        let mut not_accepted = 0usize;
         for blob in &resp.proofs {
             let Ok(proof) = serde_json::from_slice::<ghost_common::types::ShareProof>(blob) else {
+                bad_json += 1;
                 continue;
             };
             if !proof.has_valid_received_by_signature() {
+                bad_sig += 1;
                 continue; // never credit an unsigned or forged backfill
             }
             if self.accept_proof(&proof) {
                 applied += 1;
+            } else {
+                not_accepted += 1;
+            }
+        }
+        // Log whenever the peer sent anything, INCLUDING the all-rejected case — that is the
+        // interesting one. `not_accepted` is expected to be non-zero in normal operation
+        // (UNIQUE(share_hash) dedups a share we already hold); `bad_json` or `bad_sig` above
+        // zero means proofs that verify on the serving node do not verify here, which is a
+        // protocol bug rather than a no-op.
+        if !resp.proofs.is_empty() {
+            let level_warn = bad_json > 0 || bad_sig > 0;
+            if level_warn {
+                warn!(
+                    served = resp.proofs.len(),
+                    applied,
+                    bad_json,
+                    bad_sig,
+                    already_held = not_accepted,
+                    since = resp.since_ts,
+                    until = resp.until_ts,
+                    "GHOST-03: window convergence DISCARDED proofs the peer could serve"
+                );
+            } else {
+                debug!(
+                    served = resp.proofs.len(),
+                    applied,
+                    already_held = not_accepted,
+                    since = resp.since_ts,
+                    until = resp.until_ts,
+                    "GHOST-03: window convergence response"
+                );
             }
         }
         if resp.unservable > 0 {
@@ -187,7 +261,12 @@ impl ConvergenceHandler {
                  these cannot be reconciled by any protocol and leave the ledgers divergent"
             );
         }
-        applied
+        LedgerApplyOutcome {
+            applied,
+            bad_json,
+            bad_sig,
+            already_held: not_accepted,
+        }
     }
 
     /// Credit a verified proof to both the in-memory round view and the `shares` TABLE.
@@ -396,7 +475,20 @@ impl MessageHandler for ConvergenceHandler {
                 }
             }
             ConvergencePayload::LedgerRequest(req) => {
+                let advertised = req.share_hashes.len();
                 let resp = self.handle_ledger_request(&req);
+                // Serving side of #558. Without this, a node that receives requests but has
+                // nothing to serve is indistinguishable from one that never receives any —
+                // both are pure silence, and that gap is why the vm5/6/7 divergence could not
+                // be localised from logs.
+                debug!(
+                    advertised,
+                    serving = resp.proofs.len(),
+                    unservable = resp.unservable,
+                    since = req.since_ts,
+                    until = req.until_ts,
+                    "GHOST-03: window convergence request served"
+                );
                 if resp.proofs.is_empty() {
                     return Ok(());
                 }
@@ -407,12 +499,12 @@ impl MessageHandler for ConvergenceHandler {
                 }
             }
             ConvergencePayload::LedgerResponse(resp) => {
-                let applied = self.apply_ledger_response(&resp);
-                if applied > 0 {
+                let outcome = self.apply_ledger_response(&resp);
+                if outcome.applied > 0 {
                     tracing::info!(
                         since = resp.since_ts,
                         until = resp.until_ts,
-                        applied,
+                        applied = outcome.applied,
                         "GHOST-03: backfilled unpaid-ledger shares via window convergence"
                     );
                 }
@@ -629,7 +721,7 @@ mod tests {
         );
         assert_eq!(resp.unservable, 0, "all of A's shares carry proofs (v41)");
 
-        assert_eq!(ch_b.apply_ledger_response(&resp), 2);
+        assert_eq!(ch_b.apply_ledger_response(&resp).applied, 2);
         assert_eq!(
             unpaid(&db_b),
             unpaid(&db_a),
@@ -638,12 +730,51 @@ mod tests {
         );
 
         // Idempotent: re-applying must not double-count the work.
-        ch_b.apply_ledger_response(&resp);
+        let _ = ch_b.apply_ledger_response(&resp);
         assert_eq!(unpaid(&db_b), 3.0, "re-applying must not double-count");
     }
 
     /// A forged backfill must never be credited, even over the ledger path — convergence bypasses
     /// the normal share-receive gate, so it has to verify GHOST-09 itself.
+    /// A full window-convergence response must FIT ON THE WIRE.
+    ///
+    /// `MAX_PROOFS_PER_RESPONSE` bounds the response by COUNT, but the transport bounds it by
+    /// BYTES (`MAX_ENVELOPE_SIZE` = 1 MB). `proofs` is `Vec<Vec<u8>>`, and serde_json encodes
+    /// each byte as a decimal integer plus a comma — roughly 4 characters per byte — so a
+    /// count that looks modest becomes a multi-megabyte message that the receiver drops.
+    ///
+    /// This is #558: vm5/6/7 have been stuck 52-62k shares short since 2026-07-20 with the
+    /// window path applying exactly zero, while the (much smaller) round path works fine.
+    #[test]
+    fn a_full_window_convergence_response_fits_in_one_envelope() {
+        const MAX_ENVELOPE_SIZE: usize = 1_000_000; // ghost_consensus::message_validator
+
+        let producer = NodeIdentity::generate();
+        let proofs: Vec<Vec<u8>> = (0..MAX_PROOFS_PER_RESPONSE)
+            .map(|i| serde_json::to_vec(&signed_share(&producer, i as u64)).unwrap())
+            .collect();
+        let raw: usize = proofs.iter().map(|p| p.len()).sum();
+
+        let resp = LedgerConvergenceResponse {
+            since_ts: 0,
+            until_ts: i64::MAX,
+            proofs,
+            unservable: 0,
+        };
+        let wire = serde_json::to_vec(&ConvergencePayload::LedgerResponse(resp)).unwrap();
+
+        assert!(
+            wire.len() <= MAX_ENVELOPE_SIZE,
+            "a full response is {} bytes on the wire ({} raw proof bytes, {:.1}x expansion) \
+             but the envelope cap is {} — every such response is dropped, which is why \
+             window convergence repairs nothing",
+            wire.len(),
+            raw,
+            wire.len() as f64 / raw as f64,
+            MAX_ENVELOPE_SIZE
+        );
+    }
+
     #[test]
     fn ledger_convergence_rejects_a_forged_backfill() {
         let producer = NodeIdentity::generate();
@@ -664,7 +795,7 @@ mod tests {
         };
 
         assert_eq!(
-            ch_b.apply_ledger_response(&resp),
+            ch_b.apply_ledger_response(&resp).applied,
             0,
             "a proof whose received_by signature does not verify must never be credited"
         );

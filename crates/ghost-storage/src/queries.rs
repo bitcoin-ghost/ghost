@@ -473,12 +473,18 @@ impl Database {
     /// Rows whose `proof` is NULL predate schema v41 and cannot be served: their signatures no
     /// longer exist anywhere, so no peer could verify them. They are skipped, and the caller is
     /// told how many, because that count is exactly the un-reconcilable backlog.
+    /// `max_bytes` bounds the SUM of raw proof blobs returned. The count `limit` alone is not
+    /// enough: these blobs travel as `Vec<Vec<u8>>` inside a JSON envelope, where serde encodes
+    /// every byte as a decimal integer plus a comma — a measured ~3.1x expansion. A response
+    /// that looked fine by count was 4.8 MB on the wire against a 1 MB cap, so it was dropped
+    /// and the ledger never converged (#558).
     pub fn unpaid_proofs_missing_from(
         &self,
         since_ts: i64,
         until_ts: i64,
         theirs: &std::collections::HashSet<String>,
         limit: usize,
+        max_bytes: usize,
     ) -> GhostResult<(Vec<Vec<u8>>, usize)> {
         self.with_connection(|conn| {
             let mut stmt = conn
@@ -497,6 +503,7 @@ impl Database {
 
             let mut proofs = Vec::new();
             let mut unservable = 0usize;
+            let mut bytes = 0usize;
             for row in rows {
                 let (hash, proof) = row.map_err(|e| GhostError::Database(e.to_string()))?;
                 if theirs.contains(&hash) {
@@ -504,7 +511,11 @@ impl Database {
                 }
                 match proof {
                     Some(p) => {
-                        if proofs.len() < limit {
+                        // Stop on EITHER bound. Overshooting `max_bytes` would produce a
+                        // message the transport silently drops, which is strictly worse than
+                        // serving fewer proofs — the requester simply asks again next sweep.
+                        if proofs.len() < limit && bytes + p.len() <= max_bytes {
+                            bytes += p.len();
                             proofs.push(p);
                         }
                     }
