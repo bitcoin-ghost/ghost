@@ -9591,11 +9591,13 @@ mod tests {
     #[test]
     fn test_finalize_gate_enabled_with_ghost_pay() {
         // A node running ghost-pay sets enabled = true → notify is wired.
-        let mut config = NodeConfig::default();
-        config.ghost_pay = Some(GhostPayConfig {
-            enabled: true,
-            ..GhostPayConfig::default()
-        });
+        let config = NodeConfig {
+            ghost_pay: Some(GhostPayConfig {
+                enabled: true,
+                ..GhostPayConfig::default()
+            }),
+            ..Default::default()
+        };
         assert!(
             config.ghost_pay_enabled(),
             "a ghost-pay node must attempt the finalize notify"

@@ -610,8 +610,10 @@ mod tests {
         // Enabled alert config, drift event on, channels default-disabled so no
         // network I/O — we only assert the trigger reached the dispatcher.
         let dispatcher = Arc::new(AlertDispatcher::new("node".into(), || {
-            let mut c = AlertsConfig::default();
-            c.enabled = true;
+            let mut c = AlertsConfig {
+                enabled: true,
+                ..Default::default()
+            };
             c.events.capability_drift = true;
             c
         }));
@@ -647,8 +649,11 @@ mod tests {
         // v1.10.20: a present-but-disabled `[ghost_pay]` block must NOT claim the
         // capability (gate on `enabled`, not mere block presence) — otherwise
         // pool-only nodes advertise GhostPay and peers waste probes on port 8800.
-        let mut cfg = NodeConfig::default();
-        cfg.ghost_pay = Some(GhostPayConfig::default()); // default enabled = false
+        // default enabled = false, which is the point of this case
+        let cfg = NodeConfig {
+            ghost_pay: Some(GhostPayConfig::default()),
+            ..Default::default()
+        };
         let r = check_ghost_pay(&cfg).await;
         assert!(!r.claimed && !r.passed && r.reason.is_none());
     }

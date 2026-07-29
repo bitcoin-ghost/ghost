@@ -4978,7 +4978,7 @@ mod tests {
 
         let mut strict = PolicyProfile::full_open();
         strict.max_op_return_size = 40;
-        let (kept, _) = make_processor(strict).filter_transactions(&[ttx.clone()]);
+        let (kept, _) = make_processor(strict).filter_transactions(std::slice::from_ref(&ttx));
         assert!(kept.is_empty(), "oversized OP_RETURN must be dropped");
 
         let mut loose = PolicyProfile::full_open();
@@ -5021,7 +5021,7 @@ mod tests {
 
         let mut strict = PolicyProfile::full_open();
         strict.max_witness_per_input = 500;
-        let (kept, _) = make_processor(strict).filter_transactions(&[ttx.clone()]);
+        let (kept, _) = make_processor(strict).filter_transactions(std::slice::from_ref(&ttx));
         assert!(kept.is_empty(), "oversized witness must be dropped");
 
         let mut loose = PolicyProfile::full_open();
@@ -5113,7 +5113,7 @@ mod tests {
         // allow_inscriptions = false → dropped by policy (reaper disabled).
         let mut strict = PolicyProfile::full_open();
         strict.allow_inscriptions = false;
-        let (kept, _) = make_processor(strict).filter_transactions(&[ttx.clone()]);
+        let (kept, _) = make_processor(strict).filter_transactions(std::slice::from_ref(&ttx));
         assert!(
             kept.is_empty(),
             "inscription must be dropped when disallowed"

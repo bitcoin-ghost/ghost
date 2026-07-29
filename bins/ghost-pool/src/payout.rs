@@ -3963,9 +3963,8 @@ mod tests {
 
         // One whale miner with 99% of work, 99 tiny miners with 1% total
         let mut miner_work: Vec<u128> = vec![99_000u128]; // whale
-        for _ in 0..99 {
-            miner_work.push(10u128); // tiny miners: 10 each = 990 total
-        }
+                                                          // tiny miners: 10 each = 990 total
+        miner_work.extend(std::iter::repeat_n(10u128, 99));
         let total_work: u128 = miner_work.iter().sum();
         assert_eq!(total_work, 99_990);
 
