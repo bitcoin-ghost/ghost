@@ -463,6 +463,28 @@ impl Database {
         })
     }
 
+    /// How many unpaid share hashes a window would advertise. Cheap COUNT, used to split a
+    /// window before building a request that would not fit on the wire.
+    ///
+    /// The convergence REQUEST carries every unpaid hash in its window, and nothing bounded it.
+    /// A busy 30-minute bucket holds ~5,800 hashes, which serialises to **1.58 MB** against the
+    /// 1 MB cap — so the request was dropped before reaching any peer. Silently: an oversized
+    /// request produces no error and no discard counter, because there is no peer to count it.
+    /// Repair therefore worked only in thin buckets and stalled wherever the divergence actually
+    /// was. Mirror image of the response-side bug in #559/#561/#562 (#558).
+    pub fn count_unpaid_shares_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<i64> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM shares
+                 WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                   AND timestamp >= ?1 AND timestamp < ?2",
+                params![since_ts, until_ts],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     pub fn unpaid_share_hashes_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
         self.with_connection(|conn| {
             let mut stmt = conn
