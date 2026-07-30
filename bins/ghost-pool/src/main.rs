@@ -3619,6 +3619,7 @@ async fn main() -> Result<()> {
         let conv_handler = Arc::clone(&convergence_handler);
         let rm_for_conv = Arc::clone(&round_manager);
         let conv_tx = conv_tx.clone();
+        let db_for_conv = Arc::clone(&db);
         tokio::spawn(async move {
             const CONVERGENCE_INTERVAL_SECS: u64 = 30;
 
@@ -3633,19 +3634,33 @@ async fn main() -> Result<()> {
             // rotating back through `LEDGER_SWEEP_SPAN_SECS`. Bucketing keeps each advertisement
             // a sane size; the rotation covers the whole span.
             const LEDGER_BUCKET_SECS: i64 = 1_800; // 30 min per advertisement
-                                                   // Sweep the trailing 7 days, matching the verification-ledger sweep
-                                                   // (VLEDGER_SWEEP_SPAN_SECS). At 24h a proof-present share dropped in gossip
-                                                   // that was not reconciled within a day aged out of the rotation and stayed
-                                                   // divergent forever — even though its proof exists and it is fully servable.
-                                                   // The unpaid-share horizon spans well past 24h (shares accumulate until a
-                                                   // payout settles), so the sweep must too, or the payout ledger can never
-                                                   // reach the byte-identical totals the checkpoint requires.
-            const LEDGER_SWEEP_SPAN_SECS: i64 = 7 * 86_400; // sweep the last 7 days
-            const LEDGER_BUCKETS: i64 = LEDGER_SWEEP_SPAN_SECS / LEDGER_BUCKET_SECS;
+
+            // The span must cover the UNPAID HORIZON, not a fixed number of days.
+            //
+            // It was 7 days, and that was still too short. The window SLIDES, so a hole ages out
+            // of it whether or not it was repaired first — measured on 2026-07-30, vm7 had 6,121
+            // shares frozen on 07-20, 3,552 on 07-21, and 4,321 on 07-22 that had aged out
+            // MID-REPAIR (that day was 4,397 and had come down by only 76 before the boundary
+            // passed it). Meanwhile 07-25, still inside the window, went 17,862 -> 9,404. So the
+            // mechanism works and simply loses the race against its own boundary.
+            //
+            // The payout ledger compares EVERY unpaid share, and nothing has settled since
+            // 2026-06-02 (won_blocks = 0, see #556), so the horizon is ~2 months and growing. A
+            // fixed span can never track that. Derive it from the oldest unpaid share instead,
+            // with a cap so a pathological backlog cannot make the rotation unbounded.
+            const LEDGER_SPAN_MIN_SECS: i64 = 7 * 86_400;
+            const LEDGER_SPAN_MAX_SECS: i64 = 90 * 86_400;
+            // Fast lane: recent holes must not wait for a full long rotation. Every other tick
+            // sweeps within the last day, so a fresh drop is still repaired within ~24 min while
+            // the long rotation guarantees everything is eventually reached.
+            const LEDGER_RECENT_SPAN_SECS: i64 = 86_400;
+            const LEDGER_RECENT_BUCKETS: i64 = LEDGER_RECENT_SPAN_SECS / LEDGER_BUCKET_SECS;
 
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
             let mut bucket: i64 = 0;
+            let mut recent_bucket: i64 = 0;
+            let mut long_lane = true;
 
             loop {
                 ticker.tick().await;
@@ -3657,11 +3672,30 @@ async fn main() -> Result<()> {
                 }
 
                 // Repair one window of the unpaid ledger (the slow path that actually keeps the
-                // ledgers converged). A full sweep of the span takes LEDGER_BUCKETS ticks.
+                // ledgers converged), alternating between the long rotation over the whole
+                // unpaid horizon and a fast lane over the last day.
                 let now = chrono::Utc::now().timestamp();
-                let until = now - bucket * LEDGER_BUCKET_SECS;
-                let since = until - LEDGER_BUCKET_SECS;
-                bucket = (bucket + 1) % LEDGER_BUCKETS;
+
+                // Span tracks the oldest unpaid share, clamped. Cheap query, and it must be
+                // re-read rather than cached: the horizon grows for as long as nothing settles.
+                let span = db_for_conv
+                    .oldest_unpaid_share_timestamp()
+                    .ok()
+                    .flatten()
+                    .map(|oldest| (now - oldest).clamp(LEDGER_SPAN_MIN_SECS, LEDGER_SPAN_MAX_SECS))
+                    .unwrap_or(LEDGER_SPAN_MIN_SECS);
+                let long_buckets = (span / LEDGER_BUCKET_SECS).max(1);
+
+                let (since, until) = if long_lane {
+                    let until = now - bucket * LEDGER_BUCKET_SECS;
+                    bucket = (bucket + 1) % long_buckets;
+                    (until - LEDGER_BUCKET_SECS, until)
+                } else {
+                    let until = now - recent_bucket * LEDGER_BUCKET_SECS;
+                    recent_bucket = (recent_bucket + 1) % LEDGER_RECENT_BUCKETS;
+                    (until - LEDGER_BUCKET_SECS, until)
+                };
+                long_lane = !long_lane;
 
                 // #558: log the outbound sweep request. A silent client and a client whose
                 // requests are all answered "nothing to serve" produced identical logs, so
