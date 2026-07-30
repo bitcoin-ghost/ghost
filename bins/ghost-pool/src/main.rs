@@ -3678,7 +3678,18 @@ async fn main() -> Result<()> {
             // lever. 12 buckets per long tick covers 6 hours of history per minute — a full
             // horizon sweep in ~4 hours instead of 46 — and each request is bounded by
             // MAX_HASHES_PER_REQUEST, so the wire cost stays flat.
-            const LONG_BUCKETS_PER_TICK: i64 = 12;
+            //
+            // Was 12. That made the rotation 12x faster but the binding constraint was never
+            // visits-per-hour — it was proofs-per-visit, which the truncation signal now fixes
+            // directly (#558). 12 cost real capacity for nothing: vm5's `/health` went from
+            // sub-millisecond to 10.06s, having read 887 GB since restart at 36% CPU with
+            // 1,329 MB available, because each tick runs 12x the ledger queries against a
+            // 2.6 GB database on a node whose working set already exceeds RAM (#556).
+            //
+            // 4 keeps a useful improvement on the original 46-hour rotation (~11.6h) at a third
+            // of the query load. With truncation now drained in-place, rotation speed only
+            // governs how quickly a NEW hole is discovered, not how long one takes to clear.
+            const LONG_BUCKETS_PER_TICK: i64 = 4;
             /// Hard cap on requests emitted in one tick. Sized above LONG_BUCKETS_PER_TICK so a
             /// tick's buckets are never silently dropped, with room for windows that split.
             const MAX_REQUESTS_PER_TICK: usize = 24;
