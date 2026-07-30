@@ -11,13 +11,20 @@
 
 use std::path::PathBuf;
 
-/// Outbound slots Core holds back from `maxconnections`: 8 full-relay + 2 block-relay-only.
+/// Outbound slots Core holds back from `maxconnections`: 8 full-relay + 2 block-relay-only
+/// + 1 feeler.
 ///
-/// These are Core's documented defaults (`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS` and
-/// `MAX_BLOCK_RELAY_ONLY_CONNECTIONS`). Feeler connections are short-lived and not counted here.
+/// These are Core's documented defaults (`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`,
+/// `MAX_BLOCK_RELAY_ONLY_CONNECTIONS`) plus the single feeler slot, which Core includes in the
+/// outbound reserve even though an individual feeler connection is short-lived.
+///
+/// This was 10 — the feeler was omitted — which overstated inbound capacity by one. The live
+/// fleet settles it: on 2026-07-30 vm4 reported `connections_out=11` while vm1-vm3 reported 10,
+/// the difference being whether a feeler happened to be open at that instant. The reserve is 11.
+///
 /// The inbound capacity an operator actually has is `maxconnections` MINUS this, which is the
 /// number that matters and the one nothing was showing.
-pub const RESERVED_OUTBOUND: u32 = 10;
+pub const RESERVED_OUTBOUND: u32 = 11;
 
 /// Fraction of inbound capacity at which a node is close enough to full to warn about.
 ///
@@ -278,12 +285,15 @@ mod tests {
     /// The number that actually matters: inbound capacity, not the headline setting.
     #[test]
     fn inbound_capacity_is_the_setting_minus_cores_outbound_reserve() {
-        // The exact case from #497: 50 configured looks generous and leaves 40 inbound,
-        // which a settled node fills.
-        assert_eq!(inbound_capacity(50), 40);
-        assert_eq!(inbound_capacity(125), 115);
-        // Never negative.
+        // The exact case from #497: 50 configured looks generous but leaves only 39 inbound,
+        // which a settled node fills — and a full node silently stops accepting peers.
+        assert_eq!(inbound_capacity(50), 39);
+        // 125 is the current fleet setting. vm1/vm2/vm3 sat at 114 inbound on 2026-07-30,
+        // i.e. exactly full against this capacity (#572).
+        assert_eq!(inbound_capacity(125), 114);
+        // Never negative, even below the reserve.
         assert_eq!(inbound_capacity(5), 0);
+        assert_eq!(inbound_capacity(RESERVED_OUTBOUND), 0);
     }
 
     #[test]

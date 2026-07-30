@@ -2,6 +2,32 @@
 import { fetchApi } from './client';
 import type { NodeConfig, FullNodeConfig, L2PruningConfig } from '@/types/api';
 
+/// Live peer-connection state (#499).
+///
+/// `maxconnections` on its own is not the number that matters: ghostd reserves 11 outbound
+/// slots (8 full-relay + 2 block-relay-only + 1 feeler) out of the total, so inbound capacity
+/// is the setting minus that. A node at its inbound ceiling silently stops accepting peers —
+/// crawlers then record it unreachable and drop it from public listings, which is what #497
+/// and #498 were, and what #572 is again at the higher limit.
+export interface MaxConnectionsStatus {
+  configured: number | null;      // value in bitcoin.conf, null = not set
+  effective: number;              // configured, or ghostd's default
+  is_core_default: boolean;
+  ambiguous: boolean;             // set more than once in the file — we refuse to write
+  inbound_capacity: number;       // effective - reserved_outbound
+  reserved_outbound: number;
+  connections: number | null;     // live, from getnetworkinfo
+  connections_in: number | null;
+  connections_out: number | null;
+  inbound_utilisation: number | null;  // connections_in / inbound_capacity, 0..1
+  near_ceiling: boolean | null;        // at/above the warn fraction
+  recommended_max: number | null;      // memory-derived ceiling for this node
+}
+
+export async function getMaxConnections(): Promise<MaxConnectionsStatus> {
+  return fetchApi<MaxConnectionsStatus>('/api/v1/config/maxconnections');
+}
+
 export async function getConfig(): Promise<NodeConfig> {
   return fetchApi<NodeConfig>('/api/v1/config');
 }
