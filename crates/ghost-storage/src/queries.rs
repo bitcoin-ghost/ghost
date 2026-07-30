@@ -446,6 +446,23 @@ impl Database {
     /// This is what a node ADVERTISES during ledger convergence. Peers reply with the proofs
     /// for anything they hold that is absent from this list. Scoped to unpaid shares because
     /// those are precisely the ones a payout will be computed from.
+    /// Timestamp of the OLDEST unpaid share, or `None` if the ledger is empty.
+    ///
+    /// The GHOST-03 sweep span is derived from this rather than fixed, because the unpaid horizon
+    /// grows for as long as nothing settles and a fixed window slides past holes before they are
+    /// repaired — see the sweep in `main.rs` and #558.
+    pub fn oldest_unpaid_share_timestamp(&self) -> GhostResult<Option<i64>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT MIN(timestamp) FROM shares
+                 WHERE paid_in_proposal_hash IS NULL AND valid = 1",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     pub fn unpaid_share_hashes_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
         self.with_connection(|conn| {
             let mut stmt = conn
@@ -9347,6 +9364,33 @@ pub fn resolve_bond_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GHOST-03 sweep span is derived from this, so it must ignore paid and invalid shares —
+    /// and return None on an empty ledger rather than 0, which would make the span the epoch.
+    #[test]
+    fn oldest_unpaid_share_timestamp_ignores_paid_and_invalid() {
+        let db = Database::in_memory().expect("in-memory db");
+        assert_eq!(db.oldest_unpaid_share_timestamp().unwrap(), None);
+
+        db.with_connection(|conn| {
+            conn.execute_batch(
+                "INSERT INTO shares
+                   (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid, paid_in_proposal_hash)
+                 VALUES
+                   (1,'m',1.0,1.0,'h_unpaid_old', 1000,'n',1,NULL),
+                   (1,'m',1.0,1.0,'h_paid_older',  500,'n',1,X'AA'),
+                   (1,'m',1.0,1.0,'h_invalid',     400,'n',0,NULL);",
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed shares");
+
+        assert_eq!(
+            db.oldest_unpaid_share_timestamp().unwrap(),
+            Some(1000),
+            "must skip the PAID share at 500 and the INVALID one at 400"
+        );
+    }
 
     /// `get_blocks_found_count` reflects only real settled WINS (`won_blocks`), is
     /// idempotent per height, and is not inflated by payout proposals.
