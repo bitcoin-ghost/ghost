@@ -417,6 +417,52 @@ def test_tls_serializer():
     return got
 
 
+
+def probe_serializer_extranonce_rekey():
+    """#411 acceptance, measured rather than described. INFORMATIONAL — does not gate.
+
+    A serialising client (cgminer, Avalon) waits for the subscribe response before sending
+    authorize. The channel only opens on authorize, so the subscribe-defer fallback answers
+    after ~1.5s with the PLACEHOLDER extranonce1 (8 zero bytes), and the real one arrives
+    later via `mining.set_extranonce` — a mid-handshake re-key.
+
+    #411's acceptance is "a serializing client gets a real extranonce at subscribe with no
+    later re-key". That is not met today and cannot be met inside the translator: extranonce1
+    is allocated by the SV2 pool in `OpenExtendedMiningChannelSuccess`, so the translator has
+    nothing valid to hand out before the channel exists.
+
+    Deliberately NOT in `results`: it would fail every run and block deploys for a known,
+    accepted limitation. It prints what actually happens so the gap is a number, and becomes
+    the gate when the allocation is decoupled.
+    """
+    s = socket.create_connection((HOST, PORT), timeout=15)
+    send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
+
+    t0 = time.time()
+    msgs = recv_until(s, 4.0, lambda m: m.get("id") == 1 and "result" in m)
+    sub_delay = time.time() - t0
+    sub = [m for m in msgs if m.get("id") == 1 and "result" in m]
+    en1 = None
+    if sub and isinstance(sub[0].get("result"), list) and len(sub[0]["result"]) > 1:
+        en1 = sub[0]["result"][1]
+
+    placeholder = isinstance(en1, str) and len(en1) == 16 and set(en1) == {"0"}
+
+    # Only now authorize — the defining behaviour of a serialising client.
+    send(s, {"id": 2, "method": "mining.authorize",
+             "params": ["bc1qserializerprobexxxxxxxxxxxxxxxxxxxxxxxx.probe", "x"]})
+    rekey = recv_until(s, 6.0, lambda m: m.get("method") == "mining.set_extranonce")
+    got_rekey = any(m.get("method") == "mining.set_extranonce" for m in rekey)
+    s.close()
+
+    met = (en1 is not None) and (not placeholder) and (not got_rekey)
+    print(f"  [411-rekey]       {'MET' if met else 'NOT MET'} (informational) — "
+          f"subscribe answered in {sub_delay:.2f}s, extranonce1="
+          f"{'placeholder' if placeholder else en1}, "
+          f"set_extranonce re-key: {'yes' if got_rekey else 'no'}")
+    return met
+
+
 def main():
     print(f"SV1 handshake smoke test vs {HOST}:{PORT}")
     results = {
@@ -436,6 +482,14 @@ def main():
         results["tls"] = test_tls_serializer()
     else:
         print("  [tls]             SKIP — no TLS port set (pass 4th arg or GHOST_TLS_PORT)")
+    # Informational probes: measured, reported, and deliberately NOT gating.
+    print()
+    print("  informational (not gating):")
+    try:
+        probe_serializer_extranonce_rekey()
+    except Exception as e:  # a probe must never break the gate
+        print(f"  [411-rekey]       SKIP — probe error: {e}")
+
     print()
     bad = [k for k, v in results.items() if not v]
     if bad:
