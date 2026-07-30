@@ -3656,6 +3656,16 @@ async fn main() -> Result<()> {
             const LEDGER_RECENT_SPAN_SECS: i64 = 86_400;
             const LEDGER_RECENT_BUCKETS: i64 = LEDGER_RECENT_SPAN_SECS / LEDGER_BUCKET_SECS;
 
+            // Max share hashes in ONE request. The request advertises every unpaid hash in its
+            // window and nothing bounded it, so a busy 30-minute bucket (~5,800 hashes) built a
+            // 1.58 MB message against the 1 MB cap and was dropped BEFORE reaching a peer —
+            // silently, since an undelivered request produces neither an error nor a discard
+            // count. Repair worked in thin buckets and stalled exactly where divergence was.
+            //
+            // Measured: 3,000 hashes -> 817 KB as an envelope, 5,799 -> 1,577,942 bytes. This is
+            // the request-side twin of the response bound in #559/#561/#562.
+            const MAX_HASHES_PER_REQUEST: i64 = 3_000;
+
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
             let mut bucket: i64 = 0;
@@ -3700,23 +3710,43 @@ async fn main() -> Result<()> {
                 // #558: log the outbound sweep request. A silent client and a client whose
                 // requests are all answered "nothing to serve" produced identical logs, so
                 // there was no way to tell a broken sweep from a converged one.
-                match conv_handler.build_ledger_request(since, until) {
-                    Ok(req) => {
-                        let advertised = req.share_hashes.len();
-                        if let Ok(bytes) = conv_handler.ledger_request_bytes(since, until) {
+                // Split the window until each request fits on the wire. A window with more
+                // than MAX_HASHES_PER_REQUEST hashes is halved repeatedly; each sub-window is
+                // sent separately. Without this the busiest windows — the ones actually holding
+                // divergence — produced messages no peer ever received.
+                let mut windows: Vec<(i64, i64)> = vec![(since, until)];
+                let mut sent = 0usize;
+                while let Some((ws, wu)) = windows.pop() {
+                    let n = db_for_conv.count_unpaid_shares_in(ws, wu).unwrap_or(0);
+                    if n > MAX_HASHES_PER_REQUEST && wu - ws > 1 {
+                        let mid = ws + (wu - ws) / 2;
+                        windows.push((ws, mid));
+                        windows.push((mid, wu));
+                        continue;
+                    }
+                    if n == 0 {
+                        continue; // nothing to advertise in this slice
+                    }
+                    match conv_handler.ledger_request_bytes(ws, wu) {
+                        Ok(bytes) => {
                             tracing::debug!(
-                                bucket,
-                                since,
-                                until,
-                                advertised,
+                                since = ws,
+                                until = wu,
+                                advertised = n,
+                                bytes = bytes.len(),
                                 "GHOST-03: window convergence request sent"
                             );
                             let _ = conv_tx.send(bytes).await;
+                            sent += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, since = ws, until = wu,
+                                "GHOST-03: could not build window convergence request");
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, since, until,
-                            "GHOST-03: could not build window convergence request");
+                    // Bound the fan-out from one tick so a pathological window cannot flood.
+                    if sent >= 8 {
+                        break;
                     }
                 }
             }

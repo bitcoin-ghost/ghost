@@ -747,6 +747,48 @@ mod tests {
 
     /// A forged backfill must never be credited, even over the ledger path — convergence bypasses
     /// the normal share-receive gate, so it has to verify GHOST-09 itself.
+    /// A convergence REQUEST must fit on the wire too — the response bound alone is not enough.
+    ///
+    /// The request advertises every unpaid hash in its window and nothing bounded it. A busy
+    /// 30-minute bucket on the live fleet holds ~5,800 hashes, which serialises to 1.58 MB
+    /// against the 1 MB cap, so it was dropped BEFORE reaching any peer. Silently: an
+    /// undelivered request yields neither an error nor a discard count, so repair simply
+    /// stalled wherever the divergence was densest while thin buckets kept working (#558).
+    #[test]
+    fn a_max_size_request_fits_in_one_envelope() {
+        const MAX_ENVELOPE_SIZE: usize = 1_000_000;
+        const MAX_HASHES_PER_REQUEST: usize = 3_000; // mirrors main.rs
+
+        let req = LedgerConvergenceRequest {
+            since_ts: 0,
+            until_ts: i64::MAX,
+            share_hashes: (0..MAX_HASHES_PER_REQUEST)
+                .map(|i| format!("{i:064x}"))
+                .collect(),
+        };
+        let inner = serde_json::to_vec(&ConvergencePayload::LedgerRequest(req)).unwrap();
+
+        // MessageEnvelope.payload is a bare Vec<u8>, so the inner JSON expands a second time.
+        let envelope = serde_json::json!({
+            "msg_type": "ShareConvergence",
+            "sender": "00".repeat(32),
+            "timestamp": 0u64,
+            "sequence": 0u64,
+            "signature": "00".repeat(64),
+            "payload": inner,
+            "ttl": 3u8,
+        });
+        let wire = serde_json::to_vec(&envelope).unwrap();
+
+        assert!(
+            wire.len() <= MAX_ENVELOPE_SIZE,
+            "a {MAX_HASHES_PER_REQUEST}-hash request is {} bytes as an envelope against a {} \
+             cap — the transport drops it and convergence silently never happens",
+            wire.len(),
+            MAX_ENVELOPE_SIZE
+        );
+    }
+
     /// A full window-convergence response must FIT ON THE WIRE — measured through BOTH
     /// serialisation layers, not just the inner payload.
     ///
