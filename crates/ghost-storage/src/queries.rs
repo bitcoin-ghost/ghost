@@ -8363,6 +8363,36 @@ impl Database {
     }
 
     /// Get L2 checkpoint at a specific height
+    /// The lowest INTERIOR gap in the stored L2 checkpoint range, as `(gap_start, gap_end)`
+    /// inclusive, or `None` if the range is contiguous.
+    ///
+    /// Tree sync only ever requested `from_height = current_height` — the TIP — so it chased the
+    /// few blocks it was behind at the front and never asked for holes inside its own range. The
+    /// canaries sat on frozen interior gaps (vm5 1,216, vm7 446, vm6 244) that no amount of
+    /// syncing could close, because nothing looked for them (#535).
+    ///
+    /// Returns the LOWEST gap so repeated calls walk the range forward deterministically rather
+    /// than re-requesting the same window. A node with no checkpoints has no interior gap.
+    pub fn lowest_l2_checkpoint_gap(&self) -> GhostResult<Option<(u64, u64)>> {
+        self.with_connection(|conn| {
+            // The first height whose successor is absent, paired with the next height present
+            // above it. Bounded by the stored range, so a node that is merely behind the tip
+            // (no interior hole) yields None rather than the whole future.
+            conn.query_row(
+                "SELECT c.height + 1, (SELECT MIN(n.height) FROM l2_checkpoints n WHERE n.height > c.height) - 1
+                 FROM l2_checkpoints c
+                 WHERE c.height < (SELECT MAX(height) FROM l2_checkpoints)
+                   AND NOT EXISTS (SELECT 1 FROM l2_checkpoints x WHERE x.height = c.height + 1)
+                 ORDER BY c.height
+                 LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     pub fn get_l2_checkpoint(&self, height: u64) -> GhostResult<Option<L2CheckpointRecord>> {
         self.with_connection(|conn| {
             let result = conn
@@ -9364,6 +9394,61 @@ pub fn resolve_bond_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Interior gaps must be found; a node merely BEHIND the tip must not report one.
+    /// This is #535: sync chased the tip and never asked for holes inside its own range.
+    #[test]
+    fn lowest_l2_checkpoint_gap_finds_interior_holes_only() {
+        let db = Database::in_memory().expect("in-memory db");
+        assert_eq!(db.lowest_l2_checkpoint_gap().unwrap(), None, "empty ledger");
+
+        let insert = |hs: &[u64]| -> String {
+            let vals = hs
+                .iter()
+                .map(|h| format!("({h},0,X'00',0,'p',1,X'00')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "INSERT INTO l2_checkpoints
+                   (height, epoch, commitment_root, tx_count, proposer_id, active_node_count, block_data)
+                 VALUES {vals};"
+            )
+        };
+
+        // Contiguous 100..=104 — being behind the tip is NOT an interior gap.
+        // The parent epoch must exist first: a trigger enforces
+        // l2_checkpoints.epoch -> l2_epochs.epoch.
+        db.with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO l2_epochs (epoch, start_height, initial_root) VALUES (0, 0, X'00');",
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed epoch");
+        db.with_connection(|c| {
+            c.execute_batch(&insert(&[100, 101, 102, 103, 104]))
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed contiguous");
+        assert_eq!(
+            db.lowest_l2_checkpoint_gap().unwrap(),
+            None,
+            "a contiguous range has no interior gap however far behind the tip it is"
+        );
+
+        // Punch holes: 105..=107 missing (108 present), 109 missing (110 present).
+        db.with_connection(|c| {
+            c.execute_batch(&insert(&[108, 110]))
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed holes");
+
+        assert_eq!(
+            db.lowest_l2_checkpoint_gap().unwrap(),
+            Some((105, 107)),
+            "must report the LOWEST gap so repeated calls walk forward deterministically"
+        );
+    }
 
     /// The GHOST-03 sweep span is derived from this, so it must ignore paid and invalid shares —
     /// and return None on an empty ledger rather than 0, which would make the span the epoch.

@@ -1909,11 +1909,38 @@ impl NullifierRouteHandler {
             }
         }
 
-        let current_height = self.epoch_manager.current_height();
+        // Ask for the lowest INTERIOR hole if we have one, otherwise for the tip.
+        //
+        // This only ever requested `current_height`, so it chased the few blocks it was behind
+        // at the FRONT and never asked for holes inside its own range. The canaries sat on
+        // frozen interior gaps — vm5 1,216 checkpoints in 64 contiguous runs, vm7 446, vm6 244 —
+        // that no amount of syncing could close, because nothing looked for them. Sync kept
+        // reporting "Tree sync complete — root matches peer" the whole time, which is true of
+        // the tip and says nothing about the holes (#535).
+        //
+        // Serving `from_height` walks forward from there, so requesting the gap start pulls the
+        // missing run. Taking the LOWEST gap each time makes repeated calls walk the range
+        // forward deterministically instead of re-requesting the same window.
+        let tip_height = self.epoch_manager.current_height();
+        let from_height = match self.db.lowest_l2_checkpoint_gap() {
+            Ok(Some((gap_start, gap_end))) => {
+                info!(
+                    gap_start,
+                    gap_end, tip_height, "L2 tree sync targeting an interior checkpoint gap"
+                );
+                gap_start
+            }
+            Ok(None) => tip_height,
+            Err(e) => {
+                // Never let a gap-query failure stop the tip from syncing.
+                warn!(error = %e, "could not check for interior checkpoint gaps — syncing tip");
+                tip_height
+            }
+        };
 
         let request = L2TreeSyncRequest {
             requesting_node: self.our_id,
-            from_height: current_height,
+            from_height,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
         };
 
@@ -1922,10 +1949,7 @@ impl NullifierRouteHandler {
                 .map_err(|e| GhostError::Serialization(e.to_string()))?;
             broadcast(MessageType::L2TreeSync, payload)?;
             *self.last_sync_request_sent.write() = Some(Instant::now());
-            info!(
-                from_height = current_height,
-                "Requested L2 tree sync from peers"
-            );
+            info!(from_height, tip_height, "Requested L2 tree sync from peers");
         }
 
         Ok(())
