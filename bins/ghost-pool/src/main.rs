@@ -3666,9 +3666,43 @@ async fn main() -> Result<()> {
             // the request-side twin of the response bound in #559/#561/#562.
             const MAX_HASHES_PER_REQUEST: i64 = 3_000;
 
+            // How many long-lane buckets to enqueue per tick.
+            //
+            // One bucket per long tick means the cursor walks 30 minutes of history per
+            // minute of wall-clock. Measured on vm7 2026-07-30: after 95 minutes of uptime
+            // the sweep had reached only 47 hours back, and the divergent region (07-25, five
+            // days back) needs FOUR HOURS from a cold start before it is even looked at. A
+            // full rotation over the ~58-day unpaid horizon takes 46 hours.
+            //
+            // There is no server-side throttle on serving these requests, so fan-out is the
+            // lever. 12 buckets per long tick covers 6 hours of history per minute — a full
+            // horizon sweep in ~4 hours instead of 46 — and each request is bounded by
+            // MAX_HASHES_PER_REQUEST, so the wire cost stays flat.
+            const LONG_BUCKETS_PER_TICK: i64 = 12;
+            /// Hard cap on requests emitted in one tick. Sized above LONG_BUCKETS_PER_TICK so a
+            /// tick's buckets are never silently dropped, with room for windows that split.
+            const MAX_REQUESTS_PER_TICK: usize = 24;
+
+            // Where the cursor is persisted. A restart used to reset it to bucket 0, throwing
+            // away the entire walk-back: five deploys on 2026-07-30 each cost up to 46 hours of
+            // traversal, which is why repair appeared to stall for a whole day.
+            const SWEEP_CURSOR_KEY: &str = "ghost03.ledger_sweep.bucket";
+
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(CONVERGENCE_INTERVAL_SECS));
-            let mut bucket: i64 = 0;
+            // Resume the cursor rather than restarting the walk-back on every process start.
+            let mut bucket: i64 = db_for_conv
+                .kv_get(SWEEP_CURSOR_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            if bucket != 0 {
+                info!(
+                    bucket,
+                    "GHOST-03: resuming ledger sweep from persisted cursor"
+                );
+            }
             let mut recent_bucket: i64 = 0;
             let mut long_lane = true;
 
@@ -3696,15 +3730,25 @@ async fn main() -> Result<()> {
                     .unwrap_or(LEDGER_SPAN_MIN_SECS);
                 let long_buckets = (span / LEDGER_BUCKET_SECS).max(1);
 
-                let (since, until) = if long_lane {
-                    let until = now - bucket * LEDGER_BUCKET_SECS;
-                    bucket = (bucket + 1) % long_buckets;
-                    (until - LEDGER_BUCKET_SECS, until)
+                // Collect this tick's windows. The long lane advances several buckets at
+                // once so the horizon is traversed in hours rather than days; the recent lane
+                // stays at one bucket because it is already covered every other tick.
+                let mut lane_windows: Vec<(i64, i64)> = Vec::new();
+                if long_lane {
+                    for _ in 0..LONG_BUCKETS_PER_TICK {
+                        let until = now - bucket * LEDGER_BUCKET_SECS;
+                        lane_windows.push((until - LEDGER_BUCKET_SECS, until));
+                        bucket = (bucket + 1) % long_buckets;
+                    }
+                    // Persist after advancing so a restart resumes here, not at bucket 0.
+                    if let Err(e) = db_for_conv.kv_set(SWEEP_CURSOR_KEY, &bucket.to_string()) {
+                        debug!(error = %e, "GHOST-03: could not persist sweep cursor");
+                    }
                 } else {
                     let until = now - recent_bucket * LEDGER_BUCKET_SECS;
+                    lane_windows.push((until - LEDGER_BUCKET_SECS, until));
                     recent_bucket = (recent_bucket + 1) % LEDGER_RECENT_BUCKETS;
-                    (until - LEDGER_BUCKET_SECS, until)
-                };
+                }
                 long_lane = !long_lane;
 
                 // #558: log the outbound sweep request. A silent client and a client whose
@@ -3714,7 +3758,7 @@ async fn main() -> Result<()> {
                 // than MAX_HASHES_PER_REQUEST hashes is halved repeatedly; each sub-window is
                 // sent separately. Without this the busiest windows — the ones actually holding
                 // divergence — produced messages no peer ever received.
-                let mut windows: Vec<(i64, i64)> = vec![(since, until)];
+                let mut windows: Vec<(i64, i64)> = lane_windows;
                 let mut sent = 0usize;
                 while let Some((ws, wu)) = windows.pop() {
                     let n = db_for_conv.count_unpaid_shares_in(ws, wu).unwrap_or(0);
@@ -3745,7 +3789,15 @@ async fn main() -> Result<()> {
                         }
                     }
                     // Bound the fan-out from one tick so a pathological window cannot flood.
-                    if sent >= 8 {
+                    // Must exceed LONG_BUCKETS_PER_TICK or the extra buckets are enqueued and
+                    // then silently dropped, which would make the faster traversal a no-op.
+                    // Headroom above it covers windows that split into several requests.
+                    if sent >= MAX_REQUESTS_PER_TICK {
+                        debug!(
+                            sent,
+                            remaining = windows.len(),
+                            "GHOST-03: sweep fan-out cap reached this tick"
+                        );
                         break;
                     }
                 }
