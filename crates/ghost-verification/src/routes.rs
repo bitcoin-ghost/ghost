@@ -11132,8 +11132,14 @@ async fn api_nickname_post_handler(
     .into_response()
 }
 
-/// Swarm node add body
+/// Swarm node add body.
+///
+/// Retained while the route answers 501 (#403): axum still deserialises it, so a malformed
+/// body is rejected with 422 rather than reaching the handler. Deleting it would loosen the
+/// wire contract to "accepts anything", which is the wrong direction for a route that is
+/// meant to be implemented rather than removed.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SwarmNodeAddBody {
     name: String,
     address: String,
@@ -11144,30 +11150,56 @@ async fn api_swarm_node_add_handler(
     State(_state): State<Arc<VerificationState>>,
     Json(body): Json<SwarmNodeAddBody>,
 ) -> impl IntoResponse {
-    // Swarm node management is operator-local fleet tracking
-    // For now, return the node as acknowledged (DB persistence comes later)
-    Json(serde_json::json!({
-        "node_id": format!("{:08x}", fxhash(&body.address)),
-        "name": body.name,
-        "address": body.address,
-        "online": false,
-        "shares": 0,
-        "max_shares": 15,
-        "last_seen": 0
-    }))
+    // Returned a fully-formed node object — id, name, online, shares — none of which was
+    // stored anywhere. The caller had every reason to believe the node had been added.
+    swarm_not_implemented(&format!("{:08x}", fxhash(&body.address)), "add node")
 }
 
 /// API v1 Swarm: Remove a node from fleet tracking
+/// Fleet-control routes that claim to act on a REMOTE node but have nothing behind them.
+///
+/// These returned fabricated success — `{"message": "Restart command sent"}` with no command
+/// sent, `204 No Content` for an update that updated nothing. An operator pressing Restart in
+/// the dashboard was told it worked, and nothing happened. That is worse than an error: it
+/// hides the missing capability instead of reporting it, and the operator moves on believing
+/// the node was restarted (#403).
+///
+/// There is no swarm-node store (`grep swarm_node crates/ghost-storage` finds nothing) and no
+/// authenticated node-to-node control RPC, so these cannot be honoured locally. Until that
+/// exists they answer 501 and name what is missing.
+///
+/// Deliberately NOT wired to a real action in this change: one node restarting another is a
+/// security-sensitive capability that needs an auth design of its own, and inventing one under
+/// time pressure is how the rest of this file grew stubs.
+fn swarm_not_implemented(node_id: &str, action: &str) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "not_implemented",
+            "action": action,
+            "node_id": node_id,
+            "message": format!(
+                "{action} is not implemented: there is no swarm-node store and no authenticated \
+                 node-to-node control RPC. This endpoint previously reported success without \
+                 acting (#403)."
+            ),
+        })),
+    )
+}
+
 async fn api_swarm_node_remove_handler(
     State(_state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
-    debug!(node_id = %node_id, "Removing swarm node");
-    StatusCode::NO_CONTENT
+    swarm_not_implemented(&node_id, "remove node")
 }
 
-/// Swarm node update body
+/// Swarm node update body.
+///
+/// Retained for the same reason as [`SwarmNodeAddBody`] — it keeps the request shape validated
+/// while the route answers 501 (#403).
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SwarmNodeUpdateBody {
     name: Option<String>,
     address: Option<String>,
@@ -11177,10 +11209,9 @@ struct SwarmNodeUpdateBody {
 async fn api_swarm_node_update_handler(
     State(_state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
-    Json(body): Json<SwarmNodeUpdateBody>,
+    Json(_body): Json<SwarmNodeUpdateBody>,
 ) -> impl IntoResponse {
-    debug!(node_id = %node_id, name = ?body.name, address = ?body.address, "Updating swarm node");
-    StatusCode::NO_CONTENT
+    swarm_not_implemented(&node_id, "update node metadata")
 }
 
 /// API v1 Swarm: Re-poll a node's status
@@ -11188,12 +11219,7 @@ async fn api_swarm_node_refresh_handler(
     State(_state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
-    debug!(node_id = %node_id, "Refreshing swarm node");
-    Json(serde_json::json!({
-        "node_id": node_id,
-        "online": false,
-        "message": "Refresh queued"
-    }))
+    swarm_not_implemented(&node_id, "refresh node status")
 }
 
 /// API v1 Swarm: Configure a remote node
@@ -11202,11 +11228,7 @@ async fn api_swarm_node_config_handler(
     Path(node_id): Path<String>,
     Json(_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    debug!(node_id = %node_id, "Configuring swarm node");
-    Json(serde_json::json!({
-        "node_id": node_id,
-        "message": "Configuration updated"
-    }))
+    swarm_not_implemented(&node_id, "configure node")
 }
 
 /// API v1 Swarm: Restart a remote node
@@ -11214,11 +11236,7 @@ async fn api_swarm_node_restart_handler(
     State(_state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
-    debug!(node_id = %node_id, "Restarting swarm node");
-    Json(serde_json::json!({
-        "node_id": node_id,
-        "message": "Restart command sent"
-    }))
+    swarm_not_implemented(&node_id, "restart node")
 }
 
 /// API v1 Swarm: Update a remote node's version
@@ -11227,11 +11245,7 @@ async fn api_swarm_node_update_version_handler(
     Path(node_id): Path<String>,
     Json(_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    debug!(node_id = %node_id, "Updating swarm node version");
-    Json(serde_json::json!({
-        "node_id": node_id,
-        "message": "Update command sent"
-    }))
+    swarm_not_implemented(&node_id, "update node version")
 }
 
 /// API v1 Swarm: Sync fleet from P2P peer list (POST variant)
@@ -11963,6 +11977,48 @@ async fn api_system_mempool_handler(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// Fleet-control routes must never report success without acting (#403).
+    ///
+    /// They previously returned `{"message": "Restart command sent"}` with nothing sent, and
+    /// `204 No Content` for updates that updated nothing. An operator pressing Restart was told
+    /// it worked. This asserts the response is an explicit 501 that names the action, so the
+    /// missing capability is visible rather than hidden.
+    ///
+    /// Asserting the SHAPE, not just the status: a bare 501 with no body would satisfy a status
+    /// check while still telling the operator nothing about why.
+    #[tokio::test]
+    async fn swarm_control_routes_report_not_implemented_rather_than_fake_success() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+
+        for action in [
+            "restart node",
+            "configure node",
+            "refresh node status",
+            "update node version",
+            "update node metadata",
+            "remove node",
+            "add node",
+        ] {
+            let resp = swarm_not_implemented("deadbeef", action).into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "{action} must not report success while doing nothing"
+            );
+
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "not_implemented");
+            assert_eq!(body["action"], action, "the response must name the action");
+            assert_eq!(body["node_id"], "deadbeef");
+            assert!(
+                body["message"].as_str().unwrap_or("").contains("#403"),
+                "the message should point at the issue explaining why"
+            );
+        }
+    }
 
     #[test]
     fn test_filtering_activity_json_shape_and_totals() {
