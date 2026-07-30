@@ -117,3 +117,29 @@ impl DownstreamData {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stratum ordering rule this fix depends on: a miner must never see
+    /// `set_difficulty` before its first `mining.notify`.
+    ///
+    /// #455 sends `set_difficulty` straight to the wire once the miner has a job, and keeps
+    /// the old caching behaviour before that. The whole guard is
+    /// `last_job_received_time.is_some()`, so a fresh downstream MUST start as `None` — if it
+    /// ever defaulted to `Some`, the very first difficulty for a brand-new miner would be sent
+    /// ahead of its first job, which is the ordering violation the cache exists to prevent.
+    #[test]
+    fn a_fresh_downstream_has_no_job_so_difficulty_is_still_cached() {
+        let d = DownstreamData::new(None, Target::from_le_bytes([0xff; 32]), 8);
+        assert!(
+            d.last_job_received_time.is_none(),
+            "a downstream with no job must cache set_difficulty, not send it"
+        );
+        assert!(
+            d.cached_set_difficulty.is_none(),
+            "nothing should be cached before anything is received"
+        );
+    }
+}
