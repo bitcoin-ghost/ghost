@@ -237,6 +237,26 @@ fn verify_ed25519(pubkey: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bo
     ghost_common::identity::verify_signature(pubkey, message, signature).unwrap_or(false)
 }
 
+/// Read the operator public key from `GHOST_OPERATOR_PUBKEY` (64 hex chars).
+///
+/// Absent or malformed yields `None`, which disables remote control. Failing closed is the
+/// only safe direction: a typo in the key must not leave the node accepting anything, and it
+/// must not stop the node starting either.
+pub fn operator_pubkey_from_env() -> Option<[u8; 32]> {
+    let raw = std::env::var("GHOST_OPERATOR_PUBKEY").ok()?;
+    let bytes = hex::decode(raw.trim()).ok()?;
+    if bytes.len() != 32 {
+        tracing::warn!(
+            len = bytes.len(),
+            "GHOST_OPERATOR_PUBKEY is not 32 bytes — fleet control stays disabled"
+        );
+        return None;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&bytes);
+    Some(k)
+}
+
 /// Current unix seconds.
 pub fn now_secs() -> u64 {
     SystemTime::now()

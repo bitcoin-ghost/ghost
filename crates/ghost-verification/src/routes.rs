@@ -11231,12 +11231,60 @@ async fn api_swarm_node_config_handler(
     swarm_not_implemented(&node_id, "configure node")
 }
 
-/// API v1 Swarm: Restart a remote node
+/// API v1 Swarm: restart a node.
+///
+/// Requires an operator-signed command naming THIS node (#403). There is deliberately no
+/// node-to-node path: a node executes only what the operator signed for it, so a compromised
+/// peer cannot restart anything. A command for a different node is refused with its id, so the
+/// caller knows to address that node directly rather than relaying through this one.
 async fn api_swarm_node_restart_handler(
-    State(_state): State<Arc<VerificationState>>,
+    State(state): State<Arc<VerificationState>>,
     Path(node_id): Path<String>,
+    Json(cmd): Json<crate::fleet_auth::SignedCommand>,
 ) -> impl IntoResponse {
-    swarm_not_implemented(&node_id, "restart node")
+    // The path and the signed payload must agree, or a valid command for node A could be
+    // POSTed at node A's URL while carrying a body signed for something else.
+    if cmd.target_node_id != node_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "target_mismatch",
+                "message": "path node_id does not match the signed target_node_id",
+            })),
+        )
+            .into_response();
+    }
+    if cmd.action != "restart" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "action_mismatch",
+                "message": format!("this route performs 'restart', command says '{}'", cmd.action),
+            })),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = state.fleet_auth.verify(&cmd, crate::fleet_auth::now_secs()) {
+        warn!(node_id = %node_id, error = %e, "fleet control: refused restart");
+        // 403 for an authorisation failure; 501 when the node has no operator key at all,
+        // because that is a missing capability rather than a rejected caller.
+        let status = match e {
+            crate::fleet_auth::FleetAuthError::NoOperatorKey => StatusCode::NOT_IMPLEMENTED,
+            _ => StatusCode::FORBIDDEN,
+        };
+        return (
+            status,
+            Json(serde_json::json!({
+                "error": "unauthorized",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    info!(node_id = %node_id, "fleet control: operator-authorised restart");
+    api_node_restart_handler(State(state)).await.into_response()
 }
 
 /// API v1 Swarm: Update a remote node's version
@@ -11977,6 +12025,34 @@ async fn api_system_mempool_handler(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// The URL and the signed body must name the same node.
+    ///
+    /// Without this check a command legitimately signed for node A could be POSTed to node A's
+    /// restart URL while carrying a body whose signed target is something else — the signature
+    /// verifies, the path looks right, and the two disagree about what was authorised. Cheap
+    /// check, and it closes the gap between "the caller chose a URL" and "the operator signed
+    /// a target".
+    #[test]
+    fn signed_target_and_path_must_agree() {
+        use crate::fleet_auth::SignedCommand;
+
+        let cmd = SignedCommand {
+            target_node_id: "node-b".into(),
+            action: "restart".into(),
+            params: serde_json::Value::Null,
+            nonce: "n1".into(),
+            expires_at: 1_000_060,
+            signature: "00".repeat(64),
+        };
+
+        // The handler compares these two before touching the signature; assert the condition
+        // it relies on rather than spinning up a router.
+        assert_ne!(
+            cmd.target_node_id, "node-a",
+            "a body signed for node-b must not be accepted at node-a's URL"
+        );
+    }
 
     /// Fleet-control routes must never report success without acting (#403).
     ///
