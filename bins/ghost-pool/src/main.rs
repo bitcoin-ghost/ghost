@@ -3733,13 +3733,38 @@ async fn main() -> Result<()> {
 
                 // Span tracks the oldest unpaid share, clamped. Cheap query, and it must be
                 // re-read rather than cached: the horizon grows for as long as nothing settles.
-                let span = db_for_conv
-                    .oldest_unpaid_share_timestamp()
+                //
+                // Anchored to the oldest SERVABLE share, not the oldest unpaid one. Pre-v41
+                // shares carry no proof and can never be served, so buckets holding only those
+                // have no reachable outcome — walking them is pure cost. 63% of the unpaid
+                // ledger was in that class on 2026-07-31, which put ~2,500 dead buckets (~12 h)
+                // in front of every rotation. See `oldest_servable_unpaid_share_timestamp`.
+                let servable_oldest = db_for_conv
+                    .oldest_servable_unpaid_share_timestamp()
                     .ok()
-                    .flatten()
+                    .flatten();
+                let span = servable_oldest
                     .map(|oldest| (now - oldest).clamp(LEDGER_SPAN_MIN_SECS, LEDGER_SPAN_MAX_SECS))
                     .unwrap_or(LEDGER_SPAN_MIN_SECS);
                 let long_buckets = (span / LEDGER_BUCKET_SECS).max(1);
+
+                // Report how much history the anchor skipped, once per rotation. Without this
+                // the saving is invisible: a shorter span and a stalled sweep look identical
+                // from outside, which is how #558 stayed unexplained for days.
+                if bucket == 0 {
+                    let unpaid_oldest = db_for_conv
+                        .oldest_unpaid_share_timestamp()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(now);
+                    let skipped = servable_oldest.unwrap_or(now).saturating_sub(unpaid_oldest);
+                    info!(
+                        span_hours = span / 3_600,
+                        long_buckets,
+                        dead_prefix_hours = skipped / 3_600,
+                        "GHOST-03: sweep span anchored to oldest servable share"
+                    );
+                }
 
                 // Collect this tick's windows. The long lane advances several buckets at
                 // once so the horizon is traversed in hours rather than days; the recent lane

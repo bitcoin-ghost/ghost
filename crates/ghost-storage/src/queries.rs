@@ -463,6 +463,42 @@ impl Database {
         })
     }
 
+    /// Timestamp of the oldest unpaid share that can actually be SERVED, or `None` if none can.
+    ///
+    /// Identical to `oldest_unpaid_share_timestamp` except it requires a stored `proof`. That
+    /// distinction decides how far back the GHOST-03 sweep is worth walking.
+    ///
+    /// Shares predating schema v41 carry no proof — their GHOST-09 signatures are gone, so no
+    /// peer can serve or verify them and convergence cannot repair the divergence they cause
+    /// (see `unpaid_proofs_missing_from`, which counts them as `unservable`). Measured on
+    /// ghost-vm1 2026-07-31: **1,739,691 of 2,760,622 unpaid shares (63%)** are in this class,
+    /// spanning 2026-06-02 to 07-20.
+    ///
+    /// Anchoring the span to the oldest *unpaid* share therefore made the sweep cross ~2,500
+    /// buckets of unrepairable history on every rotation before reaching a share it could fix —
+    /// ~12 hours at the measured 4 buckets/min, during which repair was idle and the gap looked
+    /// frozen. Anchoring to the oldest *servable* share skips exactly the region where no
+    /// outcome is possible, and nothing is lost: those shares cannot be repaired by any sweep
+    /// schedule. Clearing the backlog itself needs the one-time union reconciliation described
+    /// on `export_unpaid_shares`.
+    ///
+    /// Uses `with_connection` deliberately, not `with_read_connection`: the read pool is
+    /// #571, which is proposed for revert (it does not fix #554 and costs ~93 MB/node), and
+    /// this fix must not depend on that outcome. It is a single indexed `MIN`, run once per
+    /// sweep tick — the connection it borrows is not the interesting cost here.
+    pub fn oldest_servable_unpaid_share_timestamp(&self) -> GhostResult<Option<i64>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT MIN(timestamp) FROM shares
+                 WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                   AND proof IS NOT NULL AND length(proof) > 0",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     /// How many unpaid share hashes a window would advertise. Cheap COUNT, used to split a
     /// window before building a request that would not fit on the wire.
     ///
@@ -9552,6 +9588,50 @@ mod tests {
             db.oldest_unpaid_share_timestamp().unwrap(),
             Some(1000),
             "must skip the PAID share at 500 and the INVALID one at 400"
+        );
+    }
+
+    /// The sweep anchor must ignore shares that carry no proof.
+    ///
+    /// Pre-v41 shares are unpaid and valid but unservable, so anchoring the GHOST-03 span to
+    /// them makes the sweep walk history where no repair is possible — 63% of the live unpaid
+    /// ledger on 2026-07-31, ~12 h of dead buckets per rotation (#558).
+    #[test]
+    fn oldest_servable_anchor_ignores_shares_with_no_proof() {
+        let db = Database::in_memory().expect("in-memory db");
+        assert_eq!(
+            db.oldest_servable_unpaid_share_timestamp().unwrap(),
+            None,
+            "empty ledger has no servable anchor"
+        );
+
+        db.with_connection(|conn| {
+            conn.execute_batch(
+                "INSERT INTO shares
+                   (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid, paid_in_proposal_hash, proof)
+                 VALUES
+                   (1,'m',1.0,1.0,'h_dead_oldest',  100,'n',1,NULL,NULL),
+                   (1,'m',1.0,1.0,'h_dead_empty',   200,'n',1,NULL,X''),
+                   (1,'m',1.0,1.0,'h_servable',     900,'n',1,NULL,X'BEEF'),
+                   (1,'m',1.0,1.0,'h_paid_proof',   300,'n',1,X'AA',X'BEEF'),
+                   (1,'m',1.0,1.0,'h_invalid_proof',400,'n',0,NULL,X'BEEF');",
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed shares");
+
+        // The plain anchor still sees the dead share at 100 — that is what dragged the span back.
+        assert_eq!(
+            db.oldest_unpaid_share_timestamp().unwrap(),
+            Some(100),
+            "unpaid anchor includes proof-less shares"
+        );
+
+        assert_eq!(
+            db.oldest_servable_unpaid_share_timestamp().unwrap(),
+            Some(900),
+            "servable anchor must skip NULL proof (100), empty proof (200), \
+             the PAID share (300) and the INVALID one (400)"
         );
     }
 
