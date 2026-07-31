@@ -107,6 +107,77 @@ jobs:
       - name: Check for unused dependencies
         run: cargo machete
 
+  # Integration test targets.
+  #
+  # CI ran `cargo test --lib --bins` (which does not build `tests/` targets at all) plus
+  # `cargo test --test integration` (ONE named target). Between them they covered 1 of the
+  # workspace's integration test files. `cargo metadata` reports 47 such targets — a
+  # `bins/*/tests` + `crates/*/tests` glob finds only 14, because three packages sit elsewhere.
+  #
+  # `payout_ledger_e2e` had consequently been RED on `main` for an unknown period, failing with
+  # "GHOST-02: 0/8 nodes approved" — which reads like a catastrophic payout bug and was in fact a
+  # stale fixture. Nobody saw it because nothing ran it (#580).
+  #
+  # This is a SEPARATE job, not a step on `test`, deliberately: adding it there pushed that job
+  # from ~28 min past its 45-minute timeout and it was cancelled mid-run. Here it runs in
+  # parallel and cannot slow the critical path. Linux only — the same rationale the
+  # wraith-wallet step already documents.
+  #
+  # Exclusions:
+  #   ghost-mpc / mpc-xproc-harness  -> `mpc-tests` job; they need a per-package feature that a
+  #                                    workspace-wide `--tests` cannot set
+  #   integration_tests_sv2          -> 18 targets that spin up real SRI pool / template-provider
+  #                                    processes (58 `start_pool` call sites, only one
+  #                                    `#[ignore]`d). They need external services and a per-test
+  #                                    budget this job does not have, and have never run in CI.
+  #                                    Triaging them is separate work, tracked on #580.
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+      - name: Run integration tests
+        run: |
+          # bond_e2e execs the real ghost-pay binary and asserts it exists.
+          cargo build -p ghost-pay
+          cargo test $WORKSPACE_EXCLUDES --tests \
+            --exclude ghost-mpc \
+            --exclude mpc-xproc-harness \
+            --exclude integration_tests_sv2
+
+  # MPC integration harnesses.
+  #
+  # Split out of the `test` job for two reasons. They require `--features mpc-test-cap` — without
+  # it both panic deliberately, because a real run would need 101 phase-2 transforms — and a
+  # workspace-wide `--tests` cannot set a per-package feature. They also take ~5 minutes each
+  # (289 s and 303 s measured), so running them here keeps them off the main job's critical path
+  # instead of adding ~10 minutes to it.
+  #
+  # Neither had ever run in CI before #580.
+  mpc-tests:
+    name: MPC integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+      - name: MPC lifecycle (small-cap harness)
+        run: cargo test -p ghost-mpc --test mpc_lifecycle --features mpc-test-cap
+      - name: MPC cross-process contribution flow
+        run: cargo test -p mpc-xproc-harness --test xproc --features mpc-test-cap
+
   # Build and test
   test:
     name: Test (${{ matrix.os }})
@@ -173,10 +244,6 @@ jobs:
       # gain without either surprise.
       - name: Run unit tests (feature-gated consensus modules)
         run: cargo test -p ghost-consensus --lib --features zk-consensus,mpc-ceremony
-
-      # Run integration tests
-      - name: Run integration tests
-        run: cargo test --test integration
 
       # Run wraith-wallet integration tests (separate from --lib --bins).
       # These spin up the real wraithd binary against a tempdir socket, plus
