@@ -35,6 +35,56 @@ use crate::models::*;
 /// row rather than a six-tuple.
 type MpcContributionRow = (i64, String, Vec<u8>, Vec<u8>, i64, i64);
 
+/// Widen a stored BLOB back to a 32-byte hash.
+///
+/// Short or corrupt values become all-zero rather than panicking: these columns are written by this
+/// process from fixed-size arrays, so a wrong length means the row is damaged, and a damaged row
+/// should fail to match anything rather than take the node down.
+fn to_hash32(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    if bytes.len() == 32 {
+        out.copy_from_slice(bytes);
+    }
+    out
+}
+
+/// A ratified payout proposal, kept so settlement can match an observed coinbase back to the
+/// proposal that paid it.
+#[derive(Debug, Clone)]
+pub struct RatifiedProposalRecord {
+    /// Identifies the proposal; what `paid_in_proposal_hash` is set to.
+    pub proposal_hash: [u8; 32],
+    /// `CoinbaseOutputs/v1` hash of the payout's outputs — the lookup key, because it is the one
+    /// thing recoverable from a coinbase seen on-chain.
+    pub outputs_hash: [u8; 32],
+    /// Ledger cutoff: shares at or before this are the ones the proposal pays.
+    pub cutoff_ts: i64,
+    /// Height the proposal was built for.
+    pub block_height: u64,
+    /// Treasury amount this payout credits, needed to invert it on a reorg.
+    pub treasury_amount: u64,
+    /// H-MINE-3 snapshot of the treasury address as it stood when the proposal was built.
+    pub treasury_address: Vec<u8>,
+    /// The serialized proposal, so a node can settle without re-deriving it.
+    pub proposal_json: Vec<u8>,
+}
+
+/// Exactly what a settlement applied — or, from `reverse_settlement`, exactly what it undid.
+///
+/// Recorded rather than recomputed so a reorg inverts the original amounts. By the time a reorg
+/// arrives the ledger has moved on, and re-deriving would act on the wrong rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementApplied {
+    /// Proposal the paying block carried.
+    pub proposal_hash: [u8; 32],
+    /// Share rows marked paid (or unmarked, when reversing).
+    pub shares_marked: usize,
+    /// Satoshis added to the treasury (or removed, when reversing).
+    pub treasury_bumped: u64,
+    /// Whether this settlement was the one that took the treasury past its decay threshold.
+    pub threshold_crossed: bool,
+}
+
 // =============================================================================
 // M-15: BLOB SIZE VALIDATION
 // =============================================================================
@@ -1710,6 +1760,318 @@ impl Database {
                 updated_total += updated;
             }
             Ok(updated_total)
+        })
+    }
+
+    /// Persist a ratified payout proposal so settlement can recognise the block that pays it.
+    ///
+    /// Proposals otherwise live only in an in-memory map, which is fine while the node that built
+    /// the template is also the node that settles — and useless the moment every node has to settle
+    /// from its own view of the chain. `outputs_hash` is the lookup key because it is the one thing
+    /// recoverable from an observed coinbase.
+    pub fn upsert_ratified_proposal(&self, rec: &RatifiedProposalRecord) -> GhostResult<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO ratified_proposals
+                    (proposal_hash, outputs_hash, cutoff_ts, block_height,
+                     treasury_amount, treasury_address, proposal_json, created_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(proposal_hash) DO NOTHING",
+                params![
+                    rec.proposal_hash.to_vec(),
+                    rec.outputs_hash.to_vec(),
+                    rec.cutoff_ts,
+                    rec.block_height as i64,
+                    rec.treasury_amount as i64,
+                    rec.treasury_address,
+                    rec.proposal_json,
+                    now,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Find the proposal a coinbase pays, given the hash of that coinbase's outputs.
+    ///
+    /// `None` means "not one of ours" — which is the overwhelmingly common answer, since every
+    /// block anyone else mines lands here too.
+    pub fn get_ratified_proposal_by_outputs_hash(
+        &self,
+        outputs_hash: &[u8; 32],
+    ) -> GhostResult<Option<RatifiedProposalRecord>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT proposal_hash, outputs_hash, cutoff_ts, block_height,
+                        treasury_amount, treasury_address, proposal_json
+                 FROM ratified_proposals WHERE outputs_hash = ?1",
+                params![outputs_hash.to_vec()],
+                |r| {
+                    let ph: Vec<u8> = r.get(0)?;
+                    let oh: Vec<u8> = r.get(1)?;
+                    Ok(RatifiedProposalRecord {
+                        proposal_hash: to_hash32(&ph),
+                        outputs_hash: to_hash32(&oh),
+                        cutoff_ts: r.get(2)?,
+                        block_height: r.get::<_, i64>(3)? as u64,
+                        treasury_amount: r.get::<_, i64>(4)? as u64,
+                        treasury_address: r.get(5)?,
+                        proposal_json: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
+    /// Settle a won block: mark its shares paid, bump the treasury, record the win — atomically.
+    ///
+    /// `Ok(None)` means this block was already settled and nothing changed. That is the idempotency
+    /// guarantee the observer relies on: the submitting node settles the instant it submits, every
+    /// other node settles when it sees the block, and a startup rescan may try again — all three
+    /// must converge on one application.
+    ///
+    /// One transaction, deliberately. The path this replaces did the mark, the won-block record and
+    /// the treasury bump as three separate writes, so a crash between them left the ledger claiming
+    /// shares were paid by a block that was never recorded as won, or a treasury credited twice on
+    /// retry.
+    ///
+    /// Returns exactly what was applied, which is what makes reversal an inversion rather than a
+    /// recomputation — by the time a reorg arrives, the ledger has moved on and re-deriving would
+    /// unmark the wrong rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle_block_atomic(
+        &self,
+        block_hash: &str,
+        block_height: u64,
+        proposal_hash: &[u8; 32],
+        outputs_hash: &[u8; 32],
+        miner_ids: &[String],
+        cutoff_ts: i64,
+        treasury_amount: u64,
+        treasury_threshold: u64,
+    ) -> GhostResult<Option<SettlementApplied>> {
+        let now = chrono::Utc::now().timestamp();
+        let proposal_hash = *proposal_hash;
+        let outputs_hash = *outputs_hash;
+
+        self.transaction(move |tx| {
+            // Claim the block. An unreversed row means someone already applied this.
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT reversed FROM settled_blocks WHERE block_hash = ?1",
+                    params![block_hash],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            if existing == Some(0) {
+                return Ok(None);
+            }
+
+            // Mark shares paid. Chunked for the same reason mark_miners_paid chunks: SQLite's
+            // variable limit, and keeping the write-lock hold short on the single writer.
+            const CHUNK: usize = 500;
+            let mut shares_marked: usize = 0;
+            for batch in miner_ids.chunks(CHUNK) {
+                let placeholders: Vec<&str> = batch.iter().map(|_| "?").collect();
+                let sql = format!(
+                    "UPDATE shares
+                        SET paid_in_proposal_hash = ?1
+                      WHERE paid_in_proposal_hash IS NULL
+                        AND timestamp <= ?2
+                        AND miner_id IN ({})",
+                    placeholders.join(",")
+                );
+                let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(batch.len() + 2);
+                bind.push(Box::new(proposal_hash.to_vec()));
+                bind.push(Box::new(cutoff_ts));
+                for id in batch {
+                    bind.push(Box::new(id.clone()));
+                }
+                let params_ref: Vec<&dyn rusqlite::ToSql> =
+                    bind.iter().map(|b| b.as_ref()).collect();
+                shares_marked += tx
+                    .prepare(&sql)
+                    .and_then(|mut s| s.execute(params_ref.as_slice()))
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+            }
+
+            // Treasury, same semantics as add_treasury_funds but inside this transaction.
+            let current: u64 = tx
+                .query_row(
+                    "SELECT value FROM kv_store WHERE key = ?1",
+                    [TREASURY_BALANCE_KEY],
+                    |row| {
+                        let s: String = row.get(0)?;
+                        Ok(s.parse::<u64>().unwrap_or(0))
+                    },
+                )
+                .unwrap_or(0);
+            let new_balance = current.saturating_add(treasury_amount);
+            tx.execute(
+                "INSERT INTO kv_store (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+                params![TREASURY_BALANCE_KEY, new_balance.to_string(), now],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            let threshold_crossed =
+                current < treasury_threshold && new_balance >= treasury_threshold;
+            if threshold_crossed {
+                tx.execute(
+                    "INSERT INTO kv_store (key, value, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+                    params![TREASURY_THRESHOLD_REACHED_KEY, now.to_string(), now],
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            }
+
+            tx.execute(
+                "INSERT OR IGNORE INTO won_blocks (block_height) VALUES (?1)",
+                params![block_height as i64],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            // Record what was applied. `reversed = 0` both for a first settle and for re-settling a
+            // block that came back after a reorg.
+            tx.execute(
+                "INSERT INTO settled_blocks
+                    (block_hash, block_height, proposal_hash, outputs_hash,
+                     shares_marked, treasury_bumped, settled_ts, reversed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+                 ON CONFLICT(block_hash) DO UPDATE SET
+                     shares_marked = ?5, treasury_bumped = ?6, settled_ts = ?7, reversed = 0",
+                params![
+                    block_hash,
+                    block_height as i64,
+                    proposal_hash.to_vec(),
+                    outputs_hash.to_vec(),
+                    shares_marked as i64,
+                    treasury_amount as i64,
+                    now,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(Some(SettlementApplied {
+                proposal_hash,
+                shares_marked,
+                treasury_bumped: treasury_amount,
+                threshold_crossed,
+            }))
+        })
+    }
+
+    /// Undo a settlement whose block left the main chain, using the amounts that settlement
+    /// recorded rather than recomputing them.
+    ///
+    /// `Ok(None)` means there was nothing unreversed to undo. Idempotent for the same reason
+    /// settling is: a `Disconnected` event and the reconciliation sweep may both reach the same
+    /// block.
+    pub fn reverse_settlement(&self, block_hash: &str) -> GhostResult<Option<SettlementApplied>> {
+        let now = chrono::Utc::now().timestamp();
+        self.transaction(move |tx| {
+            let row: Option<(Vec<u8>, i64, i64)> = tx
+                .query_row(
+                    "SELECT proposal_hash, treasury_bumped, block_height
+                     FROM settled_blocks WHERE block_hash = ?1 AND reversed = 0",
+                    params![block_hash],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let Some((proposal_hash_bytes, treasury_bumped, block_height)) = row else {
+                return Ok(None);
+            };
+            let proposal_hash = to_hash32(&proposal_hash_bytes);
+            let treasury_bumped = treasury_bumped.max(0) as u64;
+
+            // Unmark exactly the shares this proposal paid. Keyed on the proposal, not on a cutoff
+            // recomputation, so shares that accrued since are untouched.
+            let shares_unmarked = tx
+                .execute(
+                    "UPDATE shares SET paid_in_proposal_hash = NULL
+                      WHERE paid_in_proposal_hash = ?1",
+                    params![proposal_hash_bytes],
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let current: u64 = tx
+                .query_row(
+                    "SELECT value FROM kv_store WHERE key = ?1",
+                    [TREASURY_BALANCE_KEY],
+                    |row| {
+                        let s: String = row.get(0)?;
+                        Ok(s.parse::<u64>().unwrap_or(0))
+                    },
+                )
+                .unwrap_or(0);
+            if treasury_bumped > current {
+                // Floor rather than wrap, and say so: the balance moving under us means something
+                // else is writing it, which is worth knowing about.
+                tracing::error!(
+                    block_hash,
+                    treasury_bumped,
+                    current,
+                    "reversing a settlement would take the treasury below zero — flooring at 0"
+                );
+            }
+            let new_balance = current.saturating_sub(treasury_bumped);
+            tx.execute(
+                "INSERT INTO kv_store (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+                params![TREASURY_BALANCE_KEY, new_balance.to_string(), now],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            tx.execute(
+                "DELETE FROM won_blocks WHERE block_height = ?1",
+                params![block_height],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            tx.execute(
+                "UPDATE settled_blocks SET reversed = 1 WHERE block_hash = ?1",
+                params![block_hash],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(Some(SettlementApplied {
+                proposal_hash,
+                shares_marked: shares_unmarked,
+                treasury_bumped,
+                threshold_crossed: false,
+            }))
+        })
+    }
+
+    /// Blocks this node believes it has settled and not reversed.
+    ///
+    /// The reconciliation sweep re-checks each against the chain: a `Disconnected` event can be
+    /// missed (restart, dropped subscription), and a settlement left standing for a block that is no
+    /// longer in the main chain is work wrongly marked paid.
+    pub fn list_unreversed_settled_blocks(&self) -> GhostResult<Vec<(String, u64)>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT block_hash, block_height FROM settled_blocks
+                      WHERE reversed = 0 ORDER BY block_height DESC",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
         })
     }
 
@@ -11372,6 +11734,191 @@ mod tests {
             "share of a >1-year-dark miner must be reclaimed"
         );
         assert!(db.get_shares_by_round(1).unwrap().is_empty());
+    }
+
+    /// Fixture: one miner with `n` unpaid shares, plus the ratified proposal that pays them.
+    fn settlement_fixture(db: &Database, miner: &str, n: usize) -> (i64, RatifiedProposalRecord) {
+        let now_s = ledger_now_s();
+        db.upsert_miner(&ledger_miner(miner, now_s)).unwrap();
+        for i in 0..n {
+            db.insert_share(&ledger_share(
+                1,
+                miner,
+                &format!("settle_share_{i}"),
+                now_s - 600,
+            ))
+            .unwrap();
+        }
+        let rec = RatifiedProposalRecord {
+            proposal_hash: [0xAB; 32],
+            outputs_hash: [0xCD; 32],
+            cutoff_ts: now_s,
+            block_height: 900_000,
+            treasury_amount: 12_500,
+            treasury_address: b"bc1qtreasury".to_vec(),
+            proposal_json: b"{}".to_vec(),
+        };
+        db.upsert_ratified_proposal(&rec).unwrap();
+        (now_s, rec)
+    }
+
+    /// A coinbase seen on-chain must find the proposal that paid it, by outputs hash alone.
+    /// That lookup is the whole basis of settling without being told.
+    #[test]
+    fn settlement_proposal_is_found_by_outputs_hash() {
+        let db = Database::in_memory().unwrap();
+        let (_, rec) = settlement_fixture(&db, "bc1qlookup.worker", 1);
+
+        let found = db
+            .get_ratified_proposal_by_outputs_hash(&rec.outputs_hash)
+            .unwrap()
+            .expect("the proposal paying this coinbase must be found");
+        assert_eq!(found.proposal_hash, rec.proposal_hash);
+        assert_eq!(found.cutoff_ts, rec.cutoff_ts);
+        assert_eq!(found.treasury_amount, rec.treasury_amount);
+
+        // A coinbase belonging to someone else must not match.
+        assert!(db
+            .get_ratified_proposal_by_outputs_hash(&[0x11; 32])
+            .unwrap()
+            .is_none());
+    }
+
+    /// Settling the same block twice must apply once.
+    ///
+    /// This is load-bearing: the submitting node settles when it submits, every other node settles
+    /// when it observes the block, and the startup rescan may reach it again. All three paths run
+    /// against the same row and must converge on one application — otherwise the treasury is
+    /// credited repeatedly for one block.
+    #[test]
+    fn settling_a_block_twice_applies_once() {
+        let db = Database::in_memory().unwrap();
+        let miner = "bc1qidem.worker";
+        let (now_s, rec) = settlement_fixture(&db, miner, 3);
+
+        let first = db
+            .settle_block_atomic(
+                "0000blockhash",
+                900_000,
+                &rec.proposal_hash,
+                &rec.outputs_hash,
+                &[miner.to_string()],
+                now_s,
+                rec.treasury_amount,
+                u64::MAX,
+            )
+            .unwrap()
+            .expect("first settle must apply");
+        assert_eq!(first.shares_marked, 3);
+        assert_eq!(db.get_treasury_balance().unwrap(), rec.treasury_amount);
+
+        let second = db
+            .settle_block_atomic(
+                "0000blockhash",
+                900_000,
+                &rec.proposal_hash,
+                &rec.outputs_hash,
+                &[miner.to_string()],
+                now_s,
+                rec.treasury_amount,
+                u64::MAX,
+            )
+            .unwrap();
+        assert!(second.is_none(), "second settle must be a no-op");
+        assert_eq!(
+            db.get_treasury_balance().unwrap(),
+            rec.treasury_amount,
+            "treasury must not be credited twice for one block"
+        );
+        let (unpaid, _) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(unpaid, 0);
+    }
+
+    /// Reversing a settlement must restore the ledger exactly, because a reorged-out block paid
+    /// nobody: the work is owed again.
+    #[test]
+    fn reversing_a_settlement_restores_the_ledger() {
+        let db = Database::in_memory().unwrap();
+        let miner = "bc1qreorg.worker";
+        let (now_s, rec) = settlement_fixture(&db, miner, 4);
+
+        let (before_unpaid, _) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(before_unpaid, 4);
+
+        db.settle_block_atomic(
+            "0000orphan",
+            900_000,
+            &rec.proposal_hash,
+            &rec.outputs_hash,
+            &[miner.to_string()],
+            now_s,
+            rec.treasury_amount,
+            u64::MAX,
+        )
+        .unwrap()
+        .expect("settle");
+
+        let reversed = db
+            .reverse_settlement("0000orphan")
+            .unwrap()
+            .expect("reversal must find the settlement");
+        assert_eq!(reversed.shares_marked, 4);
+        assert_eq!(reversed.treasury_bumped, rec.treasury_amount);
+
+        let (after_unpaid, _) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(
+            after_unpaid, before_unpaid,
+            "work paid by an orphaned block is owed again"
+        );
+        assert_eq!(
+            db.get_treasury_balance().unwrap(),
+            0,
+            "treasury credit from an orphaned block must be removed"
+        );
+
+        // Reversing again is a no-op — a Disconnected event and the reconcile sweep can both reach
+        // the same block.
+        assert!(db.reverse_settlement("0000orphan").unwrap().is_none());
+    }
+
+    /// A block that is reorged out and then returns to the main chain must end up in exactly the
+    /// state a single settlement would have produced — no double credit, no lost marks.
+    #[test]
+    fn a_returning_block_settles_to_the_same_state() {
+        let db = Database::in_memory().unwrap();
+        let miner = "bc1qreturn.worker";
+        let (now_s, rec) = settlement_fixture(&db, miner, 2);
+
+        let settle = |db: &Database| {
+            db.settle_block_atomic(
+                "0000returns",
+                900_000,
+                &rec.proposal_hash,
+                &rec.outputs_hash,
+                &[miner.to_string()],
+                now_s,
+                rec.treasury_amount,
+                u64::MAX,
+            )
+            .unwrap()
+        };
+
+        settle(&db).expect("initial settle");
+        let treasury_once = db.get_treasury_balance().unwrap();
+        let (unpaid_once, _) = db.get_miner_unpaid_stats(miner).unwrap();
+
+        db.reverse_settlement("0000returns")
+            .unwrap()
+            .expect("reverse");
+        settle(&db).expect("re-settle after the block returns");
+
+        assert_eq!(db.get_treasury_balance().unwrap(), treasury_once);
+        let (unpaid_again, _) = db.get_miner_unpaid_stats(miner).unwrap();
+        assert_eq!(unpaid_again, unpaid_once);
+        assert_eq!(
+            db.list_unreversed_settled_blocks().unwrap(),
+            vec![("0000returns".to_string(), 900_000)]
+        );
     }
 
     /// A PAID share older than the retention window is pruned (harmless audit
