@@ -212,12 +212,65 @@ impl Downstream {
                     if handshake_complete {
                         match notification.method.as_str() {
                             "mining.set_difficulty" => {
-                                // Cache the Sv1 set_difficulty message to be sent before the next
-                                // notify
-                                debug!("Down: Caching mining.set_difficulty to send before next mining.notify");
+                                // The cache exists for ONE reason: stratum requires that a miner
+                                // never sees `set_difficulty` before its first `mining.notify`.
+                                // Once a job has been delivered that ordering is already
+                                // established, and holding the message back has no purpose — it
+                                // just waits for a notify that may not come.
+                                //
+                                // That wait is #455. A difficulty declared via `d=` in the
+                                // authorize password is applied post-authorize, cached here, and
+                                // then sits indefinitely: the channel opened on authorize, the
+                                // first notify already flushed the FLOOR, and no further notify
+                                // is due for up to `job_keepalive_interval_secs` (60s) — observed
+                                // on a live node sitting unsent for 95s with the miner left at
+                                // the pool floor. Rented-hashrate marketplaces declare their size
+                                // this way, so it hits exactly the clients the feature exists for.
+                                //
+                                // So: cache only while the miner has no job yet; otherwise send
+                                // straight out. Sending between jobs is ordinary stratum — the
+                                // miner applies the new difficulty to subsequent work — and it
+                                // cannot violate the ordering rule because we only take this path
+                                // once a job has demonstrably been sent.
+                                let already_has_job = self
+                                    .downstream_data
+                                    .super_safe_lock(|d| d.last_job_received_time.is_some());
+
+                                if !already_has_job {
+                                    debug!("Down: Caching mining.set_difficulty until the first mining.notify");
+                                    self.downstream_data.super_safe_lock(|d| {
+                                        d.cached_set_difficulty = Some(message);
+                                    });
+                                    return Ok(());
+                                }
+
+                                debug!("Down: Sending mining.set_difficulty immediately (miner already has a job)");
+                                // Adopt the staged target/hashrate now, so state matches what the
+                                // miner was just told. The notify path does this when it flushes
+                                // the cache; taking the direct path must not skip it or the
+                                // node's view of the miner's difficulty drifts from the miner's.
                                 self.downstream_data.super_safe_lock(|d| {
-                                    d.cached_set_difficulty = Some(message);
+                                    if let Some(new_target) = d.pending_target.take() {
+                                        d.target = new_target;
+                                    }
+                                    if let Some(new_hashrate) = d.pending_hashrate.take() {
+                                        d.hashrate = Some(new_hashrate);
+                                    }
                                 });
+                                self.downstream_channel_state
+                                    .downstream_sv1_sender
+                                    .send(message)
+                                    .await
+                                    .map_err(|e| {
+                                        error!(
+                                            "Down: Failed to send mining.set_difficulty to downstream: {:?}",
+                                            e
+                                        );
+                                        TproxyError::disconnect(
+                                            TproxyErrorKind::ChannelErrorSender,
+                                            downstream_id,
+                                        )
+                                    })?;
                                 return Ok(());
                             }
                             "mining.notify" => {
