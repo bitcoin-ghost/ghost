@@ -475,7 +475,13 @@ async fn divergent_fleet_is_reconciled_ratifies_and_pays_its_miners_on_a_real_ch
     );
 
     // ---- 7. NOW the ledger settles — the coins exist.
-    settle_paid_block(&node.db, &proposal, PAYOUT_ADDRESS_GROUPING_HEIGHT).expect("settle");
+    settle_paid_block(
+        &node.db,
+        &proposal,
+        PAYOUT_ADDRESS_GROUPING_HEIGHT,
+        "rehearsal_block_hash",
+    )
+    .expect("settle");
     assert!(
         select_ledger_miner_work(&node.db, now, height, subsidy)
             .expect("ledger")

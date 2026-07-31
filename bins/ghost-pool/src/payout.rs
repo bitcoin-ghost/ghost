@@ -520,12 +520,36 @@ pub fn make_proposal_validator(
 /// again, that work is marked paid and never paid. With payouts ratified at every tip, settling
 /// on approval would wipe the ledger every ~10 minutes while paying nobody at all.
 ///
-/// Returns the number of share rows marked paid.
+/// Returns the number of share rows marked paid, or 0 if the block was already settled.
+///
+/// Thin wrapper over [`apply_settlement`]: the node that submits a winning block settles it
+/// immediately, every other node settles the same block when it observes it on-chain, and both
+/// must go through one implementation or they will drift.
 pub fn settle_paid_block(
     db: &ghost_storage::Database,
     proposal: &PayoutProposal,
     grouping_height: u64,
+    block_hash: &str,
 ) -> GhostResult<usize> {
+    Ok(apply_settlement(db, proposal, grouping_height, block_hash)?
+        .map(|applied| applied.shares_marked)
+        .unwrap_or(0))
+}
+
+/// Resolve which local `miner_id`s a proposal's payout entries refer to.
+///
+/// Pre-gate, `recipient_id` is `sha256(miner_id)` — one entry per worker, matched directly.
+/// Post-gate it is `sha256(payout_address)` — one entry per address, so hash every unpaid miner's
+/// address, match against the proposal's set, then resolve those addresses back to ALL their
+/// miner_ids so the per-share UPDATE catches every worker under a paid address.
+///
+/// Split out from settlement because it is the half that depends on the ledger's current contents,
+/// and it is worth being able to test the resolution independently of the write.
+pub fn resolve_paid_miner_ids(
+    db: &ghost_storage::Database,
+    proposal: &PayoutProposal,
+    grouping_height: u64,
+) -> GhostResult<Vec<String>> {
     let cutoff_ts = proposal.timestamp as i64;
     let wanted: std::collections::HashSet<[u8; 32]> = proposal
         .miner_payouts
@@ -563,35 +587,61 @@ pub fn settle_paid_block(
             .collect()
     };
 
-    let marked = db.mark_miners_paid(&proposal.proposal_hash, &matched, cutoff_ts)?;
+    Ok(matched)
+}
 
-    // Record the real win: this is the only place a block is settled (coins exist), so
-    // it is the authoritative "blocks found" signal — see `get_blocks_found_count`.
-    if let Err(e) = db.record_won_block(proposal.block_height) {
-        warn!(error = %e, height = proposal.block_height, "Failed to record won block");
+/// Settle a won block: mark its shares paid, bump the treasury, record the win — once, atomically.
+///
+/// `Ok(None)` means the block was already settled and nothing changed. Three paths reach this for
+/// the same block — the submitting node when it submits, every other node when it observes the
+/// block on-chain, and the startup rescan — and they must converge on a single application rather
+/// than crediting the treasury once per caller.
+///
+/// The share marking, the won-block record and the treasury bump all land in one transaction. They
+/// used to be three separate writes, so a crash between them could leave shares marked paid by a
+/// block never recorded as won.
+pub fn apply_settlement(
+    db: &ghost_storage::Database,
+    proposal: &PayoutProposal,
+    grouping_height: u64,
+    block_hash: &str,
+) -> GhostResult<Option<ghost_storage::queries::SettlementApplied>> {
+    let cutoff_ts = proposal.timestamp as i64;
+    let matched = resolve_paid_miner_ids(db, proposal, grouping_height)?;
+
+    let outputs_hash = crate::coinbase_verifier::CoinbaseCommitment::from_proposal(
+        proposal,
+        &proposal.treasury_address,
+    )
+    .output_hash;
+
+    let applied = db.settle_block_atomic(
+        block_hash,
+        proposal.block_height,
+        &proposal.proposal_hash,
+        &outputs_hash,
+        &matched,
+        cutoff_ts,
+        proposal.treasury_amount,
+        ghost_reconciliation::fee_distribution::TREASURY_THRESHOLD_SATS,
+    )?;
+
+    match &applied {
+        Some(a) => info!(
+            shares_marked = a.shares_marked,
+            miners = matched.len(),
+            height = proposal.block_height,
+            treasury_sats = a.treasury_bumped,
+            threshold_crossed = a.threshold_crossed,
+            block_hash,
+            "Ledger settled: shares marked paid because a block carrying this payout was accepted"
+        ),
+        None => debug!(
+            height = proposal.block_height,
+            block_hash, "Block already settled — nothing to apply"
+        ),
     }
-
-    if proposal.treasury_amount > 0 {
-        match db.add_treasury_funds(
-            proposal.treasury_amount,
-            ghost_reconciliation::fee_distribution::TREASURY_THRESHOLD_SATS,
-        ) {
-            Ok(crossed) => info!(
-                amount_sats = proposal.treasury_amount,
-                threshold_crossed = crossed,
-                "Treasury balance bumped from a PAID block"
-            ),
-            Err(e) => error!(error = %e, "Failed to bump treasury balance after payment"),
-        }
-    }
-
-    info!(
-        shares_marked = marked,
-        miners = matched.len(),
-        height = proposal.block_height,
-        "Ledger settled: shares marked paid because a block carrying this payout was accepted"
-    );
-    Ok(marked)
+    Ok(applied)
 }
 
 /// Data needed to create a payout proposal

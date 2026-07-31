@@ -278,24 +278,6 @@ impl CoinbaseCommitment {
     /// - Domain separator: "CoinbaseOutputs/v1" (COINBASE_OUTPUTS_DOMAIN)
     /// - Value output count (excludes 0-value witness commitment)
     /// - For each value output: amount (8 bytes LE) + script length (4 bytes LE) + script bytes
-    /// Recover the outputs hash from a coinbase transaction observed on-chain.
-    ///
-    /// This is the settlement lookup key. A won block's coinbase already commits to exactly who
-    /// was paid, so hashing its outputs recovers the `outputs_hash` that the paying proposal
-    /// committed to — which is what lets every node settle from its own view of the chain instead
-    /// of being told by the node that happened to submit the block.
-    ///
-    /// It deliberately delegates to [`Self::compute_outputs_hash`] rather than hashing here. H-8
-    /// was a divergence between two implementations of this hash, and the way to not have that bug
-    /// again is to not have two implementations: the proposal side, the pre-submission verifier and
-    /// settlement all end up in the same function.
-    pub fn outputs_hash_from_raw_coinbase(
-        coinbase_bytes: &[u8],
-    ) -> Result<[u8; 32], CoinbaseVerificationError> {
-        let outputs = CoinbaseOutput::parse_from_coinbase(coinbase_bytes)?;
-        Ok(Self::compute_outputs_hash(&outputs))
-    }
-
     fn compute_outputs_hash(outputs: &[CoinbaseOutput]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         // H-8: Use the SAME domain separator as from_proposal()
@@ -315,6 +297,24 @@ impl CoinbaseCommitment {
         }
 
         hasher.finalize().into()
+    }
+
+    /// Recover the outputs hash from a coinbase transaction observed on-chain.
+    ///
+    /// This is the settlement lookup key. A won block's coinbase already commits to exactly who was
+    /// paid, so hashing its outputs recovers the `outputs_hash` that the paying proposal committed
+    /// to — which is what lets every node settle from its own view of the chain instead of being
+    /// told by the node that happened to submit the block.
+    ///
+    /// It deliberately delegates to [`Self::compute_outputs_hash`] rather than hashing here. H-8 was
+    /// a divergence between two implementations of this hash, and the way to not have that bug again
+    /// is to not have two implementations: the proposal side, the pre-submission verifier and
+    /// settlement all end up in the same function.
+    pub fn outputs_hash_from_raw_coinbase(
+        coinbase_bytes: &[u8],
+    ) -> Result<[u8; 32], CoinbaseVerificationError> {
+        let outputs = CoinbaseOutput::parse_from_coinbase(coinbase_bytes)?;
+        Ok(Self::compute_outputs_hash(&outputs))
     }
 }
 
@@ -685,8 +685,8 @@ mod tests {
     /// somewhere else.
     fn serialize_coinbase(outputs: &[(u64, Vec<u8>)], scriptsig: Vec<u8>) -> Vec<u8> {
         use bitcoin::{
-            absolute::LockTime, consensus::encode::serialize, transaction::Version, Amount, OutPoint,
-            ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+            absolute::LockTime, consensus::encode::serialize, transaction::Version, Amount,
+            OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
         };
 
         let tx = Transaction {

@@ -7435,10 +7435,14 @@ async fn main() -> Result<()> {
                 if let Some(snapshot) = info.payout_snapshot {
                     match tp_for_block.get_proposal(&snapshot) {
                         Some(paid) => {
+                            // The block hash keys the settlement, so this node's immediate settle
+                            // and the same block's later observation by every other node collapse
+                            // onto one row instead of applying twice.
                             if let Err(e) = ghost_pool::payout::settle_paid_block(
                                 &db_for_block,
                                 &paid,
                                 PAYOUT_ADDRESS_GROUPING_HEIGHT,
+                                &hex::encode(info.block_hash),
                             ) {
                                 error!(
                                     error = %e,

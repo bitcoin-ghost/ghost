@@ -516,8 +516,13 @@ fn block_win_is_ratified_and_pays_every_miner_the_ledger_owes() {
     );
 
     // --- The block is mined and accepted; its coinbase carries this payout. NOW settle.
-    ghost_pool::payout::settle_paid_block(&node.db, &proposal, PAYOUT_ADDRESS_GROUPING_HEIGHT)
-        .expect("settle the paid block");
+    ghost_pool::payout::settle_paid_block(
+        &node.db,
+        &proposal,
+        PAYOUT_ADDRESS_GROUPING_HEIGHT,
+        "e2e_block_hash",
+    )
+    .expect("settle the paid block");
 
     let still_unpaid =
         select_ledger_miner_work(&node.db, now, BLOCK_HEIGHT, SUBSIDY_SATS).expect("ledger");
@@ -585,8 +590,13 @@ fn share_arriving_after_the_cutoff_does_not_break_ratification() {
     }
 
     // And the late share is still owed after this block is paid out.
-    ghost_pool::payout::settle_paid_block(&nodes[0].db, &proposal, PAYOUT_ADDRESS_GROUPING_HEIGHT)
-        .expect("settle the paid block");
+    ghost_pool::payout::settle_paid_block(
+        &nodes[0].db,
+        &proposal,
+        PAYOUT_ADDRESS_GROUPING_HEIGHT,
+        "e2e_block_hash_multi",
+    )
+    .expect("settle the paid block");
 
     let still_owed = select_ledger_miner_work(&nodes[0].db, now + 60, BLOCK_HEIGHT, SUBSIDY_SATS)
         .expect("ledger");

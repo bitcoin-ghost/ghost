@@ -78,10 +78,12 @@ ledger only grows.
 
 - [x] v49 migration: `ratified_proposals` + `settled_blocks` (`6d3519f76`)
 - [x] `outputs_hash_from_raw_coinbase` — one hasher, both sides (`ac5e8ea4a`)
-- [ ] storage: `try_begin_settlement` (idempotency gate), `unmark_proposal_paid`,
-      `deduct_treasury_funds`, `settled_blocks` accessors — settle and reverse each ONE transaction
-      (today's path does mark/won-block/treasury as three, which a crash can split)
-- [ ] refactor `settle_paid_block` body into shared `apply_settlement` so both paths cannot diverge
+- [x] storage: atomic `settle_block_atomic` + `reverse_settlement` + proposal persistence —
+      settle and reverse each ONE transaction (the path this replaces did mark/won-block/treasury
+      as three, which a crash can split). Reversal inverts *recorded* amounts, not recomputed ones.
+- [x] refactor `settle_paid_block` into shared `apply_settlement` + `resolve_paid_miner_ids`, so
+      the submitter path and the observer path cannot diverge (`settle_paid_block` now takes the
+      block hash, which is what keys the idempotency)
 - [ ] seed `ratified_proposals` from the already-persisted approved proposal on first start
 - [ ] `SettlementObserver`: on_block_connected / on_block_disconnected / rescan
 - [ ] wire to a second `BlockEvent` receiver alongside `ReorgHandler` (do not extend ReorgHandler)
