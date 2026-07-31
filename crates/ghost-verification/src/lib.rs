@@ -46,9 +46,12 @@ pub mod challenge;
 pub mod challenger_assignment;
 pub mod client;
 pub mod config;
+/// Operator-signed fleet control (#403).
+pub mod fleet_auth;
 pub mod handlers;
 pub mod journal;
 pub mod log_buffer;
+
 pub mod maxconnections;
 pub mod pool_series;
 pub mod qualification;

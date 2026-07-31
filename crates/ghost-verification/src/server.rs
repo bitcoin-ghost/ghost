@@ -1238,6 +1238,9 @@ pub struct VerificationState {
     policy_engine: parking_lot::Mutex<PolicyEngine>,
     /// Capabilities
     pub capabilities: NodeCapabilities,
+    /// Operator-signed fleet control (#403). Disabled unless an operator public key is
+    /// configured — a node nobody set up for remote control must not be controllable.
+    pub fleet_auth: Arc<crate::fleet_auth::FleetAuth>,
     /// Server start time
     start_time: Instant,
     /// Block height getter (callback)
@@ -1566,6 +1569,10 @@ impl VerificationState {
         // L-28: Capture debug endpoint setting at startup - immutable thereafter
         let debug_enabled = dashboard_config.enable_debug_endpoints;
         Self {
+            fleet_auth: Arc::new(crate::fleet_auth::FleetAuth::new(
+                node_id.clone(),
+                crate::fleet_auth::operator_pubkey_from_env(),
+            )),
             node_id,
             version,
             // Defaults to Signet (the historical hardcoded value); production
