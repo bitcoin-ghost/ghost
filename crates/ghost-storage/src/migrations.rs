@@ -2410,7 +2410,7 @@ fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> 
     Ok(())
 }
 
-/// v49: chain-derived settlement — `ratified_proposals` + `settled_blocks`.
+/// v49: chain-derived settlement — `payout_proposals.outputs_hash` + `settled_blocks`.
 ///
 /// Settlement is what marks a miner's shares paid so the next payout does not pay the same work
 /// twice. Until now it ran in exactly one place: `payout::settle_paid_block`, called only from the
@@ -2427,35 +2427,66 @@ fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> 
 /// proposal committed to, which is what makes the match trustworthy: the chain is the anchor, so a
 /// forged proposal cannot hash to an observed coinbase.
 ///
-/// Two tables, because two things were missing:
+/// Two changes, because two things were missing — and, deliberately, no new proposal table.
 ///
-/// `ratified_proposals` — proposals lived only in `TemplateProcessor::payout_proposals`, an
-/// in-memory map, so a restart lost them. A node cannot settle a block whose proposal it can no
-/// longer see, and the block that eventually wins may carry an older armed snapshot than the one
-/// currently approved. Indexed by `outputs_hash` because that is the lookup key the chain gives us.
+/// `payout_proposals.outputs_hash` — proposals are **already** persisted with their full JSON
+/// (`payout_proposals`, added in v18; written by `store_payout_proposal` on every proposal, and
+/// never pruned). What was missing is only the lookup key: settlement starts from a coinbase seen
+/// on-chain, so it needs to find a proposal by the hash of that coinbase's outputs. Adding the
+/// column and its index to the existing table keeps one source of truth for "what proposals exist";
+/// an earlier draft of this migration created a parallel `ratified_proposals` table, which would
+/// have duplicated the JSON and left two places to disagree about proposal history.
+///
+/// Nullable, because rows written before this migration have no hash. They are backfilled lazily:
+/// `store_payout_proposal` computes it going forward, and a proposal that predates the column
+/// simply will not match a coinbase until it is rewritten. That is the correct failure — it means
+/// "I cannot prove this block is mine", not "this block is not mine".
 ///
 /// `settled_blocks` — records exactly what each settlement applied (`shares_marked`,
 /// `treasury_bumped`) so a reorg reversal is an exact inversion of recorded amounts rather than a
 /// recomputation, and so re-settling is idempotent. `reversed` is a flag rather than a deletion:
 /// an orphaned block that later returns to the main chain must re-settle through the same row.
 ///
-/// Both are additive and `IF NOT EXISTS`, so this is a no-op on a database that already has them.
+/// Additive throughout. The column add is guarded so re-running is a no-op.
 fn migrate_v49(conn: &Connection) -> GhostResult<()> {
-    debug!("Running migration v49: ratified_proposals + settled_blocks");
+    debug!("Running migration v49: payout_proposals.outputs_hash + settled_blocks");
+
+    // Same guard as v41 and v48: a real pool DB always has `payout_proposals` (v18), but
+    // partial-schema test fixtures do not, and there is nothing to extend on those.
+    let has_proposals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='payout_proposals'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    if has_proposals > 0 {
+        // ALTER TABLE ADD COLUMN is not idempotent in SQLite, so check for the column first.
+        let has_outputs_hash: bool = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(payout_proposals)")
+                .map_err(|e| GhostError::Migration(e.to_string()))?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| GhostError::Migration(e.to_string()))?
+                .filter_map(|c| c.ok())
+                .collect();
+            cols.iter().any(|c| c == "outputs_hash")
+        };
+        if !has_outputs_hash {
+            conn.execute_batch("ALTER TABLE payout_proposals ADD COLUMN outputs_hash BLOB;")
+                .map_err(|e| GhostError::Migration(e.to_string()))?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_payout_proposals_outputs
+                 ON payout_proposals(outputs_hash);",
+        )
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    }
+
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ratified_proposals (
-            proposal_hash    BLOB    PRIMARY KEY,
-            outputs_hash     BLOB    NOT NULL,
-            cutoff_ts        INTEGER NOT NULL,
-            block_height     INTEGER NOT NULL,
-            treasury_amount  INTEGER NOT NULL,
-            treasury_address BLOB    NOT NULL,
-            proposal_json    BLOB    NOT NULL,
-            created_ts       INTEGER NOT NULL
-        );
-         CREATE INDEX IF NOT EXISTS idx_ratified_proposals_outputs
-             ON ratified_proposals(outputs_hash);
-         CREATE TABLE IF NOT EXISTS settled_blocks (
+        "CREATE TABLE IF NOT EXISTS settled_blocks (
             block_hash      TEXT    PRIMARY KEY,
             block_height    INTEGER NOT NULL,
             proposal_hash   BLOB    NOT NULL,
@@ -2469,7 +2500,7 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
              ON settled_blocks(reversed, block_height);",
     )
     .map_err(|e| GhostError::Migration(e.to_string()))?;
-    info!("v49: created ratified_proposals and settled_blocks");
+    info!("v49: added payout_proposals.outputs_hash and created settled_blocks");
     Ok(())
 }
 
@@ -2589,18 +2620,10 @@ mod tests {
                     "reversed",
                 ],
             ),
+            // Extended, not duplicated: proposals already live here with their full JSON.
             (
-                "ratified_proposals",
-                vec![
-                    "proposal_hash",
-                    "outputs_hash",
-                    "cutoff_ts",
-                    "block_height",
-                    "treasury_amount",
-                    "treasury_address",
-                    "proposal_json",
-                    "created_ts",
-                ],
+                "payout_proposals",
+                vec!["proposal_hash", "proposal_json", "outputs_hash"],
             ),
         ] {
             let mut stmt = conn
@@ -2630,7 +2653,7 @@ mod tests {
 
         let plan: String = conn
             .query_row(
-                "EXPLAIN QUERY PLAN SELECT proposal_hash FROM ratified_proposals \
+                "EXPLAIN QUERY PLAN SELECT proposal_hash FROM payout_proposals \
                  WHERE outputs_hash = ?1",
                 [vec![0u8; 32]],
                 |r| r.get(3),
@@ -2638,9 +2661,19 @@ mod tests {
             .expect("explain");
 
         assert!(
-            plan.contains("idx_ratified_proposals_outputs"),
+            plan.contains("idx_payout_proposals_outputs"),
             "planner did not choose the outputs_hash index; plan was: {plan}"
         );
+    }
+
+    /// The column add is not idempotent in SQLite, so it is guarded. A node that already took v49
+    /// (a canary on an earlier build) must not fail its next start with "duplicate column name".
+    #[test]
+    fn v49_column_add_is_guarded() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+        migrate_v49(&conn).expect("v49 must tolerate an existing outputs_hash column");
+        migrate_v49(&conn).expect("and again");
     }
 
     /// A database from a NEWER build must be left alone, and must not be mistaken for one

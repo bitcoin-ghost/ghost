@@ -84,7 +84,17 @@ ledger only grows.
 - [x] refactor `settle_paid_block` into shared `apply_settlement` + `resolve_paid_miner_ids`, so
       the submitter path and the observer path cannot diverge (`settle_paid_block` now takes the
       block hash, which is what keys the idempotency)
-- [ ] seed `ratified_proposals` from the already-persisted approved proposal on first start
+- [x] ~~seed `ratified_proposals` from the already-persisted approved proposal on first start~~
+      **Plan was wrong — corrected 2026-08-01.** The premise was "proposals live only in an
+      in-memory map, so a restart loses them". They do not: `payout_proposals` (v18) already stores
+      every proposal with its full JSON, `store_proposal` already writes to it
+      (`bins/ghost-pool/src/template.rs:519-528`), and nothing prunes it — the only reads are
+      `WHERE is_approved = 1`. So there was no history to seed and no second table needed. v49 was
+      revised to add `outputs_hash` + an index to the existing table instead of creating a parallel
+      `ratified_proposals`, which would have duplicated the JSON and left two places to disagree
+      about proposal history. Proposals written before the column simply do not match a coinbase,
+      which reads as "I cannot prove this block is mine" rather than a false positive.
+- [ ] populate `outputs_hash` on `store_proposal` (the going-forward half of the above)
 - [ ] `SettlementObserver`: on_block_connected / on_block_disconnected / rescan
 - [ ] wire to a second `BlockEvent` receiver alongside `ReorgHandler` (do not extend ReorgHandler)
 - [ ] `OBSERVED_SETTLEMENT_HEIGHT` gate, dry-run below it

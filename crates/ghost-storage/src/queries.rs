@@ -48,27 +48,6 @@ fn to_hash32(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// A ratified payout proposal, kept so settlement can match an observed coinbase back to the
-/// proposal that paid it.
-#[derive(Debug, Clone)]
-pub struct RatifiedProposalRecord {
-    /// Identifies the proposal; what `paid_in_proposal_hash` is set to.
-    pub proposal_hash: [u8; 32],
-    /// `CoinbaseOutputs/v1` hash of the payout's outputs — the lookup key, because it is the one
-    /// thing recoverable from a coinbase seen on-chain.
-    pub outputs_hash: [u8; 32],
-    /// Ledger cutoff: shares at or before this are the ones the proposal pays.
-    pub cutoff_ts: i64,
-    /// Height the proposal was built for.
-    pub block_height: u64,
-    /// Treasury amount this payout credits, needed to invert it on a reorg.
-    pub treasury_amount: u64,
-    /// H-MINE-3 snapshot of the treasury address as it stood when the proposal was built.
-    pub treasury_address: Vec<u8>,
-    /// The serialized proposal, so a node can settle without re-deriving it.
-    pub proposal_json: Vec<u8>,
-}
-
 /// Exactly what a settlement applied — or, from `reverse_settlement`, exactly what it undid.
 ///
 /// Recorded rather than recomputed so a reorg inverts the original amounts. By the time a reorg
@@ -1763,31 +1742,22 @@ impl Database {
         })
     }
 
-    /// Persist a ratified payout proposal so settlement can recognise the block that pays it.
+    /// Record the outputs hash of an already-persisted proposal, so settlement can find it from a
+    /// coinbase seen on-chain.
     ///
-    /// Proposals otherwise live only in an in-memory map, which is fine while the node that built
-    /// the template is also the node that settles — and useless the moment every node has to settle
-    /// from its own view of the chain. `outputs_hash` is the lookup key because it is the one thing
-    /// recoverable from an observed coinbase.
-    pub fn upsert_ratified_proposal(&self, rec: &RatifiedProposalRecord) -> GhostResult<()> {
-        let now = chrono::Utc::now().timestamp();
+    /// Proposals are persisted with their full JSON by `store_payout_proposal` and never pruned, so
+    /// this deliberately does not copy them into a second table — it fills in the one field that was
+    /// missing. Settlement starts from a block, and the only thing a block gives you is the hash of
+    /// its coinbase outputs.
+    pub fn set_proposal_outputs_hash(
+        &self,
+        proposal_hash: &[u8; 32],
+        outputs_hash: &[u8; 32],
+    ) -> GhostResult<()> {
         self.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO ratified_proposals
-                    (proposal_hash, outputs_hash, cutoff_ts, block_height,
-                     treasury_amount, treasury_address, proposal_json, created_ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(proposal_hash) DO NOTHING",
-                params![
-                    rec.proposal_hash.to_vec(),
-                    rec.outputs_hash.to_vec(),
-                    rec.cutoff_ts,
-                    rec.block_height as i64,
-                    rec.treasury_amount as i64,
-                    rec.treasury_address,
-                    rec.proposal_json,
-                    now,
-                ],
+                "UPDATE payout_proposals SET outputs_hash = ?2 WHERE proposal_hash = ?1",
+                params![proposal_hash.to_vec(), outputs_hash.to_vec()],
             )
             .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(())
@@ -1796,30 +1766,22 @@ impl Database {
 
     /// Find the proposal a coinbase pays, given the hash of that coinbase's outputs.
     ///
-    /// `None` means "not one of ours" — which is the overwhelmingly common answer, since every
-    /// block anyone else mines lands here too.
-    pub fn get_ratified_proposal_by_outputs_hash(
+    /// `None` means "not one of ours" — the overwhelmingly common answer, since every block anyone
+    /// else mines is checked here too. It also covers a proposal written before `outputs_hash`
+    /// existed: that reads as "I cannot prove this block is mine", which is the correct thing to say
+    /// rather than guessing.
+    pub fn get_proposal_by_outputs_hash(
         &self,
         outputs_hash: &[u8; 32],
-    ) -> GhostResult<Option<RatifiedProposalRecord>> {
+    ) -> GhostResult<Option<([u8; 32], String)>> {
         self.with_connection(|conn| {
             conn.query_row(
-                "SELECT proposal_hash, outputs_hash, cutoff_ts, block_height,
-                        treasury_amount, treasury_address, proposal_json
-                 FROM ratified_proposals WHERE outputs_hash = ?1",
+                "SELECT proposal_hash, proposal_json FROM payout_proposals
+                  WHERE outputs_hash = ?1",
                 params![outputs_hash.to_vec()],
                 |r| {
                     let ph: Vec<u8> = r.get(0)?;
-                    let oh: Vec<u8> = r.get(1)?;
-                    Ok(RatifiedProposalRecord {
-                        proposal_hash: to_hash32(&ph),
-                        outputs_hash: to_hash32(&oh),
-                        cutoff_ts: r.get(2)?,
-                        block_height: r.get::<_, i64>(3)? as u64,
-                        treasury_amount: r.get::<_, i64>(4)? as u64,
-                        treasury_address: r.get(5)?,
-                        proposal_json: r.get(6)?,
-                    })
+                    Ok((to_hash32(&ph), r.get::<_, String>(1)?))
                 },
             )
             .optional()
@@ -11736,8 +11698,16 @@ mod tests {
         assert!(db.get_shares_by_round(1).unwrap().is_empty());
     }
 
-    /// Fixture: one miner with `n` unpaid shares, plus the ratified proposal that pays them.
-    fn settlement_fixture(db: &Database, miner: &str, n: usize) -> (i64, RatifiedProposalRecord) {
+    /// Settlement fixture: one miner with `n` unpaid shares, plus the persisted proposal that pays
+    /// them, tagged with the outputs hash its coinbase will carry.
+    struct SettleFixture {
+        now_s: i64,
+        proposal_hash: [u8; 32],
+        outputs_hash: [u8; 32],
+        treasury_amount: u64,
+    }
+
+    fn settlement_fixture(db: &Database, miner: &str, n: usize) -> SettleFixture {
         let now_s = ledger_now_s();
         db.upsert_miner(&ledger_miner(miner, now_s)).unwrap();
         for i in 0..n {
@@ -11749,17 +11719,19 @@ mod tests {
             ))
             .unwrap();
         }
-        let rec = RatifiedProposalRecord {
-            proposal_hash: [0xAB; 32],
-            outputs_hash: [0xCD; 32],
-            cutoff_ts: now_s,
-            block_height: 900_000,
+        let proposal_hash = [0xAB; 32];
+        let outputs_hash = [0xCD; 32];
+        // Proposals are already persisted by the normal path; settlement only adds the hash.
+        db.store_payout_proposal(&proposal_hash, 1, 900_000, "{}")
+            .unwrap();
+        db.set_proposal_outputs_hash(&proposal_hash, &outputs_hash)
+            .unwrap();
+        SettleFixture {
+            now_s,
+            proposal_hash,
+            outputs_hash,
             treasury_amount: 12_500,
-            treasury_address: b"bc1qtreasury".to_vec(),
-            proposal_json: b"{}".to_vec(),
-        };
-        db.upsert_ratified_proposal(&rec).unwrap();
-        (now_s, rec)
+        }
     }
 
     /// A coinbase seen on-chain must find the proposal that paid it, by outputs hash alone.
@@ -11767,19 +11739,31 @@ mod tests {
     #[test]
     fn settlement_proposal_is_found_by_outputs_hash() {
         let db = Database::in_memory().unwrap();
-        let (_, rec) = settlement_fixture(&db, "bc1qlookup.worker", 1);
+        let f = settlement_fixture(&db, "bc1qlookup.worker", 1);
 
-        let found = db
-            .get_ratified_proposal_by_outputs_hash(&rec.outputs_hash)
+        let (found_hash, json) = db
+            .get_proposal_by_outputs_hash(&f.outputs_hash)
             .unwrap()
             .expect("the proposal paying this coinbase must be found");
-        assert_eq!(found.proposal_hash, rec.proposal_hash);
-        assert_eq!(found.cutoff_ts, rec.cutoff_ts);
-        assert_eq!(found.treasury_amount, rec.treasury_amount);
+        assert_eq!(found_hash, f.proposal_hash);
+        assert_eq!(json, "{}");
 
         // A coinbase belonging to someone else must not match.
         assert!(db
-            .get_ratified_proposal_by_outputs_hash(&[0x11; 32])
+            .get_proposal_by_outputs_hash(&[0x11; 32])
+            .unwrap()
+            .is_none());
+    }
+
+    /// A proposal stored before the outputs_hash column existed must not match anything. "I cannot
+    /// prove this block is mine" is the correct answer; a false match would mark real work paid.
+    #[test]
+    fn a_proposal_without_an_outputs_hash_never_matches() {
+        let db = Database::in_memory().unwrap();
+        db.store_payout_proposal(&[0x77; 32], 1, 900_000, "{}")
+            .unwrap();
+        assert!(db
+            .get_proposal_by_outputs_hash(&[0u8; 32])
             .unwrap()
             .is_none());
     }
@@ -11794,40 +11778,40 @@ mod tests {
     fn settling_a_block_twice_applies_once() {
         let db = Database::in_memory().unwrap();
         let miner = "bc1qidem.worker";
-        let (now_s, rec) = settlement_fixture(&db, miner, 3);
+        let f = settlement_fixture(&db, miner, 3);
 
         let first = db
             .settle_block_atomic(
                 "0000blockhash",
                 900_000,
-                &rec.proposal_hash,
-                &rec.outputs_hash,
+                &f.proposal_hash,
+                &f.outputs_hash,
                 &[miner.to_string()],
-                now_s,
-                rec.treasury_amount,
+                f.now_s,
+                f.treasury_amount,
                 u64::MAX,
             )
             .unwrap()
             .expect("first settle must apply");
         assert_eq!(first.shares_marked, 3);
-        assert_eq!(db.get_treasury_balance().unwrap(), rec.treasury_amount);
+        assert_eq!(db.get_treasury_balance().unwrap(), f.treasury_amount);
 
         let second = db
             .settle_block_atomic(
                 "0000blockhash",
                 900_000,
-                &rec.proposal_hash,
-                &rec.outputs_hash,
+                &f.proposal_hash,
+                &f.outputs_hash,
                 &[miner.to_string()],
-                now_s,
-                rec.treasury_amount,
+                f.now_s,
+                f.treasury_amount,
                 u64::MAX,
             )
             .unwrap();
         assert!(second.is_none(), "second settle must be a no-op");
         assert_eq!(
             db.get_treasury_balance().unwrap(),
-            rec.treasury_amount,
+            f.treasury_amount,
             "treasury must not be credited twice for one block"
         );
         let (unpaid, _) = db.get_miner_unpaid_stats(miner).unwrap();
@@ -11840,7 +11824,7 @@ mod tests {
     fn reversing_a_settlement_restores_the_ledger() {
         let db = Database::in_memory().unwrap();
         let miner = "bc1qreorg.worker";
-        let (now_s, rec) = settlement_fixture(&db, miner, 4);
+        let f = settlement_fixture(&db, miner, 4);
 
         let (before_unpaid, _) = db.get_miner_unpaid_stats(miner).unwrap();
         assert_eq!(before_unpaid, 4);
@@ -11848,11 +11832,11 @@ mod tests {
         db.settle_block_atomic(
             "0000orphan",
             900_000,
-            &rec.proposal_hash,
-            &rec.outputs_hash,
+            &f.proposal_hash,
+            &f.outputs_hash,
             &[miner.to_string()],
-            now_s,
-            rec.treasury_amount,
+            f.now_s,
+            f.treasury_amount,
             u64::MAX,
         )
         .unwrap()
@@ -11863,7 +11847,7 @@ mod tests {
             .unwrap()
             .expect("reversal must find the settlement");
         assert_eq!(reversed.shares_marked, 4);
-        assert_eq!(reversed.treasury_bumped, rec.treasury_amount);
+        assert_eq!(reversed.treasury_bumped, f.treasury_amount);
 
         let (after_unpaid, _) = db.get_miner_unpaid_stats(miner).unwrap();
         assert_eq!(
@@ -11887,17 +11871,17 @@ mod tests {
     fn a_returning_block_settles_to_the_same_state() {
         let db = Database::in_memory().unwrap();
         let miner = "bc1qreturn.worker";
-        let (now_s, rec) = settlement_fixture(&db, miner, 2);
+        let f = settlement_fixture(&db, miner, 2);
 
         let settle = |db: &Database| {
             db.settle_block_atomic(
                 "0000returns",
                 900_000,
-                &rec.proposal_hash,
-                &rec.outputs_hash,
+                &f.proposal_hash,
+                &f.outputs_hash,
                 &[miner.to_string()],
-                now_s,
-                rec.treasury_amount,
+                f.now_s,
+                f.treasury_amount,
                 u64::MAX,
             )
             .unwrap()
