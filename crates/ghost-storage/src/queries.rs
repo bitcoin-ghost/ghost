@@ -452,7 +452,7 @@ impl Database {
     /// grows for as long as nothing settles and a fixed window slides past holes before they are
     /// repaired — see the sweep in `main.rs` and #558.
     pub fn oldest_unpaid_share_timestamp(&self) -> GhostResult<Option<i64>> {
-        self.with_read_connection(|conn| {
+        self.with_connection(|conn| {
             conn.query_row(
                 "SELECT MIN(timestamp) FROM shares
                  WHERE paid_in_proposal_hash IS NULL AND valid = 1",
@@ -473,7 +473,7 @@ impl Database {
     /// Repair therefore worked only in thin buckets and stalled wherever the divergence actually
     /// was. Mirror image of the response-side bug in #559/#561/#562 (#558).
     pub fn count_unpaid_shares_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<i64> {
-        self.with_read_connection(|conn| {
+        self.with_connection(|conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM shares
                  WHERE paid_in_proposal_hash IS NULL AND valid = 1
@@ -486,7 +486,7 @@ impl Database {
     }
 
     pub fn unpaid_share_hashes_in(&self, since_ts: i64, until_ts: i64) -> GhostResult<Vec<String>> {
-        self.with_read_connection(|conn| {
+        self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT share_hash FROM shares
@@ -525,7 +525,7 @@ impl Database {
         limit: usize,
         max_bytes: usize,
     ) -> GhostResult<(Vec<Vec<u8>>, usize, bool)> {
-        self.with_read_connection(|conn| {
+        self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT share_hash, proof FROM shares
@@ -1323,7 +1323,7 @@ impl Database {
         // below — integer addition is order-independent, so every node computes a
         // byte-identical per-address total. Float summation here was the residual
         // divergence that kept the checkpoint from finalising exactly.
-        let raw: Vec<(String, i64, String)> = self.with_read_connection(|conn| {
+        let raw: Vec<(String, i64, String)> = self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT s.miner_id, SUM(CAST(ROUND(s.work * 1000000) AS INTEGER)) AS micro_work, m.payout_address
@@ -8404,7 +8404,7 @@ impl Database {
     /// Returns the LOWEST gap so repeated calls walk the range forward deterministically rather
     /// than re-requesting the same window. A node with no checkpoints has no interior gap.
     pub fn lowest_l2_checkpoint_gap(&self) -> GhostResult<Option<(u64, u64)>> {
-        self.with_read_connection(|conn| {
+        self.with_connection(|conn| {
             // The first height whose successor is absent, paired with the next height present
             // above it. Bounded by the stored range, so a node that is merely behind the tip
             // (no interior hole) yields None rather than the whole future.

@@ -192,18 +192,6 @@ pub struct Database {
 struct DatabaseInner {
     /// Primary connection (write)
     write_conn: Mutex<Connection>,
-    /// Read-only connections (#537).
-    ///
-    /// The database runs in WAL mode, which permits any number of concurrent readers
-    /// alongside one writer. Routing every read through `write_conn` therefore serialises
-    /// work SQLite is happy to do in parallel, and — because the guard is a `parking_lot`
-    /// mutex, which does not yield — each waiter blocks the whole tokio worker thread it is
-    /// running on rather than just its own task.
-    ///
-    /// Empty for in-memory databases: each `open_in_memory` is a SEPARATE database, so a
-    /// second connection would see an empty schema rather than the same data. Callers fall
-    /// back to `write_conn`, which is always correct, just serialised.
-    read_conns: Vec<Mutex<Connection>>,
     /// Database path
     path: String,
     /// Whether this is an in-memory database
@@ -402,7 +390,6 @@ impl Database {
         let db = Self {
             inner: Arc::new(DatabaseInner {
                 write_conn: Mutex::new(conn),
-                read_conns: Self::open_read_pool(&path_str, None),
                 path: path_str,
                 in_memory: false,
                 encryption_key: RwLock::new(None),
@@ -426,8 +413,6 @@ impl Database {
         let db = Self {
             inner: Arc::new(DatabaseInner {
                 write_conn: Mutex::new(conn),
-                // In-memory databases cannot be shared across connections.
-                read_conns: Vec::new(),
                 path: ":memory:".to_string(),
                 in_memory: true,
                 encryption_key: RwLock::new(None),
@@ -488,7 +473,6 @@ impl Database {
         let db = Self {
             inner: Arc::new(DatabaseInner {
                 write_conn: Mutex::new(conn),
-                read_conns: Self::open_read_pool(&path_str, Some(*key)),
                 path: path_str,
                 in_memory: false,
                 encryption_key: RwLock::new(Some(*key)),
@@ -668,71 +652,6 @@ impl Database {
             GhostError::Database(format!("Failed to register reverse_hex function: {}", e))
         })?;
         Ok(())
-    }
-
-    /// Number of read-only connections opened alongside the writer (#537).
-    ///
-    /// Nodes are 2-CPU boxes, so this is about removing needless serialisation rather than
-    /// exploiting parallelism: four readers let the 30-second convergence scan, the payout
-    /// ledger read and an inbound `/health` proceed together instead of queueing behind one
-    /// another on a lock that blocks its worker thread.
-    const READ_POOL_SIZE: usize = 4;
-
-    /// Open the read-only connection pool for a file-backed database.
-    ///
-    /// Returns an EMPTY pool on any failure — callers fall back to the write connection, which
-    /// is always correct and merely serialised. A node must never fail to start because an
-    /// optimisation could not be applied.
-    fn open_read_pool(path: &str, key: Option<[u8; 32]>) -> Vec<Mutex<Connection>> {
-        let mut pool = Vec::new();
-        for _ in 0..Self::READ_POOL_SIZE {
-            let conn = match Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = %e, "read pool: could not open connection — reads will use the writer");
-                    break;
-                }
-            };
-            // SQLCipher: the key must be applied before any other statement.
-            if let Some(k) = key {
-                if let Err(e) = conn.pragma_update(None, "key", format!("x'{}'", hex::encode(k))) {
-                    tracing::warn!(error = %e, "read pool: PRAGMA key failed — reads will use the writer");
-                    break;
-                }
-            }
-            if let Err(e) = Self::register_functions(&conn) {
-                tracing::warn!(error = %e, "read pool: could not register functions — reads will use the writer");
-                break;
-            }
-            // Readers must never wait on a writer's lock; WAL means they do not have to.
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-            pool.push(Mutex::new(conn));
-        }
-        pool
-    }
-
-    /// Execute a read-only function, preferring a pooled reader over the write connection.
-    ///
-    /// Falls back to the writer when every reader is busy, when the pool is empty (in-memory
-    /// databases), or when the pool could not be opened — so behaviour is never worse than
-    /// before, only less serialised.
-    ///
-    /// ONLY for statements that read. A write issued here fails: the connections are opened
-    /// `SQLITE_OPEN_READ_ONLY`, so a stray `INSERT` surfaces as an error rather than silently
-    /// landing somewhere unexpected.
-    pub fn with_read_connection<F, T>(&self, f: F) -> GhostResult<T>
-    where
-        F: FnOnce(&Connection) -> GhostResult<T>,
-    {
-        for slot in &self.inner.read_conns {
-            if let Some(conn) = slot.try_lock() {
-                return f(&conn);
-            }
-        }
-        self.with_connection(f)
     }
 
     /// Execute a function with the database connection
@@ -1674,57 +1593,6 @@ impl DatabaseStats {
 
 #[cfg(test)]
 mod tests {
-
-    /// A pooled read must proceed while the WRITE connection is held. That is the entire
-    /// point of #537: reads used to queue behind the writer on a `parking_lot` mutex, which
-    /// does not yield, so each waiter blocked a whole tokio worker thread rather than a task.
-    #[test]
-    fn read_proceeds_while_write_connection_is_held() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("ghost-readpool-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-
-        let db = Database::open(&path).expect("open");
-        assert!(
-            !db.inner.read_conns.is_empty(),
-            "a file-backed database must open a read pool"
-        );
-
-        // Hold the writer for the duration, exactly as a long write would.
-        let held = db.inner.write_conn.lock();
-
-        // A pooled read must NOT need that lock.
-        let n: i64 = db
-            .with_read_connection(|c| {
-                c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
-                    .map_err(|e| GhostError::Database(e.to_string()))
-            })
-            .expect("read must succeed while the writer is held");
-        assert!(n > 0, "schema should be present after migrations");
-
-        drop(held);
-        drop(db);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// In-memory databases get no pool — each `open_in_memory` is a distinct database, so a
-    /// second connection would see an empty schema. Reads must fall back to the writer and
-    /// still be correct.
-    #[test]
-    fn in_memory_falls_back_to_the_write_connection() {
-        let db = Database::in_memory().expect("open");
-        assert!(
-            db.inner.read_conns.is_empty(),
-            "in-memory must not open a pool against a different database"
-        );
-        let n: i64 = db
-            .with_read_connection(|c| {
-                c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
-                    .map_err(|e| GhostError::Database(e.to_string()))
-            })
-            .expect("fallback read must work");
-        assert!(n > 0, "in-memory schema must be visible via the fallback");
-    }
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
