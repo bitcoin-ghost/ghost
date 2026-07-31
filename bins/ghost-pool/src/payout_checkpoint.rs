@@ -495,6 +495,42 @@ impl PayoutCheckpointManager {
         )
     }
 
+    /// Compute the canonical payout WITHOUT blocking the async runtime.
+    ///
+    /// `compute_root` is a synchronous closure that walks the whole unpaid ledger:
+    /// `get_top_unpaid_addresses` scans every unpaid share to produce a handful of per-address
+    /// totals. Measured on ghost-vm5 2026-07-31 against 2.76M unpaid rows: **1.60 s wall,
+    /// 1.33 s user CPU, returning 78 rows**. It already uses a covering index — the cost is
+    /// inherent to the row count, not a missing index.
+    ///
+    /// Run inline on a runtime worker it starved everything sharing that worker: `/health`
+    /// showed a **15 s period with ~5 s blocking windows, 40% of wall-clock blocked**, one
+    /// `tokio-runtime-worker` pinned at 72–83% while median latency stayed at 0.4 ms. A pure
+    /// tail effect, and the reason #571's read-connection pool could not help — the contention
+    /// is CPU on the executor, not connections on the database.
+    ///
+    /// `spawn_blocking` moves it to the blocking pool, so a long scan can no longer stall
+    /// request handling, gossip or voting. It does NOT make the scan cheaper; see #554 for the
+    /// remaining options (memoisation — which needs a mutation fingerprint to stay correct, see
+    /// the hazard note there — and shrinking the scan via #558's dead-share reconciliation).
+    async fn compute_root_off_runtime(
+        &self,
+        cutoff_ts: i64,
+        height: u64,
+    ) -> Option<CanonicalPayout> {
+        let f = Arc::clone(&self.compute_root);
+        match tokio::task::spawn_blocking(move || f(cutoff_ts, height)).await {
+            Ok(v) => v,
+            Err(e) => {
+                // A panic inside the scan must not be read as "not computable" without a
+                // trace: that path abstains silently, which is indistinguishable from an
+                // unconverged ledger and would hide a real fault.
+                warn!(height, error = %e, "payout checkpoint: canonical payout task failed");
+                None
+            }
+        }
+    }
+
     /// Called on a cadence from `main.rs` with the target lagging checkpoint
     /// height. No-op unless this node is the deterministic proposer for it.
     pub async fn maybe_propose(&self, height: u64, cutoff_ts: i64) {
@@ -504,7 +540,7 @@ impl PayoutCheckpointManager {
         if proposer != Some(me) || self.already_finalized(height) {
             return;
         }
-        let Some(canonical) = (self.compute_root)(cutoff_ts, height) else {
+        let Some(canonical) = self.compute_root_off_runtime(cutoff_ts, height).await else {
             // C-7: cannot compute from our own view — do not propose an
             // unreproducible payout; wait for convergence.
             warn!(
@@ -591,7 +627,10 @@ impl PayoutCheckpointManager {
         }
 
         // Option (c): recompute our OWN canonical payout and tolerance-check the proposer's.
-        let Some(local) = (self.compute_root)(msg.cutoff_ts, msg.height) else {
+        let Some(local) = self
+            .compute_root_off_runtime(msg.cutoff_ts, msg.height)
+            .await
+        else {
             // C-7: we lack the data to judge it — abstain (do NOT approve).
             warn!(
                 height = msg.height,
@@ -924,7 +963,7 @@ impl PayoutCheckpointManager {
         }
         let mut applied = 0usize;
         for entry in &resp.checkpoints {
-            if self.apply_synced_checkpoint(entry) {
+            if self.apply_synced_checkpoint(entry).await {
                 applied += 1;
             }
         }
@@ -942,7 +981,10 @@ impl PayoutCheckpointManager {
     /// INDEPENDENTLY recompute our own canonical payout, require it agrees within
     /// tolerance, then persist. Never trusts the serving peer (strictly stronger than
     /// L2's signature-only sync). Returns true iff newly persisted.
-    fn apply_synced_checkpoint(&self, entry: &PayoutCheckpointSyncEntry) -> bool {
+    /// Async because it recomputes the canonical payout, which is a full unpaid-ledger scan and
+    /// must not run on a runtime worker. Catch-up sync applies these in a LOOP, so inline it
+    /// blocked for N x 1.6 s exactly when a node was already behind and trying to recover.
+    async fn apply_synced_checkpoint(&self, entry: &PayoutCheckpointSyncEntry) -> bool {
         if self.already_finalized(entry.height) {
             return false;
         }
@@ -961,7 +1003,10 @@ impl PayoutCheckpointManager {
             return false;
         }
         // Trustless: recompute OUR canonical payout and require tolerance agreement.
-        let Some(local) = (self.compute_root)(entry.cutoff_ts, entry.height) else {
+        let Some(local) = self
+            .compute_root_off_runtime(entry.cutoff_ts, entry.height)
+            .await
+        else {
             return false; // cannot validate yet — skip; a later cadence retries
         };
         if let Err(reason) = payouts_agree(
@@ -1558,7 +1603,7 @@ mod tests {
             proposer: nodes[(H as usize) % 4].id,
         };
         assert!(
-            !nodes[3].mgr.apply_synced_checkpoint(&entry),
+            !nodes[3].mgr.apply_synced_checkpoint(&entry).await,
             "outside tolerance → rejected"
         );
         assert!(nodes[3]
@@ -1578,7 +1623,7 @@ mod tests {
         );
         bad_author.proposer = nodes[((H as usize) + 1) % 4].id;
         assert!(
-            !nodes[3].mgr.apply_synced_checkpoint(&bad_author),
+            !nodes[3].mgr.apply_synced_checkpoint(&bad_author).await,
             "wrong proposer → rejected"
         );
     }
