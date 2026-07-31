@@ -278,6 +278,24 @@ impl CoinbaseCommitment {
     /// - Domain separator: "CoinbaseOutputs/v1" (COINBASE_OUTPUTS_DOMAIN)
     /// - Value output count (excludes 0-value witness commitment)
     /// - For each value output: amount (8 bytes LE) + script length (4 bytes LE) + script bytes
+    /// Recover the outputs hash from a coinbase transaction observed on-chain.
+    ///
+    /// This is the settlement lookup key. A won block's coinbase already commits to exactly who
+    /// was paid, so hashing its outputs recovers the `outputs_hash` that the paying proposal
+    /// committed to — which is what lets every node settle from its own view of the chain instead
+    /// of being told by the node that happened to submit the block.
+    ///
+    /// It deliberately delegates to [`Self::compute_outputs_hash`] rather than hashing here. H-8
+    /// was a divergence between two implementations of this hash, and the way to not have that bug
+    /// again is to not have two implementations: the proposal side, the pre-submission verifier and
+    /// settlement all end up in the same function.
+    pub fn outputs_hash_from_raw_coinbase(
+        coinbase_bytes: &[u8],
+    ) -> Result<[u8; 32], CoinbaseVerificationError> {
+        let outputs = CoinbaseOutput::parse_from_coinbase(coinbase_bytes)?;
+        Ok(Self::compute_outputs_hash(&outputs))
+    }
+
     fn compute_outputs_hash(outputs: &[CoinbaseOutput]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         // H-8: Use the SAME domain separator as from_proposal()
@@ -657,6 +675,119 @@ mod tests {
         assert!(
             commitment.verify(&outputs).is_ok(),
             "M-28: Commitment from bech32 addresses must match script pubkey outputs"
+        );
+    }
+
+    /// Serialize a coinbase transaction paying `outputs`, the way a real one appears on-chain.
+    ///
+    /// Uses the `bitcoin` crate's consensus encoding rather than hand-assembling bytes: the parser
+    /// under test is hand-written, so the test is only worth anything if the input came from
+    /// somewhere else.
+    fn serialize_coinbase(outputs: &[(u64, Vec<u8>)], scriptsig: Vec<u8>) -> Vec<u8> {
+        use bitcoin::{
+            absolute::LockTime, consensus::encode::serialize, transaction::Version, Amount, OutPoint,
+            ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(scriptsig),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: outputs
+                .iter()
+                .map(|(value, script)| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::from_bytes(script.clone()),
+                })
+                .collect(),
+        };
+        serialize(&tx)
+    }
+
+    /// The assertion settlement rests on: the hash a proposal commits to must equal the hash
+    /// recovered from the coinbase that pays it, once that coinbase is on-chain.
+    ///
+    /// If these two ever diverge, settlement silently matches nothing — every pool block looks
+    /// like a stranger's block, no node settles, and the ledger grows forever while payouts double
+    /// up. That is the failure this test exists to prevent, and it is why `outputs_hash_from_raw_
+    /// coinbase` delegates to the same hasher instead of reimplementing it.
+    #[test]
+    fn outputs_hash_from_observed_coinbase_matches_the_proposal_commitment() {
+        // BIP173 vector, as used by the M-28 test above.
+        let addr_bech32 = b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_vec();
+        let addr_script = hex::decode("0014751e76e8199196d454941c45d1b3a323f1433bd6").unwrap();
+
+        let mut proposal = create_test_proposal();
+        proposal.miner_payouts = vec![
+            PayoutEntry {
+                address: addr_bech32.clone(),
+                amount: 100_000_000,
+                recipient_id: [10u8; 32],
+                payout_type: PayoutType::Mining,
+            },
+            PayoutEntry {
+                address: addr_bech32.clone(),
+                amount: 50_000_000,
+                recipient_id: [11u8; 32],
+                payout_type: PayoutType::Mining,
+            },
+        ];
+        proposal.node_payouts = vec![PayoutEntry {
+            address: addr_bech32.clone(),
+            amount: 25_000_000,
+            recipient_id: [20u8; 32],
+            payout_type: PayoutType::NodeReward,
+        }];
+        proposal.treasury_amount = 12_500_000;
+        proposal.treasury_address = addr_bech32.clone();
+
+        let committed = CoinbaseCommitment::from_proposal(&proposal, &addr_bech32).output_hash;
+
+        // The coinbase as it would appear in the block: the same outputs, in the same order, plus
+        // a zero-value witness commitment that the hash must ignore on both sides.
+        let raw = serialize_coinbase(
+            &[
+                (100_000_000, addr_script.clone()),
+                (50_000_000, addr_script.clone()),
+                (25_000_000, addr_script.clone()),
+                (12_500_000, addr_script.clone()),
+                (0, hex::decode("6a24aa21a9ed").unwrap()),
+            ],
+            // BIP34 height push plus arbitrary extranonce, as a real scriptsig carries.
+            hex::decode("03401f0c2f6768six2f").unwrap_or_else(|_| vec![0x03, 0x40, 0x1f, 0x0c]),
+        );
+
+        let observed = CoinbaseCommitment::outputs_hash_from_raw_coinbase(&raw)
+            .expect("a well-formed coinbase must parse");
+
+        assert_eq!(
+            observed, committed,
+            "settlement could not match a coinbase to the proposal that paid it"
+        );
+    }
+
+    /// A coinbase paying someone else must not match our proposal — otherwise settlement would
+    /// mark our miners paid off the back of a stranger's block.
+    #[test]
+    fn outputs_hash_does_not_match_a_foreign_coinbase() {
+        let addr_bech32 = b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_vec();
+        let addr_script = hex::decode("0014751e76e8199196d454941c45d1b3a323f1433bd6").unwrap();
+
+        let proposal = create_test_proposal();
+        let committed = CoinbaseCommitment::from_proposal(&proposal, &addr_bech32).output_hash;
+
+        // Same shape, different amount.
+        let raw = serialize_coinbase(&[(312_500_000, addr_script)], vec![0x03, 0x40, 0x1f, 0x0c]);
+        let observed = CoinbaseCommitment::outputs_hash_from_raw_coinbase(&raw).expect("parse");
+
+        assert_ne!(
+            observed, committed,
+            "a foreign coinbase must not be mistaken for ours"
         );
     }
 
