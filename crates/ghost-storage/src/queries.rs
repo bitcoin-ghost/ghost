@@ -620,6 +620,86 @@ impl Database {
     /// PER-NODE (`GHOST_ENCRYPTION_KEY`): copying rows between databases verbatim would leave the
     /// address undecryptable on the target, the `INNER JOIN miners` in `get_top_unpaid_addresses`
     /// would drop the share, and the miner would silently lose that work.
+    /// Stream every unpaid share to `f`, one at a time. Returns how many were emitted.
+    ///
+    /// `export_unpaid_shares` materialises the whole ledger twice — once as row tuples, once as
+    /// `UnpaidShareExport` — and its caller then serialises the result into a single contiguous
+    /// buffer. At 2.77M unpaid rows that was **OOM-killed on a live node** (1.57 GB RSS against
+    /// 1.4 GB available, #584), which made the one-time reconciliation impossible to run at the
+    /// very scale that requires it.
+    ///
+    /// Peak memory here is one record plus the miner-address map, regardless of row count.
+    ///
+    /// The addresses are resolved BEFORE the share cursor opens, deliberately. Per-share lookup
+    /// would call `get_miner_payout_address`, which takes the same connection mutex this method
+    /// already holds — a self-deadlock. Resolving up front costs one map: miners number in the
+    /// hundreds where shares number in the millions.
+    pub fn for_each_unpaid_share<F>(&self, mut f: F) -> GhostResult<usize>
+    where
+        F: FnMut(&UnpaidShareExport) -> GhostResult<()>,
+    {
+        // Distinct miners in the unpaid ledger, then one address lookup each. Both queries
+        // complete and release the connection before the streaming cursor below opens.
+        let miner_ids: Vec<String> = self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT miner_id FROM shares
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let it = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in it {
+                out.push(row.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
+        })?;
+        let mut addrs: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::with_capacity(miner_ids.len());
+        for id in miner_ids {
+            let a = self.get_miner_payout_address(&id).unwrap_or(None);
+            addrs.insert(id, a);
+        }
+
+        let mut emitted = 0usize;
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT round_id, miner_id, difficulty, work, share_hash, timestamp, received_by
+                     FROM shares
+                     WHERE paid_in_proposal_hash IS NULL AND valid = 1
+                     ORDER BY timestamp",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            while let Some(r) = rows
+                .next()
+                .map_err(|e| GhostError::Database(e.to_string()))?
+            {
+                let miner_id: String = r.get(1).map_err(|e| GhostError::Database(e.to_string()))?;
+                let payout_address = addrs.get(&miner_id).cloned().flatten();
+                let rec = UnpaidShareExport {
+                    round_id: r.get(0).map_err(|e| GhostError::Database(e.to_string()))?,
+                    miner_id,
+                    difficulty: r.get(2).map_err(|e| GhostError::Database(e.to_string()))?,
+                    work: r.get(3).map_err(|e| GhostError::Database(e.to_string()))?,
+                    share_hash: r.get(4).map_err(|e| GhostError::Database(e.to_string()))?,
+                    timestamp: r.get(5).map_err(|e| GhostError::Database(e.to_string()))?,
+                    received_by: r.get(6).map_err(|e| GhostError::Database(e.to_string()))?,
+                    payout_address,
+                };
+                f(&rec)?;
+                emitted += 1;
+            }
+            Ok(())
+        })?;
+        Ok(emitted)
+    }
+
     pub fn export_unpaid_shares(&self) -> GhostResult<Vec<UnpaidShareExport>> {
         let rows: Vec<(u64, String, f64, f64, String, i64, String)> =
             self.with_connection(|conn| {
@@ -12740,5 +12820,91 @@ mod ledger_reconciliation_tests {
             .expect("re-import");
         assert_eq!(again, 0, "re-running must not double-count");
         assert_eq!(again_miners, 0, "miner already exists on re-run");
+    }
+
+    /// The streaming export must emit exactly what the buffering one returns.
+    ///
+    /// `export_unpaid_shares` materialises the ledger twice and its caller serialised the result
+    /// into one contiguous buffer; at 2.77M rows that was OOM-killed on a live node, which made
+    /// the one-time reconciliation impossible to run (#584). `for_each_unpaid_share` streams
+    /// instead — but only helps if it produces the SAME records, including the decrypted payout
+    /// address, which it resolves up front rather than per row.
+    #[test]
+    fn streaming_export_matches_buffered_export() {
+        let a = Database::in_memory().expect("db a");
+        a.upsert_miner(&miner("m1", "bc1qstreamaddrccccccccccccccccccccccccccc"))
+            .expect("miner m1");
+        a.upsert_miner(&miner("m2", "bc1qstreamaddrddddddddddddddddddddddddddd"))
+            .expect("miner m2");
+        a.insert_share(&share("s1", "m1", 100.0, 10)).expect("s1");
+        a.insert_share(&share("s2", "m2", 200.0, 20)).expect("s2");
+        a.insert_share(&share("s3", "m1", 300.0, 30)).expect("s3");
+
+        let buffered = a.export_unpaid_shares().expect("buffered export");
+
+        let mut streamed: Vec<UnpaidShareExport> = Vec::new();
+        let n = a
+            .for_each_unpaid_share(|rec| {
+                streamed.push(rec.clone());
+                Ok(())
+            })
+            .expect("streaming export");
+
+        assert_eq!(n, buffered.len(), "streamed count must match");
+        assert_eq!(streamed.len(), 3);
+        for (s, b) in streamed.iter().zip(buffered.iter()) {
+            assert_eq!(s.share_hash, b.share_hash);
+            assert_eq!(s.miner_id, b.miner_id);
+            assert_eq!(s.work, b.work);
+            assert_eq!(s.timestamp, b.timestamp);
+            assert_eq!(
+                s.payout_address, b.payout_address,
+                "the DECRYPTED address must survive streaming — without it the payout query's \
+                 INNER JOIN drops the share and the miner silently loses the work"
+            );
+        }
+        assert!(
+            streamed.iter().all(|s| s.payout_address.is_some()),
+            "both miners have addresses, so every record must carry one"
+        );
+
+        // A share whose miner row is absent must still stream, carrying no address, rather than
+        // aborting the export — the caller counts these and warns.
+        a.insert_share(&share("s4", "ghost_miner", 400.0, 40))
+            .expect("s4");
+        let mut orphan = 0usize;
+        a.for_each_unpaid_share(|rec| {
+            if rec.payout_address.is_none() {
+                orphan += 1;
+            }
+            Ok(())
+        })
+        .expect("streaming export with orphan");
+        assert_eq!(
+            orphan, 1,
+            "a miner-less share streams with payout_address=None"
+        );
+    }
+
+    /// An error from the callback must abort the export rather than being swallowed — a
+    /// half-written export file silently imported across the fleet is worse than no export.
+    #[test]
+    fn streaming_export_propagates_callback_errors() {
+        let a = Database::in_memory().expect("db");
+        a.upsert_miner(&miner("m1", "bc1qstreamaddrccccccccccccccccccccccccccc"))
+            .expect("miner");
+        a.insert_share(&share("s1", "m1", 100.0, 10)).expect("s1");
+        a.insert_share(&share("s2", "m1", 200.0, 20)).expect("s2");
+
+        let mut seen = 0usize;
+        let err = a.for_each_unpaid_share(|_| {
+            seen += 1;
+            Err(GhostError::Database("disk full".into()))
+        });
+        assert!(err.is_err(), "callback failure must surface");
+        assert_eq!(
+            seen, 1,
+            "must stop at the first failure, not walk the ledger"
+        );
     }
 }
