@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 48;
+const SCHEMA_VERSION: u32 = 49;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -125,6 +125,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (46, migrate_v46),
         (47, migrate_v47),
         (48, migrate_v48),
+        (49, migrate_v49),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2409,6 +2410,69 @@ fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> 
     Ok(())
 }
 
+/// v49: chain-derived settlement — `ratified_proposals` + `settled_blocks`.
+///
+/// Settlement is what marks a miner's shares paid so the next payout does not pay the same work
+/// twice. Until now it ran in exactly one place: `payout::settle_paid_block`, called only from the
+/// `block_submitted` consumer, i.e. **only on the node that submitted the winning block**. The
+/// other seven never marked anything paid, so after a win their ledgers still owed the whole paid
+/// set. Whichever of them proposed next would pay it again, and — because they are the majority —
+/// their view is the one that reaches quorum. That is a double-payment path, and it also explains
+/// why the unpaid ledger only ever grows: nothing has settled since 2026-06-02.
+///
+/// The fix is to stop *announcing* settlement and start *observing* it. A won block's coinbase is
+/// already on-chain and already commits to exactly who was paid, so every node can settle from its
+/// own view of the chain with no gossip, no new consensus object, and no agreement step. Hashing
+/// the observed coinbase outputs under `CoinbaseOutputs/v1` yields the same `outputs_hash` the
+/// proposal committed to, which is what makes the match trustworthy: the chain is the anchor, so a
+/// forged proposal cannot hash to an observed coinbase.
+///
+/// Two tables, because two things were missing:
+///
+/// `ratified_proposals` — proposals lived only in `TemplateProcessor::payout_proposals`, an
+/// in-memory map, so a restart lost them. A node cannot settle a block whose proposal it can no
+/// longer see, and the block that eventually wins may carry an older armed snapshot than the one
+/// currently approved. Indexed by `outputs_hash` because that is the lookup key the chain gives us.
+///
+/// `settled_blocks` — records exactly what each settlement applied (`shares_marked`,
+/// `treasury_bumped`) so a reorg reversal is an exact inversion of recorded amounts rather than a
+/// recomputation, and so re-settling is idempotent. `reversed` is a flag rather than a deletion:
+/// an orphaned block that later returns to the main chain must re-settle through the same row.
+///
+/// Both are additive and `IF NOT EXISTS`, so this is a no-op on a database that already has them.
+fn migrate_v49(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v49: ratified_proposals + settled_blocks");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ratified_proposals (
+            proposal_hash    BLOB    PRIMARY KEY,
+            outputs_hash     BLOB    NOT NULL,
+            cutoff_ts        INTEGER NOT NULL,
+            block_height     INTEGER NOT NULL,
+            treasury_amount  INTEGER NOT NULL,
+            treasury_address BLOB    NOT NULL,
+            proposal_json    BLOB    NOT NULL,
+            created_ts       INTEGER NOT NULL
+        );
+         CREATE INDEX IF NOT EXISTS idx_ratified_proposals_outputs
+             ON ratified_proposals(outputs_hash);
+         CREATE TABLE IF NOT EXISTS settled_blocks (
+            block_hash      TEXT    PRIMARY KEY,
+            block_height    INTEGER NOT NULL,
+            proposal_hash   BLOB    NOT NULL,
+            outputs_hash    BLOB    NOT NULL,
+            shares_marked   INTEGER NOT NULL,
+            treasury_bumped INTEGER NOT NULL,
+            settled_ts      INTEGER NOT NULL,
+            reversed        INTEGER NOT NULL DEFAULT 0
+        );
+         CREATE INDEX IF NOT EXISTS idx_settled_blocks_unreversed
+             ON settled_blocks(reversed, block_height);",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v49: created ratified_proposals and settled_blocks");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2490,6 +2554,93 @@ mod tests {
         run_migrations(&conn).expect("migrate");
         migrate_v48(&conn).expect("v48 must be idempotent");
         migrate_v48(&conn).expect("v48 must be idempotent twice");
+    }
+
+    /// v49 must be idempotent: a node that has already taken the settlement tables (a canary on an
+    /// earlier build, or a hand-applied fix) runs this against tables that already exist.
+    #[test]
+    fn v49_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+        migrate_v49(&conn).expect("v49 must be idempotent");
+        migrate_v49(&conn).expect("v49 must be idempotent twice");
+    }
+
+    /// The settlement tables must carry every column the reversal path reads back. Reversal is an
+    /// exact inversion of what settlement applied, so `shares_marked` and `treasury_bumped` are
+    /// load-bearing: without them a reorg could only re-derive, and re-deriving after the ledger
+    /// has moved on is how you double-credit.
+    #[test]
+    fn v49_settlement_tables_have_the_reversal_columns() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+
+        for (table, required) in [
+            (
+                "settled_blocks",
+                vec![
+                    "block_hash",
+                    "block_height",
+                    "proposal_hash",
+                    "outputs_hash",
+                    "shares_marked",
+                    "treasury_bumped",
+                    "settled_ts",
+                    "reversed",
+                ],
+            ),
+            (
+                "ratified_proposals",
+                vec![
+                    "proposal_hash",
+                    "outputs_hash",
+                    "cutoff_ts",
+                    "block_height",
+                    "treasury_amount",
+                    "treasury_address",
+                    "proposal_json",
+                    "created_ts",
+                ],
+            ),
+        ] {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("prepare");
+            let columns: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .expect("query")
+                .map(|c| c.expect("column"))
+                .collect();
+            for column in required {
+                assert!(
+                    columns.contains(&column.to_string()),
+                    "{table} missing '{column}'. Found: {columns:?}"
+                );
+            }
+        }
+    }
+
+    /// The lookup that drives settlement is "given a coinbase I just saw on-chain, which proposal
+    /// does it pay?" — an `outputs_hash` probe. It must not degrade into a table scan, because it
+    /// runs on every block the node sees, including every block mined by everyone else.
+    #[test]
+    fn v49_outputs_hash_lookup_uses_the_index() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT proposal_hash FROM ratified_proposals \
+                 WHERE outputs_hash = ?1",
+                [vec![0u8; 32]],
+                |r| r.get(3),
+            )
+            .expect("explain");
+
+        assert!(
+            plan.contains("idx_ratified_proposals_outputs"),
+            "planner did not choose the outputs_hash index; plan was: {plan}"
+        );
     }
 
     /// A database from a NEWER build must be left alone, and must not be mistaken for one
