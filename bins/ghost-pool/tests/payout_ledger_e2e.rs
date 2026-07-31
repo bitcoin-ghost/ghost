@@ -109,8 +109,23 @@ struct Node {
 /// If the scenario were future-dated, the re-derived `now` would fall BEFORE the shares and
 /// exclude everything — the tests would still go red, but for a reason that cannot happen in
 /// production, and the real race would go untested.
+///
+/// It must ALSO stay inside `PRE_GATE_FRESHNESS_SECS` (1800, `payout.rs`), which validators
+/// apply to the proposal timestamp. This was `- 3_600`, chosen before that rule existed, so
+/// every validator rejected the proposal outright:
+///
+/// ```text
+/// node rejected the payout: pre-gate proposal timestamp ... not within 1800s of now ...
+/// GHOST-02: 0/8 nodes approved, quorum needs 6
+/// ```
+///
+/// which reads like a catastrophic payout failure and is purely a stale fixture. It went
+/// unnoticed because CI never ran this target (#580).
+///
+/// 600 s keeps a real gap for the race under test while leaving 3x headroom on the freshness
+/// bound, so a slow runner cannot drift the test into rejection.
 fn block_found_at() -> i64 {
-    chrono::Utc::now().timestamp() - 3_600
+    chrono::Utc::now().timestamp() - 600
 }
 
 fn regtest_rpc() -> Option<Arc<BitcoinRpc>> {
