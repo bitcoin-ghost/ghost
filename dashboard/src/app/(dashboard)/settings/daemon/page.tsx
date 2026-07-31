@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Toggle } from "@/components/ui/Toggle";
 import { ConfirmDialog } from "@/components/ui/Dialog";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
+import { getMaxConnections, type MaxConnectionsStatus } from "@/lib/api/config";
 import { useToast } from "@/components/ui/Toast";
 import {
   useDaemonSettings,
@@ -145,6 +146,8 @@ function FieldRow({
 // Only the total (`-maxconnections`) is tunable; inbound capacity is whatever is
 // left after the reserved outbound. This control sets the total and shows the
 // fixed-outbound / variable-inbound split as a two-tone bar.
+// 8 full-relay + 2 block-relay-only + 1 feeler. Matches RESERVED_OUTBOUND in
+// crates/ghost-verification/src/maxconnections.rs — the two must not drift.
 const OUTBOUND_RESERVED = 11;
 const MAXCONN_DEFAULT = 125; // ghostd DEFAULT_MAX_PEER_CONNECTIONS
 const MAXCONN_SLIDER_MIN = 11;
@@ -154,10 +157,12 @@ function PeerConnectionsField({
   value,
   onChange,
   disabled,
+  live,
 }: {
   value: string;
   onChange: (v: string) => void;
   disabled?: boolean;
+  live?: MaxConnectionsStatus | null;
 }) {
   const isDefault = value.trim() === "";
   const parsed = parseInt(value, 10);
@@ -239,6 +244,47 @@ function PeerConnectionsField({
           </button>
         )}
       </div>
+
+      {/* Live inbound usage (#499). The configured total says nothing about whether the
+          node is actually full; a node at its inbound ceiling stops accepting peers
+          silently and drops out of public crawler listings (#497, #498, #572). */}
+      {live && live.connections_in != null && (
+        <div
+          className={
+            "rounded-md px-3 py-2 text-xs " +
+            (live.near_ceiling
+              ? "bg-[color:var(--warn-bg,rgba(200,120,0,0.12))] text-[color:var(--warn,#c87800)]"
+              : "text-[color:var(--dim)]")
+          }
+        >
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span>
+              In use <b>{live.connections_in}</b> / {live.inbound_capacity} inbound
+              {live.inbound_utilisation != null && (
+                <> ({Math.round(live.inbound_utilisation * 100)}%)</>
+              )}
+            </span>
+            <span>
+              Outbound {live.connections_out ?? "-"} of {live.reserved_outbound} reserved
+            </span>
+          </div>
+          {live.near_ceiling && (
+            <div className="mt-1">
+              This node is at or near its inbound ceiling and is refusing new peers. Crawlers
+              that cannot connect record it unreachable and drop it from public listings.
+              {live.recommended_max != null && (
+                <> Memory on this node supports up to <b>{live.recommended_max}</b>.</>
+              )}
+            </div>
+          )}
+          {live.ambiguous && (
+            <div className="mt-1">
+              <code>maxconnections</code> is set more than once in <code>bitcoin.conf</code>;
+              this control will not overwrite an ambiguous file.
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -279,6 +325,28 @@ export default function DaemonSettingsPage() {
 
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // Live peer-connection state (#499). Polled rather than read from the config, because the
+  // question "is this node full?" cannot be answered by the configured value alone.
+  const [maxConn, setMaxConn] = useState<MaxConnectionsStatus | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getMaxConnections()
+        .then((r) => {
+          if (!cancelled) setMaxConn(r);
+        })
+        .catch(() => {
+          // Non-fatal: the widget simply shows no live figures.
+          if (!cancelled) setMaxConn(null);
+        });
+    load();
+    const t = setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
 
   // Seed the form once the current settings load / change.
   const loaded = data?.settings;
@@ -398,6 +466,7 @@ export default function DaemonSettingsPage() {
               <PeerConnectionsField
                 value={form.maxConnections}
                 onChange={(v) => patch({ maxConnections: v })}
+                live={maxConn}
               />
               <FieldRow
                 label="Max upload target / 24h"
