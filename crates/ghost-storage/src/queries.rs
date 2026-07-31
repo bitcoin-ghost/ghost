@@ -524,7 +524,7 @@ impl Database {
         theirs: &std::collections::HashSet<String>,
         limit: usize,
         max_bytes: usize,
-    ) -> GhostResult<(Vec<Vec<u8>>, usize)> {
+    ) -> GhostResult<(Vec<Vec<u8>>, usize, bool)> {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
@@ -543,6 +543,11 @@ impl Database {
             let mut proofs = Vec::new();
             let mut unservable = 0usize;
             let mut bytes = 0usize;
+            // Whether either bound stopped us adding a proof we DO hold and COULD serve.
+            // Without this the caller cannot tell a complete answer from a truncated one, so it
+            // treats a full response as "window done" and does not ask again until the sweep
+            // cursor comes round — 28 hours for a dense bucket (#558).
+            let mut truncated = false;
             for row in rows {
                 let (hash, proof) = row.map_err(|e| GhostError::Database(e.to_string()))?;
                 if theirs.contains(&hash) {
@@ -552,16 +557,19 @@ impl Database {
                     Some(p) => {
                         // Stop on EITHER bound. Overshooting `max_bytes` would produce a
                         // message the transport silently drops, which is strictly worse than
-                        // serving fewer proofs — the requester simply asks again next sweep.
+                        // serving fewer proofs — but the requester must be TOLD, or it cannot
+                        // know to ask again.
                         if proofs.len() < limit && bytes + p.len() <= max_bytes {
                             bytes += p.len();
                             proofs.push(p);
+                        } else {
+                            truncated = true;
                         }
                     }
                     None => unservable += 1,
                 }
             }
-            Ok((proofs, unservable))
+            Ok((proofs, unservable, truncated))
         })
     }
 
@@ -9470,6 +9478,54 @@ mod tests {
             Some((105, 107)),
             "must report the LOWEST gap so repeated calls walk forward deterministically"
         );
+    }
+
+    /// A truncated response must SAY it was truncated.
+    ///
+    /// The responder stops adding proofs at either bound, and before #558 said nothing about
+    /// it — so a requester receiving a full budget could not tell "that is everything" from
+    /// "that is the first 56 of 400". It treated the window as done and did not ask again
+    /// until the sweep cursor returned, one visit per rotation: 28 hours to drain a dense
+    /// bucket that could drain in seconds.
+    #[test]
+    fn a_truncated_proof_response_reports_that_more_remain() {
+        let db = Database::in_memory().expect("in-memory db");
+
+        db.with_connection(|conn| {
+            conn.execute_batch(
+                "INSERT INTO shares
+                   (round_id, miner_id, difficulty, work, share_hash, timestamp, received_by, valid, proof)
+                 VALUES
+                   (1,'m',1.0,1.0,'h1',100,'n',1,X'AABB'),
+                   (1,'m',1.0,1.0,'h2',101,'n',1,X'AABB'),
+                   (1,'m',1.0,1.0,'h3',102,'n',1,X'AABB');",
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed");
+
+        let theirs = std::collections::HashSet::new();
+
+        // Budget for everything: complete answer, nothing withheld.
+        let (proofs, _unservable, more) = db
+            .unpaid_proofs_missing_from(0, 1000, &theirs, 10, 1_000_000)
+            .expect("query");
+        assert_eq!(proofs.len(), 3);
+        assert!(!more, "a complete answer must not claim more remain");
+
+        // Count bound hit — must report truncation.
+        let (proofs, _unservable, more) = db
+            .unpaid_proofs_missing_from(0, 1000, &theirs, 2, 1_000_000)
+            .expect("query");
+        assert_eq!(proofs.len(), 2);
+        assert!(more, "hitting the COUNT bound must report more remain");
+
+        // Byte bound hit — must also report truncation.
+        let (proofs, _unservable, more) = db
+            .unpaid_proofs_missing_from(0, 1000, &theirs, 10, 3)
+            .expect("query");
+        assert!(proofs.len() < 3);
+        assert!(more, "hitting the BYTE bound must report more remain");
     }
 
     /// The GHOST-03 sweep span is derived from this, so it must ignore paid and invalid shares —

@@ -74,6 +74,19 @@ pub struct LedgerConvergenceResponse {
     /// schema v41 and their signature no longer exists. Reported so the divergence is visible
     /// rather than silent — no protocol can reconcile these, only a one-time operation.
     pub unservable: usize,
+    /// The responder had MORE servable proofs for this window than fitted in one response.
+    ///
+    /// Without this the requester cannot distinguish a complete answer from a truncated one:
+    /// a response carrying the full 56-proof budget looks identical to one carrying everything
+    /// that was missing. It therefore treated the window as done and did not ask again until
+    /// the sweep cursor returned — one visit per rotation, so a bucket holding ~400 missing
+    /// shares needed 7 visits and 28 hours. With the flag the requester re-asks immediately
+    /// and the bucket drains in seconds (#558).
+    ///
+    /// `#[serde(default)]` for wire-compat: a peer predating this field sends `false`, which
+    /// is exactly the old behaviour — ask again next sweep.
+    #[serde(default)]
+    pub more_available: bool,
 }
 
 /// Cap on proofs served in one response, so a wide window cannot produce an enormous message.
@@ -186,7 +199,7 @@ impl ConvergenceHandler {
         req: &LedgerConvergenceRequest,
     ) -> LedgerConvergenceResponse {
         let theirs: std::collections::HashSet<String> = req.share_hashes.iter().cloned().collect();
-        let (proofs, unservable) = match &self.db {
+        let (proofs, unservable, more_available) = match &self.db {
             Some(db) => db
                 .unpaid_proofs_missing_from(
                     req.since_ts,
@@ -196,13 +209,14 @@ impl ConvergenceHandler {
                     MAX_PROOF_BYTES_PER_RESPONSE,
                 )
                 .unwrap_or_default(),
-            None => (Vec::new(), 0),
+            None => (Vec::new(), 0, false),
         };
         LedgerConvergenceResponse {
             since_ts: req.since_ts,
             until_ts: req.until_ts,
             proofs,
             unservable,
+            more_available,
         }
     }
 
@@ -516,8 +530,34 @@ impl MessageHandler for ConvergenceHandler {
                         since = resp.since_ts,
                         until = resp.until_ts,
                         applied = outcome.applied,
+                        more_available = resp.more_available,
                         "GHOST-03: backfilled unpaid-ledger shares via window convergence"
                     );
+                }
+
+                // The peer had more for this window than fitted. Ask again NOW rather than
+                // waiting for the sweep cursor to come round — that wait is one full rotation,
+                // so a bucket holding ~400 missing shares took 7 visits and 28 hours (#558).
+                //
+                // Guarded on `applied > 0`: if we applied nothing, re-asking would repeat an
+                // identical request and could loop. Progress is the condition for continuing,
+                // which also means a peer that lies about `more_available` cannot spin us.
+                if resp.more_available && outcome.applied > 0 {
+                    if let Some(send) = &self.send {
+                        match self.ledger_request_bytes(resp.since_ts, resp.until_ts) {
+                            Ok(bytes) => {
+                                debug!(
+                                    since = resp.since_ts,
+                                    until = resp.until_ts,
+                                    "GHOST-03: window has more — re-requesting immediately"
+                                );
+                                send(bytes)?;
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "GHOST-03: could not build follow-up request");
+                            }
+                        }
+                    }
                 }
             }
             ConvergencePayload::Response(resp) => {
@@ -821,6 +861,7 @@ mod tests {
                 until_ts: i64::MAX,
                 proofs,
                 unservable: 0,
+                more_available: false,
             },
         ))
         .unwrap();
@@ -866,6 +907,7 @@ mod tests {
             until_ts: i64::MAX,
             proofs: vec![serde_json::to_vec(&forged).unwrap()],
             unservable: 0,
+            more_available: false,
         };
 
         assert_eq!(
