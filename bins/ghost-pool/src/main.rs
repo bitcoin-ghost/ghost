@@ -2471,14 +2471,59 @@ async fn main() -> Result<()> {
     // rather than verified, and it is only defensible because every node in the mesh belongs to
     // the same operator. New shares (v41 onward) carry their proof and converge verifiably.
     if let Some(path) = &args.ledger_export {
-        let shares = db.export_unpaid_shares()?;
-        let total_work: f64 = shares.iter().map(|s| s.work).sum();
-        let no_address = shares.iter().filter(|s| s.payout_address.is_none()).count();
-        std::fs::write(path, serde_json::to_vec(&shares)?)?;
+        // STREAMING export. The previous version called `export_unpaid_shares()` (which
+        // materialises the ledger twice) and then `serde_json::to_vec` (a third copy, as one
+        // contiguous buffer). On ghost-vm5 with 2.77M unpaid rows that was OOM-killed at 1.57 GB
+        // RSS against 1.4 GB available — so the one-time reconciliation could not be run at the
+        // scale that needs it (#584).
+        //
+        // Both formats stream, so neither can OOM:
+        //   *.jsonl -> one record per line (what `--ledger-import` already streams back in)
+        //   other   -> a JSON array written incrementally, for compatibility with the legacy
+        //              whole-file import path
+        //
+        // Peak memory is one record either way.
+        use std::io::Write as _;
+        let as_jsonl = path.extension().map(|e| e == "jsonl").unwrap_or(false);
+        let file = std::fs::File::create(path)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+        let mut total_work = 0f64;
+        let mut no_address = 0usize;
+        let mut first = true;
+        if !as_jsonl {
+            w.write_all(b"[")?;
+        }
+        let shares_len = db.for_each_unpaid_share(|rec| {
+            total_work += rec.work;
+            if rec.payout_address.is_none() {
+                no_address += 1;
+            }
+            let line = serde_json::to_vec(rec)
+                .map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))?;
+            let emit = |w: &mut std::io::BufWriter<std::fs::File>| -> std::io::Result<()> {
+                if as_jsonl {
+                    w.write_all(&line)?;
+                    w.write_all(b"\n")
+                } else {
+                    if !first {
+                        w.write_all(b",")?;
+                    }
+                    w.write_all(&line)
+                }
+            };
+            emit(&mut w).map_err(|e| ghost_common::error::GhostError::Database(e.to_string()))?;
+            first = false;
+            Ok(())
+        })?;
+        if !as_jsonl {
+            w.write_all(b"]")?;
+        }
+        w.flush()?;
         info!(
-            shares = shares.len(),
+            shares = shares_len,
             total_work,
             no_address,
+            format = if as_jsonl { "jsonl" } else { "json-array" },
             file = %path.display(),
             "Ledger export complete"
         );
