@@ -1013,7 +1013,7 @@ pub struct DashboardConfig {
     pub private_mining: Option<bool>,
     /// Payout address for mining rewards
     pub payout_address: Option<String>,
-    /// Custom pool name for coinbase tag (formatted as "- G H O S T - {pool_name}")
+    /// Custom pool name for coinbase tag (formatted as "GHOST {pool_name}")
     pub pool_name: Option<String>,
     /// Tor mode active (ghostd -tormode)
     pub tor_mode: bool,

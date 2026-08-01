@@ -2792,7 +2792,7 @@ async fn main() -> Result<()> {
                 .pool
                 .pool_name
                 .as_ref()
-                .map(|name| format!("- G H O S T - {}", name))
+                .map(|name| format!("GHOST {}", name))
         })
         .unwrap_or_else(|| mining_mode.default_coinbase_tag().to_string());
 

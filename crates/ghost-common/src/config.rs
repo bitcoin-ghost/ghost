@@ -1193,11 +1193,21 @@ pub enum MiningMode {
 impl MiningMode {
     /// Returns the default coinbase scriptsig tag for this mining mode.
     /// Visible on block explorers to identify the pool and its mode.
+    /// Tag stamped into the coinbase scriptsig.
+    ///
+    /// Deliberately terse. The scriptsig has a 100-byte consensus ceiling and the measured mainnet
+    /// coinbase already used 53 of it, 24 of which was this tag in its spaced-out form
+    /// (`- G H O S T - PublicPool`). Upcoming work needs ~44 bytes there for two commitments — the
+    /// payout identity a won block pays, and the node a share was mined to — which left only ~3
+    /// bytes of margin. Trimming the tag to `GHOST <mode>` recovers 8 bytes on the public path and
+    /// more on the others, taking the margin to a comfortable ~11.
+    ///
+    /// It stays human-readable in a block explorer, which is the only thing it is for.
     pub fn default_coinbase_tag(&self) -> &'static str {
         match self {
-            MiningMode::PublicPool => "- G H O S T - PublicPool",
-            MiningMode::PrivatePool => "- G H O S T - PrivatePool",
-            MiningMode::PrivateSolo => "- G H O S T - PrivateSolo",
+            MiningMode::PublicPool => "GHOST PublicPool",
+            MiningMode::PrivatePool => "GHOST SoloPool",
+            MiningMode::PrivateSolo => "GHOST Solo",
         }
     }
 }
@@ -2442,7 +2452,7 @@ pub struct PoolConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_payout_address: Option<String>,
     /// Optional custom pool name shown in coinbase (e.g. "SatoshiPool").
-    /// Formatted as "- G H O S T - {pool_name}" in the coinbase scriptsig.
+    /// Formatted as "GHOST {pool_name}" in the coinbase scriptsig.
     /// If not set, falls back to mining_mode default (PublicPool, PrivatePool, PrivateSolo).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_name: Option<String>,
