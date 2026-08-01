@@ -433,6 +433,41 @@ impl ZmqSubscriber {
     }
 }
 
+/// Normalise a 64-hex block hash to **display order** — the form every RPC accepts.
+///
+/// [`BlockEvent`] hashes are not reliably in the order its parser documents. On the live fleet
+/// (ghost-vm5, 2026-08-01) `parse_sequence_body` emitted `76a8…c700000000000000000000`, whose
+/// byte-reverse was the actual tip: internal order, not the display order the doc promises. The
+/// discrepancy went unseen because the parser's test fixture is `[0x11; 32]`, a palindrome, so
+/// reversing it proves nothing.
+///
+/// Rather than flip the shared parser on one fleet's observed behaviour — it is a consensus-
+/// adjacent path and upstream Core documents the opposite convention — this normalises at the
+/// point of use, and is correct whichever way the parser behaves.
+///
+/// The test is unambiguous on Bitcoin mainnet: proof of work forces a long run of leading zero
+/// bytes in display order, which appear as trailing zeros in internal order. A hash with trailing
+/// zeros and no leading ones is therefore internal and gets reversed.
+///
+/// Anything not matching either shape is returned untouched — guessing at an unrecognised shape
+/// would turn a clear "not found" into a silent lookup of the wrong block.
+pub fn block_hash_to_display_order(hash: &str) -> String {
+    const ZERO_RUN: usize = 8; // 4 bytes; mainnet has far more
+    let leading = hash.chars().take_while(|c| *c == '0').count();
+    let trailing = hash.chars().rev().take_while(|c| *c == '0').count();
+
+    if leading >= ZERO_RUN || trailing < ZERO_RUN || hash.len() != 64 {
+        return hash.to_string();
+    }
+    match hex::decode(hash) {
+        Ok(mut bytes) => {
+            bytes.reverse();
+            hex::encode(bytes)
+        }
+        Err(_) => hash.to_string(),
+    }
+}
+
 /// Parse a Bitcoin Core ZMQ `sequence`-topic body into a chain [`BlockEvent`].
 ///
 /// The body layout is `<32-byte hash (internal little-endian)><1-byte label>`,
@@ -479,14 +514,46 @@ mod sequence_parse_tests {
         hex::encode(h)
     }
 
+    /// The fixture is deliberately NOT palindromic. It used to be `[0x11; 32]`, so reversing it
+    /// changed nothing and the assertion could not tell whether the parser reversed at all — a
+    /// test that cannot fail on the property it appears to check.
     #[test]
     fn block_connect_and_disconnect_parse_from_label_byte() {
-        let h = [0x11u8; 32];
+        let mut h = [0u8; 32];
+        for (i, b) in h.iter_mut().enumerate() {
+            *b = i as u8;
+        }
         let want = display_hash(h);
         assert!(matches!(parse_sequence_body(&body(h, b'C', None)),
                 Some(BlockEvent::Connected { hash }) if hash == want));
         assert!(matches!(parse_sequence_body(&body(h, b'D', None)),
                 Some(BlockEvent::Disconnected { hash }) if hash == want));
+    }
+
+    /// The exact pair observed on ghost-vm5, 2026-08-01: `BlockEvent` delivered the internal-order
+    /// form and `getblock` answered "Block not found"; the reverse was the live tip.
+    #[test]
+    fn an_internal_order_hash_is_flipped_to_display_order() {
+        let internal = "76a82370124a5dc50ab649501e94673a75de61bd3fc700000000000000000000";
+        let display = "00000000000000000000c73fbd61de753a67941e5049b60ac55d4a127023a876";
+        assert_eq!(block_hash_to_display_order(internal), display);
+    }
+
+    /// A hash already in display order must be left exactly alone — flipping a good hash is the
+    /// same failure as not flipping a bad one.
+    #[test]
+    fn a_display_order_hash_is_left_alone() {
+        let display = "00000000000000000000c73fbd61de753a67941e5049b60ac55d4a127023a876";
+        assert_eq!(block_hash_to_display_order(display), display);
+    }
+
+    /// Anything not clearly one shape or the other is returned untouched. Guessing would turn an
+    /// honest "not found" into a silent lookup of some other block.
+    #[test]
+    fn an_unrecognisable_hash_is_not_guessed_at() {
+        for odd in ["", "deadbeef", &"ab".repeat(32)] {
+            assert_eq!(block_hash_to_display_order(odd), odd);
+        }
     }
 
     #[test]

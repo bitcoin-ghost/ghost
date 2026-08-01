@@ -86,6 +86,11 @@ impl SettlementObserver {
 
     /// Pull the coinbase scriptSig out of a block.
     async fn coinbase_scriptsig(&self, block_hash: &str) -> GhostResult<Vec<u8>> {
+        // Normalise to display order first. `BlockEvent` hashes arrive in internal order despite
+        // the parser's doc claiming otherwise (observed on vm5, 2026-08-01: every settlement probe
+        // got "Block not found" for a block that existed). Settlement is the first consumer to
+        // take one of these to an RPC call, which is why it surfaced here.
+        let block_hash = &ghost_common::zmq::block_hash_to_display_order(block_hash);
         // Verbosity 0: raw hex. Parsing the block ourselves avoids depending on the shape of the
         // verbose JSON, which differs between Core versions.
         let raw = self.rpc.get_block(block_hash, 0).await?;
