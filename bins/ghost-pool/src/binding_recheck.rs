@@ -20,6 +20,65 @@ use ghost_common::share_binding::{verify_share_node_binding, BindingError, Coinb
 use ghost_storage::Database;
 use tracing::{debug, info, warn};
 
+/// Accept a skeleton announced by `pool_sv2`, if it proves itself.
+///
+/// **Verified by rehashing, never trusted.** The id is a content address, so a skeleton is stored
+/// only under the id its own bytes produce. Without this check a peer could name any bytes it
+/// liked under an identity that shares already point at, and every one of those shares would then
+/// "verify" against a coinbase of the sender's choosing — which is the whole attack the binding
+/// exists to prevent, reintroduced at the storage layer.
+pub fn accept_skeleton(
+    db: &Database,
+    claimed_id: &str,
+    coinbase_prefix: &str,
+    coinbase_suffix: &str,
+    merkle_path: &[String],
+    height: u64,
+) -> GhostResult<[u8; 32]> {
+    let claimed = hex32(claimed_id).ok_or_else(|| {
+        ghost_common::error::GhostError::Internal("skeleton id is not 32 bytes".into())
+    })?;
+    let prefix = hex::decode(coinbase_prefix)
+        .map_err(|e| ghost_common::error::GhostError::Internal(format!("prefix: {e}")))?;
+    let suffix = hex::decode(coinbase_suffix)
+        .map_err(|e| ghost_common::error::GhostError::Internal(format!("suffix: {e}")))?;
+    let mut path = Vec::with_capacity(merkle_path.len());
+    for node in merkle_path {
+        path.push(hex32(node).ok_or_else(|| {
+            ghost_common::error::GhostError::Internal("merkle node is not 32 bytes".into())
+        })?);
+    }
+
+    let built = CoinbaseSkeleton {
+        coinbase_prefix: prefix,
+        coinbase_suffix: suffix,
+        merkle_path: path,
+    };
+    let actual = built.id();
+    if actual != claimed {
+        return Err(ghost_common::error::GhostError::Internal(
+            "skeleton does not hash to the id it claims".into(),
+        ));
+    }
+
+    db.store_skeleton(
+        &actual,
+        &built.coinbase_prefix,
+        &built.coinbase_suffix,
+        &built.merkle_path,
+        height,
+    )?;
+    Ok(actual)
+}
+
+/// Parse a 32-byte hex string, or nothing.
+///
+/// `None` rather than a truncated or padded array: a wrong-width hash is not a hash, and coercing
+/// one would have a share reference a skeleton that cannot exist.
+pub fn hex32(s: &str) -> Option<[u8; 32]> {
+    <[u8; 32]>::try_from(hex::decode(s).ok()?.as_slice()).ok()
+}
+
 /// Most bindings to re-judge in one pass.
 ///
 /// Bounded so a large backlog cannot stall the tick it shares with settlement reconciliation. What
@@ -238,6 +297,72 @@ mod tests {
                 .expect("defer");
         }
         assert_eq!(db.count_unverified_bindings().expect("count"), 1);
+    }
+
+    /// An honest announcement is stored under the id its own bytes produce.
+    #[test]
+    fn an_honest_skeleton_is_accepted() {
+        let db = a_db();
+        let (skeleton, _, _) = a_bound_share();
+        let id = skeleton.id();
+
+        let stored = accept_skeleton(
+            &db,
+            &hex::encode(id),
+            &hex::encode(&skeleton.coinbase_prefix),
+            &hex::encode(&skeleton.coinbase_suffix),
+            &skeleton
+                .merkle_path
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>(),
+            960_000,
+        )
+        .expect("should accept");
+        assert_eq!(stored, id);
+        assert!(db.get_skeleton(&id).expect("get").is_some());
+    }
+
+    /// **The trust-free property.** A peer cannot store bytes of its choosing under an id that
+    /// shares already point at — which would make every one of those shares verify against a
+    /// coinbase the sender picked, reintroducing the exact attack the binding prevents.
+    #[test]
+    fn a_skeleton_that_does_not_hash_to_its_claimed_id_is_refused() {
+        let db = a_db();
+        let (skeleton, _, _) = a_bound_share();
+        let real_id = skeleton.id();
+
+        let mut doctored = skeleton.coinbase_prefix.clone();
+        doctored[10] ^= 0xFF; // change the coinbase, keep the claimed identity
+
+        assert!(
+            accept_skeleton(
+                &db,
+                &hex::encode(real_id),
+                &hex::encode(&doctored),
+                &hex::encode(&skeleton.coinbase_suffix),
+                &skeleton
+                    .merkle_path
+                    .iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>(),
+                960_000,
+            )
+            .is_err(),
+            "bytes that do not hash to the claimed id must be refused"
+        );
+        assert!(
+            db.get_skeleton(&real_id).expect("get").is_none(),
+            "and nothing should have been stored"
+        );
+    }
+
+    /// A malformed announcement is refused rather than stored half-parsed.
+    #[test]
+    fn a_malformed_skeleton_is_refused() {
+        let db = a_db();
+        assert!(accept_skeleton(&db, "notlongenough", "00", "01", &[], 1).is_err());
+        assert!(accept_skeleton(&db, &hex::encode([1u8; 32]), "zz", "01", &[], 1).is_err());
     }
 
     /// A skeleton stored and read back must be the same skeleton — the merkle path is flattened

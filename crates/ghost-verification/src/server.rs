@@ -864,6 +864,12 @@ pub struct ShareNotification {
     /// proof-of-work independently. Optional for backward compatibility.
     #[serde(default)]
     pub header: Option<String>,
+    /// Full extranonce this share was mined with, hex.
+    #[serde(default)]
+    pub extranonce: Option<String>,
+    /// Content address of the coinbase skeleton this share was mined against, hex.
+    #[serde(default)]
+    pub skeleton_id: Option<String>,
 }
 
 /// Data for a single share in a batch (from SRI Pool native webhook)
@@ -943,6 +949,9 @@ pub struct ShareBatch {
 
 /// Callback for recording shares (from SRI Pool notifications)
 pub type RecordShareFn = Arc<dyn Fn(ShareNotification) -> GhostResult<()> + Send + Sync>;
+
+/// Callback for storing a coinbase skeleton announced alongside a share batch.
+pub type RecordSkeletonFn = Arc<dyn Fn(SkeletonData) -> GhostResult<()> + Send + Sync>;
 
 /// Data passed to the block_found callback when a block-difficulty share arrives
 #[derive(Debug, Clone)]
@@ -1346,6 +1355,7 @@ pub struct VerificationState {
     test_proposal_fn: Option<TestProposalFn>,
     /// Share recording callback (from SRI Pool notifications)
     record_share_fn: Option<RecordShareFn>,
+    record_skeleton_fn: Option<RecordSkeletonFn>,
     /// Block found callback (triggers payout proposal before block submission)
     block_found_fn: Option<BlockFoundFn>,
     /// Internal API authentication (H10/H11 security fix)
@@ -1643,6 +1653,7 @@ impl VerificationState {
             ws_state: Arc::new(WsState::new()),
             test_proposal_fn: None,
             record_share_fn: None,
+            record_skeleton_fn: None,
             block_found_fn: None,
             internal_auth: None,
             get_pool_peers: None,
@@ -1804,6 +1815,18 @@ impl VerificationState {
         self
     }
 
+    /// Set the coinbase-skeleton recorder.
+    ///
+    /// Skeletons arrive alongside the shares that reference them and are stored **first** — see
+    /// `record_share_batch`. A share whose skeleton is in the same batch must find it.
+    pub fn with_skeleton_recorder<F>(mut self, recorder: F) -> Self
+    where
+        F: Fn(SkeletonData) -> GhostResult<()> + Send + Sync + 'static,
+    {
+        self.record_skeleton_fn = Some(Arc::new(recorder));
+        self
+    }
+
     /// Set block found callback (triggers payout proposal before block submission)
     ///
     /// This callback fires when a block-difficulty share arrives via the SRI webhook,
@@ -1841,6 +1864,17 @@ impl VerificationState {
             ));
         }
 
+        // Skeletons first, and deliberately so: a share naming a skeleton carried in the *same*
+        // batch must be able to find it. Recording the shares first would defer every one of them
+        // for no reason, and the deferral would only be cleared on a later tick.
+        if let Some(ref recorder) = self.record_skeleton_fn {
+            for skeleton in batch.skeletons {
+                if let Err(e) = recorder(skeleton) {
+                    tracing::warn!(error = %e, "Failed to record coinbase skeleton from batch");
+                }
+            }
+        }
+
         let mut recorded = 0;
         let mut blocks_found = 0;
 
@@ -1875,6 +1909,8 @@ impl VerificationState {
                     None
                 },
                 header: share.header.clone(),
+                extranonce: share.extranonce.clone(),
+                skeleton_id: share.skeleton_id.clone(),
             };
 
             if let Err(e) = self.record_share(notification) {

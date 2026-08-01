@@ -294,8 +294,19 @@ did not, which was a defect, not a trade):
 | share arrived before its skeleton | `unverified_bindings` + the recheck pass |
 | skeleton never arrives at all | backlog is counted and logged, so it is visible not inferred |
 
-  - [ ] wire the ingest side: store arriving `skeletons`, and defer a binding when a share names
-        one that is not held (the recheck pass and its storage are ready; the call site is not)
+  - [x] **ingest wired.** `record_share_batch` stores the batch's skeletons **before** its shares —
+        a share naming a skeleton carried in the *same* batch must find it, or every one of them
+        would defer for no reason and wait a tick to be cleared.
+        `accept_skeleton` is a function rather than a closure so the trust-free property has a
+        test: a skeleton is stored **only** under the id its own bytes hash to. Without that check
+        a peer could put bytes of its choosing under an id shares already point at, and every one
+        of those shares would then verify against a coinbase the sender picked — the exact attack
+        the binding exists to prevent, reintroduced at the storage layer.
+        At ingest a share is judged if its skeleton is held and deferred if not. 7 tests.
+
+**WP-1b is complete end to end** — tag in the coinbase, skeleton cut from the real transaction,
+transport with dedup, storage, verification, and repair at every layer where evidence can go
+missing. All of it dark: `SHARE_ADDR_BIND_HEIGHT` is `u64::MAX` and nothing acts on a verdict.
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
 

@@ -42,6 +42,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn, Level};
+
 use tracing_subscriber::prelude::*;
 
 use ghost_common::config::{MiningMode, NodeConfig, ReaperSettings};
@@ -7000,6 +7001,27 @@ async fn main() -> Result<()> {
     });
 
     // Configure share recorder callback for SRI Pool share notifications
+    // Store coinbase skeletons as they are announced, so a share naming one can be judged.
+    //
+    // Verified by rehashing, never trusted: the id a share carries must be the id the skeleton
+    // itself hashes to, or a peer could name any bytes it liked and have them stored under an
+    // identity that shares already point at.
+    {
+        let db_for_skeletons = Arc::clone(&db);
+        let rm_for_skeletons = Arc::clone(&round_manager);
+        verification_state = verification_state.with_skeleton_recorder(move |skeleton| {
+            ghost_pool::binding_recheck::accept_skeleton(
+                &db_for_skeletons,
+                &skeleton.skeleton_id,
+                &skeleton.coinbase_prefix,
+                &skeleton.coinbase_suffix,
+                &skeleton.merkle_path,
+                rm_for_skeletons.current_height(),
+            )
+            .map(|_| ())
+        });
+    }
+
     let rm_for_shares = Arc::clone(&round_manager);
     let identity_for_shares = Arc::clone(&identity);
     let db_for_shares = Arc::clone(&db);
@@ -7104,6 +7126,77 @@ async fn main() -> Result<()> {
             received_by: hex::encode(&identity_for_shares.node_id()[..8]),
             valid: true, // Already validated by SRI Pool
         };
+
+        // Establish which node this share was really mined for, from the share itself.
+        //
+        // `received_by` is only a claim until the coinbase says so: the header commits to a merkle
+        // root that commits to the coinbase that carries the node tag. Judging that needs the
+        // skeleton, which travels once per job — so a share can legitimately arrive first, and a
+        // share we cannot judge yet must be recorded rather than given a verdict it did not earn.
+        //
+        // Dark: nothing acts on the verdict below `SHARE_ADDR_BIND_HEIGHT`, which is unarmed.
+        if let (Some(sid_hex), Some(extranonce_hex), Some(header_hex)) = (
+            share.skeleton_id.as_deref(),
+            share.extranonce.as_deref(),
+            share.header.as_deref(),
+        ) {
+            match (
+                ghost_pool::binding_recheck::hex32(sid_hex),
+                hex::decode(extranonce_hex),
+                hex::decode(header_hex),
+            ) {
+                (Some(skeleton_id), Ok(extranonce), Ok(header)) => {
+                    let expected = {
+                        let digest =
+                            ghost_common::identity::hash_message(&identity_for_shares.node_id());
+                        let mut c = [0u8; ghost_common::coinbase_tags::NODE_ID_LEN];
+                        c.copy_from_slice(&digest[..ghost_common::coinbase_tags::NODE_ID_LEN]);
+                        c
+                    };
+
+                    match db_for_shares.get_skeleton(&skeleton_id) {
+                        Ok(Some((prefix, suffix, merkle_path))) => {
+                            let skeleton = ghost_common::share_binding::CoinbaseSkeleton {
+                                coinbase_prefix: prefix,
+                                coinbase_suffix: suffix,
+                                merkle_path,
+                            };
+                            if let Err(e) = ghost_common::share_binding::verify_share_node_binding(
+                                &skeleton,
+                                &extranonce,
+                                &header,
+                                &expected,
+                            ) {
+                                warn!(
+                                    share_hash = %share.share_hash,
+                                    error = ?e,
+                                    "share does NOT prove it was mined for this node"
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            // Not a fault — the skeleton is simply not here yet. Recorded so the
+                            // recheck pass judges it when the skeleton lands, instead of the share
+                            // keeping a verdict that only reflects when it happened to arrive.
+                            if let Err(e) = db_for_shares.defer_binding(
+                                &share.share_hash,
+                                &skeleton_id,
+                                &extranonce,
+                                &header,
+                                &expected,
+                            ) {
+                                warn!(error = %e, "could not record a share awaiting its skeleton");
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "skeleton lookup failed for a share"),
+                    }
+                }
+                _ => debug!(
+                    share_hash = %share.share_hash,
+                    "share carries malformed binding fields; no binding claimed"
+                ),
+            }
+        }
 
         match db_for_shares.insert_share_with_proof(&share_record, &proof_blob) {
             Ok(_) => {
