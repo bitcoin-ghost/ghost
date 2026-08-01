@@ -238,6 +238,91 @@ mod tests {
         assert_eq!(balances.get("bc1qalice"), Some(&15));
     }
 
+    /// The real thing: the canonical payout the fleet had ratified at height 960,550, read from
+    /// production on 2026-08-01.
+    ///
+    /// All 8 nodes held a **byte-identical** `canonical_payout` blob (one distinct SHA-256 across
+    /// the fleet) and identical `ledger_root`s at 960,548–960,550. That is the property genesis
+    /// depends on and it is worth pinned to a test rather than remembered: if this conversion ever
+    /// stops producing the same balances from the same adopted bytes, the chain cannot start.
+    ///
+    /// Six payees, and the whole fleet loses **less than one micro-work** — a millionth of a share
+    /// — to truncation across all of them.
+    fn ratified_960550() -> Vec<(String, u128)> {
+        vec![
+            (
+                "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
+                56_331_582_763_867_633_090_560,
+            ),
+            (
+                "bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".to_string(),
+                2_793_514_555_167_149_129_728,
+            ),
+            (
+                "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".to_string(),
+                2_207_417_987_159_784_685_568,
+            ),
+            (
+                "148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN".to_string(),
+                749_653_085_382_128_041_984,
+            ),
+            (
+                "bc1pgfky40eg9nk5lqn54epltfvxyld5aaeed6j03n2knjh0x904eusskg48d7".to_string(),
+                124_182_128_766_138_007_552,
+            ),
+            (
+                "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h".to_string(),
+                19_521_704_918_910_001_152,
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_real_ratified_checkpoint_converts_cleanly() {
+        let (balances, rounding) = genesis_balances(&ratified_960550());
+
+        assert_eq!(balances.len(), 6, "every payee must survive the conversion");
+        assert_eq!(rounding.addresses_dropped, 0);
+        assert_eq!(
+            rounding.units_discarded, 956_544,
+            "the entire fleet loses under one micro-work to truncation"
+        );
+        assert!(
+            rounding.units_discarded < CHECKPOINT_UNITS_PER_MICRO,
+            "less than a millionth of a share, in total, across every payee"
+        );
+
+        // The dominant payee holds ~90% of the ledger; a conversion bug there is the one that
+        // would actually cost someone money.
+        assert_eq!(
+            balances.get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
+            Some(&56_331_582_763_867_633)
+        );
+    }
+
+    /// Golden vector for the production genesis candidate.
+    ///
+    /// Pins `(seq 0, cutoff_ts 1785580254)` against the adopted bytes at height 960,550. A change
+    /// here means either the conversion or the state-root encoding moved, and either one would
+    /// silently give eight nodes eight different opening balances.
+    #[test]
+    fn genesis_root_for_the_960550_candidate_is_pinned() {
+        const CUTOFF_TS: i64 = 1_785_580_254;
+        let (batch, _, _) = genesis_batch(
+            [0u8; 32], // the checkpoint hash is supplied at ceremony time
+            CUTOFF_TS,
+            [0u8; 32],
+            &ratified_960550(),
+            vec![],
+        );
+        let root: String = batch
+            .state_root
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(root, "e0c6ee483e18fa65d5a6b17b626515a38415863969441feba8d58e6a943fa9e4");
+    }
+
     /// An empty checkpoint is a cold start, not a panic.
     #[test]
     fn an_empty_checkpoint_yields_an_empty_genesis() {

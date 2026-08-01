@@ -301,7 +301,27 @@ i.e. before 2026-08-31** — target genesis by ~2026-08-20.
         authorises it. A zero parent would be a chain anyone could start.
       - No shares in the batch: the work is in the balances, and re-listing shares would invite a
         validator to re-derive numbers that were agreed by vote rather than by arithmetic.
-- [ ] OPEN: which checkpoint (height) is genesis — operator decision, see "Open decisions"
+- [x] **genesis preview run 2026-08-01 — the fleet is already unanimous.** Read-only across all 8:
+
+      | | |
+      |---|---|
+      | latest checkpoint height | **960,550** (all 8 agree) |
+      | `ledger_root` at 960,548 / 549 / 550 | byte-identical on all 8 |
+      | `canonical_payout` blob | **one distinct SHA-256 across the fleet** (1,402 bytes) |
+      | payees | 6 miner addresses, 8 node entries (every node 1 share) |
+      | ratified work | 62,225,872,225.26 units |
+      | truncation loss, whole fleet | **956,544 checkpoint units = 0.96 micro-work** |
+
+      So genesis needs no negotiation and no union: every node converts identical adopted bytes to
+      identical opening balances. The union stays available but is now provably unnecessary — the
+      466-share raw-ledger spread does not reach the checkpoint, because the checkpoint is adopted
+      verbatim rather than recomputed. That was always the design; this is the evidence.
+
+      Golden vector pinned in `batch_genesis.rs` against the real 960,550 bytes:
+      `state_root(seq 0, cutoff_ts 1785580254)` =
+      `e0c6ee483e18fa65d5a6b17b626515a38415863969441feba8d58e6a943fa9e4`
+- [ ] OPERATOR: confirm 960,550 (or a later height) as the genesis anchor — the preview says any
+      recent finalised height works, so this is a timing choice, not a technical one
 - [ ] the ceremony itself: pick it, sign it, adopt it fleet-wide
 
 ### WP-5 — shadow run + trust gate
