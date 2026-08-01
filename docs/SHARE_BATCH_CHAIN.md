@@ -94,11 +94,13 @@ ledger only grows.
       `ratified_proposals`, which would have duplicated the JSON and left two places to disagree
       about proposal history. Proposals written before the column simply do not match a coinbase,
       which reads as "I cannot prove this block is mine" rather than a false positive.
-- [ ] populate `outputs_hash` on `store_proposal` (the going-forward half of the above)
-- [ ] `SettlementObserver`: on_block_connected / on_block_disconnected / rescan
-- [ ] wire to a second `BlockEvent` receiver alongside `ReorgHandler` (do not extend ReorgHandler)
-- [ ] `OBSERVED_SETTLEMENT_HEIGHT` gate, dry-run below it
-- [ ] **red-before test: a non-submitting node settles** (fails on main today)
+- [x] populate `outputs_hash` on `store_proposal`, computed with the same treasury-address
+      selection the commitment uses (that selection was duplicated at three sites and is now one
+      helper — picking the other branch silently changes the hash)
+- [ ] **BLOCKED on D12** — `SettlementObserver`: on_block_connected / on_block_disconnected / rescan
+- [ ] **BLOCKED on D12** — wire to a second `BlockEvent` receiver alongside `ReorgHandler`
+- [ ] **BLOCKED on D12** — `OBSERVED_SETTLEMENT_HEIGHT` gate, dry-run below it
+- [ ] **BLOCKED on D12** — red-before test: a non-submitting node settles (fails on main today)
 
 ### WP-1 — attribution bindings (one shared gate)
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
@@ -143,6 +145,57 @@ Tip change reads the `ArmedPayout`; proposal binding moves from `cutoff_ts` equa
 ### WP-7 — deletion (LAST)
 Sweep, tolerance, tip−6 loop. Only after the cutover has soaked. Keep the checkpoint tables (genesis
 provenance) and the treasury-only fallback (cold start / lost quorum floor) forever.
+
+## ⚠ BLOCKER found 2026-08-01: outputs-hash matching cannot identify a won block
+
+**Settlement's match key does not work.** WP-S assumed a node can recognise its own won block by
+hashing the observed coinbase outputs and finding the proposal that committed to that hash. It
+cannot, because the coinbase that gets mined is **not** the coinbase the proposal described.
+
+Evidence — `bins/ghost-pool/src/template.rs:1045-1095`, "bidirectional fee adjustment". Before the
+coinbase is built, the approved proposal is mutated to match the fees actually available in *this
+node's* template:
+
+- surplus ⇒ `prop.treasury_amount` increased by the extra;
+- shortfall ⇒ treasury reduced first, then `node_payouts` amounts reduced largest-first and
+  zero entries dropped entirely.
+
+Miner payouts are untouched in both branches. Node payouts are touched on shortfall. Treasury is
+touched always.
+
+The commitment is then recomputed from the adjusted proposal (`template.rs:1455-1465`, which states
+the pre-adjustment commitment is "stale"). So the on-chain coinbase hashes to the *adjusted*
+outputs, while the proposal we stored hashes to the unadjusted ones.
+
+Worse, the adjustment is **per-node by design**: "the mempool moves, RBF replaces transactions, and
+each node's Reaper/BUDS filtering drops a different set — so every node sees slightly different
+fees". The winner's drift is not reproducible by anyone else, so no observer can derive the hash
+either. This is not a bug in the adjustment; it is what makes the coinbase determinable before the
+block is won.
+
+Net effect: matching on outputs hash would fail on essentially every real block, silently — a pool
+block would look exactly like a stranger's. The v49 column and lookup are still sound plumbing, but
+they cannot be the sole match key.
+
+### Options (OPERATOR DECISION — D12)
+
+1. **Tag the coinbase with the proposal hash (recommended).** Put `GHPP‖proposal_hash[..16]` in the
+   coinbase scriptsig, so a won block *declares* which proposal it pays and settlement needs no
+   amount hashing at all. Exact regardless of drift, and it makes "is this block ours?" a lookup
+   rather than an inference. Cost: ~20 bytes of scriptsig, which competes with WP-1b's 20-byte node
+   tag against the 100-byte ceiling — so the scriptsig space audit in WP-1b must cover both, and the
+   two tags should be specified together.
+2. **Match on the drift-invariant subset** — hash only the miner outputs, which the adjustment never
+   touches. No coinbase change, but a weaker key: two proposals with an identical miner split (very
+   possible across consecutive tips when no new shares landed) would be indistinguishable, and
+   settling the wrong one marks the wrong cutoff.
+3. **Match on miner outputs, then disambiguate** by checking the block height against the proposal's
+   and requiring the coinbase's total to equal subsidy + that block's fees. Heavier, still
+   inferential, and it re-introduces per-node fee reasoning.
+
+Recommendation: **(1)**, specified jointly with WP-1b's node tag so the scriptsig budget is settled
+once. Until this is decided, the observer cannot be written — it would be built on a key that does
+not match.
 
 ## Open decisions
 

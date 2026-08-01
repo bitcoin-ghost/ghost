@@ -459,11 +459,7 @@ impl TemplateProcessor {
 
                         // M-28: Reconstruct coinbase commitment so templates created
                         // after restart carry a valid commitment_snapshot for verification
-                        let treasury_addr = if !proposal.treasury_address.is_empty() {
-                            proposal.treasury_address.clone()
-                        } else {
-                            self.config.treasury_address.address().as_bytes().to_vec()
-                        };
+                        let treasury_addr = self.effective_treasury_address(&proposal);
                         let commitment =
                             CoinbaseCommitment::from_proposal(&proposal, &treasury_addr);
                         self.coinbase_verifier.set_commitment(commitment);
@@ -510,6 +506,21 @@ impl TemplateProcessor {
         self.block_submitted_rx.lock().take()
     }
 
+    /// The treasury address this proposal's coinbase actually pays.
+    ///
+    /// H-MINE-3 snapshots the address into the proposal, but older proposals carry an empty field
+    /// and fall back to config. This selection was duplicated at every site that builds a coinbase
+    /// commitment — and every copy has to agree, because the commitment is a hash: pick the other
+    /// branch and the hash changes, the pre-submission check fails, and (since settlement now looks
+    /// proposals up by that hash) a won block stops being recognisable as ours.
+    fn effective_treasury_address(&self, proposal: &PayoutProposal) -> Vec<u8> {
+        if !proposal.treasury_address.is_empty() {
+            proposal.treasury_address.clone()
+        } else {
+            self.config.treasury_address.address().as_bytes().to_vec()
+        }
+    }
+
     /// Store a payout proposal (called when proposal is received)
     pub fn store_proposal(&self, proposal: PayoutProposal) {
         let hash = proposal.proposal_hash;
@@ -531,6 +542,24 @@ impl TemplateProcessor {
                             error = %e,
                             "Failed to persist payout proposal to database"
                         );
+                    } else {
+                        // Tag it with the hash of the coinbase outputs it will pay. This is how a
+                        // node later recognises a won block as its own: it hashes the coinbase it
+                        // sees on-chain and looks the proposal up by that hash. Computed here,
+                        // where the same treasury-address selection the commitment uses is in
+                        // scope — computing it anywhere else risks the two disagreeing.
+                        let treasury_addr = self.effective_treasury_address(&proposal);
+                        let outputs_hash =
+                            CoinbaseCommitment::from_proposal(&proposal, &treasury_addr)
+                                .output_hash;
+                        if let Err(e) = db.set_proposal_outputs_hash(&hash, &outputs_hash) {
+                            warn!(
+                                hash = %hex::encode(&hash[..8]),
+                                error = %e,
+                                "Failed to record the proposal's coinbase outputs hash — a block \
+                                 paying this proposal will not be recognised as ours"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -610,11 +639,7 @@ impl TemplateProcessor {
         };
 
         // M-28: Create and store coinbase commitment for verification
-        let treasury_addr = if !proposal.treasury_address.is_empty() {
-            proposal.treasury_address.clone()
-        } else {
-            self.config.treasury_address.address().as_bytes().to_vec()
-        };
+        let treasury_addr = self.effective_treasury_address(&proposal);
         let commitment = CoinbaseCommitment::from_proposal(&proposal, &treasury_addr);
         self.coinbase_verifier.set_commitment(commitment);
 
