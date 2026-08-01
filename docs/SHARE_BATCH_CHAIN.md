@@ -241,7 +241,19 @@ batches cannot both reach 67%.
 - [x] `bft_threshold(n)` given one home in `constants.rs`, and `voting.rs` now calls it — the
       arithmetic is trivial, which is exactly why two sites rounding it differently is a quorum one
       node believes was reached and another does not. Pinned against the formula it replaced.
-- [ ] batch verification + terminal quarantine
+- [x] **batch verification, with the terminal/recoverable line drawn explicitly.** `verify_batch`
+      returns `Valid` / `Defer(reason)` / `Fault(reason)`, and the split is the load-bearing part:
+      a fault is terminal, so anything an honest node could produce merely by holding a different
+      view **must** defer. `Defer` covers stale seq, being behind, parent mismatch (it may be *us*
+      on the wrong parent), a proposer one step early on a fast clock, and a proposer not due under
+      *our* voter set — that last one because voter sets are not always identical fleet-wide, and
+      faulting it would have honest nodes quarantining each other over a membership lag.
+      `Fault` is only what is decidable from the batch's own bytes against a finalised parent:
+      out-of-order shares, a duplicate, a share that does not prove itself, a wrong state root, a
+      truncation flag contradicting its count, a close time that does not advance, an unsigned
+      batch. Position is judged **before** contents, so a batch we are not entitled to judge is
+      never branded for a defect — the response to a fault cannot be taken back. 11 tests.
+- [ ] the quarantine itself (what a `Fault` does to the peer) — needs the alert path
 - [ ] propose/finalise driver and mesh message types
 
 ### WP-4 — genesis batch

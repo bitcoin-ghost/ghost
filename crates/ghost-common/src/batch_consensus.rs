@@ -161,6 +161,187 @@ impl ProposerSchedule {
     }
 }
 
+/// Why a batch could not be judged yet. **Not** a fault: sync, wait, or ask again.
+///
+/// The distinction from [`FaultReason`] is the load-bearing part of this module. A fault is
+/// terminal — the proposer is quarantined and the batch is never retried — so anything that an
+/// honest node could produce merely by holding a different view must land here instead. Getting
+/// that wrong does not produce a false alarm; it produces a fleet that quarantines itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferReason {
+    /// Its sequence is at or below our head. Almost always a resend.
+    Stale { batch_seq: u64, our_seq: u64 },
+    /// Its sequence is beyond our head + 1: we are behind and must catch up first.
+    AheadOfUs { batch_seq: u64, our_seq: u64 },
+    /// Right sequence, different parent. Ambiguous by nature — it may be us on the wrong parent —
+    /// so the answer is to sync and re-judge, never to accuse.
+    ParentMismatch,
+    /// Their clock is ahead of ours. See [`Authorisation::TooEarly`].
+    ProposerTooEarly { escalation: u32 },
+    /// Not their turn as far as our voter set goes. Deferred rather than faulted **because voter
+    /// sets themselves are not always identical across the fleet** — an honest proposer under a
+    /// membership view we have not caught up with would otherwise be quarantined for it.
+    ProposerNotDue,
+}
+
+/// A defect in the batch itself. Terminal: quarantine the proposer, alarm, never retry.
+///
+/// Every variant here is decidable from the batch's own bytes plus a parent that is already
+/// finalised — so no honest node can produce one by holding a different view. That is the test for
+/// membership of this enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaultReason {
+    /// Time ran backwards against a finalised parent.
+    CloseTimeNotForward { close_ts: i64, parent_close_ts: i64 },
+    /// Shares are not in the canonical order the batch hash commits to.
+    SharesOutOfOrder { at_index: usize },
+    /// The same share twice — work counted twice.
+    DuplicateShare { share_hash: [u8; 32] },
+    /// A share does not prove itself: bad PoW or a bad GHOST-09 signature.
+    InvalidShare { share_hash: [u8; 32] },
+    /// The claimed state root is not what folding these shares onto the parent state gives.
+    StateRootMismatch {
+        claimed: [u8; 32],
+        computed: [u8; 32],
+    },
+    /// `truncated` and `pending_count` contradict each other, so a peer cannot tell a full batch
+    /// from a starved one — the #558 failure, restated.
+    TruncationContradiction { truncated: bool, pending_count: u32 },
+    /// The proposer did not sign the batch it proposed.
+    ProposerSignatureInvalid,
+}
+
+/// The outcome of judging a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchVerdict {
+    /// Valid — vote for it.
+    Valid,
+    /// Cannot judge yet. Recoverable.
+    Defer(DeferReason),
+    /// Defective. Terminal.
+    Fault(FaultReason),
+}
+
+/// The checks this module cannot do itself.
+///
+/// Share validity is policy (difficulty targets, which signature encoding is in force at a height)
+/// and proposer signatures need the identity layer. Injecting both keeps the decision logic pure
+/// and, more usefully, testable: a test can make a share invalid without constructing a real one.
+pub trait BatchChecks {
+    /// Does this share prove itself — proof of work, and a GHOST-09 signature over it?
+    fn share_is_valid(&self, share: &crate::types::ShareProof) -> bool;
+    /// Did this proposer sign this batch hash?
+    fn proposer_signed(&self, proposer: &[u8; 32], batch_hash: &[u8; 32], signature: &[u8])
+        -> bool;
+}
+
+/// Judge a batch against a finalised parent.
+///
+/// The order of the checks is deliberate: everything recoverable is decided *before* anything that
+/// could brand a peer. A batch we are not in a position to judge must never be mistaken for a bad
+/// one, because the response to a bad one cannot be taken back.
+///
+/// `parent_balances` are the running balances after the parent — the state this batch folds onto.
+pub fn verify_batch<C: BatchChecks>(
+    batch: &crate::share_batch::ShareBatch,
+    parent: &crate::share_batch::ShareBatch,
+    parent_balances: &BTreeMap<String, i64>,
+    schedule: &ProposerSchedule,
+    now: i64,
+    checks: &C,
+) -> BatchVerdict {
+    use crate::share_batch::{canonical_cmp, compute_state_root, fold_shares};
+    use std::cmp::Ordering;
+
+    // --- position in the chain: are we even looking at the same place? ---
+    match batch.seq.cmp(&parent.seq.saturating_add(1)) {
+        Ordering::Less => {
+            return BatchVerdict::Defer(DeferReason::Stale {
+                batch_seq: batch.seq,
+                our_seq: parent.seq,
+            })
+        }
+        Ordering::Greater => {
+            return BatchVerdict::Defer(DeferReason::AheadOfUs {
+                batch_seq: batch.seq,
+                our_seq: parent.seq,
+            })
+        }
+        Ordering::Equal => {}
+    }
+    if batch.prev_batch_hash != parent.batch_hash() {
+        return BatchVerdict::Defer(DeferReason::ParentMismatch);
+    }
+
+    // --- whose turn: the sequence opened when its parent closed, which every node agrees on ---
+    match schedule.authorise(batch.seq, &batch.proposer, parent.close_ts, now) {
+        Authorisation::Authorised { .. } => {}
+        Authorisation::TooEarly { escalation } => {
+            return BatchVerdict::Defer(DeferReason::ProposerTooEarly { escalation })
+        }
+        Authorisation::NotAProposer => return BatchVerdict::Defer(DeferReason::ProposerNotDue),
+    }
+
+    // --- from here on, every failure is the batch's own fault ---
+    if batch.close_ts <= parent.close_ts {
+        return BatchVerdict::Fault(FaultReason::CloseTimeNotForward {
+            close_ts: batch.close_ts,
+            parent_close_ts: parent.close_ts,
+        });
+    }
+
+    if batch.truncated != (batch.pending_count > 0) {
+        return BatchVerdict::Fault(FaultReason::TruncationContradiction {
+            truncated: batch.truncated,
+            pending_count: batch.pending_count,
+        });
+    }
+
+    for (i, pair) in batch.shares.windows(2).enumerate() {
+        match canonical_cmp(&pair[0], &pair[1]) {
+            Ordering::Less => {}
+            Ordering::Equal => {
+                return BatchVerdict::Fault(FaultReason::DuplicateShare {
+                    share_hash: pair[1].share_hash,
+                })
+            }
+            Ordering::Greater => {
+                return BatchVerdict::Fault(FaultReason::SharesOutOfOrder { at_index: i + 1 })
+            }
+        }
+    }
+
+    for share in &batch.shares {
+        if !checks.share_is_valid(share) {
+            return BatchVerdict::Fault(FaultReason::InvalidShare {
+                share_hash: share.share_hash,
+            });
+        }
+    }
+
+    let mut balances = parent_balances.clone();
+    fold_shares(&mut balances, &batch.shares);
+    let computed = compute_state_root(&balances, batch.seq, batch.close_ts);
+    if computed != batch.state_root {
+        return BatchVerdict::Fault(FaultReason::StateRootMismatch {
+            claimed: batch.state_root,
+            computed,
+        });
+    }
+
+    // Last, because it is the most expensive and the cheap structural checks have already had
+    // their chance to reject.
+    if !checks.proposer_signed(
+        &batch.proposer,
+        &batch.batch_hash(),
+        &batch.proposer_signature,
+    ) {
+        return BatchVerdict::Fault(FaultReason::ProposerSignatureInvalid);
+    }
+
+    BatchVerdict::Valid
+}
+
 /// One vote per sequence, remembered.
 ///
 /// Round-robin decides who *asks*; this decides that a node answers once. Without it two valid
@@ -412,6 +593,343 @@ mod tests {
         let mut lock = SeqVoteLock::new();
         lock.try_vote(7, [0xAA; 32]);
         assert_eq!(lock.try_vote(8, [0xBB; 32]), VoteDecision::Fresh);
+    }
+
+    // ---- verify_batch ----
+
+    use crate::share_batch::{compute_state_root, fold_shares, ShareBatch};
+    use crate::types::ShareProof;
+
+    /// Accepts everything. Defects are injected by editing the batch, not by faking a checker, so
+    /// the tests exercise the real decision path.
+    struct AllGood;
+    impl BatchChecks for AllGood {
+        fn share_is_valid(&self, _: &ShareProof) -> bool {
+            true
+        }
+        fn proposer_signed(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    struct RejectsShares;
+    impl BatchChecks for RejectsShares {
+        fn share_is_valid(&self, _: &ShareProof) -> bool {
+            false
+        }
+        fn proposer_signed(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    struct RejectsSignature;
+    impl BatchChecks for RejectsSignature {
+        fn share_is_valid(&self, _: &ShareProof) -> bool {
+            true
+        }
+        fn proposer_signed(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8]) -> bool {
+            false
+        }
+    }
+
+    fn a_share(ts: u64, byte: u8, addr: &str, work: f64) -> ShareProof {
+        ShareProof {
+            round_id: 1,
+            miner_id: [byte; 32],
+            difficulty: work,
+            work,
+            share_hash: [byte; 32],
+            timestamp: ts,
+            received_by: [0u8; 32],
+            template_id: None,
+            payout_address: Some(addr.to_string()),
+            header: None,
+            signature: None,
+        }
+    }
+
+    const PARENT_CLOSE: i64 = 1_700_000_000;
+
+    fn a_parent() -> ShareBatch {
+        ShareBatch {
+            seq: 41,
+            prev_batch_hash: [0x11; 32],
+            close_ts: PARENT_CLOSE,
+            proposer: voter(1),
+            shares: vec![],
+            settled_blocks: vec![],
+            node_shares: vec![],
+            state_root: [0x22; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: vec![1, 2, 3],
+        }
+    }
+
+    /// A well-formed child of `a_parent()`, proposed by whoever is actually due at escalation 0.
+    fn a_child(
+        parent: &ShareBatch,
+        schedule: &ProposerSchedule,
+    ) -> (ShareBatch, BTreeMap<String, i64>) {
+        let parent_balances: BTreeMap<String, i64> = BTreeMap::new();
+        let mut shares = vec![
+            a_share(1000, 1, "bc1qalice", 1.5),
+            a_share(1000, 2, "bc1qbob", 2.5),
+            a_share(1001, 3, "bc1qalice", 0.25),
+        ];
+        crate::share_batch::canonical_sort(&mut shares);
+
+        let mut balances = parent_balances.clone();
+        fold_shares(&mut balances, &shares);
+        let close_ts = parent.close_ts + 30;
+        let state_root = compute_state_root(&balances, parent.seq + 1, close_ts);
+
+        let batch = ShareBatch {
+            seq: parent.seq + 1,
+            prev_batch_hash: parent.batch_hash(),
+            close_ts,
+            proposer: schedule.proposer_at(parent.seq + 1, 0).unwrap(),
+            shares,
+            settled_blocks: vec![],
+            node_shares: vec![],
+            state_root,
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: vec![9, 9, 9],
+        };
+        (batch, parent_balances)
+    }
+
+    #[test]
+    fn a_well_formed_batch_is_valid() {
+        let s = eight();
+        let parent = a_parent();
+        let (batch, balances) = a_child(&parent, &s);
+        assert_eq!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Valid
+        );
+    }
+
+    /// **The rule that keeps the fleet from quarantining itself.** Everything an honest node can
+    /// produce by holding a different view defers; nothing about it is terminal.
+    #[test]
+    fn view_differences_defer_and_never_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (good, balances) = a_child(&parent, &s);
+        let now = PARENT_CLOSE + 1;
+
+        let mut stale = good.clone();
+        stale.seq = parent.seq;
+        assert_eq!(
+            verify_batch(&stale, &parent, &balances, &s, now, &AllGood),
+            BatchVerdict::Defer(DeferReason::Stale {
+                batch_seq: parent.seq,
+                our_seq: parent.seq
+            })
+        );
+
+        let mut ahead = good.clone();
+        ahead.seq = parent.seq + 5;
+        assert_eq!(
+            verify_batch(&ahead, &parent, &balances, &s, now, &AllGood),
+            BatchVerdict::Defer(DeferReason::AheadOfUs {
+                batch_seq: parent.seq + 5,
+                our_seq: parent.seq
+            })
+        );
+
+        let mut other_parent = good.clone();
+        other_parent.prev_batch_hash = [0xFF; 32];
+        assert_eq!(
+            verify_batch(&other_parent, &parent, &balances, &s, now, &AllGood),
+            BatchVerdict::Defer(DeferReason::ParentMismatch),
+            "a different parent may be us on the wrong chain — sync, never accuse"
+        );
+
+        let mut not_due = good.clone();
+        not_due.proposer = s.proposer_at(parent.seq + 1, 4).unwrap();
+        assert_eq!(
+            verify_batch(&not_due, &parent, &balances, &s, now, &AllGood),
+            BatchVerdict::Defer(DeferReason::ProposerNotDue),
+            "voter sets are not always identical across the fleet, so this cannot be terminal"
+        );
+
+        let mut early = good.clone();
+        early.proposer = s.proposer_at(parent.seq + 1, 1).unwrap();
+        assert_eq!(
+            verify_batch(&early, &parent, &balances, &s, now, &AllGood),
+            BatchVerdict::Defer(DeferReason::ProposerTooEarly { escalation: 1 })
+        );
+    }
+
+    /// Position is judged before contents. A batch we are not in a position to judge must not be
+    /// branded for a defect we were never entitled to look for.
+    #[test]
+    fn an_unjudgeable_batch_is_not_branded_for_its_contents() {
+        let s = eight();
+        let parent = a_parent();
+        let (good, balances) = a_child(&parent, &s);
+
+        // Both out of position AND thoroughly defective.
+        let mut broken = good.clone();
+        broken.seq = parent.seq + 9;
+        broken.state_root = [0xAB; 32];
+        broken.shares.reverse();
+        broken.pending_count = 7;
+
+        assert!(
+            matches!(
+                verify_batch(&broken, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+                BatchVerdict::Defer(_)
+            ),
+            "out of position wins over any defect — the response to a fault cannot be taken back"
+        );
+    }
+
+    /// Reordering breaks the hash the fleet agreed on, and is decidable from the bytes alone.
+    #[test]
+    fn shares_out_of_canonical_order_are_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.shares.reverse();
+        assert!(matches!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Fault(FaultReason::SharesOutOfOrder { .. })
+        ));
+    }
+
+    /// The same share twice is the same work paid twice.
+    #[test]
+    fn a_duplicated_share_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (mut batch, balances) = a_child(&parent, &s);
+        let dup = batch.shares[0].clone();
+        batch.shares.insert(1, dup);
+        assert_eq!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Fault(FaultReason::DuplicateShare {
+                share_hash: batch.shares[0].share_hash
+            })
+        );
+    }
+
+    /// The root is the whole point: it is what a validator recomputes instead of trusting.
+    #[test]
+    fn a_wrong_state_root_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.state_root = [0xAB; 32];
+        assert!(matches!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Fault(FaultReason::StateRootMismatch { .. })
+        ));
+    }
+
+    /// A single micro-work difference must be caught — the root exists precisely so that "nearly
+    /// the same" is not "the same".
+    #[test]
+    fn one_micro_work_of_drift_is_caught() {
+        let s = eight();
+        let parent = a_parent();
+        let (mut batch, mut balances) = a_child(&parent, &s);
+        // One micro-work — a millionth of a share — added to the parent state the batch folds onto.
+        balances.insert("bc1qalice".to_string(), 1);
+
+        assert!(
+            matches!(
+                verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+                BatchVerdict::Fault(FaultReason::StateRootMismatch { .. })
+            ),
+            "the root exists so that nearly the same is not the same"
+        );
+
+        // And the root an honest node computes from that same state is accepted, so the check is
+        // detecting the drift rather than rejecting everything.
+        let mut expected = balances.clone();
+        fold_shares(&mut expected, &batch.shares);
+        batch.state_root = compute_state_root(&expected, batch.seq, batch.close_ts);
+        assert_eq!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Valid
+        );
+    }
+
+    /// `truncated` and `pending_count` must agree, or a peer cannot tell a full batch from a
+    /// starved one — which is #558 restated.
+    #[test]
+    fn a_truncation_flag_that_contradicts_the_count_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (mut batch, balances) = a_child(&parent, &s);
+
+        batch.pending_count = 12; // still truncated: false
+        assert_eq!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Fault(FaultReason::TruncationContradiction {
+                truncated: false,
+                pending_count: 12
+            })
+        );
+
+        batch.truncated = true;
+        batch.pending_count = 0;
+        assert!(matches!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Fault(FaultReason::TruncationContradiction { .. })
+        ));
+    }
+
+    #[test]
+    fn a_close_time_that_does_not_advance_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.close_ts = parent.close_ts;
+        assert!(matches!(
+            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            BatchVerdict::Fault(FaultReason::CloseTimeNotForward { .. })
+        ));
+    }
+
+    #[test]
+    fn a_share_that_does_not_prove_itself_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (batch, balances) = a_child(&parent, &s);
+        assert!(matches!(
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &s,
+                PARENT_CLOSE + 1,
+                &RejectsShares
+            ),
+            BatchVerdict::Fault(FaultReason::InvalidShare { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unsigned_batch_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (batch, balances) = a_child(&parent, &s);
+        assert_eq!(
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &s,
+                PARENT_CLOSE + 1,
+                &RejectsSignature
+            ),
+            BatchVerdict::Fault(FaultReason::ProposerSignatureInvalid)
+        );
     }
 
     /// Pruning bounds the memory, and must only ever drop what is already final: a lock released
