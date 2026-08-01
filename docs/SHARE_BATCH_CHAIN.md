@@ -167,8 +167,24 @@ ledger only grows.
       too so there is one signature-format transition rather than two.
       Tests assert both directions: v1 *accepts* a redirected payout address (the vulnerability,
       asserted so it cannot be mistaken for safe) and v2 rejects it, plus strip/add/swap cases.
-- [ ] WP-1b: receiver binding via per-job coinbase skeletons — UNBLOCKED by D12; size the node
-      tag jointly with the payout-identity tag against the ~11-byte margin
+- [ ] WP-1b: receiver binding via per-job coinbase skeletons — UNBLOCKED by D12; shape APPROVED by
+      operator 2026-08-01; size the node tag jointly with the payout-identity tag against the
+      ~9-byte margin
+  - [x] **retention rule** — `bins/ghost-pool/src/skeleton_store.rs`, 10 tests. Operator's call:
+        finalisation alone is NOT enough, because a settlement reversal puts shares back into the
+        owed set and the binding must still be re-establishable. So: hold until the batch is
+        finalised **AND** a reorg depth has passed, floor `RETENTION_FLOOR_BLOCKS = 100` (matching
+        `ReorgConfig::max_reorg_depth`, not the shallower `min_confirmations = 6`), and an observed
+        reorg **pushes the floor forward** rather than racing it. Ceiling at 10x so a permanently
+        stalled chain cannot grow the store without bound — and a ceiling eviction is reported
+        distinctly, because a skeleton dropped while still needed turns into an unverifiable share
+        and must not be discoverable only as a mystery later.
+        Affordable only because the ~29 KB outputs blob is content-addressed and shared across
+        every job reusing it; the per-template marginal cost is the merkle path plus prefix, a few
+        hundred bytes. Whole coinbases per job would be tens of GB over the same window.
+  - [ ] `pool_sv2`: node tag into the scriptSig where `pool_signature` already goes
+  - [ ] `pool_sv2`: publish the skeleton on job announce
+  - [ ] share webhook carries `extranonce` + `header80`
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
 
@@ -398,6 +414,41 @@ coinbase (the pool has not won a block since 2026-06-02, so there is none recent
 assumes the SRI job builder places the pool signature in the scriptsig as stock SRI does. Both worth
 confirming against an actual template before the tags are sized in code — but the conclusion has
 ~8 bytes of margin even if a byte or two is off, and trimming the signature restores plenty.
+
+## ⚠ #558 RE-MEASURED 2026-08-01 — the premise this plan inherited is stale
+
+All 8 nodes, live, `paid_in_proposal_hash IS NULL AND valid = 1`:
+
+| node | unpaid | vs lowest |
+|---|---|---|
+| vm7 | 2,895,630 | — |
+| vm6 | 2,895,634 | +4 |
+| vm8 | 2,895,639 | +9 |
+| vm4 | 2,895,664 | +34 |
+| vm1 | 2,895,674 | +44 |
+| vm3 | 2,895,695 | +65 |
+| vm5 | 2,895,836 | +206 |
+| vm2 | 2,896,096 | +466 |
+
+**Spread 466 shares = 0.0161%.** It was 52,000–62,000 on 07-20. All 8 agree *exactly* on 07-30
+(55,617 each). The convergence PRs (#565 #568 #569 #576) did their job.
+
+Two corrections that change decisions:
+
+1. **Proof-NULL shares are UNSERVABLE, not unused.** `get_top_unpaid_addresses` filters on
+   `paid_in_proposal_hash IS NULL AND valid = 1` and nothing else — no proof filter. That work
+   counts toward payouts today. Calling them "dead" was wrong.
+2. **Proof-NULL creation has stopped** — 0 on every node on 08-01, after a declining tail. The
+   rate tracked sweep activity: the sweep was *replicating* unservable shares between nodes, which
+   is precisely how the ledgers converged. Repair working, not a leak.
+
+**Consequence for WP-4.** A standalone union reconciliation would now add ~466 shares — not worth
+doing as its own exercise. Genesis should still take the union (it is exact, cheap, and retires the
+question permanently), but it is now a formality rather than a rescue, and it should not be allowed
+to delay genesis.
+
+⚠ Tooling note: never read a live pool DB with `immutable=1` — it ignores the WAL and reports
+`database disk image is malformed`. vm5 looked corrupt for exactly that reason and is healthy.
 
 ## Open decisions
 

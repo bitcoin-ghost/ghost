@@ -73,6 +73,7 @@ pub mod proposal_sync;
 
 /// Settling the ledger from blocks observed on-chain.
 pub mod settlement;
+pub mod skeleton_store;
 
 /// Mining round lifecycle and share accounting.
 pub mod round;
