@@ -271,11 +271,31 @@ actually 50. The total is now measured on the assembled bytes inside
         forgetting it if the batch is dropped. `announce` runs per share and is suppressed *only*
         by that memory, so clearing an id is sufficient — the very next share re-announces, with no
         retry queue and nothing to track. Tested on the property, not the plumbing.
-  - [ ] persist the skeleton store, so a ghost-pool restart does not start empty (the in-flight
-        case is already covered above; this covers skeletons delivered before the restart)
-  - [ ] re-verify pass: shares recorded unverified should be re-checked when their skeleton
-        arrives — the same shape as `deferred_settlements`, and the piece that makes the *already
-        recorded* shares heal rather than only future ones
+  - [x] **skeletons persist** (`coinbase_skeletons`, v49). An in-memory store meant a restart left
+        every share of the job in flight unverifiable: the skeleton had already been delivered, so
+        `pool_sv2` would not offer it again and nothing would ask.
+  - [x] **re-verify pass** — `bins/ghost-pool/src/binding_recheck.rs`, 4 tests, on the same
+        reconcile tick that retries deferred settlements. `unverified_bindings` records a share
+        whose skeleton had not arrived; the list query **joins against the skeletons held**, so a
+        pass costs what can now be judged rather than the size of the backlog.
+        A refuted binding is *resolved*, not retried — the skeleton was present and the proof did
+        not hold, so retrying yields the same answer and queueing it hides a real finding. An
+        unusable header is likewise dropped rather than retried forever.
+  - [x] receiving types mirrored in `ghost-verification` (`extranonce`, `skeleton_id`,
+        `ShareBatch::skeletons`), all `#[serde(default)]` so an older `pool_sv2` still parses
+
+**The gap now closes at every layer** (operator asked whether "binding unverified" ever heals — it
+did not, which was a defect, not a trade):
+
+| how the evidence goes missing | what repairs it |
+|---|---|
+| skeleton lost in a failed POST | sender forgets the id; the next share re-announces |
+| ghost-pool restarts | skeleton is on disk |
+| share arrived before its skeleton | `unverified_bindings` + the recheck pass |
+| skeleton never arrives at all | backlog is counted and logged, so it is visible not inferred |
+
+  - [ ] wire the ingest side: store arriving `skeletons`, and defer a binding when a share names
+        one that is not held (the recheck pass and its storage are ready; the call site is not)
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
 

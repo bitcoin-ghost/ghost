@@ -69,6 +69,7 @@ pub mod registry;
 pub mod reorg;
 
 /// Fetching a payout proposal a node needs but never received.
+pub mod binding_recheck;
 pub mod proposal_sync;
 
 /// Settling the ledger from blocks observed on-chain.

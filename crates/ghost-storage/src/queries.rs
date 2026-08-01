@@ -2113,6 +2113,189 @@ impl Database {
         })
     }
 
+    /// Store a coinbase skeleton, or leave the existing one alone.
+    ///
+    /// Keyed on its own content address, so re-storing is a no-op and the retention clock belongs
+    /// to the content rather than to how often it is re-announced.
+    pub fn store_skeleton(
+        &self,
+        skeleton_id: &[u8; 32],
+        coinbase_prefix: &[u8],
+        coinbase_suffix: &[u8],
+        merkle_path: &[[u8; 32]],
+        height: u64,
+    ) -> GhostResult<()> {
+        let flat: Vec<u8> = merkle_path.iter().flat_map(|n| n.iter().copied()).collect();
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO coinbase_skeletons
+                     (skeleton_id, coinbase_prefix, coinbase_suffix, merkle_path, stored_at,
+                      floor_from, last_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)
+                 ON CONFLICT(skeleton_id) DO NOTHING",
+                rusqlite::params![
+                    skeleton_id.as_slice(),
+                    coinbase_prefix,
+                    coinbase_suffix,
+                    flat,
+                    height as i64,
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Fetch a skeleton by its content address.
+    ///
+    /// Returns `(coinbase_prefix, coinbase_suffix, merkle_path)`. A merkle blob whose length is not
+    /// a multiple of 32 is treated as absent rather than truncated — a partial path folds to the
+    /// wrong root, and reporting "no skeleton" is honest where reporting a broken one is not.
+    #[allow(clippy::type_complexity)]
+    pub fn get_skeleton(
+        &self,
+        skeleton_id: &[u8; 32],
+    ) -> GhostResult<Option<(Vec<u8>, Vec<u8>, Vec<[u8; 32]>)>> {
+        self.with_connection(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT coinbase_prefix, coinbase_suffix, merkle_path FROM coinbase_skeletons
+                      WHERE skeleton_id = ?1",
+                    rusqlite::params![skeleton_id.as_slice()],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let Some((prefix, suffix, flat)) = row else {
+                return Ok(None);
+            };
+            if flat.len() % 32 != 0 {
+                return Ok(None);
+            }
+            let path = flat
+                .chunks_exact(32)
+                .map(|c| {
+                    let mut n = [0u8; 32];
+                    n.copy_from_slice(c);
+                    n
+                })
+                .collect();
+            Ok(Some((prefix, suffix, path)))
+        })
+    }
+
+    /// Remember a share whose skeleton had not arrived, so it can be judged when the evidence does.
+    ///
+    /// Without this the share is judged exactly once, on the one occasion the evidence happened to
+    /// be missing, and never looked at again — which turns a transient gap into a permanent verdict.
+    pub fn defer_binding(
+        &self,
+        share_hash: &str,
+        skeleton_id: &[u8; 32],
+        extranonce: &[u8],
+        header: &[u8],
+        expected_node: &[u8; 20],
+    ) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO unverified_bindings
+                     (share_hash, skeleton_id, extranonce, header, expected_node, first_seen,
+                      attempts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                 ON CONFLICT(share_hash) DO UPDATE SET attempts = attempts + 1",
+                rusqlite::params![
+                    share_hash,
+                    skeleton_id.as_slice(),
+                    extranonce,
+                    header,
+                    expected_node.as_slice(),
+                    chrono::Utc::now().timestamp(),
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Shares waiting on a skeleton that is now held.
+    ///
+    /// Joined against `coinbase_skeletons` so only the ones that can actually be judged come back —
+    /// walking the whole waiting set on every tick to re-discover that most of it is still waiting
+    /// would make the retry cost grow with the backlog.
+    #[allow(clippy::type_complexity)]
+    pub fn list_verifiable_bindings(
+        &self,
+        limit: usize,
+    ) -> GhostResult<Vec<(String, [u8; 32], Vec<u8>, Vec<u8>, [u8; 20])>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT u.share_hash, u.skeleton_id, u.extranonce, u.header, u.expected_node
+                       FROM unverified_bindings u
+                       JOIN coinbase_skeletons s ON s.skeleton_id = u.skeleton_id
+                      ORDER BY u.first_seen ASC LIMIT ?1",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, Vec<u8>>(4)?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (hash, sid, extranonce, header, node) =
+                    row.map_err(|e| GhostError::Database(e.to_string()))?;
+                // Wrong-width ids or commitments cannot have come from the wire format; skipping
+                // keeps one corrupt row from stalling every other retry.
+                let (Ok(sid), Ok(node)) = (
+                    <[u8; 32]>::try_from(sid.as_slice()),
+                    <[u8; 20]>::try_from(node.as_slice()),
+                ) else {
+                    continue;
+                };
+                out.push((hash, sid, extranonce, header, node));
+            }
+            Ok(out)
+        })
+    }
+
+    /// Forget a share's deferred binding, once it has been judged.
+    pub fn clear_deferred_binding(&self, share_hash: &str) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM unverified_bindings WHERE share_hash = ?1",
+                rusqlite::params![share_hash],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// How many shares are still waiting on a skeleton. For reporting, so a growing backlog is
+    /// visible rather than inferred.
+    pub fn count_unverified_bindings(&self) -> GhostResult<usize> {
+        self.with_connection(|conn| {
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM unverified_bindings", [], |r| r.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(n as usize)
+        })
+    }
+
     /// Remember a block that is ours but cannot be settled yet, because the proposal its coinbase
     /// names never reached this node.
     ///

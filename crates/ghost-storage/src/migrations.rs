@@ -2442,6 +2442,17 @@ fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> 
 /// simply will not match a coinbase until it is rewritten. That is the correct failure — it means
 /// "I cannot prove this block is mine", not "this block is not mine".
 ///
+/// `coinbase_skeletons` — the invariant parts of a job's coinbase, either side of the extranonce.
+/// Persisted rather than held in memory because a restart would otherwise leave every share of the
+/// job in flight unverifiable: the skeleton had already been delivered, so `pool_sv2` will not
+/// offer it again, and nothing would ask. Retention is the reorg-floor rule in `skeleton_store`.
+///
+/// `unverified_bindings` — shares whose skeleton had not arrived when they did. Recording them is
+/// what makes the gap close: without this the share is judged once, on the one occasion the
+/// evidence happened to be missing, and never revisited. Indexed by `skeleton_id` so a skeleton
+/// arriving late can find exactly the shares waiting on it. Cleared on success; retried on the
+/// same reconcile tick that retries deferred settlements.
+///
 /// `deferred_settlements` — a block that carries our payout tag but whose proposal this node never
 /// received. It cannot be settled yet, and forgetting it would be a silent hole: the forward scan
 /// is cursor-driven, so once the cursor passes that height the block is never looked at again, and
@@ -2505,6 +2516,30 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
         );
          CREATE INDEX IF NOT EXISTS idx_settled_blocks_unreversed
              ON settled_blocks(reversed, block_height);",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS coinbase_skeletons (
+            skeleton_id     BLOB    PRIMARY KEY,
+            coinbase_prefix BLOB    NOT NULL,
+            coinbase_suffix BLOB    NOT NULL,
+            merkle_path     BLOB    NOT NULL,
+            stored_at       INTEGER NOT NULL,
+            floor_from      INTEGER NOT NULL,
+            last_seq        INTEGER
+        );
+         CREATE TABLE IF NOT EXISTS unverified_bindings (
+            share_hash  TEXT    PRIMARY KEY,
+            skeleton_id BLOB    NOT NULL,
+            extranonce  BLOB    NOT NULL,
+            header      BLOB    NOT NULL,
+            expected_node BLOB  NOT NULL,
+            first_seen  INTEGER NOT NULL,
+            attempts    INTEGER NOT NULL DEFAULT 0
+        );
+         CREATE INDEX IF NOT EXISTS idx_unverified_bindings_skeleton
+             ON unverified_bindings(skeleton_id);",
     )
     .map_err(|e| GhostError::Migration(e.to_string()))?;
 

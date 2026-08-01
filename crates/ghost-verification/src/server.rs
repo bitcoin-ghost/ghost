@@ -893,6 +893,35 @@ pub struct ShareData {
     /// (`sha256d(header) == share_hash`). Optional for backward compatibility.
     #[serde(default)]
     pub header: Option<String>,
+    /// The full extranonce this share was mined with, hex.
+    ///
+    /// The one part of the coinbase that cannot be inferred from the job, and therefore the one
+    /// part needed to rebuild it.
+    #[serde(default)]
+    pub extranonce: Option<String>,
+    /// Content address of the coinbase skeleton this share was mined against, hex.
+    ///
+    /// Names the coinbase rather than carrying it. The skeleton itself arrives once per job in
+    /// [`ShareBatch::skeletons`].
+    #[serde(default)]
+    pub skeleton_id: Option<String>,
+}
+
+/// A coinbase skeleton, carried once per job rather than once per share.
+///
+/// `coinbase_prefix ‖ extranonce ‖ coinbase_suffix` is the serialized coinbase; folding its txid
+/// up `merkle_path` must reproduce the merkle root inside the share's header. Nothing here is
+/// trusted — a wrong skeleton simply fails to reproduce the root.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkeletonData {
+    /// Content address, matching `skeleton_id` on the shares referencing it.
+    pub skeleton_id: String,
+    /// Serialized coinbase up to where the extranonce begins, hex.
+    pub coinbase_prefix: String,
+    /// Serialized coinbase from where the extranonce ends, hex.
+    pub coinbase_suffix: String,
+    /// Sibling hashes folding the coinbase txid to the header merkle root, hex.
+    pub merkle_path: Vec<String>,
 }
 
 /// Batch of shares from SRI Pool native webhook
@@ -904,6 +933,12 @@ pub struct ShareBatch {
     pub batch_seq: u64,
     /// Array of shares in this batch
     pub shares: Vec<ShareData>,
+    /// Skeletons first referenced by this batch.
+    ///
+    /// Usually empty — a job lasts ~30 s against ~2 s batches. Absent on an older `pool_sv2`,
+    /// which is why it defaults rather than being required.
+    #[serde(default)]
+    pub skeletons: Vec<SkeletonData>,
 }
 
 /// Callback for recording shares (from SRI Pool notifications)

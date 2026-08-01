@@ -9099,6 +9099,7 @@ async fn main() -> Result<()> {
             // two block reads.
             let reconcile_observer = Arc::clone(&observer);
             let reconcile_woken = Arc::clone(&reconcile_wake);
+            let db_for_recheck = Arc::clone(&db);
             tokio::spawn(async move {
                 const RECONCILE_INTERVAL_SECS: u64 = 300;
                 let period = std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS);
@@ -9110,6 +9111,14 @@ async fn main() -> Result<()> {
                 loop {
                     if let Err(e) = reconcile_observer.reconcile().await {
                         warn!(error = %e, "settlement reconciliation failed");
+                    }
+                    // Same tick, same reason: a share whose coinbase skeleton had not arrived was
+                    // judged with the evidence missing, and must be re-judged once it is there.
+                    // Sharing the tick keeps one place that repairs what the live paths could not.
+                    if let Err(e) =
+                        ghost_pool::binding_recheck::recheck_bindings(&db_for_recheck).await
+                    {
+                        warn!(error = %e, "share-binding recheck failed");
                     }
                     tokio::select! {
                         _ = ticker.tick() => {}
