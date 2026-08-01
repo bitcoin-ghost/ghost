@@ -198,7 +198,39 @@ ledger only grows.
 
         Measured, at the live configuration: **91 of 100 bytes, 9 spare.** 58 tests pass, including
         the 50 pre-existing vectors — the offset dedup is behaviour-preserving.
-  - [ ] `pool_sv2`: build and pass the Ghost tags into the factory
+  - [x] ~~`pool_sv2`: build and pass the Ghost tags into the factory~~ **Not needed — already
+        wired.** `ghost-pool` IS the template provider (`:8442` → `pool_sv2` `:34255` →
+        `translator_sv2` `:3333`), and `template_provider.rs` already carries both tags through
+        into the TDP `coinbase_prefix`. `pool_sv2` appends its pool tag and extranonce after them.
+        The tags reach the mined coinbase today.
+
+### 🔴 PRODUCTION: the coinbase scriptSig is at 99 of 100 bytes
+
+Measured 2026-08-01 from the live `pool_signature` on ghost-vm5 and the real encoders, pinned as a
+test in `skeleton_store.rs`:
+
+| | bytes |
+|---|---|
+| BIP34 height (at ~960k) | 4 |
+| payout tag | 21 |
+| node tag | 25 |
+| `/- G H O S T - PublicPool//` (SRI) | 28 |
+| `OP_PUSHBYTES` + extranonce | 21 |
+| **total** | **99 / 100** |
+
+**One byte.** Two more characters of `pool_signature` and every block the fleet mines is invalid.
+
+It is latent only because a treasury-only coinbase omits the payout tag (78 bytes) — and nothing
+has been settleable since 2026-06-02. **Fixing payouts is what arms this.** That makes it a
+prerequisite of this whole programme, not a side note.
+
+Neither program could catch it: `ghost-pool` checks its own scriptSig, `pool_sv2`'s job factory
+checks its own tag against a budget that nominally reserves 5 bytes for a template prefix that is
+actually 50. The total is now measured on the assembled bytes inside
+`script_sig_before_extranonce`, which is the one place that sees all of it.
+
+**OPERATOR:** shortening `pool_signature` to `GHOST PublicPool` (already agreed) takes it to 91/100
+— 9 bytes. That is a fleet config change, so it needs your go-ahead.
   - [ ] `pool_sv2`: publish the skeleton on job announce
   - [ ] share webhook carries `extranonce` + `header80`
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature

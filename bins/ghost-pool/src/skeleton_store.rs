@@ -320,3 +320,79 @@ mod tests {
         assert!(s.get(&id).is_some());
     }
 }
+
+/// What the **whole fleet's** coinbase scriptSig actually costs, end to end.
+///
+/// The bytes are assembled by two programs that never see each other's arithmetic. `ghost-pool`
+/// serves `coinbase_prefix` over the template-distribution protocol (BIP34 height, payout tag, node
+/// tag); `pool_sv2`'s job factory then appends its own pool tag and the extranonce. Each side checks
+/// only its own contribution against the 100-byte consensus limit, and neither one can see the
+/// total.
+///
+/// So the total is measured here, once, against the live configuration. An over-length scriptSig is
+/// not a warning — it is a block the network rejects, discovered the one time it matters.
+#[cfg(test)]
+mod script_sig_budget {
+    use ghost_common::coinbase_tags::{
+        encode_node_tag, encode_payout_tag, NODE_ID_LEN, PAYOUT_ID_LEN,
+    };
+
+    /// `pool_signature` from the live pool-config.toml, read from ghost-vm5 on 2026-08-01.
+    const LIVE_POOL_SIGNATURE: &str = "- G H O S T - PublicPool";
+
+    /// `POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES` in `pool_sv2`'s channel manager.
+    const FULL_EXTRANONCE: usize = 4 + 16;
+
+    /// BIP34 height push at the current tip: `OP_PUSHBYTES_3` plus three bytes.
+    const BIP34_AT_960K: usize = 4;
+
+    fn total_script_sig(pool_signature: &str, with_payout_tag: bool) -> usize {
+        // ghost-pool's half: what the template provider puts in `coinbase_prefix`.
+        let payout = if with_payout_tag {
+            encode_payout_tag(&[0u8; PAYOUT_ID_LEN]).len()
+        } else {
+            0
+        };
+        let node = encode_node_tag(&[0u8; NODE_ID_LEN]).len();
+
+        // pool_sv2's half: `/pool/miner/` as one push, then the extranonce.
+        let sri_tag = 1 + 1 + pool_signature.len() + 1 + 1;
+
+        BIP34_AT_960K + payout + node + sri_tag + 1 + FULL_EXTRANONCE
+    }
+
+    /// **The live number.** 99 of 100 — one byte of headroom across the entire fleet.
+    ///
+    /// Nothing in either program reports this, because neither one computes it. Pinned so that
+    /// lengthening `pool_signature` by a single character fails here rather than on a won block.
+    #[test]
+    fn the_live_configuration_has_one_byte_to_spare() {
+        let total = total_script_sig(LIVE_POOL_SIGNATURE, true);
+        assert_eq!(total, 99, "live scriptSig total");
+        assert!(total <= 100, "over the consensus limit");
+    }
+
+    /// One more character and the fleet mines invalid blocks. This is the assertion that makes the
+    /// margin real rather than a remark in a document.
+    #[test]
+    fn two_more_characters_would_break_consensus() {
+        assert_eq!(total_script_sig("- G H O S T - PublicPool!", true), 100);
+        assert!(
+            total_script_sig("- G H O S T - PublicPool!!", true) > 100,
+            "the very next character must be over the limit"
+        );
+    }
+
+    /// The shortened tag the operator asked for (`GHOST PublicPool`) buys back eight bytes.
+    #[test]
+    fn the_shortened_pool_tag_restores_headroom() {
+        assert_eq!(total_script_sig("GHOST PublicPool", true), 91);
+    }
+
+    /// A treasury-only coinbase carries no payout tag, so it is 21 bytes cheaper — which is why the
+    /// limit has never been hit: nothing has been settleable since 2026-06-02.
+    #[test]
+    fn a_treasury_only_coinbase_is_far_from_the_limit() {
+        assert_eq!(total_script_sig(LIVE_POOL_SIGNATURE, false), 78);
+    }
+}

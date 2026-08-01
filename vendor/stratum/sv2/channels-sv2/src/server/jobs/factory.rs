@@ -168,6 +168,21 @@ impl JobFactory {
         // The extranonce stays last: the prefix/suffix split is "everything before it" and
         // "everything after it", so anything appended behind would land on the wrong side.
         script_sig.push(full_extranonce_size as u8);
+
+        // The only check that sees the WHOLE scriptSig.
+        //
+        // `pool_miner_tag_budget` reserves a nominal `BIP34_HEIGHT_RESERVE` for the template's
+        // prefix, which holds while the template provider sends a bare height push. Ghost's does
+        // not — it carries the payout and node tags there, ten times that reserve — and no amount
+        // of care in the tag guard can notice, because the template prefix arrives from another
+        // program entirely.
+        //
+        // So the total is measured on the assembled bytes. An over-length scriptSig is not a
+        // warning; it is a block the network rejects, found the one time it matters.
+        let total = script_sig.len() + full_extranonce_size;
+        if total > MAX_COINBASE_SCRIPT_SIG {
+            return Err(JobFactoryError::CoinbaseTxPrefixError);
+        }
         Ok(script_sig)
     }
 
@@ -806,6 +821,36 @@ mod tests {
         );
         assert_eq!(budget - needed, 8, "spare headroom, for the record");
         assert!(f.op_pushbytes_pool_miner_tag(20).is_ok());
+    }
+
+    /// **The check neither program could make alone.** Ghost's template provider puts 50 bytes in
+    /// `coinbase_prefix` (height + payout tag + node tag), not the 5 the tag budget nominally
+    /// reserves. The tag guard cannot see that — the prefix comes from another process — so only a
+    /// measurement of the assembled bytes catches an overflow.
+    #[test]
+    fn an_oversized_template_prefix_is_caught_on_the_assembled_bytes() {
+        let f = JobFactory::new(true, Some("- G H O S T - PublicPool".into()), None);
+
+        // A realistic Ghost prefix: BIP34 height, payout tag, node tag.
+        let mut ghost_prefix = vec![0x03, 0x40, 0x1f, 0x0e];
+        ghost_prefix.extend_from_slice(&[21u8; 21]);
+        ghost_prefix.extend_from_slice(&[25u8; 25]);
+        assert_eq!(ghost_prefix.len(), 50);
+
+        assert!(
+            f.script_sig_before_extranonce(&ghost_prefix, 20).is_ok(),
+            "the live configuration must still build — 99 of 100 bytes"
+        );
+
+        // Two more characters of pool tag and the same template prefix goes over.
+        let longer = JobFactory::new(true, Some("- G H O S T - PublicPool!!".into()), None);
+        assert!(
+            matches!(
+                longer.script_sig_before_extranonce(&ghost_prefix, 20),
+                Err(JobFactoryError::CoinbaseTxPrefixError)
+            ),
+            "an over-length total must be refused, not mined"
+        );
     }
 
     /// And the assembled scriptSig really is inside the consensus limit — asserted on the bytes,
