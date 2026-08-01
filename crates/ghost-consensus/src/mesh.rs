@@ -1794,6 +1794,12 @@ impl MeshNetwork {
             | MessageType::PayoutLedgerCheckpointVote
             | MessageType::PayoutLedgerCheckpointSync
             | MessageType::PayoutProposalSync
+            // The batch chain decides who gets paid, so it is at least as sensitive as the
+            // payout messages beside it. Defaulting a new financial message to plaintext is the
+            // kind of omission that never announces itself.
+            | MessageType::ShareBatchProposal
+            | MessageType::ShareBatchVote
+            | MessageType::ShareBatchSync
             | MessageType::ElderUpdate
             | MessageType::ZkBlockProposal
             | MessageType::ZkVote
@@ -2136,9 +2142,14 @@ impl MeshNetwork {
         let host_only = host.split(':').next().unwrap_or(host);
 
         let base_port = match msg_type {
-            MessageType::ShareProof | MessageType::ShareConvergence => {
-                self.config.ports.share_propagation
-            }
+            MessageType::ShareProof
+            | MessageType::ShareConvergence
+            // The batch chain is the share ledger, so its traffic belongs on the share port
+            // rather than a new one: adding a port would mean a firewall change on every node
+            // before a single batch could flow, which is a deployment step that buys nothing.
+            | MessageType::ShareBatchProposal
+            | MessageType::ShareBatchSync => self.config.ports.share_propagation,
+            MessageType::ShareBatchVote => self.config.ports.consensus_voting,
             MessageType::BlockFound => self.config.ports.block_announcement,
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
@@ -3192,9 +3203,14 @@ impl MeshNetwork {
     /// should use this method to validate after deserialization.
     pub fn is_valid_msg_type_for_port(&self, msg_type: MessageType, port: u16) -> bool {
         let expected_port = match msg_type {
-            MessageType::ShareProof | MessageType::ShareConvergence => {
-                self.config.ports.share_propagation
-            }
+            MessageType::ShareProof
+            | MessageType::ShareConvergence
+            // The batch chain is the share ledger, so its traffic belongs on the share port
+            // rather than a new one: adding a port would mean a firewall change on every node
+            // before a single batch could flow, which is a deployment step that buys nothing.
+            | MessageType::ShareBatchProposal
+            | MessageType::ShareBatchSync => self.config.ports.share_propagation,
+            MessageType::ShareBatchVote => self.config.ports.consensus_voting,
             MessageType::BlockFound => self.config.ports.block_announcement,
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
@@ -4086,6 +4102,9 @@ mod tests {
                 | MessageType::PayoutLedgerCheckpointVote
                 | MessageType::PayoutLedgerCheckpointSync
                 | MessageType::PayoutProposalSync
+                | MessageType::ShareBatchProposal
+                | MessageType::ShareBatchVote
+                | MessageType::ShareBatchSync
                 | MessageType::ElderUpdate
                 | MessageType::ZkBlockProposal
                 | MessageType::ZkVote

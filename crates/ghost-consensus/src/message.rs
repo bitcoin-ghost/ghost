@@ -69,6 +69,12 @@ pub mod topics {
     /// Payout-ledger checkpoint sync (on-demand backfill of missed checkpoints)
     pub const PAYOUT_LEDGER_SYNC: &[u8] = b"plsync";
     pub const PAYOUT_PROPOSAL_SYNC: &[u8] = b"ppsync";
+    /// Share-batch chain: a proposed batch
+    pub const SHARE_BATCH: &[u8] = b"sbatch";
+    /// Share-batch chain: a vote on a proposed batch
+    pub const SHARE_BATCH_VOTE: &[u8] = b"sbvote";
+    /// Share-batch chain: on-demand backfill of adopted batches
+    pub const SHARE_BATCH_SYNC: &[u8] = b"sbsync";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
@@ -266,6 +272,20 @@ pub enum MessageType {
     /// Fetching it needs no trust: the chain names the payout, so a response is accepted only if
     /// the proposal it carries hashes to that identity. A forged one cannot.
     PayoutProposalSync,
+    /// Share-batch chain: a proposed batch (dark until the chain is armed).
+    ///
+    /// Carries the shares themselves, so this is the one batch-chain message with real size — and
+    /// the packing budget is derived from its wire limit rather than guessed at, because guessing
+    /// is what produced a convergence response that could not carry a single proof (#558).
+    ShareBatchProposal,
+    /// Share-batch chain: a vote for a batch at a sequence. Hash plus signature; small.
+    ShareBatchVote,
+    /// Share-batch chain: request/response for an adopted batch a node missed.
+    ///
+    /// The chain is a hash chain, so a node that misses one link cannot verify any later batch
+    /// against its own head — it must fetch, not guess. Verified by rehashing: an adopted batch is
+    /// accepted only if it hashes to the parent the next one names.
+    ShareBatchSync,
 }
 
 impl MessageType {
@@ -301,6 +321,9 @@ impl MessageType {
             Self::PayoutLedgerCheckpointVote => topics::PAYOUT_LEDGER_VOTE,
             Self::PayoutLedgerCheckpointSync => topics::PAYOUT_LEDGER_SYNC,
             Self::PayoutProposalSync => topics::PAYOUT_PROPOSAL_SYNC,
+            Self::ShareBatchProposal => topics::SHARE_BATCH,
+            Self::ShareBatchVote => topics::SHARE_BATCH_VOTE,
+            Self::ShareBatchSync => topics::SHARE_BATCH_SYNC,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
@@ -340,6 +363,9 @@ impl MessageType {
             Self::PayoutLedgerCheckpointVote => "plvote",
             Self::PayoutLedgerCheckpointSync => "plsync",
             Self::PayoutProposalSync => "ppsync",
+            Self::ShareBatchProposal => "sbatch",
+            Self::ShareBatchVote => "sbvote",
+            Self::ShareBatchSync => "sbsync",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
@@ -1225,6 +1251,59 @@ impl PayoutLedgerCheckpointMessage {
         hasher.update(self.proposer);
         hasher.finalize().into()
     }
+}
+
+/// A vote for a batch at a sequence.
+///
+/// Small on purpose: a hash and a signature. The batch it names is fetched or already held, never
+/// re-sent with every vote — eight nodes echoing a megabyte back at each other would make the
+/// vote round cost more than the proposal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareBatchVoteMessage {
+    /// Chain position being voted on.
+    pub seq: u64,
+    /// The batch being approved.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub batch_hash: [u8; 32],
+    /// Who is voting.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub voter: NodeId,
+    /// Signature over `(seq, batch_hash)`.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl ShareBatchVoteMessage {
+    /// The bytes a vote signs.
+    ///
+    /// **Both** the sequence and the hash, domain-separated. Signing the hash alone would let a
+    /// vote be replayed at a different sequence, and signing the sequence alone would make every
+    /// vote at that height interchangeable — either one turns a signature into a formality.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 32 + 24);
+        out.extend_from_slice(b"ShareBatchVote/v1");
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&self.batch_hash);
+        out
+    }
+}
+
+/// Request or response for an adopted batch a node is missing.
+///
+/// One type for both directions, disambiguated on deserialize — the same shape the convergence and
+/// proposal-sync exchanges already use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ShareBatchSyncMessage {
+    /// "Send me the adopted batch at this sequence."
+    ///
+    /// By sequence rather than hash, because a node that is behind does not know the hash — that
+    /// is precisely what it is missing.
+    Request { seq: u64 },
+    /// The batch, as stored JSON.
+    ///
+    /// Verified by rehashing against the parent the *next* batch names, never by trusting the
+    /// sender. The chain is the anchor, so a forged batch cannot link.
+    Response { seq: u64, batch_json: String },
 }
 
 /// Payout-ledger checkpoint vote (validator → all).

@@ -76,6 +76,42 @@ pub const MAX_CHALLENGE_CONVERGENCE_SIZE: usize = 1_000_000;
 /// Mirrors `MAX_CHALLENGE_CONVERGENCE_SIZE` — the other batch-carrying convergence type, which
 /// was correctly given its own limit.
 pub const MAX_SHARE_CONVERGENCE_SIZE: usize = 1_000_000;
+/// Share-batch chain: the largest proposed batch that may cross the wire.
+///
+/// **This number is the authority, and the packer derives its budget from it** — see
+/// `share_batch_pack_budget`. The reverse, choosing a packing budget and hoping the wire accepts
+/// it, is exactly how every convergence message-size bug happened: #559, #561, #562 and #568 were
+/// all a sender bounding by the wrong thing and a receiver rejecting the result. A batch too large
+/// to send is worse than a small one, because the chain cannot skip the sequence.
+pub const MAX_SHARE_BATCH_SIZE: usize = MAX_ENVELOPE_SIZE;
+/// Share-batch chain: a vote is a sequence, a hash and a signature.
+pub const MAX_SHARE_BATCH_VOTE_SIZE: usize = MAX_VOTE_SIZE;
+/// Share-batch chain: a sync response carries one batch, so it is bounded like one.
+pub const MAX_SHARE_BATCH_SYNC_SIZE: usize = MAX_SHARE_BATCH_SIZE;
+
+/// Bytes a proposer may fill with shares, after the batch's own fields and the JSON expansion.
+///
+/// Derived from [`MAX_SHARE_BATCH_SIZE`] rather than chosen. Two reservations:
+///
+/// * **JSON expansion.** The wire encoding is JSON and a `Vec<u8>` becomes a list of decimal
+///   integers, so payload bytes are roughly 3.1x the underlying data — the ratio measured on real
+///   share proofs when #558 was diagnosed. Ignoring it is how a 10 KB ceiling ended up unable to
+///   carry one 1,169-byte proof.
+/// * **Envelope and batch overhead.** Signature, roots, node shares and settled blocks all ride in
+///   the same message.
+///
+/// Deliberately conservative: under-filling a batch costs one extra batch, while over-filling it
+/// produces a message every peer rejects, at a sequence the chain cannot skip past.
+pub const fn share_batch_pack_budget() -> usize {
+    const JSON_EXPANSION_NUMERATOR: usize = 10;
+    const JSON_EXPANSION_DENOMINATOR: usize = 31; // ~3.1x
+    const BATCH_OVERHEAD: usize = 64 * 1024;
+
+    MAX_SHARE_BATCH_SIZE
+        .saturating_sub(BATCH_OVERHEAD)
+        .saturating_mul(JSON_EXPANSION_NUMERATOR)
+        / JSON_EXPANSION_DENOMINATOR
+}
 /// P2P-H3: Equivocation proof (two votes + metadata)
 pub const MAX_EQUIVOCATION_PROOF_SIZE: usize = 10_000;
 /// P2P-C1: Elder registration proposal (candidate + PoW + signatures)
@@ -413,6 +449,9 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::PayoutLedgerCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
         // One proposal per response, so the existing proposal bound applies.
         MessageType::PayoutProposalSync => MAX_PAYOUT_PROPOSAL_SIZE,
+        MessageType::ShareBatchProposal => MAX_SHARE_BATCH_SIZE,
+        MessageType::ShareBatchVote => MAX_SHARE_BATCH_VOTE_SIZE,
+        MessageType::ShareBatchSync => MAX_SHARE_BATCH_SYNC_SIZE,
         MessageType::L2TreeSync => MAX_L2_TREE_SYNC_SIZE,
         MessageType::L2ShieldBroadcast => 256, // ShieldCommitment: 32-byte commitment + u64 index + u64 height
         MessageType::GhostGlyphClaim => MAX_GLYPH_CLAIM_SIZE,
@@ -876,6 +915,65 @@ impl ValidationStats {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The budget must fit the wire, not the other way round.**
+    ///
+    /// #559, #561, #562 and #568 were all one shape: a sender bounding its payload by something
+    /// other than what the receiver enforces. Deriving the budget from the limit makes that
+    /// impossible by construction, and this asserts the derivation actually leaves room.
+    #[test]
+    fn the_pack_budget_fits_inside_the_wire_limit() {
+        let budget = share_batch_pack_budget();
+        assert!(budget > 0, "a zero budget would wedge the chain");
+        assert!(
+            budget < MAX_SHARE_BATCH_SIZE,
+            "the budget must be smaller than the limit it is derived from"
+        );
+
+        // Worst case on the wire: every budgeted byte expands ~3.1x as JSON, plus overhead.
+        let worst_case = budget * 31 / 10 + 64 * 1024;
+        assert!(
+            worst_case <= MAX_SHARE_BATCH_SIZE,
+            "a full batch would be {worst_case} bytes against a {MAX_SHARE_BATCH_SIZE} limit"
+        );
+    }
+
+    /// A batch big enough to matter must still fit. A budget that technically satisfies the
+    /// arithmetic but holds three shares would be correct and useless.
+    #[test]
+    fn the_pack_budget_holds_a_useful_number_of_shares() {
+        // ~1,169 bytes per real share proof, measured when #558 was diagnosed.
+        const REAL_SHARE_PROOF_BYTES: usize = 1_169;
+        let shares = share_batch_pack_budget() / REAL_SHARE_PROOF_BYTES;
+        assert!(
+            shares >= 200,
+            "a batch would hold only {shares} shares, which is not a batch"
+        );
+    }
+
+    /// Every batch-chain type has its own limit rather than inheriting a default. A message type
+    /// that silently falls into someone else's bound is how a payload ends up rejected for a
+    /// reason nobody wrote down.
+    #[test]
+    fn every_batch_message_type_has_its_own_bound() {
+        assert_eq!(
+            max_payload_size(MessageType::ShareBatchProposal),
+            MAX_SHARE_BATCH_SIZE
+        );
+        assert_eq!(
+            max_payload_size(MessageType::ShareBatchVote),
+            MAX_SHARE_BATCH_VOTE_SIZE
+        );
+        assert_eq!(
+            max_payload_size(MessageType::ShareBatchSync),
+            MAX_SHARE_BATCH_SYNC_SIZE
+        );
+        assert!(
+            max_payload_size(MessageType::ShareBatchVote)
+                < max_payload_size(MessageType::ShareBatchProposal),
+            "a vote is a hash and a signature; if it is bounded like a batch, something is wrong"
+        );
+    }
 
     /// A convergence BATCH must not be bounded by the SINGLE-proof limit.
     ///

@@ -433,7 +433,22 @@ batches cannot both reach 67%.
       batch fault, for the same reason: it is provable from two messages the peer signed itself.
       Two valid batches at one sequence is **not** misbehaviour — that is escalation working — so
       the second is refused without blame.
-- [ ] propose/finalise driver and mesh message types
+- [x] **mesh message types** — `ShareBatchProposal`, `ShareBatchVote`, `ShareBatchSync`, with
+      topics, Noise routing and per-type size limits.
+      - **The wire limit is the authority and the packer derives its budget from it**
+        (`share_batch_pack_budget`), not the reverse. #559, #561, #562 and #568 were all one
+        shape: a sender bounding its payload by something other than what the receiver enforces.
+        Deriving makes that impossible by construction, and it is asserted — a full batch's
+        worst-case JSON expansion (~3.1x, the ratio measured on real proofs) plus overhead must
+        still fit, and the budget must hold ≥200 real shares or it is not a batch.
+      - Batch traffic rides the **existing** share port. A new port would mean a firewall change
+        on every node before a single batch could flow — a deployment step that buys nothing.
+      - All three require Noise. The batch chain decides who gets paid, so defaulting a new
+        financial message to plaintext is an omission that never announces itself.
+      - A vote signs **both** sequence and hash, domain-separated: the hash alone replays at
+        another sequence, the sequence alone makes every vote at that height interchangeable.
+      - Sync requests by **sequence**, not hash — a node that is behind does not know the hash;
+        that is exactly what it is missing.
 
 ### WP-4 — genesis batch
 `seq 0` opening balances from the latest finalised `PayoutLedgerCheckpoint` (already fleet-identical
