@@ -411,6 +411,8 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::PayoutLedgerCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::PayoutLedgerCheckpointVote => MAX_VOTE_SIZE,
         MessageType::PayoutLedgerCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
+        // One proposal per response, so the existing proposal bound applies.
+        MessageType::PayoutProposalSync => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::L2TreeSync => MAX_L2_TREE_SYNC_SIZE,
         MessageType::L2ShieldBroadcast => 256, // ShieldCommitment: 32-byte commitment + u64 index + u64 height
         MessageType::GhostGlyphClaim => MAX_GLYPH_CLAIM_SIZE,

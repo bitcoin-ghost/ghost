@@ -51,6 +51,12 @@ pub struct SettlementObserver {
     /// only some nodes observe-settle would split on the first won block. Dry-run gives the
     /// evidence that matching works before the behaviour turns on everywhere at once.
     activation_height: u64,
+    /// Fetches a proposal a won block names but this node never received.
+    ///
+    /// Without it a missed proposal leaves the block unsettled until somebody reads a log. The
+    /// forward scan in `reconcile` then settles it once the answer lands, so the recovery completes
+    /// without anyone intervening.
+    proposal_sync: Option<Arc<crate::proposal_sync::ProposalSyncHandler>>,
 }
 
 impl SettlementObserver {
@@ -65,7 +71,17 @@ impl SettlementObserver {
             rpc,
             grouping_height,
             activation_height,
+            proposal_sync: None,
         }
+    }
+
+    /// Attach the peer fetch used to recover a proposal this node is missing.
+    pub fn with_proposal_sync(
+        mut self,
+        sync: Arc<crate::proposal_sync::ProposalSyncHandler>,
+    ) -> Self {
+        self.proposal_sync = Some(sync);
+        self
     }
 
     /// Pull the coinbase scriptSig out of a block.
@@ -136,13 +152,23 @@ impl SettlementObserver {
         };
 
         let Some((proposal_hash, json)) = found else {
-            // The block is ours — it carries our tag — but the proposal is gone or was never
-            // stored. Loud, because it means a won block cannot be settled here.
+            // The block is ours — it carries our tag — but we never received the proposal, most
+            // likely because we were down when it was gossiped. Ask the mesh rather than warning
+            // and waiting for someone to notice: the forward scan settles the block on a later
+            // pass, once the answer has landed.
+            //
+            // The fetch is safe without trust because the chain names the payout, so a response is
+            // only accepted if it hashes to the identity this coinbase carries.
             warn!(
                 block_hash,
                 payout_id = %hex::encode(payout_id),
-                "a block carries our payout tag but the proposal is not held — cannot settle it"
+                "a block carries our payout tag but the proposal is not held — requesting it"
             );
+            if let Some(sync) = &self.proposal_sync {
+                if let Err(e) = sync.request(payout_id) {
+                    warn!(error = %e, "could not request the missing payout proposal");
+                }
+            }
             return SettleOutcome::ProposalMissing { payout_id };
         };
 

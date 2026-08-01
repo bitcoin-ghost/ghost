@@ -68,6 +68,9 @@ pub mod registry;
 /// Chain reorganization detection and recovery.
 pub mod reorg;
 
+/// Fetching a payout proposal a node needs but never received.
+pub mod proposal_sync;
+
 /// Settling the ledger from blocks observed on-chain.
 pub mod settlement;
 

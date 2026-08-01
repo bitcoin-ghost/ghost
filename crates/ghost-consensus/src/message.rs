@@ -68,6 +68,7 @@ pub mod topics {
     pub const PAYOUT_LEDGER_VOTE: &[u8] = b"plvote";
     /// Payout-ledger checkpoint sync (on-demand backfill of missed checkpoints)
     pub const PAYOUT_LEDGER_SYNC: &[u8] = b"plsync";
+    pub const PAYOUT_PROPOSAL_SYNC: &[u8] = b"ppsync";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
@@ -255,6 +256,16 @@ pub enum MessageType {
     /// backfill of finalised checkpoints a node missed (proposals are broadcast
     /// once and never rebroadcast). Multiplexes request + response by trial-deser.
     PayoutLedgerCheckpointSync,
+    /// Payout-proposal sync request/response (node ↔ peer).
+    ///
+    /// A node settling a won block reads the payout identity off its coinbase, then needs the
+    /// proposal that identity names. If it never received that proposal — it was down when the
+    /// proposal was gossiped, and proposals are broadcast once — the block cannot be settled and
+    /// the ledger silently keeps owing work the pool already paid.
+    ///
+    /// Fetching it needs no trust: the chain names the payout, so a response is accepted only if
+    /// the proposal it carries hashes to that identity. A forged one cannot.
+    PayoutProposalSync,
 }
 
 impl MessageType {
@@ -289,6 +300,7 @@ impl MessageType {
             Self::PayoutLedgerCheckpoint => topics::PAYOUT_LEDGER_CHECKPOINT,
             Self::PayoutLedgerCheckpointVote => topics::PAYOUT_LEDGER_VOTE,
             Self::PayoutLedgerCheckpointSync => topics::PAYOUT_LEDGER_SYNC,
+            Self::PayoutProposalSync => topics::PAYOUT_PROPOSAL_SYNC,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
@@ -327,6 +339,7 @@ impl MessageType {
             Self::PayoutLedgerCheckpoint => "plchk",
             Self::PayoutLedgerCheckpointVote => "plvote",
             Self::PayoutLedgerCheckpointSync => "plsync",
+            Self::PayoutProposalSync => "ppsync",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
