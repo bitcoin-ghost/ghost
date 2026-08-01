@@ -141,6 +141,18 @@ pub const ELDER_OFFLINE_THRESHOLD_DAYS: u64 = 7;
 /// PROTOCOL CONSTANT — DO NOT MODIFY AFTER MAINNET
 pub const BFT_THRESHOLD_PERCENT: u64 = 67;
 
+/// Votes needed from `voters` participants: `ceil(voters * 67 / 100)`.
+///
+/// The arithmetic is trivial and that is exactly why it wants one home. Two sites rounding it
+/// differently — floor in one, ceiling in the other — is a quorum that one node believes has been
+/// reached and another does not, from the same votes.
+///
+/// Ceiling division, so the threshold is genuinely above two thirds rather than equal to it: 3 of 4
+/// and 6 of 8, not 2 and 5.
+pub const fn bft_threshold(voters: usize) -> usize {
+    ((voters as u64) * BFT_THRESHOLD_PERCENT).div_ceil(100) as usize
+}
+
 /// BFT threshold percentage for MPC ceremony contribution approval (67%).
 ///
 /// SINGLE SOURCE OF TRUTH shared by `ghost-mpc` and `ghost-consensus` so the
@@ -528,6 +540,37 @@ mod tests {
         // 67% means we need 2/3 majority
         const { assert!(BFT_THRESHOLD_PERCENT > 50) };
         const { assert!(BFT_THRESHOLD_PERCENT < 100) };
+    }
+
+    /// The threshold must sit strictly above two thirds, or a 2-of-3 "supermajority" is really a
+    /// simple majority and one faulty node out of three carries the vote.
+    #[test]
+    fn the_threshold_is_above_two_thirds_not_equal_to_it() {
+        for n in 1..=64usize {
+            let t = bft_threshold(n);
+            assert!(
+                t * 3 > n * 2 || n == 0,
+                "{t} of {n} is not above two thirds"
+            );
+            assert!(t <= n, "{t} of {n} would be unreachable");
+        }
+        // The fleet sizes that actually exist, pinned so a rounding change is loud.
+        assert_eq!(bft_threshold(1), 1);
+        assert_eq!(bft_threshold(4), 3);
+        assert_eq!(bft_threshold(8), 6);
+    }
+
+    /// Pins the helper against the inline arithmetic it replaced, so extracting it cannot have
+    /// quietly moved a quorum boundary.
+    #[test]
+    fn the_helper_matches_the_formula_it_replaced() {
+        for n in 0..=256u64 {
+            assert_eq!(
+                bft_threshold(n as usize) as u64,
+                (n * BFT_THRESHOLD_PERCENT).div_ceil(100),
+                "threshold diverged at {n} voters"
+            );
+        }
     }
 
     #[test]

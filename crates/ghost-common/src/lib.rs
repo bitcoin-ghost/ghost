@@ -31,9 +31,10 @@
 
 #![deny(unreachable_pub)]
 
+/// Commitments stamped into the coinbase scriptsig (payout identity, node identity).
+pub mod batch_consensus;
 pub mod circuit_breaker;
 pub mod clock;
-/// Commitments stamped into the coinbase scriptsig (payout identity, node identity).
 pub mod coinbase_tags;
 
 pub mod config;

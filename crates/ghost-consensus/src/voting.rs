@@ -638,10 +638,11 @@ impl VotingSession {
     }
 
     /// Get required threshold
+    ///
+    /// Delegates to `bft_threshold` so this and the share-batch chain cannot round the same
+    /// supermajority differently — identical arithmetic, one home.
     pub fn threshold(&self) -> u32 {
-        let total = self.eligible_voters.len() as u64;
-        // Use ceiling division to ensure proper 67% threshold
-        (total * BFT_THRESHOLD_PERCENT).div_ceil(100) as u32
+        ghost_common::constants::bft_threshold(self.eligible_voters.len()) as u32
     }
 
     /// Get detected equivocations

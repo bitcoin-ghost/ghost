@@ -222,6 +222,28 @@ batches cannot both reach 67%.
 
 **Verification failure must be terminal** (quarantine + alarm), never retried — see #583 below.
 
+- [x] **rota + escalation + vote lock** — `crates/ghost-common/src/batch_consensus.rs`. Pure
+      functions and one small map; no clock, no network, nothing wired. 15 tests.
+      - The rota sorts and dedups its voter set, so two nodes that learned the fleet in different
+        orders derive the same schedule — a rota that depends on arrival order is one they disagree
+        about while both behave correctly.
+      - Escalation is **uncapped and cycling**: there is no point at which "nobody is due" is safe
+        for a chain that cannot skip a height.
+      - Acceptance uses a **window** around our own escalation (±1 step), not a prefix. A prefix
+        (`0..=current`) authorises the entire fleet once a stall exceeds the ring size, so a long
+        stall would end with everyone proposing and splitting its own vote. Proposing stays exactly
+        one node; only acceptance is widened, and only enough to absorb clock skew.
+      - `TooEarly` is distinct from `NotAProposer` **because verification failure is terminal** — a
+        node one step ahead on a fast clock must read as a retry, not as a peer to quarantine.
+      - `SeqVoteLock` refuses a second *different* batch at a sequence while treating a resend as
+        idempotent; pruning keeps the finalised boundary itself, since releasing a lock at a
+        sequence still in flight is the one thing the type exists to prevent.
+- [x] `bft_threshold(n)` given one home in `constants.rs`, and `voting.rs` now calls it — the
+      arithmetic is trivial, which is exactly why two sites rounding it differently is a quorum one
+      node believes was reached and another does not. Pinned against the formula it replaced.
+- [ ] batch verification + terminal quarantine
+- [ ] propose/finalise driver and mesh message types
+
 ### WP-4 — genesis batch
 `seq 0` opening balances from the latest finalised `PayoutLedgerCheckpoint` (already fleet-identical
 by adoption). Uses the tolerance machinery one final time. **Must complete while single-operator,
