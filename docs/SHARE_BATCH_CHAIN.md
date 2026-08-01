@@ -142,8 +142,18 @@ bound. Pure library code, exhaustively tested for determinism before any wiring.
       make address boundaries unambiguous, and a golden vector pins `SbcStateRoot/v1`.
       Unattributed shares (no payout address) are **counted**, not silently dropped as the existing
       INNER JOIN does.
-- [ ] `ShareBatch` type + `batch_hash` (needs D11's settlement-pair field settled first)
-- [ ] send-side packing bound (needs the wire budget, i.e. D12)
+- [x] **send-side packing bound** — `pack_batch(shares, budget_bytes)` splits a pending pool into
+      `included` / `deferred` in canonical order and reports `truncated`. Written *parameterised*:
+      the mechanism is settled, the budget number stays an open decision (D12/wire), so nothing here
+      commits to a cap. Six tests: the split partitions the input exactly at every budget (nothing
+      lost or duplicated — a share in neither list is work a miner never gets paid for), a fitting
+      batch is not marked truncated, an impossible budget still emits one share rather than wedging
+      the chain forever, packing is arrival-order-independent, repeated packing drains and
+      terminates, and the estimate is checked against the real encoded length.
+- [ ] `ShareBatch` type + `batch_hash` — **blocked on D12**. The struct's settlement field depends on
+      how a won block is identified: if the coinbase carries the proposal hash (D12 option 1) the
+      batch need only carry `block_hash`, whereas the pair form is needed otherwise. Defining the
+      struct now would bake in a guess about a decision that is still open.
 
 ### WP-3 — batch consensus manager (dark)
 Propose/vote/finalise/sync. Round-robin `voters[seq % n]`. **Stall escalation is required** —
