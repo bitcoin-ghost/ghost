@@ -2113,6 +2113,85 @@ impl Database {
         })
     }
 
+    /// Remember a block that is ours but cannot be settled yet, because the proposal its coinbase
+    /// names never reached this node.
+    ///
+    /// Recording it is what makes the recovery finish. The forward scan is cursor-driven, so once
+    /// the cursor passes this height the block is never examined again — and the proposal fetched
+    /// from a peer arrives seconds later, with nothing left to apply it to. The row is the memory
+    /// that outlives both the event and a restart.
+    ///
+    /// Re-observing the same block bumps `attempts` rather than resetting it, so "how long has this
+    /// been stuck" survives the retries.
+    pub fn defer_settlement(
+        &self,
+        block_hash: &str,
+        block_height: u64,
+        payout_id: &[u8; 16],
+    ) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO deferred_settlements
+                     (block_hash, block_height, payout_id, first_seen_ts, attempts)
+                 VALUES (?1, ?2, ?3, ?4, 1)
+                 ON CONFLICT(block_hash) DO UPDATE SET attempts = attempts + 1",
+                rusqlite::params![
+                    block_hash,
+                    block_height as i64,
+                    payout_id.as_slice(),
+                    chrono::Utc::now().timestamp(),
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Blocks still waiting on a proposal, oldest first — retried oldest-first because the oldest
+    /// is the one whose work has been wrongly owed the longest.
+    pub fn list_deferred_settlements(&self) -> GhostResult<Vec<(String, u64, [u8; 16])>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT block_hash, block_height, payout_id FROM deferred_settlements
+                      ORDER BY block_height ASC",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (hash, height, id) = row.map_err(|e| GhostError::Database(e.to_string()))?;
+                // A payout id that is not 16 bytes cannot have come from a coinbase tag; skipping
+                // it keeps one corrupt row from stalling every other retry.
+                let Ok(payout_id) = <[u8; 16]>::try_from(id.as_slice()) else {
+                    continue;
+                };
+                out.push((hash, height, payout_id));
+            }
+            Ok(out)
+        })
+    }
+
+    /// Forget a deferred block, once it has been settled.
+    pub fn clear_deferred_settlement(&self, block_hash: &str) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM deferred_settlements WHERE block_hash = ?1",
+                rusqlite::params![block_hash],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Rolling-window miner summary with lifetime share counts. Backs
     /// the "next block payout" projection: the recent work/share numbers
     /// drive the share% and projected-sats math, while `lifetime_shares`

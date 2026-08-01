@@ -141,9 +141,19 @@ ledger only grows.
       settlements for departed blocks AND settles ones the event stream missed, cursor-driven. An
       earlier version only reversed, which left a node that restarted while a block landed never
       settling it: the same divergence, just rarer.
-- [ ] wire to a second `BlockEvent` receiver alongside `ReorgHandler`
+- [x] wired to a second `BlockEvent` receiver alongside `ReorgHandler` — its own subscription, so
+      settlement failing cannot take reorg detection down with it
 - [x] `OBSERVED_SETTLEMENT_HEIGHT` gate, UNARMED at `u64::MAX`, dry-run below it
-- [ ] red-before test: a non-submitting node settles (fails on main today)
+- [x] red-before test: a non-submitting node settles (fails on main today)
+- [x] **the recovery closes its own loop.** `ProposalSyncHandler` is registered on the mesh, so a
+      node both asks for a proposal a won block names and serves one to a peer that asks. Asking is
+      not enough on its own: the answer lands after the block was observed, and the forward scan is
+      cursor-driven, so nothing would ever apply it. `deferred_settlements` (v49) records the block,
+      reconciliation retries exactly those — re-asking each pass, dropping any that left the chain —
+      and the row survives a restart.
+- [x] reconciliation runs on a **timer**, not only at startup, and the event loop wakes it early
+      when the broadcast receiver lags. A node that self-heals only when an operator deploys is not
+      self-healing.
 
 ### WP-1 — attribution bindings (one shared gate)
 

@@ -9028,20 +9028,95 @@ async fn main() -> Result<()> {
 
             let mut settlement_events = zmq_subscriber.subscribe_block_events();
             let rm_for_settlement = Arc::clone(&round_manager);
-            let observer = Arc::new(SettlementObserver::new(
-                Arc::clone(&db),
-                Arc::clone(&rpc),
-                PAYOUT_ADDRESS_GROUPING_HEIGHT,
-                ghost_pool::observed_settlement_height(),
-            ));
 
-            // Catch up on anything missed while down, and reverse settlements whose blocks left
-            // the chain — a Disconnected event can be lost across a restart, and a settlement left
-            // standing for an orphaned block is work silently marked paid.
-            let startup_observer = Arc::clone(&observer);
+            // Recovering a proposal a won block names but this node never received. Proposals are
+            // gossiped once and never rebroadcast, so a node that was down at that moment cannot
+            // settle the block at all — it keeps owing work the pool has already paid.
+            //
+            // Registered on the mesh so this node both asks and answers: the recovery only works
+            // because the peers that do hold the proposal serve it unprompted. The fetch needs no
+            // trust — the coinbase names the payout, and a response is accepted only if it hashes
+            // to that identity.
+            let (psync_tx, mut psync_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            {
+                let mesh_for_psync = Arc::clone(&mesh);
+                tokio::spawn(async move {
+                    while let Some(bytes) = psync_rx.recv().await {
+                        match mesh_for_psync.create_envelope_raw(
+                            ghost_consensus::MessageType::PayoutProposalSync,
+                            bytes,
+                        ) {
+                            Ok(envelope) => {
+                                if let Err(e) = mesh_for_psync.broadcast(envelope).await {
+                                    debug!(error = %e, "payout-proposal sync broadcast failed");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "payout-proposal sync envelope failed")
+                            }
+                        }
+                    }
+                });
+            }
+            let psync_send: ghost_pool::proposal_sync::ProposalSyncSendFn =
+                Arc::new(move |bytes| {
+                    psync_tx.try_send(bytes).map_err(|e| {
+                        ghost_common::error::GhostError::P2PMessage(format!(
+                            "proposal-sync channel: {e}"
+                        ))
+                    })
+                });
+            let proposal_sync = Arc::new(
+                ghost_pool::proposal_sync::ProposalSyncHandler::new(Arc::clone(&db))
+                    .with_send(psync_send),
+            );
+            mesh.register_handler(Arc::clone(&proposal_sync)
+                as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+
+            let observer = Arc::new(
+                SettlementObserver::new(
+                    Arc::clone(&db),
+                    Arc::clone(&rpc),
+                    PAYOUT_ADDRESS_GROUPING_HEIGHT,
+                    ghost_pool::observed_settlement_height(),
+                )
+                .with_proposal_sync(Arc::clone(&proposal_sync)),
+            );
+
+            // Waking reconciliation early, when the event loop knows it has fallen behind.
+            let reconcile_wake = Arc::new(tokio::sync::Notify::new());
+
+            // Reconciliation is the safety net under the event stream, and it runs on a timer
+            // rather than only at startup.
+            //
+            // Two holes need it while the node is up, not just after a restart. A proposal fetched
+            // from a peer arrives *after* its block was observed, so something has to come back and
+            // settle it; and a lagged broadcast receiver drops events outright. Leaving either to
+            // the next restart would mean the ledger self-heals only when an operator happens to
+            // deploy, which is the same as not self-healing.
+            //
+            // Both passes are idempotent and cursor-driven, so a tick in steady state costs one or
+            // two block reads.
+            let reconcile_observer = Arc::clone(&observer);
+            let reconcile_woken = Arc::clone(&reconcile_wake);
             tokio::spawn(async move {
-                if let Err(e) = startup_observer.reconcile().await {
-                    warn!(error = %e, "settlement reconciliation failed at startup");
+                const RECONCILE_INTERVAL_SECS: u64 = 300;
+                let period = std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS);
+                // Start the timer one period out: the loop reconciles before it waits, so the
+                // startup pass is the first iteration rather than a separate task.
+                let mut ticker =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    if let Err(e) = reconcile_observer.reconcile().await {
+                        warn!(error = %e, "settlement reconciliation failed");
+                    }
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = reconcile_woken.notified() => {
+                            debug!("settlement reconciliation woken early");
+                        }
+                    }
                 }
             });
 
@@ -9061,7 +9136,7 @@ async fn main() -> Result<()> {
                                     block = %hash,
                                     payout_id = %hex::encode(payout_id),
                                     "observed a block carrying our payout tag but hold no matching \
-                                     proposal — it cannot be settled here"
+                                     proposal — requested it and deferred the block for retry"
                                 ),
                                 SettleOutcome::DryRunMatch { .. }
                                 | SettleOutcome::AlreadySettled
@@ -9072,13 +9147,15 @@ async fn main() -> Result<()> {
                             observer.on_block_disconnected(&hash);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            // Missing a block here means a settlement may have been missed, which
-                            // reconcile() cannot fix (it only reverses, never applies). Say so.
+                            // Dropped events mean a won block may have gone unseen. The forward
+                            // scan covers exactly that, so wake it now instead of leaving the hole
+                            // open until the next tick — a log line here would be a report of a
+                            // problem nothing is acting on.
                             warn!(
                                 skipped,
-                                "settlement observer lagged behind block events — a won block may \
-                                 be unsettled until the next reconcile"
+                                "settlement observer lagged behind block events — reconciling now"
                             );
+                            reconcile_wake.notify_one();
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             info!("settlement observer shutting down — block events closed");

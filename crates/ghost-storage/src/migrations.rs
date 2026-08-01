@@ -2442,6 +2442,13 @@ fn normalise_legacy_share_hash_byte_order(conn: &Connection) -> GhostResult<()> 
 /// simply will not match a coinbase until it is rewritten. That is the correct failure — it means
 /// "I cannot prove this block is mine", not "this block is not mine".
 ///
+/// `deferred_settlements` — a block that carries our payout tag but whose proposal this node never
+/// received. It cannot be settled yet, and forgetting it would be a silent hole: the forward scan
+/// is cursor-driven, so once the cursor passes that height the block is never looked at again, and
+/// the proposal fetched from a peer a second later would arrive with nothing left to apply it to.
+/// Recording the block instead lets reconciliation retry exactly those, bounded, and survive a
+/// restart — the cursor keeps advancing and the unresolved set stays small.
+///
 /// `settled_blocks` — records exactly what each settlement applied (`shares_marked`,
 /// `treasury_bumped`) so a reorg reversal is an exact inversion of recorded amounts rather than a
 /// recomputation, and so re-settling is idempotent. `reversed` is a flag rather than a deletion:
@@ -2500,7 +2507,19 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
              ON settled_blocks(reversed, block_height);",
     )
     .map_err(|e| GhostError::Migration(e.to_string()))?;
-    info!("v49: added payout_proposals.outputs_hash and created settled_blocks");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS deferred_settlements (
+            block_hash    TEXT    PRIMARY KEY,
+            block_height  INTEGER NOT NULL,
+            payout_id     BLOB    NOT NULL,
+            first_seen_ts INTEGER NOT NULL,
+            attempts      INTEGER NOT NULL DEFAULT 0
+        );",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    info!("v49: added payout_proposals.outputs_hash, settled_blocks and deferred_settlements");
     Ok(())
 }
 

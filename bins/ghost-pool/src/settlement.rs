@@ -154,16 +154,23 @@ impl SettlementObserver {
         let Some((proposal_hash, json)) = found else {
             // The block is ours — it carries our tag — but we never received the proposal, most
             // likely because we were down when it was gossiped. Ask the mesh rather than warning
-            // and waiting for someone to notice: the forward scan settles the block on a later
-            // pass, once the answer has landed.
+            // and waiting for someone to notice.
             //
             // The fetch is safe without trust because the chain names the payout, so a response is
             // only accepted if it hashes to the identity this coinbase carries.
+            //
+            // Asking is not enough on its own: the answer lands seconds later, by which time this
+            // block has been seen and the forward scan's cursor has moved past it, so nothing would
+            // ever apply it. Recording the block is what closes that loop — reconciliation retries
+            // exactly these, and the row outlives a restart.
             warn!(
                 block_hash,
                 payout_id = %hex::encode(payout_id),
                 "a block carries our payout tag but the proposal is not held — requesting it"
             );
+            if let Err(e) = self.db.defer_settlement(block_hash, height, &payout_id) {
+                error!(block_hash, error = %e, "could not record a block awaiting its proposal");
+            }
             if let Some(sync) = &self.proposal_sync {
                 if let Err(e) = sync.request(payout_id) {
                     warn!(error = %e, "could not request the missing payout proposal");
@@ -171,6 +178,13 @@ impl SettlementObserver {
             }
             return SettleOutcome::ProposalMissing { payout_id };
         };
+
+        // The proposal is in hand, so whatever happens next this block is no longer waiting on one.
+        // Discharged on the dry-run path too: the deferral tracks "cannot resolve the payout", not
+        // "has not been applied", and the gate is a separate question.
+        if let Err(e) = self.db.clear_deferred_settlement(block_hash) {
+            debug!(block_hash, error = %e, "could not clear a deferred settlement");
+        }
 
         let proposal: PayoutProposal = match serde_json::from_str(&json) {
             Ok(p) => p,
@@ -248,16 +262,80 @@ impl SettlementObserver {
     /// - **backward**: any settled block no longer on the main chain is reversed, because a
     ///   `Disconnected` event can be missed the same way, and a settlement left standing for an
     ///   orphaned block is work silently marked paid.
+    /// - **deferred**: blocks known to be ours but unsettleable because their proposal had not
+    ///   arrived. The forward cursor has long since passed them, so only an explicit retry can
+    ///   finish the recovery a peer fetch started.
     /// - **forward**: every block since the last scan is examined, and any carrying our payout tag
     ///   is settled. This is what closes the missed-event hole.
+    ///
+    /// Deferred runs before forward so a proposal that arrived since the last pass is applied
+    /// straight away, rather than waiting a further tick behind a scan that cannot see it.
     ///
     /// The forward pass is cursor-driven rather than a fixed lookback, so steady state costs a
     /// block or two per run while a node returning from downtime catches up on everything it
     /// missed. Settling is idempotent, so re-examining a block is harmless.
     pub async fn reconcile(&self) -> GhostResult<usize> {
         let reversed = self.reverse_departed_blocks().await?;
+        self.retry_deferred_blocks().await?;
         self.settle_missed_blocks().await?;
         Ok(reversed)
+    }
+
+    /// Retry blocks that were ours but had no proposal to settle against.
+    ///
+    /// Each one is either resolvable now — because a peer answered — or asked for again. Asking
+    /// repeatedly is the point: the peer that holds it may itself have been down when we first
+    /// asked, and a recovery that gives up after one attempt is a recovery that needs an operator.
+    async fn retry_deferred_blocks(&self) -> GhostResult<()> {
+        let deferred = self.db.list_deferred_settlements()?;
+        if deferred.is_empty() {
+            return Ok(());
+        }
+
+        for (block_hash, height, payout_id) in deferred {
+            // A block can be orphaned while it waits. Settling it then would mark work paid by a
+            // block that no longer pays anyone. Only `-1` is treated as departed — an RPC failure
+            // leaves the deferral alone rather than discarding it.
+            if let Ok(header) = self.rpc.get_block_header(&block_hash).await {
+                if header.confirmations == -1 {
+                    warn!(
+                        block_hash,
+                        height, "a block awaiting its proposal left the main chain — dropping it"
+                    );
+                    self.db.clear_deferred_settlement(&block_hash)?;
+                    continue;
+                }
+            }
+
+            if self.db.get_proposal_by_hash_prefix(&payout_id)?.is_none() {
+                debug!(
+                    block_hash,
+                    payout_id = %hex::encode(payout_id),
+                    "still awaiting a payout proposal — asking again"
+                );
+                if let Some(sync) = &self.proposal_sync {
+                    if let Err(e) = sync.request(payout_id) {
+                        warn!(error = %e, "could not re-request a missing payout proposal");
+                    }
+                }
+                continue;
+            }
+
+            match self.on_block_connected(&block_hash, height).await {
+                SettleOutcome::Settled(applied) => info!(
+                    block_hash,
+                    height,
+                    shares_marked = applied.shares_marked,
+                    "settled a block once its payout proposal was recovered from a peer"
+                ),
+                other => debug!(
+                    block_hash,
+                    ?other,
+                    "deferred block resolved without settling"
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// kv key holding the height the forward scan has reached.
@@ -568,6 +646,64 @@ mod tests {
 
         let (unpaid, _) = db.get_miner_unpaid_stats(MINER).expect("stats");
         assert_eq!(unpaid, 2, "nothing should be settled on a proposal we lack");
+    }
+
+    /// **The recovery has to be remembered, not just requested.**
+    ///
+    /// The forward scan is cursor-driven, so by the time a peer answers, the cursor has passed the
+    /// block and nothing would ever look at it again. Without this row the fetch is theatre: the
+    /// proposal arrives, sits in the database, and the work stays wrongly owed forever.
+    #[test]
+    fn a_block_we_cannot_settle_yet_is_recorded_for_retry() {
+        let (db, observer) = non_submitting_node(2);
+
+        let mut s = vec![0x03, 0x40, 0x1f, 0x0e];
+        s.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xEE; 16]));
+        observer.settle_from_scriptsig("0000unknown", 960_001, &s);
+
+        assert_eq!(
+            db.list_deferred_settlements().expect("deferred"),
+            vec![("0000unknown".to_string(), 960_001, [0xEE; 16])],
+            "a block awaiting its proposal must survive the moment it was observed"
+        );
+    }
+
+    /// Once the proposal is in hand the deferral is discharged, so the retry list stays the small
+    /// set of things actually stuck rather than a log of everything that was ever late.
+    #[test]
+    fn recovering_the_proposal_clears_the_deferral() {
+        let (db, observer) = non_submitting_node(2);
+
+        // Observed before the proposal was held.
+        db.defer_settlement("0000won", 960_001, &{
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&PROPOSAL_HASH[..16]);
+            id
+        })
+        .expect("defer");
+
+        assert!(matches!(
+            observer.settle_from_scriptsig("0000won", 960_001, &winning_coinbase_scriptsig()),
+            SettleOutcome::Settled(_)
+        ));
+        assert!(
+            db.list_deferred_settlements().expect("deferred").is_empty(),
+            "a settled block is no longer waiting on anything"
+        );
+    }
+
+    /// Re-observing the same stuck block must not multiply it — the retry list is keyed on the
+    /// block, and a node restarting in a loop would otherwise grow one row per restart.
+    #[test]
+    fn re_observing_a_stuck_block_does_not_duplicate_it() {
+        let (db, observer) = non_submitting_node(1);
+
+        let mut s = vec![0x03, 0x40, 0x1f, 0x0e];
+        s.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xEE; 16]));
+        observer.settle_from_scriptsig("0000unknown", 960_001, &s);
+        observer.settle_from_scriptsig("0000unknown", 960_001, &s);
+
+        assert_eq!(db.list_deferred_settlements().expect("deferred").len(), 1);
     }
 
     /// Below the activation height the observer matches and reports but writes nothing, so the
