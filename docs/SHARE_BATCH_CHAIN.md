@@ -210,6 +210,33 @@ Recommendation: **(1)**, specified jointly with WP-1b's node tag so the scriptsi
 once. Until this is decided, the observer cannot be written — it would be built on a key that does
 not match.
 
+### Scriptsig budget — MEASURED 2026-08-01, both tags fit
+
+The objection to option (1) was that the coinbase scriptsig might not have room for a second tag
+alongside WP-1b's node id. It does. From the live canary config and the code:
+
+| consumer | bytes | source |
+|---|---|---|
+| BIP34 height push (960k ⇒ 3-byte value + opcode) | 4 | consensus |
+| extranonce (`POOL_ALLOCATION_BYTES` 4 + `CLIENT_SEARCH_SPACE_BYTES` 16) | 20 | `bins/pool-sv2/src/lib/channel_manager/mod.rs:54-57` |
+| `pool_signature = "- G H O S T - PublicPool"` | 24 | `/etc/ghost/pool-config.toml:7` (ghost-vm5) |
+| **used** | **~48** | |
+| **consensus ceiling** | **100** | coinbase scriptSig must be 2–100 bytes |
+| **spare** | **~52** | |
+
+Proposal tag (4 magic + 16 hash) + node tag (4 magic + 20 hash) = **44 bytes**, leaving ~8 spare. So
+option (1) is affordable without touching anything else.
+
+If more headroom is wanted, the cheapest source is `pool_signature`: 24 of the 48 used bytes are
+vanity text, and trimming it to e.g. `"-GHOST-"` frees ~17 more. That is an operator preference, not
+a technical constraint.
+
+Caveats on the measurement: the 48 is derived from config and constants rather than read off a real
+coinbase (the pool has not won a block since 2026-06-02, so there is none recent to inspect), and it
+assumes the SRI job builder places the pool signature in the scriptsig as stock SRI does. Both worth
+confirming against an actual template before the tags are sized in code — but the conclusion has
+~8 bytes of margin even if a byte or two is off, and trimming the signature restores plenty.
+
 ## Open decisions
 
 - Genesis source height (after a read-only preview-hash comparison across all 8)
