@@ -342,6 +342,113 @@ pub fn verify_batch<C: BatchChecks>(
     BatchVerdict::Valid
 }
 
+/// What recording a peer's vote did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TallyEvent {
+    /// Counted.
+    Recorded { approvals: usize, needed: usize },
+    /// The same vote again. Ignored, not punished — resends happen.
+    Duplicate,
+    /// This voter has now approved two different batches at one sequence. Their votes are
+    /// discarded — every one of them, including the first — because a node that will say two
+    /// contradictory things has told us nothing.
+    Equivocation {
+        voter: [u8; 32],
+        first: [u8; 32],
+        second: [u8; 32],
+    },
+    /// Quorum reached. This batch is final.
+    Finalised { batch_hash: [u8; 32], votes: usize },
+}
+
+/// Votes at one sequence, across every candidate batch proposed for it.
+///
+/// Per-sequence rather than per-batch on purpose: equivocation is only visible when the candidates
+/// are counted together. A tally that only ever saw one batch could not tell that the voter
+/// approving it had approved a different one a moment earlier.
+#[derive(Debug, Clone)]
+pub struct SeqTally {
+    seq: u64,
+    quorum: usize,
+    /// Who each voter approved. One entry per voter — the second, differing entry is equivocation.
+    choice: BTreeMap<[u8; 32], [u8; 32]>,
+    /// Voters whose votes are void.
+    equivocators: std::collections::BTreeSet<[u8; 32]>,
+    finalised: Option<[u8; 32]>,
+}
+
+impl SeqTally {
+    pub fn new(seq: u64, quorum: usize) -> Self {
+        Self {
+            seq,
+            quorum,
+            choice: BTreeMap::new(),
+            equivocators: std::collections::BTreeSet::new(),
+            finalised: None,
+        }
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn finalised(&self) -> Option<[u8; 32]> {
+        self.finalised
+    }
+
+    pub fn equivocators(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.equivocators.iter()
+    }
+
+    /// Approvals for one candidate, excluding voters whose word is worthless.
+    pub fn approvals_for(&self, batch_hash: &[u8; 32]) -> usize {
+        self.choice
+            .iter()
+            .filter(|(voter, chosen)| *chosen == batch_hash && !self.equivocators.contains(*voter))
+            .count()
+    }
+
+    /// Record an approval.
+    ///
+    /// Finalisation is reported once and only once: a batch that has reached quorum is final, and
+    /// re-announcing it on every later vote would have a caller applying it repeatedly.
+    pub fn record(&mut self, voter: [u8; 32], batch_hash: [u8; 32]) -> TallyEvent {
+        if self.equivocators.contains(&voter) {
+            return TallyEvent::Duplicate;
+        }
+
+        match self.choice.get(&voter) {
+            Some(existing) if *existing == batch_hash => return TallyEvent::Duplicate,
+            Some(existing) => {
+                let first = *existing;
+                self.equivocators.insert(voter);
+                self.choice.remove(&voter);
+                return TallyEvent::Equivocation {
+                    voter,
+                    first,
+                    second: batch_hash,
+                };
+            }
+            None => {
+                self.choice.insert(voter, batch_hash);
+            }
+        }
+
+        let approvals = self.approvals_for(&batch_hash);
+        if approvals >= self.quorum && self.finalised.is_none() {
+            self.finalised = Some(batch_hash);
+            return TallyEvent::Finalised {
+                batch_hash,
+                votes: approvals,
+            };
+        }
+        TallyEvent::Recorded {
+            approvals,
+            needed: self.quorum,
+        }
+    }
+}
+
 /// One vote per sequence, remembered.
 ///
 /// Round-robin decides who *asks*; this decides that a node answers once. Without it two valid
@@ -930,6 +1037,95 @@ mod tests {
             ),
             BatchVerdict::Fault(FaultReason::ProposerSignatureInvalid)
         );
+    }
+
+    // ---- SeqTally ----
+
+    #[test]
+    fn a_batch_finalises_at_quorum_and_only_announces_it_once() {
+        let mut t = SeqTally::new(9, 6);
+        let batch = [0xAA; 32];
+        for n in 1..=5u8 {
+            assert!(matches!(
+                t.record(voter(n), batch),
+                TallyEvent::Recorded { .. }
+            ));
+        }
+        assert_eq!(
+            t.record(voter(6), batch),
+            TallyEvent::Finalised {
+                batch_hash: batch,
+                votes: 6
+            }
+        );
+        assert!(
+            matches!(t.record(voter(7), batch), TallyEvent::Recorded { .. }),
+            "a later vote must not re-announce finalisation, or the caller applies it twice"
+        );
+        assert_eq!(t.finalised(), Some(batch));
+    }
+
+    /// **Equivocation voids the voter, not just the second vote.** A node that will approve two
+    /// contradictory batches has told us nothing, so its first vote is worth no more than its
+    /// second — and leaving that first vote counted is how a two-faced node pushes a batch over
+    /// the line.
+    #[test]
+    fn an_equivocating_voter_stops_counting_for_anything() {
+        let mut t = SeqTally::new(9, 3);
+        let a = [0xAA; 32];
+        let b = [0xBB; 32];
+
+        t.record(voter(1), a);
+        t.record(voter(2), a);
+        assert_eq!(t.approvals_for(&a), 2);
+
+        assert_eq!(
+            t.record(voter(1), b),
+            TallyEvent::Equivocation {
+                voter: voter(1),
+                first: a,
+                second: b
+            }
+        );
+        assert_eq!(
+            t.approvals_for(&a),
+            1,
+            "the first vote must be withdrawn too"
+        );
+        assert_eq!(t.approvals_for(&b), 0);
+        assert_eq!(t.equivocators().count(), 1);
+
+        // And they cannot buy their way back in.
+        assert_eq!(t.record(voter(1), a), TallyEvent::Duplicate);
+        assert_eq!(t.approvals_for(&a), 1);
+    }
+
+    /// Two candidates at one sequence is the normal consequence of escalation, not an attack. Both
+    /// tally independently; only one can reach quorum, because the vote lock stops any node
+    /// backing both.
+    #[test]
+    fn two_candidates_at_one_sequence_tally_independently() {
+        let mut t = SeqTally::new(9, 6);
+        let a = [0xAA; 32];
+        let b = [0xBB; 32];
+        for n in 1..=4u8 {
+            t.record(voter(n), a);
+        }
+        for n in 5..=8u8 {
+            t.record(voter(n), b);
+        }
+        assert_eq!(t.approvals_for(&a), 4);
+        assert_eq!(t.approvals_for(&b), 4);
+        assert_eq!(t.finalised(), None, "neither reaches 6 of 8 — correct");
+    }
+
+    #[test]
+    fn a_resent_vote_is_not_equivocation() {
+        let mut t = SeqTally::new(9, 6);
+        let a = [0xAA; 32];
+        t.record(voter(1), a);
+        assert_eq!(t.record(voter(1), a), TallyEvent::Duplicate);
+        assert_eq!(t.approvals_for(&a), 1);
     }
 
     /// Pruning bounds the memory, and must only ever drop what is already final: a lock released

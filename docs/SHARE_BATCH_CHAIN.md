@@ -253,6 +253,14 @@ batches cannot both reach 67%.
       truncation flag contradicting its count, a close time that does not advance, an unsigned
       batch. Position is judged **before** contents, so a batch we are not entitled to judge is
       never branded for a defect — the response to a fault cannot be taken back. 11 tests.
+- [x] **vote tally + equivocation.** `SeqTally` counts per sequence, not per batch, because
+      equivocation is only visible when the candidates are counted together. An equivocating voter
+      is voided **entirely, including their first vote** — a node that will approve two
+      contradictory batches has told us nothing, and leaving the first counted is exactly how a
+      two-faced node pushes one over the line. Finalisation is announced once, so a later vote
+      cannot have the caller apply the same batch twice. Two candidates at one sequence tally
+      independently: that is the normal consequence of escalation, and the vote lock is what stops
+      either reaching quorum dishonestly.
 - [ ] the quarantine itself (what a `Fault` does to the peer) — needs the alert path
 - [ ] propose/finalise driver and mesh message types
 
