@@ -119,6 +119,109 @@ pub fn compute_state_root(balances: &BTreeMap<String, i64>, seq: u64, close_ts: 
     hasher.finalize().into()
 }
 
+/// Domain tag for the batch commitment. Same versioning rule as the state root — a batch hashed
+/// under a different encoding is not comparable, so any change bumps the version and is gated.
+const BATCH_HASH_DOMAIN: &[u8] = b"ShareBatch/v1";
+
+/// One link in the share-batch chain.
+///
+/// The adopted chain **is** the share ledger. A batch is self-proving: every share in it carries
+/// its own PoW and signature, so a validator checks validity rather than asking whether it happens
+/// to hold the same shares. That is what lets agreement be verification instead of election.
+///
+/// `seq` is independent of block height. Share consensus runs on its own cadence and never waits on
+/// a block — the whole point of the redesign is that a tip change *consumes* the latest agreed
+/// batch rather than triggering agreement.
+#[derive(Debug, Clone)]
+pub struct ShareBatch {
+    /// Position in the chain. Increments by one per adopted batch; unrelated to block height.
+    pub seq: u64,
+    /// Hash of the previous batch, making the chain a chain.
+    pub prev_batch_hash: [u8; 32],
+    /// When the proposer closed this batch. Advisory — a share's eligibility is decided by chain
+    /// membership, not by landing inside a window.
+    pub close_ts: i64,
+    /// Who proposed it, per the deterministic round-robin.
+    pub proposer: [u8; 32],
+    /// The shares, in canonical order.
+    pub shares: Vec<ShareProof>,
+    /// Blocks whose settlements are folded into this batch's state.
+    ///
+    /// Block hashes only. An earlier design carried `(block_hash, proposal_hash)` pairs, but the
+    /// coinbase now names the payout it pays, so the second half was redundant — every validator
+    /// resolves it from its own chain. What the batch still has to say is *which* settlements are
+    /// included, because nodes observe blocks at different moments relative to a batch close, and
+    /// without a stated cut point two honest nodes fold different sets and their roots diverge.
+    pub settled_blocks: Vec<[u8; 32]>,
+    /// Qualified-node shares (the 5-4-3-2-1 snapshot) as of this batch.
+    pub node_shares: Vec<([u8; 32], i32)>,
+    /// Commitment to the running per-address balances after applying this batch.
+    pub state_root: [u8; 32],
+    /// Whether shares were deferred to the next batch for want of room.
+    ///
+    /// Carried so a peer can tell a full batch from a truncated one. Without it, "the proposer had
+    /// nothing more" and "the proposer had more and could not fit it" look identical.
+    pub truncated: bool,
+    /// How many shares were deferred.
+    pub pending_count: u32,
+    /// The proposer's signature over [`ShareBatch::batch_hash`].
+    pub proposer_signature: Vec<u8>,
+}
+
+impl ShareBatch {
+    /// Commitment to everything in this batch except the signature over it.
+    ///
+    /// Shares are committed by their **canonical signing bytes**, not by their serialized form. The
+    /// wire encoding is JSON and two nodes need not produce byte-identical JSON, so hashing the
+    /// serialized proof would make the batch hash depend on an accident of serialization. The
+    /// signing bytes are canonical by construction — they are what the GHOST-09 signature already
+    /// covers — so both sides agree.
+    ///
+    /// The signature is excluded because it is *over* this hash; including it would be circular.
+    pub fn batch_hash(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(BATCH_HASH_DOMAIN);
+        h.update(self.seq.to_le_bytes());
+        h.update(self.prev_batch_hash);
+        h.update(self.close_ts.to_le_bytes());
+        h.update(self.proposer);
+
+        h.update((self.shares.len() as u32).to_le_bytes());
+        for share in &self.shares {
+            let bytes = share.signing_bytes();
+            h.update((bytes.len() as u32).to_le_bytes());
+            h.update(&bytes);
+        }
+
+        h.update((self.settled_blocks.len() as u32).to_le_bytes());
+        for block in &self.settled_blocks {
+            h.update(block);
+        }
+
+        h.update((self.node_shares.len() as u32).to_le_bytes());
+        for (node, shares) in &self.node_shares {
+            h.update(node);
+            h.update(shares.to_le_bytes());
+        }
+
+        h.update(self.state_root);
+        h.update([self.truncated as u8]);
+        h.update(self.pending_count.to_le_bytes());
+        h.finalize().into()
+    }
+
+    /// Whether this batch follows `previous`.
+    ///
+    /// Checked rather than assumed: a batch whose parent is not the adopted head is not a
+    /// disagreement about contents, it is a node looking at a different chain, and it should sync
+    /// rather than vote.
+    pub fn follows(&self, previous: &ShareBatch) -> bool {
+        self.seq == previous.seq.saturating_add(1)
+            && self.prev_batch_hash == previous.batch_hash()
+            && self.close_ts > previous.close_ts
+    }
+}
+
 /// How a batch was packed against a byte budget.
 ///
 /// Not `PartialEq`: `ShareProof` deliberately is not, so compare packs by `share_hash` — which is
@@ -525,6 +628,129 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn a_batch() -> ShareBatch {
+        let mut shares = sample_shares();
+        canonical_sort(&mut shares);
+        let mut balances = BTreeMap::new();
+        fold_shares(&mut balances, &shares);
+        ShareBatch {
+            seq: 500,
+            prev_batch_hash: [0x11; 32],
+            close_ts: 1_700_000_000,
+            proposer: [0x22; 32],
+            shares,
+            settled_blocks: vec![[0x33; 32]],
+            node_shares: vec![([0x44; 32], 15)],
+            state_root: compute_state_root(&balances, 500, 1_700_000_000),
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: vec![0x55; 64],
+        }
+    }
+
+    /// Every field must be covered, or a batch could be altered without changing its identity —
+    /// and the identity is what a quorum signs.
+    #[test]
+    fn the_batch_hash_covers_every_field() {
+        let base = a_batch();
+        let h = base.batch_hash();
+
+        let mut b = base.clone();
+        b.seq += 1;
+        assert_ne!(h, b.batch_hash(), "seq not covered");
+
+        let mut b = base.clone();
+        b.prev_batch_hash = [0x99; 32];
+        assert_ne!(h, b.batch_hash(), "prev_batch_hash not covered");
+
+        let mut b = base.clone();
+        b.close_ts += 1;
+        assert_ne!(h, b.batch_hash(), "close_ts not covered");
+
+        let mut b = base.clone();
+        b.proposer = [0x99; 32];
+        assert_ne!(h, b.batch_hash(), "proposer not covered");
+
+        let mut b = base.clone();
+        b.shares.pop();
+        assert_ne!(h, b.batch_hash(), "shares not covered");
+
+        let mut b = base.clone();
+        b.settled_blocks.push([0x77; 32]);
+        assert_ne!(h, b.batch_hash(), "settled_blocks not covered");
+
+        let mut b = base.clone();
+        b.node_shares[0].1 = 14;
+        assert_ne!(h, b.batch_hash(), "node_shares not covered");
+
+        let mut b = base.clone();
+        b.state_root = [0x99; 32];
+        assert_ne!(h, b.batch_hash(), "state_root not covered");
+
+        let mut b = base.clone();
+        b.truncated = true;
+        assert_ne!(h, b.batch_hash(), "truncated not covered");
+
+        let mut b = base.clone();
+        b.pending_count = 7;
+        assert_ne!(h, b.batch_hash(), "pending_count not covered");
+    }
+
+    /// The signature is over the hash, so it cannot be inside it.
+    #[test]
+    fn the_batch_hash_excludes_the_signature() {
+        let base = a_batch();
+        let mut resigned = base.clone();
+        resigned.proposer_signature = vec![0xEE; 64];
+        assert_eq!(
+            base.batch_hash(),
+            resigned.batch_hash(),
+            "including the signature would make signing it circular"
+        );
+    }
+
+    /// Committing to shares by their canonical signing bytes rather than their serialized form:
+    /// two nodes need not produce identical JSON, and a batch identity that depended on that would
+    /// diverge for no reason.
+    #[test]
+    fn reordering_shares_changes_the_batch_hash() {
+        let base = a_batch();
+        let mut swapped = base.clone();
+        swapped.shares.swap(0, 1);
+        assert_ne!(
+            base.batch_hash(),
+            swapped.batch_hash(),
+            "share order is part of the batch identity"
+        );
+    }
+
+    /// Chaining is checked, not assumed. A batch whose parent is not our head means we are looking
+    /// at a different chain and should sync, which is a different response from disagreeing.
+    #[test]
+    fn follows_requires_sequence_parent_and_forward_time() {
+        let parent = a_batch();
+        let mut child = a_batch();
+        child.seq = parent.seq + 1;
+        child.prev_batch_hash = parent.batch_hash();
+        child.close_ts = parent.close_ts + 30;
+        assert!(child.follows(&parent));
+
+        let mut wrong_seq = child.clone();
+        wrong_seq.seq = parent.seq + 2;
+        assert!(!wrong_seq.follows(&parent), "a gap must not chain");
+
+        let mut wrong_parent = child.clone();
+        wrong_parent.prev_batch_hash = [0xAB; 32];
+        assert!(
+            !wrong_parent.follows(&parent),
+            "a different parent must not chain"
+        );
+
+        let mut backwards = child.clone();
+        backwards.close_ts = parent.close_ts - 1;
+        assert!(!backwards.follows(&parent), "time must move forward");
     }
 
     /// Golden vector, pinning `SbcStateRoot/v1` at the moment the encoding was defined.

@@ -193,7 +193,13 @@ bound. Pure library code, exhaustively tested for determinism before any wiring.
       batch is not marked truncated, an impossible budget still emits one share rather than wedging
       the chain forever, packing is arrival-order-independent, repeated packing drains and
       terminates, and the estimate is checked against the real encoded length.
-- [ ] `ShareBatch` type + `batch_hash` — UNBLOCKED by D12. The struct's settlement field depends on
+- [x] `ShareBatch` type + `batch_hash`. Carries `settled_blocks: Vec<[u8;32]>` — block hashes only,
+      refining D11: the coinbase now names the payout, so the pair's second half was redundant, but
+      the batch must still state WHICH settlements are folded in or nodes observing blocks at
+      different moments diverge. Shares are committed by canonical signing bytes, not serialized
+      form, so the identity cannot depend on an accident of JSON. `follows()` checks sequence,
+      parent and forward time, so a batch on a different chain is a sync condition rather than a
+      disagreement. The struct's settlement field depends on
       how a won block is identified: if the coinbase carries the proposal hash (D12 option 1) the
       batch need only carry `block_hash`, whereas the pair form is needed otherwise. Defining the
       struct now would bake in a guess about a decision that is still open.
