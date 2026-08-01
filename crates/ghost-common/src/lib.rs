@@ -52,6 +52,9 @@ pub mod serde_hex;
 pub mod setup;
 /// Share-batch chain: deterministic core (canonical order, integer fold, state root).
 pub mod share_batch;
+
+/// Proving a share was mined to the node that claims it.
+pub mod share_binding;
 pub mod signer;
 pub mod template_verifier;
 pub mod tls;
