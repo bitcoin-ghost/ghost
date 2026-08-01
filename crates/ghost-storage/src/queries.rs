@@ -2018,6 +2018,37 @@ impl Database {
         })
     }
 
+    /// Find the proposal a coinbase names, given the identity tag read off its scriptSig.
+    ///
+    /// The tag carries the first 16 bytes of the proposal hash — enough to identify one among the
+    /// bounded set this node retains, and small enough to share the scriptSig with the node
+    /// commitment. A full 32 bytes would not fit alongside it.
+    ///
+    /// Matching on a prefix rather than the full hash is safe here because the candidate set is
+    /// this node's own retained proposals, not an open space: a collision would need two proposals
+    /// this node itself stored whose hashes share 128 bits.
+    ///
+    /// A scan rather than an index, deliberately — retention keeps this table to roughly a day's
+    /// proposals (~160 rows), and this runs once per observed block.
+    pub fn get_proposal_by_hash_prefix(
+        &self,
+        prefix: &[u8; 16],
+    ) -> GhostResult<Option<([u8; 32], String)>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT proposal_hash, proposal_json FROM payout_proposals
+                  WHERE substr(proposal_hash, 1, 16) = ?1",
+                params![prefix.to_vec()],
+                |r| {
+                    let hash: Vec<u8> = r.get(0)?;
+                    Ok((to_hash32(&hash), r.get::<_, String>(1)?))
+                },
+            )
+            .optional()
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     /// Prune payout proposals that can no longer be needed.
     ///
     /// The table stores every proposal but the running node only ever reads one — the approved row.

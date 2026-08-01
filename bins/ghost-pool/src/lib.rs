@@ -68,6 +68,9 @@ pub mod registry;
 /// Chain reorganization detection and recovery.
 pub mod reorg;
 
+/// Settling the ledger from blocks observed on-chain.
+pub mod settlement;
+
 /// Mining round lifecycle and share accounting.
 pub mod round;
 
