@@ -4730,8 +4730,6 @@ mod tests {
         );
     }
 
-    /// H-MINE-3-TEST-2: Test that runtime script_len validation works
-    #[test]
     /// Both commitments must survive into the coinbase this node builds, and the result must fit
     /// the consensus ceiling with the real pool tag and extranonce alongside.
     ///
@@ -4820,6 +4818,7 @@ mod tests {
         );
     }
 
+    /// H-MINE-3-TEST-2: Test that runtime script_len validation works
     #[test]
     fn test_script_len_runtime_validation() {
         // Defensive test: even if config validation is bypassed, building a coinbase must refuse a
