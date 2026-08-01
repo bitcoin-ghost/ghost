@@ -197,12 +197,104 @@ impl SettlementObserver {
         }
     }
 
-    /// Re-check settled blocks against the chain, and reverse any that are no longer on it.
+    /// Bring settlement back in line with the chain, in both directions.
     ///
-    /// A `Disconnected` event can be missed — a restart, a dropped subscription — and a settlement
-    /// left standing for an orphaned block is work wrongly marked paid, which is silent. This is the
-    /// backstop that makes the reversal path self-healing rather than event-dependent.
+    /// Events alone are not enough. A node that is restarting when a block lands never sees its
+    /// `Connected` event, so it never settles — and deploys happen. Relying on events would leave
+    /// that node's ledger owing work the pool already paid, which is exactly the divergence this
+    /// whole mechanism exists to remove; making it rarer is not fixing it.
+    ///
+    /// So this does two passes:
+    ///
+    /// - **backward**: any settled block no longer on the main chain is reversed, because a
+    ///   `Disconnected` event can be missed the same way, and a settlement left standing for an
+    ///   orphaned block is work silently marked paid.
+    /// - **forward**: every block since the last scan is examined, and any carrying our payout tag
+    ///   is settled. This is what closes the missed-event hole.
+    ///
+    /// The forward pass is cursor-driven rather than a fixed lookback, so steady state costs a
+    /// block or two per run while a node returning from downtime catches up on everything it
+    /// missed. Settling is idempotent, so re-examining a block is harmless.
     pub async fn reconcile(&self) -> GhostResult<usize> {
+        let reversed = self.reverse_departed_blocks().await?;
+        self.settle_missed_blocks().await?;
+        Ok(reversed)
+    }
+
+    /// kv key holding the height the forward scan has reached.
+    const SCAN_CURSOR_KEY: &'static str = "settlement.scan_height";
+
+    /// Most blocks to examine in one catch-up, so a very stale cursor cannot stall startup.
+    ///
+    /// Anything further behind is reported and picked up next run rather than done in one burst.
+    const MAX_CATCHUP_BLOCKS: u64 = 500;
+
+    /// Forward pass: settle any block since the last scan that names one of our payouts.
+    async fn settle_missed_blocks(&self) -> GhostResult<()> {
+        let tip = self.rpc.get_block_count().await?;
+
+        // First run has no cursor. Start one block back rather than at genesis — there is nothing
+        // to settle in history this node has never had proposals for, and scanning the whole chain
+        // on first start would be pointless work.
+        let cursor: u64 = match self.db.kv_get(Self::SCAN_CURSOR_KEY)? {
+            Some(v) => v.parse().unwrap_or(tip.saturating_sub(1)),
+            None => tip.saturating_sub(1),
+        };
+
+        if cursor >= tip {
+            return Ok(());
+        }
+
+        let behind = tip - cursor;
+        let scan_to = if behind > Self::MAX_CATCHUP_BLOCKS {
+            warn!(
+                behind,
+                limit = Self::MAX_CATCHUP_BLOCKS,
+                "settlement scan is a long way behind; catching up in batches"
+            );
+            cursor + Self::MAX_CATCHUP_BLOCKS
+        } else {
+            tip
+        };
+
+        let mut settled = 0usize;
+        for height in (cursor + 1)..=scan_to {
+            let hash = match self.rpc.get_block_hash(height).await {
+                Ok(h) => h,
+                Err(e) => {
+                    // Stop at the first gap rather than skipping it — advancing the cursor past a
+                    // height we could not read would lose that block permanently.
+                    warn!(height, error = %e, "settlement scan stopped: could not read block hash");
+                    break;
+                }
+            };
+
+            if let SettleOutcome::Settled(applied) = self.on_block_connected(&hash, height).await {
+                settled += 1;
+                info!(
+                    height,
+                    block = %hash,
+                    shares_marked = applied.shares_marked,
+                    "settled a won block the event stream missed"
+                );
+            }
+
+            // Advance per block, so an interruption resumes rather than restarts.
+            self.db.kv_set(Self::SCAN_CURSOR_KEY, &height.to_string())?;
+        }
+
+        if settled > 0 {
+            warn!(
+                settled,
+                "the forward scan settled blocks that no Connected event was seen for — \
+                 expected after a restart, worth investigating otherwise"
+            );
+        }
+        Ok(())
+    }
+
+    /// Backward pass: reverse settlements whose blocks left the main chain.
+    async fn reverse_departed_blocks(&self) -> GhostResult<usize> {
         let settled = self.db.list_unreversed_settled_blocks()?;
         let mut reversed = 0usize;
 
