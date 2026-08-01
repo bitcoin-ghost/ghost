@@ -97,9 +97,12 @@ ledger only grows.
 - [x] populate `outputs_hash` on `store_proposal`, computed with the same treasury-address
       selection the commitment uses (that selection was duplicated at three sites and is now one
       helper — picking the other branch silently changes the hash)
-- [ ] `SettlementObserver`: on_block_connected / on_block_disconnected / rescan
+- [x] `SettlementObserver`: connect / disconnect / reconcile. Reconcile is SYMMETRIC — it reverses
+      settlements for departed blocks AND settles ones the event stream missed, cursor-driven. An
+      earlier version only reversed, which left a node that restarted while a block landed never
+      settling it: the same divergence, just rarer.
 - [ ] wire to a second `BlockEvent` receiver alongside `ReorgHandler`
-- [ ] `OBSERVED_SETTLEMENT_HEIGHT` gate, dry-run below it
+- [x] `OBSERVED_SETTLEMENT_HEIGHT` gate, UNARMED at `u64::MAX`, dry-run below it
 - [ ] red-before test: a non-submitting node settles (fails on main today)
 
 ### WP-1 — attribution bindings (one shared gate)
