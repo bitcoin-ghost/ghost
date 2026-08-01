@@ -182,7 +182,23 @@ ledger only grows.
         Affordable only because the ~29 KB outputs blob is content-addressed and shared across
         every job reusing it; the per-template marginal cost is the merkle path plus prefix, a few
         hundred bytes. Whole coinbases per job would be tens of GB over the same window.
-  - [ ] `pool_sv2`: node tag into the scriptSig where `pool_signature` already goes
+  - [x] **scriptSig budget made real, and one assembler for four sites.** `channels-sv2`'s job
+        factory takes `with_extra_script_sig(bytes)` — Ghost's tags arrive pre-encoded, so the
+        vendored fork carries budget arithmetic rather than Ghost semantics and stays rebasable.
+        Three defects found while sizing it:
+        - The tag guard was a literal `61` with its arithmetic in a comment. Adding tags without
+          tightening it produces a scriptSig over the 100-byte consensus limit — **discoverable
+          only on a won block.** Now derived from named constants.
+        - The reserve assumed a 32-byte extranonce; the pool runs 20. Budgeting against the real
+          size recovers 12 bytes, which is what makes `/GHOST PublicPool/` fit beside both tags.
+        - **`StandardChannel::validate_share` reassembles the scriptSig by hand on the block-found
+          path** and knew nothing about extra pushes, so it would have built a different coinbase
+          from the one the miner hashed. Two more copies of the prefix/suffix offset existed in the
+          factory. All four now call `script_sig_before_extranonce`.
+
+        Measured, at the live configuration: **91 of 100 bytes, 9 spare.** 58 tests pass, including
+        the 50 pre-existing vectors — the offset dedup is behaviour-preserving.
+  - [ ] `pool_sv2`: build and pass the Ghost tags into the factory
   - [ ] `pool_sv2`: publish the skeleton on job announce
   - [ ] share webhook carries `extranonce` + `header80`
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature

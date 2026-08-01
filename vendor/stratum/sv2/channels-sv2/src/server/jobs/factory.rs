@@ -57,6 +57,21 @@ impl JobIdFactory {
     }
 }
 
+/// Consensus limit on a coinbase scriptSig, in bytes.
+pub const MAX_COINBASE_SCRIPT_SIG: usize = 100;
+
+/// Bytes reserved for the BIP34 block-height push.
+///
+/// One opcode plus up to four bytes of height. Four is only needed above height 16,777,215, so this
+/// is one byte generous today and stays correct for as long as the chain runs.
+pub const BIP34_HEIGHT_RESERVE: usize = 5;
+
+/// Fixed serialized-transaction bytes ahead of the scriptSig.
+///
+/// version(4) + segwit marker/flag(2) + input count(1) + prev outpoint(32) + index(4) +
+/// script length(1). Named because it was previously six magic numbers added up inline, twice.
+pub const COINBASE_HEADER_BYTES: usize = 4 + 2 + 1 + 32 + 4 + 1;
+
 /// A Factory for creating Extended or Standard Jobs.
 ///
 /// Ensures unique job ids.
@@ -70,6 +85,15 @@ pub struct JobFactory {
     version_rolling_allowed: bool,
     pool_tag_string: Option<String>,
     miner_tag_string: Option<String>,
+    /// Extra scriptSig pushes appended after the pool/miner tag, opaque to this factory.
+    ///
+    /// Ghost puts its payout-identity and node-identity tags here. They are passed in already
+    /// encoded — including their `OP_PUSHBYTES` opcodes — rather than built here, because they are
+    /// Ghost semantics and this is vendored upstream code: keeping the meaning out of the fork
+    /// keeps the rebase diff to the budget arithmetic, which is the part upstream would want too.
+    ///
+    /// What the factory *does* owe them is room. See [`Self::pool_miner_tag_budget`].
+    extra_script_sig: Vec<u8>,
 }
 
 impl JobFactory {
@@ -90,7 +114,61 @@ impl JobFactory {
             version_rolling_allowed,
             pool_tag_string,
             miner_tag_string,
+            extra_script_sig: Vec::new(),
         }
+    }
+
+    /// Append extra, already-encoded scriptSig pushes to every job this factory builds.
+    ///
+    /// They come out of the same 100-byte budget as everything else, so adding them *shrinks* what
+    /// the pool and miner tags may occupy — which is the whole reason this is a setter on the
+    /// factory rather than something spliced in by the caller afterwards. A caller that appended
+    /// bytes itself would produce an over-length scriptSig, and the first time anyone found out
+    /// would be a won block rejected by consensus.
+    pub fn with_extra_script_sig(mut self, extra: Vec<u8>) -> Self {
+        self.extra_script_sig = extra;
+        self
+    }
+
+    /// How many bytes the pool+miner tag may occupy, given everything else in the scriptSig.
+    ///
+    /// Derived rather than written down. This was a literal `61` with the arithmetic in a comment
+    /// beside it, which is fine until one of the terms changes — and then the guard passes while
+    /// the coinbase it guards is over the consensus limit. The failure surfaces only on a won
+    /// block, which is the most expensive place to discover anything.
+    ///
+    /// Saturating, so an extra push large enough to consume the whole budget yields zero rather
+    /// than wrapping to an enormous allowance.
+    pub fn pool_miner_tag_budget(&self, full_extranonce_size: usize) -> usize {
+        MAX_COINBASE_SCRIPT_SIG
+            .saturating_sub(BIP34_HEIGHT_RESERVE)
+            .saturating_sub(1) // OP_PUSHBYTES for the pool/miner tag
+            .saturating_sub(1 + full_extranonce_size)
+            .saturating_sub(self.extra_script_sig.len())
+    }
+
+    /// Everything in the scriptSig before the extranonce bytes themselves, including the
+    /// `OP_PUSHBYTES` that introduces them.
+    ///
+    /// **Four places used to assemble this independently** — two in this factory, and, most
+    /// dangerously, `StandardChannel::validate_share` on the block-found path. That last one only
+    /// runs when the pool wins, so a disagreement between them would produce a coinbase different
+    /// from the one the miner actually hashed, and the block would be rejected. Nobody would find
+    /// out until it cost a block.
+    ///
+    /// One assembler removes the whole class of that bug rather than the current instance of it.
+    pub fn script_sig_before_extranonce(
+        &self,
+        template_coinbase_prefix: &[u8],
+        full_extranonce_size: usize,
+    ) -> Result<Vec<u8>, JobFactoryError> {
+        let mut script_sig = template_coinbase_prefix.to_vec();
+        script_sig.extend_from_slice(&self.op_pushbytes_pool_miner_tag(full_extranonce_size)?);
+        script_sig.extend_from_slice(&self.extra_script_sig);
+        // The extranonce stays last: the prefix/suffix split is "everything before it" and
+        // "everything after it", so anything appended behind would land on the wrong side.
+        script_sig.push(full_extranonce_size as u8);
+        Ok(script_sig)
     }
 
     /// Returns a byte vector with the OP_PUSHBYTES opcode and the pool+miner tag.
@@ -98,7 +176,10 @@ impl JobFactory {
     /// The character `/` is used as a delimiter.
     ///
     /// If no pool or miner tag is provided, the delimiters are still added.
-    pub fn op_pushbytes_pool_miner_tag(&self) -> Result<Vec<u8>, JobFactoryError> {
+    pub fn op_pushbytes_pool_miner_tag(
+        &self,
+        full_extranonce_size: usize,
+    ) -> Result<Vec<u8>, JobFactoryError> {
         let mut pool_miner_tag = vec![];
         pool_miner_tag.extend_from_slice(b"/");
         if let Some(pool_tag_string) = &self.pool_tag_string {
@@ -110,13 +191,13 @@ impl JobFactory {
         }
         pool_miner_tag.extend_from_slice(b"/");
 
-        // Create the proper OP_PUSHBYTES opcode based on data length
+        // The budget is computed from the parts rather than hardcoded, because the miner tag is
+        // caller-supplied: a long one plus the extra pushes would otherwise pass a stale literal
+        // and produce a scriptSig over the 100-byte consensus limit. That is only discoverable on
+        // a won block.
+        let budget = self.pool_miner_tag_budget(full_extranonce_size);
         let op_pushbytes = match pool_miner_tag.len() {
-            // 100 bytes are available for scriptSig
-            // subtract 5 for BIP34
-            // subtract 1 for OP_PUSHBYTES before pool/miner tag
-            // subtract 1+32 for extranonce (OP_PUSHBYTES + 32 bytes max)
-            len @ 1..=61 => len as u8,
+            len if (1..=budget).contains(&len) => len as u8,
             _ => return Err(JobFactoryError::CoinbaseTxPrefixError),
         };
 
@@ -385,10 +466,10 @@ impl JobFactory {
 
         let serialized_outputs = serialize(&coinbase_tx_outputs);
 
-        let mut coinbase_prefix = vec![];
-        coinbase_prefix.extend_from_slice(&template.coinbase_prefix.to_vec());
-        coinbase_prefix.extend_from_slice(&self.op_pushbytes_pool_miner_tag()?);
-        coinbase_prefix.push(full_extranonce_size as u8); // OP_PUSHBYTES_X (for the full extranonce)
+        let coinbase_prefix = self.script_sig_before_extranonce(
+            &template.coinbase_prefix.to_vec(),
+            full_extranonce_size,
+        )?;
 
         let set_custom_mining_job = SetCustomMiningJob {
             channel_id,
@@ -593,12 +674,10 @@ impl JobFactory {
 
         outputs.append(&mut template_outputs);
 
-        let op_pushbytes_pool_miner_tag = self.op_pushbytes_pool_miner_tag()?;
-
-        let mut script_sig = vec![];
-        script_sig.extend_from_slice(&template.coinbase_prefix.to_vec());
-        script_sig.extend_from_slice(&op_pushbytes_pool_miner_tag);
-        script_sig.push(full_extranonce_size as u8); // OP_PUSHBYTES_X (for the full extranonce)
+        let mut script_sig = self.script_sig_before_extranonce(
+            &template.coinbase_prefix.to_vec(),
+            full_extranonce_size,
+        )?;
         script_sig.extend_from_slice(&vec![0; full_extranonce_size]);
 
         let tx_in = TxIn {
@@ -618,6 +697,28 @@ impl JobFactory {
         })
     }
 
+    /// Byte offset, within the serialized coinbase, at which the extranonce begins.
+    ///
+    /// The prefix ends here and the suffix starts `full_extranonce_size` later. It was computed
+    /// twice — once in `coinbase_tx_prefix`, once in `coinbase_tx_suffix` — from a re-derived tag
+    /// length rather than the tag actually emitted. Two copies of an offset is one copy too many:
+    /// if they ever disagree the split lands mid-field, and the coinbase a miner reassembles is
+    /// not the one whose hash it submits.
+    ///
+    /// Measured from the real bytes (`op_pushbytes_pool_miner_tag()`) instead of re-adding up the
+    /// delimiters, so it cannot drift from what was written.
+    fn extranonce_offset(
+        &self,
+        template: &NewTemplate<'_>,
+        full_extranonce_size: usize,
+    ) -> Result<usize, JobFactoryError> {
+        let before = self.script_sig_before_extranonce(
+            &template.coinbase_prefix.to_vec(),
+            full_extranonce_size,
+        )?;
+        Ok(COINBASE_HEADER_BYTES + before.len())
+    }
+
     fn coinbase_tx_prefix(
         &self,
         template: NewTemplate<'_>,
@@ -631,21 +732,7 @@ impl JobFactory {
         )?;
         let serialized_coinbase = serialize(&coinbase);
 
-        // Calculate the full pool/miner tag length including delimiters and OP_PUSHBYTES opcode
-        let pool_miner_tag_len = 1 // OP_PUSHBYTES opcode
-            + 3 // three "/" delimiters
-            + self.pool_tag_string.as_ref().map_or(0, |s| s.len())
-            + self.miner_tag_string.as_ref().map_or(0, |s| s.len());
-
-        let index = 4 // tx version
-            + 2 // segwit bytes
-            + 1 // number of inputs
-            + 32 // prev OutPoint
-            + 4 // index
-            + 1 // bytes in script
-            + template.coinbase_prefix.len()
-            + pool_miner_tag_len
-            + 1; // OP_PUSHBYTES_X (for the extranonce)
+        let index = self.extranonce_offset(&template, full_extranonce_size)?;
 
         let coinbase_tx_prefix = serialized_coinbase[0..index].to_vec();
 
@@ -665,22 +752,8 @@ impl JobFactory {
         )?;
         let serialized_coinbase = serialize(&coinbase);
 
-        // Calculate the full pool/miner tag length including delimiters and OP_PUSHBYTES opcode
-        let pool_miner_tag_len = 1 // OP_PUSHBYTES opcode
-            + 3 // three "/" delimiters
-            + self.pool_tag_string.as_ref().map_or(0, |s| s.len())
-            + self.miner_tag_string.as_ref().map_or(0, |s| s.len());
-
-        let coinbase_tx_suffix = serialized_coinbase[4 // tx version
-            + 2 // segwit bytes
-            + 1 // number of inputs
-            + 32 // prev OutPoint
-            + 4 // index
-            + 1 // bytes in script
-            + template.coinbase_prefix.len()
-            + pool_miner_tag_len
-            + 1 // OP_PUSHBYTES_X (for the full extranonce)
-            + full_extranonce_size..]
+        let coinbase_tx_suffix = serialized_coinbase
+            [self.extranonce_offset(&template, full_extranonce_size)? + full_extranonce_size..]
             .to_vec();
 
         Ok(coinbase_tx_suffix)
@@ -692,6 +765,117 @@ mod tests {
     use super::*;
     use bitcoin::ScriptBuf;
     use template_distribution_sv2::NewTemplate;
+
+    /// Ghost's two coinbase tags, with their `OP_PUSHBYTES` opcodes: payout identity (4+16) and
+    /// node identity (4+20).
+    const GHOST_TAGS: usize = (1 + 4 + 16) + (1 + 4 + 20);
+
+    /// The refactor must not have moved the limit. `61` was the literal this replaced, with the
+    /// arithmetic written out beside it; deriving the same number from the same terms is the proof
+    /// that nothing shifted while the duplication was removed.
+    #[test]
+    fn the_derived_budget_equals_the_literal_it_replaced() {
+        let f = JobFactory::new(true, Some("pool".into()), None);
+        assert_eq!(
+            f.pool_miner_tag_budget(32),
+            61,
+            "at the 32-byte extranonce the old literal assumed, the derived budget must match it"
+        );
+    }
+
+    /// The old literal assumed a 32-byte extranonce. The pool actually runs 20, and budgeting
+    /// against the real size rather than a worst case is what makes room for Ghost's tags at all.
+    #[test]
+    fn budgeting_against_the_real_extranonce_recovers_the_unused_reserve() {
+        let f = JobFactory::new(true, Some("pool".into()), None);
+        assert_eq!(f.pool_miner_tag_budget(20), 61 + 12);
+    }
+
+    /// The live configuration, end to end: `/GHOST PublicPool/` alongside both Ghost tags, at the
+    /// pool's real 20-byte extranonce. This is the sizing question the whole design hinged on.
+    #[test]
+    fn the_live_pool_tag_fits_beside_both_ghost_tags() {
+        let f = JobFactory::new(true, Some("GHOST PublicPool".into()), None)
+            .with_extra_script_sig(vec![0u8; GHOST_TAGS]);
+
+        let budget = f.pool_miner_tag_budget(20);
+        let needed = 3 + "GHOST PublicPool".len(); // three delimiters
+        assert!(
+            needed <= budget,
+            "/GHOST PublicPool/ needs {needed} bytes, budget is {budget}"
+        );
+        assert_eq!(budget - needed, 8, "spare headroom, for the record");
+        assert!(f.op_pushbytes_pool_miner_tag(20).is_ok());
+    }
+
+    /// And the assembled scriptSig really is inside the consensus limit — asserted on the bytes,
+    /// not on the arithmetic that was supposed to guarantee it.
+    #[test]
+    fn the_assembled_script_sig_stays_under_the_consensus_limit() {
+        let f = JobFactory::new(true, Some("GHOST PublicPool".into()), None)
+            .with_extra_script_sig(vec![0u8; GHOST_TAGS]);
+
+        // BIP34 height push for ~960k: OP_PUSHBYTES_3 plus three bytes.
+        let bip34 = vec![0x03, 0x40, 0x1f, 0x0e];
+        let before = f
+            .script_sig_before_extranonce(&bip34, 20)
+            .expect("must assemble");
+        let total = before.len() + 20;
+        assert!(
+            total <= MAX_COINBASE_SCRIPT_SIG,
+            "scriptSig would be {total} bytes, over the {MAX_COINBASE_SCRIPT_SIG}-byte limit"
+        );
+        // 4 BIP34 + 20 pool tag + 46 Ghost tags + 1 OP_PUSHBYTES + 20 extranonce.
+        // Nine bytes of headroom, pinned so anyone lengthening a tag sees what it costs.
+        assert_eq!(total, 91);
+        assert_eq!(MAX_COINBASE_SCRIPT_SIG - total, 9);
+    }
+
+    /// Extra pushes come out of the same 100 bytes, so they shrink what is left for the tags.
+    #[test]
+    fn extra_pushes_shrink_the_tag_budget() {
+        let f = JobFactory::new(true, Some("pool".into()), None)
+            .with_extra_script_sig(vec![0u8; GHOST_TAGS]);
+        assert_eq!(f.pool_miner_tag_budget(32), 61 - GHOST_TAGS);
+    }
+
+    /// **The failure this guards.** A miner tag that fitted before the extra pushes must now be
+    /// refused, not quietly emitted as an over-length scriptSig — which consensus rejects, and
+    /// which nobody would discover until the pool won a block.
+    #[test]
+    fn a_tag_that_no_longer_fits_is_refused_rather_than_overflowing() {
+        let long_tag = "x".repeat(50); // 50 + 3 delimiters = 53, inside the bare 61 budget
+        let without = JobFactory::new(true, Some(long_tag.clone()), None);
+        assert!(
+            without.op_pushbytes_pool_miner_tag(32).is_ok(),
+            "fixture must fit before the extra pushes, or the test proves nothing"
+        );
+
+        let with = JobFactory::new(true, Some(long_tag), None)
+            .with_extra_script_sig(vec![0u8; GHOST_TAGS]);
+        assert!(matches!(
+            with.op_pushbytes_pool_miner_tag(32),
+            Err(JobFactoryError::CoinbaseTxPrefixError)
+        ));
+    }
+
+    /// A tag inside the reduced budget still works — the guard must be tighter, not broken.
+    #[test]
+    fn a_tag_within_the_reduced_budget_still_fits() {
+        let f = JobFactory::new(true, Some("GHOST PublicPool".into()), None)
+            .with_extra_script_sig(vec![0u8; GHOST_TAGS]);
+        let tag = f.op_pushbytes_pool_miner_tag(20).expect("should fit");
+        assert_eq!(tag.len(), 1 + 3 + "GHOST PublicPool".len());
+    }
+
+    /// An extra push big enough to swallow the whole budget yields zero, not a wrapped enormous
+    /// allowance — and every tag is then refused rather than every tag being accepted.
+    #[test]
+    fn an_oversized_extra_push_saturates_to_no_budget() {
+        let f = JobFactory::new(true, Some("p".into()), None).with_extra_script_sig(vec![0u8; 500]);
+        assert_eq!(f.pool_miner_tag_budget(20), 0);
+        assert!(f.op_pushbytes_pool_miner_tag(20).is_err());
+    }
 
     #[test]
     fn test_new_pool_job() {

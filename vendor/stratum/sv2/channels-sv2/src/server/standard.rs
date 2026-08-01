@@ -650,14 +650,16 @@ where
             self.share_accounting.increment_blocks_found();
             self.share_accounting.mark_batch_acknowledged();
 
-            let op_pushbytes_pool_miner_tag = self
+            // Built by the SAME assembler the job was built with. Reproducing the layout here by
+            // hand is what makes a won block reconstructible-but-wrong: this path only runs on a
+            // block, so any divergence stays invisible until it costs one.
+            let mut script_sig = self
                 .job_factory
-                .op_pushbytes_pool_miner_tag()
+                .script_sig_before_extranonce(
+                    &job.get_template().coinbase_prefix.to_vec(),
+                    self.extranonce_prefix.len(),
+                )
                 .map_err(|_| ShareValidationError::InvalidCoinbase)?;
-
-            let mut script_sig = job.get_template().coinbase_prefix.to_vec();
-            script_sig.extend(op_pushbytes_pool_miner_tag);
-            script_sig.push(self.extranonce_prefix.len() as u8); // OP_PUSHBYTES_X (for the extranonce)
             script_sig.extend(job.get_extranonce_prefix());
 
             let tx_in = TxIn {
