@@ -250,7 +250,7 @@ mod tests {
         let header = header_for(&skeleton, &extranonce);
 
         assert_eq!(
-            verify_share_node_binding(&skeleton, &vec![0xAB; 20], &header, &HONEST),
+            verify_share_node_binding(&skeleton, &[0xAB; 20], &header, &HONEST),
             Err(BindingError::MerkleRootMismatch)
         );
     }
