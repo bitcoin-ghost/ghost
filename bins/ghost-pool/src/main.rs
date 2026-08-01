@@ -7071,7 +7071,15 @@ async fn main() -> Result<()> {
         };
         // GHOST-09: sign as the receiving node so peers can authenticate the
         // node-reward credit and reject relayed/forged `received_by`.
-        proof.sign(identity_for_shares.as_ref());
+        //
+        // At and above the bind gate the signature also covers `payout_address`, so a relay cannot
+        // redirect this miner's earnings while keeping the signature valid. Signer and verifier use
+        // the same predicate, so both switch encoding at the same block.
+        if ghost_pool::binds_payout_address(rm_for_shares.current_height()) {
+            proof.sign_bound(identity_for_shares.as_ref());
+        } else {
+            proof.sign(identity_for_shares.as_ref());
+        }
 
         // GHOST-03 (schema v41): store the signed proof with the share so this node can serve a
         // backfill of it to any peer that dropped the broadcast, at any age.

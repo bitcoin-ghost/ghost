@@ -301,9 +301,15 @@ fn canonical_json_f64(x: f64) -> f64 {
 }
 
 impl ShareProof {
-    /// GHOST-09: canonical bytes the `received_by` node signs. Binds every
-    /// credit-relevant field, so a relay that mutates `received_by` (or the
-    /// share being credited) invalidates the signature.
+    /// GHOST-09 v1: canonical bytes the `received_by` node signs.
+    ///
+    /// Binds the fields that identify the WORK — a relay that mutates `received_by`, the share
+    /// hash, the work or the header invalidates the signature.
+    ///
+    /// ⚠ It does NOT bind `payout_address`, which since `PAYOUT_ADDRESS_GROUPING_HEIGHT` is the
+    /// field payouts are grouped by. This comment previously claimed to bind "every credit-relevant
+    /// field"; that became false when grouping moved from miner_id to the address, and the gap is
+    /// exploitable — see [`Self::signing_bytes_bound`], which closes it behind a height gate.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut m = Vec::with_capacity(120);
         m.extend_from_slice(&self.round_id.to_le_bytes());
@@ -342,6 +348,48 @@ impl ShareProof {
     pub fn signed(mut self, identity: &crate::identity::NodeIdentity) -> Self {
         self.sign(identity);
         self
+    }
+
+    /// GHOST-09 v2: [`Self::signing_bytes`] extended to bind `payout_address`.
+    ///
+    /// The v1 encoding covers everything that identifies the *work* but not the field that decides
+    /// who gets *paid* for it. Since payouts are grouped by payout address, and the address is
+    /// adopted first-writer-wins from whichever signed proof arrives first, an unbound address lets
+    /// any mesh peer rewrite a relayed proof's destination without breaking the signature.
+    ///
+    /// Length-prefixed rather than appended raw: the address is variable-width, so without a length
+    /// two different (address, next-field) pairs could serialize identically. `header` above is
+    /// fixed at 80 bytes and does not have that problem.
+    ///
+    /// When `payout_address` is `None` this is byte-identical to v1, which keeps a proof that never
+    /// carried an address verifying the same way under either encoding.
+    pub fn signing_bytes_bound(&self) -> Vec<u8> {
+        let mut m = self.signing_bytes();
+        if let Some(ref addr) = self.payout_address {
+            m.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+            m.extend_from_slice(addr.as_bytes());
+        }
+        m
+    }
+
+    /// GHOST-09 v2: sign this proof as the receiving node, binding the payout address.
+    pub fn sign_bound(&mut self, identity: &crate::identity::NodeIdentity) {
+        self.signature = Some(identity.sign(&self.signing_bytes_bound()).to_vec());
+    }
+
+    /// GHOST-09 v2: true iff the signature covers this proof *including* its payout address.
+    ///
+    /// Stripping the address, adding one, or swapping it all change the signed bytes, so all three
+    /// fail here. Unsigned or malformed returns false — secure by default, as v1.
+    pub fn has_valid_bound_signature(&self) -> bool {
+        let Some(ref sig) = self.signature else {
+            return false;
+        };
+        let Ok(sig) = <[u8; 64]>::try_from(sig.as_slice()) else {
+            return false;
+        };
+        crate::identity::verify_signature(&self.received_by, &self.signing_bytes_bound(), &sig)
+            .unwrap_or(false)
     }
 
     /// GHOST-09: true iff the proof carries a valid signature by `received_by`.
@@ -944,6 +992,94 @@ mod tests {
         assert!(
             !swapped.has_valid_received_by_signature(),
             "swapping the signed header must invalidate the signature"
+        );
+    }
+
+    /// The hole this closes: today a relayed proof's payout address can be rewritten and the
+    /// signature still verifies, because v1 does not cover the field payouts are grouped by.
+    ///
+    /// Asserts both directions — v1 accepts the tampered proof (documenting the exploit), v2
+    /// rejects it — so if anyone ever "simplifies" the bound encoding back to v1 the test says why
+    /// that is not a simplification.
+    #[test]
+    fn payout_address_is_bound_only_under_the_v2_signature() {
+        let id = crate::identity::NodeIdentity::generate();
+        let honest = ShareProof {
+            round_id: 7,
+            miner_id: [9u8; 32],
+            difficulty: 1.0,
+            work: 2.5,
+            share_hash: [4u8; 32],
+            timestamp: 1_700_000_000,
+            received_by: id.node_id(),
+            template_id: Some([5u8; 32]),
+            payout_address: Some("bc1qhonestminer".to_string()),
+            header: Some(vec![0xab; 80]),
+            signature: None,
+        };
+
+        // Signed the old way, an attacker can redirect the payout and the signature still passes.
+        let mut v1 = honest.clone();
+        v1.sign(&id);
+        assert!(v1.has_valid_received_by_signature());
+        let mut redirected = v1.clone();
+        redirected.payout_address = Some("bc1qattacker".to_string());
+        assert!(
+            redirected.has_valid_received_by_signature(),
+            "v1 does not bind the address — this is the vulnerability, asserted so it is not \
+             mistaken for safe"
+        );
+
+        // Signed the new way, the same tamper fails.
+        let mut v2 = honest.clone();
+        v2.sign_bound(&id);
+        assert!(v2.has_valid_bound_signature(), "valid as signed");
+        let mut redirected2 = v2.clone();
+        redirected2.payout_address = Some("bc1qattacker".to_string());
+        assert!(
+            !redirected2.has_valid_bound_signature(),
+            "rewriting the payout address must invalidate a bound signature"
+        );
+
+        // Stripping the address entirely, and adding one where there was none, both fail too.
+        let mut stripped = v2.clone();
+        stripped.payout_address = None;
+        assert!(!stripped.has_valid_bound_signature(), "stripping must fail");
+
+        let mut addrless = honest.clone();
+        addrless.payout_address = None;
+        addrless.sign_bound(&id);
+        let mut added = addrless.clone();
+        added.payout_address = Some("bc1qattacker".to_string());
+        assert!(
+            !added.has_valid_bound_signature(),
+            "adding an address to a proof signed without one must fail"
+        );
+    }
+
+    /// Mixed-fleet safety: with no payout address the two encodings are byte-identical, so a proof
+    /// that predates the field verifies the same either side of the gate.
+    #[test]
+    fn bound_encoding_matches_v1_when_there_is_no_address() {
+        let id = crate::identity::NodeIdentity::generate();
+        let mut p = ShareProof {
+            round_id: 1,
+            miner_id: [1u8; 32],
+            difficulty: 1.0,
+            work: 1.0,
+            share_hash: [2u8; 32],
+            timestamp: 100,
+            received_by: id.node_id(),
+            template_id: None,
+            payout_address: None,
+            header: None,
+            signature: None,
+        };
+        assert_eq!(p.signing_bytes(), p.signing_bytes_bound());
+        p.sign(&id);
+        assert!(
+            p.has_valid_bound_signature(),
+            "a v1 signature over an address-less proof must satisfy the v2 check"
         );
     }
 

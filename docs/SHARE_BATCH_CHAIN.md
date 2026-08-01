@@ -103,6 +103,19 @@ ledger only grows.
 - [ ] **BLOCKED on D12** — red-before test: a non-submitting node settles (fails on main today)
 
 ### WP-1 — attribution bindings (one shared gate)
+
+- [x] **WP-1a: `payout_address` bound into the GHOST-09 signature.** `signing_bytes_bound`
+      length-prefixes the address onto the v1 bytes; `sign_bound` / `has_valid_bound_signature` are
+      the v2 pair. Signer (`main.rs`) and all three verifiers (`share_handler`, both convergence
+      paths) choose the encoding through one predicate, `binds_payout_address(height)`, so they
+      cannot disagree about which form is in force. Address-less proofs encode identically under
+      both, which is what makes a mixed fleet safe. Gate `SHARE_ADDR_BIND_HEIGHT` is present but
+      **UNARMED (`u64::MAX`)** — arming is a separate operator release, and it should carry WP-1b
+      too so there is one signature-format transition rather than two.
+      Tests assert both directions: v1 *accepts* a redirected payout address (the vulnerability,
+      asserted so it cannot be mistaken for safe) and v2 rejects it, plus strip/add/swap cases.
+- [ ] WP-1b: receiver binding via per-job coinbase skeletons (see D12 — specify the scriptsig
+      budget jointly with the proposal tag)
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
 

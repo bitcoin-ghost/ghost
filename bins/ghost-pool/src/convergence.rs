@@ -238,7 +238,7 @@ impl ConvergenceHandler {
                 bad_json += 1;
                 continue;
             };
-            if !proof.has_valid_received_by_signature() {
+            if !self.signature_is_valid(&proof) {
                 bad_sig += 1;
                 continue; // never credit an unsigned or forged backfill
             }
@@ -385,12 +385,25 @@ impl ConvergenceHandler {
 
     /// Apply a convergence RESPONSE. Each backfilled proof is GHOST-09-verified
     /// (we bypass the normal share-receive gate here, so we must re-check the
+    /// GHOST-09: does this backfilled proof carry a signature we accept at the current height?
+    ///
+    /// At and above the bind gate the signature must also cover `payout_address`, so a peer cannot
+    /// serve a backfill whose payout destination it rewrote. Both convergence paths go through here
+    /// rather than calling the verifier directly, so neither can be left on the old encoding.
+    fn signature_is_valid(&self, proof: &ghost_common::types::ShareProof) -> bool {
+        if crate::binds_payout_address(self.round_manager.current_height()) {
+            proof.has_valid_bound_signature()
+        } else {
+            proof.has_valid_received_by_signature()
+        }
+    }
+
     /// signature) and then fed through the standard validation+dedup path.
     /// Returns the number of shares newly accepted.
     pub fn apply_response(&self, resp: &ShareConvergenceResponse) -> usize {
         let mut applied = 0;
         for proof in &resp.missing_shares {
-            if !proof.has_valid_received_by_signature() {
+            if !self.signature_is_valid(proof) {
                 continue; // GHOST-09: never credit an unsigned/forged backfill
             }
 

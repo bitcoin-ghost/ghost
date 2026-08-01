@@ -201,6 +201,27 @@ pub const COINBASE_FEE_SPLIT_HEIGHT: u64 = 959_290;
 /// BEFORE the tip reaches this height (canary roll finishes ~959_022, ~8-block margin).
 pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 
+/// Bind the miner's payout address into the GHOST-09 share signature.
+///
+/// `ShareProof::signing_bytes` covers `round_id`, `miner_id`, `work`, `share_hash`, `timestamp`,
+/// `received_by`, `template_id` and `header` — but NOT `payout_address`, even though since
+/// [`PAYOUT_ADDRESS_GROUPING_HEIGHT`] payouts are grouped by exactly that field. Its own doc claims
+/// to bind "every credit-relevant field", which stopped being true when grouping moved to the
+/// address. A mesh peer can therefore rewrite the address on a relayed proof, keep the signature
+/// valid, and win the first-writer-wins adoption race for a miner_id nobody has seen yet.
+///
+/// At and above this height, signers and verifiers both use the bound encoding, so a rewritten
+/// address invalidates the signature. Below it the encoding is byte-identical to today's, which is
+/// what makes a mixed-version fleet safe: nothing changes until every node can produce and check
+/// the new form.
+///
+/// UNARMED (`u64::MAX`). Arming is a deliberate, separate release: the whole fleet must be on a
+/// binary that understands the bound encoding BEFORE the tip reaches the chosen height, exactly as
+/// [`SHARE_POW_VERIFY_HEIGHT`] was rolled (pool_sv2 first, then ghost-pool, then arm). Set the real
+/// height at that release; the same gate also carries the `received_by` PoW binding, so both
+/// signature-format changes land in one transition rather than two.
+pub const SHARE_ADDR_BIND_HEIGHT: u64 = u64::MAX;
+
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
 /// when they are members of the consensus voter set AND come from diverse IP subnets, and it
@@ -271,6 +292,7 @@ mod gates {
     pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
+    pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -315,12 +337,18 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         ACTIVE_VOTER_SET_HEIGHT,
     );
+    let share_addr_bind = gates::from_env(
+        "GHOST_SHARE_ADDR_BIND_HEIGHT",
+        network,
+        SHARE_ADDR_BIND_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
     let _ = gates::CHALLENGER_ASSIGNMENT.set(challenger_assignment);
     let _ = gates::SHARE_POW_VERIFY.set(share_pow_verify);
     let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
+    let _ = gates::SHARE_ADDR_BIND.set(share_addr_bind);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != COINBASE_FEE_SPLIT_HEIGHT
@@ -328,6 +356,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         || challenger_assignment != CHALLENGER_ASSIGNMENT_HEIGHT
         || share_pow_verify != SHARE_POW_VERIFY_HEIGHT
         || active_voter_set != ACTIVE_VOTER_SET_HEIGHT
+        || share_addr_bind != SHARE_ADDR_BIND_HEIGHT
     {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
@@ -336,6 +365,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
             challenger_assignment_height = challenger_assignment,
             share_pow_verify_height = share_pow_verify,
             active_voter_set_height = active_voter_set,
+            share_addr_bind_height = share_addr_bind,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
         );
@@ -370,6 +400,19 @@ pub fn challenger_assignment_height() -> u64 {
 /// (Surface B). Accessor form so the gate is env-overridable off-mainnet like the rest.
 pub fn share_pow_verify_height() -> u64 {
     *gates::SHARE_POW_VERIFY.get_or_init(|| SHARE_POW_VERIFY_HEIGHT)
+}
+
+/// Height at and above which the GHOST-09 share signature also binds `payout_address`.
+pub fn share_addr_bind_height() -> u64 {
+    *gates::SHARE_ADDR_BIND.get_or_init(|| SHARE_ADDR_BIND_HEIGHT)
+}
+
+/// Whether a share seen at `height` must carry the address-bound signature.
+///
+/// One predicate, used by the signer and by every verifier, so the two cannot disagree about
+/// which encoding is in force at a given block.
+pub fn binds_payout_address(height: u64) -> bool {
+    height >= share_addr_bind_height()
 }
 
 /// The height at which BFT payout voting draws its eligible-voter set from the qualified active
