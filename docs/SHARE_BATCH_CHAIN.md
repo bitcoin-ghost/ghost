@@ -640,6 +640,26 @@ to delay genesis.
 ⚠ Tooling note: never read a live pool DB with `immutable=1` — it ignores the WAL and reports
 `database disk image is malformed`. vm5 looked corrupt for exactly that reason and is healthy.
 
+## Verification — whole workspace, 2026-08-01
+
+`cargo build --workspace` and `cargo test --workspace --lib`, with CI's own exclusions
+(`wraith-wallet-gui`, `ghost-tap-desktop` — Tauri crates that need a pre-built binary resource and
+are excluded from the Rust jobs for that reason).
+
+| | |
+|---|---|
+| build | clean |
+| tests | **2,666 passed across 20 crates** |
+| clippy on every touched crate | 0 findings |
+
+One failure, and it is **not** from this work:
+`integration_tests_sv2::template_provider::tests::test_create_mempool_transaction`. It starts a real
+bitcoin node plus an external `sv2-tp` binary, and fails at `fund_wallet()` — which is
+`corepc_node` RPC (`new_address` then `generate_to_address(101, …)`) against a bundled bitcoind.
+`bitcoind` is not on PATH on this box. Traced by code path rather than assumed: nothing in that
+test reaches any crate this branch changes, and the test is already marked heavy/flaky in its own
+`cfg_attr`.
+
 ## Deploy package — the sequence when we go
 
 Four things are authorised and belong in **one** package rather than three separate touches at
