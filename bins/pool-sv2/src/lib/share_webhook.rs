@@ -188,6 +188,12 @@ pub struct ShareWebhookWorker {
     pool_id: u16,
     batch_seq: AtomicU64,
     client: reqwest::Client,
+    /// The sender's "already sent" memory, shared so a failed delivery can be un-remembered.
+    ///
+    /// Without this the dedup is a one-way door: a skeleton marked sent and then lost in a failed
+    /// POST is never offered again, and every share of that job names a skeleton the other side
+    /// will never hold. Nothing would repair it, because nothing would know.
+    recent_skeletons: Arc<Mutex<(HashSet<String>, VecDeque<String>)>>,
 }
 
 impl ShareWebhookWorker {
@@ -200,17 +206,20 @@ impl ShareWebhookWorker {
             .build()
             .expect("Failed to create HTTP client");
 
+        let recent_skeletons = Arc::new(Mutex::new((HashSet::new(), VecDeque::new())));
+
         let worker = ShareWebhookWorker {
             receiver,
             config,
             pool_id,
             batch_seq: AtomicU64::new(0),
             client,
+            recent_skeletons: Arc::clone(&recent_skeletons),
         };
 
         let sender = ShareWebhookSender {
             sender,
-            recent_skeletons: Arc::new(Mutex::new((HashSet::new(), VecDeque::new()))),
+            recent_skeletons,
         };
 
         (sender, worker)
@@ -293,6 +302,25 @@ impl ShareWebhookWorker {
         }
     }
 
+    /// Un-remember skeletons whose delivery failed, so the next share re-announces them.
+    ///
+    /// This is what makes the gap self-healing instead of permanent. `announce` runs for **every**
+    /// share, and is suppressed only by the dedup memory — so clearing an id is enough: the very
+    /// next share of that job offers the skeleton again, with no retry queue and nothing to track.
+    fn forget_skeletons(&self, skeletons: &[SkeletonData]) {
+        if skeletons.is_empty() {
+            return;
+        }
+        let mut seen = match self.recent_skeletons.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        for s in skeletons {
+            seen.0.remove(&s.skeleton_id);
+            seen.1.retain(|id| id != &s.skeleton_id);
+        }
+    }
+
     /// Send a batch of shares to the webhook endpoint
     async fn send_batch(&self, batch: &mut Vec<ShareData>, skeletons: &mut Vec<SkeletonData>) {
         if batch.is_empty() {
@@ -348,8 +376,16 @@ impl ShareWebhookWorker {
             if attempts > max_retries {
                 error!(
                     batch_seq,
-                    share_count, max_retries, "Share batch dropped after max retries"
+                    share_count,
+                    skeletons = payload.skeletons.len(),
+                    max_retries,
+                    "Share batch dropped after max retries"
                 );
+                // The shares are gone, but the skeletons must not be treated as delivered: the
+                // shares that come next still name them. Forgetting them here is what lets the
+                // next share re-announce, and is the difference between a gap that closes in one
+                // batch and one that lasts the rest of the job.
+                self.forget_skeletons(&payload.skeletons);
                 return;
             }
 
@@ -371,6 +407,96 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_pair() -> (ShareWebhookSender, ShareWebhookWorker) {
+        ShareWebhookWorker::new(
+            crate::config::ShareWebhookConfig {
+                // Port 0 never accepts, so every send fails — which is the case under test.
+                url: "http://127.0.0.1:1/never".to_string(),
+                batch_size: 1,
+                batch_timeout_ms: 1000,
+                max_retries: 0,
+            },
+            1,
+        )
+    }
+
+    fn a_skeleton(id: &str) -> SkeletonData {
+        SkeletonData {
+            skeleton_id: id.to_string(),
+            coinbase_prefix: "00".to_string(),
+            coinbase_suffix: "01".to_string(),
+            merkle_path: vec![],
+        }
+    }
+
+    /// A skeleton travels once per job, not once per share — otherwise ~29 KB rides along with
+    /// every share and the whole point of content-addressing is lost.
+    #[test]
+    fn a_skeleton_is_offered_only_once_while_delivery_is_working() {
+        let (sender, mut worker) = a_pair();
+        sender.send_skeleton(a_skeleton("aa"));
+        sender.send_skeleton(a_skeleton("aa"));
+        sender.send_skeleton(a_skeleton("bb"));
+
+        let mut ids = Vec::new();
+        while let Ok(item) = worker.receiver.try_recv() {
+            if let WebhookItem::Skeleton(s) = item {
+                ids.push(s.skeleton_id);
+            }
+        }
+        assert_eq!(ids, vec!["aa".to_string(), "bb".to_string()]);
+    }
+
+    /// **The self-healing property.**
+    ///
+    /// A skeleton marked delivered and then lost in a failed POST would never be offered again,
+    /// and every subsequent share of that job would name a skeleton the other side will never
+    /// hold — permanently, with nothing able to notice. Forgetting it on failure means the very
+    /// next share re-announces it, because `announce` runs per share and is suppressed only by
+    /// this memory.
+    #[tokio::test]
+    async fn a_failed_delivery_lets_the_next_share_re_announce() {
+        let (sender, worker) = a_pair();
+
+        sender.send_skeleton(a_skeleton("aa"));
+        // Suppressed: as far as the sender knows, "aa" is on its way.
+        sender.send_skeleton(a_skeleton("aa"));
+
+        // Delivery fails and the batch is dropped.
+        let mut batch = vec![ShareData {
+            timestamp_ms: 0,
+            share_hash: "h".to_string(),
+            share_work: 1.0,
+            channel_id: 1,
+            sequence_number: 1,
+            job_id: 1,
+            downstream_id: 1,
+            is_block: false,
+            user_identity: "u".to_string(),
+            header: None,
+            extranonce: None,
+            skeleton_id: Some("aa".to_string()),
+        }];
+        let mut skeletons = vec![a_skeleton("aa")];
+        worker.send_batch(&mut batch, &mut skeletons).await;
+
+        // The next share offers it again, rather than referencing something nobody holds.
+        sender.send_skeleton(a_skeleton("aa"));
+        let mut reannounced = false;
+        let mut rx = worker.receiver;
+        while let Ok(item) = rx.try_recv() {
+            if let WebhookItem::Skeleton(s) = item {
+                if s.skeleton_id == "aa" {
+                    reannounced = true;
+                }
+            }
+        }
+        assert!(
+            reannounced,
+            "a skeleton lost in a failed delivery must be offered again, or the gap is permanent"
+        );
+    }
 
     #[test]
     fn test_share_data_serialization() {

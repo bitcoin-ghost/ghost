@@ -261,10 +261,21 @@ actually 50. The total is now measured on the assembled bytes inside
   - [x] share webhook carries `header80` (already present) and now `extranonce`
   - [ ] ghost-pool side: consume `skeletons`/`skeleton_id`/`extranonce`, store, and call
         `verify_share_node_binding` — still gated, still dark
-  - [ ] OPEN: what happens to a share whose skeleton is unknown (e.g. ghost-pool restarted
-        mid-job). Bounded to ~one job of shares. Recommend recording it as *binding unverified*
-        rather than rejecting — under the gate it is moot, but once armed, rejecting honest shares
-        after a restart would be the worse failure. **Operator decision.**
+  - [x] **the unknown-skeleton gap now closes by itself.** Operator asked the right question of
+        the first design — "binding unverified" was a *permanent* state, which is not a trade-off,
+        it is a defect.
+        The cause was a one-way dedup: a skeleton was marked sent when it was *enqueued*, so one
+        lost in a failed POST was never offered again, and every later share of that job named
+        something the other side would never hold. Nothing could notice, because nothing knew.
+        Fixed by only remembering a skeleton as delivered once the batch actually succeeds, and
+        forgetting it if the batch is dropped. `announce` runs per share and is suppressed *only*
+        by that memory, so clearing an id is sufficient — the very next share re-announces, with no
+        retry queue and nothing to track. Tested on the property, not the plumbing.
+  - [ ] persist the skeleton store, so a ghost-pool restart does not start empty (the in-flight
+        case is already covered above; this covers skeletons delivered before the restart)
+  - [ ] re-verify pass: shares recorded unverified should be re-checked when their skeleton
+        arrives — the same shape as `deferred_settlements`, and the piece that makes the *already
+        recorded* shares heal rather than only future ones
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
 
