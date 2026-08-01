@@ -97,10 +97,10 @@ ledger only grows.
 - [x] populate `outputs_hash` on `store_proposal`, computed with the same treasury-address
       selection the commitment uses (that selection was duplicated at three sites and is now one
       helper — picking the other branch silently changes the hash)
-- [ ] **BLOCKED on D12** — `SettlementObserver`: on_block_connected / on_block_disconnected / rescan
-- [ ] **BLOCKED on D12** — wire to a second `BlockEvent` receiver alongside `ReorgHandler`
-- [ ] **BLOCKED on D12** — `OBSERVED_SETTLEMENT_HEIGHT` gate, dry-run below it
-- [ ] **BLOCKED on D12** — red-before test: a non-submitting node settles (fails on main today)
+- [ ] `SettlementObserver`: on_block_connected / on_block_disconnected / rescan
+- [ ] wire to a second `BlockEvent` receiver alongside `ReorgHandler`
+- [ ] `OBSERVED_SETTLEMENT_HEIGHT` gate, dry-run below it
+- [ ] red-before test: a non-submitting node settles (fails on main today)
 
 ### WP-1 — attribution bindings (one shared gate)
 
@@ -114,8 +114,8 @@ ledger only grows.
       too so there is one signature-format transition rather than two.
       Tests assert both directions: v1 *accepts* a redirected payout address (the vulnerability,
       asserted so it cannot be mistaken for safe) and v2 rejects it, plus strip/add/swap cases.
-- [ ] WP-1b: receiver binding via per-job coinbase skeletons (see D12 — specify the scriptsig
-      budget jointly with the proposal tag)
+- [ ] WP-1b: receiver binding via per-job coinbase skeletons — UNBLOCKED by D12; size the node
+      tag jointly with the payout-identity tag against the ~11-byte margin
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
 
@@ -150,7 +150,7 @@ bound. Pure library code, exhaustively tested for determinism before any wiring.
       batch is not marked truncated, an impossible budget still emits one share rather than wedging
       the chain forever, packing is arrival-order-independent, repeated packing drains and
       terminates, and the estimate is checked against the real encoded length.
-- [ ] `ShareBatch` type + `batch_hash` — **blocked on D12**. The struct's settlement field depends on
+- [ ] `ShareBatch` type + `batch_hash` — UNBLOCKED by D12. The struct's settlement field depends on
       how a won block is identified: if the coinbase carries the proposal hash (D12 option 1) the
       batch need only carry `block_hash`, whereas the pair form is needed otherwise. Defining the
       struct now would bake in a guess about a decision that is still open.
@@ -182,7 +182,26 @@ Tip change reads the `ArmedPayout`; proposal binding moves from `cutoff_ts` equa
 Sweep, tolerance, tip−6 loop. Only after the cutover has soaked. Keep the checkpoint tables (genesis
 provenance) and the treasury-only fallback (cold start / lost quorum floor) forever.
 
-## ⚠ BLOCKER found 2026-08-01: outputs-hash matching cannot identify a won block
+## ✅ D12 DECIDED 2026-08-01: the coinbase carries a payout-identity tag
+
+Operator agreed option (1). A won block **declares** what it pays, so settlement is a lookup rather
+than an inference, and it is exact regardless of per-node fee drift.
+
+Specify it as a **payout identity**, not a proposal hash. Same 16-byte field, meaning gated by
+height: the proposal hash before the SBC cutover, the batch identity after. One tag format, one
+scriptsig budget, and the coinbase format never changes twice — which matters because it is the one
+field where every node must switch at the same block.
+
+Space was the objection and it is resolved: the coinbase tag was trimmed to `GHOST <mode>`
+(`crates/ghost-common/src/config.rs`), taking the measured scriptsig from 53 to ~45 bytes and the
+margin from ~3 to ~11 with both tags present.
+
+Unblocks: WP-S (all items), WP-1b, and `ShareBatch` in WP-2.
+
+Remaining sizing work before code: confirm the miner-supplied portion of `/pool_tag/miner_tag/` does
+not vary in length, or the margin is not fixed either.
+
+## ⚠ ~~BLOCKER~~ RESOLVED — the analysis that produced D12
 
 **Settlement's match key does not work.** WP-S assumed a node can recognise its own won block by
 hashing the observed coinbase outputs and finding the proposal that committed to that hash. It
