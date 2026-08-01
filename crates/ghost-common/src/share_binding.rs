@@ -43,6 +43,32 @@ pub struct CoinbaseSkeleton {
     pub merkle_path: Vec<[u8; 32]>,
 }
 
+impl CoinbaseSkeleton {
+    /// Content address: `sha256("CoinbaseSkeleton/v1" ‖ each field, length-prefixed)`.
+    ///
+    /// Lives here, beside the type, because **two programs must agree on it**: `pool_sv2` stamps
+    /// the id onto every share it reports, and `ghost-pool` looks the skeleton up by that id. Two
+    /// implementations of a content address is two chances for a share to reference a skeleton
+    /// nobody can find.
+    ///
+    /// Content-addressed rather than keyed by job id so that jobs sharing an invariant part share
+    /// one stored copy — which is what makes a ~29 KB outputs blob affordable — and so a skeleton
+    /// received from elsewhere is verified by rehashing rather than trusted.
+    pub fn id(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"CoinbaseSkeleton/v1");
+        h.update((self.coinbase_prefix.len() as u32).to_le_bytes());
+        h.update(&self.coinbase_prefix);
+        h.update((self.coinbase_suffix.len() as u32).to_le_bytes());
+        h.update(&self.coinbase_suffix);
+        h.update((self.merkle_path.len() as u32).to_le_bytes());
+        for node in &self.merkle_path {
+            h.update(node);
+        }
+        h.finalize().into()
+    }
+}
+
 /// Why a share failed to prove it was mined to the node claiming it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingError {

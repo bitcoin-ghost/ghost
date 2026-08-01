@@ -241,10 +241,30 @@ actually 50. The total is now measured on the assembled bytes inside
         Two tests: the skeleton reassembles byte-for-byte with the cut landing exactly on the
         extranonce (an off-by-one here rejects *every* honest share), and the skeleton is stable
         across extranonces, which is what makes it worth storing per job rather than per share.
-  - [ ] `pool_sv2`: transport — publish the skeleton to ghost-pool (push-with-dedup on the existing
-        share webhook, or pull-on-unknown-id; leaning pull, since a skeleton is only needed when a
-        share actually references one)
-  - [ ] share webhook carries `extranonce` + `header80`
+  - [x] **transport — push-with-dedup on the existing share webhook.** Chose push over pull:
+        `pool_sv2` has no HTTP listener, so pull would mean a new endpoint and a new auth surface,
+        while push reuses the retry and back-pressure the share path already has. A skeleton that
+        arrived by another route while the share path was failing would name shares that never
+        turned up.
+        - `ShareData` gains `extranonce` and `skeleton_id`; `ShareBatch` gains `skeletons`.
+        - Deduplicated in the sender (bounded, 64 recent ids), not at the call site: every channel
+          referencing a job would otherwise send the same skeleton, and nothing upstream knows what
+          the others already did. A job lasts ~30 s against ~2 s batches, so roughly one batch in
+          fifteen carries one.
+        - Skeletons are **held for the next batch** rather than sent immediately, so one never
+          arrives after the shares naming it.
+        - All four report sites wired — standard and extended, valid-share and block-found. The
+          extended path uses the **non-BIP141** serialization: the txid that folds into the merkle
+          root excludes witness data, so the with-BIP141 variant would never reproduce the root.
+        - A merkle node of the wrong width yields *no* binding rather than a broken one — an absent
+          claim beats one guaranteed to fail.
+  - [x] share webhook carries `header80` (already present) and now `extranonce`
+  - [ ] ghost-pool side: consume `skeletons`/`skeleton_id`/`extranonce`, store, and call
+        `verify_share_node_binding` — still gated, still dark
+  - [ ] OPEN: what happens to a share whose skeleton is unknown (e.g. ghost-pool restarted
+        mid-job). Bounded to ~one job of shares. Recommend recording it as *binding unverified*
+        rather than rejecting — under the gate it is moot, but once armed, rejecting honest shares
+        after a restart would be the worse failure. **Operator decision.**
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
 

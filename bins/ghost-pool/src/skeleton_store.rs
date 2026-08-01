@@ -24,7 +24,6 @@
 use std::collections::HashMap;
 
 use ghost_common::share_binding::CoinbaseSkeleton;
-use sha2::{Digest, Sha256};
 
 /// Blocks of chain a skeleton must survive regardless of batch progress.
 ///
@@ -42,23 +41,13 @@ pub const RETENTION_FLOOR_BLOCKS: u64 = 100;
 /// that must not be discoverable only as a mystery later.
 pub const RETENTION_CEILING_BLOCKS: u64 = RETENTION_FLOOR_BLOCKS * 10;
 
-/// Content address of a skeleton: `sha256(prefix ‖ suffix ‖ merkle_path)`.
+/// Content address of a skeleton.
 ///
-/// Content-addressed rather than keyed by job id so that two jobs sharing an invariant part share
-/// one stored copy — which is what makes the outputs blob affordable — and so that a skeleton
-/// handed over by a peer is verified by rehashing rather than trusted.
+/// Delegates to [`CoinbaseSkeleton::id`] — `pool_sv2` stamps the same id onto every share, and a
+/// second implementation here would be a second chance for a share to name a skeleton this node
+/// cannot find.
 pub fn skeleton_id(skeleton: &CoinbaseSkeleton) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b"CoinbaseSkeleton/v1");
-    h.update((skeleton.coinbase_prefix.len() as u32).to_le_bytes());
-    h.update(&skeleton.coinbase_prefix);
-    h.update((skeleton.coinbase_suffix.len() as u32).to_le_bytes());
-    h.update(&skeleton.coinbase_suffix);
-    h.update((skeleton.merkle_path.len() as u32).to_le_bytes());
-    for node in &skeleton.merkle_path {
-        h.update(node);
-    }
-    h.finalize().into()
+    skeleton.id()
 }
 
 /// Why a skeleton was let go.

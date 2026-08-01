@@ -633,6 +633,20 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     Ok(ShareValidationResult::Valid(share_hash, header80)) => {
                         let share_work = standard_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
+                            // Bind the share to the coinbase it was mined against, so the node
+                            // that received it can be proved rather than asserted.
+                            let (extranonce, skeleton_id) = standard_channel
+                                .coinbase_skeleton()
+                                .map(|(prefix, suffix, path)| {
+                                    crate::binding::announce(
+                                        sender,
+                                        prefix,
+                                        suffix,
+                                        path,
+                                        standard_channel.get_extranonce_prefix(),
+                                    )
+                                })
+                                .unwrap_or((None, None));
                             sender.send(ShareData {
                                 timestamp_ms: now_ms(),
                                 share_hash: share_hash.to_string(),
@@ -644,6 +658,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 is_block: false,
                                 user_identity: standard_channel.get_user_identity().to_string(),
                                 header: Some(hex::encode(&header80)),
+                                extranonce,
+                                skeleton_id,
                             });
                         }
                         let share_accounting = standard_channel.get_share_accounting();
@@ -668,6 +684,20 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         info!("SubmitSharesStandard: 💰 Block Found!!! 💰{share_hash}");
                         let share_work = standard_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
+                            // Bind the share to the coinbase it was mined against, so the node
+                            // that received it can be proved rather than asserted.
+                            let (extranonce, skeleton_id) = standard_channel
+                                .coinbase_skeleton()
+                                .map(|(prefix, suffix, path)| {
+                                    crate::binding::announce(
+                                        sender,
+                                        prefix,
+                                        suffix,
+                                        path,
+                                        standard_channel.get_extranonce_prefix(),
+                                    )
+                                })
+                                .unwrap_or((None, None));
                             sender.send(ShareData {
                                 timestamp_ms: now_ms(),
                                 share_hash: share_hash.to_string(),
@@ -679,6 +709,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 is_block: true,
                                 user_identity: standard_channel.get_user_identity().to_string(),
                                 header: Some(hex::encode(&header80)),
+                                extranonce,
+                                skeleton_id,
                             });
                         }
                         // if we have a template id (i.e.: this was not a custom job)
@@ -886,6 +918,30 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     Ok(ShareValidationResult::Valid(share_hash, header80)) => {
                         let share_work = extended_channel.get_target().difficulty_float();
                         if let (Some(ref sender), true) = (&self.share_webhook_sender, attributable) {
+                            // The full extranonce on an extended channel is the channel's
+                            // prefix followed by the miner's own bytes; the coinbase commits to
+                            // both, so the binding needs both.
+                            let (extranonce, skeleton_id) = extended_channel
+                                .get_active_job()
+                                .map(|job| {
+                                    let mut full = job.get_extranonce_prefix().clone();
+                                    full.extend_from_slice(msg.extranonce.inner_as_ref());
+                                    crate::binding::announce(
+                                        sender,
+                                        // The NON-witness serialization: the txid that folds into
+                                        // the merkle root is computed without BIP141 data, so the
+                                        // with-BIP141 variant would never reproduce the root.
+                                        job.get_coinbase_tx_prefix_without_bip141(),
+                                        job.get_coinbase_tx_suffix_without_bip141(),
+                                        job.get_merkle_path()
+                                            .inner_as_ref()
+                                            .iter()
+                                            .map(|n| n.to_vec())
+                                            .collect(),
+                                        &full,
+                                    )
+                                })
+                                .unwrap_or((None, None));
                             sender.send(ShareData {
                                 timestamp_ms: now_ms(),
                                 share_hash: share_hash.to_string(),
@@ -900,6 +956,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     tlv_worker,
                                 ),
                                 header: Some(hex::encode(&header80)),
+                                extranonce,
+                                skeleton_id,
                             });
                         }
                         let share_accounting = extended_channel.get_share_accounting();
@@ -934,6 +992,30 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         }
                         let share_work = extended_channel.get_target().difficulty_float();
                         if let Some(ref sender) = self.share_webhook_sender {
+                            // The full extranonce on an extended channel is the channel's
+                            // prefix followed by the miner's own bytes; the coinbase commits to
+                            // both, so the binding needs both.
+                            let (extranonce, skeleton_id) = extended_channel
+                                .get_active_job()
+                                .map(|job| {
+                                    let mut full = job.get_extranonce_prefix().clone();
+                                    full.extend_from_slice(msg.extranonce.inner_as_ref());
+                                    crate::binding::announce(
+                                        sender,
+                                        // The NON-witness serialization: the txid that folds into
+                                        // the merkle root is computed without BIP141 data, so the
+                                        // with-BIP141 variant would never reproduce the root.
+                                        job.get_coinbase_tx_prefix_without_bip141(),
+                                        job.get_coinbase_tx_suffix_without_bip141(),
+                                        job.get_merkle_path()
+                                            .inner_as_ref()
+                                            .iter()
+                                            .map(|n| n.to_vec())
+                                            .collect(),
+                                        &full,
+                                    )
+                                })
+                                .unwrap_or((None, None));
                             sender.send(ShareData {
                                 timestamp_ms: now_ms(),
                                 share_hash: share_hash.to_string(),
@@ -948,6 +1030,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     tlv_worker,
                                 ),
                                 header: Some(hex::encode(&header80)),
+                                extranonce,
+                                skeleton_id,
                             });
                         }
                         // if we have a template id (i.e.: this was not a custom job)

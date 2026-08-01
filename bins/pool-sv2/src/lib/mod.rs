@@ -35,6 +35,7 @@ use crate::{
     },
 };
 
+pub mod binding;
 pub mod channel_manager;
 pub mod config;
 pub mod downstream;

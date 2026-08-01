@@ -6237,6 +6237,7 @@ dependencies = [
  "bitcoin_core_sv2",
  "clap",
  "config",
+ "ghost-common",
  "hex",
  "hotpath",
  "jd_server_sv2",
