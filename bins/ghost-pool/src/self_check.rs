@@ -79,6 +79,16 @@ impl SelfCheck {
     /// CapabilityDrift / LowDisk operator alerts (the dispatcher debounces, so
     /// each is delivered once per transition, not every tick).
     pub async fn run_once(&self, config: &NodeConfig, alerts: Option<&Arc<AlertDispatcher>>) {
+        self.run_once_inner(config, alerts, true).await
+    }
+
+    /// `warm` is false only on the very first probe after start — see the suppression note below.
+    async fn run_once_inner(
+        &self,
+        config: &NodeConfig,
+        alerts: Option<&Arc<AlertDispatcher>>,
+        warm: bool,
+    ) {
         let public_mining = check_public_mining(config).await;
         let archive = check_archive(config);
         let ghost_pay = check_ghost_pay(config).await;
@@ -95,7 +105,20 @@ impl SelfCheck {
         log_transitions(&prev, &next);
 
         if let Some(alerts) = alerts {
-            fire_capability_drift_alerts(alerts, &next).await;
+            // Capability drift is suppressed on the first tick after start.
+            //
+            // `public_mining` legitimately fails until the first template exists, which is a
+            // second or two after boot — so alerting on the immediate probe fires a false drift on
+            // every single restart. Eight restarts during one deploy produced eight false alarms
+            // on 2026-08-01, which is how an alert channel becomes something people mute.
+            //
+            // Low disk is NOT suppressed: free space is true the instant it is read, has no
+            // warm-up, and a node that boots already full is exactly when the warning matters.
+            if warm {
+                fire_capability_drift_alerts(alerts, &next).await;
+            } else {
+                debug!("self-check warm-up: capability drift alerts suppressed for this tick");
+            }
             fire_low_disk_alert(alerts, config).await;
         }
 
@@ -107,8 +130,9 @@ impl SelfCheck {
     /// wires the loop into the operator alert pipeline.
     pub fn spawn_loop(self, config: Arc<NodeConfig>, alerts: Option<Arc<AlertDispatcher>>) {
         tokio::spawn(async move {
-            // Run once immediately so the dashboard has something to show.
-            self.run_once(&config, alerts.as_ref()).await;
+            // Run once immediately so the dashboard has something to show — but cold, so a
+            // capability that has simply not warmed up yet does not page anyone.
+            self.run_once_inner(&config, alerts.as_ref(), false).await;
             let mut interval = tokio::time::interval(TICK_INTERVAL);
             interval.tick().await; // consume the immediate tick
             loop {
