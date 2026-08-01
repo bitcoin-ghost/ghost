@@ -49,6 +49,46 @@ Key properties:
 
 Deletes: the GHOST-03 sweep, the payout tolerance, the proof-NULL class, and the #554 hot scan.
 
+## Design principle — the system must work itself
+
+Operator, 2026-08-01: *"i want everything to work itself — thats why decentralisation and atomicity
+is important."*
+
+This is the test any proposed mechanism has to pass, and it rules out a class of answer that keeps
+looking attractive because it is cheap:
+
+- **Detection is not protection.** A check that fires an alarm someone has to read is a human in the
+  loop. So is anything that depends on an operator noticing a divergence, comparing nodes by hand, or
+  running a reconciliation script.
+- **Verification must be local and complete.** A node decides alone, from data it holds, whether
+  something is valid. Not by asking peers, not by majority opinion about a fact, not by waiting.
+- **"It does not pay today" is not a security argument.** Every hole found in this programme was
+  harmless under the economics in force when it was written: the unsigned `payout_address` did not
+  matter until grouping moved to address; the payout tolerance was sound until multi-operator. v1
+  changes the economics, which is exactly when dormant holes wake up.
+
+Operator, same day: *"thats why self mediating and healing are important!"* — so the bar is three
+things, not one:
+
+- **self-verifying** — a node decides validity alone, from data in hand.
+- **self-mediating** — disagreement is settled by arithmetic or by the chain, never by negotiation,
+  tolerance or an operator's judgement. This is why exact equality replaces the payout tolerance:
+  a tolerance *absorbs* disagreement instead of resolving it, which means nobody ever finds out
+  which node was wrong.
+- **self-healing** — a node that falls behind, misses an event, or ends up in a bad state returns to
+  correctness on its own. Not by a script, not by a runbook.
+
+Where the design already meets it: `reconcile()` repairs missed settlements and orphaned ones in
+both directions; settlement is idempotent so repeated application converges; a diverged node rebuilds
+by replaying the batch chain; content-addressed data is self-certifying, so fetching it from an
+untrusted peer is safe.
+
+**Where it does NOT, found by applying this to WP-S:** `SettleOutcome::ProposalMissing` currently
+logs a warning and stops. That is a human-in-the-loop answer — a won block sits unsettled until
+somebody reads the log. It should fetch the missing proposal from a peer and settle. The response is
+self-certifying (a forged proposal cannot hash to the payout id the on-chain coinbase names), so the
+fetch needs no trust and no quorum. Tracked in WP-S below.
+
 ## Operator decisions (settled — do not relitigate)
 
 | # | decision |
