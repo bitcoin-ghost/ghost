@@ -33,6 +33,8 @@
 
 /// Commitments stamped into the coinbase scriptsig (payout identity, node identity).
 pub mod batch_consensus;
+pub mod batch_driver;
+pub mod batch_quarantine;
 pub mod circuit_breaker;
 pub mod clock;
 pub mod coinbase_tags;

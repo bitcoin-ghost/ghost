@@ -399,7 +399,32 @@ batches cannot both reach 67%.
       cannot have the caller apply the same batch twice. Two candidates at one sequence tally
       independently: that is the normal consequence of escalation, and the vote lock is what stops
       either reaching quorum dishonestly.
-- [ ] the quarantine itself (what a `Fault` does to the peer) — needs the alert path
+- [x] **quarantine** — `crates/ghost-common/src/batch_quarantine.rs`, 7 tests. Two decisions, both
+      the opposite of the obvious one:
+      - **It does not change the rota.** Skipping a quarantined node's turns is the tempting
+        design and it is a split generator: each node judges faults independently, so two nodes
+        with different quarantine sets would derive different schedules and disagree about who may
+        propose. A quarantined peer keeps its turns and simply cannot win a vote here; escalation
+        already carries the sequence past a proposer who cannot reach quorum.
+      - **It is never refused to preserve quorum.** If enough peers are excluded that 67% becomes
+        unreachable, the answer is not to start voting for batches known to be invalid. It is
+        quarantined anyway and the quorum loss is reported as its own condition — "I cannot reach
+        agreement" and "this batch is bad" are different facts and an operator needs both.
+      - The threshold is measured against the **whole** fleet, never the survivors. Recomputing
+        67% over what is left is how a quarantined minority becomes a majority: exclude three of
+        eight and three of the remaining five could finalise anything.
+      - Release is **operator-only**, no timer. An automatic one lets a Byzantine node misbehave,
+        wait it out, and repeat forever.
+- [x] **propose/vote/finalise driver** — `crates/ghost-common/src/batch_driver.rs`, 8 tests. Pure:
+      no clock, no socket, no database; the caller supplies `now` and the inputs and receives an
+      action. Consensus logic that reaches for the world cannot be tested for the rare cases, and
+      the rare cases are the entire point.
+      A quarantined proposer's batch is **not judged at all** — verifying every share on behalf of
+      a peer whose answer is already worthless is a denial-of-service anyone could trigger by
+      staying quarantined and shouting. Equivocation on votes routes to the same quarantine as a
+      batch fault, for the same reason: it is provable from two messages the peer signed itself.
+      Two valid batches at one sequence is **not** misbehaviour — that is escalation working — so
+      the second is refused without blame.
 - [ ] propose/finalise driver and mesh message types
 
 ### WP-4 — genesis batch
