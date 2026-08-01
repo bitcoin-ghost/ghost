@@ -38,7 +38,11 @@ use crate::{
     server::{
         error::StandardChannelError,
         jobs::{
-            extended::ExtendedJob, factory::JobFactory, job_store::JobStore, standard::StandardJob,
+            error::JobFactoryError,
+            extended::ExtendedJob,
+            factory::{JobFactory, COINBASE_HEADER_BYTES},
+            job_store::JobStore,
+            standard::StandardJob,
         },
         share_accounting::{ShareAccounting, ShareValidationError, ShareValidationResult},
     },
@@ -245,6 +249,88 @@ where
     }
 
     /// Returns the extranonce prefix bytes.
+    /// Build the coinbase transaction for `job` with a given extranonce.
+    ///
+    /// The block-found path and the skeleton below must produce the *same* transaction, differing
+    /// only in the extranonce bytes — that is the entire basis on which a share's proof of work can
+    /// be said to commit to this pool's coinbase. Two constructions would be two chances to differ.
+    fn build_coinbase(
+        &self,
+        job: &StandardJob<'_>,
+        extranonce: &[u8],
+    ) -> Result<Transaction, JobFactoryError> {
+        let mut script_sig = self.job_factory.script_sig_before_extranonce(
+            &job.get_template().coinbase_prefix.to_vec(),
+            self.extranonce_prefix.len(),
+        )?;
+        script_sig.extend_from_slice(extranonce);
+
+        let tx_in = TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: script_sig.into(),
+            sequence: Sequence(job.get_template().coinbase_tx_input_sequence),
+            witness: Witness::from(vec![vec![0; 32]]),
+        };
+
+        Ok(Transaction {
+            version: TxVersion::non_standard(job.get_template().coinbase_tx_version as i32),
+            lock_time: LockTime::from_consensus(job.get_template().coinbase_tx_locktime),
+            input: vec![tx_in],
+            output: job.get_coinbase_outputs().to_vec(),
+        })
+    }
+
+    /// The invariant parts of this channel's active-job coinbase, either side of the extranonce,
+    /// plus the merkle path that reaches the header's merkle root.
+    ///
+    /// Returns `(coinbase_prefix, coinbase_suffix, merkle_path)`, where
+    /// `prefix ‖ extranonce ‖ suffix` is the serialized coinbase byte-for-byte.
+    ///
+    /// This is what lets a share be verified *against the chain of hashes the miner actually
+    /// worked on*, rather than against a claim about it: rebuild the coinbase, walk the path, and
+    /// compare with the merkle root inside the submitted header. Nothing in it needs to be trusted
+    /// — a wrong skeleton simply fails to reproduce the root.
+    ///
+    /// Derived by serializing the real coinbase and cutting it, not by re-deriving offsets. The
+    /// cut is computed from the assembled scriptSig, so it cannot drift from what was built.
+    pub fn coinbase_skeleton(&self) -> Option<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> {
+        let job = self.get_active_job()?;
+        let extranonce_len = self.extranonce_prefix.len();
+
+        let script_sig_head = self
+            .job_factory
+            .script_sig_before_extranonce(
+                &job.get_template().coinbase_prefix.to_vec(),
+                extranonce_len,
+            )
+            .ok()?;
+        let coinbase = self.build_coinbase(&job, &vec![0u8; extranonce_len]).ok()?;
+
+        let mut serialized = Vec::new();
+        coinbase.consensus_encode(&mut serialized).ok()?;
+
+        let cut = COINBASE_HEADER_BYTES + script_sig_head.len();
+        // A malformed cut would silently hand out a skeleton that reassembles into the wrong
+        // transaction, so it is checked rather than assumed.
+        if serialized.len() < cut + extranonce_len {
+            return None;
+        }
+
+        let merkle_path = job
+            .get_template()
+            .merkle_path
+            .inner_as_ref()
+            .iter()
+            .map(|n| n.to_vec())
+            .collect();
+
+        Some((
+            serialized[..cut].to_vec(),
+            serialized[cut + extranonce_len..].to_vec(),
+            merkle_path,
+        ))
+    }
+
     pub fn get_extranonce_prefix(&self) -> &Vec<u8> {
         &self.extranonce_prefix
     }
@@ -650,31 +736,9 @@ where
             self.share_accounting.increment_blocks_found();
             self.share_accounting.mark_batch_acknowledged();
 
-            // Built by the SAME assembler the job was built with. Reproducing the layout here by
-            // hand is what makes a won block reconstructible-but-wrong: this path only runs on a
-            // block, so any divergence stays invisible until it costs one.
-            let mut script_sig = self
-                .job_factory
-                .script_sig_before_extranonce(
-                    &job.get_template().coinbase_prefix.to_vec(),
-                    self.extranonce_prefix.len(),
-                )
+            let coinbase = self
+                .build_coinbase(&job, job.get_extranonce_prefix())
                 .map_err(|_| ShareValidationError::InvalidCoinbase)?;
-            script_sig.extend(job.get_extranonce_prefix());
-
-            let tx_in = TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: script_sig.into(),
-                sequence: Sequence(job.get_template().coinbase_tx_input_sequence),
-                witness: Witness::from(vec![vec![0; 32]]),
-            };
-
-            let coinbase = Transaction {
-                version: TxVersion::non_standard(job.get_template().coinbase_tx_version as i32),
-                lock_time: LockTime::from_consensus(job.get_template().coinbase_tx_locktime),
-                input: vec![tx_in],
-                output: job.get_coinbase_outputs().to_vec(),
-            };
             let mut serialized_coinbase = Vec::new();
             coinbase
                 .consensus_encode(&mut serialized_coinbase)
@@ -750,6 +814,173 @@ mod tests {
     use template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp};
 
     const SATS_AVAILABLE_IN_TEMPLATE: u64 = 5000000000;
+
+    /// **The property the receiver binding rests on.**
+    ///
+    /// `prefix ‖ extranonce ‖ suffix` must reproduce the coinbase byte-for-byte. If it does not,
+    /// a validator rebuilding the coinbase gets a different txid, a different merkle root, and
+    /// concludes the share does not match its own header — so an honest share reads as forged.
+    ///
+    /// The two halves are cut from a serialization; this asserts the cut is in the right place,
+    /// which is the kind of off-by-one that is invisible until it rejects everything.
+    #[test]
+    fn the_coinbase_skeleton_reassembles_byte_for_byte() {
+        use bitcoin::consensus::Encodable;
+
+        let extranonce_prefix = vec![7u8; 16];
+        let job_store = DefaultJobStore::<StandardJob>::new();
+        let mut channel = StandardChannel::new(
+            1,
+            "user".to_string(),
+            extranonce_prefix.clone(),
+            Target::from_le_bytes([0xff; 32]),
+            10.0,
+            100,
+            1.0,
+            job_store,
+            Some("GHOST PublicPool".to_string()),
+            None,
+        )
+        .unwrap();
+
+        // A non-future template needs a tip to hang off.
+        channel.set_chain_tip(ChainTip::new(
+            [
+                200, 53, 253, 129, 214, 31, 43, 84, 179, 58, 58, 76, 128, 213, 24, 53, 38, 144,
+                205, 88, 172, 20, 251, 22, 217, 141, 21, 221, 21, 0, 0, 0,
+            ]
+            .into(),
+            503543726,
+            1745596960,
+        ));
+
+        let template = NewTemplate {
+            template_id: 1,
+            future_template: false,
+            version: 536870912,
+            coinbase_tx_version: 2,
+            // A realistic Ghost prefix: BIP34 height, then the payout and node tags.
+            coinbase_prefix: {
+                let mut p = vec![0x03, 0x40, 0x1f, 0x0e];
+                p.extend_from_slice(&[20u8; 21]);
+                p.extend_from_slice(&[24u8; 25]);
+                p.try_into().unwrap()
+            },
+            coinbase_tx_input_sequence: 4294967294,
+            coinbase_tx_value_remaining: SATS_AVAILABLE_IN_TEMPLATE,
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_outputs: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 38, 106, 36, 170, 33, 169, 237, 226, 246, 28, 63, 113, 209,
+                222, 253, 63, 169, 153, 223, 163, 105, 83, 117, 92, 105, 6, 137, 121, 153, 98, 180,
+                139, 235, 216, 54, 151, 78, 140, 249,
+            ]
+            .try_into()
+            .unwrap(),
+            coinbase_tx_locktime: 158,
+            merkle_path: vec![].try_into().unwrap(),
+        };
+
+        let mut script_bytes = vec![0u8, 20];
+        script_bytes.extend_from_slice(&[0xABu8; 20]);
+        let reward = vec![TxOut {
+            value: Amount::from_sat(SATS_AVAILABLE_IN_TEMPLATE),
+            script_pubkey: ScriptBuf::from(script_bytes),
+        }];
+        channel
+            .on_new_template(template.clone(), reward)
+            .expect("template must be accepted");
+
+        let (prefix, suffix, _path) = channel
+            .coinbase_skeleton()
+            .expect("an active job must yield a skeleton");
+
+        let job = channel.get_active_job().expect("active job");
+        let real = channel
+            .build_coinbase(&job, &extranonce_prefix)
+            .expect("coinbase must build");
+        let mut serialized = Vec::new();
+        real.consensus_encode(&mut serialized).unwrap();
+
+        let mut reassembled = prefix.clone();
+        reassembled.extend_from_slice(&extranonce_prefix);
+        reassembled.extend_from_slice(&suffix);
+
+        assert_eq!(
+            reassembled, serialized,
+            "prefix + extranonce + suffix must be the coinbase exactly"
+        );
+        assert_eq!(
+            &serialized[prefix.len()..prefix.len() + extranonce_prefix.len()],
+            &extranonce_prefix[..],
+            "the cut must land exactly on the extranonce, not a byte either side"
+        );
+    }
+
+    /// A different extranonce must change only the extranonce — the skeleton is the part that does
+    /// not move, which is what makes it worth storing once per job instead of once per share.
+    #[test]
+    fn the_skeleton_is_invariant_across_extranonces() {
+        let job_store = DefaultJobStore::<StandardJob>::new();
+        let mut channel = StandardChannel::new(
+            1,
+            "user".to_string(),
+            vec![7u8; 16],
+            Target::from_le_bytes([0xff; 32]),
+            10.0,
+            100,
+            1.0,
+            job_store,
+            Some("GHOST PublicPool".to_string()),
+            None,
+        )
+        .unwrap();
+
+        // A non-future template needs a tip to hang off.
+        channel.set_chain_tip(ChainTip::new(
+            [
+                200, 53, 253, 129, 214, 31, 43, 84, 179, 58, 58, 76, 128, 213, 24, 53, 38, 144,
+                205, 88, 172, 20, 251, 22, 217, 141, 21, 221, 21, 0, 0, 0,
+            ]
+            .into(),
+            503543726,
+            1745596960,
+        ));
+
+        let template = NewTemplate {
+            template_id: 1,
+            future_template: false,
+            version: 536870912,
+            coinbase_tx_version: 2,
+            coinbase_prefix: vec![0x03, 0x40, 0x1f, 0x0e].try_into().unwrap(),
+            coinbase_tx_input_sequence: 4294967294,
+            coinbase_tx_value_remaining: SATS_AVAILABLE_IN_TEMPLATE,
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_outputs: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 38, 106, 36, 170, 33, 169, 237, 226, 246, 28, 63, 113, 209,
+                222, 253, 63, 169, 153, 223, 163, 105, 83, 117, 92, 105, 6, 137, 121, 153, 98, 180,
+                139, 235, 216, 54, 151, 78, 140, 249,
+            ]
+            .try_into()
+            .unwrap(),
+            coinbase_tx_locktime: 158,
+            merkle_path: vec![].try_into().unwrap(),
+        };
+        let mut script_bytes = vec![0u8, 20];
+        script_bytes.extend_from_slice(&[0xABu8; 20]);
+        channel
+            .on_new_template(
+                template,
+                vec![TxOut {
+                    value: Amount::from_sat(SATS_AVAILABLE_IN_TEMPLATE),
+                    script_pubkey: ScriptBuf::from(script_bytes),
+                }],
+            )
+            .unwrap();
+
+        let first = channel.coinbase_skeleton().expect("skeleton");
+        let second = channel.coinbase_skeleton().expect("skeleton");
+        assert_eq!(first, second, "the skeleton must be stable for a given job");
+    }
 
     #[test]
     fn test_future_job_activation_flow() {

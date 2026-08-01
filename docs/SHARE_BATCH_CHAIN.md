@@ -231,7 +231,19 @@ actually 50. The total is now measured on the assembled bytes inside
 
 **OPERATOR:** shortening `pool_signature` to `GHOST PublicPool` (already agreed) takes it to 91/100
 — 9 bytes. That is a fleet config change, so it needs your go-ahead.
-  - [ ] `pool_sv2`: publish the skeleton on job announce
+  - [x] **`StandardChannel::coinbase_skeleton()`** — returns `(prefix, suffix, merkle_path)` where
+        `prefix ‖ extranonce ‖ suffix` is the serialized coinbase byte-for-byte. Derived by
+        serializing the real coinbase and cutting it, not by re-deriving offsets, so the cut cannot
+        drift from what was built. Also extracted `build_coinbase`, so the block-found path and the
+        skeleton produce the same transaction differing only in extranonce bytes — two
+        constructions would be two chances to differ, and only one of them runs often enough to be
+        noticed.
+        Two tests: the skeleton reassembles byte-for-byte with the cut landing exactly on the
+        extranonce (an off-by-one here rejects *every* honest share), and the skeleton is stable
+        across extranonces, which is what makes it worth storing per job rather than per share.
+  - [ ] `pool_sv2`: transport — publish the skeleton to ghost-pool (push-with-dedup on the existing
+        share webhook, or pull-on-unknown-id; leaning pull, since a skeleton is only needed when a
+        share actually references one)
   - [ ] share webhook carries `extranonce` + `header80`
 Two verified forgery holes. Both append to `signing_bytes`, so they share ONE gate — one signature
 format transition, one mixed-fleet window.
