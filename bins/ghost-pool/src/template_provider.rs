@@ -1282,26 +1282,38 @@ fn create_new_template(
     // Detected rather than assumed: the tag is one push immediately after the height, so its
     // presence is checkable. A treasury-only coinbase carries none, and then the prefix is
     // height-only exactly as before.
-    const PAYOUT_TAG_TOTAL: usize = 1 + 4 + ghost_common::coinbase_tags::PAYOUT_ID_LEN;
-    let payout_tag_len = {
-        let rest = &scriptsig_full[height_push_len..];
-        let is_tag = rest.len() >= PAYOUT_TAG_TOTAL
-            && rest[0] as usize == 4 + ghost_common::coinbase_tags::PAYOUT_ID_LEN
-            && &rest[1..5] == ghost_common::coinbase_tags::PAYOUT_TAG_MAGIC.as_slice();
-        if is_tag {
-            PAYOUT_TAG_TOTAL
+    /// A tag is one push: `[len][magic][payload]`. Present or absent, never partial.
+    fn tag_len_at(bytes: &[u8], magic: &[u8; 4], payload_len: usize) -> usize {
+        let total = 1 + 4 + payload_len;
+        let present = bytes.len() >= total
+            && bytes[0] as usize == 4 + payload_len
+            && &bytes[1..5] == magic.as_slice();
+        if present {
+            total
         } else {
             0
         }
-    };
-    let prefix_len = height_push_len + payout_tag_len;
+    }
+
+    let payout_tag_len = tag_len_at(
+        &scriptsig_full[height_push_len..],
+        ghost_common::coinbase_tags::PAYOUT_TAG_MAGIC,
+        ghost_common::coinbase_tags::PAYOUT_ID_LEN,
+    );
+    let node_tag_len = tag_len_at(
+        &scriptsig_full[height_push_len + payout_tag_len..],
+        ghost_common::coinbase_tags::NODE_TAG_MAGIC,
+        ghost_common::coinbase_tags::NODE_ID_LEN,
+    );
+    let prefix_len = height_push_len + payout_tag_len + node_tag_len;
     let scriptsig_prefix = &scriptsig_full[..prefix_len];
 
     debug!(
-        "TDP coinbase_prefix: {} bytes (height + {} payout-tag bytes, stripping {} pool-tag \
-         bytes), hex: {}",
+        "TDP coinbase_prefix: {} bytes (height + {} payout-tag + {} node-tag, stripping {} \
+         pool-tag bytes), hex: {}",
         scriptsig_prefix.len(),
         payout_tag_len,
+        node_tag_len,
         scriptsig_full.len() - prefix_len,
         hex::encode(scriptsig_prefix)
     );

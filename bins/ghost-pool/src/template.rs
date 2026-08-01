@@ -132,6 +132,17 @@ pub struct TemplateConfig {
     pub target_weight: u64,
     /// Coinbase extra data (pool signature)
     pub coinbase_extra: String,
+    /// This node's commitment, stamped into the coinbase so a share mined here is provably mined
+    /// *here*.
+    ///
+    /// `sha256(node_id)[..20]` rather than the full 32-byte id: the scriptSig has a 100-byte
+    /// ceiling shared with the height push, the payout tag, the pool tag and the extranonce, and
+    /// 20 bytes of second-preimage resistance is ample for binding an identity.
+    ///
+    /// Without it, a peer can lift a relayed share's header and re-sign it claiming it received the
+    /// work — `has_valid_received_by_signature` only proves the *named* node signed, never that it
+    /// was the one mined to. `None` leaves the coinbase exactly as it was.
+    pub node_commitment: Option<[u8; 20]>,
     /// Treasury address for pool fees (supports multi-sig)
     pub treasury_address: TreasuryAddress,
     /// Pool payout address for fallback coinbase (bech32)
@@ -169,6 +180,7 @@ impl Default for TemplateConfig {
             min_fee_rate: 1.0,
             target_weight: 3_992_000, // ~99% of 4MW limit
             coinbase_extra: "GHOST".to_string(),
+            node_commitment: None,
             treasury_address: TreasuryAddress::default(), // Must be configured
             pool_payout_address: String::new(),           // Must be configured
             network: BitcoinNetwork::Mainnet,
@@ -2763,9 +2775,18 @@ impl TemplateProcessor {
                 ghost_common::coinbase_tags::encode_payout_tag(&id)
             })
             .unwrap_or_default();
+        // Commit to this node, so a peer cannot lift the header off a relayed share and claim it
+        // received the work. Goes before the raw pool tag for the same reason the payout tag does.
+        let node_tag = self
+            .config
+            .node_commitment
+            .map(|c| ghost_common::coinbase_tags::encode_node_tag(&c))
+            .unwrap_or_default();
+
         let extra = self.config.coinbase_extra.as_bytes();
 
-        let total = height_bytes.len() + payout_tag.len() + extra.len() + extranonce_len;
+        let total =
+            height_bytes.len() + payout_tag.len() + node_tag.len() + extra.len() + extranonce_len;
 
         // Consensus caps a coinbase scriptSig at 100 bytes. The previous check guarded only the
         // u8 length field at 255, so a long tag could build blocks the network rejects — a failure
@@ -2774,18 +2795,22 @@ impl TemplateProcessor {
         if total > MAX_COINBASE_SCRIPTSIG {
             return Err(TemplateError::ConfigError(format!(
                 "Coinbase scriptSig would be {total} bytes, over the {MAX_COINBASE_SCRIPTSIG} \
-                 consensus limit (height {}, payout tag {}, pool tag {}, extranonce {}). \
-                 Shorten coinbase_extra.",
+                 consensus limit (height {}, payout tag {}, node tag {}, pool tag {}, \
+                 extranonce {}). Shorten coinbase_extra.",
                 height_bytes.len(),
                 payout_tag.len(),
+                node_tag.len(),
                 extra.len(),
                 extranonce_len
             )));
         }
 
-        let mut out = Vec::with_capacity(height_bytes.len() + payout_tag.len() + extra.len());
+        let mut out = Vec::with_capacity(
+            height_bytes.len() + payout_tag.len() + node_tag.len() + extra.len(),
+        );
         out.extend_from_slice(&height_bytes);
         out.extend_from_slice(&payout_tag);
+        out.extend_from_slice(&node_tag);
         out.extend_from_slice(extra);
         Ok(out)
     }
@@ -4706,6 +4731,95 @@ mod tests {
     }
 
     /// H-MINE-3-TEST-2: Test that runtime script_len validation works
+    #[test]
+    /// Both commitments must survive into the coinbase this node builds, and the result must fit
+    /// the consensus ceiling with the real pool tag and extranonce alongside.
+    ///
+    /// The unit tests for the codec prove encode/extract agree; this proves the bytes actually
+    /// reach the coinbase, which is the step where a commitment silently goes missing.
+    #[test]
+    fn both_commitments_reach_the_built_coinbase() {
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        let node_commitment = [0x7Au8; 20];
+        let processor = TemplateProcessor::new(
+            TemplateConfig {
+                coinbase_extra: "GHOST PublicPool".to_string(),
+                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                mining_mode: MiningMode::PublicPool,
+                node_commitment: Some(node_commitment),
+                ..Default::default()
+            },
+            rpc,
+            PolicyProfile::permissive(),
+            ReaperConfig::default(),
+        );
+
+        let scriptsig = processor
+            .coinbase_scriptsig(960_000, Some([0xC3u8; 32]), 20)
+            .expect("scriptsig must build");
+
+        let mut expected_payout = [0u8; 16];
+        expected_payout.copy_from_slice(&[0xC3u8; 32][..16]);
+        assert_eq!(
+            ghost_common::coinbase_tags::extract_payout_tag(&scriptsig),
+            Some(expected_payout),
+            "the payout commitment did not reach the coinbase"
+        );
+        assert_eq!(
+            ghost_common::coinbase_tags::extract_node_tag(&scriptsig),
+            Some(node_commitment),
+            "the node commitment did not reach the coinbase"
+        );
+
+        // The human-readable tag still trails behind, where nothing parses it.
+        assert!(
+            scriptsig
+                .windows(b"GHOST PublicPool".len())
+                .any(|w| w == b"GHOST PublicPool"),
+            "the pool tag should still be present"
+        );
+
+        // 20 is the SV2 extranonce, the binding case.
+        assert!(
+            scriptsig.len() + 20 <= 100,
+            "scriptSig would breach the consensus ceiling: {} + 20 extranonce",
+            scriptsig.len()
+        );
+    }
+
+    /// With no payout armed there is nothing to settle, so no payout tag — but the node commitment
+    /// still applies, because the share was still mined here.
+    #[test]
+    fn a_treasury_only_coinbase_carries_no_payout_tag() {
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        let processor = TemplateProcessor::new(
+            TemplateConfig {
+                coinbase_extra: "GHOST PublicPool".to_string(),
+                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                mining_mode: MiningMode::PublicPool,
+                node_commitment: Some([0x11u8; 20]),
+                ..Default::default()
+            },
+            rpc,
+            PolicyProfile::permissive(),
+            ReaperConfig::default(),
+        );
+
+        let scriptsig = processor
+            .coinbase_scriptsig(960_000, None, 20)
+            .expect("scriptsig must build");
+
+        assert_eq!(
+            ghost_common::coinbase_tags::extract_payout_tag(&scriptsig),
+            None,
+            "a coinbase paying no armed payout must not name one"
+        );
+        assert_eq!(
+            ghost_common::coinbase_tags::extract_node_tag(&scriptsig),
+            Some([0x11u8; 20])
+        );
+    }
+
     #[test]
     fn test_script_len_runtime_validation() {
         // Defensive test: even if config validation is bypassed, building a coinbase must refuse a

@@ -2830,6 +2830,13 @@ async fn main() -> Result<()> {
         mining_mode,
         solo_payout_address: config.network.solo_payout_address.clone(),
         coinbase_extra: coinbase_tag,
+        node_commitment: {
+            // sha256(node_id)[..20] — see TemplateConfig::node_commitment.
+            let digest = ghost_common::identity::hash_message(&identity.node_id());
+            let mut c = [0u8; 20];
+            c.copy_from_slice(&digest[..20]);
+            Some(c)
+        },
         min_fee_rate: template_min_fee_rate,
         enforce_custom_policy_fields,
         // Block-priority lever (max_fee default | payments_first). Resolved once
