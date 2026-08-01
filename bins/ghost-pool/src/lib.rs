@@ -225,6 +225,26 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// signature-format changes land in one transition rather than two.
 pub const SHARE_ADDR_BIND_HEIGHT: u64 = u64::MAX;
 
+/// Settle a won block by observing it on-chain, on every node rather than only the submitter.
+///
+/// Today `settle_paid_block` has one reachable call site, in the block-submitted path, so only the
+/// node that submitted a winning block marks its shares paid. The other seven still owe the whole
+/// paid set — and being the majority, their view is the one that reaches quorum on the next
+/// proposal, which pays the same work twice.
+///
+/// At and above this height every node settles from its own view of the chain: the coinbase names
+/// the payout it pays, so the block itself is the record. Below it the observer still matches and
+/// logs, writing nothing — that dry run is what proves matching works before the behaviour turns on.
+///
+/// Gated because settlement changes the unpaid ledger every node votes with. A mixed fleet where
+/// some nodes observe-settle and others do not would diverge on the first won block, so the flip
+/// has to be simultaneous, like [`PAYOUT_TOLERANCE_V2_HEIGHT`].
+///
+/// UNARMED (`u64::MAX`). Arming needs the whole fleet on a binary that both stamps the payout tag
+/// and understands it, and a dry-run window showing matches across all eight. The emitting side
+/// must roll first: a node that reads tags before its peers write them settles nothing.
+pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = u64::MAX;
+
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
 /// when they are members of the consensus voter set AND come from diverse IP subnets, and it
@@ -296,6 +316,7 @@ mod gates {
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
+    pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -345,6 +366,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         SHARE_ADDR_BIND_HEIGHT,
     );
+    let observed_settlement = gates::from_env(
+        "GHOST_OBSERVED_SETTLEMENT_HEIGHT",
+        network,
+        OBSERVED_SETTLEMENT_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
@@ -352,6 +378,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::SHARE_POW_VERIFY.set(share_pow_verify);
     let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
     let _ = gates::SHARE_ADDR_BIND.set(share_addr_bind);
+    let _ = gates::OBSERVED_SETTLEMENT.set(observed_settlement);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != COINBASE_FEE_SPLIT_HEIGHT
@@ -360,6 +387,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         || share_pow_verify != SHARE_POW_VERIFY_HEIGHT
         || active_voter_set != ACTIVE_VOTER_SET_HEIGHT
         || share_addr_bind != SHARE_ADDR_BIND_HEIGHT
+        || observed_settlement != OBSERVED_SETTLEMENT_HEIGHT
     {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
@@ -369,6 +397,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
             share_pow_verify_height = share_pow_verify,
             active_voter_set_height = active_voter_set,
             share_addr_bind_height = share_addr_bind,
+            observed_settlement_height = observed_settlement,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
         );
@@ -408,6 +437,11 @@ pub fn share_pow_verify_height() -> u64 {
 /// Height at and above which the GHOST-09 share signature also binds `payout_address`.
 pub fn share_addr_bind_height() -> u64 {
     *gates::SHARE_ADDR_BIND.get_or_init(|| SHARE_ADDR_BIND_HEIGHT)
+}
+
+/// Height at and above which every node settles won blocks by observing them on-chain.
+pub fn observed_settlement_height() -> u64 {
+    *gates::OBSERVED_SETTLEMENT.get_or_init(|| OBSERVED_SETTLEMENT_HEIGHT)
 }
 
 /// Whether a share seen at `height` must carry the address-bound signature.

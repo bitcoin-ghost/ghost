@@ -9009,6 +9009,83 @@ async fn main() -> Result<()> {
             .with_height_getter(move || rm_for_reorg.current_height());
         reorg_handler.start(block_events);
 
+        // Settle won blocks by observing the chain, on EVERY node rather than only the one that
+        // submitted the block. Takes its own subscription rather than extending ReorgHandler:
+        // that handler's job is round orphaning and alerts, and settlement failing should not take
+        // reorg detection down with it.
+        //
+        // Below `OBSERVED_SETTLEMENT_HEIGHT` this matches and logs without writing, so the dry run
+        // proves matching works before the ledger behaviour changes fleet-wide.
+        {
+            use ghost_pool::settlement::{SettleOutcome, SettlementObserver};
+
+            let mut settlement_events = zmq_subscriber.subscribe_block_events();
+            let rm_for_settlement = Arc::clone(&round_manager);
+            let observer = Arc::new(SettlementObserver::new(
+                Arc::clone(&db),
+                Arc::clone(&rpc),
+                PAYOUT_ADDRESS_GROUPING_HEIGHT,
+                ghost_pool::observed_settlement_height(),
+            ));
+
+            // Catch up on anything missed while down, and reverse settlements whose blocks left
+            // the chain — a Disconnected event can be lost across a restart, and a settlement left
+            // standing for an orphaned block is work silently marked paid.
+            let startup_observer = Arc::clone(&observer);
+            tokio::spawn(async move {
+                if let Err(e) = startup_observer.reconcile().await {
+                    warn!(error = %e, "settlement reconciliation failed at startup");
+                }
+            });
+
+            tokio::spawn(async move {
+                loop {
+                    match settlement_events.recv().await {
+                        Ok(ghost_common::zmq::BlockEvent::Connected { hash }) => {
+                            let height = rm_for_settlement.current_height();
+                            match observer.on_block_connected(&hash, height).await {
+                                SettleOutcome::Settled(applied) => info!(
+                                    block = %hash,
+                                    shares_marked = applied.shares_marked,
+                                    treasury_sats = applied.treasury_bumped,
+                                    "settled a won block observed on-chain"
+                                ),
+                                SettleOutcome::ProposalMissing { payout_id } => warn!(
+                                    block = %hash,
+                                    payout_id = %hex::encode(payout_id),
+                                    "observed a block carrying our payout tag but hold no matching \
+                                     proposal — it cannot be settled here"
+                                ),
+                                SettleOutcome::DryRunMatch { .. }
+                                | SettleOutcome::AlreadySettled
+                                | SettleOutcome::NotOurs => {}
+                            }
+                        }
+                        Ok(ghost_common::zmq::BlockEvent::Disconnected { hash }) => {
+                            observer.on_block_disconnected(&hash);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Missing a block here means a settlement may have been missed, which
+                            // reconcile() cannot fix (it only reverses, never applies). Say so.
+                            warn!(
+                                skipped,
+                                "settlement observer lagged behind block events — a won block may \
+                                 be unsettled until the next reconcile"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            info!("settlement observer shutting down — block events closed");
+                            break;
+                        }
+                    }
+                }
+            });
+            info!(
+                activation_height = ghost_pool::observed_settlement_height(),
+                "Settlement observer started (dry run below the activation height)"
+            );
+        }
+
         info!("ZMQ block watcher connected to {}", zmq_endpoint);
         if let Some(seq_ep) = sequence_endpoint {
             info!("ZMQ reorg detection connected to {}", seq_ep);
