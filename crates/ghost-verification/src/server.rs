@@ -1295,6 +1295,12 @@ pub struct VerificationState {
     get_miner_count: Box<dyn Fn() -> u32 + Send + Sync>,
     /// Peer count getter (callback)
     get_peer_count: Box<dyn Fn() -> u32 + Send + Sync>,
+    /// Liveness of Ghost Core: `(reachable, seconds since it last answered)`.
+    ///
+    /// Optional so an unwired caller reports `core_reachable: null` — "unknown" — rather than
+    /// silently claiming health. Defaulting an unwired probe to `true` is precisely the bug this
+    /// replaces.
+    get_core_health: Option<Box<dyn Fn() -> (bool, u64) + Send + Sync>>,
     /// Archive mode handler
     archive_handler: Option<Box<dyn ArchiveHandler + Send + Sync>>,
     /// GhostPay handler
@@ -1634,6 +1640,7 @@ impl VerificationState {
             get_round_id: Box::new(|| 0),
             get_miner_count: Box::new(|| 0),
             get_peer_count: Box::new(|| 0),
+            get_core_health: None,
             archive_handler: None,
             ghostpay_handler: None,
             gsp_handler: None,
@@ -2221,6 +2228,19 @@ impl VerificationState {
         self
     }
 
+    /// Wire the Ghost Core liveness probe.
+    ///
+    /// The callback returns `(reachable, seconds_since_last_success)`. Without it `/health` cannot
+    /// claim the node is healthy — it reports `core_reachable: null` and leaves `healthy` false,
+    /// because an unmeasured dependency is not a working one.
+    pub fn with_core_health(
+        mut self,
+        probe: impl Fn() -> (bool, u64) + Send + Sync + 'static,
+    ) -> Self {
+        self.get_core_health = Some(Box::new(probe));
+        self
+    }
+
     /// Returns the current miner count from the application callback.
     pub fn miner_count(&self) -> u32 {
         (self.get_miner_count)()
@@ -2561,8 +2581,13 @@ impl VerificationState {
 
     /// Get health response
     pub async fn get_health(&self) -> HealthResponse {
+        let core = self.get_core_health.as_ref().map(|probe| probe());
         HealthResponse {
-            healthy: true,
+            // Unknown is not healthy. If nothing wired a probe, this node cannot demonstrate it
+            // can reach Ghost Core, and saying "healthy" on that basis is what hid vm7's outage.
+            healthy: core.map(|(reachable, _)| reachable).unwrap_or(false),
+            core_reachable: core.map(|(reachable, _)| reachable),
+            core_last_ok_secs: core.map(|(_, secs)| secs),
             node_id: self.node_id.clone(),
             version: self.version.clone(),
             block_height: (self.get_block_height)(),

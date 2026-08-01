@@ -495,8 +495,22 @@ impl GhostPayResponse {
 /// Health check response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
-    /// Node is healthy
+    /// Whether the node can actually do its job.
+    ///
+    /// This was the literal `true` for as long as the HTTP server could answer — a check that
+    /// cannot fail. On 2026-08-01 ghost-vm7 served `healthy: true` for an hour with its Ghost Core
+    /// dead underneath it, and nothing noticed: not the dashboard, not the load balancer, not an
+    /// operator. It now reflects the one dependency without which the node does nothing useful.
     pub healthy: bool,
+    /// Whether Ghost Core answered recently.
+    ///
+    /// `None` means no probe was wired, which is reported as such rather than assumed good — so a
+    /// monitor can tell "never checked" from "checked and failing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_reachable: Option<bool>,
+    /// Seconds since Ghost Core last answered, so a monitor sees how stale the answer is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_last_ok_secs: Option<u64>,
     /// Node ID (hex)
     pub node_id: String,
     /// Software version
@@ -1069,6 +1083,8 @@ mod tests {
     fn test_signed_response_creation() {
         let health = HealthResponse {
             healthy: true,
+            core_reachable: Some(true),
+            core_last_ok_secs: Some(0),
             node_id: "test_node".to_string(),
             version: "1.0.0".to_string(),
             block_height: 100,
@@ -1100,6 +1116,8 @@ mod tests {
     fn test_signed_response_timestamp_validation() {
         let health = HealthResponse {
             healthy: true,
+            core_reachable: Some(true),
+            core_last_ok_secs: Some(0),
             node_id: "test".to_string(),
             version: "1.0".to_string(),
             block_height: 0,

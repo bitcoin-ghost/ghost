@@ -226,7 +226,24 @@ test in `skeleton_store.rs`:
 | `OP_PUSHBYTES` + extranonce | 21 |
 | **total** | **99 / 100** |
 
-**One byte.** Two more characters of `pool_signature` and every block the fleet mines is invalid.
+**One byte** — *once this branch is deployed and a payout is armed.*
+
+⚠ **CORRECTION, observed on ghost-vm5 2026-08-01 15:57.** The live TDP `coinbase_prefix` is
+`0349a80e` — **4 bytes, the BIP34 height push alone**. The deployed binary predates the node tag,
+and no payout has been settleable since 2026-06-02, so neither tag is present. The scriptSig on
+production today is:
+
+| | bytes |
+|---|---|
+| BIP34 height | 4 |
+| `/- G H O S T - PublicPool//` | 28 |
+| `OP_PUSHBYTES` + extranonce | 21 |
+| **today** | **53 / 100** |
+
+99 is the figure *after* this branch (node tag, +25) **and** an armed payout (+21). So shortening
+`pool_signature` is a **prerequisite for arming**, not a fix for a live hazard. Stated wrongly as
+"at 99 today" earlier; the test `a_treasury_only_coinbase_is_far_from_the_limit` already pinned 78
+for the no-payout case, which should have prompted the check sooner.
 
 It is latent only because a treasury-only coinbase omits the payout tag (78 bytes) — and nothing
 has been settleable since 2026-06-02. **Fixing payouts is what arms this.** That makes it a

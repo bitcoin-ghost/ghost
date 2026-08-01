@@ -508,6 +508,12 @@ pub struct BitcoinRpc {
     id_counter: AtomicU64,
     /// Last known block height (for template validation)
     last_known_height: AtomicU64,
+    /// Unix seconds of the last successful RPC call, or 0 if none has ever succeeded.
+    ///
+    /// The circuit breaker knows whether calls are *failing*; it cannot say when one last
+    /// worked, and a breaker that nothing has exercised looks identical to a healthy one. This is
+    /// the difference between "no bad news" and "good news", and only the second is health.
+    last_success_ts: AtomicU64,
     /// Circuit breaker for fault tolerance
     circuit_breaker: Arc<CircuitBreaker>,
     /// Retry configuration
@@ -613,6 +619,7 @@ impl BitcoinRpc {
             auth,
             id_counter: AtomicU64::new(1),
             last_known_height: AtomicU64::new(0),
+            last_success_ts: AtomicU64::new(0),
             circuit_breaker,
             retry_config,
             network: BitcoinNetwork::Mainnet,
@@ -625,6 +632,35 @@ impl BitcoinRpc {
     }
 
     /// Get a reference to the circuit breaker for manual control
+    /// Record that Ghost Core just answered.
+    fn mark_rpc_success(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.last_success_ts.store(now, Ordering::Relaxed);
+    }
+
+    /// Liveness of Ghost Core as `(reachable, seconds since it last answered)`.
+    ///
+    /// `reachable` is false until a call has actually succeeded — an unexercised client is not a
+    /// healthy one — and false again once answers go `stale_after` seconds cold. Staleness rather
+    /// than error-counting, because the failure that matters is silence: on 2026-08-01 a node's
+    /// Core died and the node kept reporting health because nothing was asking whether it was
+    /// still there.
+    pub fn core_liveness(&self, stale_after: u64) -> (bool, u64) {
+        let last = self.last_success_ts.load(Ordering::Relaxed);
+        if last == 0 {
+            return (false, u64::MAX);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let age = now.saturating_sub(last);
+        (age <= stale_after, age)
+    }
+
     pub fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
     }
@@ -691,6 +727,8 @@ impl BitcoinRpc {
                 .await
             {
                 Ok(result) => {
+                    self.mark_rpc_success();
+                    self.mark_rpc_success();
                     self.circuit_breaker.record_success();
                     return Ok(result);
                 }
@@ -2099,6 +2137,43 @@ pub struct BatchFeeEstimate {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The bug this exists to prevent.** A client that has never spoken to Core is not healthy,
+    /// however willing it is to answer an HTTP request. `/health` used to be a hardcoded `true`,
+    /// which is exactly this mistake with no way to notice it.
+    #[test]
+    fn a_client_that_never_reached_core_is_not_live() {
+        let rpc = BitcoinRpc::new("127.0.0.1", 8332, "u", "p").expect("rpc");
+        let (reachable, age) = rpc.core_liveness(120);
+        assert!(!reachable, "never having succeeded is not health");
+        assert_eq!(age, u64::MAX, "and the age must say never, not zero");
+    }
+
+    /// A success makes it live, and the reported age is fresh.
+    #[test]
+    fn a_successful_call_marks_core_live() {
+        let rpc = BitcoinRpc::new("127.0.0.1", 8332, "u", "p").expect("rpc");
+        rpc.mark_rpc_success();
+        let (reachable, age) = rpc.core_liveness(120);
+        assert!(reachable);
+        assert!(age <= 1, "age should be ~0, got {age}");
+    }
+
+    /// **Silence is the failure mode that matters.** vm7's Core did not return errors — it stopped
+    /// existing, and the node kept reporting health because nothing asked how long it had been
+    /// since Core last answered. A zero staleness budget makes any past success already stale.
+    #[test]
+    fn a_stale_success_stops_counting_as_live() {
+        let rpc = BitcoinRpc::new("127.0.0.1", 8332, "u", "p").expect("rpc");
+        rpc.mark_rpc_success();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let (reachable, age) = rpc.core_liveness(0);
+        assert!(
+            !reachable,
+            "a success {age}s old must not count with a 0s budget"
+        );
+    }
+
     use super::*;
 
     #[test]

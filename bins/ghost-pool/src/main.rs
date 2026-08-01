@@ -7717,6 +7717,21 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Report Ghost Core's liveness on /health, so a node whose Core has died stops claiming to be
+    // healthy. `healthy` used to be a literal `true`; on 2026-08-01 vm7 served it for an hour with
+    // Core dead underneath and nothing — dashboard, load balancer, operator — could tell.
+    //
+    // Two template refreshes' worth of silence is the staleness bound: one missed refresh is a
+    // hiccup, two in a row means Core is not answering.
+    {
+        let rpc_for_health = Arc::clone(&rpc);
+        let stale_after = (config.pool.template_refresh_ms() / 1000)
+            .saturating_mul(2)
+            .max(120);
+        verification_state =
+            verification_state.with_core_health(move || rpc_for_health.core_liveness(stale_after));
+    }
+
     // Wire Prometheus metrics to verification state
     verification_state = verification_state.with_metrics(Arc::clone(&metrics));
 
