@@ -145,6 +145,14 @@ ledger only grows.
       settlement failing cannot take reorg detection down with it
 - [x] `OBSERVED_SETTLEMENT_HEIGHT` gate, UNARMED at `u64::MAX`, dry-run below it
 - [x] red-before test: a non-submitting node settles (fails on main today)
+- [x] **settlement driven by the REAL coinbase builder, and a reorg round trip.** Every other
+      fixture wrote the scriptSig longhand, which proves the parser agrees with the fixture — not
+      that it agrees with `coinbase_scriptsig`. Those two drifting apart is only discoverable on a
+      won block, so `coinbase_scriptsig` is now `pub(crate)` and the settlement test builds its
+      bytes with it. The consensus ceiling is asserted on those same bytes.
+      The round trip: settle → orphan → reverse (work owed again, by the amount *recorded*) →
+      reverse again is a no-op, not a second credit → block returns → settles through the same
+      row. That last step is why settlement is a flag rather than a deletion.
 - [x] **the recovery closes its own loop.** `ProposalSyncHandler` is registered on the mesh, so a
       node both asks for a proposal a won block names and serves one to a peer that asks. Asking is
       not enough on its own: the answer lands after the block was observed, and the forward scan is

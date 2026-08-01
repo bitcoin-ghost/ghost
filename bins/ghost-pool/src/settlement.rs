@@ -706,6 +706,102 @@ mod tests {
         assert_eq!(db.list_deferred_settlements().expect("deferred").len(), 1);
     }
 
+    /// Build the winning scriptSig with the **real** template code, not by hand.
+    ///
+    /// Every other fixture here writes the bytes out longhand, which proves the parser agrees with
+    /// the fixture — not that it agrees with the builder. If `coinbase_scriptsig` and
+    /// `extract_payout_tag` ever drift apart, only this catches it, and the alternative place to
+    /// find out is a won block that no node can settle.
+    fn scriptsig_from_the_real_builder(payout: [u8; 32]) -> Vec<u8> {
+        use crate::template::{TemplateConfig, TemplateProcessor};
+        let rpc =
+            Arc::new(ghost_common::rpc::BitcoinRpc::new("127.0.0.1", 8332, "u", "p").expect("rpc"));
+        let processor = TemplateProcessor::new(
+            TemplateConfig {
+                coinbase_extra: "GHOST PublicPool".to_string(),
+                pool_payout_address: ADDRESS.to_string(),
+                node_commitment: Some([0x7Au8; 20]),
+                ..Default::default()
+            },
+            rpc,
+            ghost_policy::PolicyProfile::permissive(),
+            Default::default(),
+        );
+        processor
+            .coinbase_scriptsig(960_001, Some(payout), 20)
+            .expect("the real builder must produce a scriptSig")
+    }
+
+    /// **End to end through the real coinbase builder.** The bytes a winning node would actually
+    /// put on-chain are parsed by the settlement path and produce a settlement.
+    #[test]
+    fn a_scriptsig_from_the_real_builder_settles() {
+        let (db, observer) = non_submitting_node(4);
+        let scriptsig = scriptsig_from_the_real_builder(PROPOSAL_HASH);
+
+        // The consensus ceiling, checked on the same bytes rather than in the abstract.
+        assert!(
+            scriptsig.len() + 20 <= 100,
+            "scriptSig {} bytes + 20 extranonce breaches the 100-byte limit",
+            scriptsig.len()
+        );
+
+        match observer.settle_from_scriptsig("0000real", 960_001, &scriptsig) {
+            SettleOutcome::Settled(applied) => assert_eq!(applied.shares_marked, 4),
+            other => panic!("the real builder's coinbase did not settle: {other:?}"),
+        }
+        assert_eq!(db.get_miner_unpaid_stats(MINER).expect("stats").0, 0);
+    }
+
+    /// **The reorg round trip.** A won block settles, is orphaned and reversed — the work is owed
+    /// again — then returns to the main chain and settles once more.
+    ///
+    /// The middle step is the one that matters: settlement is recorded as a flag rather than a
+    /// deletion precisely so a block that comes back can re-settle through the same row. Deleting
+    /// it would leave the returning block looking like one that was never settled, which is the
+    /// same outcome but arrived at by luck.
+    #[test]
+    fn a_reorged_block_reverses_and_settles_again_when_it_returns() {
+        let (db, observer) = non_submitting_node(5);
+        let scriptsig = scriptsig_from_the_real_builder(PROPOSAL_HASH);
+
+        assert!(matches!(
+            observer.settle_from_scriptsig("0000reorg", 960_001, &scriptsig),
+            SettleOutcome::Settled(_)
+        ));
+        assert_eq!(db.get_miner_unpaid_stats(MINER).expect("stats").0, 0);
+
+        // Orphaned: the work is owed again, and by the amount that was actually recorded.
+        let reversed = observer
+            .on_block_disconnected("0000reorg")
+            .expect("a settled block must be reversible");
+        assert_eq!(reversed.shares_marked, 5);
+        assert_eq!(
+            db.get_miner_unpaid_stats(MINER).expect("stats").0,
+            5,
+            "reversal must put the work back"
+        );
+
+        // Reversing twice must not double-credit — a Disconnected event can arrive alongside a
+        // reconcile that already reversed it.
+        assert!(
+            observer.on_block_disconnected("0000reorg").is_none(),
+            "a second reversal must be a no-op, not a second credit"
+        );
+        assert_eq!(db.get_miner_unpaid_stats(MINER).expect("stats").0, 5);
+
+        // And back on the main chain.
+        assert!(matches!(
+            observer.settle_from_scriptsig("0000reorg", 960_001, &scriptsig),
+            SettleOutcome::Settled(_)
+        ));
+        assert_eq!(
+            db.get_miner_unpaid_stats(MINER).expect("stats").0,
+            0,
+            "a returning block must settle again through the same row"
+        );
+    }
+
     /// Below the activation height the observer matches and reports but writes nothing, so the
     /// dry run can prove matching works before the ledger behaviour changes fleet-wide.
     #[test]

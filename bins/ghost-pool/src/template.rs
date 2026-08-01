@@ -2761,7 +2761,11 @@ impl TemplateProcessor {
     /// can tell what it settled. It cannot be inferred from the outputs — those are fee-adjusted
     /// per node and so do not match any stored proposal. `None` means a treasury-only fallback
     /// coinbase, which settles nothing and needs no name.
-    fn coinbase_scriptsig(
+    /// `pub(crate)` so the settlement tests can build a scriptSig with **this** code rather than
+    /// hand-rolling one. A hand-written fixture proves the parser agrees with the fixture, not
+    /// that it agrees with the builder — and those two drifting apart is precisely the failure
+    /// that only shows up on a won block.
+    pub(crate) fn coinbase_scriptsig(
         &self,
         height: u64,
         payout_snapshot: Option<[u8; 32]>,
