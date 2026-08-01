@@ -29,6 +29,7 @@
 
 #![deny(unreachable_pub)]
 
+pub mod batch_genesis;
 pub mod coinbase;
 pub mod shares;
 

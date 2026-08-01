@@ -269,6 +269,25 @@ batches cannot both reach 67%.
 by adoption). Uses the tolerance machinery one final time. **Must complete while single-operator,
 i.e. before 2026-08-31** — target genesis by ~2026-08-20.
 
+- [x] **the conversion** — `crates/ghost-accounting/src/batch_genesis.rs`, 9 tests. It lives in
+      `ghost-accounting` because that is where `WORK_SCALE` lives, so the two scales meet in one
+      place instead of a constant being copied.
+      - Genesis **converts** the checkpoint, it does not recompute from local shares. Recomputing
+        would reintroduce the exact divergence the checkpoint exists to have settled — eight
+        slightly different unpaid ledgers giving eight slightly different genesis roots.
+      - The scales differ: checkpoint 1e12, batch chain 1e6. The ratio is *derived* from both, so
+        changing either cannot leave a hardcoded number quietly wrong.
+      - **Truncates, never rounds up.** Under-crediting by a millionth of a share is immaterial;
+        crediting work nobody proved is a different kind of thing.
+      - The discarded remainder is **reported** (`GenesisRounding`), not swallowed. A conversion
+        that quietly loses balance is how an unexplained drift begins.
+      - `prev_batch_hash` is the checkpoint hash, so the first link points at the object that
+        authorises it. A zero parent would be a chain anyone could start.
+      - No shares in the batch: the work is in the balances, and re-listing shares would invite a
+        validator to re-derive numbers that were agreed by vote rather than by arithmetic.
+- [ ] OPEN: which checkpoint (height) is genesis — operator decision, see "Open decisions"
+- [ ] the ceremony itself: pick it, sign it, adopt it fleet-wide
+
 ### WP-5 — shadow run + trust gate
 Both systems live; only checkpoints feed the coinbase. Gate: byte-identical `(seq, state_root)`
 across all 8 for a sustained window, zero quorum stalls, drift vs checkpoints bounded and
