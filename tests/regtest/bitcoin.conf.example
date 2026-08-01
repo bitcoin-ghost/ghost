@@ -1,0 +1,10 @@
+regtest=1
+server=1
+listen=0
+rpcuser=rt
+rpcpassword=rt
+fallbackfee=0.0001
+[regtest]
+rpcport=18999
+zmqpubsequence=tcp://127.0.0.1:28999
+zmqpubhashblock=tcp://127.0.0.1:28998
