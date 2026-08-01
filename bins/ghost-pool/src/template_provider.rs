@@ -1272,12 +1272,37 @@ fn create_new_template(
             "Coinbase1 scriptSig shorter than expected BIP34 height push"
         ));
     }
-    let scriptsig_prefix = &scriptsig_full[..height_push_len];
+    // Carry the payout tag through into the prefix.
+    //
+    // SRI appends its pool tag and the extranonce AFTER `coinbase_prefix`, so anything left out
+    // here never reaches the mined coinbase. The pool tag is deliberately excluded (SRI stamps its
+    // own, and including it too is the double-stamp described above), but the payout commitment
+    // must survive — it is how a node later recognises a won block as one it can settle.
+    //
+    // Detected rather than assumed: the tag is one push immediately after the height, so its
+    // presence is checkable. A treasury-only coinbase carries none, and then the prefix is
+    // height-only exactly as before.
+    const PAYOUT_TAG_TOTAL: usize = 1 + 4 + ghost_common::coinbase_tags::PAYOUT_ID_LEN;
+    let payout_tag_len = {
+        let rest = &scriptsig_full[height_push_len..];
+        let is_tag = rest.len() >= PAYOUT_TAG_TOTAL
+            && rest[0] as usize == 4 + ghost_common::coinbase_tags::PAYOUT_ID_LEN
+            && &rest[1..5] == ghost_common::coinbase_tags::PAYOUT_TAG_MAGIC.as_slice();
+        if is_tag {
+            PAYOUT_TAG_TOTAL
+        } else {
+            0
+        }
+    };
+    let prefix_len = height_push_len + payout_tag_len;
+    let scriptsig_prefix = &scriptsig_full[..prefix_len];
 
     debug!(
-        "TDP coinbase_prefix: {} bytes (height-only, stripping {} tag bytes), hex: {}",
+        "TDP coinbase_prefix: {} bytes (height + {} payout-tag bytes, stripping {} pool-tag \
+         bytes), hex: {}",
         scriptsig_prefix.len(),
-        scriptsig_full.len() - height_push_len,
+        payout_tag_len,
+        scriptsig_full.len() - prefix_len,
         hex::encode(scriptsig_prefix)
     );
 

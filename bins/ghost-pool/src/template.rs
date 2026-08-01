@@ -246,10 +246,18 @@ impl TemplateConfig {
         }
 
         // H-MINE-3: Validate coinbase_extra length to prevent script_len truncation
-        // Script sig format: height_bytes (1-5 bytes) + coinbase_extra + extranonce (8 bytes)
-        // Total must fit in a single byte (max 255) for BIP34 compliance.
-        // Maximum safe length: 255 - 5 (max height bytes) - 8 (extranonce) = 242 bytes
-        const MAX_COINBASE_EXTRA_LEN: usize = 242;
+        // Script sig format: height (1-5) + payout tag (21) + coinbase_extra + extranonce.
+        //
+        // The bound here used to be 242, derived from the u8 length field (255 - 5 - 8). That is
+        // the wrong limit: **consensus caps a coinbase scriptSig at 100 bytes**, so anything
+        // between 100 and 255 passes validation and then builds blocks the network rejects — a
+        // failure that only shows up as a won block being lost.
+        //
+        // The binding case is the SV2 path, whose extranonce is 20 bytes (4 pool + 16 client)
+        // rather than the 8 reserved on the direct path:
+        //
+        //   100 - 5 (max height push) - 20 (extranonce) - 21 (payout tag) = 54
+        const MAX_COINBASE_EXTRA_LEN: usize = 54;
         if self.coinbase_extra.len() > MAX_COINBASE_EXTRA_LEN {
             return Err(TemplateError::ConfigError(format!(
                 "coinbase_extra is too long: {} bytes (max {} bytes). This would cause script_len \
@@ -1238,24 +1246,10 @@ impl TemplateProcessor {
         // Previous output index (0xffffffff for coinbase)
         coinbase1.extend_from_slice(&0xffffffffu32.to_le_bytes());
 
-        // Script sig (height in BIP34 format + extra data)
-        let height_bytes = self.encode_height(height);
-        let extra = self.config.coinbase_extra.as_bytes();
-        let script_len = height_bytes.len() + extra.len() + 8; // +8 for extranonce space
-
-        // H-MINE-3: Validate script_len fits in u8 to prevent silent truncation
-        if script_len > 255 {
-            return Err(TemplateError::ConfigError(format!(
-                "Coinbase script too long: {} bytes (max 255). coinbase_extra is {} bytes, \
-                 which exceeds the safe limit. Reduce coinbase_extra to prevent corruption.",
-                script_len,
-                extra.len()
-            )));
-        }
-
-        coinbase1.push(script_len as u8);
-        coinbase1.extend_from_slice(&height_bytes);
-        coinbase1.extend_from_slice(extra);
+        // Script sig: height, the payout commitment, then the pool tag. See coinbase_scriptsig.
+        let scriptsig = self.coinbase_scriptsig(height, payout_snapshot, 8)?;
+        coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
+        coinbase1.extend_from_slice(&scriptsig);
 
         // Coinbase2: extranonce end + sequence + outputs + locktime
         // NO witness data here - that's separate for block assembly
@@ -1540,24 +1534,11 @@ impl TemplateProcessor {
         // Previous output index (0xffffffff for coinbase)
         coinbase1.extend_from_slice(&0xffffffffu32.to_le_bytes());
 
-        // Script sig (height in BIP34 format + extra data)
-        let height_bytes = self.encode_height(height);
-        let extra = self.config.coinbase_extra.as_bytes();
-        let script_len = height_bytes.len() + extra.len() + 8; // +8 for extranonce space
-
-        // H-MINE-3: Validate script_len fits in u8 to prevent silent truncation
-        if script_len > 255 {
-            return Err(TemplateError::ConfigError(format!(
-                "Coinbase script too long: {} bytes (max 255). coinbase_extra is {} bytes, \
-                 which exceeds the safe limit. Reduce coinbase_extra to prevent corruption.",
-                script_len,
-                extra.len()
-            )));
-        }
-
-        coinbase1.push(script_len as u8);
-        coinbase1.extend_from_slice(&height_bytes);
-        coinbase1.extend_from_slice(extra);
+        // Script sig: height then the pool tag. No payout commitment — this path builds no
+        // settleable payout. See coinbase_scriptsig.
+        let scriptsig = self.coinbase_scriptsig(height, None, 8)?;
+        coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
+        coinbase1.extend_from_slice(&scriptsig);
 
         // Coinbase2: extranonce end + sequence + outputs + locktime
         let mut coinbase2 = Vec::new();
@@ -2680,24 +2661,11 @@ impl TemplateProcessor {
         // Previous output index (0xffffffff for coinbase)
         coinbase1.extend_from_slice(&0xffffffffu32.to_le_bytes());
 
-        // Script sig (height in BIP34 format + extra data)
-        let height_bytes = self.encode_height(height);
-        let extra = self.config.coinbase_extra.as_bytes();
-        let script_len = height_bytes.len() + extra.len() + 8; // +8 for extranonce space
-
-        // H-MINE-3: Validate script_len fits in u8 to prevent silent truncation
-        if script_len > 255 {
-            return Err(TemplateError::ConfigError(format!(
-                "Coinbase script too long: {} bytes (max 255). coinbase_extra is {} bytes, \
-                 which exceeds the safe limit. Reduce coinbase_extra to prevent corruption.",
-                script_len,
-                extra.len()
-            )));
-        }
-
-        coinbase1.push(script_len as u8);
-        coinbase1.extend_from_slice(&height_bytes);
-        coinbase1.extend_from_slice(extra);
+        // Script sig: height then the pool tag. No payout commitment — this path builds no
+        // settleable payout. See coinbase_scriptsig.
+        let scriptsig = self.coinbase_scriptsig(height, None, 8)?;
+        coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
+        coinbase1.extend_from_slice(&scriptsig);
 
         // Coinbase2: extranonce end + sequence + outputs + locktime
         // NO witness data - that's tracked separately
@@ -2759,6 +2727,67 @@ impl TemplateProcessor {
         witness_data.nonce = [0u8; 32];
 
         Ok((coinbase1, coinbase2, witness_data))
+    }
+
+    /// Assemble the coinbase scriptSig content, excluding the extranonce the miner fills in.
+    ///
+    /// One implementation because there were three, byte-identical, in three coinbase builders.
+    /// Anything that changes the scriptSig has to change in all of them or the paths produce
+    /// different blocks — and the length check below only guarded one of them.
+    ///
+    /// Layout, and the order is load-bearing:
+    ///
+    /// ```text
+    ///   [BIP34 height push] [payout tag push]? [pool tag, RAW] .. [extranonce]
+    /// ```
+    ///
+    /// The pool tag is raw text, not a push, so anything reading the scriptSig as a push sequence
+    /// stops when it reaches it. Machine-readable commitments therefore go first, while the bytes
+    /// are still well-formed pushes; the human-readable tag trails where nothing parses it.
+    ///
+    /// `payout_snapshot` names the payout this coinbase pays, so a node seeing the block on-chain
+    /// can tell what it settled. It cannot be inferred from the outputs — those are fee-adjusted
+    /// per node and so do not match any stored proposal. `None` means a treasury-only fallback
+    /// coinbase, which settles nothing and needs no name.
+    fn coinbase_scriptsig(
+        &self,
+        height: u64,
+        payout_snapshot: Option<[u8; 32]>,
+        extranonce_len: usize,
+    ) -> Result<Vec<u8>, TemplateError> {
+        let height_bytes = self.encode_height(height);
+        let payout_tag = payout_snapshot
+            .map(|hash| {
+                let mut id = [0u8; ghost_common::coinbase_tags::PAYOUT_ID_LEN];
+                id.copy_from_slice(&hash[..ghost_common::coinbase_tags::PAYOUT_ID_LEN]);
+                ghost_common::coinbase_tags::encode_payout_tag(&id)
+            })
+            .unwrap_or_default();
+        let extra = self.config.coinbase_extra.as_bytes();
+
+        let total = height_bytes.len() + payout_tag.len() + extra.len() + extranonce_len;
+
+        // Consensus caps a coinbase scriptSig at 100 bytes. The previous check guarded only the
+        // u8 length field at 255, so a long tag could build blocks the network rejects — a failure
+        // that surfaces as "we mined a block and lost it", which is the worst way to learn it.
+        const MAX_COINBASE_SCRIPTSIG: usize = 100;
+        if total > MAX_COINBASE_SCRIPTSIG {
+            return Err(TemplateError::ConfigError(format!(
+                "Coinbase scriptSig would be {total} bytes, over the {MAX_COINBASE_SCRIPTSIG} \
+                 consensus limit (height {}, payout tag {}, pool tag {}, extranonce {}). \
+                 Shorten coinbase_extra.",
+                height_bytes.len(),
+                payout_tag.len(),
+                extra.len(),
+                extranonce_len
+            )));
+        }
+
+        let mut out = Vec::with_capacity(height_bytes.len() + payout_tag.len() + extra.len());
+        out.extend_from_slice(&height_bytes);
+        out.extend_from_slice(&payout_tag);
+        out.extend_from_slice(extra);
+        Ok(out)
     }
 
     /// Encode block height for coinbase (BIP34)
@@ -4006,28 +4035,33 @@ mod tests {
             "Short coinbase_extra should pass validation"
         );
 
-        // coinbase_extra at exactly 242 bytes (max safe) should pass
+        // The bound is the CONSENSUS scriptSig limit, not the u8 length field.
+        //
+        // This used to accept 242 bytes and reject 243, derived from 255 - 5 - 8. That is the wrong
+        // limit: consensus caps a coinbase scriptSig at 100 bytes, so every value between 100 and
+        // 242 passed validation and produced blocks the network rejects. The real ceiling leaves
+        // room for the max height push, the SV2 extranonce and the payout tag:
+        // 100 - 5 - 20 - 21 = 54.
         let config = TemplateConfig {
-            coinbase_extra: "A".repeat(242),
+            coinbase_extra: "A".repeat(54),
             pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             mining_mode: MiningMode::PublicPool,
             ..Default::default()
         };
         assert!(
             config.validate().is_ok(),
-            "242-byte coinbase_extra should pass (max safe length)"
+            "54-byte coinbase_extra should pass (max that fits the consensus limit)"
         );
 
-        // coinbase_extra at 243 bytes should fail (would overflow script_len)
         let config = TemplateConfig {
-            coinbase_extra: "A".repeat(243),
+            coinbase_extra: "A".repeat(55),
             pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
             mining_mode: MiningMode::PublicPool,
             ..Default::default()
         };
         assert!(
             config.validate().is_err(),
-            "243-byte coinbase_extra should fail (exceeds safe limit)"
+            "55-byte coinbase_extra should fail — it would breach the 100-byte scriptSig limit"
         );
 
         // Very long coinbase_extra should definitely fail
@@ -4674,31 +4708,43 @@ mod tests {
     /// H-MINE-3-TEST-2: Test that runtime script_len validation works
     #[test]
     fn test_script_len_runtime_validation() {
-        // This is a defensive test to ensure that even if config validation is bypassed,
-        // the runtime check in build_coinbase_parts catches the overflow.
-        // We can't easily bypass config validation, but we can verify the error message
-        // pattern matches what we expect.
+        // Defensive test: even if config validation is bypassed, building a coinbase must refuse a
+        // scriptSig the network would reject.
+        //
+        // This previously asserted that a 200-byte coinbase_extra "should work", which encoded the
+        // wrong limit. 200 bytes builds a 212-byte scriptSig, and consensus caps a coinbase
+        // scriptSig at 100 — so what the old test asserted was the ability to mine blocks that get
+        // rejected. It passed because the only guard was the u8 length field at 255.
+        let make = |extra: &str| {
+            let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+            TemplateProcessor::new(
+                TemplateConfig {
+                    coinbase_extra: extra.to_string(),
+                    pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                    mining_mode: MiningMode::PublicPool,
+                    ..Default::default()
+                },
+                rpc,
+                PolicyProfile::permissive(),
+                ReaperConfig::default(),
+            )
+        };
 
-        // Create a config with a barely-safe coinbase_extra
-        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-        let processor = TemplateProcessor::new(
-            TemplateConfig {
-                coinbase_extra: "A".repeat(200), // Safe length
-                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-                mining_mode: MiningMode::PublicPool,
-                ..Default::default()
-            },
-            rpc,
-            PolicyProfile::permissive(),
-            ReaperConfig::default(),
+        // A realistic tag builds fine.
+        assert!(
+            make("GHOST PublicPool")
+                .build_coinbase_parts(800_000, 312_500_000, &None)
+                .is_ok(),
+            "the shipped tag must build"
         );
 
-        // This should succeed
-        let result = processor.build_coinbase_parts(800_000, 312_500_000, &None);
+        // One that would breach the consensus limit must be refused at build time, not mined.
+        let err = make(&"A".repeat(200))
+            .build_coinbase_parts(800_000, 312_500_000, &None)
+            .expect_err("a 212-byte scriptSig must be refused");
         assert!(
-            result.is_ok(),
-            "200-byte coinbase_extra should work at runtime: {:?}",
-            result.err()
+            format!("{err}").contains("consensus limit"),
+            "expected the consensus-limit error, got: {err}"
         );
     }
 
