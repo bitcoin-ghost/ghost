@@ -293,7 +293,7 @@ pub struct ShareProof {
 /// round-trip is idempotent, so applying it on both the signer and the verifier
 /// yields the identical value that actually crossed the wire — used by
 /// `ShareProof::signing_bytes` so GHOST-09 signatures survive gossip.
-fn canonical_json_f64(x: f64) -> f64 {
+pub(crate) fn canonical_json_f64(x: f64) -> f64 {
     serde_json::to_string(&x)
         .ok()
         .and_then(|s| serde_json::from_str::<f64>(&s).ok())

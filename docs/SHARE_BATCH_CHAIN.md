@@ -132,6 +132,19 @@ Types, canonical order `(timestamp asc, share_hash asc)` in **internal** byte or
 (`CAST(ROUND(work*1e6) AS INTEGER)` on `canonical_json_f64(work)`), `state_root`, send-side packing
 bound. Pure library code, exhaustively tested for determinism before any wiring.
 
+- [x] **deterministic core** — `crates/ghost-common/src/share_batch.rs`. `micro_work`,
+      `canonical_cmp`/`canonical_sort`, `fold_shares`, `compute_state_root`. Pure functions only;
+      nothing reads a clock, a database or the network, and nothing is wired into a runtime path.
+      11 tests: quantisation matches the SQL (incl. half-away-from-zero), ordering and folding are
+      permutation-invariant over 200 shuffles each with a fixed-seed PRNG, folding is associative
+      across batch boundaries, eight simulated nodes with different arrival orders derive an
+      identical root, a 1-micro-work change is detected, `seq`/`close_ts` are bound, length prefixes
+      make address boundaries unambiguous, and a golden vector pins `SbcStateRoot/v1`.
+      Unattributed shares (no payout address) are **counted**, not silently dropped as the existing
+      INNER JOIN does.
+- [ ] `ShareBatch` type + `batch_hash` (needs D11's settlement-pair field settled first)
+- [ ] send-side packing bound (needs the wire budget, i.e. D12)
+
 ### WP-3 — batch consensus manager (dark)
 Propose/vote/finalise/sync. Round-robin `voters[seq % n]`. **Stall escalation is required** —
 round-robin alone deadlocks on an offline proposer because `seq` cannot be skipped in a hash chain:
