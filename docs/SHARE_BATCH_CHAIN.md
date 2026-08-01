@@ -640,6 +640,63 @@ to delay genesis.
 ⚠ Tooling note: never read a live pool DB with `immutable=1` — it ignores the WAL and reports
 `database disk image is malformed`. vm5 looked corrupt for exactly that reason and is healthy.
 
+## Deploy package — the sequence when we go
+
+Four things are authorised and belong in **one** package rather than three separate touches at
+production. Ordered so risk comes down before anything new goes on.
+
+### Stage 0 — reduce risk first (no new code)
+
+Both of these make production safer on their own and neither depends on the branch.
+
+1. **`pool_signature` → `"GHOST PublicPool"`** on all 8, in `/etc/ghost/pool-config.toml`, then
+   restart `sri-pool`. Takes the coinbase scriptSig **99 → 91 of 100 bytes**. It is at 99 *today*.
+   - Verify: `sha256` the config change per node; after restart confirm `pool_sv2` binds `:34255`
+     (it does not bind until its TDP handshake completes, ~60s — see
+     `gotcha_pool_sv2_startup_ordering`), and that miners reconnect.
+   - Rollback: restore the config file, restart.
+
+2. **Revert #571** (read-pool connections) and re-ship #574 + #575 alone. Returns ~93 MB RSS per
+   node on a fleet that is swapping (vm1 `si=4MB/s`, free 137 MB).
+   - Verify: RSS per node before/after; `free` shows swap-in dropping.
+   - Rollback: the prior binary, backed up before the swap.
+
+### Stage 1 — the branch (schema v49, all gates unarmed)
+
+Everything on `fix/observed-settlement`. Additive migration, guarded and idempotent; every height
+gate is `u64::MAX` and nothing acts on a verdict.
+
+- **Canary vm4 first**, then vm3, vm2, vm1 (genesis last) — and vm5-8 in between per the usual
+  order. Back up the binary before each swap.
+- Verify per node: `is-active`, `/health`, v49 applied (`PRAGMA user_version`), round advancing,
+  0 errors in the first 15 minutes, mesh peers ≥ 6.
+- What to watch that is **new** in this build:
+  - `settlement observer started (dry run below the activation height)` on boot.
+  - Reconciliation ticking every 5 min without error.
+  - `DRY RUN: would settle this block` if the pool wins — the dry-run proof that matching works.
+  - Skeletons arriving: `coinbase_skeletons` gaining rows, `unverified_bindings` staying small.
+    A backlog that grows means skeletons are not arriving, which is transport, not shares.
+- Rollback: prior binary. v49 is additive so a downgrade reads the old columns fine; the new
+  tables are simply ignored.
+
+### Stage 2 — genesis
+
+Pick the height at deploy time (operator delegated this). Any recent finalised checkpoint works —
+the 2026-08-01 preview found all 8 nodes byte-identical at 960,548-550, so this is a timing choice.
+Re-run the preview against the then-current height first, because the property is what matters, not
+the number.
+
+### Stage 3 — shadow run
+
+Both systems live, only checkpoints feeding the coinbase. Gate to pass before anything is armed:
+byte-identical `(seq, state_root)` across all 8 for a sustained window, zero quorum stalls, drift
+vs checkpoints bounded and non-growing.
+
+### Not in this package
+
+Arming any height gate. `SHARE_ADDR_BIND_HEIGHT` and `OBSERVED_SETTLEMENT_HEIGHT` stay at
+`u64::MAX` until the shadow run passes — that is a separate, deliberate release.
+
 ## Open decisions
 
 - Genesis source height (after a read-only preview-hash comparison across all 8)
