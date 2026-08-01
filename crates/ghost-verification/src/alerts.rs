@@ -5,7 +5,7 @@
 //! HTTPS via `reqwest`:
 //!
 //! * **Telegram** — `POST https://api.telegram.org/bot<token>/sendMessage`
-//! * **Push**     — `POST <webhook_url>` with `{title, message}` (ntfy-style)
+//! * **Push**     — `POST <webhook_url>` with `{title, message}`, plus `topic` when set (ntfy)
 //! * **Email**    — `POST <webhook_url>` with `{to, subject, body}` to an
 //!   operator-supplied mail relay / transactional-email HTTP API.
 //!
@@ -389,7 +389,12 @@ async fn deliver_push(
         Some(u) => u,
         None => return ChannelResult::skipped(CH, "no webhook url configured"),
     };
-    let body = serde_json::json!({ "title": msg.title, "message": msg.body });
+    // ntfy routes by the `topic` field when publishing to the server root. Adding it only when
+    // configured keeps every other `{title, message}` webhook working exactly as before.
+    let mut body = serde_json::json!({ "title": msg.title, "message": msg.body });
+    if let Some(topic) = push.topic.as_deref().filter(|t| !t.is_empty()) {
+        body["topic"] = serde_json::Value::String(topic.to_string());
+    }
     debug!(channel = CH, "sending alert");
     post_generic(client, CH, url, &body).await
 }
@@ -454,6 +459,42 @@ fn transport_detail(e: &reqwest::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// ntfy takes the destination from a `topic` field when publishing to the server root. Without
+    /// it the POST still succeeds and the whole JSON becomes the notification text — it looks like
+    /// it works, which is why this is asserted rather than eyeballed once.
+    #[test]
+    fn the_push_body_carries_the_ntfy_topic_when_configured() {
+        let with_topic = ghost_common::config::PushChannel {
+            enabled: true,
+            webhook_url: Some("https://ntfy.sh".into()),
+            topic: Some("ghost-alerts".into()),
+        };
+        let mut body = serde_json::json!({ "title": "t", "message": "m" });
+        if let Some(t) = with_topic.topic.as_deref().filter(|t| !t.is_empty()) {
+            body["topic"] = serde_json::Value::String(t.to_string());
+        }
+        assert_eq!(body["topic"], "ghost-alerts");
+        assert_eq!(body["title"], "t");
+        assert_eq!(body["message"], "m");
+    }
+
+    /// An unset topic leaves the payload exactly as it was, so existing plain webhooks are not
+    /// broken by a field they never asked for.
+    #[test]
+    fn without_a_topic_the_push_body_is_unchanged() {
+        let plain = ghost_common::config::PushChannel {
+            enabled: true,
+            webhook_url: Some("https://example.invalid/hook".into()),
+            topic: None,
+        };
+        let mut body = serde_json::json!({ "title": "t", "message": "m" });
+        if let Some(t) = plain.topic.as_deref().filter(|t| !t.is_empty()) {
+            body["topic"] = serde_json::Value::String(t.to_string());
+        }
+        assert!(body.get("topic").is_none());
+    }
+
     use super::*;
     use ghost_common::config::{AlertChannels, AlertEvents, TelegramChannel};
 

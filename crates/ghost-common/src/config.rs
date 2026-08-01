@@ -2117,8 +2117,23 @@ pub struct PushChannel {
     #[serde(default)]
     pub enabled: bool,
     /// HTTP(S) endpoint that receives the push payload.
+    ///
+    /// For ntfy this is the **server root** (`https://ntfy.sh`), not the topic URL — see `topic`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+    /// ntfy topic to publish to.
+    ///
+    /// ntfy only honours JSON publishing at the server root, taking the destination from a `topic`
+    /// field in the body. POST the same JSON to `https://ntfy.sh/<topic>` and it is accepted, but
+    /// the whole JSON blob becomes the notification *text* and the title is lost — it looks like it
+    /// works, which is the worst way for it not to.
+    ///
+    /// Left unset, the payload is unchanged and any plain `{title, message}` webhook still works.
+    ///
+    /// **A topic is a shared secret**: on the public ntfy.sh anyone who knows it can read the
+    /// alerts and publish to them. Use a long random one, or a server with auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 /// Telegram delivery via the Bot API `sendMessage` method.
