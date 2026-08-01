@@ -2018,6 +2018,44 @@ impl Database {
         })
     }
 
+    /// Prune payout proposals that can no longer be needed.
+    ///
+    /// The table stores every proposal but the running node only ever reads one — the approved row.
+    /// Settlement widened that slightly: matching a won block needs whichever proposal armed *that
+    /// block's template*, which may be older than the currently-approved one, because miners work a
+    /// template for a while and consensus approves new proposals meanwhile. So a rolling window is
+    /// required, not a single row.
+    ///
+    /// Two classes are kept regardless of age:
+    ///
+    /// - anything a `settled_blocks` row names, and
+    /// - anything a share's `paid_in_proposal_hash` points at.
+    ///
+    /// Those are the provenance of real payouts. Delete them and the hash on a settled share still
+    /// exists but nothing can say who it paid or from what cutoff, which is exactly the question a
+    /// payout dispute asks.
+    ///
+    /// Everything else older than `cutoff_ts` is a proposal that armed a coinbase which never won.
+    /// It has served its purpose and references nothing.
+    pub fn prune_payout_proposals(&self, cutoff_ts: i64) -> GhostResult<usize> {
+        self.with_connection(|conn| {
+            let removed = conn
+                .execute(
+                    "DELETE FROM payout_proposals
+                      WHERE created_at < ?1
+                        AND is_approved = 0
+                        AND proposal_hash NOT IN (SELECT proposal_hash FROM settled_blocks)
+                        AND proposal_hash NOT IN (
+                            SELECT DISTINCT paid_in_proposal_hash FROM shares
+                             WHERE paid_in_proposal_hash IS NOT NULL
+                        )",
+                    params![cutoff_ts],
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(removed)
+        })
+    }
+
     /// Blocks this node believes it has settled and not reversed.
     ///
     /// The reconciliation sweep re-checks each against the chain: a `Disconnected` event can be
@@ -11910,6 +11948,110 @@ mod tests {
             db.list_unreversed_settled_blocks().unwrap(),
             vec![("0000returns".to_string(), 900_000)]
         );
+    }
+
+    /// Old proposals that armed a coinbase which never won are dead weight — on production, 1,234
+    /// stored and not one referenced by anything. They prune.
+    ///
+    /// What must NOT prune is anything a real payout points at, at any age: the approved row (a
+    /// restart rebuilds its coinbase from it), anything a settled block names, and anything a paid
+    /// share references. Losing the last one leaves a settled share carrying a hash that nothing
+    /// can explain.
+    #[test]
+    fn pruning_proposals_keeps_everything_a_payout_depends_on() {
+        let db = Database::in_memory().unwrap();
+        let now = ledger_now_s();
+        let old = now - 30 * 24 * 3600;
+
+        // Four old proposals, three of which are load-bearing for different reasons.
+        for (h, approved) in [
+            ([0x01u8; 32], false), // plain old — must go
+            ([0x02u8; 32], true),  // currently approved — restart needs it
+            ([0x03u8; 32], false), // a settled block names it
+            ([0x04u8; 32], false), // a paid share references it
+        ] {
+            db.store_payout_proposal(&h, 1, 900_000, "{}").unwrap();
+            db.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE payout_proposals SET created_at = ?2, is_approved = ?3
+                      WHERE proposal_hash = ?1",
+                    rusqlite::params![h.to_vec(), old, approved as i64],
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // A settled block naming 0x03.
+        let miner = "bc1qprune.worker";
+        db.upsert_miner(&ledger_miner(miner, now)).unwrap();
+        db.insert_share(&ledger_share(1, miner, "prune_share", now - 600))
+            .unwrap();
+        db.settle_block_atomic(
+            "0000settled",
+            900_000,
+            &[0x03u8; 32],
+            &[0xAAu8; 32],
+            &[],
+            now,
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .expect("settle");
+
+        // A paid share referencing 0x04.
+        db.mark_miners_paid(&[0x04u8; 32], &[miner.to_string()], now)
+            .unwrap();
+
+        let removed = db.prune_payout_proposals(now - 24 * 3600).unwrap();
+        assert_eq!(removed, 1, "only the unreferenced old proposal should go");
+
+        let survivors: Vec<Vec<u8>> = db
+            .with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT proposal_hash FROM payout_proposals ORDER BY proposal_hash")
+                    .unwrap();
+                let rows: Vec<Vec<u8>> = stmt
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+                Ok(rows)
+            })
+            .unwrap();
+
+        assert_eq!(survivors.len(), 3);
+        assert!(
+            !survivors.contains(&[0x01u8; 32].to_vec()),
+            "unreferenced kept"
+        );
+        assert!(
+            survivors.contains(&[0x02u8; 32].to_vec()),
+            "approved pruned"
+        );
+        assert!(
+            survivors.contains(&[0x03u8; 32].to_vec()),
+            "settled-block provenance pruned"
+        );
+        assert!(
+            survivors.contains(&[0x04u8; 32].to_vec()),
+            "paid-share provenance pruned"
+        );
+    }
+
+    /// Recent proposals stay: a block won on a slightly stale template pays a proposal that is no
+    /// longer the approved one, and settlement has to be able to find it.
+    #[test]
+    fn pruning_proposals_keeps_the_recent_window() {
+        let db = Database::in_memory().unwrap();
+        let now = ledger_now_s();
+        db.store_payout_proposal(&[0x09u8; 32], 1, 900_000, "{}")
+            .unwrap();
+
+        let removed = db.prune_payout_proposals(now - 24 * 3600).unwrap();
+        assert_eq!(removed, 0, "a proposal inside the window must survive");
     }
 
     /// A PAID share older than the retention window is pruned (harmless audit

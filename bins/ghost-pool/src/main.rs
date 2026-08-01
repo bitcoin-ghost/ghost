@@ -8124,6 +8124,13 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         const PRUNE_INTERVAL_SECS: u64 = 3600;
         const SHARE_RETENTION_SECS: i64 = 24 * 3600;
+        /// How far back settlement may need to look up a proposal.
+        ///
+        /// A won block pays whatever was armed when ITS template was built, which can be older than
+        /// the currently-approved proposal — miners work a template while consensus approves new
+        /// ones. 24h covers that plus any reorg comfortably; at the observed ~160 proposals/day it
+        /// is well under a megabyte.
+        const PROPOSAL_RETENTION_SECS: i64 = 24 * 3600;
 
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(PRUNE_INTERVAL_SECS));
@@ -8137,6 +8144,24 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "Failed to prune old shares");
+                        }
+                    }
+
+                    // Payout proposals: the table only ever gets read for the approved row, plus a
+                    // recent window so settlement can match a block won on a slightly stale
+                    // template. Everything older that no payout references is a proposal which
+                    // armed a coinbase that never won — 1,234 such rows had accumulated on vm1 with
+                    // not one referenced by anything. The prune keeps the approved row and any
+                    // provenance a settled block or paid share depends on, at any age.
+                    let proposal_cutoff =
+                        chrono::Utc::now().timestamp() - PROPOSAL_RETENTION_SECS;
+                    match db_for_pruning.prune_payout_proposals(proposal_cutoff) {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            tracing::info!(deleted = count, "Pruned superseded payout proposals");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to prune payout proposals");
                         }
                     }
                 }
