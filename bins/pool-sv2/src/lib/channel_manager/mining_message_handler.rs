@@ -631,7 +631,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash, header80)) => {
-                        let share_work = standard_channel.get_target().difficulty_float();
+                        // Credit the target the JOB was issued against, not the channel's current one.
+                        // Vardiff moves the channel target while jobs are outstanding, so on a raise an accepted
+                        // share would be credited more work than its hash proves — and every peer that
+                        // re-derives difficulty from the hash then rejects it as below_difficulty.
+                        let share_work = match standard_channel.job_target(msg.job_id) {
+                            Some(t) => t.difficulty_float(),
+                            None => standard_channel.get_target().difficulty_float(),
+                        };
                         if let Some(ref sender) = self.share_webhook_sender {
                             // Bind the share to the coinbase it was mined against, so the node
                             // that received it can be proved rather than asserted.
@@ -682,7 +689,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase, header80)) => {
                         info!("SubmitSharesStandard: 💰 Block Found!!! 💰{share_hash}");
-                        let share_work = standard_channel.get_target().difficulty_float();
+                        // Credit the target the JOB was issued against, not the channel's current one.
+                        // Vardiff moves the channel target while jobs are outstanding, so on a raise an accepted
+                        // share would be credited more work than its hash proves — and every peer that
+                        // re-derives difficulty from the hash then rejects it as below_difficulty.
+                        let share_work = match standard_channel.job_target(msg.job_id) {
+                            Some(t) => t.difficulty_float(),
+                            None => standard_channel.get_target().difficulty_float(),
+                        };
                         if let Some(ref sender) = self.share_webhook_sender {
                             // Bind the share to the coinbase it was mined against, so the node
                             // that received it can be proved rather than asserted.
@@ -916,7 +930,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash, header80)) => {
-                        let share_work = extended_channel.get_target().difficulty_float();
+                        // Credit the target the JOB was issued against, not the channel's current one.
+                        // Vardiff moves the channel target while jobs are outstanding, so on a raise an accepted
+                        // share would be credited more work than its hash proves — and every peer that
+                        // re-derives difficulty from the hash then rejects it as below_difficulty.
+                        let share_work = match extended_channel.job_target(msg.job_id) {
+                            Some(t) => t.difficulty_float(),
+                            None => extended_channel.get_target().difficulty_float(),
+                        };
                         if let (Some(ref sender), true) = (&self.share_webhook_sender, attributable) {
                             // The full extranonce on an extended channel is the channel's
                             // prefix followed by the miner's own bytes; the coinbase commits to
@@ -990,7 +1011,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 channel_id
                             );
                         }
-                        let share_work = extended_channel.get_target().difficulty_float();
+                        // Credit the target the JOB was issued against, not the channel's current one.
+                        // Vardiff moves the channel target while jobs are outstanding, so on a raise an accepted
+                        // share would be credited more work than its hash proves — and every peer that
+                        // re-derives difficulty from the hash then rejects it as below_difficulty.
+                        let share_work = match extended_channel.job_target(msg.job_id) {
+                            Some(t) => t.difficulty_float(),
+                            None => extended_channel.get_target().difficulty_float(),
+                        };
                         if let Some(ref sender) = self.share_webhook_sender {
                             // The full extranonce on an extended channel is the channel's
                             // prefix followed by the miner's own bytes; the coinbase commits to

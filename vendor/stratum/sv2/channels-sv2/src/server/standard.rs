@@ -375,6 +375,18 @@ where
         &self.target
     }
 
+    /// Returns the target a specific job was issued against — the one `validate_share` judged a
+    /// share for that job by.
+    ///
+    /// Use this, not [`Self::get_target`], to decide how much work a share is worth. Under vardiff
+    /// the channel target moves while jobs are outstanding, and crediting an accepted share at the
+    /// *current* target rather than its *job's* target over-states the work whenever the target has
+    /// been raised since the job was issued. Downstream that share then claims more work than its
+    /// hash can prove, and any party that re-derives the difficulty from the hash will reject it.
+    pub fn job_target(&self, job_id: u32) -> Option<&Target> {
+        self.job_id_to_target.get(&job_id)
+    }
+
     /// Returns the nominal hashrate for this channel.
     pub fn get_nominal_hashrate(&self) -> f32 {
         self.nominal_hashrate
@@ -814,6 +826,108 @@ mod tests {
     use template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp};
 
     const SATS_AVAILABLE_IN_TEMPLATE: u64 = 5000000000;
+
+    /// **The property share crediting rests on.**
+    ///
+    /// A share is validated against the target its JOB was issued at, but the amount of work it is
+    /// credited was being read from the channel's CURRENT target. Under vardiff those differ the
+    /// moment the target is raised while a job is outstanding: the share is accepted (it beat the
+    /// old target) and then credited at the new, harder one, claiming work its hash cannot prove.
+    /// Any peer re-deriving difficulty from the hash rejects it.
+    ///
+    /// Observed in production: a hashrate burst drove the target 2,328 -> 815,982 across four
+    /// rounds, and 20-60% of that hour's shares became permanently unacceptable to every peer.
+    #[test]
+    fn a_jobs_target_is_remembered_when_the_channel_target_moves() {
+        let job_store = DefaultJobStore::<StandardJob>::new();
+        let max_target = Target::from_le_bytes([0xff; 32]);
+        let mut channel = StandardChannel::new(
+            1,
+            "user".to_string(),
+            vec![7u8; 16],
+            max_target,
+            10.0,
+            100,
+            1.0,
+            job_store,
+            Some("GHOST PublicPool".to_string()),
+            None,
+        )
+        .unwrap();
+        channel.set_chain_tip(ChainTip::new(
+            [
+                200, 53, 253, 129, 214, 31, 43, 84, 179, 58, 58, 76, 128, 213, 24, 53, 38, 144,
+                205, 88, 172, 20, 251, 22, 217, 141, 21, 221, 21, 0, 0, 0,
+            ]
+            .into(),
+            503543726,
+            1745596960,
+        ));
+
+        let template = NewTemplate {
+            template_id: 1,
+            future_template: false,
+            version: 536870912,
+            coinbase_tx_version: 2,
+            coinbase_prefix: {
+                let mut p = vec![0x03, 0x40, 0x1f, 0x0e];
+                p.extend_from_slice(&[20u8; 21]);
+                p.extend_from_slice(&[24u8; 25]);
+                p.try_into().unwrap()
+            },
+            coinbase_tx_input_sequence: 4294967294,
+            coinbase_tx_value_remaining: SATS_AVAILABLE_IN_TEMPLATE,
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_outputs: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 38, 106, 36, 170, 33, 169, 237, 226, 246, 28, 63, 113, 209,
+                222, 253, 63, 169, 153, 223, 163, 105, 83, 117, 92, 105, 6, 137, 121, 153, 98, 180,
+                139, 235, 216, 54, 151, 78, 140, 249,
+            ]
+            .try_into()
+            .unwrap(),
+            coinbase_tx_locktime: 158,
+            merkle_path: vec![].try_into().unwrap(),
+        };
+        let mut script_bytes = vec![0u8, 20];
+        script_bytes.extend_from_slice(&[0xABu8; 20]);
+        channel
+            .on_new_template(
+                template,
+                vec![TxOut {
+                    value: Amount::from_sat(SATS_AVAILABLE_IN_TEMPLATE),
+                    script_pubkey: ScriptBuf::from(script_bytes),
+                }],
+            )
+            .expect("template must be accepted");
+
+        let job_id = channel.get_active_job().expect("active job").get_job_id();
+        // Whatever the channel derived for itself — the point is the job pins it.
+        let issued = channel.get_target().clone();
+        assert_eq!(
+            channel.job_target(job_id),
+            Some(&issued),
+            "the job must record the target it was issued at"
+        );
+
+        // Vardiff raises the target while that job is still outstanding.
+        let harder = Target::from_le_bytes({
+            let mut b = [0u8; 32];
+            b[0] = 1; // little-endian: numerically tiny target == very high difficulty
+            b
+        });
+        channel.set_target(harder.clone());
+
+        assert_eq!(channel.get_target(), &harder, "channel target moves");
+        assert_eq!(
+            channel.job_target(job_id),
+            Some(&issued),
+            "the outstanding job must STILL be credited at the target it was issued at"
+        );
+        assert!(
+            issued.difficulty_float() < harder.difficulty_float(),
+            "the raise must be a raise, else this test proves nothing"
+        );
+    }
 
     /// **The property the receiver binding rests on.**
     ///

@@ -323,6 +323,18 @@ where
         &self.target
     }
 
+    /// Returns the target a specific job was issued against — the one `validate_share` judged a
+    /// share for that job by.
+    ///
+    /// Use this, not [`Self::get_target`], to decide how much work a share is worth. Under vardiff
+    /// the channel target moves while jobs are outstanding, and crediting an accepted share at the
+    /// *current* target rather than its *job's* target over-states the work whenever the target has
+    /// been raised since the job was issued. Downstream that share then claims more work than its
+    /// hash can prove, and any party that re-derives the difficulty from the hash will reject it.
+    pub fn job_target(&self, job_id: u32) -> Option<&Target> {
+        self.job_id_to_target.get(&job_id)
+    }
+
     /// Updates the current target for this channel.
     ///
     /// Please note that this will NOT update the target associated with jobs that were already created.
