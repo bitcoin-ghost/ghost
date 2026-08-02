@@ -676,10 +676,18 @@ impl RoundManager {
                 self.pow_reject_below_diff
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.maybe_summarise_pow_rejects();
+                // Log the ACHIEVED difficulty alongside the claim. Without it the line says a
+                // share missed its target and not by how much, which cannot distinguish a
+                // mislabelled share (ratio just under 1) from one carrying a wildly wrong
+                // difficulty (ratio orders of magnitude out) — and those have different causes.
+                let achieved =
+                    ghost_accounting::DifficultyCalculator::difficulty_from_hash(&proof.share_hash);
                 debug!(
                     round_id = proof.round_id,
                     miner = %hex::encode(&proof.miner_id[..8]),
                     claimed_difficulty = proof.difficulty,
+                    achieved_difficulty = achieved,
+                    ratio = achieved / proof.difficulty,
                     "share hash is genuine but misses its claimed difficulty"
                 );
                 return Err(ShareError::InvalidShareHash);
