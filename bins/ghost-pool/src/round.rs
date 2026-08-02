@@ -639,7 +639,19 @@ impl RoundManager {
         // runs on the GOSSIP + BACKFILL ingest paths (both funnel here), which is exactly where an
         // injected share would enter the converged ledger; a node's own SRI-validated shares are
         // its own trust anchor. Below the gate, the legacy numeric check stands (single-operator).
-        if self.current_height() >= crate::share_pow_verify_height() {
+        // Fail CLOSED when the height is not yet established. `current_height` is 0 from process
+        // start until the first block template arrives, and 0 is below any activation height — so
+        // a plain `>=` silently selected the weaker legacy check for that whole window, on every
+        // restart. That window is also when a node ingests its backfill burst from peers, i.e. the
+        // highest-volume remote ingest it ever does, and the legacy check cannot tell a real hash
+        // from a fabricated 32-byte value because it never binds the hash to a header. Precisely
+        // the injection this gate exists to stop.
+        //
+        // Treating "unknown" as above the gate costs nothing measurable: `missing_header` is 0
+        // across the fleet over hours, so every share genuinely in flight carries its header.
+        let height = self.current_height();
+        let height_established = height > 0;
+        if !height_established || height >= crate::share_pow_verify_height() {
             let header80 = match proof.header.as_deref() {
                 Some(h) if h.len() == 80 => {
                     let mut a = [0u8; 80];
@@ -1936,6 +1948,45 @@ mod tests {
                 Err(ShareError::InvalidShareHash)
             ),
             "a header that isn't the share's PoW preimage must be rejected"
+        );
+    }
+
+    /// #597: the PoW re-verification is height-gated, and `current_height` is 0 from process start
+    /// until the first template arrives. A plain `>=` puts 0 below any activation height, so every
+    /// restart opened a window in which gossiped shares took the legacy numeric check — which never
+    /// binds the hash to a header and therefore cannot detect the fabricated share the gate exists
+    /// to stop. The window coincides with the backfill burst, so it is not a narrow one.
+    #[test]
+    fn an_unknown_height_uses_the_strict_check_not_the_legacy_one() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        // No start_round: height is 0, exactly as it is for the first seconds after a restart.
+        assert_eq!(manager.current_height(), 0);
+        assert!(
+            crate::share_pow_verify_height() > 0,
+            "gate must be a real height for this test to mean anything"
+        );
+
+        // A fabricated hash with no header. Under the legacy numeric check a low claimed difficulty
+        // makes this acceptable; under the strict check it cannot be verified and must be refused.
+        let fabricated = ShareProof {
+            round_id: 1,
+            miner_id: [2u8; 32],
+            difficulty: 1e-12,
+            work: 1e-12,
+            share_hash: [7u8; 32],
+            timestamp: 0,
+            received_by: [9u8; 32],
+            template_id: Some([3u8; 32]),
+            payout_address: None,
+            header: None,
+            signature: None,
+        };
+        assert!(
+            matches!(
+                manager.handle_share_proof(fabricated),
+                Err(ShareError::InvalidShareHash)
+            ),
+            "a header-less gossiped share must be refused while the height is unknown"
         );
     }
 

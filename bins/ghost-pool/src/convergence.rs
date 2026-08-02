@@ -613,6 +613,13 @@ mod tests {
             ..RoundConfig::default()
         };
         let rm = Arc::new(RoundManager::new(id.node_id(), cfg));
+        // Put the node at an explicit height BELOW the PoW-verify gate. These tests are about
+        // convergence and backfill, not PoW gating, and their fixtures carry `header: None`.
+        //
+        // This used to be implicit: without a round the height is 0, which sorted below the gate
+        // by accident. Since #597 an unknown height fails closed and takes the strict path, so the
+        // height a test wants has to be stated rather than inherited from "not set yet".
+        rm.start_round(crate::share_pow_verify_height().saturating_sub(1));
         rm.set_template_id(TPL);
         rm
     }
@@ -1065,6 +1072,9 @@ mod tests {
             ..RoundConfig::default()
         };
         let rm = Arc::new(RoundManager::new(NodeIdentity::generate().node_id(), cfg));
+        // Explicit height below the PoW-verify gate — this test is about the M-9 work model, and
+        // its fixture carries no header. See the note in `round_manager()`.
+        rm.start_round(crate::share_pow_verify_height().saturating_sub(1));
         rm.set_template_id(TPL);
 
         let mut p = ShareProof {
