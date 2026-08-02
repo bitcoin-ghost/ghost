@@ -101,7 +101,11 @@ pub struct RecheckOutcome {
 }
 
 /// Re-judge every deferred binding whose skeleton is now held.
-pub async fn recheck_bindings(db: &Arc<Database>) -> GhostResult<RecheckOutcome> {
+pub async fn recheck_bindings(
+    db: &Arc<Database>,
+    height: u64,
+    finalised_seq: Option<u64>,
+) -> GhostResult<RecheckOutcome> {
     let mut outcome = RecheckOutcome::default();
 
     let ready = db.list_verifiable_bindings(MAX_RECHECK_PER_PASS)?;
@@ -152,6 +156,32 @@ pub async fn recheck_bindings(db: &Arc<Database>) -> GhostResult<RecheckOutcome>
                 );
             }
         }
+    }
+
+    // Prune while we are here. The skeletons this pass just used are the ones worth keeping; the
+    // rest are held only by the retention rule, and nothing else in the process is positioned to
+    // apply it. Left unwired, `coinbase_skeletons` grows for the life of the node — measured at
+    // ~1.1 MB/day on 2026-08-02, and roughly 30x that once the coinbase carries 200 payees.
+    match db.prune_skeletons(
+        height,
+        finalised_seq,
+        crate::skeleton_store::RETENTION_FLOOR_BLOCKS,
+        crate::skeleton_store::RETENTION_CEILING_BLOCKS,
+    ) {
+        Ok((released, ceiling)) => {
+            if ceiling > 0 {
+                // Said loudly: every share still relying on these has become unverifiable.
+                warn!(
+                    ceiling,
+                    released,
+                    "skeletons dropped at the retention CEILING while still needed — the batch \
+                     chain is not finalising"
+                );
+            } else if released > 0 {
+                debug!(released, "pruned skeletons past the reorg floor");
+            }
+        }
+        Err(e) => warn!(error = %e, "skeleton prune failed"),
     }
 
     outcome.still_waiting = db.count_unverified_bindings()?;
@@ -239,7 +269,7 @@ mod tests {
             .expect("defer");
 
         // Nothing to judge yet, and the share is still waiting rather than resolved.
-        let first = recheck_bindings(&db).await.expect("pass");
+        let first = recheck_bindings(&db, 960_000, None).await.expect("pass");
         assert_eq!(first.confirmed, 0);
         assert_eq!(first.still_waiting, 1);
 
@@ -252,7 +282,7 @@ mod tests {
         )
         .expect("store");
 
-        let second = recheck_bindings(&db).await.expect("pass");
+        let second = recheck_bindings(&db, 960_000, None).await.expect("pass");
         assert_eq!(second.confirmed, 1, "the skeleton arrived; judge it now");
         assert_eq!(second.still_waiting, 0, "and stop waiting on it");
     }
@@ -277,7 +307,7 @@ mod tests {
         db.defer_binding("share-2", &id, &extranonce, &header, &[0xEEu8; 20])
             .expect("defer");
 
-        let out = recheck_bindings(&db).await.expect("pass");
+        let out = recheck_bindings(&db, 960_000, None).await.expect("pass");
         assert_eq!(out.refuted, 1);
         assert_eq!(out.confirmed, 0);
         assert_eq!(
@@ -363,6 +393,100 @@ mod tests {
         let db = a_db();
         assert!(accept_skeleton(&db, "notlongenough", "00", "01", &[], 1).is_err());
         assert!(accept_skeleton(&db, &hex::encode([1u8; 32]), "zz", "01", &[], 1).is_err());
+    }
+
+    /// Storage-side retention must agree with the in-memory policy in `skeleton_store`: released
+    /// once the reorg floor has passed, and not a block before it.
+    #[test]
+    fn pruning_respects_the_reorg_floor() {
+        use crate::skeleton_store::{RETENTION_CEILING_BLOCKS, RETENTION_FLOOR_BLOCKS};
+        let db = a_db();
+        let (skeleton, _, _) = a_bound_share();
+        let id = skeleton.id();
+        db.store_skeleton(
+            &id,
+            &skeleton.coinbase_prefix,
+            &skeleton.coinbase_suffix,
+            &skeleton.merkle_path,
+            960_000,
+        )
+        .expect("store");
+
+        // One block short of the floor: still needed.
+        let (released, ceiling) = db
+            .prune_skeletons(
+                960_000 + RETENTION_FLOOR_BLOCKS - 1,
+                None,
+                RETENTION_FLOOR_BLOCKS,
+                RETENTION_CEILING_BLOCKS,
+            )
+            .expect("prune");
+        assert_eq!((released, ceiling), (0, 0));
+        assert!(db.get_skeleton(&id).expect("get").is_some());
+
+        // At the floor: released.
+        let (released, ceiling) = db
+            .prune_skeletons(
+                960_000 + RETENTION_FLOOR_BLOCKS,
+                None,
+                RETENTION_FLOOR_BLOCKS,
+                RETENTION_CEILING_BLOCKS,
+            )
+            .expect("prune");
+        assert_eq!((released, ceiling), (1, 0));
+        assert!(db.get_skeleton(&id).expect("get").is_none());
+    }
+
+    /// **A skeleton still needed must never be dropped quietly.** If the batch referencing it has
+    /// not finalised, the floor alone must not release it — and if the ceiling takes it anyway,
+    /// that has to be reported separately so the caller can alarm rather than log a tidy number.
+    #[test]
+    fn an_unfinalised_skeleton_survives_the_floor_and_is_reported_at_the_ceiling() {
+        use crate::skeleton_store::{RETENTION_CEILING_BLOCKS, RETENTION_FLOOR_BLOCKS};
+        let db = a_db();
+        let (skeleton, _, _) = a_bound_share();
+        let id = skeleton.id();
+        db.store_skeleton(
+            &id,
+            &skeleton.coinbase_prefix,
+            &skeleton.coinbase_suffix,
+            &skeleton.merkle_path,
+            960_000,
+        )
+        .expect("store");
+        // Referenced by batch 9, and the chain has only finalised up to 8.
+        db.note_skeleton_referenced(&id, 9).expect("note");
+
+        let (released, ceiling) = db
+            .prune_skeletons(
+                960_000 + RETENTION_FLOOR_BLOCKS,
+                Some(8),
+                RETENTION_FLOOR_BLOCKS,
+                RETENTION_CEILING_BLOCKS,
+            )
+            .expect("prune");
+        assert_eq!(
+            (released, ceiling),
+            (0, 0),
+            "the floor must not release a skeleton whose batch is unfinalised"
+        );
+        assert!(db.get_skeleton(&id).expect("get").is_some());
+
+        // Past the ceiling it goes anyway — and is counted as a ceiling eviction, not a release.
+        let (released, ceiling) = db
+            .prune_skeletons(
+                960_000 + RETENTION_CEILING_BLOCKS,
+                Some(8),
+                RETENTION_FLOOR_BLOCKS,
+                RETENTION_CEILING_BLOCKS,
+            )
+            .expect("prune");
+        assert_eq!(
+            (released, ceiling),
+            (0, 1),
+            "a still-needed skeleton dropped at the ceiling must be reported as such"
+        );
+        assert!(db.get_skeleton(&id).expect("get").is_none());
     }
 
     /// A skeleton stored and read back must be the same skeleton — the merkle path is flattened

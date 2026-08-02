@@ -2191,6 +2191,79 @@ impl Database {
         })
     }
 
+    /// Record that a batch at `seq` contains shares proved by this skeleton.
+    ///
+    /// Kept as a maximum: a skeleton referenced by several batches is only free once the **last**
+    /// of them is final. Until the batch chain runs, nothing calls this and `last_seq` stays NULL,
+    /// which the prune correctly reads as "no batch ever needed it".
+    pub fn note_skeleton_referenced(&self, skeleton_id: &[u8; 32], seq: u64) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE coinbase_skeletons
+                    SET last_seq = MAX(IFNULL(last_seq, 0), ?2)
+                  WHERE skeleton_id = ?1",
+                rusqlite::params![skeleton_id.as_slice(), seq as i64],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Drop skeletons that are no longer needed, applying the retention rule to the stored rows.
+    ///
+    /// Mirrors `skeleton_store::SkeletonStore::prune` exactly, and deliberately takes the two
+    /// bounds as parameters rather than importing them: the policy lives in one place
+    /// (`skeleton_store`), and this is only the storage half of it. Two copies of the numbers would
+    /// be two things to keep in step.
+    ///
+    /// A skeleton goes when its batch is final **and** the reorg floor has passed, or when the
+    /// ceiling is hit regardless — the ceiling case being the one that must be reported, because a
+    /// skeleton dropped while still needed turns into an unverifiable share.
+    ///
+    /// `finalised_seq` of `None` means the batch chain has finalised nothing, in which case a
+    /// skeleton no batch ever referenced is still releasable on the floor alone — holding it
+    /// forever because nothing claimed it would be backwards.
+    ///
+    /// Returns `(released, ceiling_evictions)`.
+    pub fn prune_skeletons(
+        &self,
+        height: u64,
+        finalised_seq: Option<u64>,
+        floor_blocks: u64,
+        ceiling_blocks: u64,
+    ) -> GhostResult<(usize, usize)> {
+        self.with_connection(|conn| {
+            let h = height as i64;
+            let floor_cut = h - floor_blocks as i64;
+            let ceiling_cut = h - ceiling_blocks as i64;
+
+            // Count the ceiling cases first: they are still needed, and the caller has to be able
+            // to say so rather than have them vanish into a total.
+            let ceiling: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM coinbase_skeletons
+                      WHERE stored_at <= ?1
+                        AND NOT (floor_from <= ?2
+                                 AND (last_seq IS NULL OR last_seq <= IFNULL(?3, -1)))",
+                    rusqlite::params![ceiling_cut, floor_cut, finalised_seq.map(|s| s as i64)],
+                    |r| r.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let removed = conn
+                .execute(
+                    "DELETE FROM coinbase_skeletons
+                      WHERE (floor_from <= ?2
+                             AND (last_seq IS NULL OR last_seq <= IFNULL(?3, -1)))
+                         OR stored_at <= ?1",
+                    rusqlite::params![ceiling_cut, floor_cut, finalised_seq.map(|s| s as i64)],
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok((removed.saturating_sub(ceiling as usize), ceiling as usize))
+        })
+    }
+
     /// Remember a share whose skeleton had not arrived, so it can be judged when the evidence does.
     ///
     /// Without this the share is judged exactly once, on the one occasion the evidence happened to

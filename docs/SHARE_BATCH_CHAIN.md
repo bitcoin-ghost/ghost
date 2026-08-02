@@ -734,7 +734,7 @@ vs checkpoints bounded and non-growing.
 Arming any height gate. `SHARE_ADDR_BIND_HEIGHT` and `OBSERVED_SETTLEMENT_HEIGHT` stay at
 `u64::MAX` until the shadow run passes — that is a separate, deliberate release.
 
-## ⚠ GAP FOUND IN SOAK 2026-08-02 — `coinbase_skeletons` is never pruned
+## ✅ CLOSED 2026-08-02 — `coinbase_skeletons` pruning wired (was: never pruned)
 
 The retention rule exists and is tested (`bins/ghost-pool/src/skeleton_store.rs`: finalised-batch
 condition, reorg floor at `max_reorg_depth`, ceiling, reorg extends rather than races). **It is not
@@ -755,6 +755,20 @@ Arming the gates is what makes the payout set large, so this must be wired **bef
 after. What is missing is small: a `prune_skeletons(before_height, finalised_seq)` query and a call
 from the reconcile tick that already runs every 5 minutes. The policy is already written and tested;
 only the storage side and the call site are absent.
+
+**Fixed the same night.** `prune_skeletons(height, finalised_seq, floor, ceiling)` implements the
+same rule in SQL and is called from the reconcile tick that already runs every 5 minutes. The two
+bounds are passed in rather than imported, so the policy stays in one place (`skeleton_store`) and
+this is only its storage half.
+
+`note_skeleton_referenced` added alongside, so `last_seq` can be set once the batch chain runs;
+until then it stays NULL, which the prune correctly reads as "no batch ever needed it" and releases
+on the floor alone.
+
+Two tests pin the behaviour that matters: released at the floor and **not a block before it**, and
+a skeleton whose batch has not finalised **survives the floor** and is reported as a *ceiling*
+eviction rather than a release — because a skeleton dropped while still needed makes shares
+unverifiable and must alarm, not appear in a tidy total.
 
 Filed against #585.
 
