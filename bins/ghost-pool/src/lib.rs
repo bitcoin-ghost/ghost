@@ -76,6 +76,9 @@ pub mod proposal_sync;
 pub mod settlement;
 pub mod skeleton_store;
 
+/// Remembering share proofs whose verification failure can never be undone.
+pub mod terminal_reject_cache;
+
 /// Mining round lifecycle and share accounting.
 pub mod round;
 

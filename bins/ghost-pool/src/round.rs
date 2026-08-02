@@ -281,6 +281,10 @@ pub struct RoundManager {
     /// honest share that simply missed its claimed difficulty, and those mean opposite things.
     pow_reject_counts: std::sync::atomic::AtomicU64,
     pow_reject_below_diff: std::sync::atomic::AtomicU64,
+    /// Proofs dropped at ingest because this exact claim was already judged unfixable.
+    pow_reject_cached: std::sync::atomic::AtomicU64,
+    /// Terminal verdicts, so a permanently-invalid proof is judged once rather than for ever.
+    terminal_rejects: crate::terminal_reject_cache::TerminalRejectCache,
     pow_reject_no_header: std::sync::atomic::AtomicU64,
     /// Unix seconds of the last emitted summary.
     pow_reject_last_log: std::sync::atomic::AtomicI64,
@@ -362,6 +366,8 @@ impl RoundManager {
             config,
             pow_reject_counts: std::sync::atomic::AtomicU64::new(0),
             pow_reject_below_diff: std::sync::atomic::AtomicU64::new(0),
+            pow_reject_cached: std::sync::atomic::AtomicU64::new(0),
+            terminal_rejects: crate::terminal_reject_cache::TerminalRejectCache::default(),
             pow_reject_no_header: std::sync::atomic::AtomicU64::new(0),
             pow_reject_last_log: std::sync::atomic::AtomicI64::new(0),
             current_round: RwLock::new(0),
@@ -647,6 +653,22 @@ impl RoundManager {
                     return Err(ShareError::InvalidShareHash);
                 }
             };
+            // #583: a proof this node has already judged unfixable is dropped here rather than
+            // verified again. The key covers the header, the hash and the claimed difficulty —
+            // exactly the inputs the verdict is a function of — so a *different* claim about the
+            // same share is still judged on its merits and cannot be suppressed by a forged one.
+            let verdict_key = crate::terminal_reject_cache::verdict_key(
+                &header80,
+                &proof.share_hash,
+                proof.difficulty,
+            );
+            if self.terminal_rejects.contains(&verdict_key) {
+                self.pow_reject_cached
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.maybe_summarise_pow_rejects();
+                return Err(ShareError::InvalidShareHash);
+            }
+
             // Split the two causes. They mean opposite things — a hash that is not this header's
             // PoW is fabricated or relayed, while a real hash that misses its claimed difficulty is
             // an honest share mis-rated — and the single "does not verify" message conflated them,
@@ -658,6 +680,8 @@ impl RoundManager {
             if computed != proof.share_hash {
                 self.pow_reject_counts
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Terminal: these bytes can never hash to this value.
+                self.terminal_rejects.insert(verdict_key);
                 self.maybe_summarise_pow_rejects();
                 debug!(
                     round_id = proof.round_id,
@@ -675,6 +699,8 @@ impl RoundManager {
             ) {
                 self.pow_reject_below_diff
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Terminal: this hash cannot reach this difficulty, and neither value can change.
+                self.terminal_rejects.insert(verdict_key);
                 self.maybe_summarise_pow_rejects();
                 // Log the ACHIEVED difficulty alongside the claim. Without it the line says a
                 // share missed its target and not by how much, which cannot distinguish a
@@ -685,6 +711,12 @@ impl RoundManager {
                 debug!(
                     round_id = proof.round_id,
                     miner = %hex::encode(&proof.miner_id[..8]),
+                    // The hash identifies the SHARE. Without it a burst of identical
+                    // (round, miner, difficulty) lines cannot be told apart: one share redelivered
+                    // in a loop and many distinct shares sharing a vardiff target look the same,
+                    // and those are completely different bugs.
+                    share = %hex::encode(&proof.share_hash[..8]),
+                    from = %hex::encode(&proof.received_by[..8]),
                     claimed_difficulty = proof.difficulty,
                     achieved_difficulty = achieved,
                     ratio = achieved / proof.difficulty,
@@ -1059,13 +1091,18 @@ impl RoundManager {
         let mismatched = self.pow_reject_counts.swap(0, Relaxed);
         let below = self.pow_reject_below_diff.swap(0, Relaxed);
         let no_header = self.pow_reject_no_header.swap(0, Relaxed);
-        if mismatched + below + no_header == 0 {
+        let cached = self.pow_reject_cached.swap(0, Relaxed);
+        if mismatched + below + no_header + cached == 0 {
             return;
         }
         warn!(
             hash_mismatch = mismatched,
             below_difficulty = below,
             missing_header = no_header,
+            // Redeliveries dropped without re-verifying. A high number here against low
+            // first-judgement counts is the #583 signature: few bad shares, endlessly resent.
+            already_judged = cached,
+            distinct_terminal = self.terminal_rejects.len(),
             window_secs = POW_REJECT_SUMMARY_SECS,
             "share proofs rejected on PoW re-verification"
         );
@@ -1899,6 +1936,136 @@ mod tests {
                 Err(ShareError::InvalidShareHash)
             ),
             "a header that isn't the share's PoW preimage must be rejected"
+        );
+    }
+
+    /// #583: fourteen bad shares produced sixty-seven rejections in ten minutes because nothing
+    /// remembered that the verdict was final. A redelivered proof must be dropped, not re-judged.
+    #[test]
+    fn a_terminally_bad_proof_is_judged_once_and_then_dropped() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+
+        let header = vec![0u8; 80];
+        let real_hash = {
+            use bitcoin::hashes::{sha256d, Hash};
+            sha256d::Hash::hash(&header).to_byte_array()
+        };
+        // Genuine PoW preimage, but claiming a difficulty the hash cannot possibly reach — the
+        // shape of every share #583 rejects.
+        let bad = ShareProof {
+            round_id: 1,
+            miner_id: [2u8; 32],
+            difficulty: f64::MAX,
+            work: f64::MAX,
+            share_hash: real_hash,
+            timestamp: 0,
+            received_by: [9u8; 32],
+            template_id: Some([3u8; 32]),
+            payout_address: None,
+            header: Some(header),
+            signature: None,
+        };
+
+        // Stop the summariser draining the counters mid-test: `pow_reject_last_log` starts at 0,
+        // so the very first rejection trips the 5-minute timer and swaps them to zero. (That is
+        // also why every node logs `below_difficulty=1` immediately after a restart.)
+        manager.pow_reject_last_log.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            Relaxed,
+        );
+
+        assert!(manager.handle_share_proof(bad.clone()).is_err());
+        assert_eq!(
+            manager.pow_reject_below_diff.load(Relaxed),
+            1,
+            "first delivery must actually be verified and judged"
+        );
+        assert_eq!(manager.pow_reject_cached.load(Relaxed), 0);
+        assert_eq!(manager.terminal_rejects.len(), 1);
+
+        // Redeliver the identical proof four more times, as backfill does.
+        for _ in 0..4 {
+            assert!(manager.handle_share_proof(bad.clone()).is_err());
+        }
+        assert_eq!(
+            manager.pow_reject_below_diff.load(Relaxed),
+            1,
+            "redeliveries must NOT re-enter verification"
+        );
+        assert_eq!(
+            manager.pow_reject_cached.load(Relaxed),
+            4,
+            "redeliveries must be counted as already-judged"
+        );
+        assert_eq!(
+            manager.terminal_rejects.len(),
+            1,
+            "one bad share is one cache entry however often it is resent"
+        );
+    }
+
+    /// The poisoning guard, end to end: over-claiming a share once must not stop the honest
+    /// delivery of that same share from being verified on its merits.
+    #[test]
+    fn caching_a_bad_claim_does_not_suppress_a_different_claim_for_the_same_share() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+        manager.pow_reject_last_log.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            Relaxed,
+        );
+
+        let header = vec![0u8; 80];
+        let real_hash = {
+            use bitcoin::hashes::{sha256d, Hash};
+            sha256d::Hash::hash(&header).to_byte_array()
+        };
+        let mut hostile = ShareProof {
+            round_id: 1,
+            miner_id: [2u8; 32],
+            difficulty: f64::MAX,
+            work: f64::MAX,
+            share_hash: real_hash,
+            timestamp: 0,
+            received_by: [9u8; 32],
+            template_id: Some([3u8; 32]),
+            payout_address: None,
+            header: Some(header.clone()),
+            signature: None,
+        };
+        assert!(manager.handle_share_proof(hostile.clone()).is_err());
+
+        assert_eq!(manager.pow_reject_below_diff.load(Relaxed), 1);
+        assert_eq!(manager.terminal_rejects.len(), 1);
+
+        // Same share, same header, but an honest difficulty this hash genuinely reaches.
+        let achieved =
+            ghost_accounting::DifficultyCalculator::difficulty_from_hash(&real_hash) * 0.5;
+        hostile.difficulty = achieved;
+        hostile.work = achieved;
+
+        let verdict = manager.handle_share_proof(hostile);
+        assert!(
+            !matches!(verdict, Err(ShareError::InvalidShareHash)),
+            "an honest claim must not inherit a forged claim's verdict, got {verdict:?}"
+        );
+        // The property that matters: it was judged on its merits, not silently dropped by the
+        // cache. If keying were on `share_hash` alone this would have been suppressed.
+        assert_eq!(
+            manager.pow_reject_cached.load(Relaxed),
+            0,
+            "the honest claim must never have hit the negative cache"
         );
     }
 
