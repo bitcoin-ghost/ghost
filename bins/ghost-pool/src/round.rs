@@ -263,9 +263,27 @@ impl CrossRoundToleranceTracker {
 }
 
 /// Manages mining rounds and share accounting
+/// How often the PoW-rejection summary may be emitted, in seconds.
+///
+/// One line per rejected share was **59% of all ghost-pool log volume** measured on 2026-08-02
+/// (2,811 of 4,704 lines in 20 minutes, ~39 MB/day before the rsyslog duplicate) — the growth that
+/// filled vm7's disk and took ghostd down for an hour. A warning that fires thousands of times an
+/// hour is not a warning, it is a metric, so it is accumulated and summarised.
+const POW_REJECT_SUMMARY_SECS: i64 = 300;
+
 pub struct RoundManager {
     /// Configuration
     config: RoundConfig,
+    /// Rejections since the last summary: `(hash mismatch, below difficulty, missing header)`.
+    ///
+    /// Split by cause because the original single message could not distinguish them, which is
+    /// exactly why #583 could not be judged: "does not verify" covers both a fabricated hash and an
+    /// honest share that simply missed its claimed difficulty, and those mean opposite things.
+    pow_reject_counts: std::sync::atomic::AtomicU64,
+    pow_reject_below_diff: std::sync::atomic::AtomicU64,
+    pow_reject_no_header: std::sync::atomic::AtomicU64,
+    /// Unix seconds of the last emitted summary.
+    pow_reject_last_log: std::sync::atomic::AtomicI64,
     /// Current round ID
     current_round: RwLock<RoundId>,
     /// Current block height
@@ -342,6 +360,10 @@ impl RoundManager {
 
         Self {
             config,
+            pow_reject_counts: std::sync::atomic::AtomicU64::new(0),
+            pow_reject_below_diff: std::sync::atomic::AtomicU64::new(0),
+            pow_reject_no_header: std::sync::atomic::AtomicU64::new(0),
+            pow_reject_last_log: std::sync::atomic::AtomicI64::new(0),
             current_round: RwLock::new(0),
             current_height: RwLock::new(0),
             current_round_start: RwLock::new(std::time::Instant::now()),
@@ -619,23 +641,46 @@ impl RoundManager {
                     a
                 }
                 _ => {
-                    warn!(
-                        round_id = proof.round_id,
-                        miner = %hex::encode(&proof.miner_id[..8]),
-                        "share proof missing its 80-byte PoW header (required at/above SHARE_POW_VERIFY_HEIGHT)"
-                    );
+                    self.pow_reject_no_header
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.maybe_summarise_pow_rejects();
                     return Err(ShareError::InvalidShareHash);
                 }
             };
+            // Split the two causes. They mean opposite things — a hash that is not this header's
+            // PoW is fabricated or relayed, while a real hash that misses its claimed difficulty is
+            // an honest share mis-rated — and the single "does not verify" message conflated them,
+            // which is why #583 sat unjudgeable for weeks.
+            let computed = {
+                use bitcoin::hashes::{sha256d, Hash};
+                sha256d::Hash::hash(&header80).to_byte_array()
+            };
+            if computed != proof.share_hash {
+                self.pow_reject_counts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.maybe_summarise_pow_rejects();
+                debug!(
+                    round_id = proof.round_id,
+                    miner = %hex::encode(&proof.miner_id[..8]),
+                    claimed = %hex::encode(&proof.share_hash[..8]),
+                    computed = %hex::encode(&computed[..8]),
+                    "share hash is not this header's PoW"
+                );
+                return Err(ShareError::InvalidShareHash);
+            }
             if !ghost_accounting::DifficultyCalculator::verify_pow_preimage(
                 &header80,
                 &proof.share_hash,
                 proof.difficulty,
             ) {
-                warn!(
+                self.pow_reject_below_diff
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.maybe_summarise_pow_rejects();
+                debug!(
                     round_id = proof.round_id,
                     miner = %hex::encode(&proof.miner_id[..8]),
-                    "share PoW does not verify against its header — rejecting (fabricated/relayed)"
+                    claimed_difficulty = proof.difficulty,
+                    "share hash is genuine but misses its claimed difficulty"
                 );
                 return Err(ShareError::InvalidShareHash);
             }
@@ -976,6 +1021,48 @@ impl RoundManager {
     }
 
     /// Get current round ID
+    /// Emit an aggregated PoW-rejection summary, at most once per
+    /// [`POW_REJECT_SUMMARY_SECS`].
+    ///
+    /// Counts are drained when reported, so each rejection appears in exactly one summary and the
+    /// numbers are a rate rather than a running total.
+    ///
+    /// Silence means zero rejections — the summary is only emitted when something was counted, so
+    /// a quiet log is evidence rather than merely an absence of noise.
+    fn maybe_summarise_pow_rejects(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let last = self.pow_reject_last_log.load(Relaxed);
+        if now - last < POW_REJECT_SUMMARY_SECS {
+            return;
+        }
+        // Claim the slot before draining, so two threads crossing the boundary together cannot
+        // both report and double-count.
+        if self
+            .pow_reject_last_log
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let mismatched = self.pow_reject_counts.swap(0, Relaxed);
+        let below = self.pow_reject_below_diff.swap(0, Relaxed);
+        let no_header = self.pow_reject_no_header.swap(0, Relaxed);
+        if mismatched + below + no_header == 0 {
+            return;
+        }
+        warn!(
+            hash_mismatch = mismatched,
+            below_difficulty = below,
+            missing_header = no_header,
+            window_secs = POW_REJECT_SUMMARY_SECS,
+            "share proofs rejected on PoW re-verification"
+        );
+    }
+
     pub fn current_round_id(&self) -> RoundId {
         *self.current_round.read()
     }
