@@ -2776,6 +2776,26 @@ async fn main() -> Result<()> {
     round_manager_inner.set_metrics(Arc::clone(&metrics));
     let round_manager = Arc::new(round_manager_inner);
 
+    // Seed the chain height before anything reads a gate. Until the first template arrives
+    // `current_height` is 0, which sorts below every activation height — so a restarted node
+    // disagrees with the fleet about which rules are in force. That was #597 for the PoW check;
+    // for a signature-format gate it would mean signing with the wrong encoding and having peers
+    // reject the shares. A failure here is not fatal: the first template still sets the height,
+    // and the gates behave exactly as they did before this call existed.
+    match rpc.get_block_count().await {
+        Ok(h) => {
+            round_manager.seed_height(h);
+            info!(
+                height = h,
+                "Seeded chain height from Core before gate evaluation"
+            );
+        }
+        Err(e) => warn!(
+            error = %e,
+            "Could not seed chain height from Core — gates read 0 until the first template"
+        ),
+    }
+
     // Register our own node's capabilities so we're included in node reward calculations
     // This is critical - without this, our shares won't be counted for node rewards
     round_manager.register_node(identity.node_id(), capabilities);

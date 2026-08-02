@@ -400,6 +400,23 @@ impl RoundManager {
         self.event_tx.subscribe()
     }
 
+    /// Seed the chain height at startup, before any template has arrived.
+    ///
+    /// `current_height` is otherwise 0 from process start until the first template, and every
+    /// height gate reads it. Zero sorts below any activation height, so a freshly restarted node
+    /// silently disagrees with the fleet about which rules are in force — it took the weaker PoW
+    /// check in #597, and for a signature-format gate it would sign with the wrong encoding and
+    /// have its shares rejected by peers that are past the gate.
+    ///
+    /// Seeding from Core at boot closes that window for all gates at once. Never lowers the
+    /// height: a template that has already arrived is better evidence than a startup RPC.
+    pub fn seed_height(&self, block_height: u64) {
+        let mut h = self.current_height.write();
+        if block_height > *h {
+            *h = block_height;
+        }
+    }
+
     /// Start a new round (called on new block template)
     pub fn start_round(&self, block_height: u64) -> RoundId {
         let round_id = {
@@ -1948,6 +1965,25 @@ mod tests {
                 Err(ShareError::InvalidShareHash)
             ),
             "a header that isn't the share's PoW preimage must be rejected"
+        );
+    }
+
+    /// Seeding exists so a restarted node does not read 0 and conclude every gate is inactive.
+    #[test]
+    fn seeding_sets_the_height_before_any_template_and_never_lowers_it() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        assert_eq!(manager.current_height(), 0, "no template yet");
+
+        manager.seed_height(960_000);
+        assert_eq!(manager.current_height(), 960_000);
+
+        // A template is better evidence than a startup RPC; seeding must not walk it back.
+        manager.start_round(960_050);
+        manager.seed_height(960_010);
+        assert_eq!(
+            manager.current_height(),
+            960_050,
+            "a stale seed must not lower a height a template already established"
         );
     }
 
