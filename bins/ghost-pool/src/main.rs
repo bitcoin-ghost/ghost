@@ -2197,7 +2197,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Setup logging
-    let level = parse_log_level(&args.log_level);
+    let log_filter = build_log_filter(&args.log_level, std::env::var("RUST_LOG").ok().as_deref());
 
     // Console layer (stdout → journald under systemd). ANSI is gated on an
     // interactive terminal so journald stores clean UTF-8, not colour escapes.
@@ -2211,7 +2211,7 @@ async fn main() -> Result<()> {
     // Ring-buffer layer feeds the dashboard `/logs` endpoint with ghost-pool's
     // own structured log tail (real message + target + level per event).
     let subscriber = tracing_subscriber::registry()
-        .with(tracing_subscriber::filter::LevelFilter::from_level(level))
+        .with(log_filter)
         .with(fmt_layer)
         .with(ghost_pool::log_ring::LogRingLayer);
 
@@ -10051,6 +10051,25 @@ fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
 }
 
 /// Parse a log level string into a tracing Level
+/// Build the log filter from the `--log-level` argument and `RUST_LOG`.
+///
+/// `RUST_LOG` wins when it is set, and it takes full `tracing` directives, so
+/// `RUST_LOG=info,ghost_pool::round=debug` turns up one module and leaves the rest at info.
+///
+/// The flat `LevelFilter` this replaces could not express that. Any per-target string fell through
+/// [`parse_log_level`]'s catch-all arm and silently became `INFO`, so the only way to see a
+/// `debug!` on a live node was to turn the whole binary to debug — on a node ingesting ~200
+/// shares/min, against the 30 GB disks vm5-7 run, that is not a thing you can safely do. #583 went
+/// weeks without a diagnosis for exactly this reason: the evidence existed and could not be reached.
+fn build_log_filter(arg_level: &str, rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let default = tracing_subscriber::filter::LevelFilter::from_level(parse_log_level(arg_level));
+    let directives = rust_log.map(str::trim).filter(|s| !s.is_empty());
+    tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(default.into())
+        // Lossy: a fat-fingered RUST_LOG drops the bad directive instead of refusing to boot.
+        .parse_lossy(directives.unwrap_or(""))
+}
+
 fn parse_log_level(s: &str) -> Level {
     match s.to_lowercase().as_str() {
         "trace" => Level::TRACE,
@@ -11219,6 +11238,35 @@ mod tests {
     #[test]
     fn parse_log_level_empty_defaults_to_info() {
         assert_eq!(parse_log_level(""), Level::INFO);
+    }
+
+    // ── build_log_filter ─────────────────────────────────────────────
+    //
+    // The point of these is that ONE module can be turned up without turning the whole binary
+    // into a firehose. #583 sat undiagnosed for weeks because that was impossible.
+
+    #[test]
+    fn log_filter_honours_a_per_target_directive() {
+        let f = build_log_filter("info", Some("info,ghost_pool::round=debug")).to_string();
+        assert!(
+            f.contains("ghost_pool::round=debug"),
+            "per-target directive must survive, got {f:?}"
+        );
+    }
+
+    #[test]
+    fn log_filter_falls_back_to_the_cli_level_without_rust_log() {
+        assert_eq!(build_log_filter("warn", None).to_string(), "warn");
+        assert_eq!(build_log_filter("debug", Some("")).to_string(), "debug");
+    }
+
+    #[test]
+    fn log_filter_keeps_the_valid_half_of_a_typo() {
+        // parse_lossy drops the bad directive rather than dying at startup — a fat-fingered
+        // RUST_LOG must never stop a node from booting.
+        let f =
+            build_log_filter("info", Some("ghost_pool::round=debug,!!!nonsense!!!")).to_string();
+        assert!(f.contains("ghost_pool::round=debug"), "got {f:?}");
     }
 
     // ── is_loopback_url ──────────────────────────────────────────────
