@@ -273,6 +273,39 @@ impl NoiseConnectionPool {
         self.connections.read().get(peer_key).cloned()
     }
 
+    /// Send to a peer, replacing the pooled connection if it turns out to be dead.
+    ///
+    /// [`Self::get_connection`] judges a cached connection only by how recently it was used, and
+    /// a caller that keeps trying keeps refreshing that timer — so a connection whose far end has
+    /// gone is never recognised as dead. Callers that simply propagated the send error left the
+    /// corpse pooled and wrote to it for ever: when a node restarted, its peers logged
+    /// `Broken pipe` for hours with zero TCP connections to it, starving it of consensus votes.
+    ///
+    /// A write failure is the only reliable liveness signal available here, so it is treated as
+    /// one: evict, then retry once on a connection that cannot be the evicted one. A peer that
+    /// restarted becomes reachable on the next message rather than after some later cleanup.
+    pub async fn send_to(&self, peer_addr: SocketAddr, data: &[u8]) -> Result<(), NoiseError> {
+        let conn = self.get_connection(peer_addr).await?;
+        let Err(first) = conn.send(data).await else {
+            return Ok(());
+        };
+
+        self.remove_connection(&conn.peer_key);
+        debug!(
+            peer = %peer_addr,
+            error = %first,
+            "Noise send failed — evicted the pooled connection, retrying once"
+        );
+
+        let fresh = self.get_connection(peer_addr).await?;
+        if let Err(second) = fresh.send(data).await {
+            // Do not leave this one pooled either.
+            self.remove_connection(&fresh.peer_key);
+            return Err(second);
+        }
+        Ok(())
+    }
+
     /// Establish a new connection to a peer (initiator role)
     async fn establish_connection(
         &self,
@@ -632,6 +665,53 @@ mod tests {
             Arc::as_ptr(&reused),
             out_ptr,
             "A reuses its stable outbound to B — no re-dial"
+        );
+    }
+
+    /// **The property a restarted peer depends on.**
+    ///
+    /// `get_connection` judges a cached connection only by how recently it was used, and a caller
+    /// that keeps trying keeps refreshing that timer — so a dead connection is never recognised as
+    /// dead. Before `send_to`, the send error was simply propagated and the corpse stayed pooled:
+    /// when a node restarted, its peers wrote to the closed socket for hours, logging `Broken
+    /// pipe` with zero TCP connections open, and it never received another consensus vote.
+    #[tokio::test]
+    async fn a_dead_pooled_connection_is_evicted_rather_than_reused_for_ever() {
+        let pool_a = Arc::new(
+            NoiseConnectionPool::new(NoiseKeypair::generate(), test_pool_config()).unwrap(),
+        );
+        let pool_b = Arc::new(
+            NoiseConnectionPool::new(NoiseKeypair::generate(), test_pool_config()).unwrap(),
+        );
+
+        let lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = lb.local_addr().unwrap();
+        let pb = Arc::clone(&pool_b);
+        let b_accept = tokio::spawn(async move {
+            let (s, _) = lb.accept().await.unwrap();
+            pb.accept_connection(s).await
+        });
+        // A dials B and pools the connection.
+        let _out = pool_a.get_connection(b_addr).await.unwrap();
+        let b_side = b_accept.await.unwrap().unwrap();
+        assert_eq!(pool_a.connection_count(), 1, "A pooled its outbound to B");
+
+        // B goes away — exactly what a node restart looks like from A's side.
+        drop(b_side);
+        drop(pool_b);
+
+        // A keeps sending. TCP may swallow the first write into a buffer, so allow a few
+        // attempts for the reset to surface; what matters is what the pool holds afterwards.
+        for _ in 0..5 {
+            if pool_a.send_to(b_addr, b"consensus vote").await.is_err() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            pool_a.connection_count(),
+            0,
+            "the dead connection must be evicted, not handed back on every send for ever"
         );
     }
 

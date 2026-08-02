@@ -1851,14 +1851,11 @@ impl MeshNetwork {
             .parse()
             .map_err(|e| GhostError::P2PMessage(format!("Invalid peer address: {}", e)))?;
 
-        // Get or establish Noise connection
-        let conn = pool
-            .get_connection(noise_addr)
-            .await
-            .map_err(|e| GhostError::P2PMessage(format!("Noise connection failed: {}", e)))?;
-
-        // Send encrypted
-        conn.send(&data)
+        // Send encrypted. `send_to` owns the connection lifecycle: it evicts and re-dials once if
+        // the pooled connection turns out to be dead, which this path previously never did — a
+        // restarted peer stayed undeliverable for hours because the corpse was handed back on
+        // every attempt.
+        pool.send_to(noise_addr, &data)
             .await
             .map_err(|e| GhostError::P2PMessage(format!("Noise send failed: {}", e)))?;
 
