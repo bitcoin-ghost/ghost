@@ -724,6 +724,10 @@ pub enum VoteResult {
     NotEligible,
     /// Duplicate vote from same voter (same decision)
     DuplicateVote,
+    /// Arrived before the session opened here; held and applied when it does.
+    BufferedEarly,
+    /// Arrived before the session opened and a buffer bound refused it.
+    NoSession,
     /// Invalid signature
     InvalidSignature,
     /// Equivocation detected (voter signed conflicting votes)
@@ -779,6 +783,19 @@ fn verify_vote_signature_with_round(
 /// Default maximum active voting sessions (S-3 OOM protection)
 const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 100;
 
+/// Distinct (round, proposal) keys we will hold early votes for.
+///
+/// Buffering is a memory surface a peer can push on: nothing stops it voting for proposals that
+/// will never exist. These three bounds are what make it safe — a cap on keys, a cap per key, and
+/// an age limit — so the worst case is fixed and small rather than attacker-chosen.
+const MAX_PENDING_KEYS: usize = 64;
+/// Early votes held per key. A vote set is one per eligible voter, so a voter set of 8 cannot
+/// legitimately exceed this; the margin is for a larger fleet, not for volume.
+const MAX_PENDING_PER_KEY: usize = 32;
+/// How long an early vote stays useful. The observed session-open spread is seconds; a minute is
+/// generous and still bounds how long a flood can occupy memory.
+const PENDING_VOTE_TTL_SECS: u64 = 60;
+
 /// Voting manager for multiple sessions
 #[derive(Debug)]
 pub struct VotingManager {
@@ -791,6 +808,23 @@ pub struct VotingManager {
     max_completed: usize,
     /// S-3: Maximum active sessions to prevent unbounded memory growth
     max_active_sessions: usize,
+    /// Votes that arrived before their session existed, held until it opens.
+    ///
+    /// Every node proposes the same payout independently and opens its own session, and those
+    /// openings are seconds apart — 2 to 12 seconds observed in production. Peers broadcast their
+    /// votes as soon as they decide, so a node that opens late used to receive votes with nowhere
+    /// to put them: `vote()` did `sessions.get_mut(&key)?` and the `?` discarded them silently,
+    /// with no log on the path. One node reached consensus 2.4 s before another had even opened
+    /// its session; the late node tallied 3 of 8 and timed out while the rest executed the payout.
+    /// That leaves the timed-out node mining without the payout armed while its peers have it.
+    pending: RwLock<HashMap<(RoundId, [u8; 32]), VecDeque<PendingVote>>>,
+}
+
+/// A vote held for a session that has not opened yet.
+#[derive(Debug)]
+struct PendingVote {
+    vote: Vote,
+    received: std::time::Instant,
 }
 
 impl VotingManager {
@@ -801,6 +835,7 @@ impl VotingManager {
             completed: RwLock::new(VecDeque::new()),
             max_completed,
             max_active_sessions: DEFAULT_MAX_ACTIVE_SESSIONS,
+            pending: RwLock::new(HashMap::new()),
         }
     }
 
@@ -836,7 +871,86 @@ impl VotingManager {
         );
 
         sessions.insert(key, session);
+
+        // Apply any votes that arrived before this session existed. They go through `add_vote`
+        // like any other, so timeout, eligibility, signature and equivocation checks all still
+        // run — buffering changes when a vote is judged, never whether it is.
+        let early: Vec<Vote> = {
+            let mut pending = self.pending.write();
+            pending
+                .remove(&key)
+                .map(|q| {
+                    let cutoff = std::time::Duration::from_secs(PENDING_VOTE_TTL_SECS);
+                    q.into_iter()
+                        .filter(|p| p.received.elapsed() < cutoff)
+                        .map(|p| p.vote)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        if !early.is_empty() {
+            let session = sessions.get_mut(&key).expect("just inserted");
+            let mut applied = 0usize;
+            for vote in early {
+                match session.add_vote(vote) {
+                    VoteResult::ApprovalRecorded | VoteResult::RejectionRecorded => applied += 1,
+                    _ => {}
+                }
+            }
+            info!(
+                round_id = key.0,
+                applied, "Applied votes that arrived before the session opened"
+            );
+        }
+
         true
+    }
+
+    /// Hold a vote whose session has not opened yet.
+    ///
+    /// Returns false when a bound refuses it. Bounds are checked before insert so a peer cannot
+    /// grow this past `MAX_PENDING_KEYS * MAX_PENDING_PER_KEY` entries however it behaves.
+    fn buffer_early_vote(&self, key: (RoundId, [u8; 32]), vote: Vote) -> bool {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(PENDING_VOTE_TTL_SECS);
+        let mut pending = self.pending.write();
+
+        // Drop expired entries first — this is what stops a slow drip accumulating.
+        pending.retain(|_, q| {
+            q.retain(|p| now.duration_since(p.received) < ttl);
+            !q.is_empty()
+        });
+
+        if !pending.contains_key(&key) && pending.len() >= MAX_PENDING_KEYS {
+            warn!(
+                round_id = key.0,
+                max = MAX_PENDING_KEYS,
+                "Refusing to buffer early vote: pending key limit reached"
+            );
+            return false;
+        }
+        let queue = pending.entry(key).or_default();
+
+        // One vote per voter is all that can ever be useful; a second from the same voter is
+        // either a duplicate or equivocation, and `add_vote` is the thing that must judge that.
+        if queue.iter().any(|p| p.vote.voter == vote.voter) {
+            return false;
+        }
+        if queue.len() >= MAX_PENDING_PER_KEY {
+            return false;
+        }
+
+        queue.push_back(PendingVote {
+            vote,
+            received: now,
+        });
+        true
+    }
+
+    /// Number of buffered early votes, for tests and diagnostics.
+    pub fn pending_vote_count(&self) -> usize {
+        self.pending.read().values().map(|q| q.len()).sum()
     }
 
     /// Add a vote to a session
@@ -849,7 +963,19 @@ impl VotingManager {
         let key = (round_id, proposal_hash);
 
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(&key)?;
+        let Some(session) = sessions.get_mut(&key) else {
+            // The session has not opened here yet. Hold the vote rather than dropping it: peers
+            // open their sessions seconds apart and this used to lose the votes that arrived in
+            // between, which is what made proposals time out at a node while the rest of the
+            // fleet had already executed them.
+            drop(sessions);
+            let buffered = self.buffer_early_vote(key, vote);
+            return Some(if buffered {
+                VoteResult::BufferedEarly
+            } else {
+                VoteResult::NoSession
+            });
+        };
 
         let result = session.add_vote(vote);
 
@@ -1023,6 +1149,146 @@ mod tests {
             VotingSession::MIN_VOTERS_FOR_BFT,
         )
         .expect("Test session should have enough voters")
+    }
+
+    // ── early votes ──────────────────────────────────────────────────────────
+    //
+    // Every node proposes the same payout and opens its own session, seconds apart. Votes that
+    // arrived before the local session existed were dropped by `sessions.get_mut(&key)?`, with no
+    // log on the path. In production one node reached consensus 2.4 s before another had opened
+    // its session; the late node tallied 3 of 8 and timed out while the rest executed the payout,
+    // leaving it mining without the payout armed.
+
+    /// Builds an eligible voter set plus signed approvals from `n` of them.
+    fn signed_approvals(
+        round_id: RoundId,
+        proposal_hash: [u8; 32],
+        n: usize,
+    ) -> (HashSet<[u8; 32]>, Vec<Vote>) {
+        let ids: Vec<NodeIdentity> = (0..n).map(|_| NodeIdentity::generate()).collect();
+        let mut eligible: HashSet<[u8; 32]> = ids.iter().map(|i| i.node_id()).collect();
+        // Pad so the set clears MIN_VOTERS_FOR_BFT without those extras ever voting.
+        for i in 0..10u8 {
+            eligible.insert([i + 200; 32]);
+        }
+        let votes = ids
+            .iter()
+            .map(|id| {
+                let msg =
+                    compute_vote_signing_message(round_id, &proposal_hash, &id.node_id(), true);
+                Vote::new(id.node_id(), true, id.sign(&msg))
+            })
+            .collect();
+        (eligible, votes)
+    }
+
+    fn session_with(
+        round_id: RoundId,
+        proposal_hash: [u8; 32],
+        eligible: HashSet<[u8; 32]>,
+    ) -> VotingSession {
+        VotingSession::new(
+            round_id,
+            proposal_hash,
+            VoteType::PayoutApproval,
+            eligible,
+            5000,
+            VotingSession::MIN_VOTERS_FOR_BFT,
+        )
+        .expect("enough voters")
+    }
+
+    #[test]
+    fn votes_arriving_before_the_session_are_applied_when_it_opens() {
+        let (round_id, hash) = (7u64, [3u8; 32]);
+        let (eligible, votes) = signed_approvals(round_id, hash, 3);
+        let mgr = VotingManager::new(8);
+
+        // Peers vote before this node has opened its session.
+        for v in votes {
+            assert!(matches!(
+                mgr.vote(round_id, hash, v),
+                Some(VoteResult::BufferedEarly)
+            ));
+        }
+        assert_eq!(mgr.pending_vote_count(), 3);
+
+        assert!(mgr.start_session(session_with(round_id, hash, eligible)));
+
+        let status = mgr.get_session(round_id, hash).expect("session");
+        assert_eq!(
+            status.approvals, 3,
+            "early votes must be counted, not dropped"
+        );
+        assert_eq!(mgr.pending_vote_count(), 0, "buffer drained on open");
+    }
+
+    #[test]
+    fn an_early_vote_from_an_ineligible_voter_is_still_refused_on_drain() {
+        let (round_id, hash) = (7u64, [4u8; 32]);
+        let (eligible, _) = signed_approvals(round_id, hash, 1);
+        let outsider = NodeIdentity::generate();
+        let msg = compute_vote_signing_message(round_id, &hash, &outsider.node_id(), true);
+        let vote = Vote::new(outsider.node_id(), true, outsider.sign(&msg));
+
+        let mgr = VotingManager::new(8);
+        mgr.vote(round_id, hash, vote);
+        mgr.start_session(session_with(round_id, hash, eligible));
+
+        // Buffering changes WHEN a vote is judged, never WHETHER it is.
+        assert_eq!(
+            mgr.get_session(round_id, hash).expect("session").approvals,
+            0,
+            "an ineligible voter must not be admitted by going through the buffer"
+        );
+    }
+
+    #[test]
+    fn one_voter_cannot_occupy_the_buffer_for_a_key() {
+        let (round_id, hash) = (7u64, [5u8; 32]);
+        let (_, votes) = signed_approvals(round_id, hash, 1);
+        let mgr = VotingManager::new(8);
+
+        assert!(matches!(
+            mgr.vote(round_id, hash, votes[0].clone()),
+            Some(VoteResult::BufferedEarly)
+        ));
+        for _ in 0..50 {
+            mgr.vote(round_id, hash, votes[0].clone());
+        }
+        assert_eq!(
+            mgr.pending_vote_count(),
+            1,
+            "a repeated voter must not consume the per-key budget"
+        );
+    }
+
+    #[test]
+    fn the_buffer_is_bounded_against_a_flood_of_invented_proposals() {
+        let mgr = VotingManager::new(8);
+        // One identity, reused. Key generation dominates the cost of this test and proves
+        // nothing here — what is under test is the bound, not the crypto.
+        let attacker = NodeIdentity::generate();
+        // A peer voting for proposals that will never exist must not grow memory without limit.
+        for k in 0..(MAX_PENDING_KEYS * 4) {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(k as u64).to_be_bytes());
+            let msg = compute_vote_signing_message(1, &hash, &attacker.node_id(), true);
+            mgr.vote(
+                1,
+                hash,
+                Vote::new(attacker.node_id(), true, attacker.sign(&msg)),
+            );
+        }
+        assert!(
+            mgr.pending_vote_count() <= MAX_PENDING_KEYS * MAX_PENDING_PER_KEY,
+            "pending buffer exceeded its bound: {}",
+            mgr.pending_vote_count()
+        );
+        assert!(
+            mgr.pending_vote_count() <= MAX_PENDING_KEYS,
+            "one vote per invented key, so keys are the binding limit"
+        );
     }
 
     /// GHOST-04: a 4-elder bootstrap set forms a session at a floor of 4 (so

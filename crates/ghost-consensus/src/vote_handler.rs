@@ -1539,6 +1539,24 @@ impl VoteHandler {
                         );
                     }
                 }
+                VoteResult::BufferedEarly => {
+                    // Normal: peers open their sessions seconds apart, so a vote routinely
+                    // arrives before this node's session exists. It is applied on open.
+                    debug!(
+                        round_id = vote_msg.round_id,
+                        sender = hex::encode(&sender[..8]),
+                        "Vote arrived before the session opened — held"
+                    );
+                }
+                VoteResult::NoSession => {
+                    // A bound refused it. Worth a warning: at the observed vote volume this
+                    // should not happen, so it means either a flood or a real misconfiguration.
+                    warn!(
+                        round_id = vote_msg.round_id,
+                        sender = hex::encode(&sender[..8]),
+                        "Early vote dropped — pending buffer bound reached"
+                    );
+                }
                 VoteResult::DuplicateVote => {
                     debug!(sender = hex::encode(sender), "Duplicate vote ignored");
                 }
