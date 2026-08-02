@@ -734,6 +734,30 @@ vs checkpoints bounded and non-growing.
 Arming any height gate. `SHARE_ADDR_BIND_HEIGHT` and `OBSERVED_SETTLEMENT_HEIGHT` stay at
 `u64::MAX` until the shadow run passes — that is a separate, deliberate release.
 
+## ⚠ GAP FOUND IN SOAK 2026-08-02 — `coinbase_skeletons` is never pruned
+
+The retention rule exists and is tested (`bins/ghost-pool/src/skeleton_store.rs`: finalised-batch
+condition, reorg floor at `max_reorg_depth`, ceiling, reorg extends rather than races). **It is not
+wired.** `SkeletonStore` is an in-memory type with no reference from `main.rs`, and there is no
+`DELETE` on `coinbase_skeletons` anywhere in `queries.rs`.
+
+So the table added by WP-1b grows without limit. Measured on vm5 after ~6 hours of live traffic:
+
+```
+282 rows, 270 KB, 983 B average  ->  ~47 rows/hour, ~1.1 MB/day
+```
+
+Small today only because the coinbase carries few payout outputs. **At the 200-payee design target
+the suffix is ~29 KB, i.e. ~34 MB/day and never stops** — on the same 30 GB nodes that ran out of
+disk on 2026-08-01.
+
+Arming the gates is what makes the payout set large, so this must be wired **before** arming, not
+after. What is missing is small: a `prune_skeletons(before_height, finalised_seq)` query and a call
+from the reconcile tick that already runs every 5 minutes. The policy is already written and tested;
+only the storage side and the call site are absent.
+
+Filed against #585.
+
 ## Open decisions
 
 - Genesis source height (after a read-only preview-hash comparison across all 8)
