@@ -37,10 +37,20 @@ use parking_lot::Mutex;
 
 /// Entries retained before the oldest is evicted.
 ///
-/// Sized for the observed population — a handful of bad shares per node, not thousands — with a
-/// wide margin. At 16 bytes a key this is tens of KB, and the cost of an eviction is only that one
-/// proof gets verified again.
-pub const DEFAULT_CAPACITY: usize = 4096;
+/// Sized from measurement. The bad-share population a node encounters is **finite**: on vm5 the
+/// distinct set grew to 598 and then stopped dead, after which new judgements fell to zero and
+/// every further arrival was an already-known redelivery (1,343 in one five-minute window). The
+/// backlog is historical — shares produced in bursts during vardiff retargets — so a node learns
+/// it once and is then quiet. It is re-learned after each restart, since this cache is in memory.
+///
+/// 598 is the figure for one node over one pass. Producers with more history behind them will hold
+/// more, and the whole point is to avoid re-verifying, so the capacity carries real headroom rather
+/// than tracking the observed number. 256Ki keys is ~4 MB of key material against a process that
+/// already works in the gigabytes.
+///
+/// An eviction is not a correctness problem — the proof simply gets verified once more — so this is
+/// a throughput knob, not a safety one.
+pub const DEFAULT_CAPACITY: usize = 262_144;
 
 /// A digest of the bytes a terminal verdict is a function of.
 pub type VerdictKey = [u8; 16];
