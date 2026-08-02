@@ -391,7 +391,10 @@ impl ConvergenceHandler {
     /// serve a backfill whose payout destination it rewrote. Both convergence paths go through here
     /// rather than calling the verifier directly, so neither can be left on the old encoding.
     fn signature_is_valid(&self, proof: &ghost_common::types::ShareProof) -> bool {
-        if crate::binds_payout_address(self.round_manager.current_height()) {
+        // Era-aware: a backfilled proof from before the gate stays verifiable for ever. Judging
+        // it by the CURRENT height would make every pre-gate share unservable the moment the gate
+        // fired, freezing each node's gaps permanently.
+        if self.round_manager.requires_bound_signature(proof.round_id) {
             proof.has_valid_bound_signature()
         } else {
             proof.has_valid_received_by_signature()

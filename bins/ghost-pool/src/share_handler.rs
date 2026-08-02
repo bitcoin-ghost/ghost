@@ -86,7 +86,10 @@ impl ShareProofHandler {
         // sign their own shares (always-on) so the converged state is primed for
         // the moment the gate fires fleet-wide.
         let height = self.round_manager.current_height();
-        let signature_ok = if crate::binds_payout_address(height) {
+        // Judged by the share's ROUND, not the current height: the gate is a signature-format
+        // change and a share signed before it is not invalid, merely older. See
+        // `RoundManager::requires_bound_signature`.
+        let signature_ok = if self.round_manager.requires_bound_signature(proof.round_id) {
             proof.has_valid_bound_signature()
         } else {
             proof.has_valid_received_by_signature()

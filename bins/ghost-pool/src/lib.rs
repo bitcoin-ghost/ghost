@@ -226,12 +226,24 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// what makes a mixed-version fleet safe: nothing changes until every node can produce and check
 /// the new form.
 ///
-/// UNARMED (`u64::MAX`). Arming is a deliberate, separate release: the whole fleet must be on a
-/// binary that understands the bound encoding BEFORE the tip reaches the chosen height, exactly as
-/// [`SHARE_POW_VERIFY_HEIGHT`] was rolled (pool_sv2 first, then ghost-pool, then arm). Set the real
-/// height at that release; the same gate also carries the `received_by` PoW binding, so both
-/// signature-format changes land in one transition rather than two.
-pub const SHARE_ADDR_BIND_HEIGHT: u64 = u64::MAX;
+/// ARMED at `961_100` (2026-08-02). Tip was `960_764` when this was cut — ~336 blocks, roughly
+/// 2.3 days at 10 min/block. The fleet roll takes ~15 minutes, so that leaves an overnight soak
+/// plus room to re-roll a node, while not holding the address-rewrite vector open any longer than
+/// necessary. If the roll slips and the tip nears this height before every node is on the binary,
+/// bump it and rebuild: a node still below the gate signs the old encoding and its shares would be
+/// rejected by peers already above it.
+///
+/// Verification is era-aware, keyed on the round recorded in
+/// [`ADDR_BIND_ACTIVATION_KEY`] rather than on the current height, so a share signed before the
+/// boundary stays verifiable for ever. Judging by the tip would make every pre-gate share
+/// unservable the instant the gate fired, freezing each node's ledger gaps permanently.
+pub const SHARE_ADDR_BIND_HEIGHT: u64 = 961_100;
+
+/// `kv_store` key holding the round in which [`SHARE_ADDR_BIND_HEIGHT`] first took effect.
+///
+/// Shares carry a round, not a height, so the boundary has to be recorded as a round — and it has
+/// to outlive a restart, or the node re-derives a later one and downgrades post-gate shares.
+pub const ADDR_BIND_ACTIVATION_KEY: &str = "addr_bind_activation_round";
 
 /// Settle a won block by observing it on-chain, on every node rather than only the submitter.
 ///

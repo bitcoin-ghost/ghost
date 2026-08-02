@@ -2796,6 +2796,20 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Restore the address-bind era boundary. It must survive a restart: re-deriving it from the
+    // next template would place it later than the true boundary.
+    match db.kv_get(ghost_pool::ADDR_BIND_ACTIVATION_KEY) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(r) => {
+                round_manager.note_addr_bind_activation(r);
+                info!(activation_round = r, "Restored address-bind era boundary");
+            }
+            Err(e) => warn!(value = %v, error = %e, "unparseable address-bind activation round"),
+        },
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "could not read address-bind activation round"),
+    }
+
     // Register our own node's capabilities so we're included in node reward calculations
     // This is critical - without this, our shares won't be counted for node rewards
     round_manager.register_node(identity.node_id(), capabilities);
@@ -7124,7 +7138,9 @@ async fn main() -> Result<()> {
         // At and above the bind gate the signature also covers `payout_address`, so a relay cannot
         // redirect this miner's earnings while keeping the signature valid. Signer and verifier use
         // the same predicate, so both switch encoding at the same block.
-        if ghost_pool::binds_payout_address(rm_for_shares.current_height()) {
+        // Signing happens in the current round, so era and "now" coincide here — but go through
+        // the same predicate the verifiers use, so signer and verifier cannot drift apart.
+        if rm_for_shares.requires_bound_signature(round_id) {
             proof.sign_bound(identity_for_shares.as_ref());
         } else {
             proof.sign(identity_for_shares.as_ref());
@@ -9362,6 +9378,31 @@ async fn main() -> Result<()> {
                 TemplateEvent::NewWork { job_id: _, height } => {
                     // Start new round (SRI gets jobs via TDP automatically)
                     let round_id = rm_notify.start_round(height);
+
+                    // Persist the address-bind era boundary the first time it is established.
+                    // Without this a restart loses it and re-derives a LATER round from the next
+                    // template, which would treat genuinely post-gate shares as historical and
+                    // accept the weaker signature for them.
+                    if let Some(activation) = rm_notify.addr_bind_activation_round() {
+                        let stored = db_for_rounds
+                            .kv_get(ghost_pool::ADDR_BIND_ACTIVATION_KEY)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse::<u64>().ok());
+                        if stored != Some(activation) {
+                            if let Err(e) = db_for_rounds.kv_set(
+                                ghost_pool::ADDR_BIND_ACTIVATION_KEY,
+                                &activation.to_string(),
+                            ) {
+                                warn!(error = %e, "could not persist address-bind activation round");
+                            } else {
+                                info!(
+                                    activation_round = activation,
+                                    "Recorded the address-bind signature era boundary"
+                                );
+                            }
+                        }
+                    }
 
                     // Tell the vote handler the chain has advanced — feeds the payout-proposal
                     // height window (`known_best_height +/- 1000`); it was never called, so the

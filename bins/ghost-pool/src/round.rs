@@ -292,6 +292,8 @@ pub struct RoundManager {
     current_round: RwLock<RoundId>,
     /// Current block height
     current_height: RwLock<u64>,
+    /// First round at or above SHARE_ADDR_BIND_HEIGHT — the signature-format boundary.
+    addr_bind_activation_round: RwLock<Option<RoundId>>,
     /// Wall-clock start of the current round (reset on every `start_round`,
     /// i.e. each new-work / template event). Monotonic `Instant` so the
     /// reported elapsed time is immune to system clock adjustments. Read by
@@ -372,6 +374,7 @@ impl RoundManager {
             pow_reject_last_log: std::sync::atomic::AtomicI64::new(0),
             current_round: RwLock::new(0),
             current_height: RwLock::new(0),
+            addr_bind_activation_round: RwLock::new(None),
             current_round_start: RwLock::new(std::time::Instant::now()),
             rounds: RwLock::new(HashMap::new()),
             difficulty: RwLock::new(difficulty),
@@ -400,6 +403,38 @@ impl RoundManager {
         self.event_tx.subscribe()
     }
 
+    /// The round in which `SHARE_ADDR_BIND_HEIGHT` first took effect, if it has.
+    ///
+    /// Verification is era-aware because the gate is a **signature-format change**, and a share
+    /// carries no height — only a round. Judging an old share by the current height would make
+    /// every pre-gate share unverifiable the moment the gate fires, so a peer could never backfill
+    /// one again and the gaps between nodes' ledgers would freeze permanently. Judging it by the
+    /// era it was signed in keeps history verifiable while still requiring the bound encoding on
+    /// everything new.
+    pub fn addr_bind_activation_round(&self) -> Option<RoundId> {
+        *self.addr_bind_activation_round.read()
+    }
+
+    /// Record the activation round, if not already known. Ignores a later value: the FIRST round
+    /// at or above the gate is the boundary, and a restart that re-derives a later one would
+    /// wrongly treat genuinely post-gate shares as historical.
+    pub fn note_addr_bind_activation(&self, round_id: RoundId) {
+        let mut a = self.addr_bind_activation_round.write();
+        if a.map_or(true, |existing| round_id < existing) {
+            *a = Some(round_id);
+        }
+    }
+
+    /// Whether a share from `share_round_id` must carry the address-bound signature.
+    ///
+    /// Unknown activation round means the gate has never fired here, so nothing is bound yet.
+    pub fn requires_bound_signature(&self, share_round_id: RoundId) -> bool {
+        match self.addr_bind_activation_round() {
+            Some(activation) => share_round_id >= activation,
+            None => false,
+        }
+    }
+
     /// Seed the chain height at startup, before any template has arrived.
     ///
     /// `current_height` is otherwise 0 from process start until the first template, and every
@@ -426,6 +461,12 @@ impl RoundManager {
         };
 
         *self.current_height.write() = block_height;
+
+        // The gate is by height, but shares are judged by round, so the boundary has to be
+        // captured as a round the first time the height crosses it.
+        if block_height >= crate::share_addr_bind_height() {
+            self.note_addr_bind_activation(round_id);
+        }
         // Reset the round timer so `current_round_duration_secs` measures time
         // spent working THIS template, not the pool's total uptime.
         *self.current_round_start.write() = std::time::Instant::now();
@@ -1965,6 +2006,47 @@ mod tests {
                 Err(ShareError::InvalidShareHash)
             ),
             "a header that isn't the share's PoW preimage must be rejected"
+        );
+    }
+
+    /// The gate is a signature-format change, so a share is judged by the era it was signed in,
+    /// not by where the tip happens to be. Judging by current height would make every pre-gate
+    /// share unverifiable the instant the gate fired — no peer could backfill one again and each
+    /// node's gaps would freeze permanently.
+    #[test]
+    fn a_pre_gate_share_stays_verifiable_after_the_gate_fires() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        assert_eq!(manager.addr_bind_activation_round(), None);
+        assert!(
+            !manager.requires_bound_signature(1),
+            "nothing is bound before the gate has ever fired"
+        );
+
+        manager.note_addr_bind_activation(500);
+
+        assert!(
+            !manager.requires_bound_signature(499),
+            "a share from before the boundary must remain verifiable for ever"
+        );
+        assert!(
+            manager.requires_bound_signature(500),
+            "the boundary round is bound"
+        );
+        assert!(manager.requires_bound_signature(501));
+    }
+
+    /// A restart re-derives the activation from the first template it sees, which is LATER than
+    /// the true boundary. Taking that later value would treat genuinely post-gate shares as
+    /// historical and accept the weaker signature for them.
+    #[test]
+    fn the_earliest_activation_round_wins() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.note_addr_bind_activation(500);
+        manager.note_addr_bind_activation(900);
+        assert_eq!(manager.addr_bind_activation_round(), Some(500));
+        assert!(
+            manager.requires_bound_signature(600),
+            "a post-gate share must not be downgraded by a late re-derivation"
         );
     }
 
