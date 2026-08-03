@@ -66,6 +66,10 @@ pub struct VerificationTaskConfig {
     pub stratum_proof_gate_height: u64,
     /// Stratum port the challenger dials for that handshake. 3333 is the fleet's SV1 port.
     pub stratum_proof_port: u16,
+    /// #605: block height at/above which Archive must serve TRANSACTION-level detail, not just a
+    /// block header. `u64::MAX` (default) keeps the header-only challenge, so a node that never sets
+    /// this behaves exactly as before.
+    pub archive_tx_gate_height: u64,
 }
 
 impl Default for VerificationTaskConfig {
@@ -83,6 +87,7 @@ impl Default for VerificationTaskConfig {
             assignment_gate_height: u64::MAX,
             stratum_proof_gate_height: u64::MAX,
             stratum_proof_port: 3333,
+            archive_tx_gate_height: u64::MAX,
         }
     }
 }
@@ -110,6 +115,20 @@ pub trait PeerProvider: Send + Sync {
     /// Should exclude the specified node_id (self) and return
     /// at most `count` peers that are currently connected.
     fn get_random_peers(&self, exclude: &NodeId, count: usize) -> Vec<VerifiablePeer>;
+}
+
+/// What OUR node says about the transaction we are about to challenge on (#605).
+///
+/// Derived from the challenger's own RPC before the challenge is issued, so the comparison is against
+/// an independent view rather than anything the target supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedTx {
+    pub txid: String,
+    pub block_hash: String,
+    pub tx_index: usize,
+    pub size: usize,
+    pub input_count: usize,
+    pub output_count: usize,
 }
 
 /// Result of a verification challenge that can be broadcast
@@ -848,6 +867,21 @@ impl VerificationTask {
         self
     }
 
+    /// #605: set the height at/above which Archive must serve transaction-level detail
+    /// (from `ghost_pool::archive_tx_proof_height()`).
+    ///
+    /// Below it the challenge asks only for a block, and every response field is derivable from the
+    /// public 80-byte header — which is why +5, the largest capability weight, is currently earned by
+    /// anything holding headers.
+    ///
+    /// Gated because it changes what QUALIFIES a node for payout: a node demanding a transaction while
+    /// its peers accept a header would compute a different qualified set and the node-reward split
+    /// would diverge.
+    pub fn with_archive_tx_gate(mut self, height: u64) -> Self {
+        self.config.archive_tx_gate_height = height;
+        self
+    }
+
     /// H-1 FIX: Check if identity has been verified before allowing DB writes
     ///
     /// Returns Ok(()) if identity is verified, Err if not.
@@ -1285,9 +1319,31 @@ impl VerificationTask {
         })
         .to_string();
 
+        // #605: at/above the gate, name a TRANSACTION in that block instead of asking only for the
+        // block. Every field of a block-only response is derivable from the public 80-byte header, so
+        // +5 — the largest capability weight — is currently earned by anything holding headers.
+        //
+        // Falls back to the header-only challenge whenever we cannot establish our own expectation:
+        // no RPC, an empty block, a malformed reply. A challenger that cannot read its own chain must
+        // not fail the peer for it.
+        let expected_tx = if self
+            .rpc
+            .as_ref()
+            .map(|_| block_height >= self.config.archive_tx_gate_height)
+            .unwrap_or(false)
+        {
+            self.expected_tx_from_block(&block_hash).await
+        } else {
+            None
+        };
+
         let result = self
             .client
-            .verify_archive(&peer.http_address, Some(&block_hash), None)
+            .verify_archive(
+                &peer.http_address,
+                Some(&block_hash),
+                expected_tx.as_ref().map(|e| e.txid.as_str()),
+            )
             .await;
 
         // C-2 FIX: Validate block data authenticity, not just success flag.
@@ -1297,12 +1353,23 @@ impl VerificationTask {
         let (passed, response_data, target_signed_response) = match result {
             Ok((resp, signed_raw)) => {
                 // C-2 FIX: Perform merkle root validation
-                let validation_result = self.validate_archive_response(
+                let mut validation_result = self.validate_archive_response(
                     &resp,
                     &block_hash,
                     block_height,
                     expected_merkle_root.as_deref(),
                 );
+
+                // #605: when we asked for a transaction, the answer must match OUR node's view of it.
+                // Only tightens — a target that already failed the block check cannot be rescued.
+                if let Some(exp) = expected_tx.as_ref() {
+                    match Self::archive_tx_matches(resp.tx_data.as_ref(), exp) {
+                        Ok(()) => {}
+                        Err(why) => {
+                            validation_result = (false, format!("archive tx check failed: {why}"));
+                        }
+                    }
+                }
 
                 let response_json = serde_json::json!({
                     "success": resp.success,
@@ -1375,6 +1442,93 @@ impl VerificationTask {
     /// block selection, preventing attackers from pre-computing challenge responses.
     ///
     /// HIGH-VER-2: Uniform distribution across ALL block heights, not just recent
+    /// Pick a transaction from `block_hash` and record what OUR node says about it (#605).
+    ///
+    /// `None` on any RPC failure, which the caller treats as "do not escalate to a tx challenge" and
+    /// falls back to the header-only check rather than failing the target. A challenger that cannot
+    /// read its own chain has learned nothing about the peer.
+    async fn expected_tx_from_block(&self, block_hash: &str) -> Option<ExpectedTx> {
+        let rpc = self.rpc.as_ref()?;
+        // Verbosity 2 gives full transaction objects, so index/size/vin/vout come from one call.
+        let block = rpc.get_block(block_hash, 2).await.ok()?;
+        let txs = block.get("tx")?.as_array()?;
+        if txs.is_empty() {
+            return None;
+        }
+        let mut rb = [0u8; 8];
+        getrandom::getrandom(&mut rb).ok()?;
+        let idx = (u64::from_le_bytes(rb) as usize) % txs.len();
+        let tx = txs.get(idx)?;
+        Some(ExpectedTx {
+            txid: tx.get("txid")?.as_str()?.to_string(),
+            block_hash: block_hash.to_string(),
+            tx_index: idx,
+            size: tx.get("size")?.as_u64()? as usize,
+            input_count: tx.get("vin")?.as_array()?.len(),
+            output_count: tx.get("vout")?.as_array()?.len(),
+        })
+    }
+
+    /// Does the target's `TxData` match what OUR node says about that transaction? (#605)
+    ///
+    /// A free function on purpose, so the decision is driven directly by tests instead of only
+    /// through a live challenge. Two H-13 tests passed while production rejected every share because
+    /// they re-implemented the logic rather than calling it; the fix that mattered there was making
+    /// the decision callable.
+    ///
+    /// `expected` is derived from the challenger's own RPC. Every field must agree:
+    ///
+    /// - `txid` and `block_hash` — the target answered about the transaction we ASKED for, in the
+    ///   block we asked about, rather than whatever it happened to have
+    /// - `tx_index`, `size`, `input_count`, `output_count` — it holds the actual transaction, not
+    ///   just a note that the id exists
+    ///
+    /// A pruned node or SPV client cannot produce these at all. An on-demand proxy still can, so this
+    /// is NOT proof-of-storage — it excludes the population that currently passes for free.
+    pub(crate) fn archive_tx_matches(
+        returned: Option<&crate::challenge::TxData>,
+        expected: &ExpectedTx,
+    ) -> Result<(), String> {
+        let tx = returned.ok_or_else(|| "no tx_data in response".to_string())?;
+        if tx.txid != expected.txid {
+            return Err(format!(
+                "txid mismatch: asked {} got {}",
+                expected.txid, tx.txid
+            ));
+        }
+        if tx.block_hash != expected.block_hash {
+            return Err(format!(
+                "block_hash mismatch: asked {} got {}",
+                expected.block_hash, tx.block_hash
+            ));
+        }
+        if tx.tx_index != expected.tx_index {
+            return Err(format!(
+                "tx_index mismatch: ours {} theirs {}",
+                expected.tx_index, tx.tx_index
+            ));
+        }
+        if tx.size != expected.size {
+            return Err(format!(
+                "size mismatch: ours {} theirs {}",
+                expected.size, tx.size
+            ));
+        }
+        if tx.input_count != expected.input_count {
+            return Err(format!(
+                "input_count mismatch: ours {} theirs {}",
+                expected.input_count, tx.input_count
+            ));
+        }
+        if tx.output_count != expected.output_count {
+            return Err(format!(
+                "output_count mismatch: ours {} theirs {}",
+                expected.output_count, tx.output_count
+            ));
+        }
+        Ok(())
+    }
+
     async fn get_random_block_with_merkle(&self) -> Option<(String, u64, Option<String>)> {
         let rpc = self.rpc.as_ref()?;
 
@@ -2155,6 +2309,108 @@ impl VerificationTask {
 
 #[cfg(test)]
 mod tests {
+
+    fn expected_tx() -> ExpectedTx {
+        ExpectedTx {
+            txid: "aa".repeat(32),
+            block_hash: "bb".repeat(32),
+            tx_index: 7,
+            size: 250,
+            input_count: 2,
+            output_count: 3,
+        }
+    }
+
+    fn matching_txdata(e: &ExpectedTx) -> crate::challenge::TxData {
+        crate::challenge::TxData {
+            txid: e.txid.clone(),
+            block_hash: e.block_hash.clone(),
+            tx_index: e.tx_index,
+            size: e.size,
+            input_count: e.input_count,
+            output_count: e.output_count,
+        }
+    }
+
+    /// #605: an honest archive node answering about the transaction we asked for must PASS.
+    ///
+    /// The positive case matters as much as the negatives: a check that rejects everything would
+    /// strip +5 from the entire fleet, which is worse than the hole it closes.
+    #[test]
+    fn archive_tx_accepts_a_node_that_serves_the_requested_transaction() {
+        let e = expected_tx();
+        assert!(VerificationTask::archive_tx_matches(Some(&matching_txdata(&e)), &e).is_ok());
+    }
+
+    /// The header-only population must now FAIL — no tx_data at all is what a pruned node,
+    /// an SPV client, or the current header-only responder produces.
+    #[test]
+    fn archive_tx_rejects_a_response_with_no_transaction() {
+        let e = expected_tx();
+        let err = VerificationTask::archive_tx_matches(None, &e).unwrap_err();
+        assert!(err.contains("no tx_data"), "got: {err}");
+    }
+
+    /// Answering about a DIFFERENT transaction must fail. A node that returns whatever it happens to
+    /// hold, rather than what was asked for, has not demonstrated anything.
+    #[test]
+    fn archive_tx_rejects_a_substituted_transaction() {
+        let e = expected_tx();
+        let mut t = matching_txdata(&e);
+        t.txid = "cc".repeat(32);
+        let err = VerificationTask::archive_tx_matches(Some(&t), &e).unwrap_err();
+        assert!(err.contains("txid mismatch"), "got: {err}");
+
+        let mut t2 = matching_txdata(&e);
+        t2.block_hash = "dd".repeat(32);
+        let err2 = VerificationTask::archive_tx_matches(Some(&t2), &e).unwrap_err();
+        assert!(err2.contains("block_hash mismatch"), "got: {err2}");
+    }
+
+    /// EVERY metadata field must be checked, one test per field.
+    ///
+    /// Written as four separate assertions rather than one composite because a single "some field is
+    /// wrong" case passes even if three of the four comparisons were deleted — the exact shape that
+    /// let a bare-connect stratum check survive its own test earlier today.
+    #[test]
+    fn archive_tx_rejects_each_wrong_metadata_field_individually() {
+        let e = expected_tx();
+
+        let mut a = matching_txdata(&e);
+        a.tx_index = e.tx_index + 1;
+        assert!(VerificationTask::archive_tx_matches(Some(&a), &e)
+            .unwrap_err()
+            .contains("tx_index mismatch"));
+
+        let mut b = matching_txdata(&e);
+        b.size = e.size + 1;
+        assert!(VerificationTask::archive_tx_matches(Some(&b), &e)
+            .unwrap_err()
+            .contains("size mismatch"));
+
+        let mut c = matching_txdata(&e);
+        c.input_count = e.input_count + 1;
+        assert!(VerificationTask::archive_tx_matches(Some(&c), &e)
+            .unwrap_err()
+            .contains("input_count mismatch"));
+
+        let mut d = matching_txdata(&e);
+        d.output_count = e.output_count + 1;
+        assert!(VerificationTask::archive_tx_matches(Some(&d), &e)
+            .unwrap_err()
+            .contains("output_count mismatch"));
+    }
+
+    /// The gate must ship DORMANT, so a build that forgets to wire it keeps the old behaviour rather
+    /// than unilaterally demanding transactions its peers do not.
+    #[test]
+    fn archive_tx_gate_defaults_dormant() {
+        assert_eq!(
+            VerificationTaskConfig::default().archive_tx_gate_height,
+            u64::MAX,
+            "#605: an unwired archive gate must never activate on its own"
+        );
+    }
 
     /// #605: the stratum-proof gate must default to DORMANT.
     ///
