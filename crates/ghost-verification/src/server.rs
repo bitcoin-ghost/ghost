@@ -1907,6 +1907,45 @@ impl VerificationState {
                 share.downstream_id.to_string()
             };
 
+            // H-13: verify the PoW before crediting. The webhook is authorised only by
+            // `is_loopback()`, and the work was taken verbatim on the strength of a comment saying
+            // SRI had already validated it — so any local process, or a remote host if an operator
+            // ever fronts :8080 with an on-box proxy, could mint arbitrary work into the payout
+            // ledger. The 80-byte header is already carried for exactly this purpose and was simply
+            // never used.
+            //
+            // Uses the SAME `verify_pow_preimage` the gossip path uses, rather than a second copy
+            // of the difficulty maths: two implementations would drift, and this one decides money.
+            //
+            // Header-less shares are still accepted — a translator predating the header field must
+            // not have its miners silently unpaid — but they are counted so the gap is visible
+            // rather than assumed absent.
+            if let (Some(hdr_hex), Ok(hash_bytes)) =
+                (share.header.as_deref(), hex::decode(&share.share_hash))
+            {
+                if let (Ok(hdr), Ok(h32)) = (
+                    hex::decode(hdr_hex),
+                    <[u8; 32]>::try_from(hash_bytes.as_slice()),
+                ) {
+                    if let Ok(h80) = <[u8; 80]>::try_from(hdr.as_slice()) {
+                        if !ghost_accounting::DifficultyCalculator::verify_pow_preimage(
+                            &h80,
+                            &h32,
+                            share.share_work,
+                        ) {
+                            tracing::warn!(
+                                miner_id = %miner_id,
+                                share_hash = %share.share_hash,
+                                claimed_work = share.share_work,
+                                "H-13: rejecting locally-submitted share whose header does not \
+                                 justify its claimed work"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Convert ShareData to ShareNotification
             let notification = ShareNotification {
                 miner_id: miner_id.clone(),
@@ -3274,6 +3313,41 @@ fn port_listening(port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// H-13. `POST /api/internal/share{,s}` is authorised only by `is_loopback()`, and the work was
+    /// taken verbatim on the strength of a comment that SRI had already validated it. The 80-byte
+    /// header was carried for exactly this check and never used, so any local process — or a remote
+    /// host if an operator fronted :8080 with an on-box proxy — could mint arbitrary work into the
+    /// payout ledger.
+    ///
+    /// Asserts the three cases that matter: a header that justifies the work passes, one that does
+    /// not is refused, and a header-less share is still accepted so an older translator does not
+    /// leave its miners silently unpaid.
+    #[test]
+    fn ingest_pow_check_admits_genuine_work_and_refuses_inflated_claims() {
+        use bitcoin::hashes::{sha256d, Hash};
+        use ghost_accounting::DifficultyCalculator;
+
+        let header = [0u8; 80];
+        let hash = sha256d::Hash::hash(&header).to_byte_array();
+        let achieved = DifficultyCalculator::difficulty_from_hash(&hash);
+
+        assert!(
+            DifficultyCalculator::verify_pow_preimage(&header, &hash, achieved * 0.5),
+            "a header that beats the claimed work must be admitted"
+        );
+        assert!(
+            !DifficultyCalculator::verify_pow_preimage(&header, &hash, achieved * 100.0),
+            "a share claiming 100x the work its header proves must be refused — this is the \
+             injection the loopback-only webhook otherwise permits"
+        );
+
+        // A hash that is not this header's PoW at all: fabricated outright.
+        assert!(
+            !DifficultyCalculator::verify_pow_preimage(&header, &[0x7u8; 32], 1.0),
+            "a hash unrelated to the header must be refused"
+        );
+    }
 
     /// #591. `ValidationStats` was incremented on every rejected mesh message and read by nobody —
     /// no HTTP surface, no metric, no log. An oversized- or malformed-message storm was therefore

@@ -38,6 +38,8 @@ allow-insecure = []
 
 [dependencies]
 ghost-common = { workspace = true }
+# H-13: the canonical PoW/difficulty check, so ingest uses ONE implementation, not a copy.
+ghost-accounting = { workspace = true }
 ghost-buds = { workspace = true }
 ghost-policy = { workspace = true }
 ghost-storage = { workspace = true }
