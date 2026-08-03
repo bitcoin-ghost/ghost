@@ -16,34 +16,45 @@
 #
 # THRESHOLD ARITHMETIC (read before changing the number of entries)
 #
-#   signers n = 8
-#   required  = ceil(n * 67 / 100) = ceil(5.36) = 6
+#   signers n = 12   (8 fleet nodes + 4 offline-only keys)
+#   required  = ceil(n * 67 / 100) = ceil(8.04) = 9
 #
-# So 6 of these 8 must sign to move the set forward. Two consequences, both permanent:
+# So 9 of these 12 must sign to move the set forward. Two consequences, both permanent:
 #
-#   * Lose 3 keys and the set FREEZES. Anyone already running the shim keeps dialling whatever
-#     nodes were last attested, forever, because 6 signatures can never again be assembled.
-#   * Whoever controls 6 keys can point every shim-using miner anywhere they like, and the shim
+#   * Lose 4 keys and the set FREEZES. Anyone already running the shim keeps dialling whatever
+#     nodes were last attested, forever, because 9 signatures can never again be assembled.
+#     At most 3 may be lost.
+#   * Whoever controls 9 keys can point every shim-using miner anywhere they like, and the shim
 #     sees a perfectly valid update.
 #
-# WHERE THE KEYS MUST LIVE — at least 3 OFF the fleet
+# WHY 4 OFFLINE KEYS AND NOT 3
 #
-# All 8 ids below belong to nodes reachable with one set of SSH credentials. If all 8 signing keys
-# stay on those machines, a single SSH compromise yields 8 of 8: the attacker owns the trust root
-# and can redirect every miner legitimately.
+# An earlier draft said "hold 3 of the 8 fleet keys offline". That was wrong on its own premise. The
+# 8 fleet ids below ARE the nodes' operational identity keys (`node.key`), used at 32 signing sites
+# for mesh messages, votes, health pings and checkpoints. A node cannot run without its own key, so
+# none of the 8 can be taken offline. Offline signers must be SEPARATE keypairs added to the set,
+# which grows n and moves the threshold with it:
 #
-# Moving keys offline only helps if enough move:
+#   set                    | n  | threshold | fleet holds | one SSH compromise wins?
+#   -----------------------|----|-----------|-------------|-------------------------
+#   8 fleet only           | 8  | 6         | 8           | YES
+#   8 fleet + 2 offline    | 10 | 7         | 8           | YES
+#   8 fleet + 3 offline    | 11 | 8         | 8           | YES  <- exactly reaches it
+#   8 fleet + 4 offline    | 12 | 9         | 8           | NO   <- what this file uses
 #
-#   keys left on the fleet | reaches the threshold of 6? | trust root safe from one SSH compromise?
-#   -----------------------|----------------------------|------------------------------------------
-#   8 (none offline)       | yes, 8 >= 6                | NO
-#   7 (1 offline)          | yes, 7 >= 6                | NO
-#   6 (2 offline)          | yes, exactly 6 >= 6        | NO  <-- the easy mistake
-#   5 (3 offline)          | no, 5 < 6                  | YES
+# Four is the smallest number that puts the fleet's own 8 keys BELOW the threshold, so compromising
+# every production node no longer yields control of miner discovery.
 #
-# THREE keys must be held off the fleet — hardware key or an offline machine. Two is not enough,
-# and "at least one" is actively misleading. The cost is friction: every legitimate change to the
-# node list needs an offline key brought out.
+# The 4 offline keys were generated on an operator machine that is not a pool node, one `--data-dir`
+# each (the path is otherwise fixed at `~/.ghost/node.key` and repeated runs overwrite it). Their
+# private keys have never been on the fleet and must never be copied to it.
+#
+# KEY HYGIENE — learned the hard way
+#
+# `node.key` is 44 bytes: a 32-byte SECRET key plus a 12-byte PoW proof. `xxd`/`cat` on it prints the
+# secret. A first set of 4 keys was discarded and regenerated because its contents were rendered to a
+# terminal and captured. Back these up by COPYING the file, or by writing the hex to a file with
+# output redirection — never by displaying it. Verify a backup with `cmp`, which is silent on success.
 #
 # ADDING AN OPERATOR
 #
@@ -78,3 +89,16 @@ e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927
 f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f
 # ghost-vm8
 4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132
+
+# ---------------------------------------------------------------------------
+# OFFLINE-ONLY SIGNERS (4). Private keys held off the fleet, never on a pool node.
+# These are what stop a full fleet compromise from reaching the threshold of 9.
+# ---------------------------------------------------------------------------
+# offline-1
+2f377c5c7d104869c60c58a310a2e1a30f18656a6ee6f1b1b0ca26b3d901ff12
+# offline-2
+da7bd831c9d8924109571b63ec1cc4c5dc8f450df82c997345d08be1aaad95a0
+# offline-3
+fdeded12e086c8a2ee43e861723f5ac8a0590d5a902f69ee347601d8df2c046a
+# offline-4
+9889b24987b4cad505be1c762d3cbcea363e2f17dc223a48e979089b0425c7f3
