@@ -1301,6 +1301,10 @@ pub struct VerificationState {
     /// silently claiming health. Defaulting an unwired probe to `true` is precisely the bug this
     /// replaces.
     get_core_health: Option<Box<dyn Fn() -> (bool, u64) + Send + Sync>>,
+    /// #591: mesh validation counters. Optional so an unwired caller reports `null` — "unknown" —
+    /// rather than a confident row of zeros that looks like a clean mesh.
+    get_mesh_validation:
+        Option<Box<dyn Fn() -> crate::challenge::MeshValidationStats + Send + Sync>>,
     /// Archive mode handler
     archive_handler: Option<Box<dyn ArchiveHandler + Send + Sync>>,
     /// GhostPay handler
@@ -1641,6 +1645,7 @@ impl VerificationState {
             get_miner_count: Box::new(|| 0),
             get_peer_count: Box::new(|| 0),
             get_core_health: None,
+            get_mesh_validation: None,
             archive_handler: None,
             ghostpay_handler: None,
             gsp_handler: None,
@@ -2233,6 +2238,16 @@ impl VerificationState {
     /// The callback returns `(reachable, seconds_since_last_success)`. Without it `/health` cannot
     /// claim the node is healthy — it reports `core_reachable: null` and leaves `healthy` false,
     /// because an unmeasured dependency is not a working one.
+    /// Wire the mesh validation counters into `/health` (#591). Without this they are incremented
+    /// and read by nobody, so a malformed-message storm is invisible.
+    pub fn with_mesh_validation(
+        mut self,
+        probe: impl Fn() -> crate::challenge::MeshValidationStats + Send + Sync + 'static,
+    ) -> Self {
+        self.get_mesh_validation = Some(Box::new(probe));
+        self
+    }
+
     pub fn with_core_health(
         mut self,
         probe: impl Fn() -> (bool, u64) + Send + Sync + 'static,
@@ -2583,6 +2598,7 @@ impl VerificationState {
     pub async fn get_health(&self) -> HealthResponse {
         let core = self.get_core_health.as_ref().map(|probe| probe());
         HealthResponse {
+            mesh_validation: self.get_mesh_validation.as_ref().map(|p| p()),
             // Unknown is not healthy. If nothing wired a probe, this node cannot demonstrate it
             // can reach Ghost Core, and saying "healthy" on that basis is what hid vm7's outage.
             healthy: core.map(|(reachable, _)| reachable).unwrap_or(false),
@@ -3258,6 +3274,46 @@ fn port_listening(port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #591. `ValidationStats` was incremented on every rejected mesh message and read by nobody —
+    /// no HTTP surface, no metric, no log. An oversized- or malformed-message storm was therefore
+    /// indistinguishable from a clean mesh, which is the blindness that let #558 and #583 run for
+    /// weeks. A counter with no reader is not instrumentation.
+    #[tokio::test]
+    async fn health_surfaces_mesh_validation_when_wired_and_omits_it_when_not() {
+        use crate::challenge::MeshValidationStats;
+
+        fn state() -> VerificationState {
+            VerificationState::new(
+                "test_node".to_string(),
+                "1.0.0".to_string(),
+                PolicyProfile::default(),
+                NodeCapabilities::default(),
+            )
+        }
+
+        // Unwired: absent, NOT a confident row of zeros.
+        assert!(
+            state().get_health().await.mesh_validation.is_none(),
+            "an unwired probe must report unknown, not a clean-looking zero"
+        );
+
+        // Wired: the numbers reach the response.
+        let wired = state().with_mesh_validation(|| MeshValidationStats {
+            total: 1_000,
+            valid: 940,
+            too_large: 60,
+            ..Default::default()
+        });
+        let stats = wired
+            .get_health()
+            .await
+            .mesh_validation
+            .expect("wired probe must report");
+        assert_eq!(stats.total, 1_000);
+        assert_eq!(stats.too_large, 60, "the drop count must be readable");
+    }
+
     use super::*;
     use ghost_common::types::NodeCapabilities;
     use ghost_policy::PolicyProfile;

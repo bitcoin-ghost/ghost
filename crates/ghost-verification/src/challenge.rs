@@ -527,6 +527,28 @@ pub struct HealthResponse {
     pub capabilities: CapabilityStatus,
     /// Uptime (seconds)
     pub uptime_secs: u64,
+    /// Mesh message-validation counters, or `null` if not wired.
+    ///
+    /// #591: these were incremented on every rejected message and read by nobody, so an oversized
+    /// or malformed-message storm was invisible — the same blindness that let #558 and #583 run
+    /// for weeks. A counter with no reader is not instrumentation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_validation: Option<MeshValidationStats>,
+}
+
+/// Mesh message-validation counters surfaced on `/health`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct MeshValidationStats {
+    pub total: u64,
+    pub valid: u64,
+    pub too_small: u64,
+    pub too_large: u64,
+    pub bad_version: u64,
+    pub bad_type: u64,
+    pub bad_signature: u64,
+    pub bad_timestamp: u64,
+    pub other_errors: u64,
+    pub memory_limit_exceeded: u64,
 }
 
 /// Capability status
@@ -1082,6 +1104,7 @@ mod tests {
     #[test]
     fn test_signed_response_creation() {
         let health = HealthResponse {
+            mesh_validation: None,
             healthy: true,
             core_reachable: Some(true),
             core_last_ok_secs: Some(0),
@@ -1115,6 +1138,7 @@ mod tests {
     #[test]
     fn test_signed_response_timestamp_validation() {
         let health = HealthResponse {
+            mesh_validation: None,
             healthy: true,
             core_reachable: Some(true),
             core_last_ok_secs: Some(0),

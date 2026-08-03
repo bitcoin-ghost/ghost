@@ -7768,6 +7768,28 @@ async fn main() -> Result<()> {
             verification_state.with_core_health(move || rpc_for_health.core_liveness(stale_after));
     }
 
+    // #591: surface the mesh validation counters on /health. They were incremented on every
+    // rejected message and read by nobody, so an oversized- or malformed-message storm produced no
+    // observable output at all — the failure mode that let #558 and #583 run for weeks.
+    {
+        let mesh_for_health = Arc::clone(&mesh);
+        verification_state = verification_state.with_mesh_validation(move || {
+            let s = mesh_for_health.validation_stats();
+            ghost_verification::challenge::MeshValidationStats {
+                total: s.total,
+                valid: s.valid,
+                too_small: s.too_small,
+                too_large: s.too_large,
+                bad_version: s.bad_version,
+                bad_type: s.bad_type,
+                bad_signature: s.bad_signature,
+                bad_timestamp: s.bad_timestamp,
+                other_errors: s.other_errors,
+                memory_limit_exceeded: s.memory_limit_exceeded,
+            }
+        });
+    }
+
     // Wire Prometheus metrics to verification state
     verification_state = verification_state.with_metrics(Arc::clone(&metrics));
 
