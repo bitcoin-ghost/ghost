@@ -420,7 +420,7 @@ impl RoundManager {
     /// wrongly treat genuinely post-gate shares as historical.
     pub fn note_addr_bind_activation(&self, round_id: RoundId) {
         let mut a = self.addr_bind_activation_round.write();
-        if a.map_or(true, |existing| round_id < existing) {
+        if a.is_none_or(|existing| round_id < existing) {
             *a = Some(round_id);
         }
     }

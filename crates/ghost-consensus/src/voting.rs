@@ -817,8 +817,11 @@ pub struct VotingManager {
     /// with no log on the path. One node reached consensus 2.4 s before another had even opened
     /// its session; the late node tallied 3 of 8 and timed out while the rest executed the payout.
     /// That leaves the timed-out node mining without the payout armed while its peers have it.
-    pending: RwLock<HashMap<(RoundId, [u8; 32]), VecDeque<PendingVote>>>,
+    pending: RwLock<PendingVotes>,
 }
+
+/// Early votes held per (round, proposal), oldest first.
+type PendingVotes = HashMap<(RoundId, [u8; 32]), VecDeque<PendingVote>>;
 
 /// A vote held for a session that has not opened yet.
 #[derive(Debug)]
