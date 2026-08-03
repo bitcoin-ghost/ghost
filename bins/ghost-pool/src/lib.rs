@@ -279,7 +279,7 @@ pub const ADDR_BIND_ACTIVATION_KEY: &str = "addr_bind_activation_round";
 /// twice (#589), which is the larger error.
 pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 
-/// Report-and-median adoption of the payout checkpoint (#606). **DORMANT — deliberately unarmed.**
+/// Report-and-median adoption of the payout checkpoint (#606). **ARMED at 961_700.**
 ///
 /// At and above this height a voter REPORTS its own recomputed per-address work in its checkpoint
 /// vote, and finalisation adopts the per-address lower median of those reports instead of the
@@ -287,12 +287,18 @@ pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 /// tolerance (2% relative, 0.2%-of-pool floor, 1% aggregate), be ratified by an honest quorum, and
 /// compound the skew at every checkpoint.
 ///
-/// `u64::MAX` = never. It MUST NOT be armed until the whole fleet runs a binary carrying
-/// `MAX_PAYOUT_LEDGER_VOTE_SIZE`: an enlarged vote is up to ~70 KB, and a node on an older build
-/// validates checkpoint votes against the old 1 KB `MAX_VOTE_SIZE` and silently DROPS them. A
-/// partial roll would therefore cost quorum and stop payouts. Ordering the size limit ahead of the
-/// behaviour change is the entire reason this is a height gate rather than a straight fix.
-pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = u64::MAX;
+/// The precondition for arming was that every node already accepts an enlarged vote: a report is up
+/// to ~70 KB, and a node on a build predating `MAX_PAYOUT_LEDGER_VOTE_SIZE` validates checkpoint
+/// votes against the old 1 KB `MAX_VOTE_SIZE` and silently DROPS them, which would cost quorum and
+/// stop payouts. That precondition is MET — `e9ca0c446` carries the size limit and was rolled to all
+/// eight nodes on 2026-08-03, verified byte-identical. Ordering the limit ahead of the behaviour
+/// change is the whole reason this is a height gate.
+///
+/// 961_700 is ~300 blocks after [`OBSERVED_SETTLEMENT_HEIGHT`], deliberately: two payout behaviour
+/// changes must not land together, or a divergence cannot be attributed to either. It is ~800 blocks
+/// (roughly 4 days at the observed ~8 min/block) beyond the tip at the time of arming, which leaves
+/// room for the build, canary soak and rolling deploy several times over.
+pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = 961_700;
 
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
@@ -421,6 +427,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         OBSERVED_SETTLEMENT_HEIGHT,
     );
+    let payout_median = gates::from_env(
+        "GHOST_PAYOUT_MEDIAN_ADOPTION_HEIGHT",
+        network,
+        PAYOUT_MEDIAN_ADOPTION_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
@@ -429,6 +440,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
     let _ = gates::SHARE_ADDR_BIND.set(share_addr_bind);
     let _ = gates::OBSERVED_SETTLEMENT.set(observed_settlement);
+    let _ = gates::PAYOUT_MEDIAN_ADOPTION.set(payout_median);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != COINBASE_FEE_SPLIT_HEIGHT
