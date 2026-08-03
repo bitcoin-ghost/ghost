@@ -306,7 +306,7 @@ impl CoinbaseCommitment {
     /// to — which is what lets every node settle from its own view of the chain instead of being
     /// told by the node that happened to submit the block.
     ///
-    /// It deliberately delegates to [`Self::compute_outputs_hash`] rather than hashing here. H-8 was
+    /// It deliberately delegates to the private `compute_outputs_hash` rather than hashing here. H-8 was
     /// a divergence between two implementations of this hash, and the way to not have that bug again
     /// is to not have two implementations: the proposal side, the pre-submission verifier and
     /// settlement all end up in the same function.

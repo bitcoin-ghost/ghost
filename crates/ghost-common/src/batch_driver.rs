@@ -6,7 +6,7 @@
 //! tested for the cases that matter, and the cases that matter here are the rare ones.
 //!
 //! The pieces it ties together already exist and are each tested on their own:
-//! [`ProposerSchedule`] decides whose turn it is, [`verify_batch`](crate::batch_consensus::verify_batch)
+//! [`ProposerSchedule`] decides whose turn it is, [`crate::batch_consensus::verify_batch`]
 //! judges a batch, [`SeqVoteLock`] stops this node backing two batches at one height,
 //! [`SeqTally`] counts, and [`Quarantine`] holds what a terminal fault costs a peer.
 //!
