@@ -1352,15 +1352,32 @@ impl VoteHandler {
             }
         }
 
-        // 6. Check for duplicate addresses (same address receiving multiple payouts)
-        let mut seen_addresses = std::collections::HashSet::new();
-        for payout in proposal
-            .miner_payouts
-            .iter()
-            .chain(proposal.node_payouts.iter())
-        {
-            if !seen_addresses.insert(&payout.address) {
-                return Err("duplicate payout address");
+        // 6. Check for duplicate addresses WITHIN each list — not across the two (#587).
+        //
+        // This check used to chain `miner_payouts` with `node_payouts`, which made an operator who
+        // mines to their own node reward address unpayable. That is not hypothetical: ghost-vm1's
+        // `node_payout_address` is also the rank-2 miner's address, so the builder produced a
+        // proposal its own validator was guaranteed to reject, 6 of 8 nodes voting no, every
+        // round. The pool could never have paid out.
+        //
+        // Cross-list collision is legitimate. The two payments have different provenance — one is
+        // work, one is capability — and each list is separately pinned by exact equality against
+        // the fleet-ratified checkpoint (`validate_proposal_split` for miners,
+        // `validate_node_split` for nodes). So a collision cannot inflate either side; the amounts
+        // are already nailed down independently. It costs one extra coinbase output, which is
+        // valid and which the coinbase commitment covers.
+        //
+        // A duplicate WITHIN a list is still a genuine defect: post-grouping there is exactly one
+        // miner entry per address, so a repeat is double payment.
+        for (list, what) in [
+            (&proposal.miner_payouts, "duplicate miner payout address"),
+            (&proposal.node_payouts, "duplicate node payout address"),
+        ] {
+            let mut seen_addresses = std::collections::HashSet::new();
+            for payout in list.iter() {
+                if !seen_addresses.insert(&payout.address) {
+                    return Err(what);
+                }
             }
         }
 
@@ -1973,6 +1990,97 @@ mod tests {
         assert!(
             handler.validate_proposal(&p).is_err(),
             "ancient timestamp must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_proposal_allows_one_address_to_be_paid_as_both_miner_and_node() {
+        // #587: this rejection stopped the pool ever paying out. ghost-vm1's
+        // `node_payout_address` is also the rank-2 miner's payout address (4.63% of the pool), and
+        // the duplicate check spanned `miner_payouts` CHAINED WITH `node_payouts` — so every
+        // proposal the builder produced was rejected by its own validator, 6 of 8 nodes voting no,
+        // every round.
+        //
+        // An operator who also mines to the same address is a legitimate and expected
+        // configuration. The two payments have different provenance: one is work, one is
+        // capability. They are built independently, and each is separately pinned by exact
+        // equality against the fleet-ratified checkpoint (`validate_proposal_split` for miners,
+        // `validate_node_split` for nodes), so a cross-list collision cannot be used to inflate
+        // anything — the amounts on both sides are already nailed down.
+        //
+        // Duplicates WITHIN a list remain a real defect and must still be rejected: post-grouping
+        // there is exactly one miner entry per address, so a repeat means double payment.
+        let identity = create_test_identity();
+        let voting_manager = Arc::new(VotingManager::new(100));
+        let handler = VoteHandler::new(identity, voting_manager);
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        let shared = b"bc1q9zsharedwithanodewt9k0q0ej".to_vec();
+
+        // The live shape: the same address appears once as a miner and once as a node.
+        let mut p = create_test_proposal();
+        p.timestamp = now;
+        p.block_height = 800_000;
+        p.miner_payouts = vec![PayoutEntry {
+            address: shared.clone(),
+            amount: 14_323_370,
+            recipient_id: [7u8; 32],
+            payout_type: PayoutType::Mining,
+        }];
+        p.node_payouts = vec![PayoutEntry {
+            address: shared.clone(),
+            amount: 1_000_000,
+            recipient_id: [8u8; 32],
+            payout_type: PayoutType::NodeReward,
+        }];
+        assert!(
+            handler.validate_proposal(&p).is_ok(),
+            "#587: an operator who also mines to their node reward address must not block payouts"
+        );
+
+        // A repeat WITHIN miner_payouts is still double payment — must stay rejected.
+        let mut dup_miner = create_test_proposal();
+        dup_miner.timestamp = now;
+        dup_miner.miner_payouts = vec![
+            PayoutEntry {
+                address: shared.clone(),
+                amount: 10_000,
+                recipient_id: [7u8; 32],
+                payout_type: PayoutType::Mining,
+            },
+            PayoutEntry {
+                address: shared.clone(),
+                amount: 10_000,
+                recipient_id: [7u8; 32],
+                payout_type: PayoutType::Mining,
+            },
+        ];
+        dup_miner.node_payouts = vec![];
+        assert!(
+            handler.validate_proposal(&dup_miner).is_err(),
+            "a duplicate address within miner_payouts is double payment and must be rejected"
+        );
+
+        // And a repeat WITHIN node_payouts likewise.
+        let mut dup_node = create_test_proposal();
+        dup_node.timestamp = now;
+        dup_node.node_payouts = vec![
+            PayoutEntry {
+                address: b"bc1qnode".to_vec(),
+                amount: 10_000,
+                recipient_id: [9u8; 32],
+                payout_type: PayoutType::NodeReward,
+            },
+            PayoutEntry {
+                address: b"bc1qnode".to_vec(),
+                amount: 10_000,
+                recipient_id: [9u8; 32],
+                payout_type: PayoutType::NodeReward,
+            },
+        ];
+        assert!(
+            handler.validate_proposal(&dup_node).is_err(),
+            "a duplicate address within node_payouts is double payment and must be rejected"
         );
     }
 
