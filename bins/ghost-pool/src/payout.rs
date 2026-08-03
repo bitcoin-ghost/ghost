@@ -1553,18 +1553,31 @@ impl PayoutProposalCreator {
             let address = self.get_miner_address(&miner_id)?;
 
             // HIGH-MINE-5: Validate miner address before including in payout
-            // This prevents unspendable outputs from malformed addresses
-            if !address.is_empty() {
-                if let Err(e) = self.validate_payout_address(&address, "miner") {
-                    warn!(
-                        miner_id,
-                        error = %e,
-                        "HIGH-MINE-5: Invalid miner address - treating as dust"
-                    );
-                    dust_total = dust_total.saturating_add(amount);
-                    allocated_total = allocated_total.saturating_add(amount);
-                    continue;
-                }
+            // This prevents unspendable outputs from malformed addresses.
+            //
+            // M-11: the empty case must be handled FIRST. `get_miner_address` returns an empty vec
+            // for an unknown miner or one whose stored address will not parse, and this validation
+            // used to sit inside `if !address.is_empty()` — so an empty address skipped it and was
+            // pushed as a payout entry with no address at all. A malformed address became dust; a
+            // missing one became an anyone-can-spend output carrying that miner's whole share.
+            if address.is_empty() {
+                warn!(
+                    miner_id,
+                    "M-11: miner has no resolvable payout address - treating as dust"
+                );
+                dust_total = dust_total.saturating_add(amount);
+                allocated_total = allocated_total.saturating_add(amount);
+                continue;
+            }
+            if let Err(e) = self.validate_payout_address(&address, "miner") {
+                warn!(
+                    miner_id,
+                    error = %e,
+                    "HIGH-MINE-5: Invalid miner address - treating as dust"
+                );
+                dust_total = dust_total.saturating_add(amount);
+                allocated_total = allocated_total.saturating_add(amount);
+                continue;
             }
 
             // Convert miner_id to recipient_id
@@ -2548,6 +2561,36 @@ mod tests {
     }
 
     // ---- GHOST-02: proposal split recompute ----
+
+    /// Audit M-11. `get_miner_address` returns an empty vec for an unknown miner or one whose
+    /// stored address fails to parse, commenting that it "will be filtered out by proposal
+    /// validator". `calculate_miner_payouts` did not filter it: the HIGH-MINE-5 validation is
+    /// inside `if !address.is_empty()`, so an EMPTY address skipped validation entirely and was
+    /// pushed as a `PayoutEntry` with no address.
+    ///
+    /// A non-empty invalid address becomes dust; an empty one became an output. Downstream that
+    /// stalls payouts (the vote handler rejects it) and, if that check were ever bypassed, is an
+    /// anyone-can-spend coinbase output.
+    #[test]
+    fn a_miner_with_no_resolvable_address_becomes_dust_not_an_empty_output() {
+        let creator = ghost02_creator();
+        // A miner_id that is not itself an address and has no row in `miners`, so
+        // `get_miner_address` yields empty.
+        let miner_work: Vec<(String, u128)> = vec![("worker-with-no-address".to_string(), 1_000)];
+
+        let (payouts, dust) = creator
+            .calculate_miner_payouts(&miner_work, 5_000_000_000)
+            .expect("calculation must succeed");
+
+        assert!(
+            payouts.iter().all(|p| !p.address.is_empty()),
+            "no payout entry may carry an empty address: {payouts:?}"
+        );
+        assert!(
+            dust > 0,
+            "the unresolvable miner's share must go to the node pool as dust, got dust={dust}"
+        );
+    }
 
     fn ghost02_creator() -> PayoutProposalCreator {
         let config = PayoutConfig {
