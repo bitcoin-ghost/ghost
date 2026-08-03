@@ -279,6 +279,21 @@ pub const ADDR_BIND_ACTIVATION_KEY: &str = "addr_bind_activation_round";
 /// twice (#589), which is the larger error.
 pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 
+/// Report-and-median adoption of the payout checkpoint (#606). **DORMANT — deliberately unarmed.**
+///
+/// At and above this height a voter REPORTS its own recomputed per-address work in its checkpoint
+/// vote, and finalisation adopts the per-address lower median of those reports instead of the
+/// proposer's list verbatim. That closes the hole where a proposer could skew every address within
+/// tolerance (2% relative, 0.2%-of-pool floor, 1% aggregate), be ratified by an honest quorum, and
+/// compound the skew at every checkpoint.
+///
+/// `u64::MAX` = never. It MUST NOT be armed until the whole fleet runs a binary carrying
+/// `MAX_PAYOUT_LEDGER_VOTE_SIZE`: an enlarged vote is up to ~70 KB, and a node on an older build
+/// validates checkpoint votes against the old 1 KB `MAX_VOTE_SIZE` and silently DROPS them. A
+/// partial roll would therefore cost quorum and stop payouts. Ordering the size limit ahead of the
+/// behaviour change is the entire reason this is a height gate rather than a straight fix.
+pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = u64::MAX;
+
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
 /// when they are members of the consensus voter set AND come from diverse IP subnets, and it
@@ -348,6 +363,7 @@ mod gates {
     pub(super) static VOTER_SET_QUALIFICATION: OnceLock<u64> = OnceLock::new();
     pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
+    pub(super) static PAYOUT_MEDIAN_ADOPTION: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
@@ -476,6 +492,21 @@ pub fn share_addr_bind_height() -> u64 {
 /// Height at and above which every node settles won blocks by observing them on-chain.
 pub fn observed_settlement_height() -> u64 {
     *gates::OBSERVED_SETTLEMENT.get_or_init(|| OBSERVED_SETTLEMENT_HEIGHT)
+}
+
+/// Height at and above which the checkpoint adopts the per-address median of voters' own
+/// recomputed work, instead of the proposer's list verbatim (#606).
+pub fn payout_median_adoption_height() -> u64 {
+    *gates::PAYOUT_MEDIAN_ADOPTION.get_or_init(|| PAYOUT_MEDIAN_ADOPTION_HEIGHT)
+}
+
+/// Whether a voter at `height` reports its own recomputed work, and finalisation adopts the median.
+///
+/// One predicate for both the emitter and the adopter, so they cannot disagree about which rule is
+/// in force at a given block — a voter must never report while finalisation still adopts verbatim,
+/// nor the reverse.
+pub fn adopts_payout_median(height: u64) -> bool {
+    height >= payout_median_adoption_height()
 }
 
 /// Whether a share seen at `height` must carry the address-bound signature.

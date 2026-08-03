@@ -45,6 +45,26 @@ pub const MAX_JSON_DEPTH: usize = 16;
 pub const MAX_SHARE_PROOF_SIZE: usize = 10_000;
 pub const MAX_BLOCK_FOUND_SIZE: usize = 100_000;
 pub const MAX_VOTE_SIZE: usize = 1_000;
+/// Payout-ledger checkpoint vote. Sized for a voter REPORTING its own recomputed per-address work
+/// (#606), not for a bare hash + signature.
+///
+/// A voter used to send `approve: bool` and throw its own numbers away, which is what let a proposer
+/// skew every address within tolerance and still be ratified. Reporting the numbers is what makes a
+/// per-address median possible — and it means the vote now carries up to [`LEDGER_CAP`] entries.
+///
+/// At `LEDGER_CAP = 1000`, an entry is a ~42-byte address plus a 16-byte micro-work integer plus
+/// JSON overhead: on the order of 70 KB. Against the previous `MAX_VOTE_SIZE` of 1 KB that is a 70x
+/// overrun, and the trap is that it would have looked fine — live canonical payouts currently carry
+/// 4-6 addresses (~500 bytes), so the old limit passes today and would start silently dropping every
+/// vote once the pool grows past roughly a dozen paid addresses. Votes dropped fleet-wide means no
+/// checkpoint finalises, which means payouts stop.
+///
+/// 128 KB leaves headroom above the 70 KB worst case without approaching the envelope cap.
+///
+/// This constant must be DEPLOYED FLEET-WIDE BEFORE the gate that makes any node emit an enlarged
+/// vote. A node on an older build validates against 1 KB and drops the message, so a partial roll
+/// would cost quorum. That ordering is the reason #606 is gated on height at all.
+pub const MAX_PAYOUT_LEDGER_VOTE_SIZE: usize = 128_000;
 pub const MAX_HEALTH_PING_SIZE: usize = 2_000;
 pub const MAX_DISCOVERY_SIZE: usize = 50_000;
 pub const MAX_PAYOUT_PROPOSAL_SIZE: usize = 500_000;
@@ -445,7 +465,8 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         // shares) so the fleet can adopt it on finalise (option c); bounded but not tiny.
         // The vote is just a hash + signature.
         MessageType::PayoutLedgerCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
-        MessageType::PayoutLedgerCheckpointVote => MAX_VOTE_SIZE,
+        // NOT MAX_VOTE_SIZE — the vote now reports the voter's own per-address work (#606).
+        MessageType::PayoutLedgerCheckpointVote => MAX_PAYOUT_LEDGER_VOTE_SIZE,
         MessageType::PayoutLedgerCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
         // One proposal per response, so the existing proposal bound applies.
         MessageType::PayoutProposalSync => MAX_PAYOUT_PROPOSAL_SIZE,

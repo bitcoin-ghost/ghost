@@ -193,6 +193,87 @@ impl std::fmt::Display for Disagreement {
     }
 }
 
+/// Adopt the per-address LOWER MEDIAN of what the voters independently recomputed (#606).
+///
+/// Before this, finalisation persisted the PROPOSER's list verbatim, tolerance-checked. Voters
+/// recomputed their own view, compared it, and then threw their numbers away — so a proposer could
+/// skew every address within tolerance (2% relative, 0.2%-of-pool floor, 1% aggregate), be ratified
+/// by an honest quorum, and compound the skew at every checkpoint. Taking the median of the reports
+/// removes that: a single skewed report cannot move a median that a majority of honest reporters
+/// determine.
+///
+/// `reports` is one entry per in-set voter that reported, each `(address, quantised work)`. The
+/// proposer's own list is passed as one of them by the caller — it gets exactly one vote, like
+/// everyone else, which is the entire point.
+///
+/// ## Why the LOWER median and not an average
+///
+/// The adopted value has to be byte-identical on every node or the root diverges and nothing
+/// finalises. With an even number of reporters there is no single middle element, so the rule must be
+/// stated rather than left to a library: sort ascending, take index `(n - 1) / 2`.
+///
+/// An average would reintroduce division and rounding on a consensus-critical value. This file
+/// already records float-sum-order as the residual divergence that kept checkpoints from finalising
+/// at all, so everything here stays integer micro-work.
+///
+/// ## Address set
+///
+/// Only addresses present in a MAJORITY of reports are adopted. An address that only a minority saw
+/// is attribution noise or a fabrication, and admitting it on one report's word would hand a single
+/// voter the ability to inject a payee — the mirror of the hole being closed. For each adopted
+/// address the median is taken over the reports that contain it.
+pub fn median_adopted_miner_work(reports: &[Vec<(String, u128)>]) -> Vec<(String, u128)> {
+    if reports.is_empty() {
+        return Vec::new();
+    }
+    // A majority of REPORTS, not of the voter set: the caller has already filtered to in-set voters,
+    // and finalisation separately refuses when too few reported at all.
+    let majority = reports.len() / 2 + 1;
+
+    let mut per_address: std::collections::BTreeMap<&str, Vec<u128>> =
+        std::collections::BTreeMap::new();
+    for report in reports {
+        // Guard against one report double-counting an address and shifting its own median.
+        let mut seen = std::collections::HashSet::new();
+        for (addr, work) in report {
+            if seen.insert(addr.as_str()) {
+                per_address.entry(addr.as_str()).or_default().push(*work);
+            }
+        }
+    }
+
+    let mut out: Vec<(String, u128)> = per_address
+        .into_iter()
+        .filter(|(_, works)| works.len() >= majority)
+        .map(|(addr, mut works)| {
+            works.sort_unstable();
+            (addr.to_string(), works[(works.len() - 1) / 2])
+        })
+        .collect();
+    // Deterministic order for the root: work desc, then address asc — the same total order
+    // `get_top_unpaid_addresses` documents, so the adopted list hashes identically everywhere.
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// How far the proposer's value for an address sits from the adopted median, as a fraction of the
+/// median. Returns `None` when the median is zero (nothing to be relative to).
+///
+/// Used to alert when a proposer sits above half the tolerance it is allowed — the detection #606
+/// asks for, and the evidence for whether skew is actually happening in practice rather than merely
+/// being possible.
+pub fn proposer_skew_permille(proposed: u128, median: u128) -> Option<u128> {
+    if median == 0 {
+        return None;
+    }
+    let diff = proposed.abs_diff(median);
+    Some(diff.saturating_mul(1000) / median)
+}
+
+/// Half the per-address relative tolerance, in permille — the alert threshold (#606).
+/// `REL_TOL` is 2%, so this is 10 permille.
+pub const SKEW_ALERT_PERMILLE: u128 = (REL_TOL_NUM * 1000) / (REL_TOL_DEN * 2);
+
 /// Does the proposer's canonical payout agree with our own within tolerance?
 /// Node set: exact (it converges via payout-address gossip). Miner set: identical
 /// address keys, each address's work within tolerance. `Ok(())` means agree.
@@ -551,6 +632,9 @@ impl PayoutCheckpointManager {
         };
 
         let active_node_count = voters.len() as u32;
+        // Kept for the proposer's OWN vote report (#606): it reports the same numbers it proposed,
+        // and they count once, exactly like any other voter's.
+        let proposer_own = canonical.clone();
         let mut msg = PayoutLedgerCheckpointMessage {
             height,
             cutoff_ts,
@@ -582,7 +666,8 @@ impl PayoutCheckpointManager {
         );
         self.log_diag("propose", height, cutoff_ts);
         self.broadcast(MessageType::PayoutLedgerCheckpoint, &msg);
-        self.cast_vote(height, hash, true);
+        // The proposer reports too, and gets exactly one vote like everyone else.
+        self.cast_vote(height, hash, true, Some(&proposer_own));
         self.maybe_finalize(height, hash);
     }
 
@@ -622,7 +707,7 @@ impl PayoutCheckpointManager {
                 proposer = %hex::encode(&msg.proposer[..4]),
                 "payout checkpoint: proposal root does not match its lists — voting reject"
             );
-            self.cast_vote(msg.height, hash, false);
+            self.cast_vote(msg.height, hash, false, None);
             return Ok(());
         }
 
@@ -672,7 +757,7 @@ impl PayoutCheckpointManager {
             );
             self.log_diag("reject", msg.height, msg.cutoff_ts);
         }
-        self.cast_vote(msg.height, hash, approve);
+        self.cast_vote(msg.height, hash, approve, Some(&local));
         if approve {
             self.maybe_finalize(msg.height, hash);
         }
@@ -709,7 +794,29 @@ impl PayoutCheckpointManager {
         Ok(())
     }
 
-    fn cast_vote(&self, height: u64, checkpoint_hash: [u8; 32], approve: bool) {
+    /// Cast a checkpoint vote, optionally REPORTING this node's own recomputed view (#606).
+    ///
+    /// `own` is the voter's `CanonicalPayout`. At/above the median-adoption gate an APPROVING vote
+    /// carries the voter's own per-address numbers, so finalisation can adopt their median rather
+    /// than trusting the proposer's list. Below the gate, and on any reject, nothing is reported —
+    /// the wire format stays byte-identical to the old one, which is what keeps a mixed-version
+    /// fleet interoperable while the gate is still dormant.
+    ///
+    /// A reject carries no report deliberately: a voter that disagrees beyond tolerance is saying
+    /// the proposal is unusable, not offering a correction to be averaged in.
+    fn cast_vote(
+        &self,
+        height: u64,
+        checkpoint_hash: [u8; 32],
+        approve: bool,
+        own: Option<&CanonicalPayout>,
+    ) {
+        let (reported_miner_work, reported_node_shares) = match own {
+            Some(c) if approve && crate::adopts_payout_median(height) => {
+                (c.miner_payouts.clone(), c.node_shares.clone())
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
         let mut vote = PayoutLedgerCheckpointVoteMessage {
             height,
             checkpoint_hash,
@@ -717,6 +824,8 @@ impl PayoutCheckpointManager {
             approve,
             signature: [0u8; 64],
             timestamp: now_ms(),
+            reported_miner_work,
+            reported_node_shares,
         };
         vote.signature = self.identity.sign(&vote.signing_message());
         self.broadcast(MessageType::PayoutLedgerCheckpointVote, &vote);
@@ -1378,6 +1487,117 @@ mod tests {
 
     const H: u64 = 100; // 100 % 4 == 0 → proposer is sorted-elder[0] = nodes[0]
     const CUTOFF: i64 = 1_784_000_000;
+
+    /// THE #606 CASE. A proposer that skews every address within tolerance must not get its skew
+    /// adopted, even though an honest quorum approves the proposal.
+    ///
+    /// This is the property the old code lacked entirely: finalisation persisted the proposer's list
+    /// verbatim, so "within tolerance" WAS "adopted", and the skew compounded at every checkpoint.
+    #[test]
+    fn a_proposer_skewing_every_address_within_tolerance_is_corrected_by_the_median() {
+        let honest = || {
+            vec![
+                ("bc1qbig".to_string(), 1_000_000u128),
+                ("bc1qmid".to_string(), 500_000u128),
+                ("bc1qsml".to_string(), 100_000u128),
+            ]
+        };
+        // Proposer skews every address by +1.9% — inside the 2% per-address tolerance, so every
+        // honest voter approves it.
+        let skewed = vec![
+            ("bc1qbig".to_string(), 1_019_000u128),
+            ("bc1qmid".to_string(), 509_500u128),
+            ("bc1qsml".to_string(), 101_900u128),
+        ];
+
+        // Proposer plus four honest voters. The proposer gets exactly one vote.
+        let reports = vec![skewed.clone(), honest(), honest(), honest(), honest()];
+        let adopted = median_adopted_miner_work(&reports);
+
+        for (addr, work) in &adopted {
+            let honest_val = honest()
+                .into_iter()
+                .find(|(a, _)| a == addr)
+                .map(|(_, w)| w)
+                .unwrap();
+            assert_eq!(
+                *work, honest_val,
+                "#606: {addr} must adopt the honest median, not the proposer's skew"
+            );
+        }
+        // And the skew is detected, not merely neutralised.
+        let skew = proposer_skew_permille(1_019_000, 1_000_000).unwrap();
+        assert!(
+            skew > SKEW_ALERT_PERMILLE,
+            "a 1.9% skew ({skew} permille) must trip the {SKEW_ALERT_PERMILLE} permille alert"
+        );
+    }
+
+    /// The adopted value must be byte-identical on every node, so the even-count rule cannot be
+    /// left to chance. Lower median: sort ascending, take index (n-1)/2. Never an average — that
+    /// reintroduces the rounding this file records as the residual that blocked finalisation.
+    #[test]
+    fn median_is_the_lower_median_and_is_order_independent() {
+        let a = vec![("x".to_string(), 10u128)];
+        let b = vec![("x".to_string(), 20u128)];
+        let c = vec![("x".to_string(), 30u128)];
+        let d = vec![("x".to_string(), 40u128)];
+
+        // Even count: lower median of [10,20,30,40] is 20, NOT 25 (the average).
+        let even = median_adopted_miner_work(&[a.clone(), b.clone(), c.clone(), d.clone()]);
+        assert_eq!(even, vec![("x".to_string(), 20u128)]);
+
+        // Odd count: [10,20,30] -> 20.
+        let odd = median_adopted_miner_work(&[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(odd, vec![("x".to_string(), 20u128)]);
+
+        // Report arrival order must not change the result — votes arrive over the network.
+        let shuffled = median_adopted_miner_work(&[d, b, a, c]);
+        assert_eq!(shuffled, even, "median must not depend on report order");
+    }
+
+    /// A minority report must not be able to inject a payee. Admitting an address on one voter's
+    /// word would be the mirror of the hole #606 closes: influence would pass from the proposer to
+    /// any single voter.
+    #[test]
+    fn an_address_only_a_minority_reported_is_not_adopted() {
+        let honest = || vec![("real".to_string(), 100u128)];
+        let liar = vec![
+            ("real".to_string(), 100u128),
+            ("attacker".to_string(), 999_999u128),
+        ];
+        let adopted = median_adopted_miner_work(&[liar, honest(), honest(), honest()]);
+        assert_eq!(
+            adopted,
+            vec![("real".to_string(), 100u128)],
+            "an address in a minority of reports must not be adopted"
+        );
+    }
+
+    /// One report listing the same address twice must not get two votes toward its own median.
+    #[test]
+    fn a_duplicated_address_within_one_report_counts_once() {
+        let dup = vec![("x".to_string(), 1000u128), ("x".to_string(), 1000u128)];
+        let honest = || vec![("x".to_string(), 10u128)];
+        // If the duplicate counted twice the values would be [1000,1000,10,10] -> lower median 10
+        // by luck; with three honest reports it would be [1000,1000,10,10,10] -> 10 as well. Use
+        // two honest reports so double-counting would visibly win: [1000,1000,10,10] -> 10 vs
+        // deduped [1000,10,10] -> 10. Make it decisive with one honest report:
+        let adopted = median_adopted_miner_work(&[dup, honest()]);
+        // Deduped: [1000, 10] -> lower median 10. Double-counted: [1000,1000,10] -> 1000.
+        assert_eq!(
+            adopted,
+            vec![("x".to_string(), 10u128)],
+            "a repeated address inside one report must contribute a single value"
+        );
+    }
+
+    /// Zero median has nothing to be relative to; the alert must not divide by it.
+    #[test]
+    fn skew_against_a_zero_median_is_undefined_not_a_panic() {
+        assert_eq!(proposer_skew_permille(500, 0), None);
+        assert_eq!(proposer_skew_permille(1000, 1000), Some(0));
+    }
 
     #[test]
     fn voter_set_floor_only_widens_to_a_superset() {
