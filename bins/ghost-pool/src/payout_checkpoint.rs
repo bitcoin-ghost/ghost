@@ -74,6 +74,9 @@ pub struct CanonicalPayout {
     pub root: [u8; 32],
 }
 
+/// One voter's reported recompute: its per-address miner work and its qualified-node set (#606).
+pub type VoterReport = (Vec<(String, u128)>, Vec<(NodeId, i32)>);
+
 pub type ComputeRootFn = Arc<dyn Fn(i64, u64) -> Option<CanonicalPayout> + Send + Sync>;
 
 /// Miner-work tolerance for option (c). The share SET converges (proven by the union)
@@ -379,6 +382,9 @@ struct PendingEntry {
     /// arrived before the proposal (race) — we still tally the approver.
     proposal: Option<PayoutLedgerCheckpointMessage>,
     approvers: HashSet<NodeId>,
+    /// What each approving voter reported it recomputed (#606), keyed by voter so a node cannot
+    /// weight the median by voting twice. Empty below the median-adoption gate.
+    reports: HashMap<NodeId, VoterReport>,
 }
 
 struct Pending {
@@ -397,6 +403,7 @@ impl Pending {
         self.by_hash.entry(hash).or_insert_with(|| PendingEntry {
             proposal: None,
             approvers: HashSet::new(),
+            reports: HashMap::new(),
         })
     }
 }
@@ -783,12 +790,21 @@ impl PayoutCheckpointManager {
         }
         {
             let mut pending = self.pending.write();
-            pending
+            let slot = pending
                 .entry(vote.height)
                 .or_insert_with(Pending::new)
-                .entry(vote.checkpoint_hash)
-                .approvers
-                .insert(vote.voter);
+                .entry(vote.checkpoint_hash);
+            slot.approvers.insert(vote.voter);
+            // Keyed by voter, so a duplicate vote replaces rather than double-weights (#606).
+            if !vote.reported_miner_work.is_empty() || !vote.reported_node_shares.is_empty() {
+                slot.reports.insert(
+                    vote.voter,
+                    (
+                        vote.reported_miner_work.clone(),
+                        vote.reported_node_shares.clone(),
+                    ),
+                );
+            }
         }
         self.maybe_finalize(vote.height, vote.checkpoint_hash);
         Ok(())
@@ -844,14 +860,14 @@ impl PayoutCheckpointManager {
         // Need the proposal BOTH to resolve the voter set (its cutoff) and to persist. If a
         // vote arrived before the proposal, we hold no content yet — the proposal message
         // will arrive and re-trigger this.
-        let (approvers, msg) = {
+        let (approvers, msg, reports) = {
             let Some(entry) = p.by_hash.get(&hash) else {
                 return;
             };
             let Some(msg) = entry.proposal.clone() else {
                 return;
             };
-            (entry.approvers.clone(), msg)
+            (entry.approvers.clone(), msg, entry.reports.clone())
         };
         // Authoritative eligibility + quorum: resolve the voter set at the proposal's cutoff
         // and count ONLY approvers that are in it. Below the ACTIVE_VOTER_SET gate this is
@@ -866,16 +882,73 @@ impl PayoutCheckpointManager {
         if approvals < needed {
             return;
         }
+        // What gets PERSISTED, and therefore what the coinbase pays.
+        //
+        // Below the median gate: the proposer's lists verbatim, so the coinbase builds from THEM
+        // rather than from this node's (divergent) local ledger. That is the behaviour #606 exists
+        // to replace — "within tolerance" was "adopted", so a proposer could skew every address and
+        // be ratified by an honest quorum.
+        //
+        // At/above it: the per-address lower median of what the in-set approvers actually
+        // recomputed. The proposer's own report is one of them and carries no extra weight.
+        let (adopted_miners, adopted_nodes) = if crate::adopts_payout_median(height) {
+            // Only in-set voters count, matching the quorum rule above — an out-of-set node must not
+            // be able to shift the median any more than it can affect the tally.
+            let in_set: Vec<&VoterReport> = voters.iter().filter_map(|v| reports.get(v)).collect();
+            let reporting = in_set.len();
+            if reporting < needed {
+                // Refuse rather than silently falling back to the proposer's list — that fallback IS
+                // the vulnerability. A checkpoint that cannot be corroborated does not finalise; the
+                // next height re-proposes.
+                warn!(
+                    height,
+                    reporting,
+                    needed,
+                    "payout checkpoint: too few reports to take a median — not finalising (#606)"
+                );
+                return;
+            }
+            let miner_reports: Vec<Vec<(String, u128)>> =
+                in_set.iter().map(|(m, _)| m.clone()).collect();
+            let medians = median_adopted_miner_work(&miner_reports);
+
+            // Detection, not just correction: say so when the proposer sat beyond half its allowed
+            // tolerance from the median. This is the evidence for whether skew actually happens.
+            let proposed: std::collections::HashMap<&str, u128> = msg
+                .miner_payouts
+                .iter()
+                .map(|(a, w)| (a.as_str(), *w))
+                .collect();
+            for (addr, median) in &medians {
+                if let Some(p) = proposed.get(addr.as_str()) {
+                    if let Some(permille) = proposer_skew_permille(*p, *median) {
+                        if permille > SKEW_ALERT_PERMILLE {
+                            warn!(
+                                height,
+                                proposer = %hex::encode(&msg.proposer[..4]),
+                                address = %addr_handle(addr),
+                                permille,
+                                threshold = SKEW_ALERT_PERMILLE,
+                                "payout checkpoint: proposer's value is far from the fleet median (#606)"
+                            );
+                        }
+                    }
+                }
+            }
+            // Node shares converge exactly (payout-address gossip), so the proposer's list stands.
+            (medians, msg.node_shares.clone())
+        } else {
+            (msg.miner_payouts.clone(), msg.node_shares.clone())
+        };
+
         let record = PayoutLedgerCheckpointRecord {
             height,
             cutoff_ts: msg.cutoff_ts,
             ledger_root: msg.ledger_root,
             proposer_id: hex::encode(msg.proposer),
             active_node_count: msg.active_node_count,
-            // Adopt-on-finalise: persist the proposer's canonical lists verbatim so the
-            // coinbase builds from THEM, not from this node's (divergent) local ledger.
-            miner_payouts: msg.miner_payouts.clone(),
-            node_shares: msg.node_shares.clone(),
+            miner_payouts: adopted_miners,
+            node_shares: adopted_nodes,
         };
         match self.db.upsert_payout_ledger_checkpoint(&record) {
             Ok(()) => {
@@ -1487,6 +1560,22 @@ mod tests {
 
     const H: u64 = 100; // 100 % 4 == 0 → proposer is sorted-elder[0] = nodes[0]
     const CUTOFF: i64 = 1_784_000_000;
+
+    /// The gate must be DORMANT as shipped. If `adopts_payout_median` were true at ordinary mainnet
+    /// heights, this binary would emit ~70 KB votes that every node on the previous build drops
+    /// against its 1 KB limit — quorum lost, payouts stopped, on deploy.
+    #[test]
+    fn median_adoption_is_dormant_as_shipped() {
+        assert_eq!(
+            crate::PAYOUT_MEDIAN_ADOPTION_HEIGHT,
+            u64::MAX,
+            "#606 must ship unarmed: the vote size limit has to reach every node first"
+        );
+        assert!(
+            !crate::adopts_payout_median(1_000_000),
+            "no mainnet height may adopt the median until the gate is deliberately armed"
+        );
+    }
 
     /// THE #606 CASE. A proposer that skews every address within tolerance must not get its skew
     /// adopted, even though an honest quorum approves the proposal.
