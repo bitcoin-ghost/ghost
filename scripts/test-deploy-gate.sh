@@ -219,4 +219,4 @@ if [ "$fail" -ne 0 ]; then
     echo "*** $fail of $((pass+fail)) deploy-gate checks FAILED — the gate is not refusing what it must ***"
     exit 1
 fi
-echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short,\n  and submission-path-broken soaks, and rolls back a deploy that stops crediting work."
+echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks, and rolls back a deploy that stops crediting work."
