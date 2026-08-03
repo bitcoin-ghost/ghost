@@ -90,3 +90,10 @@ build/
 # Python bytecode (the SV1 smoke self-test imports the smoke module)
 __pycache__/
 *.pyc
+
+# ghost-gsp writes its SQLite databases to a data_dir that defaults to a RELATIVE path
+# (`./gsp-data`, crates/ghost-gsp/src/server.rs:453), so running the test suite from the repo root
+# creates crates/ghost-gsp/gsp-data/ and leaves it behind. That dirtied the working tree, and
+# scripts/record-tests.sh refuses a dirty tree — so a plain `cargo test` could block the very gate
+# that has to run before a deploy, with a cause that looks unrelated.
+gsp-data/
