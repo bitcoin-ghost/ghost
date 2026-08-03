@@ -9553,9 +9553,15 @@ async fn main() -> Result<()> {
                                                     hash = %hex::encode(&hash[..8]),
                                                     "Tip-change payout proposed: arming the coinbase for this block"
                                                 ),
-                                                Ok(_) => debug!(
+                                                // WARN, not debug. This means we were the
+                                                // proposer, we had an adopted checkpoint, and we
+                                                // still armed nothing — the miners get paid nothing
+                                                // for this block. There is no reading of that which
+                                                // is not worth an operator's attention.
+                                                Ok(_) => warn!(
                                                     height,
-                                                    "Tip-change payout produced no miner outputs"
+                                                    "Tip-change payout produced no miner outputs — \
+                                                     this block would pay the miners nothing"
                                                 ),
                                                 Err(e) => error!(
                                                     height,
@@ -9566,18 +9572,41 @@ async fn main() -> Result<()> {
                                                 ),
                                             }
                                         }
-                                        Some(_) => debug!(
+                                        // Both of these were `debug!`, which made every
+                                        // NON-arming outcome invisible at the default log level
+                                        // while only success was visible. A pool that had silently
+                                        // stopped arming payouts therefore looked exactly like a
+                                        // pool that simply was not the proposer for those heights —
+                                        // and because only one node proposes per height
+                                        // (round-robin over the elders), "not the proposer" is the
+                                        // common case. That ambiguity cost a long investigation and
+                                        // produced a wrong conclusion: a 25-minute window on two of
+                                        // eight nodes showed nothing, which was read as "payouts
+                                        // have stopped" when it was the expected observation for a
+                                        // perfectly healthy fleet.
+                                        //
+                                        // Whether the pool is paying anyone is the single most
+                                        // important thing about it, so every outcome now states its
+                                        // reason. This runs per tip change, not per share, so the
+                                        // cost is nil.
+                                        Some(_) => warn!(
                                             height,
                                             "Adopted checkpoint has an empty miner list at tip \
-                                             change; nothing to arm"
+                                             change; nothing to arm — miners get nothing for this \
+                                             block"
                                         ),
-                                        None => debug!(
+                                        None => warn!(
                                             height,
                                             "No finalised checkpoint to adopt at tip change; \
-                                             skipping"
+                                             skipping — miners get nothing for this block"
                                         ),
                                     }
                                 }
+                                // Left at debug DELIBERATELY, unlike the branches above. This is
+                                // the one non-arming outcome that is genuinely expected and
+                                // self-resolving: there is no template yet because the node has
+                                // just started. Raising it would add a line to every restart and
+                                // train the operator to ignore the very warnings that matter.
                                 None => debug!(
                                     height,
                                     "No template id (tip) yet; cannot arm a payout this tip"
