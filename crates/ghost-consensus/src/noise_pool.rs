@@ -700,18 +700,34 @@ mod tests {
         drop(b_side);
         drop(pool_b);
 
-        // A keeps sending. TCP may swallow the first write into a buffer, so allow a few
-        // attempts for the reset to surface; what matters is what the pool holds afterwards.
-        for _ in 0..5 {
-            if pool_a.send_to(b_addr, b"consensus vote").await.is_err() {
+        // A keeps sending until the corpse is evicted, or we give up.
+        //
+        // Poll rather than assert after a fixed number of attempts. TCP absorbs writes into the
+        // send buffer and the peer's RST surfaces only afterwards, so how many `send_to` calls it
+        // takes for the error to appear is platform-dependent — macOS has larger default send
+        // buffers than Linux and needs more. The previous version tried 5 times and broke on the
+        // first error; when all 5 were swallowed it asserted against a still-pooled connection and
+        // failed. That made `Test (macos-latest)` intermittently red on main, for a reason that had
+        // nothing to do with the property being tested.
+        //
+        // The property is "a dead connection is EVENTUALLY evicted rather than reused for ever", so
+        // the test waits for eventually and bounds it. A genuine regression — never evicting — still
+        // fails, it just takes the full budget to do so.
+        let mut evicted = false;
+        for _ in 0..100 {
+            let _ = pool_a.send_to(b_addr, b"consensus vote").await;
+            if pool_a.connection_count() == 0 {
+                evicted = true;
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        assert_eq!(
-            pool_a.connection_count(),
-            0,
-            "the dead connection must be evicted, not handed back on every send for ever"
+        assert!(
+            evicted,
+            "the dead connection must be evicted, not handed back on every send for ever \
+             (pool still holds {} after 100 sends over ~5s)",
+            pool_a.connection_count()
         );
     }
 
