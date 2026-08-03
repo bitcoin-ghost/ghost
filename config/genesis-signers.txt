@@ -1,0 +1,80 @@
+# Ghost mining-discovery shim — GENESIS SIGNER SET
+#
+# The node ids a freshly-installed `ghost-miner-proxy` trusts on first run. One hex node id per
+# line; blank lines and `#` comments are ignored. Pass with `--genesis-file`, or inline the same
+# ids with `--genesis-signers`.
+#
+# WHAT THIS IS FOR
+#
+# Miners currently find the pool through one DNS name. That is a single point of control: if the
+# name is seized, misdirected, or simply goes down, every miner loses the pool at once. The shim
+# removes that dependency by carrying its own list of pool nodes.
+#
+# A list the miner holds locally is only as good as its provenance, so the list is signed and the
+# shim accepts a new one only when >=67% of the signers it ALREADY trusts have signed it. Which
+# means it has to start out trusting someone — this file.
+#
+# THRESHOLD ARITHMETIC (read before changing the number of entries)
+#
+#   signers n = 8
+#   required  = ceil(n * 67 / 100) = ceil(5.36) = 6
+#
+# So 6 of these 8 must sign to move the set forward. Two consequences, both permanent:
+#
+#   * Lose 3 keys and the set FREEZES. Anyone already running the shim keeps dialling whatever
+#     nodes were last attested, forever, because 6 signatures can never again be assembled.
+#   * Whoever controls 6 keys can point every shim-using miner anywhere they like, and the shim
+#     sees a perfectly valid update.
+#
+# WHERE THE KEYS MUST LIVE — at least 3 OFF the fleet
+#
+# All 8 ids below belong to nodes reachable with one set of SSH credentials. If all 8 signing keys
+# stay on those machines, a single SSH compromise yields 8 of 8: the attacker owns the trust root
+# and can redirect every miner legitimately.
+#
+# Moving keys offline only helps if enough move:
+#
+#   keys left on the fleet | reaches the threshold of 6? | trust root safe from one SSH compromise?
+#   -----------------------|----------------------------|------------------------------------------
+#   8 (none offline)       | yes, 8 >= 6                | NO
+#   7 (1 offline)          | yes, 7 >= 6                | NO
+#   6 (2 offline)          | yes, exactly 6 >= 6        | NO  <-- the easy mistake
+#   5 (3 offline)          | no, 5 < 6                  | YES
+#
+# THREE keys must be held off the fleet — hardware key or an offline machine. Two is not enough,
+# and "at least one" is actively misleading. The cost is friction: every legitimate change to the
+# node list needs an offline key brought out.
+#
+# ADDING AN OPERATOR
+#
+# A new operator's node id is added by publishing a list that includes it, signed by >=6 of the
+# current set. The set is not fixed for all time — only this FIRST list is, and only for miners who
+# never update. As independent operators join, the fleet's own share of the set falls below the
+# threshold on its own, which is how the single-operator trust root is meant to dissolve.
+#
+# PROVENANCE OF THESE IDS
+#
+# Read on 2026-08-03 from each node itself:
+#
+#   ssh <node> "sudo -u ghost /opt/ghost/bin/ghost-pool --config /etc/ghost/pool.toml --show-identity"
+#
+# That is the ONLY method to trust. Do not read a node's own id from the `peers` table — it returns
+# the most-recently-seen peer instead, which produced a table that was wrong for vm1 and vm7. Do not
+# infer one by elimination either; vm6's was deduced that way and only confirmed later.
+
+# ghost-vm1  (genesis node)
+fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622
+# ghost-vm2
+849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c
+# ghost-vm3
+e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927
+# ghost-vm4
+9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38
+# ghost-vm5
+5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393
+# ghost-vm6
+46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b
+# ghost-vm7
+f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f
+# ghost-vm8
+4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132
