@@ -300,6 +300,23 @@ pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 /// room for the build, canary soak and rolling deploy several times over.
 pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = 961_700;
 
+/// Public Mining proved by a real stratum handshake, not a bare TCP connect (#605). **ARMED at
+/// 962_000.**
+///
+/// Below this height the challenger opens a TCP connection to the target's stratum port and treats
+/// a successful connect as proof. `nc -l 3333` passes that, so +3 of the 15 node-reward shares are
+/// earned by opening a socket. At and above it the challenger completes a real `mining.subscribe`
+/// and requires a well-formed reply.
+///
+/// Gated because it changes what QUALIFIES a node for payout. A node still applying the connect test
+/// while its peers demand a handshake would compute a different qualified set, and the node-reward
+/// split would diverge — so the whole fleet must carry this build before the height.
+///
+/// 962_000 sits ~300 blocks after [`PAYOUT_MEDIAN_ADOPTION_HEIGHT`], keeping it clear of the three
+/// gates already scheduled so a divergence can be attributed to one change rather than two. It is
+/// ~1100 blocks beyond the tip at arming (roughly 6 days at the observed ~8 min/block).
+pub const STRATUM_HANDSHAKE_PROOF_HEIGHT: u64 = 962_000;
+
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
 /// when they are members of the consensus voter set AND come from diverse IP subnets, and it
@@ -370,6 +387,7 @@ mod gates {
     pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
     pub(super) static PAYOUT_MEDIAN_ADOPTION: OnceLock<u64> = OnceLock::new();
+    pub(super) static STRATUM_HANDSHAKE_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
@@ -432,6 +450,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         PAYOUT_MEDIAN_ADOPTION_HEIGHT,
     );
+    let stratum_proof = gates::from_env(
+        "GHOST_STRATUM_HANDSHAKE_PROOF_HEIGHT",
+        network,
+        STRATUM_HANDSHAKE_PROOF_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
@@ -441,6 +464,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::SHARE_ADDR_BIND.set(share_addr_bind);
     let _ = gates::OBSERVED_SETTLEMENT.set(observed_settlement);
     let _ = gates::PAYOUT_MEDIAN_ADOPTION.set(payout_median);
+    let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != COINBASE_FEE_SPLIT_HEIGHT
@@ -510,6 +534,12 @@ pub fn observed_settlement_height() -> u64 {
 /// recomputed work, instead of the proposer's list verbatim (#606).
 pub fn payout_median_adoption_height() -> u64 {
     *gates::PAYOUT_MEDIAN_ADOPTION.get_or_init(|| PAYOUT_MEDIAN_ADOPTION_HEIGHT)
+}
+
+/// Height at and above which Public Mining is proved by a challenger-performed stratum handshake
+/// rather than a bare TCP connect (#605).
+pub fn stratum_handshake_proof_height() -> u64 {
+    *gates::STRATUM_HANDSHAKE_PROOF.get_or_init(|| STRATUM_HANDSHAKE_PROOF_HEIGHT)
 }
 
 /// Whether a voter at `height` reports its own recomputed work, and finalisation adopts the median.

@@ -8965,6 +8965,11 @@ async fn main() -> Result<()> {
             let verification_task = verification_task
                 .with_rpc(Arc::clone(&rpc))
                 .with_assignment_gate(ghost_pool::challenger_assignment_height())
+                // #605: prove Public Mining with a real mining.subscribe at/above the gate.
+                .with_stratum_proof_gate(
+                    ghost_pool::stratum_handshake_proof_height(),
+                    ghost_common::constants::SV1_STRATUM_PORT,
+                )
                 .with_policy(policy.clone())
                 .with_broadcast(verification_tx);
 
