@@ -256,10 +256,28 @@ pub const ADDR_BIND_ACTIVATION_KEY: &str = "addr_bind_activation_round";
 /// some nodes observe-settle and others do not would diverge on the first won block, so the flip
 /// has to be simultaneous, like [`PAYOUT_TOLERANCE_V2_HEIGHT`].
 ///
-/// UNARMED (`u64::MAX`). Arming needs the whole fleet on a binary that both stamps the payout tag
-/// and understands it, and a dry-run window showing matches across all eight. The emitting side
-/// must roll first: a node that reads tags before its peers write them settles nothing.
-pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = u64::MAX;
+/// ARMED at `961_400` (2026-08-03). Tip was `960_847` when this was cut — ~553 blocks, roughly
+/// 3.5 days, and deliberately ~46h AFTER [`SHARE_ADDR_BIND_HEIGHT`] so the two behaviour changes
+/// land on different blocks and a problem is attributable to one of them.
+///
+/// The emitting prerequisite is met and was verified on the wire rather than assumed: a live
+/// stratum probe shows the coinbase scriptSig carrying `47485050` ("GHPP") plus the 16-byte payout
+/// id, and that id matches the `Set approved payout for coinbase` the node logged. So peers are
+/// writing the tag before any node reads it.
+///
+/// The "dry-run window showing matches across all eight" that this doc originally asked for cannot
+/// be obtained: the pool has never won a block (`won_blocks` is empty), so the observer has had
+/// nothing to match. `bins/ghost-pool/tests/regtest_settlement_rehearsal.rs` is the substitute —
+/// it mines a genuinely tagged block, settles it over real RPC, orphans it with a real reorg,
+/// reverses, reconsiders and re-settles. That proves the path; it is not eight production nodes
+/// agreeing on a real win, and the difference is worth remembering.
+///
+/// KNOWN GAP at arming: settlement records the amounts the fleet RATIFIED, not the amounts the
+/// coinbase actually paid, because fee drift mutates the approved proposal per node (#601). Share
+/// marking is correct; the treasury figure may not be. Arming is still the right trade — without
+/// it the seven non-winning nodes never settle at all and the next proposal pays the same work
+/// twice (#589), which is the larger error.
+pub const OBSERVED_SETTLEMENT_HEIGHT: u64 = 961_400;
 
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
