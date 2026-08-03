@@ -1511,7 +1511,10 @@ impl PayoutProposalCreator {
 
         // Sort by work descending, take top N (using scaled integer comparison)
         let mut sorted = scaled_work;
-        sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
+        // M-8: total order. The input is a slice today, so a stable sort is deterministic and
+        // this is latent rather than broken — but the determinism then rests on the caller's
+        // ordering, which is not a property this function can see or keep. Tie on the miner id.
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         sorted.truncate(self.config.max_miner_outputs);
 
         // Recalculate total work for top miners

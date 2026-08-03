@@ -247,7 +247,12 @@ impl RoundShares {
             .iter()
             .map(|(id, info)| (*id, info.shares_received))
             .collect();
-        nodes.sort_by_key(|x| std::cmp::Reverse(x.1));
+        // M-8: total order, not just a key. `node_shares` is a HashMap, so the collect above is in
+        // randomly-seeded order, and a stable sort keeps that order for ties — which made
+        // membership at the top-100 boundary differ between nodes and across restarts. Node
+        // rewards are paid from this set and GHOST-02 compares the split for exact equality, so a
+        // tie resolved differently is a fleet-wide payout rejection. node_id breaks it.
+        nodes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // Collect top 100 node IDs
         let top_100_ids: Vec<NodeId> = nodes.iter().take(100).map(|(id, _)| *id).collect();
@@ -466,6 +471,60 @@ impl DifficultyCalculator {
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
+
+    /// Audit M-8. `calculate_top_100_nodes` collects from a `HashMap`, whose iteration order is
+    /// randomly seeded per instance, then applies a STABLE sort. Ties therefore keep that random
+    /// order, and `take(100)` decides membership at the boundary differently on different nodes —
+    /// or on the same node across restarts.
+    ///
+    /// Node rewards are paid from that set and GHOST-02 compares the resulting split for exact
+    /// equality, so a boundary tie resolved differently is a fleet-wide payout rejection.
+    ///
+    /// Builds the same logical node set twice with opposite insertion orders, with a wall of ties
+    /// straddling position 100, and requires the chosen set to match.
+    #[test]
+    fn top_100_membership_is_deterministic_across_tied_nodes() {
+        fn build(reverse: bool) -> Vec<NodeId> {
+            let mut rs = RoundShares::new(1, 100);
+            // 150 nodes: the first 50 clearly in, the remaining 100 ALL tied on shares_received,
+            // so which of them lands inside the top 100 is decided purely by ordering.
+            let mut ids: Vec<u8> = (0..150).collect();
+            if reverse {
+                ids.reverse();
+            }
+            for i in ids {
+                let id: NodeId = [i; 32];
+                rs.register_node(id, NodeCapabilities::default());
+                let received = if i < 50 { 1_000 } else { 7 };
+                if let Some(info) = rs.node_shares.get_mut(&id) {
+                    info.shares_received = received;
+                }
+            }
+            rs.calculate_top_100_nodes();
+            let mut chosen: Vec<NodeId> = rs
+                .node_shares
+                .values()
+                .filter(|n| n.in_top_100)
+                .map(|n| n.node_id)
+                .collect();
+            chosen.sort();
+            chosen
+        }
+
+        let a = build(false);
+        let b = build(true);
+        assert_eq!(a.len(), 100);
+        // Compare compactly: the full sets are 100 x 32 bytes and unreadable on failure.
+        let only_a: Vec<u8> = a.iter().filter(|x| !b.contains(x)).map(|x| x[0]).collect();
+        let only_b: Vec<u8> = b.iter().filter(|x| !a.contains(x)).map(|x| x[0]).collect();
+        assert!(
+            only_a.is_empty() && only_b.is_empty(),
+            "top-100 membership must not depend on HashMap iteration order: \
+             only-in-A={only_a:?} only-in-B={only_b:?}. A tie resolved differently on two nodes \
+             makes their payout splits disagree, and GHOST-02 compares them for exact equality"
+        );
+    }
+
     use super::*;
 
     #[test]
