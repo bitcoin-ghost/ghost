@@ -1611,6 +1611,40 @@ pub struct GhostPayInfo {
     pub wraith_enabled: bool,
 }
 
+/// Does this locally-submitted share's header justify the work it claims? (H-13)
+///
+/// `None` header => `true`: a translator predating the header field must not have its miners
+/// silently unpaid. The check applies when the evidence is present.
+///
+/// **Byte order is the whole trick.** `pool_sv2` sends `share_hash.to_string()`, and bitcoin's
+/// `Display` for a hash prints it REVERSED — display order. `verify_pow_preimage` compares against
+/// `sha256d(header).to_byte_array()`, which is internal order. A version of this that skipped the
+/// reverse rejected EVERY share carrying a header, in production, for 30 minutes.
+///
+/// Extracted rather than left inline so a test can drive the real decision from the same hex
+/// strings the webhook carries. Testing `verify_pow_preimage` alone cannot catch an ordering bug in
+/// its caller — that is exactly how the outage got through review.
+pub(crate) fn share_pow_is_acceptable(
+    header_hex: Option<&str>,
+    share_hash_hex: &str,
+    claimed_work: f64,
+) -> bool {
+    let Some(hdr_hex) = header_hex else {
+        return true;
+    };
+    let (Ok(hdr), Ok(mut hash_bytes)) = (hex::decode(hdr_hex), hex::decode(share_hash_hex)) else {
+        return true; // unparseable: not this check's job to reject
+    };
+    hash_bytes.reverse();
+    let (Ok(h80), Ok(h32)) = (
+        <[u8; 80]>::try_from(hdr.as_slice()),
+        <[u8; 32]>::try_from(hash_bytes.as_slice()),
+    ) else {
+        return true;
+    };
+    ghost_accounting::DifficultyCalculator::verify_pow_preimage(&h80, &h32, claimed_work)
+}
+
 impl VerificationState {
     /// Create new verification state
     pub fn new(
@@ -1920,30 +1954,19 @@ impl VerificationState {
             // Header-less shares are still accepted — a translator predating the header field must
             // not have its miners silently unpaid — but they are counted so the gap is visible
             // rather than assumed absent.
-            if let (Some(hdr_hex), Ok(hash_bytes)) =
-                (share.header.as_deref(), hex::decode(&share.share_hash))
-            {
-                if let (Ok(hdr), Ok(h32)) = (
-                    hex::decode(hdr_hex),
-                    <[u8; 32]>::try_from(hash_bytes.as_slice()),
-                ) {
-                    if let Ok(h80) = <[u8; 80]>::try_from(hdr.as_slice()) {
-                        if !ghost_accounting::DifficultyCalculator::verify_pow_preimage(
-                            &h80,
-                            &h32,
-                            share.share_work,
-                        ) {
-                            tracing::warn!(
-                                miner_id = %miner_id,
-                                share_hash = %share.share_hash,
-                                claimed_work = share.share_work,
-                                "H-13: rejecting locally-submitted share whose header does not \
-                                 justify its claimed work"
-                            );
-                            continue;
-                        }
-                    }
-                }
+            if !share_pow_is_acceptable(
+                share.header.as_deref(),
+                &share.share_hash,
+                share.share_work,
+            ) {
+                tracing::warn!(
+                    miner_id = %miner_id,
+                    share_hash = %share.share_hash,
+                    claimed_work = share.share_work,
+                    "H-13: rejecting locally-submitted share whose header does not justify its \
+                     claimed work"
+                );
+                continue;
             }
 
             // Convert ShareData to ShareNotification
@@ -3314,38 +3337,43 @@ fn port_listening(port: u16) -> bool {
 #[cfg(test)]
 mod tests {
 
-    /// H-13. `POST /api/internal/share{,s}` is authorised only by `is_loopback()`, and the work was
-    /// taken verbatim on the strength of a comment that SRI had already validated it. The 80-byte
-    /// header was carried for exactly this check and never used, so any local process — or a remote
-    /// host if an operator fronted :8080 with an on-box proxy — could mint arbitrary work into the
-    /// payout ledger.
+    /// H-13, driving the REAL decision function with the hex strings the webhook carries.
     ///
-    /// Asserts the three cases that matter: a header that justifies the work passes, one that does
-    /// not is refused, and a header-less share is still accepted so an older translator does not
-    /// leave its miners silently unpaid.
+    /// Two earlier versions of this test passed while the deployed check rejected every share for
+    /// 30 minutes: the first built both sides in internal byte order, the second did its own
+    /// `reverse()` in the test body. Both tested my understanding rather than the code. This one
+    /// calls `share_pow_is_acceptable` — the same function ingest calls — so removing the reverse
+    /// from production fails it.
     #[test]
-    fn ingest_pow_check_admits_genuine_work_and_refuses_inflated_claims() {
+    fn share_pow_is_acceptable_admits_genuine_work_from_the_wire_format() {
         use bitcoin::hashes::{sha256d, Hash};
         use ghost_accounting::DifficultyCalculator;
 
         let header = [0u8; 80];
-        let hash = sha256d::Hash::hash(&header).to_byte_array();
-        let achieved = DifficultyCalculator::difficulty_from_hash(&hash);
+        let header_hex = hex::encode(header);
+        let internal = sha256d::Hash::hash(&header).to_byte_array();
+        let achieved = DifficultyCalculator::difficulty_from_hash(&internal);
+
+        // Exactly what pool_sv2 puts on the webhook: Display, i.e. REVERSED.
+        let wire_hex = sha256d::Hash::hash(&header).to_string();
+        assert_ne!(
+            wire_hex,
+            hex::encode(internal),
+            "display and internal order must differ, or this test proves nothing"
+        );
 
         assert!(
-            DifficultyCalculator::verify_pow_preimage(&header, &hash, achieved * 0.5),
-            "a header that beats the claimed work must be admitted"
+            share_pow_is_acceptable(Some(&header_hex), &wire_hex, achieved * 0.5),
+            "a genuine share must be ADMITTED — this is the assertion that would have caught the \
+             outage: without the reverse, it is rejected"
         );
         assert!(
-            !DifficultyCalculator::verify_pow_preimage(&header, &hash, achieved * 100.0),
-            "a share claiming 100x the work its header proves must be refused — this is the \
-             injection the loopback-only webhook otherwise permits"
+            !share_pow_is_acceptable(Some(&header_hex), &wire_hex, achieved * 100.0),
+            "a share claiming 100x its proven work must be refused"
         );
-
-        // A hash that is not this header's PoW at all: fabricated outright.
         assert!(
-            !DifficultyCalculator::verify_pow_preimage(&header, &[0x7u8; 32], 1.0),
-            "a hash unrelated to the header must be refused"
+            share_pow_is_acceptable(None, &wire_hex, achieved * 100.0),
+            "a header-less share must pass — an older translator must not go unpaid"
         );
     }
 
