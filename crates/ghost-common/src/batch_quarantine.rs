@@ -1,6 +1,6 @@
 //! What a terminal verification failure does to the peer that caused it.
 //!
-//! A [`FaultReason`](crate::batch_consensus::FaultReason) is decidable from a batch's own bytes
+//! A [`crate::batch_consensus::FaultReason`] is decidable from a batch's own bytes
 //! against a finalised parent, so no honest node can produce one by holding a different view. That
 //! is what makes it safe to act on rather than retry — and #583 is what happens when you retry a
 //! terminal condition instead: the same rejection, forever, with nothing able to recover.

@@ -8,7 +8,7 @@
 //! Two things make that safe rather than chaotic:
 //!
 //! - Only the node at the *exact* current escalation proposes, so at most one node is trying at a
-//!   time. Acceptance is slightly wider than that (see [`ESCALATION_GRACE_STEPS`]) because clocks
+//!   time. Acceptance is slightly wider than that (see [`ESCALATION_GRACE_STEPS`](crate::batch_consensus::ESCALATION_GRACE_STEPS)) because clocks
 //!   are not identical, and a node whose clock is a few seconds behind must not read a legitimate
 //!   proposal as a hostile one.
 //! - One vote per `seq`, ever. Two individually-valid batches at the same height must not both

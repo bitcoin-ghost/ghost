@@ -48,6 +48,18 @@ echo "==> fuzz targets build"
 ./scripts/check-fuzz-targets.sh \
     || { echo "FAILED: fuzz targets" >&2; exit 1; }
 
+# Documentation, with the SAME flags CI uses.
+#
+# CI runs `cargo doc --no-deps --all-features` under `RUSTDOCFLAGS: -D warnings` in a job that only
+# ever runs on main — so a broken intra-doc link cannot fail a pull request and is invisible until
+# after the push. Main sat red for three consecutive pushes on 2026-08-03 for exactly this: five
+# rustdoc errors, none of which any local gate looked at (#609).
+#
+# Cheap to run here and it closes the gap between "record-tests is green" and "main will be green".
+echo "==> documentation (-D warnings, as CI runs it)"
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace $EXCLUDES --all-features --quiet \
+    || { echo "FAILED: documentation — a rustdoc error here turns main red after the push" >&2; exit 1; }
+
 echo "==> SV1 smoke self-test"
 python3 bins/translator-sv2/tests/sv1_handshake_smoke_selftest.py \
     || { echo "FAILED: SV1 smoke self-test" >&2; exit 1; }

@@ -50,9 +50,9 @@ pub const MAX_VOTE_SIZE: usize = 1_000;
 ///
 /// A voter used to send `approve: bool` and throw its own numbers away, which is what let a proposer
 /// skew every address within tolerance and still be ratified. Reporting the numbers is what makes a
-/// per-address median possible — and it means the vote now carries up to [`LEDGER_CAP`] entries.
+/// per-address median possible — and it means the vote now carries up to `LEDGER_CAP` (1000) entries.
 ///
-/// At `LEDGER_CAP = 1000`, an entry is a ~42-byte address plus a 16-byte micro-work integer plus
+/// At `LEDGER_CAP = 1000` (defined in ghost-pool, which this crate cannot link to), an entry is a ~42-byte address plus a 16-byte micro-work integer plus
 /// JSON overhead: on the order of 70 KB. Against the previous `MAX_VOTE_SIZE` of 1 KB that is a 70x
 /// overrun, and the trap is that it would have looked fine — live canonical payouts currently carry
 /// 4-6 addresses (~500 bytes), so the old limit passes today and would start silently dropping every
