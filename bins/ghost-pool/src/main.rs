@@ -9492,12 +9492,16 @@ async fn main() -> Result<()> {
                                         {
                                             let (_, fees, _) =
                                                 tp_for_template_events.get_current_block_info();
-                                            let treasury_state = TreasuryState::from_stored(
-                                                db_for_rounds
-                                                    .get_treasury_balance()
-                                                    .unwrap_or_default(),
-                                                None,
-                                            );
+                                            // Audit H-2: this hardcoded `None` while every
+                                            // validator loaded the stored threshold. The decay
+                                            // schedule keys on it, so once the treasury crosses
+                                            // the threshold the proposer would compute a
+                                            // pre-threshold split against validators' decayed
+                                            // one — and GHOST-02 compares for exact equality.
+                                            let treasury_state =
+                                                ghost_pool::treasury::load_treasury_state(
+                                                    &db_for_rounds,
+                                                );
                                             let treasury_address_snapshot =
                                                 payout_for_tips.get_treasury_address_snapshot();
 

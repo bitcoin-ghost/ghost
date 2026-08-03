@@ -202,8 +202,60 @@ impl FeeDistribution {
     }
 }
 
+/// Load treasury state from the database — balance **and** the threshold timestamp.
+///
+/// The timestamp keys the decay schedule, so it is not optional context: a node that passes `None`
+/// while its peers load the stored value computes a pre-threshold split where they compute a
+/// decayed one. GHOST-02 compares splits for exact equality, so from the moment the treasury
+/// crosses the threshold every proposal that node makes is rejected fleet-wide, permanently.
+///
+/// This existed as four hand-rolled copies of the same load, and one of them — the tip-change
+/// payout path — hardcoded `None` (audit H-2). One loader means they cannot drift again.
+pub fn load_treasury_state(db: &ghost_storage::Database) -> TreasuryState {
+    let balance = db.get_treasury_balance().unwrap_or_default();
+    let threshold_reached_at = db
+        .get_treasury_threshold_reached()
+        .ok()
+        .flatten()
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    TreasuryState::from_stored(balance, threshold_reached_at)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Audit H-2. The tip-change payout path built its treasury state with a hardcoded `None`
+    /// threshold while every validator loaded the stored one. Latent only because the threshold
+    /// is unreached — the moment it is crossed, proposer and validators compute different decay
+    /// and GHOST-02's exact-equality check rejects every proposal fleet-wide, for ever.
+    #[test]
+    fn load_treasury_state_carries_the_stored_threshold_not_none() {
+        let db = ghost_storage::Database::in_memory().expect("db");
+        db.kv_set("treasury_balance_sats", "2100000000000")
+            .expect("balance");
+        db.kv_set("treasury_threshold_reached_at", "1785600000")
+            .expect("threshold");
+
+        let state = load_treasury_state(&db);
+
+        assert_eq!(state.balance_sats, 2_100_000_000_000);
+        assert_eq!(
+            state.threshold_reached_at.map(|t| t.timestamp()),
+            Some(1_785_600_000),
+            "the stored threshold must reach the proposer — passing None here diverges it from \
+             every validator and halts payouts once the threshold is crossed"
+        );
+    }
+
+    /// An unset threshold is genuinely None — the helper must not invent one.
+    #[test]
+    fn load_treasury_state_reports_none_when_the_threshold_is_unset() {
+        let db = ghost_storage::Database::in_memory().expect("db");
+        db.kv_set("treasury_balance_sats", "5000").expect("balance");
+        assert_eq!(load_treasury_state(&db).threshold_reached_at, None);
+    }
+
     use super::*;
 
     #[test]
