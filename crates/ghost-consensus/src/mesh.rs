@@ -198,6 +198,32 @@ pub trait MessageHandler: Send + Sync {
     async fn handle_message(&self, envelope: Arc<MessageEnvelope>) -> GhostResult<()>;
 }
 
+/// Inbound Noise connections permitted from a single IP (H-12).
+///
+/// The global semaphore is 100. Without a per-IP dimension one host can hold every permit and deny
+/// all honest inbound, and each connection also owns an 8 MiB reassembly slot — so the same host
+/// can pin hundreds of megabytes. A legitimate peer needs one or two; the margin is for NAT'd
+/// operators sharing an address, not for volume.
+const MAX_INBOUND_PER_IP: usize = 8;
+
+/// Releases an IP's inbound slot however the connection handler exits.
+struct PerIpGuard {
+    map: Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock();
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// Mesh network manager
 pub struct MeshNetwork {
     /// Our identity
@@ -2315,6 +2341,14 @@ impl MeshNetwork {
 
         // M-17: cap concurrent inbound Noise connections to bound resource use.
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(100));
+        // H-12: the semaphore is GLOBAL, so one host could hold all 100 permits and deny every
+        // honest peer. A per-IP cap makes the 100 a fleet budget rather than a single attacker's.
+        // Sized well above legitimate need: a peer uses one or two inbound connections, and the
+        // fleet is eight nodes.
+        let per_ip = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+            std::net::IpAddr,
+            usize,
+        >::new()));
         // Dial back at most once per inbound host (mesh-registration reverse-sub).
         let reverse_subscribed: Arc<std::sync::Mutex<std::collections::HashSet<std::net::IpAddr>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -2362,13 +2396,39 @@ impl MeshNetwork {
                 }
             };
 
+            // H-12: refuse a host that already holds its share of inbound slots. Checked here,
+            // after accept and before the handler is spawned, so the connection is dropped without
+            // consuming a handshake or a reassembly buffer.
+            let ip = addr.ip();
+            {
+                let mut m = per_ip.lock();
+                let n = m.entry(ip).or_insert(0);
+                if *n >= MAX_INBOUND_PER_IP {
+                    drop(m);
+                    debug!(
+                        peer = %addr,
+                        max = MAX_INBOUND_PER_IP,
+                        "refusing inbound Noise connection: per-IP limit reached"
+                    );
+                    drop(permit);
+                    continue;
+                }
+                *n += 1;
+            }
+
             let pool = Arc::clone(&pool);
             let mesh = Arc::clone(self);
             let conn_rev_sub = Arc::clone(&reverse_subscribed);
+            let per_ip_guard = PerIpGuard {
+                map: Arc::clone(&per_ip),
+                ip,
+            };
 
             tokio::spawn(async move {
                 // M-17: hold the permit for the connection lifetime.
                 let _permit = permit;
+                // H-12: releases this IP's slot however the handler exits.
+                let _per_ip = per_ip_guard;
 
                 // H2: bound the handshake so a peer that connects but never
                 // completes the handshake cannot pin resources.
@@ -3400,6 +3460,66 @@ impl EndpointBuilder {
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
+
+    /// H-12. The inbound gate was a single global `Semaphore::new(100)`, so one host could hold
+    /// every permit — denying all honest inbound — and, since each connection owns an 8 MiB
+    /// reassembly slot, pin hundreds of megabytes with it.
+    ///
+    /// The cap is only safe if the slot is released however the handler exits. A guard that leaked
+    /// on an early return (a failed handshake, a timeout) would wedge the IP shut after
+    /// `MAX_INBOUND_PER_IP` failures — turning a DoS defence into a self-inflicted one.
+    #[test]
+    fn per_ip_slots_are_released_however_the_handler_exits() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let map = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+            IpAddr,
+            usize,
+        >::new()));
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+        // Fill this IP's allowance.
+        for _ in 0..MAX_INBOUND_PER_IP {
+            *map.lock().entry(ip).or_insert(0) += 1;
+        }
+        assert_eq!(*map.lock().get(&ip).unwrap(), MAX_INBOUND_PER_IP);
+
+        // Each guard dropped — including on an early return — gives the slot back.
+        {
+            let _guards: Vec<PerIpGuard> = (0..MAX_INBOUND_PER_IP)
+                .map(|_| PerIpGuard {
+                    map: Arc::clone(&map),
+                    ip,
+                })
+                .collect();
+        }
+        assert!(
+            map.lock().get(&ip).is_none(),
+            "every slot must be returned and the entry pruned, else the IP is wedged shut after \
+             MAX_INBOUND_PER_IP failed handshakes"
+        );
+    }
+
+    /// One noisy host must not consume another's allowance.
+    #[test]
+    fn per_ip_accounting_is_per_ip() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let map = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<
+            IpAddr,
+            usize,
+        >::new()));
+        let noisy = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let quiet = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+
+        for _ in 0..MAX_INBOUND_PER_IP {
+            *map.lock().entry(noisy).or_insert(0) += 1;
+        }
+        assert_eq!(*map.lock().get(&noisy).unwrap(), MAX_INBOUND_PER_IP);
+        assert!(
+            map.lock().get(&quiet).is_none(),
+            "a flood from one address must leave another address's allowance untouched"
+        );
+    }
+
     use super::*;
 
     #[test]
