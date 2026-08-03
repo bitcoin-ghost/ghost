@@ -860,9 +860,19 @@ fn migrate_v10(conn: &Connection) -> GhostResult<()> {
     conn.execute("PRAGMA foreign_keys = OFF", [])
         .map_err(|e| GhostError::Migration(e.to_string()))?;
 
-    // M-22: Run migration, capturing any error
+    // M-22: Run migration, capturing any error.
+    //
+    // M-10: BEGIN/COMMIT inside the batch. The runner deliberately skips `run_migration_tx` for
+    // v10 because `PRAGMA foreign_keys` cannot be changed inside a transaction — but the comment
+    // there claimed v10 "manages its own transaction internally" and it did not, so the whole
+    // create/copy/drop/rename ran in autocommit. A crash partway left scratch `*_new` tables and,
+    // worse, a table dropped and never renamed back: the re-run then dies on
+    // `INSERT INTO x_new SELECT * FROM x` — no such table — and the node never starts again.
+    //
+    // The pragma stays outside the transaction, where SQLite requires it; only the DDL is wrapped.
     let migration_result = conn.execute_batch(
         r#"
+        BEGIN;
 
         -- 1. payouts table: cascade from rounds
         CREATE TABLE IF NOT EXISTS payouts_new (
@@ -1021,8 +1031,19 @@ fn migrate_v10(conn: &Connection) -> GhostResult<()> {
         ALTER TABLE elder_slashing_new RENAME TO elder_slashing;
         CREATE INDEX IF NOT EXISTS idx_elder_slashing_node ON elder_slashing(node_id);
 
+        COMMIT;
         "#,
     );
+
+    // M-10: `execute_batch` stops at the failing statement and leaves the transaction OPEN —
+    // it does not roll back for us. Without this the scratch tables stay visible on this
+    // connection and the DDL is neither applied nor undone, which is the half-migrated state the
+    // transaction was added to prevent.
+    if migration_result.is_err() {
+        if let Err(e) = conn.execute_batch("ROLLBACK;") {
+            warn!(error = %e, "v10 rollback failed after a failed migration");
+        }
+    }
 
     // M-22 FIX: ALWAYS re-enable foreign keys, even if migration failed
     // This ensures we don't leave the connection in a bad state.
@@ -3410,6 +3431,69 @@ mod tests {
             [],
         );
         assert!(result.is_err(), "Duplicate elder_position should fail");
+    }
+
+    /// Audit M-10. v10 rebuilds eight tables with create/copy/drop/rename, and the runner skips
+    /// `run_migration_tx` for it — the comment there claims v10 "manages its own transaction
+    /// internally", which it did not. The batch ran in autocommit, so a crash between
+    /// `DROP TABLE payouts` and `ALTER TABLE payouts_new RENAME TO payouts` left the database with
+    /// no `payouts` table and a stranded `payouts_new`. The re-run then dies on
+    /// `INSERT INTO payouts_new SELECT * FROM payouts` — no such table — for ever.
+    ///
+    /// Drives it by giving v10 a database where a LATER table it rebuilds is missing, so the batch
+    /// fails partway, then asserts the EARLIER table it had already rebuilt is untouched.
+    #[test]
+    fn migrate_v10_is_atomic_when_it_fails_partway() {
+        let conn = Connection::open_in_memory().expect("conn");
+        // Only the first table v10 rebuilds. Every later one is absent, so the batch must fail
+        // after it has already dropped/renamed this one in the non-atomic version.
+        conn.execute_batch(
+            "CREATE TABLE payouts (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 round_id INTEGER NOT NULL,
+                 recipient_id TEXT NOT NULL,
+                 recipient_type TEXT NOT NULL,
+                 address TEXT NOT NULL,
+                 amount_sats INTEGER NOT NULL,
+                 txid TEXT,
+                 paid_at INTEGER,
+                 created_at INTEGER NOT NULL
+             );
+             INSERT INTO payouts (round_id, recipient_id, recipient_type, address, amount_sats, created_at)
+             VALUES (1, 'miner', 'miner', 'bc1qtest', 5000, 1);",
+        )
+        .expect("seed");
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM payouts", [], |r| r.get(0))
+            .expect("payouts readable before");
+        assert_eq!(before, 1);
+
+        // Expected to fail: the later tables do not exist.
+        let result = migrate_v10(&conn);
+        assert!(
+            result.is_err(),
+            "the batch must fail for this test to mean anything"
+        );
+
+        // The database must be exactly as it was — not half-migrated. The tell is a stranded
+        // `*_new` table: without a transaction the batch gets partway through, leaving scratch
+        // tables behind and the schema in a shape the re-run cannot recover from.
+        let stranded = get_table_names(&conn)
+            .into_iter()
+            .filter(|t| t.ends_with("_new"))
+            .collect::<Vec<_>>();
+        assert!(
+            stranded.is_empty(),
+            "a failed v10 must roll back completely, leaving no scratch tables; found {stranded:?}"
+        );
+        let after: Result<i64, _> =
+            conn.query_row("SELECT COUNT(*) FROM payouts", [], |r| r.get(0));
+        assert_eq!(
+            after.ok(),
+            Some(1),
+            "payouts must survive a failed migration"
+        );
     }
 
     #[test]
