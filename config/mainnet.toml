@@ -409,40 +409,6 @@ epoch_blocks = 2160
 wraith_enabled = true
 
 # =============================================================================
-# [registry] - DNS Load Balancer Registration (Optional)
-# =============================================================================
-# Configure to register with Ghost DNS load balancer for miner discovery
-# Only needed for public pools wanting DNS-based miner routing
-
-# [registry]
-#
-# # Registry service URL
-# # Options: HTTP/HTTPS URL
-# # Default: None
-# url = "https://registry.bitcoinghost.org:8333"
-#
-# # Heartbeat interval in seconds
-# # How often to send health updates to registry
-# # Options: 10-300
-# # Default: 30
-# heartbeat_interval_secs = 30
-#
-# # Geographic region for latency-based routing
-# # Options:
-# #   - "us_east"
-# #   - "us_west"
-# #   - "eu_west"
-# #   - "eu_central"
-# #   - "asia_southeast"
-# #   - "asia_northeast"
-# #   - "oceania"
-# #   - "south_america"
-# #   - "africa"
-# #   - "unknown"
-# # Default: "unknown"
-# region = "us_east"
-
-# =============================================================================
 # Environment Variables Reference
 # =============================================================================
 #

@@ -1457,6 +1457,11 @@ pub struct VerificationState {
     /// prepends this node (self) from local state. None on deploys without the
     /// provider wired — the endpoint then returns just self.
     get_mesh_nodes: Option<Box<dyn Fn() -> Vec<MeshNodeInfo> + Send + Sync>>,
+    /// Returns the latest finalised mesh node-list checkpoint as a pre-built, verifiable JSON
+    /// blob (proposal fields + proposer signature + ≥67% approver signatures), or None if none
+    /// is finalised / the provider isn't wired. Serves the signed
+    /// `/api/v1/pool/mesh-node-list-checkpoint` endpoint a miner-side shim verifies offline.
+    get_mesh_node_list_checkpoint: Option<Box<dyn Fn() -> Option<serde_json::Value> + Send + Sync>>,
     /// Signal to trigger graceful restart (set by config update API)
     /// When true, main.rs will initiate shutdown and exit with code 100
     pub restart_signal: Arc<AtomicBool>,
@@ -1717,6 +1722,7 @@ impl VerificationState {
             get_round_elapsed_secs: None,
             get_mesh_best_records: None,
             get_mesh_nodes: None,
+            get_mesh_node_list_checkpoint: None,
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
             restart_signal: Arc::new(AtomicBool::new(false)),
@@ -2578,6 +2584,23 @@ impl VerificationState {
             .as_ref()
             .map(|f| f())
             .unwrap_or_default()
+    }
+
+    /// Wire the signed mesh node-list checkpoint provider (see the field).
+    pub fn with_mesh_node_list_checkpoint(
+        mut self,
+        f: impl Fn() -> Option<serde_json::Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_mesh_node_list_checkpoint = Some(Box::new(f));
+        self
+    }
+
+    /// The latest finalised signed mesh node-list checkpoint blob, or None if none is
+    /// finalised or no provider is wired.
+    pub fn mesh_node_list_checkpoint(&self) -> Option<serde_json::Value> {
+        self.get_mesh_node_list_checkpoint
+            .as_ref()
+            .and_then(|f| f())
     }
 
     /// Set archive handler

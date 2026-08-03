@@ -237,6 +237,13 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // website render the node list from one node instead of a hard-coded
         // VM set, so new nodes appear automatically.
         .route("/api/v1/pool/mesh-nodes", get(api_pool_mesh_nodes_handler))
+        // Signed, verifiable snapshot of the public-mining node set — the blob a miner-side
+        // shim fetches for trustless decentralised discovery. 404 until a checkpoint is
+        // finalised (the gate is dormant on mainnet today).
+        .route(
+            "/api/v1/pool/mesh-node-list-checkpoint",
+            get(api_pool_mesh_node_list_checkpoint_handler),
+        )
         // Rolling server-side time-series of pool hashrate + connected miners,
         // sampled every 30s (24h retention). `?window=1h|24h`. Lets the pool
         // page chart real history instead of a client-side session buffer.
@@ -2728,6 +2735,25 @@ fn mesh_node_to_json(node: &MeshNodeInfo, is_registry_elder: bool) -> serde_json
         "healthy": node.healthy,
         "is_self": false,
     })
+}
+
+/// The latest finalised, signed mesh node-list checkpoint — the verifiable blob a miner-side
+/// shim fetches for decentralised discovery: the public-mining node set plus the proposer
+/// signature and the ≥67% approver signatures, so the shim verifies it offline against its
+/// trusted signer set (never trusting DNS or this server). PUBLIC, no auth (the data is the
+/// same openly-gossiped node set as `mesh-nodes`, just BFT-signed). 404 until a checkpoint is
+/// finalised — the gate is dormant on mainnet, so this returns 404 today.
+async fn api_pool_mesh_node_list_checkpoint_handler(
+    State(state): State<Arc<VerificationState>>,
+) -> impl IntoResponse {
+    match state.mesh_node_list_checkpoint() {
+        Some(blob) => (StatusCode::OK, Json(blob)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no finalised mesh node-list checkpoint" })),
+        )
+            .into_response(),
+    }
 }
 
 /// Live mesh node list = this node (self) + every connected peer.

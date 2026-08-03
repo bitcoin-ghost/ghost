@@ -57,6 +57,10 @@ pub mod payout;
 /// pure function of).
 pub mod payout_checkpoint;
 
+/// Mesh node-list checkpoint finalisation (signed public-mining node set for
+/// decentralised mining discovery). Dormant until `MESH_NODE_LIST_CHECKPOINT_HEIGHT`.
+pub mod mesh_node_checkpoint;
+
 /// Chain reorganization detection and recovery.
 pub mod reorg;
 
@@ -381,6 +385,13 @@ pub const CHALLENGER_ASSIGNMENT_SEED_LAG: u64 = ghost_verification::challenger_a
 /// the prior binary (`.bak`) = instant disarm.
 pub const ACTIVE_VOTER_SET_HEIGHT: u64 = 959_200;
 
+/// Mesh node-list checkpoint (decentralised mining discovery, v2). At and above this height,
+/// nodes propose/vote/finalise a BFT-signed snapshot of the public-mining node set that an
+/// untrusted miner-side shim can verify offline (see tasks/design_mesh_node_list_checkpoint.md).
+/// DORMANT (`u64::MAX`): below it nothing is proposed, so the binary is behaviour-neutral. Built
+/// dormant — a concrete height is set only after fleet-wide convergence is proven, like the rest.
+pub const MESH_NODE_LIST_CHECKPOINT_HEIGHT: u64 = u64::MAX;
+
 /// Activation heights, resolved once at startup.
 ///
 /// A regtest chain is ~100 blocks tall, so every mainnet gate is dormant there and a regtest
@@ -407,6 +418,7 @@ mod gates {
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
+    pub(super) static MESH_NODE_LIST_CHECKPOINT: OnceLock<u64> = OnceLock::new();
 
     pub(super) fn from_env(var: &str, network: &BitcoinNetwork, default: u64) -> u64 {
         if matches!(network, BitcoinNetwork::Mainnet) {
@@ -476,6 +488,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         ARCHIVE_TX_PROOF_HEIGHT,
     );
+    let mesh_node_list_checkpoint = gates::from_env(
+        "GHOST_MESH_NODE_LIST_CHECKPOINT_HEIGHT",
+        network,
+        MESH_NODE_LIST_CHECKPOINT_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
@@ -487,6 +504,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::PAYOUT_MEDIAN_ADOPTION.set(payout_median);
     let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
     let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
+    let _ = gates::MESH_NODE_LIST_CHECKPOINT.set(mesh_node_list_checkpoint);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != COINBASE_FEE_SPLIT_HEIGHT
@@ -496,6 +514,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         || active_voter_set != ACTIVE_VOTER_SET_HEIGHT
         || share_addr_bind != SHARE_ADDR_BIND_HEIGHT
         || observed_settlement != OBSERVED_SETTLEMENT_HEIGHT
+        || mesh_node_list_checkpoint != MESH_NODE_LIST_CHECKPOINT_HEIGHT
     {
         tracing::warn!(
             cluster_enforcement_height = enforcement,
@@ -506,6 +525,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
             active_voter_set_height = active_voter_set,
             share_addr_bind_height = share_addr_bind,
             observed_settlement_height = observed_settlement,
+            mesh_node_list_checkpoint_height = mesh_node_list_checkpoint,
             network = ?network,
             "Activation heights OVERRIDDEN from the environment — non-mainnet only"
         );
@@ -592,6 +612,12 @@ pub fn binds_payout_address(height: u64) -> bool {
 /// doc deliberately does not restate the value, so it cannot go stale when the gate moves.
 pub fn active_voter_set_height() -> u64 {
     *gates::ACTIVE_VOTER_SET.get_or_init(|| ACTIVE_VOTER_SET_HEIGHT)
+}
+
+/// The height at/above which nodes propose+finalise the signed mesh node-list checkpoint for
+/// decentralised mining discovery. DORMANT (`u64::MAX`) — behaviour-neutral until armed.
+pub fn mesh_node_list_checkpoint_height() -> u64 {
+    *gates::MESH_NODE_LIST_CHECKPOINT.get_or_init(|| MESH_NODE_LIST_CHECKPOINT_HEIGHT)
 }
 
 /// GhostGlyph P2P handler for visual identity registration.

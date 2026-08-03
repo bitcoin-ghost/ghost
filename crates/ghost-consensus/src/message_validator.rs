@@ -473,6 +473,9 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::ShareBatchProposal => MAX_SHARE_BATCH_SIZE,
         MessageType::ShareBatchVote => MAX_SHARE_BATCH_VOTE_SIZE,
         MessageType::ShareBatchSync => MAX_SHARE_BATCH_SYNC_SIZE,
+        MessageType::MeshNodeListCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
+        MessageType::MeshNodeListCheckpointVote => MAX_VOTE_SIZE,
+        MessageType::MeshNodeListCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
         MessageType::L2TreeSync => MAX_L2_TREE_SYNC_SIZE,
         MessageType::L2ShieldBroadcast => 256, // ShieldCommitment: 32-byte commitment + u64 index + u64 height
         MessageType::GhostGlyphClaim => MAX_GLYPH_CLAIM_SIZE,

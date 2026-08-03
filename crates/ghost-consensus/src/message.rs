@@ -75,6 +75,12 @@ pub mod topics {
     pub const SHARE_BATCH_VOTE: &[u8] = b"sbvote";
     /// Share-batch chain: on-demand backfill of adopted batches
     pub const SHARE_BATCH_SYNC: &[u8] = b"sbsync";
+    /// Mesh node-list checkpoint proposal (signed public-mining node set for discovery)
+    pub const MESH_NODE_LIST_CHECKPOINT: &[u8] = b"mnlchk";
+    /// Mesh node-list checkpoint vote
+    pub const MESH_NODE_LIST_VOTE: &[u8] = b"mnlvote";
+    /// Mesh node-list checkpoint sync (on-demand backfill of missed checkpoints)
+    pub const MESH_NODE_LIST_SYNC: &[u8] = b"mnlsync";
     /// L2 shield commitment broadcast
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
@@ -286,6 +292,13 @@ pub enum MessageType {
     /// against its own head — it must fetch, not guess. Verified by rehashing: an adopted batch is
     /// accepted only if it hashes to the parent the next one names.
     ShareBatchSync,
+    /// Mesh node-list checkpoint proposal (proposer → all): the BFT-finalised, signed
+    /// snapshot of the public-mining node set for decentralised mining discovery.
+    MeshNodeListCheckpoint,
+    /// Mesh node-list checkpoint vote (validator → all)
+    MeshNodeListCheckpointVote,
+    /// Mesh node-list checkpoint sync request/response (node ↔ peer): on-demand backfill.
+    MeshNodeListCheckpointSync,
 }
 
 impl MessageType {
@@ -324,6 +337,9 @@ impl MessageType {
             Self::ShareBatchProposal => topics::SHARE_BATCH,
             Self::ShareBatchVote => topics::SHARE_BATCH_VOTE,
             Self::ShareBatchSync => topics::SHARE_BATCH_SYNC,
+            Self::MeshNodeListCheckpoint => topics::MESH_NODE_LIST_CHECKPOINT,
+            Self::MeshNodeListCheckpointVote => topics::MESH_NODE_LIST_VOTE,
+            Self::MeshNodeListCheckpointSync => topics::MESH_NODE_LIST_SYNC,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
@@ -366,6 +382,9 @@ impl MessageType {
             Self::ShareBatchProposal => "sbatch",
             Self::ShareBatchVote => "sbvote",
             Self::ShareBatchSync => "sbsync",
+            Self::MeshNodeListCheckpoint => "mnlchk",
+            Self::MeshNodeListCheckpointVote => "mnlvote",
+            Self::MeshNodeListCheckpointSync => "mnlsync",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
@@ -1455,6 +1474,236 @@ pub struct PayoutCheckpointSyncResponse {
     pub timestamp: u64,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Mesh node-list checkpoint (decentralised mining discovery).
+//
+// A BFT-finalised, signed snapshot of the public-mining node set that an
+// UNTRUSTED miner-side client can verify offline. Mirrors the payout-ledger
+// checkpoint machinery. Trust model (design decision C, hybrid): a shim carries
+// a baked-in genesis signer set and advances it via the signed forward chain —
+// each checkpoint's `signer_set_delta` is attested by ≥67% of the PRIOR set
+// (the approver signatures over `checkpoint_hash`, which commits `signer_set_root`).
+// Because `node_id` IS the node's Ed25519 public key, a shim verifies every
+// signature with no key distribution. See tasks/design_mesh_node_list_checkpoint.md.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One public-mining node in a mesh node-list checkpoint: the {identity, endpoint}
+/// tuple a miner-side shim needs to connect. `node_id` is the node's Ed25519 public
+/// key, so a shim can verify anything this node signs with no key distribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeshNodeEntry {
+    /// Node identity = Ed25519 public key.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub node_id: NodeId,
+    /// Public host WITHOUT a port, e.g. "203.0.113.7" or a hostname.
+    pub host: String,
+    /// Stratum V1 port (SV1 miners: Bitaxe/CGMiner).
+    pub sv1_port: u16,
+    /// Stratum V2 port.
+    pub sv2_port: u16,
+}
+
+/// Canonical Merkle-free root over a node list: sort by `node_id`, then hash each
+/// entry length-prefixed. Every node derives the byte-identical root from the same
+/// set, so `list_root` binds the list inside `checkpoint_hash`.
+pub fn mesh_node_list_root(nodes: &[MeshNodeEntry]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<&MeshNodeEntry> = nodes.iter().collect();
+    sorted.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    let mut hasher = Sha256::new();
+    hasher.update(b"MeshNodeList/v1");
+    hasher.update((sorted.len() as u32).to_le_bytes());
+    for n in sorted {
+        hasher.update(n.node_id);
+        let hb = n.host.as_bytes();
+        hasher.update((hb.len() as u32).to_le_bytes());
+        hasher.update(hb);
+        hasher.update(n.sv1_port.to_le_bytes());
+        hasher.update(n.sv2_port.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// Canonical root over a signer set (sort + dedup, then hash). Binds the resulting
+/// signer set inside `checkpoint_hash` so the forward-chain delta is authenticated.
+pub fn mesh_signer_set_root(set: &[NodeId]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted = set.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(b"MeshSignerSet/v1");
+    hasher.update((sorted.len() as u32).to_le_bytes());
+    for id in sorted {
+        hasher.update(id);
+    }
+    hasher.finalize().into()
+}
+
+/// How the signer set changed versus the previous checkpoint — the signed forward
+/// chain (decision C). A shim applies this to advance its trusted set; the delta is
+/// authenticated because `checkpoint_hash` commits `signer_set_root` (the root of
+/// the set AFTER applying it) and the checkpoint is approved by ≥67% of the prior set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerSetDelta {
+    /// Node IDs added to the signer set since the previous checkpoint.
+    #[serde(default)]
+    pub added: Vec<NodeId>,
+    /// Node IDs removed from the signer set since the previous checkpoint.
+    #[serde(default)]
+    pub removed: Vec<NodeId>,
+}
+
+/// Mesh node-list checkpoint proposal (proposer → all). The BFT-finalised, signed
+/// snapshot a miner-side shim consumes for trustless discovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshNodeListCheckpointMessage {
+    /// Lagging anchor height this checkpoint pins the node list at.
+    pub height: u64,
+    /// Cutoff = the anchor block's timestamp (deterministic, chain-committed).
+    pub cutoff_ts: i64,
+    /// The canonical public-mining node set as of `cutoff_ts`. Voters recompute
+    /// their own connected public-mining set and approve iff it matches; adopted
+    /// verbatim on finalise.
+    #[serde(default)]
+    pub nodes: Vec<MeshNodeEntry>,
+    /// `mesh_node_list_root(nodes)` — binds the list inside `checkpoint_hash`.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub list_root: [u8; 32],
+    /// Signer-set change vs the previous checkpoint (the signed forward chain).
+    #[serde(default)]
+    pub signer_set_delta: SignerSetDelta,
+    /// `mesh_signer_set_root(set)` of the signer set AFTER applying the delta —
+    /// committed in `checkpoint_hash`, so a shim can authenticate the new set.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub signer_set_root: [u8; 32],
+    /// Number of active nodes at this checkpoint.
+    pub active_node_count: u32,
+    /// Proposer's node ID (deterministic election for `height`).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub proposer: NodeId,
+    /// Proposer's signature over `checkpoint_hash()`.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub proposer_signature: [u8; 64],
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
+}
+
+impl MeshNodeListCheckpointMessage {
+    /// Content hash (excludes the signature) — the object voters sign/compare.
+    /// Commits the list root AND the resulting signer-set root, so both the node
+    /// list and the forward-chain delta are authenticated by every approval.
+    pub fn checkpoint_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"MeshNodeListCheckpoint/v1");
+        hasher.update(self.height.to_le_bytes());
+        hasher.update(self.cutoff_ts.to_le_bytes());
+        hasher.update(self.list_root);
+        hasher.update(self.signer_set_root);
+        hasher.update(self.active_node_count.to_le_bytes());
+        hasher.update(self.proposer);
+        hasher.finalize().into()
+    }
+}
+
+/// Mesh node-list checkpoint vote (validator → all).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshNodeListCheckpointVoteMessage {
+    /// Checkpoint height being voted on.
+    pub height: u64,
+    /// Hash of the checkpoint being voted on (`MeshNodeListCheckpointMessage::checkpoint_hash`).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub checkpoint_hash: [u8; 32],
+    /// Voter's node ID.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub voter: NodeId,
+    /// Vote (true = approve; the voter reproduced the same `list_root`).
+    pub approve: bool,
+    /// Voter's signature over `signing_message()`.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub signature: [u8; 64],
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
+}
+
+impl MeshNodeListCheckpointVoteMessage {
+    /// Get the message to be signed.
+    pub fn signing_message(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"MeshNodeListCheckpointVote/v1");
+        hasher.update(self.height.to_le_bytes());
+        hasher.update(self.checkpoint_hash);
+        hasher.update([self.approve as u8]);
+        hasher.finalize().into()
+    }
+}
+
+/// One finalised mesh node-list checkpoint carried in a sync response. Unlike the payout
+/// sync entry, this carries the FULL signed blob — the proposer signature and the ≥67%
+/// approver signatures — so a syncing peer verifies the quorum itself (never trusting the
+/// serving peer) and can then serve the same verifiable blob to shims. Approver signatures
+/// are `Vec<u8>` (64 bytes) because serde's array impls stop at 32.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshNodeListCheckpointSyncEntry {
+    /// Lagging anchor height.
+    pub height: u64,
+    /// Cutoff = anchor block's timestamp.
+    pub cutoff_ts: i64,
+    /// Canonical public-mining node set as of `cutoff_ts`.
+    #[serde(default)]
+    pub nodes: Vec<MeshNodeEntry>,
+    /// `mesh_node_list_root(nodes)`.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub list_root: [u8; 32],
+    /// Signer-set change vs the previous checkpoint.
+    #[serde(default)]
+    pub signer_set_delta: SignerSetDelta,
+    /// `mesh_signer_set_root` of the set after the delta.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub signer_set_root: [u8; 32],
+    /// Active-node count at this checkpoint.
+    pub active_node_count: u32,
+    /// Deterministic proposer for `height` (checked against `proposer_for(height)` on apply).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub proposer: NodeId,
+    /// Proposer's signature over the checkpoint hash.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub proposer_signature: [u8; 64],
+    /// The ≥67% approver signatures over the vote signing message: `(voter, signature)`.
+    #[serde(default)]
+    pub approvals: Vec<(NodeId, Vec<u8>)>,
+}
+
+/// Mesh node-list checkpoint sync REQUEST (node → peers): backfill finalised
+/// checkpoints from `from_height` up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshNodeListCheckpointSyncRequest {
+    /// The node asking to be backfilled.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub requesting_node: NodeId,
+    /// Lowest height the requester lacks (its `latest_finalised + 1`).
+    pub from_height: u64,
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
+}
+
+/// Mesh node-list checkpoint sync RESPONSE (peer → requester): a bounded, ascending
+/// page of finalised checkpoints. `has_more` signals the requester to paginate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshNodeListCheckpointSyncResponse {
+    /// The peer serving the backfill.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub responding_node: NodeId,
+    /// Finalised checkpoints, ascending from the requested height (bounded page).
+    pub checkpoints: Vec<MeshNodeListCheckpointSyncEntry>,
+    /// True if the responder hit its page cap — the requester should re-request.
+    pub has_more: bool,
+    /// Timestamp (Unix milliseconds).
+    pub timestamp: u64,
+}
+
 /// L2: Tree sync request (new node → peer)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2TreeSyncRequest {
@@ -1755,6 +2004,115 @@ mod tests {
 
         assert_eq!(decoded.round_id, 1);
         assert!(decoded.approve);
+    }
+
+    // ── Mesh node-list checkpoint wire types ────────────────────────────────
+    fn mesh_entry(i: u8) -> MeshNodeEntry {
+        let mut id = [0u8; 32];
+        id[0] = i;
+        id[1] = i.wrapping_mul(7);
+        MeshNodeEntry {
+            node_id: id,
+            host: format!("10.0.0.{i}"),
+            sv1_port: 3333,
+            sv2_port: 34255,
+        }
+    }
+
+    fn sample_mesh_checkpoint() -> MeshNodeListCheckpointMessage {
+        let nodes = vec![mesh_entry(1), mesh_entry(2)];
+        let signer_set = vec![[1u8; 32], [2u8; 32]];
+        MeshNodeListCheckpointMessage {
+            height: 959_400,
+            cutoff_ts: 1_760_000_000,
+            list_root: mesh_node_list_root(&nodes),
+            nodes,
+            signer_set_delta: SignerSetDelta {
+                added: vec![[2u8; 32]],
+                removed: vec![],
+            },
+            signer_set_root: mesh_signer_set_root(&signer_set),
+            active_node_count: 2,
+            proposer: [1u8; 32],
+            proposer_signature: [0u8; 64],
+            timestamp: 1,
+        }
+    }
+
+    #[test]
+    fn mesh_node_list_root_is_order_independent_and_content_sensitive() {
+        let a = vec![mesh_entry(1), mesh_entry(2), mesh_entry(3)];
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(
+            mesh_node_list_root(&a),
+            mesh_node_list_root(&b),
+            "collection order must not change the root"
+        );
+        let mut c = a.clone();
+        c[0].host = "changed".to_string();
+        assert_ne!(
+            mesh_node_list_root(&a),
+            mesh_node_list_root(&c),
+            "a changed endpoint must change the root"
+        );
+    }
+
+    #[test]
+    fn mesh_signer_set_root_is_order_and_dup_independent() {
+        let s1 = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+        let mut s2 = vec![[3u8; 32], [2u8; 32], [1u8; 32], [2u8; 32]]; // reordered + dup
+        assert_eq!(mesh_signer_set_root(&s1), mesh_signer_set_root(&s2));
+        s2.push([9u8; 32]);
+        assert_ne!(
+            mesh_signer_set_root(&s1),
+            mesh_signer_set_root(&s2),
+            "a genuinely different member must change the root"
+        );
+    }
+
+    #[test]
+    fn mesh_checkpoint_hash_excludes_signature_and_binds_content() {
+        let cp = sample_mesh_checkpoint();
+        let h = cp.checkpoint_hash();
+        let mut cp2 = cp.clone();
+        cp2.proposer_signature = [7u8; 64];
+        assert_eq!(
+            h,
+            cp2.checkpoint_hash(),
+            "signature must not affect the hash"
+        );
+        let mut cp3 = cp.clone();
+        cp3.list_root = [9u8; 32];
+        assert_ne!(h, cp3.checkpoint_hash(), "list_root is bound");
+        let mut cp4 = cp.clone();
+        cp4.signer_set_root = [9u8; 32];
+        assert_ne!(h, cp4.checkpoint_hash(), "signer_set_root is bound");
+    }
+
+    #[test]
+    fn mesh_checkpoint_vote_signing_message_flips_with_approve() {
+        let cp = sample_mesh_checkpoint();
+        let mk = |approve: bool| MeshNodeListCheckpointVoteMessage {
+            height: cp.height,
+            checkpoint_hash: cp.checkpoint_hash(),
+            voter: [5u8; 32],
+            approve,
+            signature: [0u8; 64],
+            timestamp: 1,
+        };
+        assert_ne!(mk(true).signing_message(), mk(false).signing_message());
+        assert_eq!(mk(true).signing_message(), mk(true).signing_message());
+    }
+
+    #[test]
+    fn mesh_checkpoint_serde_roundtrip() {
+        let cp = sample_mesh_checkpoint();
+        let json = serde_json::to_vec(&cp).unwrap();
+        let back: MeshNodeListCheckpointMessage = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.checkpoint_hash(), cp.checkpoint_hash());
+        assert_eq!(back.nodes, cp.nodes);
+        assert_eq!(back.signer_set_delta, cp.signer_set_delta);
     }
 
     #[test]

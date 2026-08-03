@@ -1014,19 +1014,6 @@ impl SeenMessageCache {
         self.sender_counts.retain(|_, &mut count| count > 0);
         self.sender_queues.retain(|_, queue| !queue.is_empty());
     }
-
-    /// CRIT-5: Check if a message has expired based on TTL
-    ///
-    /// Returns true if the message timestamp is older than message_ttl_secs
-    #[allow(dead_code)]
-    fn is_message_expired(&self, timestamp: u64) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        now.saturating_sub(timestamp) > self.message_ttl_secs
-    }
 }
 
 impl MeshNetwork {
@@ -1826,6 +1813,9 @@ impl MeshNetwork {
             | MessageType::ShareBatchProposal
             | MessageType::ShareBatchVote
             | MessageType::ShareBatchSync
+            | MessageType::MeshNodeListCheckpoint
+            | MessageType::MeshNodeListCheckpointVote
+            | MessageType::MeshNodeListCheckpointSync
             | MessageType::ElderUpdate
             | MessageType::ZkBlockProposal
             | MessageType::ZkVote
@@ -2207,6 +2197,9 @@ impl MeshNetwork {
             | MessageType::PayoutLedgerCheckpointVote
             | MessageType::PayoutLedgerCheckpointSync
             | MessageType::PayoutProposalSync
+            | MessageType::MeshNodeListCheckpoint
+            | MessageType::MeshNodeListCheckpointVote
+            | MessageType::MeshNodeListCheckpointSync
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             // GhostGlyph messages use consensus voting port
@@ -3293,6 +3286,9 @@ impl MeshNetwork {
             | MessageType::PayoutLedgerCheckpointVote
             | MessageType::PayoutLedgerCheckpointSync
             | MessageType::PayoutProposalSync
+            | MessageType::MeshNodeListCheckpoint
+            | MessageType::MeshNodeListCheckpointVote
+            | MessageType::MeshNodeListCheckpointSync
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {
@@ -4222,6 +4218,9 @@ mod tests {
                 | MessageType::ShareBatchProposal
                 | MessageType::ShareBatchVote
                 | MessageType::ShareBatchSync
+                | MessageType::MeshNodeListCheckpoint
+                | MessageType::MeshNodeListCheckpointVote
+                | MessageType::MeshNodeListCheckpointSync
                 | MessageType::ElderUpdate
                 | MessageType::ZkBlockProposal
                 | MessageType::ZkVote

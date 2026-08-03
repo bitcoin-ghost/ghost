@@ -13,7 +13,13 @@
 //! | < warn_pct        | Normal          | accept + maybe proxy via utilisation routing     |
 //! | ≥ warn_pct        | Warning         | log warning, still accept, prefer-proxy harder   |
 //! | ≥ reject_pct      | RejectNew       | TCP-close incoming connections immediately       |
-//! | ≥ evict_pct       | Critical        | (TODO) send `client.reconnect` to N miners       |
+//! | ≥ evict_pct       | Critical        | reject new AND shed existing miners              |
+//!
+//! Utilisation above is `miner_count / max_capacity`. Separately, opt-in
+//! **compute protection** (`compute_shed_enabled`) forces `Critical` when this
+//! node's per-core 1-minute load average reaches `compute_evict_pct`, so a node
+//! under real CPU pressure sheds miners (they reconnect elsewhere via DNS)
+//! rather than starving share validation / template building.
 //!
 //! See `bins/ghost-pool/src/capacity.rs` for how `max_capacity` is derived
 //! per node from CPU/RAM/FD limits.
@@ -50,16 +56,18 @@ pub struct LoadBalancerConfig {
     #[serde(default = "default_evict_pct")]
     pub evict_pct: u32,
 
-    /// Opt-in hourly rebalancer — when this node's utilisation exceeds the
-    /// cluster minimum by `rebalance_imbalance_pct`, evict ONE miner via
-    /// Stratum `client.reconnect`. Default false: don't disrupt healthy
-    /// mining for cosmetic balance.
+    /// Compute-protection shedding (opt-in, default off). When enabled, if this node's
+    /// 1-minute load average per core reaches `compute_evict_pct`%, the node enters `Critical`:
+    /// it stops accepting new miners and sheds existing ones (they reconnect via DNS to a
+    /// less-loaded node), so a node under compute pressure protects itself instead of degrading
+    /// share validation / block-template building.
     #[serde(default)]
-    pub rebalance_enabled: bool,
-    #[serde(default = "default_rebalance_interval_secs")]
-    pub rebalance_interval_secs: u64,
-    #[serde(default = "default_rebalance_imbalance_pct")]
-    pub rebalance_imbalance_pct: u32,
+    pub compute_shed_enabled: bool,
+    #[serde(default = "default_compute_evict_pct")]
+    pub compute_evict_pct: u32,
+    /// Miners to shed per shedding tick (gentle: re-evaluated each tick).
+    #[serde(default = "default_shed_batch_size")]
+    pub shed_batch_size: u32,
 }
 
 fn default_ghost_pool_url() -> String {
@@ -83,11 +91,11 @@ fn default_reject_pct() -> u32 {
 fn default_evict_pct() -> u32 {
     95
 }
-fn default_rebalance_interval_secs() -> u64 {
-    3600
+fn default_compute_evict_pct() -> u32 {
+    90
 }
-fn default_rebalance_imbalance_pct() -> u32 {
-    20
+fn default_shed_batch_size() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +245,15 @@ impl LoadBalancer {
     /// Falls back to `Normal` if the cache hasn't populated yet (better to
     /// err on the side of accepting connections than to refuse during boot).
     pub async fn check_capacity(&self) -> CapacityState {
+        // Compute protection (opt-in): a node under real CPU pressure goes straight to Critical
+        // regardless of miner count, so share validation / template building never starves.
+        if self.config.compute_shed_enabled {
+            if let Some(load_pct) = read_loadavg_pct() {
+                if load_pct >= self.config.compute_evict_pct {
+                    return CapacityState::Critical;
+                }
+            }
+        }
         let cache = self.cache.read().await;
         let Some(cache) = cache.as_ref() else {
             return CapacityState::Normal;
@@ -246,12 +263,12 @@ impl LoadBalancer {
             return CapacityState::Normal;
         }
         let pct = (this.miner_count.saturating_mul(100)) / this.max_capacity;
-        match pct {
-            x if x >= self.config.evict_pct => CapacityState::Critical,
-            x if x >= self.config.reject_pct => CapacityState::RejectNew,
-            x if x >= self.config.warn_pct => CapacityState::Warning,
-            _ => CapacityState::Normal,
-        }
+        state_for_pct(
+            pct,
+            self.config.warn_pct,
+            self.config.reject_pct,
+            self.config.evict_pct,
+        )
     }
 
     /// Should this connection be rejected at the TCP layer due to local
@@ -413,17 +430,47 @@ impl LoadBalancer {
         )
     }
 
-    /// Read the rebalance config (used by sv1_server to decide whether to
-    /// spawn the optional hourly evictor).
-    pub fn rebalance_enabled(&self) -> bool {
-        self.config.rebalance_enabled
+    /// Whether compute-protection shedding is enabled (accept loop only spawns the
+    /// shed tick when this is true).
+    pub fn compute_shed_enabled(&self) -> bool {
+        self.config.compute_shed_enabled
     }
-    pub fn rebalance_interval_secs(&self) -> u64 {
-        self.config.rebalance_interval_secs
+
+    /// Miners to shed per shedding tick.
+    pub fn shed_batch_size(&self) -> usize {
+        self.config.shed_batch_size.max(1) as usize
     }
-    pub fn rebalance_imbalance_pct(&self) -> u32 {
-        self.config.rebalance_imbalance_pct
+
+    /// True when this node is `Critical` (over compute or miner-capacity threshold) — the
+    /// accept loop's shed tick uses this to evict existing miners so they reconnect elsewhere.
+    pub async fn should_shed(&self) -> bool {
+        self.config.compute_shed_enabled
+            && matches!(self.check_capacity().await, CapacityState::Critical)
     }
+}
+
+/// Map a utilisation percentage to a capacity state given the three thresholds. Pure so the
+/// tiering is unit-testable independent of the cache/poll plumbing.
+fn state_for_pct(pct: u32, warn: u32, reject: u32, evict: u32) -> CapacityState {
+    match pct {
+        x if x >= evict => CapacityState::Critical,
+        x if x >= reject => CapacityState::RejectNew,
+        x if x >= warn => CapacityState::Warning,
+        _ => CapacityState::Normal,
+    }
+}
+
+/// This node's 1-minute load average as a percentage of available cores (100 = one full
+/// core-equivalent of load per core). Linux-only via `/proc/loadavg`; `None` elsewhere or on
+/// read failure, which callers treat as "no compute-pressure signal".
+fn read_loadavg_pct() -> Option<u32> {
+    let contents = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let load1: f64 = contents.split_whitespace().next()?.parse().ok()?;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as f64;
+    let pct = (load1 / cores * 100.0).round().clamp(0.0, 100_000.0);
+    Some(pct as u32)
 }
 
 fn peer_util_pct(p: &PeerInfo) -> u32 {
@@ -464,6 +511,26 @@ async fn poll_pool_nodes(host_port: &str) -> Result<PoolNodesResponse, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn state_thresholds_map_correctly() {
+        assert_eq!(state_for_pct(0, 80, 90, 95), CapacityState::Normal);
+        assert_eq!(state_for_pct(79, 80, 90, 95), CapacityState::Normal);
+        assert_eq!(state_for_pct(80, 80, 90, 95), CapacityState::Warning);
+        assert_eq!(state_for_pct(89, 80, 90, 95), CapacityState::Warning);
+        assert_eq!(state_for_pct(90, 80, 90, 95), CapacityState::RejectNew);
+        assert_eq!(state_for_pct(94, 80, 90, 95), CapacityState::RejectNew);
+        assert_eq!(state_for_pct(95, 80, 90, 95), CapacityState::Critical);
+        assert_eq!(state_for_pct(200, 80, 90, 95), CapacityState::Critical);
+    }
+
+    #[test]
+    fn loadavg_pct_is_bounded() {
+        // On Linux this reads real /proc/loadavg; just assert it's a sane bounded value.
+        if let Some(pct) = read_loadavg_pct() {
+            assert!(pct < 100_000);
+        }
+    }
+
     fn cfg() -> LoadBalancerConfig {
         LoadBalancerConfig {
             ghost_pool_url: "127.0.0.1:8080".into(),
@@ -473,9 +540,9 @@ mod tests {
             warn_pct: 80,
             reject_pct: 90,
             evict_pct: 95,
-            rebalance_enabled: false,
-            rebalance_interval_secs: 3600,
-            rebalance_imbalance_pct: 20,
+            compute_shed_enabled: false,
+            compute_evict_pct: 90,
+            shed_batch_size: 1,
         }
     }
 

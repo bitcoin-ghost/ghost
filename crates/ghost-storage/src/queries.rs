@@ -8466,6 +8466,63 @@ pub struct PayoutLedgerCheckpointRecord {
     pub node_shares: Vec<([u8; 32], i32)>,
 }
 
+/// A BFT-finalised mesh node-list checkpoint (migration v47): the signed snapshot of the
+/// public-mining node set a miner-side shim verifies offline. Unlike the payout checkpoint it
+/// keeps the proposer + approver signatures (so the served HTTP blob is independently
+/// verifiable) and the signer-set forward-chain delta (so a shim can advance its trusted set).
+/// Signatures are held as `Vec<u8>` (64 bytes) because serde's array impls stop at 32.
+#[derive(Debug, Clone)]
+pub struct MeshNodeListCheckpointRecord {
+    pub height: u64,
+    pub cutoff_ts: i64,
+    pub list_root: [u8; 32],
+    pub signer_set_root: [u8; 32],
+    /// Hex-encoded proposer node id.
+    pub proposer_id: String,
+    pub active_node_count: u32,
+    /// Proposer's Ed25519 signature over the checkpoint hash (64 bytes).
+    pub proposer_signature: Vec<u8>,
+    /// The canonical public-mining node list: `(node_id, host, sv1_port, sv2_port)`.
+    pub nodes: Vec<([u8; 32], String, u16, u16)>,
+    /// Signer-set forward-chain delta vs the previous checkpoint: `(added, removed)`.
+    pub signer_set_delta: (Vec<[u8; 32]>, Vec<[u8; 32]>),
+    /// Approver signatures over the vote signing message: `(voter_id, signature)` (64-byte sigs).
+    pub approvals: Vec<([u8; 32], Vec<u8>)>,
+}
+
+/// Decode a `mesh_node_list_checkpoints` row tuple into a record; returns `None` on a malformed
+/// root/blob (the same defensive tolerance the payout-checkpoint reader uses).
+#[allow(clippy::type_complexity)]
+fn mesh_row_to_record(
+    t: (i64, i64, Vec<u8>, Vec<u8>, String, i64, Vec<u8>, Vec<u8>),
+) -> Option<MeshNodeListCheckpointRecord> {
+    let (height, cutoff_ts, list_root_b, signer_root_b, proposer_id, active, sig, detail) = t;
+    if list_root_b.len() != 32 || signer_root_b.len() != 32 {
+        return None;
+    }
+    let mut list_root = [0u8; 32];
+    list_root.copy_from_slice(&list_root_b);
+    let mut signer_set_root = [0u8; 32];
+    signer_set_root.copy_from_slice(&signer_root_b);
+    let (nodes, signer_set_delta, approvals): (
+        Vec<([u8; 32], String, u16, u16)>,
+        (Vec<[u8; 32]>, Vec<[u8; 32]>),
+        Vec<([u8; 32], Vec<u8>)>,
+    ) = serde_json::from_slice(&detail).ok()?;
+    Some(MeshNodeListCheckpointRecord {
+        height: height as u64,
+        cutoff_ts,
+        list_root,
+        signer_set_root,
+        proposer_id,
+        active_node_count: active as u32,
+        proposer_signature: sig,
+        nodes,
+        signer_set_delta,
+        approvals,
+    })
+}
+
 /// L2 epoch record (lifecycle and compaction state)
 #[derive(Debug, Clone)]
 pub struct L2EpochRecord {
@@ -9175,6 +9232,118 @@ impl Database {
                     miner_payouts,
                     node_shares,
                 });
+            }
+            Ok(out)
+        })
+    }
+
+    /// Persist a finalised mesh node-list checkpoint (idempotent by height).
+    pub fn upsert_mesh_node_list_checkpoint(
+        &self,
+        r: &MeshNodeListCheckpointRecord,
+    ) -> GhostResult<()> {
+        let detail = serde_json::to_vec(&(&r.nodes, &r.signer_set_delta, &r.approvals))
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO mesh_node_list_checkpoints
+                 (height, cutoff_ts, list_root, signer_set_root, proposer_id,
+                  active_node_count, proposer_signature, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    r.height as i64,
+                    r.cutoff_ts,
+                    r.list_root.as_slice(),
+                    r.signer_set_root.as_slice(),
+                    r.proposer_id,
+                    r.active_node_count as i64,
+                    r.proposer_signature.as_slice(),
+                    detail.as_slice(),
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// The latest finalised mesh node-list checkpoint at or below `max_height`
+    /// (`u64::MAX` = the latest).
+    pub fn get_mesh_node_list_checkpoint_at_or_before(
+        &self,
+        max_height: u64,
+    ) -> GhostResult<Option<MeshNodeListCheckpointRecord>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT height, cutoff_ts, list_root, signer_set_root, proposer_id,
+                        active_node_count, proposer_signature, detail
+                 FROM mesh_node_list_checkpoints
+                 WHERE height <= ?1 ORDER BY height DESC LIMIT 1",
+                params![max_height.min(i64::MAX as u64) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| GhostError::Database(e.to_string()))
+            .map(|opt| opt.and_then(mesh_row_to_record))
+        })
+    }
+
+    /// The latest finalised mesh node-list checkpoint.
+    pub fn get_latest_mesh_node_list_checkpoint(
+        &self,
+    ) -> GhostResult<Option<MeshNodeListCheckpointRecord>> {
+        self.get_mesh_node_list_checkpoint_at_or_before(u64::MAX)
+    }
+
+    /// Finalised mesh node-list checkpoints at `height >= from_height`, ascending, bounded by
+    /// `limit`. Backs the sync responder (analog of the payout-checkpoint backfill).
+    pub fn get_mesh_node_list_checkpoints_from_height(
+        &self,
+        from_height: u64,
+        limit: u64,
+    ) -> GhostResult<Vec<MeshNodeListCheckpointRecord>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT height, cutoff_ts, list_root, signer_set_root, proposer_id,
+                            active_node_count, proposer_signature, detail
+                     FROM mesh_node_list_checkpoints
+                     WHERE height >= ?1 ORDER BY height ASC LIMIT ?2",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(
+                    params![from_height.min(i64::MAX as u64) as i64, limit as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
+                        ))
+                    },
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let tuple = row.map_err(|e| GhostError::Database(e.to_string()))?;
+                if let Some(rec) = mesh_row_to_record(tuple) {
+                    out.push(rec);
+                }
             }
             Ok(out)
         })
@@ -10536,6 +10705,53 @@ mod tests {
             2,
             "a second distinct win counts"
         );
+    }
+
+    /// Mesh node-list checkpoints persist and read back byte-identical, are idempotent by
+    /// height, and honour the at-or-before / from-height range reads.
+    #[test]
+    fn mesh_node_list_checkpoint_round_trips() {
+        let db = Database::in_memory().expect("in-memory db");
+        assert!(db.get_latest_mesh_node_list_checkpoint().unwrap().is_none());
+
+        let rec = MeshNodeListCheckpointRecord {
+            height: 959_400,
+            cutoff_ts: 1_760_000_000,
+            list_root: [7u8; 32],
+            signer_set_root: [9u8; 32],
+            proposer_id: "aa".repeat(32),
+            active_node_count: 3,
+            proposer_signature: vec![1u8; 64],
+            nodes: vec![
+                ([1u8; 32], "203.0.113.7".to_string(), 3333, 34255),
+                ([2u8; 32], "198.51.100.4".to_string(), 3333, 34255),
+            ],
+            signer_set_delta: (vec![[2u8; 32]], vec![]),
+            approvals: vec![([1u8; 32], vec![5u8; 64]), ([2u8; 32], vec![6u8; 64])],
+        };
+        db.upsert_mesh_node_list_checkpoint(&rec).unwrap();
+
+        let got = db.get_latest_mesh_node_list_checkpoint().unwrap().unwrap();
+        assert_eq!(got.height, 959_400);
+        assert_eq!(got.list_root, [7u8; 32]);
+        assert_eq!(got.signer_set_root, [9u8; 32]);
+        assert_eq!(got.proposer_signature, vec![1u8; 64]);
+        assert_eq!(got.nodes.len(), 2);
+        assert_eq!(got.nodes[0].1, "203.0.113.7");
+        assert_eq!(got.signer_set_delta.0, vec![[2u8; 32]]);
+        assert_eq!(got.approvals.len(), 2);
+        assert_eq!(got.approvals[1].1, vec![6u8; 64]);
+
+        // Idempotent by height (INSERT OR REPLACE), and range reads behave.
+        db.upsert_mesh_node_list_checkpoint(&rec).unwrap();
+        let from = db
+            .get_mesh_node_list_checkpoints_from_height(0, 10)
+            .unwrap();
+        assert_eq!(from.len(), 1, "idempotent by height");
+        assert!(db
+            .get_mesh_node_list_checkpoint_at_or_before(959_399)
+            .unwrap()
+            .is_none());
     }
 
     /// A-2: the `/24` subnet extractor must accept only dotted-quad IPv4 literals
