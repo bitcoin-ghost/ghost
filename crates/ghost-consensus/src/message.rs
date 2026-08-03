@@ -1332,10 +1332,33 @@ pub struct PayoutLedgerCheckpointVoteMessage {
     pub signature: [u8; 64],
     /// Timestamp (Unix milliseconds).
     pub timestamp: u64,
+    /// This voter's OWN recomputed per-address miner work, `(payout_address, quantised work)` (#606).
+    ///
+    /// Empty below the report-and-median gate, and empty on a reject. Above it, an approving voter
+    /// reports the numbers it recomputed instead of discarding them, so finalisation can adopt the
+    /// per-address median rather than the proposer's list — which is what stops a proposer skewing
+    /// every address within tolerance and still being ratified.
+    ///
+    /// `#[serde(default)]` so a vote from a node on an older build still deserialises.
+    #[serde(default)]
+    pub reported_miner_work: Vec<(String, u128)>,
+    /// This voter's own recomputed qualified-node set, `(node_id, 5-4-3-2-1 shares)` (#606).
+    #[serde(default)]
+    pub reported_node_shares: Vec<(NodeId, i32)>,
 }
 
 impl PayoutLedgerCheckpointVoteMessage {
     /// Get the message to be signed.
+    ///
+    /// The reported values are folded in DELIBERATELY. Without that, any relay could rewrite a
+    /// voter's numbers in flight and steer the median — which would turn #606's fix into a strictly
+    /// worse hole than the one it closes, since influence would pass from the proposer alone to any
+    /// participant on the path.
+    ///
+    /// The domain tag stays `/v1` and the reported fields are appended with an explicit count
+    /// prefix. An old-format vote carries empty vectors, so it hashes to exactly the same digest as
+    /// it did before this change and its signature still verifies — the wire format is additive in
+    /// both directions.
     pub fn signing_message(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -1343,6 +1366,37 @@ impl PayoutLedgerCheckpointVoteMessage {
         hasher.update(self.height.to_le_bytes());
         hasher.update(self.checkpoint_hash);
         hasher.update([self.approve as u8]);
+        // Folded in ONLY when non-empty, so an empty report hashes byte-identically to the
+        // pre-#606 format.
+        //
+        // This is not a nicety. Hashing the length prefixes unconditionally appends two zero u64s
+        // and changes the digest of every ordinary vote — so a node on this build and a node on the
+        // previous one would compute different digests for the same vote and each would reject the
+        // other's signature. That is a fleet-wide loss of quorum the moment the binary ships,
+        // whether or not the gate is armed. Caught by
+        // `an_empty_report_hashes_as_the_old_format_did`, which failed against the first version of
+        // this function.
+        //
+        // Within the non-empty branch, lengths are prefixed and fields framed so no two distinct
+        // reports can collide by concatenation — [("ab", 1)] must not hash as
+        // [("a", 1), ("b", 1)].
+        if !self.reported_miner_work.is_empty() {
+            hasher.update(b"miner_work");
+            hasher.update((self.reported_miner_work.len() as u64).to_le_bytes());
+            for (addr, work) in &self.reported_miner_work {
+                hasher.update((addr.len() as u64).to_le_bytes());
+                hasher.update(addr.as_bytes());
+                hasher.update(work.to_le_bytes());
+            }
+        }
+        if !self.reported_node_shares.is_empty() {
+            hasher.update(b"node_shares");
+            hasher.update((self.reported_node_shares.len() as u64).to_le_bytes());
+            for (node, shares) in &self.reported_node_shares {
+                hasher.update(node);
+                hasher.update(shares.to_le_bytes());
+            }
+        }
         hasher.finalize().into()
     }
 }
@@ -1553,6 +1607,94 @@ pub struct GhostGlyphRegisteredMessage {
 
 #[cfg(test)]
 mod tests {
+
+    /// #606: the reported values MUST be covered by the signature.
+    ///
+    /// If they are not, any relay can rewrite a voter's numbers in flight and steer the median —
+    /// which would make the #606 fix strictly WORSE than the bug it closes, moving influence from
+    /// the proposer alone to any participant on the network path.
+    #[test]
+    fn payout_ledger_vote_signature_covers_the_reported_values() {
+        let base = PayoutLedgerCheckpointVoteMessage {
+            height: 900_000,
+            checkpoint_hash: [7u8; 32],
+            voter: [1u8; 32],
+            approve: true,
+            signature: [0u8; 64],
+            timestamp: 1_700_000_000_000,
+            reported_miner_work: vec![("bc1qhonest".to_string(), 1_000_000u128)],
+            reported_node_shares: vec![([2u8; 32], 5)],
+        };
+
+        // Tamper with the reported work only.
+        let mut tampered = base.clone();
+        tampered.reported_miner_work = vec![("bc1qhonest".to_string(), 9_999_999u128)];
+        assert_ne!(
+            base.signing_message(),
+            tampered.signing_message(),
+            "#606: rewriting a voter's reported work must change the signed digest"
+        );
+
+        // Swapping the payee must also change it.
+        let mut renamed = base.clone();
+        renamed.reported_miner_work = vec![("bc1qattacker".to_string(), 1_000_000u128)];
+        assert_ne!(
+            base.signing_message(),
+            renamed.signing_message(),
+            "#606: rewriting a reported ADDRESS must change the signed digest"
+        );
+
+        // And the node shares.
+        let mut nodes = base.clone();
+        nodes.reported_node_shares = vec![([2u8; 32], 15)];
+        assert_ne!(
+            base.signing_message(),
+            nodes.signing_message(),
+            "#606: rewriting reported node shares must change the signed digest"
+        );
+
+        // Length-prefixing must stop concatenation collisions: [("ab",1)] vs [("a",1),("b",1)]
+        // would hash alike if the fields were simply appended.
+        let mut joined = base.clone();
+        joined.reported_miner_work = vec![("ab".to_string(), 1)];
+        let mut split = base.clone();
+        split.reported_miner_work = vec![("a".to_string(), 1), ("b".to_string(), 1)];
+        assert_ne!(
+            joined.signing_message(),
+            split.signing_message(),
+            "#606: field framing must prevent concatenation collisions"
+        );
+    }
+
+    /// A vote from a node on an OLDER build carries empty reports, and must hash exactly as it did
+    /// before #606 — otherwise every pre-gate signature stops verifying and the fleet loses quorum
+    /// the moment this binary ships, gate dormant or not.
+    #[test]
+    fn an_empty_report_hashes_as_the_old_format_did() {
+        let v = PayoutLedgerCheckpointVoteMessage {
+            height: 900_000,
+            checkpoint_hash: [7u8; 32],
+            voter: [1u8; 32],
+            approve: true,
+            signature: [0u8; 64],
+            timestamp: 1_700_000_000_000,
+            reported_miner_work: Vec::new(),
+            reported_node_shares: Vec::new(),
+        };
+        // The pre-#606 digest, recomputed here exactly as the old implementation did.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"PayoutLedgerCheckpointVote/v1");
+        h.update(900_000u64.to_le_bytes());
+        h.update([7u8; 32]);
+        h.update([1u8]);
+        let old: [u8; 32] = h.finalize().into();
+        assert_eq!(
+            v.signing_message(),
+            old,
+            "an empty report must hash identically to the old format, or pre-gate votes stop verifying"
+        );
+    }
     use super::*;
 
     #[test]
