@@ -460,6 +460,14 @@ pub struct ShareConvergenceResponse {
     pub total_work: f64,
     /// Missing share hashes (shares the requestor doesn't have)
     pub missing_shares: Vec<ShareProof>,
+    /// The responder held MORE missing proofs for this round than fitted in one response.
+    ///
+    /// Without it the requester cannot tell a complete answer from a truncated one, so it treats
+    /// the round as reconciled and never asks again — which is how #558 hid for nine days on the
+    /// ledger lane. `#[serde(default)]` keeps wire-compat: a peer predating this field sends
+    /// `false`, i.e. exactly the old behaviour.
+    #[serde(default)]
+    pub more_available: bool,
 }
 
 // =============================================================================

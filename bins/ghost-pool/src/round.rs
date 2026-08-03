@@ -978,6 +978,50 @@ impl RoundManager {
 
     /// GHOST-03: full signed proofs this node holds for `round_id` that are NOT
     /// in `their_hashes` — i.e. exactly the shares a converging peer is missing.
+    /// Returns `(proofs, more_available)`, bounded by BOTH a count and a serialised-byte budget.
+    ///
+    /// The ledger lane has been bounded since #558; this one was not, and it is the same failure:
+    /// a busy round produced a response past the 1 MB envelope cap, every receiver dropped it at
+    /// `debug!`, and convergence silently never happened. Bounding here rather than at the caller
+    /// means a huge round is never materialised in the first place.
+    ///
+    /// Iteration order of `recent_proofs` is not specified, so which proofs land in a truncated
+    /// response is arbitrary — that is fine, because `more_available` makes the requester come
+    /// back for the rest.
+    pub fn proofs_missing_from_bounded(
+        &self,
+        round_id: RoundId,
+        their_hashes: &std::collections::HashSet<[u8; 32]>,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> (Vec<ShareProof>, bool) {
+        let guard = self.recent_proofs.read();
+        let Some(m) = guard.get(&round_id) else {
+            return (Vec::new(), false);
+        };
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        let mut more = false;
+        for (h, p) in m.iter() {
+            if their_hashes.contains(h) {
+                continue;
+            }
+            if out.len() >= max_count {
+                more = true;
+                break;
+            }
+            let sz = serde_json::to_vec(p).map(|v| v.len()).unwrap_or(0);
+            if bytes + sz > max_bytes && !out.is_empty() {
+                more = true;
+                break;
+            }
+            bytes += sz;
+            out.push(p.clone());
+        }
+        (out, more)
+    }
+
+    /// Unbounded variant, for tests and callers that already know the set is small.
     pub fn proofs_missing_from(
         &self,
         round_id: RoundId,

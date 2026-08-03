@@ -371,15 +371,28 @@ impl ConvergenceHandler {
     /// Answer a peer's request with the full signed proofs they are missing.
     pub fn handle_request(&self, req: &ShareConvergenceMessage) -> ShareConvergenceResponse {
         let theirs: HashSet<[u8; 32]> = req.share_hashes.iter().copied().collect();
-        let missing = self
-            .round_manager
-            .proofs_missing_from(req.round_id, &theirs);
+        // #590: bounded by the same budget as the ledger lane. An unbounded round response
+        // exceeded the 1 MB envelope and was dropped by every receiver at `debug!`.
+        let (missing, more_available) = self.round_manager.proofs_missing_from_bounded(
+            req.round_id,
+            &theirs,
+            MAX_PROOFS_PER_RESPONSE,
+            MAX_PROOF_BYTES_PER_RESPONSE,
+        );
+        if more_available {
+            warn!(
+                round_id = req.round_id,
+                served = missing.len(),
+                "round convergence response truncated — peer must re-request"
+            );
+        }
         let (share_count, total_work) = self.round_manager.round_share_summary(req.round_id);
         ShareConvergenceResponse {
             round_id: req.round_id,
             share_count,
             total_work,
             missing_shares: missing,
+            more_available,
         }
     }
 
@@ -980,6 +993,7 @@ mod tests {
         let mut forged = signed_share(&victim, 2);
         forged.sign(&attacker);
         let resp = ShareConvergenceResponse {
+            more_available: false,
             round_id: 1,
             share_count: 1,
             total_work: 1.0,
@@ -1109,6 +1123,97 @@ mod tests {
                 Err(crate::round::ShareError::WorkValueTooHigh { .. })
             ),
             "claiming work that exceeds the difficulty is still rejected (no inflation)"
+        );
+    }
+
+    /// #590, at the responder. The bound has to be where the wire message is built, not only in
+    /// the query, or a future caller reintroduces the overflow. The ledger lane has been bounded
+    /// since #558; this one was not, so a busy round produced a response past the 1 MB envelope
+    /// cap that every receiver dropped at `debug!` — indistinguishable from "nothing to reconcile".
+    #[test]
+    fn handle_request_itself_respects_the_budget() {
+        let producer = NodeIdentity::generate();
+        let rm = round_manager();
+        for nonce in 0..(MAX_PROOFS_PER_RESPONSE + 50) {
+            rm.handle_share_proof(signed_share(&producer, nonce as u64))
+                .unwrap();
+        }
+        let h = ConvergenceHandler::new(std::sync::Arc::clone(&rm));
+        let resp = h.handle_request(&ShareConvergenceMessage {
+            round_id: 1,
+            share_hashes: vec![],
+            share_count: 0,
+            total_work: 0.0,
+        });
+        assert!(
+            resp.missing_shares.len() <= MAX_PROOFS_PER_RESPONSE,
+            "handle_request must bound the wire response, got {}",
+            resp.missing_shares.len()
+        );
+        assert!(
+            resp.more_available,
+            "a truncated wire response must flag it"
+        );
+    }
+
+    #[test]
+    fn a_busy_round_response_is_bounded_and_says_so() {
+        let producer = NodeIdentity::generate();
+        let rm = round_manager();
+        // Comfortably more proofs than the count cap.
+        for nonce in 0..(MAX_PROOFS_PER_RESPONSE + 50) {
+            let p = signed_share(&producer, nonce as u64);
+            rm.handle_share_proof(p).unwrap();
+        }
+
+        let theirs: HashSet<[u8; 32]> = HashSet::new();
+        let (served, more) = rm.proofs_missing_from_bounded(
+            1,
+            &theirs,
+            MAX_PROOFS_PER_RESPONSE,
+            MAX_PROOF_BYTES_PER_RESPONSE,
+        );
+
+        assert!(
+            served.len() <= MAX_PROOFS_PER_RESPONSE,
+            "response must respect the count cap, served {}",
+            served.len()
+        );
+        let bytes: usize = served
+            .iter()
+            .map(|p| serde_json::to_vec(p).map(|v| v.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            bytes <= MAX_PROOF_BYTES_PER_RESPONSE,
+            "response must respect the byte budget, was {bytes}"
+        );
+        assert!(
+            more,
+            "a truncated response MUST flag more_available, or the requester treats the round as \
+             reconciled and never asks again"
+        );
+    }
+
+    /// The flag must not cry wolf: a response that carried everything says so.
+    #[test]
+    fn a_complete_round_response_does_not_flag_more() {
+        let producer = NodeIdentity::generate();
+        let rm = round_manager();
+        for nonce in 0..3u64 {
+            rm.handle_share_proof(signed_share(&producer, nonce))
+                .unwrap();
+        }
+        let theirs: HashSet<[u8; 32]> = HashSet::new();
+        let (served, more) = rm.proofs_missing_from_bounded(
+            1,
+            &theirs,
+            MAX_PROOFS_PER_RESPONSE,
+            MAX_PROOF_BYTES_PER_RESPONSE,
+        );
+        assert_eq!(served.len(), 3);
+        assert!(
+            !more,
+            "a complete response must not ask the peer to come back"
         );
     }
 
