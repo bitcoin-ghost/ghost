@@ -368,17 +368,37 @@ impl CoinbaseOutput {
             )));
         }
 
-        // Skip prevout hash (32) + index (4) = 36 bytes
+        // Skip prevout hash (32) + index (4) = 36 bytes.
+        //
+        // M-12: every advance past this point is bounds-checked before the slice that follows.
+        // The output loop below always did; this path did not, and `script_len` is an
+        // attacker-supplied varint — so a coinbase claiming more script than it carries walked the
+        // cursor past the end and panicked on the next `&coinbase_bytes[cursor..]`. This parser
+        // runs at block submission, so that panic loses a won block.
         cursor += 36;
+        if cursor >= coinbase_bytes.len() {
+            return Err(CoinbaseVerificationError::ParseError(
+                "Coinbase truncated before the input script length".into(),
+            ));
+        }
 
         // Read script length and skip script
         let (script_len, consumed) = read_varint(&coinbase_bytes[cursor..])
             .ok_or_else(|| CoinbaseVerificationError::ParseError("Invalid script length".into()))?;
         cursor += consumed;
-        cursor += script_len;
+        cursor = cursor.checked_add(script_len).ok_or_else(|| {
+            CoinbaseVerificationError::ParseError("Coinbase input script length overflows".into())
+        })?;
 
         // Skip sequence (4 bytes)
-        cursor += 4;
+        cursor = cursor.checked_add(4).ok_or_else(|| {
+            CoinbaseVerificationError::ParseError("Coinbase cursor overflows at sequence".into())
+        })?;
+        if cursor >= coinbase_bytes.len() {
+            return Err(CoinbaseVerificationError::ParseError(
+                "Coinbase truncated before the output count".into(),
+            ));
+        }
 
         // Now read outputs
         let (output_count, consumed) = read_varint(&coinbase_bytes[cursor..])
@@ -530,6 +550,54 @@ impl CoinbaseVerifier {
 
 #[cfg(test)]
 mod tests {
+
+    /// Audit M-12. The output loop bounds-checks every read; the input path did not. A coinbase
+    /// whose input-script varint claims more bytes than the buffer holds walked the cursor past
+    /// the end, and the next `&coinbase_bytes[cursor..]` panicked.
+    ///
+    /// This parser runs when a block is submitted, so a panic here loses a won block — and the
+    /// bytes come off the wire, so the length is not ours to trust.
+    #[test]
+    fn a_coinbase_claiming_more_script_than_it_has_is_rejected_not_a_panic() {
+        // version(4) + input_count(1) + prevout(36) + script_len varint claiming 0xFF bytes,
+        // then nothing. Padded past the 60-byte floor so it reaches the input path.
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&2u32.to_le_bytes()); // version
+        tx.push(0x01); // input count
+        tx.extend_from_slice(&[0u8; 32]); // prevout hash
+        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // prevout index
+        tx.push(0xFC); // script_len = 252, far more than remains
+        tx.extend_from_slice(&[0u8; 20]); // only 20 bytes of "script"
+        tx.resize(64, 0); // clear the length floor
+
+        let result = CoinbaseOutput::parse_from_coinbase(&tx);
+        assert!(
+            matches!(result, Err(CoinbaseVerificationError::ParseError(_))),
+            "a truncated coinbase must be a parse error, not a panic: {result:?}"
+        );
+    }
+
+    /// The same guard for the varint reads themselves: a cursor already past the end must not
+    /// be sliced.
+    #[test]
+    fn a_coinbase_truncated_after_the_input_script_is_rejected_not_a_panic() {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&2u32.to_le_bytes());
+        tx.push(0x01);
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        tx.push(0x14); // script_len = 20
+        tx.extend_from_slice(&[0u8; 20]); // the script
+                                          // ends here: no sequence, no output count
+        tx.resize(61, 0);
+
+        let result = CoinbaseOutput::parse_from_coinbase(&tx);
+        assert!(
+            result.is_err(),
+            "a coinbase with no output section must error, not panic: {result:?}"
+        );
+    }
+
     use super::*;
     use ghost_common::types::{PayoutEntry, PayoutType};
 
