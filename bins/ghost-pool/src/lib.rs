@@ -29,7 +29,6 @@
 //!
 //! - [`coinbase_verifier`] - Validates coinbase transactions against approved payouts
 //! - [`payout`] - Payout proposal creation and BFT consensus integration
-//! - [`payout_validator`] - Validates payout proposals against economic rules
 //! - [`registry`] - Load balancer registration and health reporting
 //! - [`reorg`] - Chain reorganization detection and handling
 //! - [`round`] - Mining round management and share tracking
@@ -58,9 +57,6 @@ pub mod payout;
 /// Payout-ledger checkpoint finalisation (BFT-agreed snapshot the coinbase is a
 /// pure function of).
 pub mod payout_checkpoint;
-
-/// Economic validation of payout proposals.
-pub mod payout_validator;
 
 /// Load balancer registration and node discovery.
 pub mod registry;

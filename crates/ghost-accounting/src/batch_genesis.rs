@@ -320,7 +320,10 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert_eq!(root, "e0c6ee483e18fa65d5a6b17b626515a38415863969441feba8d58e6a943fa9e4");
+        assert_eq!(
+            root,
+            "e0c6ee483e18fa65d5a6b17b626515a38415863969441feba8d58e6a943fa9e4"
+        );
     }
 
     /// An empty checkpoint is a cold start, not a panic.
