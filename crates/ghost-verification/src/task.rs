@@ -58,6 +58,14 @@ pub struct VerificationTaskConfig {
     /// `u64::MAX` (dormant → legacy random selection). Set from
     /// `ghost_pool::challenger_assignment_height()`.
     pub assignment_gate_height: u64,
+    /// #605: block height at/above which Public Mining is proved by a real stratum handshake
+    /// performed BY THE CHALLENGER, instead of the target self-reporting over HTTP.
+    ///
+    /// `u64::MAX` (the default) means the legacy self-attestation stands, so a node that never sets
+    /// this behaves exactly as before.
+    pub stratum_proof_gate_height: u64,
+    /// Stratum port the challenger dials for that handshake. 3333 is the fleet's SV1 port.
+    pub stratum_proof_port: u16,
 }
 
 impl Default for VerificationTaskConfig {
@@ -73,6 +81,8 @@ impl Default for VerificationTaskConfig {
             stratum_timeout: Duration::from_secs(5),
             // A-2b: dormant by default; legacy random selection until set + gate armed.
             assignment_gate_height: u64::MAX,
+            stratum_proof_gate_height: u64::MAX,
+            stratum_proof_port: 3333,
         }
     }
 }
@@ -819,6 +829,22 @@ impl VerificationTask {
     /// Below it, legacy random selection stands.
     pub fn with_assignment_gate(mut self, height: u64) -> Self {
         self.config.assignment_gate_height = height;
+        self
+    }
+
+    /// #605: set the height at/above which Public Mining requires a challenger-performed stratum
+    /// handshake (from `ghost_pool::stratum_handshake_proof_height()`).
+    ///
+    /// Below it, the legacy check stands: an HTTP GET asking the target whether it serves miners,
+    /// with the verdict taken from `resp.success && resp.connected` — both self-reported. That is
+    /// why 3 of the 15 node-reward shares were earned on an assertion.
+    ///
+    /// Gated because it changes what QUALIFIES a node for payout. If some nodes required proof while
+    /// others accepted the assertion, they would compute different qualified sets and the payout
+    /// split would diverge — so the whole fleet must carry this before the height.
+    pub fn with_stratum_proof_gate(mut self, height: u64, port: u16) -> Self {
+        self.config.stratum_proof_gate_height = height;
+        self.config.stratum_proof_port = port;
         self
     }
 
@@ -1624,19 +1650,49 @@ impl VerificationTask {
 
         let short_id = &peer_id_hex[..8];
 
+        // #605: at/above the gate, PROVE Public Mining by completing a real `mining.subscribe`
+        // instead of merely opening a TCP connection.
+        //
+        // The legacy probe is a bare connect, so `nc -l 3333` passes it and earns +3 of the 15
+        // node-reward shares. Speaking the protocol is the difference between "a port is open" and
+        // "a miner can actually mine here".
+        //
+        // Gated on height because it changes what QUALIFIES a node for payout: if some nodes
+        // demanded proof while others accepted a connect, they would compute different qualified
+        // sets and the payout split would diverge. The whole fleet must carry this before the height.
+        let use_handshake = match self.rpc.as_ref() {
+            Some(rpc) => match rpc.get_block_count().await {
+                Ok(tip) => tip >= self.config.stratum_proof_gate_height,
+                // Cannot read the tip — stay on the legacy probe. Guessing the gate is active would
+                // make this node disagree with the fleet about the rule in force.
+                Err(_) => false,
+            },
+            None => false,
+        };
+        let port = if use_handshake {
+            self.config.stratum_proof_port
+        } else {
+            SV1_STRATUM_PORT
+        };
+
         let challenge_data = serde_json::json!({
             "protocol": "sv1",
-            "probe": "independent_tcp_connect",
-            "port": SV1_STRATUM_PORT,
+            "probe": if use_handshake { "independent_stratum_handshake" } else { "independent_tcp_connect" },
+            "port": port,
         })
         .to_string();
 
-        // Independent reachability probe by THIS challenger.
+        // Independent probe by THIS challenger — never the target's own account of itself.
         let start = std::time::Instant::now();
-        let probe = self
-            .client
-            .probe_stratum_port(&peer.http_address, SV1_STRATUM_PORT)
-            .await;
+        let probe = if use_handshake {
+            self.client
+                .probe_stratum_handshake(&peer.http_address, port)
+                .await
+        } else {
+            self.client
+                .probe_stratum_port(&peer.http_address, port)
+                .await
+        };
         let latency_ms = Some(start.elapsed().as_millis() as u32);
 
         let (passed, connected) = match probe {
@@ -2099,6 +2155,26 @@ impl VerificationTask {
 
 #[cfg(test)]
 mod tests {
+
+    /// #605: the stratum-proof gate must default to DORMANT.
+    ///
+    /// A node that never calls `with_stratum_proof_gate` has to keep the legacy connect test, or a
+    /// build that simply forgot to wire the gate would start demanding proof while its peers did not
+    /// — different qualified sets, diverging node-reward split. Defaulting to `u64::MAX` makes
+    /// forgetting safe rather than dangerous.
+    #[test]
+    fn stratum_proof_gate_defaults_dormant_and_is_settable() {
+        let cfg = VerificationTaskConfig::default();
+        assert_eq!(
+            cfg.stratum_proof_gate_height,
+            u64::MAX,
+            "#605: an unwired gate must never activate on its own"
+        );
+        assert_eq!(
+            cfg.stratum_proof_port, 3333,
+            "the fleet's SV1 stratum port is the default target"
+        );
+    }
     use super::*;
 
     fn test_signing_fn(message: &[u8]) -> [u8; 64] {

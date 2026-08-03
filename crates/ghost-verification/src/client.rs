@@ -610,6 +610,64 @@ impl VerificationClient {
         }
     }
 
+    /// Prove Public Mining by completing a handshake, rather than by asking the target (#605).
+    ///
+    /// The live Public Mining check (`verify_stratum`) is an HTTP GET to the target that trusts
+    /// `resp.success && resp.connected` — **both self-reported by the node being challenged**. The
+    /// challenger never touches the target's stratum port, so a node with no stratum port at all
+    /// passes by answering its own HTTP endpoint truthfully-shaped but falsely. That is 3 of the 15
+    /// node-reward shares earned on an assertion.
+    ///
+    /// `probe_stratum_port` was no better and, despite being what #605 blames, is not even in the
+    /// live path — its only callers are its own tests. A bare TCP connect is passed by `nc -l 3333`.
+    ///
+    /// This connects and speaks the protocol: `StratumVerifier::verify_sv1` sends a real
+    /// `mining.subscribe` and requires a well-formed reply. Something listening but not speaking
+    /// stratum now FAILS, which is the whole point.
+    ///
+    /// Returns, deliberately three-valued:
+    ///
+    /// - `Some(true)` — connected AND a valid `mining.subscribe` reply. Proven.
+    /// - `Some(false)` — reachable but did not speak stratum, or refused. A genuine failure.
+    /// - `None` — INCONCLUSIVE: the target host could not even be determined, which is a
+    ///   challenger-side condition. Never recorded as a failure, because punishing an honest node
+    ///   for the challenger's own DNS problem is worse than missing a dishonest one.
+    ///
+    /// A timeout after a successful connect is `Some(false)`, not `None`: something accepted the
+    /// connection and then failed to speak, which is exactly the `nc -l` case.
+    pub async fn probe_stratum_handshake(&self, node_address: &str, port: u16) -> Option<bool> {
+        let host = match Self::extract_host_part(node_address) {
+            Some(h) => h,
+            None => {
+                debug!(
+                    address = %node_address,
+                    "Stratum handshake: cannot determine target host (inconclusive, not a failure)"
+                );
+                return None;
+            }
+        };
+
+        let verifier = crate::handlers::StratumVerifier::new().with_timeout(self.config.timeout);
+        match verifier.verify_sv1(host, port).await {
+            Ok(r) => {
+                let proven = r.connected && r.valid_protocol;
+                debug!(
+                    host = %host, port,
+                    connected = r.connected,
+                    valid_protocol = r.valid_protocol,
+                    "Stratum handshake result"
+                );
+                Some(proven)
+            }
+            // Connect refused, write/read failure, closed connection, or a timeout after
+            // connecting. All of these mean the node is not serving miners at that port.
+            Err(e) => {
+                debug!(host = %host, port, error = %e, "Stratum handshake FAILED");
+                Some(false)
+            }
+        }
+    }
+
     /// Get health status of a node
     pub async fn health(&self, node_address: &str) -> GhostResult<HealthResponse> {
         let url = self.build_url(node_address, "/health?unsigned=true")?;
@@ -1411,6 +1469,100 @@ mod tests {
         // Empty -> None (inconclusive)
         assert_eq!(VerificationClient::extract_host_part(""), None);
         assert_eq!(VerificationClient::extract_host_part("   "), None);
+    }
+
+    /// THE #605 CASE: a socket that accepts and says nothing must FAIL.
+    ///
+    /// `nc -l 3333` passes both the bare TCP connect and — because the live check just asks the
+    /// target — the current Public Mining challenge. Completing a real `mining.subscribe` is what
+    /// separates "a port is open" from "a miner can actually mine here".
+    #[tokio::test]
+    async fn stratum_handshake_fails_a_socket_that_accepts_and_stays_silent() {
+        use tokio::net::TcpListener;
+
+        let client = VerificationClient::new().unwrap();
+
+        // A listener that accepts and never speaks — the `nc -l` impostor.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept and hold, replying with nothing at all.
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                drop(stream);
+            }
+        });
+
+        assert_eq!(
+            client.probe_stratum_handshake("127.0.0.1", port).await,
+            Some(false),
+            "#605: a socket that accepts but never speaks stratum must FAIL, not pass"
+        );
+    }
+
+    /// THE test that exercises the PROTOCOL requirement — a socket that replies with rubbish.
+    ///
+    /// Added because the silent-socket test above does NOT cover this: a silent peer makes
+    /// `verify_sv1` return `Err` (read timeout), so the error branch decides and
+    /// `valid_protocol` is never consulted. Removing `&& r.valid_protocol` left that test passing —
+    /// caught by mutation check, and the same shape as the H-13 tests that passed while production
+    /// rejected every share.
+    ///
+    /// A peer that ANSWERS gives `Ok(connected: true, valid_protocol: false)` for anything that is
+    /// not a well-formed `mining.subscribe` reply, which is the only path through the boolean.
+    #[tokio::test]
+    async fn stratum_handshake_fails_a_socket_that_replies_with_rubbish() {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        let client = VerificationClient::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Answers promptly, but it is not stratum. An HTTP server, a debug echo, anything.
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\n\r\nnot stratum\n")
+                    .await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+
+        assert_eq!(
+            client.probe_stratum_handshake("127.0.0.1", port).await,
+            Some(false),
+            "#605: connecting is not proof — the reply must be a valid mining.subscribe response"
+        );
+    }
+
+    /// A closed port is a definite failure, not inconclusive.
+    #[tokio::test]
+    async fn stratum_handshake_fails_a_refused_port() {
+        use tokio::net::TcpListener;
+        let client = VerificationClient::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // now refused
+
+        assert_eq!(
+            client.probe_stratum_handshake("127.0.0.1", port).await,
+            Some(false),
+            "a refused port means no miner can connect — a real failure"
+        );
+    }
+
+    /// An undeterminable host is the CHALLENGER's problem and must never be recorded as the
+    /// target's failure. Punishing an honest node for our own resolution failure is worse than
+    /// missing a dishonest one.
+    #[tokio::test]
+    async fn stratum_handshake_is_inconclusive_when_the_host_is_unknown() {
+        let client = VerificationClient::new().unwrap();
+        assert_eq!(
+            client.probe_stratum_handshake("", 3333).await,
+            None,
+            "an empty address is inconclusive, never a failure"
+        );
     }
 
     #[tokio::test]
