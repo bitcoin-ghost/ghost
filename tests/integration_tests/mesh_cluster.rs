@@ -239,6 +239,8 @@ impl TestMeshCluster {
             share_count: 1,
             total_work: proof.work,
             missing_shares: vec![proof],
+            // This helper hands over the single proof it was given and nothing is held back.
+            more_available: false,
         };
         handler.apply_response(&resp)
     }
