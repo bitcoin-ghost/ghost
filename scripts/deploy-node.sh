@@ -155,6 +155,42 @@ ssh_host_for() {
     ssh -G "$1" 2>/dev/null | awk '/^hostname /{print $2; exit}'
 }
 
+# Count shares this node took from its OWN miners since a unix timestamp.
+#
+# `miner_id like '%.%'` is the discriminator: a locally-submitted share carries a plaintext
+# `address.worker`, whereas one that arrived by gossip carries a 16-hex hash, because peers only
+# ever see the hashed form. Without that filter a node with no miners still counts its peers'
+# traffic and every throughput check passes vacuously.
+local_shares_since() {
+    timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$1" \
+        "sudo -u ghost sqlite3 /home/ghost/.ghost/ghost.db \
+         \"select count(*) from shares where timestamp > $2 and miner_id like '%.%';\"" \
+        2>/dev/null | tr -cd '0-9'
+}
+
+# The throughput verdict, as a function rather than inline, so the gate self-test can drive it.
+#
+# Extracted deliberately. The H-13 fix that motivated all of this had two tests that passed while
+# production was broken, because both re-implemented the transformation under test instead of
+# calling it. A verdict buried inside the deploy path is the same shape of untestable: the only
+# way to exercise it would be to break production again.
+#
+# 0 = regressed (roll back), 1 = fine or not measurable.
+throughput_regressed() {
+    local baseline="${1:-}" post="${2:-}"
+    # No traffic before the swap: nothing to lose, and nothing to conclude.
+    [ -n "$baseline" ] || return 1
+    [ "$baseline" -gt 0 ] 2>/dev/null || return 1
+    # An unreadable count is not a zero. Tested explicitly because `[ "" -eq 0 ]` is TRUE in bash
+    # — the empty string evaluates to 0 in arithmetic context — so the obvious spelling of this
+    # guard treats a failed ssh or sqlite read as an outage and rolls back a healthy binary. The
+    # gate self-test caught exactly that.
+    [ -n "$post" ] || return 1
+    # Traffic before, none after: work is arriving and not being credited.
+    [ "$post" -eq 0 ] 2>/dev/null && return 0
+    return 1
+}
+
 # 4. Canary soak before production. The bugs that hurt were behavioural and only showed
 #    under real traffic over time — an hourly livelock, and attribution that looked fine
 #    until a share was actually mined and its DB row inspected.
@@ -226,6 +262,28 @@ fi
 BIN_PATH="$REPO_ROOT/target/release/$BINARY"
 [ -f "$BIN_PATH" ] || die "$BIN_PATH not built"
 
+# Baseline: was this node taking shares from its own miners BEFORE the swap?
+#
+# This is the measurement the post-deploy check below compares against, and it has to be taken
+# now, because after a rollback the traffic returns and the evidence of the outage is gone.
+#
+# It exists because of the H-13 outage. A PoW check with the operands in the wrong byte order
+# rejected every locally-submitted share on all eight nodes for ~30 minutes. Throughout, every
+# signal this script looked at was green: the unit was active, the port was listening, /health
+# answered, there were no restarts and no error lines. Miners stayed CONNECTED and their work
+# was silently discarded. Nothing in the deploy path measured whether work was still being
+# credited, so nothing objected.
+BASELINE_WINDOW="${BASELINE_WINDOW:-300}"
+BASELINE_FROM=$(( $(date +%s) - BASELINE_WINDOW ))
+BASELINE_SHARES=$(local_shares_since "$NODE" "$BASELINE_FROM" || true)
+if [ "${BASELINE_SHARES:-0}" -gt 0 ] 2>/dev/null; then
+    info "baseline: $BASELINE_SHARES local shares in the last $((BASELINE_WINDOW / 60))m — throughput WILL be re-checked after the swap"
+elif [ -z "$BASELINE_SHARES" ]; then
+    info "baseline: could NOT be read from $NODE — throughput will not be re-checked"
+else
+    info "baseline: NO local shares in the last $((BASELINE_WINDOW / 60))m — throughput cannot be re-checked on this node"
+fi
+
 # ---------------------------------------------------------------- deploy
 
 SUDO='$(command -v sudo >/dev/null && echo sudo || echo)'
@@ -286,6 +344,7 @@ case "$BINARY" in
   translator_sv2)  SERVICE=sri-translator ;;
 esac
 
+SWAP_EPOCH=$(date +%s)
 timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "S=$SUDO; \$S systemctl restart $SERVICE" || exit 2
 
 # Wait for the service to be SERVING, not merely started.
@@ -348,6 +407,43 @@ if [ -z "${ROLLBACK:-}" ] && [ "$BINARY" != "ghost-pool" ]; then
     done
     if [ "$SMOKE_OK" != "yes" ]; then
         echo "SMOKE TEST FAILED after 3 attempts — rolling back" >&2
+        ROLLBACK=1
+    fi
+fi
+
+# Did work start being CREDITED again?
+#
+# This is the check the H-13 outage walked straight through, and it applies to all three binaries
+# — every one of them sits on the share path. `ghost-pool` in particular had no functional
+# verification at all before this: the smoke test above is explicitly skipped for it, so a
+# ghost-pool deploy was judged solely on "unit active" and "port listening", neither of which
+# moves when shares are accepted and then thrown away.
+#
+# Only gates when the baseline proved there was traffic to lose. A node with no miners cannot
+# fail this, and must not be able to pass it either — silence there means "not measured", which
+# is stated rather than assumed.
+#
+# The settle delay is not politeness. ghost-pool bypasses its own PoW height gate while
+# `current_height` is still 0, for roughly 90s after every restart, so a sample taken inside that
+# window can show shares flowing through a check that is not yet running. 180s clears it.
+if [ -z "${ROLLBACK:-}" ] && [ "$BASELINE_SHARES" -gt 0 ] 2>/dev/null; then
+    SETTLE="${SETTLE:-180}"
+    info "waiting ${SETTLE}s for the PoW height gate to establish, then re-checking throughput"
+    sleep "$SETTLE"
+
+    # NOT coerced to 0. sqlite3 `count(*)` always answers with a number, so an empty string means
+    # the read itself failed — a different thing from "no shares", and one that must not roll back
+    # a healthy binary. `select count(*)` returning "0" is the only genuine zero.
+    POST_SHARES=$(local_shares_since "$NODE" "$SWAP_EPOCH" || true)
+    if [ -z "$POST_SHARES" ]; then
+        info "WARNING: could not read the share count from $NODE — throughput NOT verified"
+    fi
+    if ! throughput_regressed "$BASELINE_SHARES" "$POST_SHARES"; then
+        info "throughput OK: $POST_SHARES local shares credited since the swap (baseline $BASELINE_SHARES/$((BASELINE_WINDOW / 60))m)"
+    else
+        echo "NO LOCAL SHARES CREDITED in ${SETTLE}s after the swap, but $BASELINE_SHARES arrived in the" >&2
+        echo "  $((BASELINE_WINDOW / 60))m before it. Miners are connected and their work is being discarded." >&2
+        echo "  This is the H-13 signature. Rolling back." >&2
         ROLLBACK=1
     fi
 fi

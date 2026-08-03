@@ -175,9 +175,48 @@ else
     fail=$((fail+1))
 fi
 
+# ---------------------------------------------------------------------------
+# 8. The post-deploy throughput verdict.
+#
+#    This is the check the H-13 outage went straight through: a PoW check with its operands in
+#    the wrong byte order rejected every locally-submitted share on all eight nodes for ~30
+#    minutes, while the unit stayed active, the port stayed open, /health answered, and no
+#    error line was logged. Miners remained CONNECTED and their work was discarded.
+#
+#    Driven by sourcing the verdict function out of the real script, so this tests the code that
+#    runs rather than a copy of it — the failure mode that let two H-13 tests pass green against
+#    broken production.
+# ---------------------------------------------------------------------------
+eval "$(sed -n '/^throughput_regressed()/,/^}/p' "$DEPLOY")"
+
+verdict_case() {  # label baseline post want_regressed
+    local label="$1" baseline="$2" post="$3" want="$4" got=no
+    throughput_regressed "$baseline" "$post" && got=yes
+    if [ "$got" = "$want" ]; then
+        printf "  [ok ] %s\n" "$label"
+        pass=$((pass+1))
+    else
+        printf "  [BAD] %s (wanted regressed=%s, got %s)\n" "$label" "$want" "$got"
+        fail=$((fail+1))
+    fi
+}
+
+# The outage itself: traffic before, silence after. Nothing else in the deploy path sees this.
+verdict_case "traffic before the swap and none after -> ROLL BACK" 52 0 yes
+verdict_case "traffic before and after -> proceed"                 52 47 no
+# A single share is enough to prove the path is credited; this must not gate on a rate.
+verdict_case "one share after a busy baseline -> proceed"          52 1 no
+# A canary with no miners must not be able to PASS this either — silence there is "not measured".
+verdict_case "no baseline, no post -> not measurable, proceed"      0 0 no
+verdict_case "no baseline but shares appear -> proceed"             0 9 no
+# The count comes off a remote sqlite3 through ssh; an empty or failed read must not read as an
+# outage and trigger a spurious rollback of a healthy binary.
+verdict_case "unreadable baseline -> not measurable, proceed"      "" "" no
+verdict_case "unreadable post with a real baseline -> proceed"     52 "" no
+
 echo
 if [ "$fail" -ne 0 ]; then
     echo "*** $fail of $((pass+fail)) deploy-gate checks FAILED — the gate is not refusing what it must ***"
     exit 1
 fi
-echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short, and submission-path-broken soaks."
+echo "All $pass deploy-gate checks passed: the gate refuses untested, unsoaked, wrong-binary, short,\n  and submission-path-broken soaks, and rolls back a deploy that stops crediting work."
