@@ -642,15 +642,23 @@ impl std::error::Error for NonceError {}
 /// 3. Nonces expire after a configurable TTL
 /// 4. Memory usage is bounded by MAX_NONCE_CACHE_SIZE
 pub struct NonceCache {
-    /// Nonces that have been issued but not yet used
-    /// Maps nonce string -> timestamp when issued (seconds since epoch)
-    issued: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
+    /// Nonces that have been issued but not yet used.
+    ///
+    /// Maps nonce string -> the MONOTONIC instant it was issued. Deliberately `Instant`, not epoch
+    /// seconds: `Instant` cannot be adjusted, so no clock change can widen a nonce's validity
+    /// window (#615). It was `u64` epoch seconds, and a backwards adjustment of `d` seconds extended
+    /// every live nonce by `d` — the replay window this cache exists to close, held open from
+    /// outside. Nothing here is persisted or transmitted, so `Instant` costs no compatibility.
+    issued: parking_lot::RwLock<std::collections::HashMap<String, std::time::Instant>>,
     /// Nonces that have been used (for preventing replay)
-    /// Maps nonce string -> timestamp when used (seconds since epoch)
-    /// Used nonces are kept for TTL duration after use to prevent replay attacks
-    used: parking_lot::RwLock<std::collections::HashMap<String, u64>>,
-    /// TTL in seconds for nonces
-    ttl_secs: u64,
+    ///
+    /// Maps nonce string -> the monotonic instant it was used. Used nonces are kept for the TTL
+    /// after use to prevent replay.
+    used: parking_lot::RwLock<std::collections::HashMap<String, std::time::Instant>>,
+    /// TTL for nonces. Held as a `Duration` so expiry is a duration comparison rather than
+    /// second-granularity integer arithmetic, which let a nonce issued late in a second live up to
+    /// `TTL + 1` seconds.
+    ttl: std::time::Duration,
     /// Maximum cache size
     max_size: usize,
 }
@@ -666,7 +674,7 @@ impl NonceCache {
         Self {
             issued: parking_lot::RwLock::new(std::collections::HashMap::new()),
             used: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            ttl_secs,
+            ttl: std::time::Duration::from_secs(ttl_secs),
             max_size: MAX_NONCE_CACHE_SIZE,
         }
     }
@@ -692,12 +700,7 @@ impl NonceCache {
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = hex::encode(nonce_bytes);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        issued.insert(nonce.clone(), now);
+        issued.insert(nonce.clone(), std::time::Instant::now());
         Ok(nonce)
     }
 
@@ -706,10 +709,7 @@ impl NonceCache {
     /// Returns Ok(()) if the nonce is valid and has not been used before.
     /// The nonce is marked as used and cannot be reused.
     pub fn validate_and_consume(&self, nonce: &str) -> Result<(), NonceError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = std::time::Instant::now();
 
         // Check if already used
         {
@@ -728,8 +728,8 @@ impl NonceCache {
             }
         };
 
-        // Check expiry
-        if now > issued_at + self.ttl_secs {
+        // Check expiry against MONOTONIC elapsed time (#615).
+        if now.saturating_duration_since(issued_at) > self.ttl {
             return Err(NonceError::Expired);
         }
 
@@ -748,10 +748,7 @@ impl NonceCache {
 
     /// Check if a nonce is valid without consuming it
     pub fn is_valid(&self, nonce: &str) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = std::time::Instant::now();
 
         // Check if used
         {
@@ -764,9 +761,19 @@ impl NonceCache {
         // Check if issued and not expired
         let issued = self.issued.read();
         match issued.get(nonce) {
-            Some(&ts) => now <= ts + self.ttl_secs,
+            Some(&ts) => now.saturating_duration_since(ts) <= self.ttl,
             None => false,
         }
+    }
+
+    /// Test-only: age a nonce by rewriting its issue instant, so expiry can be tested without
+    /// sleeping. Saturates at the process start instant rather than panicking on underflow.
+    #[cfg(test)]
+    fn age_nonce_for_test(&self, nonce: &str, age: std::time::Duration) {
+        let aged = std::time::Instant::now()
+            .checked_sub(age)
+            .unwrap_or_else(std::time::Instant::now);
+        self.issued.write().insert(nonce.to_string(), aged);
     }
 
     /// Clean up expired nonces
@@ -788,19 +795,14 @@ impl NonceCache {
     /// Since step 1 happens before step 3, expired nonces are rejected before
     /// we even check the used set, making their removal from the used set safe.
     pub fn cleanup(&self) -> usize {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let cutoff = now.saturating_sub(self.ttl_secs);
+        let now = std::time::Instant::now();
         let mut removed = 0;
 
         // Clean up expired issued nonces
         {
             let mut issued = self.issued.write();
             let before = issued.len();
-            issued.retain(|_, &mut ts| ts > cutoff);
+            issued.retain(|_, &mut ts| now.saturating_duration_since(ts) <= self.ttl);
             removed += before - issued.len();
         }
 
@@ -809,7 +811,7 @@ impl NonceCache {
         {
             let mut used = self.used.write();
             let before = used.len();
-            used.retain(|_, &mut used_at| used_at > cutoff);
+            used.retain(|_, &mut used_at| now.saturating_duration_since(used_at) <= self.ttl);
             removed += before - used.len();
         }
 
@@ -1052,6 +1054,53 @@ mod tests {
         assert_eq!(result, Err(NonceError::Unknown));
     }
 
+    /// #615: a nonce must not outlive its TTL, and the TTL must be measured in monotonic time.
+    ///
+    /// The bug this replaced was demonstrated with a test that recorded an issue time in the FUTURE —
+    /// standing in for "issued while the host clock was ahead, then stepped back by NTP or a resume".
+    /// Against the old epoch-seconds implementation a 2-second nonce stayed valid for a full hour,
+    /// because `now <= ts + ttl` held until the clock caught up. That is the replay window this cache
+    /// exists to close, held open from outside it.
+    ///
+    /// That test cannot be written against the fix: `Instant` is monotonic, so an issue instant in the
+    /// future is not constructible from `Instant::now()`, and no clock adjustment moves it. The
+    /// property is now structural rather than asserted, which is the stronger of the two. What is left
+    /// to test is the boundary itself.
+    #[test]
+    #[serial]
+    fn nonce_expires_exactly_at_its_ttl() {
+        let cache = NonceCache::with_ttl(2);
+
+        let fresh = cache.generate_nonce().unwrap();
+        assert!(
+            cache.is_valid(&fresh),
+            "a freshly issued nonce must be valid"
+        );
+
+        // Just inside the window must still be valid — else the fix would expire live nonces, which
+        // breaks every honest challenge-response cycle.
+        let inside = cache.generate_nonce().unwrap();
+        cache.age_nonce_for_test(&inside, std::time::Duration::from_millis(1_900));
+        assert!(
+            cache.is_valid(&inside),
+            "1.9s into a 2s TTL must still be valid"
+        );
+
+        // Just outside must not be. Sub-second granularity matters here: the old integer-seconds
+        // arithmetic let a nonce issued late in a second live up to TTL + 1 seconds.
+        let outside = cache.generate_nonce().unwrap();
+        cache.age_nonce_for_test(&outside, std::time::Duration::from_millis(2_100));
+        assert!(
+            !cache.is_valid(&outside),
+            "2.1s into a 2s TTL must be expired"
+        );
+        assert_eq!(
+            cache.validate_and_consume(&outside),
+            Err(NonceError::Expired),
+            "and consuming it must be refused as expired, not accepted"
+        );
+    }
+
     #[test]
     #[serial]
     fn test_nonce_cache_cleanup() {
@@ -1065,16 +1114,8 @@ mod tests {
         let nonce = cache.generate_nonce().unwrap();
         assert!(cache.is_valid(&nonce), "a fresh nonce must be valid");
 
-        {
-            let mut issued = cache.issued.write();
-            let ts = issued
-                .get(&nonce)
-                .copied()
-                .expect("the nonce we just generated must be in the issued set");
-            // One second past the TTL: the boundary is `now <= ts + ttl`, so ts - (ttl + 1) is the
-            // first value that must be refused.
-            issued.insert(nonce.clone(), ts - (cache.ttl_secs + 1));
-        }
+        // One second past the TTL, via the monotonic clock (#615).
+        cache.age_nonce_for_test(&nonce, cache.ttl + std::time::Duration::from_secs(1));
 
         assert!(
             !cache.is_valid(&nonce),
