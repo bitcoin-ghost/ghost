@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -33,7 +33,7 @@ use crate::message::{
     L2CheckpointBlockMessage, L2CheckpointVoteMessage, L2ConfidentialTransferMessage, L2EpochSync,
     L2NoteGapRequest, L2NoteGapResponse, L2Transaction, L2TransferBroadcastMessage,
     L2TransferConfirmationMessage, L2TreeSyncRequest, L2TreeSyncResponse, MessageEnvelope,
-    MessageType, ShieldCommitment,
+    MessageType, ShieldCommitment, TreeSyncServeReport,
 };
 use crate::vote_handler::BroadcastFn;
 
@@ -58,6 +58,18 @@ const MAX_SYNC_CHECKPOINTS: usize = 100;
 
 /// Min interval between sync requests from same peer (seconds)
 const SYNC_REQUEST_COOLDOWN_SECS: u64 = 60;
+
+/// How long a checkpoint gap stays retired after a peer reports its payload pruned.
+///
+/// Not permanent, and deliberately not persisted. Pruning keys on `created_at`, not height, and
+/// a re-synced row gets a fresh `created_at` — so payload availability is not monotonic and a
+/// gap that no peer can serve today may be servable later. Retiring it for a while stops the
+/// endless re-request; expiring the verdict means a wrong one costs six hours, not forever.
+const UNFILLABLE_GAP_RETRY_SECS: u64 = 6 * 60 * 60;
+
+/// How many interior gaps to consider before falling back to the tip. Bounds both the SQL scan
+/// and how far a run of retired gaps can be skipped in one round.
+const MAX_GAP_CANDIDATES: u64 = 32;
 
 /// Signing function type (matches NodeIdentity.sign() signature)
 pub type SignFn = Arc<dyn Fn(&[u8]) -> [u8; 64] + Send + Sync>;
@@ -193,6 +205,14 @@ pub struct NullifierRouteHandler {
     /// Client-side cooldown: last time we sent a tree sync request.
     /// Prevents spamming peers (who rate-limit at 60s) with redundant requests.
     last_sync_request_sent: RwLock<Option<Instant>>,
+    /// Checkpoint gaps a peer has told us it cannot serve: `gap_start -> retry_after`.
+    ///
+    /// A gap whose payload was pruned is re-derived by `lowest_l2_checkpoint_gap` on every
+    /// round, so without this the node asks for the same unfillable height forever and never
+    /// looks at the gaps above it — vm1 sat on height 269433 indefinitely (#621). In memory
+    /// only: a restart re-learns the verdict within one cooldown round, and no wrong verdict
+    /// can outlive the process.
+    unfillable_gaps: RwLock<HashMap<u64, Instant>>,
     /// Cached proposal for the current height. Reused on repeated proposal cycles to ensure
     /// hash stability — without this, any tree mutation between cycles would change the hash
     /// and reset peer vote state, preventing BFT quorum.
@@ -235,6 +255,7 @@ impl NullifierRouteHandler {
             global_msg_rate: RwLock::new((Instant::now(), 0)),
             sync_requests: RwLock::new(HashMap::new()),
             last_sync_request_sent: RwLock::new(None),
+            unfillable_gaps: RwLock::new(HashMap::new()),
             cached_proposal: RwLock::new(None),
             finalize_fn: RwLock::new(None),
             metrics: RwLock::new(None),
@@ -1564,22 +1585,53 @@ impl NullifierRouteHandler {
             .db
             .get_l2_checkpoints_from_height(request.from_height, MAX_SYNC_CHECKPOINTS as u64)?;
 
-        // Deserialize checkpoint blocks from stored data
+        // Deserialize checkpoint blocks from stored data.
+        //
+        // Three different outcomes used to collapse into an empty batch, and the reason was
+        // discarded here: no rows at all (the peer is behind — ask someone else), rows whose
+        // payload the retention sweep blanked (permanently unfillable), and rows whose payload
+        // failed to deserialize (corruption, skipped in total silence by an `if let Ok`).
+        // Count them and send the counts back: only this side knows why it served nothing (#621).
         let mut checkpoint_blocks = Vec::new();
         let mut has_more = false;
+        let mut rows_pruned = 0u64;
+        let mut rows_corrupt = 0u64;
+        let mut pruned_from: Option<u64> = None;
+        let mut pruned_through: Option<u64> = None;
+        let mut rows_examined = 0u64;
         for record in &checkpoints {
             if checkpoint_blocks.len() >= MAX_SYNC_CHECKPOINTS {
                 has_more = true;
                 break;
             }
-            if !record.block_data.is_empty() {
-                if let Ok(block) =
-                    serde_json::from_slice::<L2CheckpointBlockMessage>(&record.block_data)
-                {
-                    checkpoint_blocks.push(block);
+            rows_examined += 1;
+            if record.block_data.is_empty() {
+                rows_pruned += 1;
+                pruned_from =
+                    Some(pruned_from.map_or(record.height, |h: u64| h.min(record.height)));
+                pruned_through =
+                    Some(pruned_through.map_or(record.height, |h: u64| h.max(record.height)));
+                continue;
+            }
+            match serde_json::from_slice::<L2CheckpointBlockMessage>(&record.block_data) {
+                Ok(block) => checkpoint_blocks.push(block),
+                Err(e) => {
+                    rows_corrupt += 1;
+                    warn!(
+                        height = record.height,
+                        error = %e,
+                        "Tree sync: stored checkpoint payload failed to deserialize — skipping"
+                    );
                 }
             }
         }
+        let serve_report = TreeSyncServeReport {
+            rows_found: rows_examined,
+            rows_pruned,
+            rows_corrupt,
+            pruned_from,
+            pruned_through,
+        };
 
         // Attach the parent epoch record for every epoch referenced by the
         // checkpoints being sent. The requesting node upserts these BEFORE
@@ -1632,6 +1684,8 @@ impl NullifierRouteHandler {
             commitment_root: canonical_root,
             epochs,
             has_more,
+            served_from_height: request.from_height,
+            serve_report: Some(serve_report),
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
         };
 
@@ -1639,6 +1693,9 @@ impl NullifierRouteHandler {
             peer = %hex::encode(&request.requesting_node[..8]),
             from_height = request.from_height,
             checkpoints_sent = response.checkpoints.len(),
+            rows_found = rows_examined,
+            rows_pruned,
+            rows_corrupt,
             "Responded to tree sync request"
         );
 
@@ -1673,7 +1730,32 @@ impl NullifierRouteHandler {
         }
 
         if response.checkpoints.is_empty() {
-            debug!("Empty tree sync response, nothing to replay");
+            // An empty batch has three causes and they are not interchangeable: the peer has no
+            // rows there (it is behind — someone else may have them), the rows exist but their
+            // payloads were pruned by the 90-day sweep (nobody will ever serve them), or they
+            // failed to deserialize. Until the responder started saying which, all three read as
+            // "nothing to replay" and the gap was re-requested forever (#621).
+            if let Some(report) = &response.serve_report {
+                if report.rows_pruned > 0 && report.pruned_from == Some(response.served_from_height)
+                {
+                    self.retire_unfillable_gap(
+                        response.served_from_height,
+                        &response.responding_node,
+                        report.pruned_through,
+                    );
+                } else {
+                    debug!(
+                        from_height = response.served_from_height,
+                        rows_found = report.rows_found,
+                        rows_pruned = report.rows_pruned,
+                        rows_corrupt = report.rows_corrupt,
+                        peer = %hex::encode(&response.responding_node[..8]),
+                        "Empty tree sync response — peer served nothing for the requested height"
+                    );
+                }
+            } else {
+                debug!("Empty tree sync response from a peer that reports no reason — nothing to replay");
+            }
             // Even with no checkpoints to replay, check root convergence.
             // This catches the case where notes were lost (e.g., SIGKILL) but
             // checkpoint records survived — the node is at the right height
@@ -1755,6 +1837,7 @@ impl NullifierRouteHandler {
 
         // Replay checkpoint blocks in order
         let mut last_applied_root: Option<[u8; 32]> = None;
+        let mut applied = 0usize;
         for block in &response.checkpoints {
             let height = block.height;
 
@@ -1844,6 +1927,7 @@ impl NullifierRouteHandler {
             }
 
             last_applied_root = Some(canonical_root);
+            applied += 1;
         }
 
         // Update checkpoint base root to the last checkpoint we actually applied
@@ -1894,14 +1978,57 @@ impl NullifierRouteHandler {
                     info!("Sent note gap request to peers");
                 }
             }
+        } else if applied > 0 {
+            info!(applied, "Tree sync complete — root matches peer");
         } else {
-            info!("Tree sync complete — root matches peer");
+            // The roots agree because the TIP agrees. That was already true before this round
+            // and says nothing about the holes below it — logging "complete" here is how #535
+            // stayed invisible while the canaries sat on thousands of frozen interior gaps.
+            info!(
+                received = response.checkpoints.len(),
+                from_height = response.served_from_height,
+                "Tree sync applied nothing — every checkpoint in the batch was deferred"
+            );
         }
 
         // Update last checkpoint time
         *self.last_checkpoint_time.write() = Instant::now();
 
         Ok(())
+    }
+
+    /// Gap starts currently retired as unfillable, dropping any whose retry time has passed.
+    ///
+    /// Expiring here rather than on a timer keeps the map bounded by the number of gaps ever
+    /// reported dead, and means a stale verdict costs one round after it expires.
+    fn retired_gaps(&self) -> HashSet<u64> {
+        let mut retired = self.unfillable_gaps.write();
+        let now = Instant::now();
+        retired.retain(|_, retry_after| *retry_after > now);
+        retired.keys().copied().collect()
+    }
+
+    /// Record that a peer cannot serve `gap_start` because the payload was pruned there.
+    ///
+    /// Only a pruned row AT the height we asked for proves that height unfillable: the responder
+    /// serves everything from `from_height` upward, so pruned rows further up say nothing about
+    /// the gap itself.
+    fn retire_unfillable_gap(&self, gap_start: u64, peer: &NodeId, pruned_through: Option<u64>) {
+        let retry_after = Instant::now() + Duration::from_secs(UNFILLABLE_GAP_RETRY_SECS);
+        let first_time = self
+            .unfillable_gaps
+            .write()
+            .insert(gap_start, retry_after)
+            .is_none();
+        if first_time {
+            warn!(
+                gap_start,
+                pruned_through,
+                peer = %hex::encode(&peer[..8]),
+                retry_secs = UNFILLABLE_GAP_RETRY_SECS,
+                "L2 checkpoint gap cannot be filled — peer holds the row but its payload was pruned"
+            );
+        }
     }
 
     /// Request tree sync from peers (called on startup or when behind).
@@ -1942,16 +2069,40 @@ impl NullifierRouteHandler {
         // Serving `from_height` walks forward from there, so requesting the gap start pulls the
         // missing run. Taking the LOWEST gap each time makes repeated calls walk the range
         // forward deterministically instead of re-requesting the same window.
+        //
+        // Skip gaps a peer has told us it cannot serve. Taking only the lowest gap wedges the
+        // node the moment that gap is unfillable: the payload was pruned, so the request can
+        // never succeed, and the same height is re-derived every round while every fillable gap
+        // above it goes unasked. vm1 asked for height 269433 forever and never advanced (#621).
         let tip_height = self.epoch_manager.current_height();
-        let from_height = match self.db.lowest_l2_checkpoint_gap() {
-            Ok(Some((gap_start, gap_end))) => {
-                info!(
-                    gap_start,
-                    gap_end, tip_height, "L2 tree sync targeting an interior checkpoint gap"
-                );
-                gap_start
+        let from_height = match self.db.lowest_l2_checkpoint_gaps(MAX_GAP_CANDIDATES) {
+            Ok(gaps) if !gaps.is_empty() => {
+                let retired = self.retired_gaps();
+                match gaps.iter().position(|(start, _)| !retired.contains(start)) {
+                    Some(idx) => {
+                        let (gap_start, gap_end) = gaps[idx];
+                        info!(
+                            gap_start,
+                            gap_end,
+                            tip_height,
+                            skipped_unfillable = idx,
+                            "L2 tree sync targeting an interior checkpoint gap"
+                        );
+                        gap_start
+                    }
+                    None => {
+                        // Every candidate gap is retired. Sync the tip instead of re-asking for
+                        // a hole no peer can fill; the retirements expire, so this is not final.
+                        debug!(
+                            candidates = gaps.len(),
+                            tip_height,
+                            "all candidate checkpoint gaps are retired as unfillable — syncing tip"
+                        );
+                        tip_height
+                    }
+                }
             }
-            Ok(None) => tip_height,
+            Ok(_) => tip_height,
             Err(e) => {
                 // Never let a gap-query failure stop the tip from syncing.
                 warn!(error = %e, "could not check for interior checkpoint gaps — syncing tip");
@@ -2861,6 +3012,297 @@ mod tests {
         );
     }
 
+    /// Seed a ledger whose only holes are 11..=13 and 16..=19, and record every tree sync
+    /// request the handler broadcasts.
+    fn setup_with_two_gaps() -> (NullifierRouteHandler, Arc<RwLock<Vec<u64>>>) {
+        let (db, _epoch_mgr, handler) = setup();
+
+        db.upsert_l2_epoch(&ghost_storage::L2EpochRecord {
+            epoch: 0,
+            start_height: 0,
+            end_height: None,
+            initial_root: [0u8; 32],
+            final_root: None,
+            notes_migrated: 0,
+            status: "active".to_string(),
+        })
+        .expect("seed epoch");
+        for height in [10u64, 14, 15, 20] {
+            db.upsert_l2_checkpoint(&ghost_storage::L2CheckpointRecord {
+                height,
+                epoch: 0,
+                commitment_root: [0u8; 32],
+                tx_count: 0,
+                proposer_id: "p".to_string(),
+                active_node_count: 1,
+                // Blanked by the 90-day retention sweep, exactly as on the fleet.
+                block_data: Vec::new(),
+            })
+            .expect("seed checkpoint");
+        }
+
+        let asked: Arc<RwLock<Vec<u64>>> = Arc::new(RwLock::new(Vec::new()));
+        let sink = asked.clone();
+        handler.set_broadcast_fn(Arc::new(move |_ty, payload| {
+            if let Ok(req) = serde_json::from_slice::<L2TreeSyncRequest>(&payload) {
+                sink.write().push(req.from_height);
+            }
+            Ok(())
+        }));
+
+        (handler, asked)
+    }
+
+    /// An empty batch must say WHY it is empty.
+    ///
+    /// The responder skipped rows with no `block_data` and — silently, via `if let Ok(..)` —
+    /// rows that failed to deserialize, so "I have no rows there", "the payload was pruned and
+    /// nobody will ever have it" and "the payload is corrupt" all reached the requester as the
+    /// same `checkpoints_sent=0` (#621).
+    #[test]
+    fn tree_sync_request_reports_why_it_served_nothing() {
+        let (db, _epoch_mgr, handler) = setup();
+
+        db.upsert_l2_epoch(&ghost_storage::L2EpochRecord {
+            epoch: 0,
+            start_height: 0,
+            end_height: None,
+            initial_root: [0u8; 32],
+            final_root: None,
+            notes_migrated: 0,
+            status: "active".to_string(),
+        })
+        .expect("seed epoch");
+        for height in [500u64, 501, 502] {
+            db.upsert_l2_checkpoint(&ghost_storage::L2CheckpointRecord {
+                height,
+                epoch: 0,
+                commitment_root: [0u8; 32],
+                tx_count: 0,
+                proposer_id: "p".to_string(),
+                active_node_count: 1,
+                block_data: Vec::new(), // pruned by retention
+            })
+            .expect("seed pruned checkpoint");
+        }
+        // One row that is present and NOT deserializable — a different failure that used to
+        // be indistinguishable from the pruned ones.
+        db.upsert_l2_checkpoint(&ghost_storage::L2CheckpointRecord {
+            height: 503,
+            epoch: 0,
+            commitment_root: [0u8; 32],
+            tx_count: 0,
+            proposer_id: "p".to_string(),
+            active_node_count: 1,
+            block_data: b"not a checkpoint".to_vec(),
+        })
+        .expect("seed corrupt checkpoint");
+
+        let response = handler
+            .handle_tree_sync_request(&L2TreeSyncRequest {
+                requesting_node: [0x42; 32],
+                from_height: 500,
+                timestamp: 0,
+            })
+            .unwrap()
+            .expect("a first request is answered");
+
+        assert!(
+            response.checkpoints.is_empty(),
+            "nothing is replayable, so nothing may be sent"
+        );
+        assert_eq!(
+            response.served_from_height, 500,
+            "the answer must name the height it answers, or the requester cannot match it"
+        );
+        let report = response
+            .serve_report
+            .expect("an upgraded responder always reports");
+        assert_eq!(report.rows_found, 4, "all four rows were examined");
+        assert_eq!(report.rows_pruned, 3, "three had their payload pruned");
+        assert_eq!(report.rows_corrupt, 1, "one failed to deserialize");
+        assert_eq!(
+            (report.pruned_from, report.pruned_through),
+            (Some(500), Some(502)),
+            "the pruned range must be named — only a pruned row AT the asked height retires it"
+        );
+
+        // A window with nothing at all in it is a different answer: the peer is behind, and
+        // saying "pruned" there would retire a gap somebody else can still serve.
+        let empty = handler
+            .handle_tree_sync_request(&L2TreeSyncRequest {
+                requesting_node: [0x43; 32],
+                from_height: 9_000,
+                timestamp: 0,
+            })
+            .unwrap()
+            .expect("a first request from this peer is answered");
+        let empty_report = empty.serve_report.expect("still reports");
+        assert_eq!(
+            (empty_report.rows_found, empty_report.rows_pruned),
+            (0, 0),
+            "no rows found is not the same claim as rows found pruned"
+        );
+        assert_eq!(empty_report.pruned_from, None);
+    }
+
+    /// The wedge itself: a gap that can never be filled must not be asked for forever.
+    ///
+    /// vm1 was missing one checkpoint (269433) whose payload the retention sweep had blanked
+    /// fleet-wide. `lowest_l2_checkpoint_gap` re-derived it every round, so the node asked the
+    /// same unfillable question indefinitely and never looked at the gaps above it — stuck at
+    /// L2 epoch height 743426 with 86 identical log lines in 90 minutes (#621).
+    #[test]
+    fn an_unfillable_gap_is_retired_and_the_next_gap_is_asked_for() {
+        let (handler, asked) = setup_with_two_gaps();
+
+        assert!(
+            handler.request_tree_sync().unwrap(),
+            "first request is sent"
+        );
+        assert_eq!(
+            asked.read().as_slice(),
+            &[11],
+            "the lowest interior gap is asked for first"
+        );
+
+        // Pruned rows ABOVE the height we asked for say nothing about the gap itself — the
+        // responder serves everything from `from_height` upward. Retiring on those would blind
+        // the node to a gap the fleet can still fill.
+        handler
+            .handle_tree_sync_response(&L2TreeSyncResponse {
+                responding_node: [0x77; 32],
+                requesting_node: Some(handler.our_id),
+                checkpoints: vec![],
+                current_epoch: 0,
+                commitment_root: [0u8; 32],
+                epochs: vec![],
+                has_more: false,
+                served_from_height: 11,
+                serve_report: Some(TreeSyncServeReport {
+                    rows_found: 4,
+                    rows_pruned: 2,
+                    rows_corrupt: 0,
+                    pruned_from: Some(30),
+                    pruned_through: Some(31),
+                }),
+                timestamp: 0,
+            })
+            .expect("a report about higher rows is not an error");
+        *handler.last_sync_request_sent.write() = None;
+        assert!(handler.request_tree_sync().unwrap());
+        assert_eq!(
+            asked.read().as_slice(),
+            &[11, 11],
+            "a pruned range above the requested height must not retire the requested gap"
+        );
+
+        // The peer holds the rows and their payloads are gone.
+        handler
+            .handle_tree_sync_response(&L2TreeSyncResponse {
+                responding_node: [0x77; 32],
+                requesting_node: Some(handler.our_id),
+                checkpoints: vec![],
+                current_epoch: 0,
+                commitment_root: [0u8; 32],
+                epochs: vec![],
+                has_more: false,
+                served_from_height: 11,
+                serve_report: Some(TreeSyncServeReport {
+                    rows_found: 3,
+                    rows_pruned: 3,
+                    rows_corrupt: 0,
+                    pruned_from: Some(11),
+                    pruned_through: Some(13),
+                }),
+                timestamp: 0,
+            })
+            .expect("an unfillable answer is not an error");
+
+        // Clear only the client-side cooldown — the gap verdict must be what changes the target.
+        *handler.last_sync_request_sent.write() = None;
+        assert!(
+            handler.request_tree_sync().unwrap(),
+            "second request is sent"
+        );
+        assert_eq!(
+            asked.read().as_slice(),
+            &[11, 11, 16],
+            "the retired gap must be skipped and the NEXT gap asked for instead"
+        );
+
+        // ...and it stays skipped, rather than being re-derived on the following round.
+        *handler.last_sync_request_sent.write() = None;
+        assert!(
+            handler.request_tree_sync().unwrap(),
+            "third request is sent"
+        );
+        assert_eq!(
+            asked.read().as_slice(),
+            &[11, 11, 16, 16],
+            "a retired gap must not come back while its retirement holds"
+        );
+    }
+
+    /// Only an explicit report may retire a gap.
+    ///
+    /// A peer that predates the field sends no report, and "I cannot tell you why" must never
+    /// be read as "the payload is pruned" — that would let one un-upgraded peer blind this node
+    /// to a gap the rest of the fleet can still serve. Same mixed-version ordering as #517.
+    #[test]
+    fn a_response_without_a_serve_report_retires_nothing() {
+        let (handler, asked) = setup_with_two_gaps();
+
+        assert!(handler.request_tree_sync().unwrap());
+        assert_eq!(asked.read().as_slice(), &[11]);
+
+        // Two shapes must both retire nothing: the wire bytes an older peer sends (neither
+        // field present), and a response that names the height but gives no reason — which is
+        // what a buggy or hostile peer would send to point the verdict at a specific gap.
+        let unaddressed = format!(
+            r#"{{"responding_node":"{}","requesting_node":"{}","checkpoints":[],
+                 "current_epoch":0,"commitment_root":"{}","epochs":[],"has_more":false,
+                 "timestamp":0}}"#,
+            hex::encode([0x77u8; 32]),
+            hex::encode(handler.our_id),
+            hex::encode([0u8; 32]),
+        );
+        let names_the_height = unaddressed.replace(
+            r#""timestamp":0"#,
+            r#""served_from_height":11,"timestamp":0"#,
+        );
+
+        for (label, json) in [
+            ("no fields at all", &unaddressed),
+            ("height but no reason", &names_the_height),
+        ] {
+            let legacy: L2TreeSyncResponse =
+                serde_json::from_str(json).expect("a legacy response must still deserialize");
+            assert!(
+                legacy.serve_report.is_none(),
+                "{label}: no reason is supplied"
+            );
+
+            handler
+                .handle_tree_sync_response(&legacy)
+                .expect("a legacy response must still be processed");
+
+            *handler.last_sync_request_sent.write() = None;
+            assert!(handler.request_tree_sync().unwrap());
+            assert_eq!(
+                asked.read().last().copied(),
+                Some(11),
+                "{label}: with no reason given, the gap must still be asked for"
+            );
+        }
+
+        assert_eq!(
+            asked.read().as_slice(),
+            &[11, 11, 11],
+            "every round must re-ask the only gap nobody has ruled out"
+        );
+    }
+
     #[test]
     fn test_tree_sync_request_rate_limiting() {
         let (_db, _epoch_mgr, handler) = setup();
@@ -3253,6 +3695,8 @@ mod tests {
             commitment_root: block.new_commitment_root,
             epochs: vec![epoch5.clone()],
             has_more: false,
+            served_from_height: 550,
+            serve_report: None,
             timestamp: 0,
         };
         // Must NOT return a FK-violation error (that is the bug being fixed).
@@ -3297,6 +3741,8 @@ mod tests {
             commitment_root: block.new_commitment_root,
             epochs: vec![epoch5.clone()],
             has_more: false,
+            served_from_height: 550,
+            serve_report: None,
             timestamp: 0,
         };
         handler_other
@@ -3356,6 +3802,8 @@ mod tests {
             commitment_root: block.new_commitment_root,
             epochs: vec![], // peer predating the `epochs` field
             has_more: false,
+            served_from_height: 550,
+            serve_report: None,
             timestamp: 0,
         };
         // No FK-violation error surfaces (returns Ok), so the mesh logs no

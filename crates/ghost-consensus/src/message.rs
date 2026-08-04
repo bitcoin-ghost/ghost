@@ -1507,8 +1507,52 @@ pub struct L2TreeSyncResponse {
     pub epochs: Vec<L2EpochSync>,
     /// Whether there are more checkpoints to sync
     pub has_more: bool,
+    /// The `from_height` of the request this answers.
+    ///
+    /// Responses are broadcast and several peers answer the same question, so without the echo
+    /// the requester cannot tell WHICH gap an answer is about — and therefore cannot tell that
+    /// the gap it asked for came back unserved. `#[serde(default)]` keeps wire-compat; a peer
+    /// predating this field reports 0.
+    #[serde(default)]
+    pub served_from_height: u64,
+    /// Why the responder sent what it sent.
+    ///
+    /// Only the SERVER knows why a batch came back empty, and until this field it threw that
+    /// away: "no rows at all" (peer is behind — ask someone else), "rows present but their
+    /// payload was pruned" (permanently unfillable) and "payload failed to deserialize"
+    /// (corruption) all collapsed into `checkpoints_sent=0`. A node missing one pruned
+    /// checkpoint re-derived the same gap and re-asked for it forever (#621).
+    ///
+    /// `None` means the peer predates the field and MUST NOT be read as "nothing wrong" —
+    /// only an explicit report may retire a gap.
+    #[serde(default)]
+    pub serve_report: Option<TreeSyncServeReport>,
     /// Timestamp
     pub timestamp: u64,
+}
+
+/// What the responder found at and above the requested height, and what it did with it.
+///
+/// Counts, not a verdict: the requester decides what an empty answer means. Serving is
+/// bounded by `MAX_SYNC_CHECKPOINTS`, so every count describes the batch that was examined,
+/// not the responder's whole ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeSyncServeReport {
+    /// Rows at or above the requested height that were examined, before any filtering.
+    pub rows_found: u64,
+    /// Rows whose `block_data` was empty. Checkpoint payloads are blanked by the 90-day
+    /// retention sweep (`prune_old_l2_checkpoints`), so these heights can never be served
+    /// by this peer again — the row survives, the block to replay it does not.
+    pub rows_pruned: u64,
+    /// Rows whose `block_data` was present but failed to deserialize. Distinct from pruned:
+    /// this is corruption, and it used to be skipped in silence.
+    pub rows_corrupt: u64,
+    /// Lowest height whose payload was pruned in this batch, if any. The requester compares
+    /// this against what it asked for: only a pruned row AT the requested height proves that
+    /// height unfillable.
+    pub pruned_from: Option<u64>,
+    /// Highest height whose payload was pruned in this batch, if any.
+    pub pruned_through: Option<u64>,
 }
 
 /// L2: Epoch metadata carried inside a tree-sync response.
