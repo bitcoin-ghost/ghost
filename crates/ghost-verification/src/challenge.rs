@@ -100,6 +100,14 @@ pub struct TxData {
     pub input_count: usize,
     /// Number of outputs
     pub output_count: usize,
+    /// Bitcoin merkle proof that this transaction is in `block_hash`, hex-serialised `MerkleBlock`
+    /// (#605). Produced by Core's `gettxoutproof`, so it follows Bitcoin's rules — double SHA-256 and
+    /// the last hash of an odd level duplicated.
+    ///
+    /// `#[serde(default)]` so a responder that predates this field still deserialises. Verification is
+    /// gated, and the gate cannot arm until the whole fleet ships this.
+    #[serde(default)]
+    pub txout_proof: Option<String>,
 }
 
 /// C-2 FIX: Validate an archive response against expected ground-truth values.
@@ -1047,22 +1055,31 @@ mod tests {
     #[test]
     #[serial]
     fn test_nonce_cache_cleanup() {
-        // Use TTL of 2 seconds and wait well past expiry.
-        // Timestamps are second-granularity so a nonce issued late in a second
-        // can survive up to (TTL + 1) wall-clock seconds. 5s sleep gives 2s margin.
+        // Age the nonce by rewriting its issue timestamp instead of sleeping. The old version slept
+        // 5s against a 2s TTL and still failed roughly one run in seven, because expiry compares
+        // wall-clock `SystemTime`: any backwards clock adjustment during the sleep (WSL2 does this
+        // on resume and after NTP correction) leaves the nonce inside its window. Injecting the
+        // timestamp tests the expiry rule itself, and runs 5 seconds faster.
         let cache = NonceCache::with_ttl(2);
 
-        // Generate a nonce
         let nonce = cache.generate_nonce().unwrap();
+        assert!(cache.is_valid(&nonce), "a fresh nonce must be valid");
 
-        // Verify it's valid initially
-        assert!(cache.is_valid(&nonce));
+        {
+            let mut issued = cache.issued.write();
+            let ts = issued
+                .get(&nonce)
+                .copied()
+                .expect("the nonce we just generated must be in the issued set");
+            // One second past the TTL: the boundary is `now <= ts + ttl`, so ts - (ttl + 1) is the
+            // first value that must be refused.
+            issued.insert(nonce.clone(), ts - (cache.ttl_secs + 1));
+        }
 
-        // Wait for expiry
-        std::thread::sleep(std::time::Duration::from_secs(5));
-
-        // Should be expired
-        assert!(!cache.is_valid(&nonce));
+        assert!(
+            !cache.is_valid(&nonce),
+            "a nonce past its TTL must not be valid"
+        );
         assert_eq!(cache.validate_and_consume(&nonce), Err(NonceError::Expired));
     }
 
