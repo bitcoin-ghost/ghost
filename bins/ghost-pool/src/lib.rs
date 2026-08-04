@@ -29,7 +29,6 @@
 //!
 //! - [`coinbase_verifier`] - Validates coinbase transactions against approved payouts
 //! - [`payout`] - Payout proposal creation and BFT consensus integration
-//! - [`registry`] - Load balancer registration and health reporting
 //! - [`reorg`] - Chain reorganization detection and handling
 //! - [`round`] - Mining round management and share tracking
 //! - [`rpc`] - JSON-RPC request parsing for Stratum protocol
