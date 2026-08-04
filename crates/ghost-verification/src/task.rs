@@ -1369,6 +1369,27 @@ impl VerificationTask {
                             validation_result = (false, format!("archive tx check failed: {why}"));
                         }
                     }
+
+                    // #605 increment 2: metadata matching alone proves only that the target knows six
+                    // fields about the transaction — which a pruned node can learn from any indexer, or
+                    // from the challenger's own broadcast of an earlier verdict. The merkle proof is what
+                    // makes this a CAPABILITY check: only a node holding the block can produce a branch
+                    // from that txid up to that header's merkle root.
+                    //
+                    // Requires our own expected root. Without it there is nothing to bind against, so we
+                    // stay at metadata level rather than fail a peer for our own missing data.
+                    if validation_result.0 {
+                        if let Some(want_root) = expected_merkle_root.as_deref() {
+                            let proof =
+                                resp.tx_data.as_ref().and_then(|t| t.txout_proof.as_deref());
+                            if let Err(why) =
+                                Self::archive_merkle_binds(proof, &exp.txid, want_root)
+                            {
+                                validation_result =
+                                    (false, format!("archive merkle check failed: {why}"));
+                            }
+                        }
+                    }
                 }
 
                 let response_json = serde_json::json!({
@@ -1467,6 +1488,66 @@ impl VerificationTask {
             input_count: tx.get("vin")?.as_array()?.len(),
             output_count: tx.get("vout")?.as_array()?.len(),
         })
+    }
+
+    /// Does the target's merkle proof cryptographically bind that txid to that block? (#605)
+    ///
+    /// The metadata check next door proves the target agrees with OUR view. This proves the answer is
+    /// bound to the block itself, so agreement is not merely a coincidence of two nodes reading the
+    /// same source.
+    ///
+    /// Uses `bitcoin::MerkleBlock`, which implements Bitcoin's real rules — double SHA-256 and the last
+    /// hash of an odd level duplicated. Ghost's own `verify_merkle_proof` in `ghost-reconciliation` is a
+    /// DIFFERENT construction (single SHA-256, odd nodes carried forward, a domain tag and leaf count in
+    /// the root) and would fail on every block; an earlier design note in #605 wrongly said to reuse it.
+    ///
+    /// BYTE ORDER: `expected_merkle_root` arrives from RPC as a display-order hex string, which is
+    /// REVERSED relative to the bytes in the header. `TxMerkleNode`/`Txid` compare in internal order, so
+    /// the hex is parsed via `FromStr` — which handles the reversal — rather than `hex::decode`. Getting
+    /// this wrong is H-13 again: that outage was a display-vs-internal comparison that looked right.
+    ///
+    /// Returns Ok(()) only if the proof parses, its root equals the root we independently fetched, and
+    /// the txid it commits to is the one we asked about.
+    pub(crate) fn archive_merkle_binds(
+        txout_proof_hex: Option<&str>,
+        expected_txid: &str,
+        expected_merkle_root: &str,
+    ) -> Result<(), String> {
+        use bitcoin::consensus::encode::deserialize;
+        use bitcoin::{MerkleBlock, Txid};
+        use std::str::FromStr;
+
+        let hex_proof = txout_proof_hex.ok_or_else(|| "no txout_proof in response".to_string())?;
+        let raw = hex::decode(hex_proof).map_err(|e| format!("txout_proof is not hex: {e}"))?;
+        let mb: MerkleBlock =
+            deserialize(&raw).map_err(|e| format!("txout_proof is not a MerkleBlock: {e}"))?;
+
+        // Display-order hex in, internal order out. FromStr does the reversal; hex::decode would not.
+        let want_root = bitcoin::TxMerkleNode::from_str(expected_merkle_root)
+            .map_err(|e| format!("expected merkle root is not a hash: {e}"))?;
+        let want_txid = Txid::from_str(expected_txid)
+            .map_err(|e| format!("expected txid is not a hash: {e}"))?;
+
+        // The proof must be for the block we asked about, judged by the root WE fetched — not by
+        // anything the target told us about which block this is.
+        if mb.header.merkle_root != want_root {
+            return Err(format!(
+                "proof commits to merkle root {} but the block we asked about has {}",
+                mb.header.merkle_root, want_root
+            ));
+        }
+
+        let mut matches: Vec<Txid> = Vec::new();
+        let mut indexes: Vec<u32> = Vec::new();
+        mb.extract_matches(&mut matches, &mut indexes)
+            .map_err(|e| format!("merkle proof does not verify against its own root: {e:?}"))?;
+
+        if !matches.contains(&want_txid) {
+            return Err(format!(
+                "proof verifies but commits to {matches:?}, not the requested {want_txid}"
+            ));
+        }
+        Ok(())
     }
 
     /// Does the target's `TxData` match what OUR node says about that transaction? (#605)
@@ -2310,6 +2391,75 @@ impl VerificationTask {
 #[cfg(test)]
 mod tests {
 
+    // A REAL Bitcoin merkle proof, taken from mainnet block 960900 (2,642 transactions) via
+    // `gettxoutproof`. Deliberately not hand-built: a fabricated fixture tests my understanding of
+    // Bitcoin's merkle rules rather than the code, which is precisely how two H-13 tests passed while
+    // production rejected every share. A real 2,642-leaf proof also exercises the odd-level duplication
+    // that a two-leaf toy example never would.
+    const REAL_TXID: &str = "58b417953ab212585c33b47a894ecc246e23cd6d217e67d4793b09822a522e03";
+    const REAL_ROOT: &str = "ac9b29dbdd1f1ea1ac996f7e3a9b325edca44bfc19b46b813f634fec8a760d04";
+    const REAL_PROOF: &str = "002007258ee850af4a5726919ed0c971a642ddf4ddbd9c2624de01000000000000000000040d768aec4f633f816bb419fc4ba4dc5e329b3a7e6f99aca11e1fdddb299bac62ea706ad43a0217be98c693520a00000d6b76df65932b81799d93c32002e86575c157d13ac4c309cc471ac94b0af8fcc6032e522a82093b79d4677e216dcd236e24cc4e897ab4335c5812b23a9517b45809b9e0d30ad09715351823d410ac8bcd402746bc987df44f2cc638ff4a0138500e5e88118c1e56aba6d3d1152e6c460854bf610063f889b33f3ebc9b1f89630aa173ef1f1f8c864e944021f264a38d2bcb3e7ed57ff6aa80ac91231197f099d23d15fc8a3e88d21b921f6735cf2325bba0b316a9b5f76c319c523f7d044abfdb6e7e368c949e5436530c671fae33e0165ba9b01fdedcd0148709d3a14414ac12aca4d0bece8eb6536c71c870ddbdf0cf6491d667169a09f45f3574f96167cf509e0945592a9efa6a346837afd3839deb2fc3bd0ee572bfe7c0aecfb90d027bab560a3ca1bde4203532462b19c0121fe88c65d2a53f359e47419197e6d907957adfe34ff37702d506c9e57dabb8ac6527e5b807073ccbb0c4e90dcd94221c8ed2a2d3e4a8e27cdf0359e8c661c98bb75b9a2d4666a18b13ff76588fcc57c361d32318f8284c1c0e8a623bb4a046dff7b5a5bcaf7445cd39901127bc32a8a6618004ff2f0000";
+
+    /// An honest node's real proof must VERIFY. The positive case first, because a check that rejects
+    /// everything would strip +5 from every archive node — worse than the hole it closes.
+    #[test]
+    fn archive_merkle_accepts_a_real_mainnet_proof() {
+        VerificationTask::archive_merkle_binds(Some(REAL_PROOF), REAL_TXID, REAL_ROOT)
+            .expect("a real gettxoutproof for the requested txid must verify");
+    }
+
+    /// No proof at all must fail — that is the header-only responder, and the population #605 exists
+    /// to exclude.
+    #[test]
+    fn archive_merkle_rejects_a_missing_proof() {
+        let err = VerificationTask::archive_merkle_binds(None, REAL_TXID, REAL_ROOT).unwrap_err();
+        assert!(err.contains("no txout_proof"), "got: {err}");
+    }
+
+    /// THE binding property: a proof that verifies against its OWN root must still be rejected when
+    /// that root is not the block we asked about.
+    ///
+    /// Without this check a node could answer every archive challenge with one proof it happens to
+    /// hold, forever — verifying perfectly and proving nothing about the block requested.
+    #[test]
+    fn archive_merkle_rejects_a_proof_for_a_different_block() {
+        let other_root = "00000000000000000000000000000000000000000000000000000000deadbeef";
+        let err = VerificationTask::archive_merkle_binds(Some(REAL_PROOF), REAL_TXID, other_root)
+            .unwrap_err();
+        assert!(
+            err.contains("merkle root"),
+            "must reject on root mismatch, got: {err}"
+        );
+    }
+
+    /// A valid proof for the WRONG transaction must fail. The proof verifies; it just does not commit
+    /// to what was asked.
+    #[test]
+    fn archive_merkle_rejects_a_proof_for_a_different_transaction() {
+        let other_txid = "1111111111111111111111111111111111111111111111111111111111111111";
+        let err = VerificationTask::archive_merkle_binds(Some(REAL_PROOF), other_txid, REAL_ROOT)
+            .unwrap_err();
+        assert!(
+            err.contains("not the requested"),
+            "must reject on txid mismatch, got: {err}"
+        );
+    }
+
+    /// Garbage must be refused as garbage, not panic and not silently pass.
+    #[test]
+    fn archive_merkle_rejects_malformed_input() {
+        assert!(
+            VerificationTask::archive_merkle_binds(Some("nothex!!"), REAL_TXID, REAL_ROOT)
+                .unwrap_err()
+                .contains("not hex")
+        );
+        assert!(
+            VerificationTask::archive_merkle_binds(Some("deadbeef"), REAL_TXID, REAL_ROOT)
+                .unwrap_err()
+                .contains("not a MerkleBlock")
+        );
+    }
+
     fn expected_tx() -> ExpectedTx {
         ExpectedTx {
             txid: "aa".repeat(32),
@@ -2329,6 +2479,9 @@ mod tests {
             size: e.size,
             input_count: e.input_count,
             output_count: e.output_count,
+            // The metadata tests do not exercise merkle binding; that has its own tests driven by a
+            // real mainnet proof.
+            txout_proof: None,
         }
     }
 

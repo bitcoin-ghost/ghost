@@ -1050,6 +1050,23 @@ impl BitcoinRpc {
             .await
     }
 
+    /// Merkle proof that `txid` is in `block_hash`, as a hex-serialised `MerkleBlock` (#605).
+    ///
+    /// This is Bitcoin Core's own `gettxoutproof`, which means the proof follows Bitcoin's merkle
+    /// rules — double SHA-256, and the last hash of an odd level duplicated. Ghost's own
+    /// `verify_merkle_proof` in `ghost-reconciliation` is a DIFFERENT construction (single SHA-256, odd
+    /// nodes carried forward, a domain tag and leaf count folded into the root) and cannot check a
+    /// Bitcoin root. Verify the output of this with `bitcoin::MerkleBlock`, not with that.
+    ///
+    /// Naming `block_hash` matters: without it Core searches for the transaction, which needs
+    /// `-txindex` and can find it in a different block after a reorg. The archive challenge asks about
+    /// a SPECIFIC block, so the proof must be for that block or it answers a different question.
+    pub async fn get_tx_out_proof(&self, txid: &str, block_hash: &str) -> GhostResult<String> {
+        // Core returns a bare JSON string, so ask for one directly rather than a Value.
+        self.call("gettxoutproof", vec![json!([txid]), json!(block_hash)])
+            .await
+    }
+
     /// Get wallet transaction (for transactions in the wallet, does not require -txindex)
     pub async fn get_transaction(&self, txid: &str) -> GhostResult<Value> {
         self.call("gettransaction", vec![json!(txid), json!(true)])

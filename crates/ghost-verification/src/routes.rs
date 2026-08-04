@@ -14718,34 +14718,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conf = dir.path().join("bitcoin.conf");
         std::fs::write(&conf, "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n").unwrap();
-        // 40 is under any plausible memory ceiling — but only a host that can MEASURE its
-        // memory accepts it unforced. macOS has no /proc/meminfo, so there the handler
-        // correctly refuses rather than claiming a value is survivable that it cannot check.
-        // Assert the real behaviour on each platform instead of assuming Linux: this test
-        // failed CI on macOS when it assumed.
-        let measurable = crate::maxconnections::mem_available_mb().is_some();
+        // Only a host that can MEASURE its memory accepts a value unforced. macOS has no
+        // /proc/meminfo, so there the handler correctly refuses rather than claiming a value is
+        // survivable that it cannot check. Assert the real behaviour on each platform instead of
+        // assuming Linux: this test failed CI on macOS when it assumed.
+        //
+        // The value is derived from the ACTUAL ceiling, never hardcoded. A fixed 40 made this test
+        // fail roughly one run in seven: `recommended_max` reads MemAvailable at the instant of the
+        // call, and under parallel cargo test this host drops below 672MB, at which point the
+        // ceiling falls under 40 and the handler refuses — correctly. The test was asserting a
+        // property of the machine, not of the code.
+        let ceiling =
+            crate::maxconnections::recommended_max(crate::maxconnections::mem_available_mb());
+        let value = ceiling.map(|c| c.min(40)).unwrap_or(40);
         let resp = super::apply_maxconnections_update(
             &conf,
             MaxConnectionsUpdate {
-                value: 40,
-                force: !measurable,
+                value,
+                force: ceiling.is_none(),
             },
         );
 
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "40 is below any plausible ceiling and must be accepted (forced only where memory \
-             cannot be read)"
+            "a value at or under the measured ceiling ({ceiling:?}) must be accepted (forced only \
+             where memory cannot be read)"
         );
         assert_eq!(
             std::fs::read_to_string(&conf).unwrap(),
-            "# ghostd\nserver=1\nmaxconnections=40\nrpcuser=x\n"
+            format!("# ghostd\nserver=1\nmaxconnections={value}\nrpcuser=x\n")
         );
 
         // Where memory is unreadable, the same update WITHOUT force must be refused — else
         // that branch would go silently untested on exactly the platform that exercises it.
-        if !measurable {
+        if ceiling.is_none() {
             std::fs::write(&conf, "# ghostd\nserver=1\nmaxconnections=50\nrpcuser=x\n").unwrap();
             let refused = super::apply_maxconnections_update(
                 &conf,

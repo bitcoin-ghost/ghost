@@ -164,6 +164,21 @@ impl RpcArchiveHandler {
                             0
                         };
 
+                        // #605: a Bitcoin merkle proof binding this txid to that specific block.
+                        //
+                        // `None` when we cannot produce one — no block hash to prove against, or the
+                        // node lacks the data. The challenger treats absence as a failure only at/above
+                        // its own gate, so an older or partial responder is not punished before then.
+                        //
+                        // The block hash is passed to `gettxoutproof` deliberately: without it Core
+                        // searches for the transaction, which needs -txindex and after a reorg can find
+                        // it in a DIFFERENT block — answering a question nobody asked.
+                        let txout_proof = if block_hash.is_empty() {
+                            None
+                        } else {
+                            rpc.get_tx_out_proof(&txid, &block_hash).await.ok()
+                        };
+
                         Ok(Some(TxData {
                             txid,
                             block_hash,
@@ -171,6 +186,7 @@ impl RpcArchiveHandler {
                             size,
                             input_count: vin,
                             output_count: vout,
+                            txout_proof,
                         }))
                     }
                     Err(e) => {
