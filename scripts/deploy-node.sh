@@ -99,9 +99,19 @@ if echo "$PRODUCTION_NODES" | grep -qw "$NODE"; then
 fi
 
 # 3. Tests must have passed for THIS commit. Not for something near it.
+#
+#    The remedy this used to print — `deploy-node.sh --record-tests` — does not exist and never
+#    did; this script takes `<node> <binary> [--canary]` and nothing else, so following the
+#    instruction produced a usage error. `scripts/record-tests.sh` is what writes the marker.
+#
+#    Worth stating the per-SHA part explicitly, because merging is where it bites: testing a
+#    branch records the BRANCH commit, and the merge commit is a different SHA with a different
+#    tree whenever main has moved underneath it. Two independently-tested branches merged into
+#    main produce a combination neither run covered.
 MARKER="$STATE_DIR/tested-$SHA"
 [ -f "$MARKER" ] || die "no passing test record for $SHORT
-       run: scripts/deploy-node.sh --record-tests   (after a green suite)"
+       run: scripts/record-tests.sh   (records HEAD; re-run it after a merge — the merge
+       commit is a different SHA, and its tree is what actually ships)"
 
 # 3b. The commit must still be what main says, not merely something main once contained.
 #
