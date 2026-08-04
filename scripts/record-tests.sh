@@ -118,6 +118,33 @@ if grep -qE "FAILED" <<<"$test_out"; then
     exit 1
 fi
 
+# Feature-gated consensus modules. `--lib --bins` above does NOT compile these, because
+# ghost-consensus has `default = []` and gates two modules behind features:
+#
+#   #[cfg(feature = "zk-consensus")]  pub mod nullifier_route_handler;   <- L2 tree sync
+#   #[cfg(feature = "mpc-ceremony")]  pub mod mpc_handler;
+#
+# Without them the run reports ~286 tests while ~71 more are not even compiled — including
+# every test for the L2 tree-sync and nullifier-routing code that is live on all 8 production
+# nodes. CI has run these since #530; this gate did not, so a commit could fail CI's
+# feature-gated job and still be recorded here as deployable. Mirrors ci.yml exactly.
+#
+# NOT `--all-features`, deliberately, for the same reasons ci.yml gives: that would also enable
+# ghost-verification's `allow-insecure` (changing what the security tests assert) and
+# `zk-production` (which needs trusted-setup params).
+echo "==> tests (feature-gated consensus modules)"
+feat_out="$(cargo test -p ghost-consensus --lib --features zk-consensus,mpc-ceremony 2>&1)" || {
+    echo "$feat_out" | grep -E "FAILED|^error|panicked at|assertion|left ==|right ==|left:|right:" \
+        | head -40 >&2
+    echo "FAILED: feature-gated consensus tests" >&2; exit 1; }
+grep -E "^test result" <<<"$feat_out" | tail -2
+if grep -qE "FAILED" <<<"$feat_out"; then
+    echo "$feat_out" | grep -E "FAILED|panicked at|assertion|left ==|right ==|left:|right:" \
+        | head -40 >&2
+    echo "FAILED: feature-gated consensus test failures" >&2
+    exit 1
+fi
+
 SHA="$(git rev-parse HEAD)"
 date +%s > "${STATE_DIR}/tested-${SHA}"
 echo "OK: recorded $(git rev-parse --short HEAD) as tested — deploy-node.sh will now accept it"

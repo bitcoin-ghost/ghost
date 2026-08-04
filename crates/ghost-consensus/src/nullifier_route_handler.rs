@@ -1287,19 +1287,33 @@ impl NullifierRouteHandler {
             // apply commitments or compute the canonical root, which would cause this
             // node's tree to diverge from nodes that do have the proposal.
             if proposal.is_none() {
-                warn!(
-                    height,
-                    "Checkpoint reached quorum but proposal data missing — requesting tree sync"
-                );
                 // Unmark as finalized so tree sync can replay this height
-                let mut votes = self.votes.write();
-                if let Some(state) = votes.get_mut(&height) {
-                    state.finalized = false;
+                {
+                    let mut votes = self.votes.write();
+                    if let Some(state) = votes.get_mut(&height) {
+                        state.finalized = false;
+                    }
                 }
                 // Self-heal: the proposer that finalized has the checkpoint data.
                 // Request tree sync so we can replay it locally.
-                if let Err(e) = self.request_tree_sync() {
-                    warn!(error = %e, "Failed to request tree sync after quorum-without-proposal");
+                //
+                // #621: warn only when a request actually goes out. A node that cannot
+                // advance hits this path continuously — vm1 and vm4 logged it ~35x/minute
+                // for the same height (743626, 692 times in 20 minutes), which together
+                // with the suppression line was 49% of vm1's total log output. The
+                // condition still deserves a WARN, but once per cooldown, not per vote.
+                match self.request_tree_sync() {
+                    Ok(true) => warn!(
+                        height,
+                        "Checkpoint reached quorum but proposal data missing — requested tree sync"
+                    ),
+                    Ok(false) => debug!(
+                        height,
+                        "Checkpoint reached quorum but proposal data missing — sync already pending"
+                    ),
+                    Err(e) => {
+                        warn!(error = %e, "Failed to request tree sync after quorum-without-proposal")
+                    }
                 }
                 return Ok(false);
             }
@@ -1892,7 +1906,11 @@ impl NullifierRouteHandler {
 
     /// Request tree sync from peers (called on startup or when behind).
     /// Client-side cooldown prevents spamming peers who rate-limit at 60s.
-    pub fn request_tree_sync(&self) -> GhostResult<()> {
+    ///
+    /// Returns `true` if a request was actually broadcast, `false` if the cooldown
+    /// suppressed it. Callers use this to avoid logging once per *attempt* when the
+    /// attempt did nothing — a node that is behind can call this many times a second.
+    pub fn request_tree_sync(&self) -> GhostResult<bool> {
         // Client-side dedup: don't re-request within the cooldown window.
         // Peers rate-limit at SYNC_REQUEST_COOLDOWN_SECS, so sending more
         // often just wastes bandwidth and delays the first accepted response.
@@ -1900,11 +1918,14 @@ impl NullifierRouteHandler {
             let last = self.last_sync_request_sent.read();
             if let Some(last_time) = *last {
                 if last_time.elapsed().as_secs() < SYNC_REQUEST_COOLDOWN_SECS {
-                    info!(
+                    // #621: debug, not info. This says "I correctly did nothing", and on a
+                    // node that cannot advance it fired ~35x/minute — 24% of vm1's entire
+                    // log volume, on a node with the least disk headroom in the fleet.
+                    debug!(
                         remaining_secs = SYNC_REQUEST_COOLDOWN_SECS - last_time.elapsed().as_secs(),
                         "Tree sync request suppressed (client-side cooldown)"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -1950,9 +1971,12 @@ impl NullifierRouteHandler {
             broadcast(MessageType::L2TreeSync, payload)?;
             *self.last_sync_request_sent.write() = Some(Instant::now());
             info!(from_height, tip_height, "Requested L2 tree sync from peers");
+            return Ok(true);
         }
 
-        Ok(())
+        // No broadcast function wired up — nothing was sent, so say so rather than
+        // reporting a request that never left the node.
+        Ok(false)
     }
 
     /// Handle note gap request — peer is missing notes after tree sync, respond with
@@ -2797,6 +2821,46 @@ mod tests {
     }
 
     /// Test tree sync request rate limiting
+    #[test]
+    fn test_request_tree_sync_reports_whether_it_actually_sent() {
+        // #621: callers log based on this return value, so "suppressed by cooldown" must be
+        // distinguishable from "sent". Before this, a node that could not advance warned
+        // once per incoming vote — vm1 logged the same height 692 times in 20 minutes,
+        // and the two lines together were 49% of its output.
+        let (_db, _epoch_mgr, handler) = setup();
+
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = sent.clone();
+        handler.set_broadcast_fn(Arc::new(move |_ty, _payload| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+
+        assert!(
+            handler.request_tree_sync().unwrap(),
+            "the first request must report that it was sent"
+        );
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one broadcast so far"
+        );
+
+        // Every subsequent call inside the cooldown must report false AND must not
+        // broadcast. Looping proves the caller can hammer it without either effect.
+        for i in 0..25 {
+            assert!(
+                !handler.request_tree_sync().unwrap(),
+                "call {i} within the cooldown must report suppressed"
+            );
+        }
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "25 further calls must not put another request on the wire"
+        );
+    }
+
     #[test]
     fn test_tree_sync_request_rate_limiting() {
         let (_db, _epoch_mgr, handler) = setup();
