@@ -67,7 +67,7 @@ fn extract_host_from_address(address: &str) -> String {
 /// derivation: `connect_peer` calls it to mint the stub, and `upsert_peer`'s
 /// same-host reconcile calls it to recognise such a stub by exact identity — so a
 /// real peer sharing a host is never mistaken for (and evicted as) a placeholder.
-pub(crate) fn placeholder_node_id(address: &str) -> NodeId {
+pub fn placeholder_node_id(address: &str) -> NodeId {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     address.hash(&mut hasher);
@@ -664,6 +664,23 @@ impl Peer {
         }
     }
 
+    /// True while this entry is still the address-derived bootstrap stub minted by
+    /// `MeshNetwork::connect_peer`, i.e. its real identity has not yet arrived on a
+    /// health ping.
+    ///
+    /// Such a peer has no verified identity, so anything that attributes a result to a
+    /// `node_id` must skip it. #618: the verification task selected these as challenge
+    /// targets. Because only the *port* is rewritten when a challenge is sent, the host
+    /// is still a real node — it answered with a genuine nonce-bound proof, which was
+    /// then filed against a `node_id` that exists nowhere (11,754 ledger rows on vm1,
+    /// across ghostpay, policy and stratum).
+    ///
+    /// Same derivation as `upsert_peer`'s same-host reconcile, so a real peer sharing a
+    /// host is never mistaken for a stub.
+    pub fn is_bootstrap_placeholder(&self) -> bool {
+        !self.public_address.is_empty() && self.node_id == placeholder_node_id(&self.public_address)
+    }
+
     /// Node ID as hex string
     pub fn node_id_hex(&self) -> String {
         hex::encode(self.node_id)
@@ -788,6 +805,51 @@ mod tests {
     // Helper: build a 16-byte miner-id hash from a single tag byte.
     fn h(tag: u8) -> [u8; 16] {
         [tag; 16]
+    }
+
+    #[test]
+    fn test_bootstrap_placeholder_is_recognised_and_real_peers_are_not() {
+        // #618: an unidentified bootstrap stub must be distinguishable from a real
+        // peer, because anything attributing a result to a node_id has to skip it.
+        // Measured live: 11,754 verification_ledger rows on vm1 were filed against
+        // ids that exist in no table, all carrying this exact shape.
+        let addr = "95.111.221.169:8559".to_string();
+
+        let stub = Peer::new(placeholder_node_id(&addr), addr.clone());
+        assert!(
+            stub.is_bootstrap_placeholder(),
+            "an address-derived stub, exactly as connect_peer mints it, must be recognised"
+        );
+
+        // A real identity on the SAME host must not be mistaken for the stub —
+        // this is the hijack-safety property the same-host reconcile relies on.
+        let real = Peer::new([7u8; 32], addr.clone());
+        assert!(
+            !real.is_bootstrap_placeholder(),
+            "a real peer sharing the stub's host must never be treated as a placeholder"
+        );
+
+        // The observed live shape: 8 bytes, the same 8 reversed, then 16 zero bytes.
+        // Asserted directly so a future change to the derivation cannot silently
+        // stop matching what is already in the ledger.
+        let id = placeholder_node_id(&addr);
+        assert_eq!(&id[16..], &[0u8; 16], "bytes 16..32 must be zero");
+        let mut mirrored = id[..8].to_vec();
+        mirrored.reverse();
+        assert_eq!(
+            &id[8..16],
+            &mirrored[..],
+            "bytes 8..15 must reverse bytes 0..7"
+        );
+
+        // An empty address must not collapse into "everything is a placeholder":
+        // peers with no address are already filtered elsewhere, and a blanket true
+        // here would silently drop real peers from selection.
+        let no_addr = Peer::new([9u8; 32], String::new());
+        assert!(
+            !no_addr.is_bootstrap_placeholder(),
+            "an empty address must not be classified as a placeholder"
+        );
     }
 
     #[test]

@@ -567,10 +567,23 @@ impl PeerProvider for PeerProviderAdapter {
         // Get connected peers (seen in last 60 seconds)
         let connected = self.peers.get_connected_peers(60);
 
-        // Filter out the excluded node (ourselves) and peers without valid addresses
+        // Filter out the excluded node (ourselves) and peers without valid addresses.
+        //
+        // #618: also skip bootstrap placeholders. `connect_peer` registers a seed under an
+        // address-derived stub id until its real identity arrives on the first health ping,
+        // and such an entry satisfied both filters above. Selecting one produced a verdict
+        // attributed to a node_id that exists nowhere: only the port is rewritten when a
+        // challenge is sent, so the host is a real node, it answered with a genuine proof,
+        // and the result was filed against the stub. Measured on vm1: 11,754 ledger rows,
+        // 11,510 passing, across ghostpay, policy and stratum. An unidentified peer must not
+        // be verifiable at all, so this is filtered at selection rather than at record time.
         let mut candidates: Vec<_> = connected
             .into_iter()
-            .filter(|p| &p.node_id != exclude && !p.public_address.is_empty())
+            .filter(|p| {
+                &p.node_id != exclude
+                    && !p.public_address.is_empty()
+                    && !p.is_bootstrap_placeholder()
+            })
             .map(|p| {
                 // Derive HTTP address from public_address + http_port
                 let host = extract_peer_host(&p.public_address);
@@ -11343,6 +11356,42 @@ mod tests {
     #[test]
     fn extract_peer_host_ip_with_port() {
         assert_eq!(extract_peer_host("192.168.1.1:8080"), "192.168.1.1");
+    }
+
+    #[test]
+    fn get_random_peers_skips_bootstrap_placeholders() {
+        // #618: a stub must never be offered as a verification target, while a real
+        // peer on the same host still must be. Before the fix both were selectable,
+        // and the stub's verdict was filed against a node_id that exists nowhere.
+        use ghost_consensus::peer::{placeholder_node_id, Peer, PeerManager, PeerState};
+
+        let us = [1u8; 32];
+        let mgr = std::sync::Arc::new(PeerManager::new(us, 100));
+
+        // Exactly what connect_peer mints for a not-yet-identified seed.
+        let stub_addr = "95.111.221.169:8559".to_string();
+        let mut stub = Peer::new(placeholder_node_id(&stub_addr), stub_addr.clone());
+        stub.state = PeerState::Connected;
+        let stub_id = stub.node_id;
+        mgr.upsert_peer(stub);
+
+        // A real, identified peer on a different host.
+        let real_id = [42u8; 32];
+        let mut real = Peer::new(real_id, "203.0.113.7:8555".to_string());
+        real.state = PeerState::Connected;
+        mgr.upsert_peer(real);
+
+        let adapter = PeerProviderAdapter::new(mgr, 8080);
+        let selected = adapter.get_random_peers(&us, 10);
+
+        assert!(
+            selected.iter().any(|p| p.node_id == real_id),
+            "a real identified peer must still be selectable"
+        );
+        assert!(
+            !selected.iter().any(|p| p.node_id == stub_id),
+            "a bootstrap placeholder must never be selected as a verification target"
+        );
     }
 
     #[test]
