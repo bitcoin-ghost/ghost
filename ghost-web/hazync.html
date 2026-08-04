@@ -210,7 +210,8 @@
       <h1>Bitcoin consensus, proven with Core's own code. Verify <span class="a">one small proof.</span></h1>
       <p class="hz-lead" style="margin-top:22px">Hazync runs Bitcoin Core's own unmodified consensus code inside a zero-knowledge VM, script by script, signature by signature, and folds it into a single succinct proof. Not a reimplementation. The exact code the network already trusts.</p>
       <div class="hz-actions">
-        <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.10.0">Get the release <span class="arrow">→</span></a>
+        <a class="btn btn-primary" href="https://github.com/bitcoin-ghost/hazync/releases/latest">Get the release <span class="arrow">→</span></a>
+        <a class="btn btn-ghost" href="/hazync/verify/">Verify one in your browser <span class="arrow">→</span></a>
         <a class="btn btn-ghost" href="#run">Run it <span class="arrow">→</span></a>
       </div>
     </div>
@@ -218,6 +219,7 @@
       <div class="h"><span id="hz-pn-head">Chain-state proof</span><span class="hz-verdict no" id="hz-pn-verdict">LIVE</span></div>
       <dl>
         <div class="row"><dt>Proven &amp; chained</dt><dd id="hz-pn-height">, </dd></div>
+        <div class="row"><dt>Single anchored proof</dt><dd id="hz-pn-spine">, </dd></div>
         <div class="row"><dt>Tip hash</dt><dd class="hash" id="hz-pn-tip">, </dd></div>
         <div class="row"><dt>Cumulative work</dt><dd id="hz-pn-work">, </dd></div>
         <div class="row"><dt>UTXO leaves</dt><dd id="hz-pn-leaves">, </dd></div>
@@ -267,7 +269,7 @@
           <div class="r"><span class="k">cum_work</span><span class="v">total proof-of-work</span></div>
           <div class="r"><span class="k">height</span><span class="v">blocks proven</span></div>
         </div>
-        <p class="hz-foot">A verified receipt commits exactly this ChainState, and nothing else can produce it. Checked in milliseconds; SNARK-wrappable to a few hundred bytes, to verify anywhere.</p>
+        <p class="hz-foot">A verified receipt commits exactly this ChainState, and nothing else can produce it. Checked in milliseconds; SNARK-wrappable to ~1.8 KB, to verify anywhere.</p>
       </div>
     </div>
   </div></section>
@@ -398,9 +400,9 @@
 <span class="c"># 3 · confirm the binary IS the canonical guest — the id you're verifying against</span>
 <span class="c">#     (reproducible byte-for-byte via reproduce/Dockerfile)</span>
 <span class="p">$</span> ./host method-id
-3f52baff7e7d4adaa328b832d6f15fffb1b35968b6636760f9d50e045bbae67e</pre>
+b161735a13d120a29aaf1e3c910bc6cbb486467bef40c04fe839aa4044170b3d</pre>
     </div>
-    <p class="hz-lead" style="font-size:14.5px;margin-top:16px"><strong>Want to prove blocks?</strong> Grab the CUDA prover binary (NVIDIA GPU + CUDA 12.6) and join the <a class="hz-inline-a" href="/hazync-party.html">Proof Party</a>; full steps in <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">CONTRIBUTING</a>. Building from source or reproducing the image id is in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository</a>; the tagged release is <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.10.0">v0.10.0</a>.</p>
+    <p class="hz-lead" style="font-size:14.5px;margin-top:16px"><strong>Want to prove blocks?</strong> Grab the CUDA prover binary (NVIDIA GPU + CUDA 12.6) and join the <a class="hz-inline-a" href="#party">Proof Party</a>; full steps in <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">CONTRIBUTING</a>. Building from source or reproducing the image id is in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository</a>; the tagged releases are on <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases">GitHub</a>.</p>
   </div></section>
 
   <!-- WHO ELSE CAN USE IT -->
@@ -464,7 +466,7 @@
       <a class="btn btn-primary" href="#party">Open the Proof Party <span class="arrow">→</span></a>
       <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">Step-by-step guide <span class="arrow">→</span></a>
       <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync">GitHub · bitcoin-ghost/hazync <span class="arrow">→</span></a>
-      <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync/blob/main/SOUNDNESS.md">Soundness statement <span class="arrow">→</span></a>
+      <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync/blob/main/docs/SOUNDNESS.md">Soundness statement <span class="arrow">→</span></a>
       <a class="btn btn-ghost" href="https://github.com/bitcoin-ghost/hazync/blob/main/SECURITY.md">Security review <span class="arrow">→</span></a>
     </div>
   </div></section>
@@ -483,8 +485,8 @@
       <h4>Hazync</h4>
       <ul>
         <li><a href="https://github.com/bitcoin-ghost/hazync">GitHub</a></li>
-        <li><a href="https://github.com/bitcoin-ghost/hazync/releases/tag/v0.10.0">v0.10.0 release</a></li>
-        <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SOUNDNESS.md">Soundness</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/hazync/releases/latest">Latest release</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/docs/SOUNDNESS.md">Soundness</a></li>
         <li><a href="https://github.com/bitcoin-ghost/hazync/blob/main/SECURITY.md">Security</a></li>
       </ul>
     </div>
@@ -555,7 +557,18 @@
     var L=d.leaderboard.filter(function(x){return x.blocks>0});
     $('leaderboard').innerHTML=L.length?L.map(function(x,i){return '<div class="lrow"><span class="rk">'+(i+1)+'</span><span class="who"><span class="hn">'+(x.handle||'anon')+'</span><span class="ky">'+x.id+'… <span class="sig">◈</span></span></span><span class="n">'+fmt(x.blocks)+'<small>blocks</small></span></div>'}).join(''):'<div class="empty">no verified proofs yet, be the first</div>';
     // recent
-    $('recent').innerHTML=d.recent.length?d.recent.map(function(s){return '<div class="frow"><span class="'+(s.verified?'ok':'no')+'">'+(s.verified?'✓':'…')+'</span><span class="blk">'+s.range+'</span><span class="by">'+(s.handle||'anon')+' · '+ago(s.ts)+'</span></div>'}).join(''):'<div class="empty">nothing yet</div>';
+    // Say WHAT each row is. The board does two different jobs and the feed showed both as a bare
+    // range id, so "39318" (one block proved) and "733-734" (two proofs folded into one) looked like
+    // the same kind of event. A single id is a block proof; lo-hi is a fold, and its width is how
+    // many blocks that one receipt now covers.
+    $('recent').innerHTML=d.recent.length?d.recent.map(function(s){
+      var p=String(s.range).split('-'), lo=+p[0], hi=p.length>1?+p[1]:lo,
+          n=(hi-lo+1), fold=p.length>1,
+          kind=fold?('folded · '+n+' blocks'):'block proved';
+      return '<div class="frow"><span class="'+(s.verified?'ok':'no')+'">'+(s.verified?'✓':'…')+'</span>'
+           + '<span class="blk">'+s.range+'</span>'
+           + '<span class="by">'+kind+' · '+(s.handle||'anon')+' · '+ago(s.ts)+'</span></div>'
+    }).join(''):'<div class="empty">nothing yet</div>';
   }
   // ---- block explorer: single/range · search · slider · filters (all client-side over vranges/claims) ----
   var VIEW={mode:'single',filter:'all',start:0,focus:null,data:null,init:false};
@@ -629,10 +642,41 @@
       signatures:"ed25519",verify_mode:"real"
     };
   }
+  // vranges is ~99.9% of the old /api/state payload (3.39 MB of 3.40 MB at 38,507 entries) and only
+  // changes when a range is verified — but this polled it every 10s. Now: poll ?slim=1 (~842 B gzipped)
+  // and fetch the index only when `proven` moves. The explorer needs it, so it loads once on first
+  // paint and refreshes on progress; a failed refresh keeps the previous index rather than blanking it.
+  var VRANGES=[], VR_AT=-1;
+  function withVranges(d, cb){
+    var proven=(d.progress||{}).proven;
+    if(proven===VR_AT){ d.vranges=VRANGES; cb(d); return; }
+    fetch(API+'/api/vranges').then(function(r){if(!r.ok)throw 0;return r.json()})
+      .then(function(v){ VRANGES=v.vranges||[]; VR_AT=proven; d.vranges=VRANGES; cb(d); })
+      .catch(function(){ d.vranges=VRANGES; cb(d); });   // stale index beats no explorer
+  }
+  // The SPINE: the single genesis-anchored receipt. Deliberately separate from `frontier_proof`
+  // above, which is the coordinator CHAINING many verified ranges — a claim you cannot check in one
+  // download. The spine is the file you can. Conflating them on a public page would overstate what a
+  // visitor is able to verify for themselves.
+  function pollSpine(){
+    var el=$('hz-pn-spine'); if(!el)return;
+    fetch(API+'/api/spine').then(function(r){
+        if(r.status===404)return null;            // no spine yet — a real state, not a failure
+        if(!r.ok)throw 0; return r.json();
+      })
+      .then(function(sp){
+        if(!sp||!sp.hi){ el.textContent='not started yet'; return; }
+        el.innerHTML='genesis → '+fmt(sp.hi)+
+          ' · <a href="'+API+'/api/spine/proof" rel="nofollow">download</a> ('+
+          Math.round((sp.bytes||0)/1024)+' KB)';
+      })
+      .catch(function(){ el.textContent='—'; });
+  }
   function poll(){
-    fetch(API+'/api/state').then(function(r){if(!r.ok)throw 0;return r.json()})
-      .then(function(d){showBanner(false);render(d);})
+    fetch(API+'/api/state?slim=1').then(function(r){if(!r.ok)throw 0;return r.json()})
+      .then(function(d){showBanner(false);withVranges(d,render);})
       .catch(function(){showBanner(true);render(unavailableData());});   // coordinator unreachable → empty state + banner
+    pollSpine();
   }
   poll();setInterval(poll,10000);
 </script>
