@@ -2867,6 +2867,18 @@ impl VerificationState {
         Ok(response)
     }
 
+    /// Test-only: install a Ghost Pay handler.
+    ///
+    /// Deliberately `#[cfg(test)]`. Production has no way to set this field — that is the observation
+    /// #616 turns on — and adding a public setter would quietly change what a node can claim. Whether
+    /// production should be able to wire a handler is a decision to take on that issue, not a side
+    /// effect of making a path testable.
+    #[cfg(test)]
+    fn with_ghostpay_handler(mut self, handler: Box<dyn GhostPayHandler + Send + Sync>) -> Self {
+        self.ghostpay_handler = Some(handler);
+        self
+    }
+
     /// Verify GhostPay challenge
     ///
     /// H-5: When a challenge_epoch is provided, the node must prove it has
@@ -2881,6 +2893,27 @@ impl VerificationState {
         &self,
         challenge: GhostPayChallenge,
     ) -> GhostResult<GhostPayResponse> {
+        // #616 DIAGNOSTIC. Every node answers this endpoint "Ghost Pay handler not configured" or
+        // "not enabled" when asked directly on 8080 and 8443, yet the verification ledger records
+        // ghostpay passing 7300/62 in 24h with live per-nonce proofs — and `epoch_proof_fn` has no
+        // setter since 573fa59ec, which is already in the deployed commit. Two readings with opposite
+        // consequences, and six hours of tracing did not separate them.
+        //
+        // So state the three facts that do, on every request, at INFO so no log-level change is needed
+        // to see them. Whichever way it falls, this line says it outright:
+        //   claims_ghost_pay=false          -> the node does not claim the capability at all
+        //   handler_configured=false        -> it claims it with nothing behind it, and passes cannot
+        //                                      come from here
+        //   epoch_proof=Some(..)            -> the "unreachable" path is reachable and the code reading
+        //                                      was wrong
+        tracing::info!(
+            claims_ghost_pay = self.capabilities.ghost_pay,
+            handler_configured = self.ghostpay_handler.is_some(),
+            challenge_epoch = ?challenge.challenge_epoch,
+            has_nonce = challenge.challenge_nonce.is_some(),
+            "#616 ghostpay request"
+        );
+
         if !self.capabilities.ghost_pay {
             return Ok(GhostPayResponse {
                 success: false,
@@ -2926,9 +2959,23 @@ impl VerificationState {
         let (epoch_state_hash, epoch_tx_count, epoch_proof_success) =
             if let Some(challenge_epoch) = challenge.challenge_epoch {
                 match handler.get_epoch_proof(challenge_epoch) {
-                    Some(proof) => (Some(proof.state_hash), Some(proof.tx_count), true),
+                    Some(proof) => {
+                        // #616: if this ever logs, `get_epoch_proof` is returning a proof despite
+                        // `epoch_proof_fn` having no setter — which is the whole question.
+                        tracing::info!(
+                            epoch = challenge_epoch,
+                            state_hash = %proof.state_hash,
+                            tx_count = proof.tx_count,
+                            "#616 ghostpay epoch proof PRODUCED"
+                        );
+                        (Some(proof.state_hash), Some(proof.tx_count), true)
+                    }
                     None => {
                         // Node claims GhostPay but can't prove epoch state
+                        tracing::info!(
+                            epoch = challenge_epoch,
+                            "#616 ghostpay epoch proof ABSENT — answering success=false"
+                        );
                         return Ok(GhostPayResponse {
                             success: false,
                             l2_enabled: handler.is_enabled(),
@@ -4180,5 +4227,115 @@ mod tests {
             "distinct clients behind a trusted proxy must differ"
         );
         assert_eq!(k1, PeerIpKey("ip:1.2.3.4".to_string()));
+    }
+
+    // ---- #616: what `verify_ghostpay` actually does on the shipped code ----
+    //
+    // Nothing exercised this path before. That is part of why #616 took six hours: the +4 capability's
+    // server side had no test pinning what it returns, so the only way to find out was to ask a live
+    // node, and the answer contradicted the ledger.
+    //
+    // These pin the three outcomes reachable with the code as shipped. If any of them starts failing,
+    // something changed about whether a node can prove L2 state — which is exactly the thing that
+    // should not change silently.
+
+    fn ghostpay_state(claims: bool) -> VerificationState {
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        let caps = NodeCapabilities {
+            ghost_pay: claims,
+            ..NodeCapabilities::default()
+        };
+        VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+            PolicyProfile::default(),
+            caps,
+        )
+    }
+
+    fn epoch_challenge() -> crate::challenge::GhostPayChallenge {
+        crate::challenge::GhostPayChallenge {
+            challenge_type: crate::challenge::ChallengeType::GhostPayBalance,
+            address: None,
+            challenge_epoch: Some(7),
+            challenge_nonce: Some("a".repeat(64)),
+        }
+    }
+
+    /// A node that does not claim Ghost Pay says so, and says `l2_enabled: false`.
+    #[tokio::test]
+    async fn ghostpay_unclaimed_reports_not_enabled() {
+        let resp = ghostpay_state(false)
+            .verify_ghostpay(epoch_challenge())
+            .await
+            .expect("verify_ghostpay must not error");
+        assert!(!resp.success);
+        assert!(
+            !resp.l2_enabled,
+            "an unclaimed node must not report l2_enabled"
+        );
+        assert_eq!(resp.error.as_deref(), Some("Ghost Pay not enabled"));
+        assert!(resp.epoch_state_hash.is_none());
+    }
+
+    /// A node that CLAIMS Ghost Pay with no handler wired reports `l2_enabled: true` and
+    /// `success: false`. This is what all eight fleet nodes do today, on both the plain and TLS ports.
+    ///
+    /// Note the shape: `l2_enabled` is true while `success` is false. A verdict that graded on
+    /// `l2_enabled` alone would read this as a pass.
+    #[tokio::test]
+    async fn ghostpay_claimed_without_a_handler_fails_but_still_reports_l2_enabled() {
+        let resp = ghostpay_state(true)
+            .verify_ghostpay(epoch_challenge())
+            .await
+            .expect("verify_ghostpay must not error");
+        assert!(!resp.success, "no handler means no proof, so not a success");
+        assert!(
+            resp.l2_enabled,
+            "l2_enabled reflects the CLAIM, not the capability — the gap #605 is about"
+        );
+        assert_eq!(
+            resp.error.as_deref(),
+            Some("Ghost Pay handler not configured")
+        );
+        assert!(resp.epoch_state_hash.is_none());
+        assert!(resp.nonce_bound_proof.is_none());
+    }
+
+    /// With the shipped `GhostPayL2Handler`, an epoch challenge CANNOT be answered.
+    ///
+    /// `epoch_proof_fn` is set to `None` at construction and has had no setter since `573fa59ec`
+    /// removed `with_epoch_proof`, so `get_epoch_proof` falls through to the trait default and returns
+    /// `None`. The node therefore answers `success: false` — meaning the +4 is not obtainable through
+    /// this path on this code.
+    ///
+    /// That is asserted here rather than described anywhere, because the live verification ledger
+    /// disagrees (#616) and the disagreement needs a fixed reference point. If someone wires an epoch
+    /// proof source, this test fails and they must decide deliberately what the new behaviour is.
+    #[tokio::test]
+    async fn ghostpay_with_the_shipped_handler_cannot_prove_an_epoch() {
+        let handler =
+            crate::handlers::GhostPayL2Handler::new(true, || 100, || 44, |_| Ok(0), false);
+        let state = ghostpay_state(true).with_ghostpay_handler(Box::new(handler));
+
+        let resp = state
+            .verify_ghostpay(epoch_challenge())
+            .await
+            .expect("verify_ghostpay must not error");
+
+        assert!(
+            !resp.success,
+            "the shipped handler has no epoch proof source, so an epoch challenge cannot pass"
+        );
+        assert_eq!(
+            resp.error.as_deref(),
+            Some("Cannot prove L2 state for epoch 7")
+        );
+        assert!(resp.epoch_state_hash.is_none());
+        // The getters that DO work still answer, which is why a response can look populated while
+        // carrying no proof at all.
+        assert_eq!(resp.epoch, Some(44));
+        assert_eq!(resp.virtual_block, Some(100));
     }
 }
