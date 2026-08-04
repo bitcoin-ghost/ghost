@@ -183,7 +183,7 @@ Defaults are sensible for a 4-node cluster. For larger clusters consider:
 
 ## Why no Cloudflare / ghost-registry
 
-The protocol's earlier design called for a centralised ghost-registry service that aggregated node metrics and pushed them to a Cloudflare Load Balancer with TCP health checks. That design was abandoned for three reasons:
+The protocol's earlier design called for a centralised ghost-registry service that aggregated node metrics and pushed them to a Cloudflare Load Balancer with TCP health checks. That design was abandoned for three reasons, and the code implementing it has now been **deleted** — until 2026-08-04 it still compiled, was still wired into `ghost-pool`, and `config/registry.toml` still shipped `enabled = true` with a real Cloudflare zone id, so "abandoned" described the intent rather than the repository:
 
 1. **External dependency.** A Cloudflare account, a separate bootstrap service, and an API token in every node config are all things that can break independently of the network.
 2. **Privacy.** Cloudflare sees every miner connection and can correlate IPs to pool nodes. The mesh-driven approach keeps that information internal.

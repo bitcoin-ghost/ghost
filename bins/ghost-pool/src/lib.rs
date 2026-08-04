@@ -58,9 +58,6 @@ pub mod payout;
 /// pure function of).
 pub mod payout_checkpoint;
 
-/// Load balancer registration and node discovery.
-pub mod registry;
-
 /// Chain reorganization detection and recovery.
 pub mod reorg;
 

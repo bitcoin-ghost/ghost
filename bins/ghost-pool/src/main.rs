@@ -72,7 +72,6 @@ use ghost_verification::{
 
 use ghost_pool::capacity;
 use ghost_pool::payout::{BlockFoundData, PayoutConfig, PayoutHandler, SoloBlockFoundData};
-use ghost_pool::registry::RegistryClient;
 use ghost_pool::reorg::{ReorgConfig, ReorgHandler};
 use ghost_pool::round::{RoundConfig, RoundEvent, RoundManager};
 use ghost_pool::self_check::SelfCheck;
@@ -9875,73 +9874,6 @@ async fn main() -> Result<()> {
     // Note: Stratum events now come from SRI, not ghost-pool
     // WebSocket broadcast for miner events would need SRI integration
 
-    // Start registry client for load balancer registration (only for PublicPool mode)
-    // Private modes (PrivatePool, PrivateSolo) skip DNS registration
-    // Store registry client for deregistration on shutdown
-    let registry_client_for_shutdown: Option<Arc<RegistryClient>> = if !matches!(
-        mining_mode,
-        MiningMode::PublicPool
-    ) {
-        info!(
-            "Mining mode {:?}: skipping DNS registration (private mode)",
-            mining_mode
-        );
-        None
-    } else if let Some(ref registry_config) = config.registry {
-        if !registry_config.url.is_empty() {
-            let host = config
-                .network
-                .public_address
-                .clone()
-                .unwrap_or_else(|| "".to_string());
-
-            if host.is_empty() {
-                warn!("Registry configured but network.public_address is not set - skipping registration");
-                None
-            } else if let Some(ref signing_key) = config.network.signing_key {
-                match RegistryClient::new(
-                    signing_key,
-                    registry_config.clone(),
-                    host,
-                    config.network.sv1_port,
-                    config.network.sv2_port,
-                    config.network.max_miners,
-                ) {
-                    Ok(registry_client) => {
-                        let registry_client = Arc::new(registry_client);
-                        let registry_for_task = Arc::clone(&registry_client);
-                        let registry_shutdown = shutdown_tx.subscribe();
-                        tokio::spawn(async move {
-                            registry_for_task
-                                .start(
-                                    move || 0_u32, // Miner count from SRI (not tracked here)
-                                    registry_shutdown,
-                                )
-                                .await;
-                        });
-
-                        info!(
-                            "Registry client started (heartbeat every {}s)",
-                            registry_config.heartbeat_interval_secs
-                        );
-                        Some(registry_client)
-                    }
-                    Err(e) => {
-                        error!("Failed to create registry client: {}", e);
-                        None
-                    }
-                }
-            } else {
-                warn!("Registry configured but network.signing_key is not set - skipping registration");
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // Print startup summary
     info!("════════════════════════════════════════════════════════════════");
     info!("Ghost Pool is ready!");
@@ -10012,14 +9944,6 @@ async fn main() -> Result<()> {
     // 5 seconds is sufficient for orderly cleanup without blocking restart.
     info!("Waiting up to 5 seconds for tasks to complete...");
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    // Deregister from load balancer (if registered)
-    if let Some(registry_client) = registry_client_for_shutdown {
-        info!("Deregistering from load balancer...");
-        if let Err(e) = registry_client.deregister().await {
-            warn!("Failed to deregister from load balancer: {}", e);
-        }
-    }
 
     // Cleanup
     template_processor.stop();

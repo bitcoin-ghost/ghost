@@ -113,7 +113,6 @@ pub struct NodeConfig {
     #[serde(default)]
     pub reaper: ReaperSettings,
     /// Registry configuration (optional, for load balancer registration)
-    pub registry: Option<RegistryConfig>,
     /// Decentralised Wraith coordinator-election configuration.
     ///
     /// Read-only and gated OFF by default: when `wraith_election_enabled` is
@@ -1865,27 +1864,6 @@ impl std::fmt::Display for Region {
             Self::Unknown => "unknown",
         };
         write!(f, "{}", s)
-    }
-}
-
-/// Registry configuration for load balancer registration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegistryConfig {
-    /// URL of the registry/load balancer (e.g., "http://83.136.255.218:8333")
-    pub url: String,
-    /// Heartbeat interval in seconds
-    pub heartbeat_interval_secs: u64,
-    /// Geographic region of this node
-    pub region: Region,
-}
-
-impl Default for RegistryConfig {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            heartbeat_interval_secs: 30,
-            region: Region::Unknown,
-        }
     }
 }
 
