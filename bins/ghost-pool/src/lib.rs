@@ -317,6 +317,25 @@ pub const PAYOUT_MEDIAN_ADOPTION_HEIGHT: u64 = 961_700;
 /// ~1100 blocks beyond the tip at arming (roughly 6 days at the observed ~8 min/block).
 pub const STRATUM_HANDSHAKE_PROOF_HEIGHT: u64 = 962_000;
 
+/// Archive proved by serving TRANSACTION-level detail, not just block headers (#605).
+/// **DORMANT — deliberately unarmed.**
+///
+/// Below this height the archive challenge asks only for a block, and every field of the response is
+/// derivable from the public 80-byte header — so a pruned node, an SPV client or an on-demand proxy
+/// passes and collects +5, the largest single capability weight.
+///
+/// At and above it the challenger names a specific transaction in that block and checks the returned
+/// `TxData` against its own node's view of it. A pruned node cannot answer at all.
+///
+/// Being precise about the limit: this is NOT proof-of-storage. A proxy that fetches the block when
+/// challenged still passes — it simply has to do real work rather than echo a header. The gain is
+/// excluding the population that currently passes for free, not proving custody.
+///
+/// `u64::MAX` = never. Arming requires the whole fleet to run a binary that ASKS for a transaction,
+/// because a node applying the tx check while its peers do not would compute a different qualified
+/// set and the node-reward split would diverge.
+pub const ARCHIVE_TX_PROOF_HEIGHT: u64 = u64::MAX;
+
 /// Multi-operator Sybil-resistant node qualification (Surface A-2). At and above this height,
 /// the deterministic node-reward qualification counts a target's DISTINCT challengers only
 /// when they are members of the consensus voter set AND come from diverse IP subnets, and it
@@ -388,6 +407,7 @@ mod gates {
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
     pub(super) static PAYOUT_MEDIAN_ADOPTION: OnceLock<u64> = OnceLock::new();
     pub(super) static STRATUM_HANDSHAKE_PROOF: OnceLock<u64> = OnceLock::new();
+    pub(super) static ARCHIVE_TX_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ACTIVE_VOTER_SET: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_ADDR_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static OBSERVED_SETTLEMENT: OnceLock<u64> = OnceLock::new();
@@ -455,6 +475,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         STRATUM_HANDSHAKE_PROOF_HEIGHT,
     );
+    let archive_tx = gates::from_env(
+        "GHOST_ARCHIVE_TX_PROOF_HEIGHT",
+        network,
+        ARCHIVE_TX_PROOF_HEIGHT,
+    );
     let _ = gates::CLUSTER_ENFORCEMENT.set(enforcement);
     let _ = gates::COINBASE_FEE_SPLIT.set(fee);
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
@@ -465,6 +490,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::OBSERVED_SETTLEMENT.set(observed_settlement);
     let _ = gates::PAYOUT_MEDIAN_ADOPTION.set(payout_median);
     let _ = gates::STRATUM_HANDSHAKE_PROOF.set(stratum_proof);
+    let _ = gates::ARCHIVE_TX_PROOF.set(archive_tx);
 
     if enforcement != CLUSTER_ENFORCEMENT_HEIGHT
         || fee != COINBASE_FEE_SPLIT_HEIGHT
@@ -534,6 +560,11 @@ pub fn observed_settlement_height() -> u64 {
 /// recomputed work, instead of the proposer's list verbatim (#606).
 pub fn payout_median_adoption_height() -> u64 {
     *gates::PAYOUT_MEDIAN_ADOPTION.get_or_init(|| PAYOUT_MEDIAN_ADOPTION_HEIGHT)
+}
+
+/// Height at and above which Archive is proved by serving transaction-level detail (#605).
+pub fn archive_tx_proof_height() -> u64 {
+    *gates::ARCHIVE_TX_PROOF.get_or_init(|| ARCHIVE_TX_PROOF_HEIGHT)
 }
 
 /// Height at and above which Public Mining is proved by a challenger-performed stratum handshake

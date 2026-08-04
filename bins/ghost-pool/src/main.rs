@@ -8970,6 +8970,8 @@ async fn main() -> Result<()> {
                     ghost_pool::stratum_handshake_proof_height(),
                     ghost_common::constants::SV1_STRATUM_PORT,
                 )
+                // #605: demand transaction-level detail for Archive at/above the gate.
+                .with_archive_tx_gate(ghost_pool::archive_tx_proof_height())
                 .with_policy(policy.clone())
                 .with_broadcast(verification_tx);
 
