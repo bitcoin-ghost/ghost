@@ -154,6 +154,22 @@ jobs:
             --exclude ghost-mpc \
             --exclude mpc-xproc-harness \
             --exclude integration_tests_sv2
+      # COMPILE the 18 sv2 integration targets without running them (#580).
+      #
+      # They cannot be run here: 191 `start_pool`/`start_template_provider`/`start_sniffer` call sites
+      # spin up real SRI processes, and only one of the 18 is `#[ignore]`d. Un-excluding them would make
+      # main red and flaky, which is worse than not running them.
+      #
+      # But COMPILING them is cheap — measured at 3m11s with no external services — and it catches the
+      # rot that actually bit: `tests/integration` stopped compiling when f1c14cdb9 added a field to
+      # `ShareConvergenceResponse`, and nobody noticed for weeks because nothing built it. Four
+      # `PoolConfig` initializers went the same way during the ghost-registry deletion and were caught
+      # only because that target had been repaired.
+      #
+      # A compile gate is most of the value for none of the flakiness. Running them properly needs CI
+      # infrastructure for the SRI processes and stays tracked on #580.
+      - name: Compile SV2 integration targets (no run)
+        run: cargo test -p integration_tests_sv2 --no-run
 
   # MPC integration harnesses.
   #

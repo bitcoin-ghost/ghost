@@ -56,6 +56,18 @@ echo "==> fuzz targets build"
 # rustdoc errors, none of which any local gate looked at (#609).
 #
 # Cheap to run here and it closes the gap between "record-tests is green" and "main will be green".
+# COMPILE the 18 sv2 integration targets, without running them.
+#
+# CI now does this too, and locally is where it matters: `tests/integration` stopped compiling when
+# f1c14cdb9 added a field to `ShareConvergenceResponse` and nobody noticed for weeks, because nothing
+# built it. Four `PoolConfig` initializers went the same way during the ghost-registry deletion.
+#
+# They cannot be RUN here — 191 call sites spin up real SRI pool/template-provider processes — but
+# compiling them is ~3 minutes and catches that whole class of rot. Running them properly is #580.
+echo "==> sv2 integration targets compile (no run)"
+cargo test -p integration_tests_sv2 --no-run --quiet \
+    || { echo "FAILED: sv2 integration targets do not compile" >&2; exit 1; }
+
 echo "==> documentation (-D warnings, as CI runs it)"
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace $EXCLUDES --all-features --quiet \
     || { echo "FAILED: documentation — a rustdoc error here turns main red after the push" >&2; exit 1; }
