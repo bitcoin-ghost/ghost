@@ -55,7 +55,6 @@ members = [
     # Wraith coordinator (Wraith Lite v1, single-round atomic CoinJoin)
     "bins/wraith-coordinator",
     # Registry service for load balancing
-    "bins/ghost-registry",
     # Headless setup CLI
     "bins/ghost-setup",
     # Mobile Apps

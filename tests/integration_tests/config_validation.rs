@@ -491,6 +491,8 @@ fn test_133_zero_epoch_blocks_rejected() {
 #[test]
 fn test_pool_config_validate_empty_treasury() {
     let config = PoolConfig {
+        // Operator-specific; unset means `--status` skips the in-DNS check.
+        mining_dns_name: None,
         treasury_address: TreasuryAddress::Single(String::new()),
         ..PoolConfig::default()
     };
@@ -502,6 +504,8 @@ fn test_pool_config_validate_empty_treasury() {
 #[test]
 fn test_pool_config_validate_zero_min_payout_via_struct() {
     let config = PoolConfig {
+        // Operator-specific; unset means `--status` skips the in-DNS check.
+        mining_dns_name: None,
         treasury_address: TreasuryAddress::single("bc1qtest"),
         min_payout_sats: 0,
         ..PoolConfig::default()
@@ -514,6 +518,8 @@ fn test_pool_config_validate_zero_min_payout_via_struct() {
 #[test]
 fn test_pool_config_validate_zero_min_payout() {
     let config = PoolConfig {
+        // Operator-specific; unset means `--status` skips the in-DNS check.
+        mining_dns_name: None,
         treasury_address: TreasuryAddress::single("bc1qtest"),
         min_payout_sats: 0,
         ..PoolConfig::default()
@@ -526,6 +532,8 @@ fn test_pool_config_validate_zero_min_payout() {
 #[test]
 fn test_pool_config_validate_success() {
     let config = PoolConfig {
+        // Operator-specific; unset means `--status` skips the in-DNS check.
+        mining_dns_name: None,
         treasury_address: TreasuryAddress::single("bc1qtest"),
         min_payout_sats: 10000,
         payout_interval_blocks: 100,

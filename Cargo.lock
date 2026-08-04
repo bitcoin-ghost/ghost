@@ -3531,36 +3531,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-registry"
-version = "1.11.22"
-dependencies = [
- "anyhow",
- "axum 0.7.9",
- "bitcoin",
- "chrono",
- "clap",
- "ghost-common",
- "hex",
- "hmac",
- "libc",
- "parking_lot",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "rusqlite",
- "secp256k1 0.28.2",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml 0.8.2",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "ghost-setup"
 version = "1.11.22"
 dependencies = [
