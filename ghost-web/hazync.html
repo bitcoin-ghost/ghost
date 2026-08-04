@@ -400,7 +400,7 @@
 <span class="c"># 3 · confirm the binary IS the canonical guest — the id you're verifying against</span>
 <span class="c">#     (reproducible byte-for-byte via reproduce/Dockerfile)</span>
 <span class="p">$</span> ./host method-id
-b161735a13d120a29aaf1e3c910bc6cbb486467bef40c04fe839aa4044170b3d</pre>
+<span id="hz-guest-id">see bitcoinghost.org/hazync/api/meta</span></pre>
     </div>
     <p class="hz-lead" style="font-size:14.5px;margin-top:16px"><strong>Want to prove blocks?</strong> Grab the CUDA prover binary (NVIDIA GPU + CUDA 12.6) and join the <a class="hz-inline-a" href="#party">Proof Party</a>; full steps in <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/blob/main/CONTRIBUTING.md">CONTRIBUTING</a>. Building from source or reproducing the image id is in the <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync">repository</a>; the tagged releases are on <a class="hz-inline-a" href="https://github.com/bitcoin-ghost/hazync/releases">GitHub</a>.</p>
   </div></section>
@@ -672,11 +672,29 @@ b161735a13d120a29aaf1e3c910bc6cbb486467bef40c04fe839aa4044170b3d</pre>
       })
       .catch(function(){ el.textContent='—'; });
   }
+  // The guest image id is FETCHED, never written into this page (hazync#89).
+  //
+  // A literal here went stale across THREE re-baselines — be5e0528, 71790584, dfc9eeda — while every
+  // check in the hazync repo stayed green, because this file lives in a different repository and
+  // nothing there can see it. The damage lands on exactly the wrong person: step 3 is the last step of
+  // the only verification walkthrough we publish, so a newcomer whose binary is CORRECT sees a
+  // mismatch and concludes their download is fake. The page was wrong, not their binary.
+  //
+  // /api/meta reports the id the coordinator is actually running, which is the id a visitor's proofs
+  // must match, so this cannot drift from reality — there is no longer a second copy to keep in sync.
+  // On failure it says so rather than showing a hex: no id is safe, a wrong id is not.
+  function pollGuestId(){
+    var el=$('hz-guest-id'); if(!el)return;
+    fetch(API+'/api/meta').then(function(r){if(!r.ok)throw 0;return r.json()})
+      .then(function(m){ if(m&&m.method_id) el.textContent=m.method_id; })
+      .catch(function(){ el.textContent='(unavailable — see '+API+'/api/meta)'; });
+  }
   function poll(){
     fetch(API+'/api/state?slim=1').then(function(r){if(!r.ok)throw 0;return r.json()})
       .then(function(d){showBanner(false);withVranges(d,render);})
       .catch(function(){showBanner(true);render(unavailableData());});   // coordinator unreachable → empty state + banner
     pollSpine();
+    pollGuestId();
   }
   poll();setInterval(poll,10000);
 </script>
