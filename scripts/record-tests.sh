@@ -99,10 +99,24 @@ run_gate "check (all targets, all features)" \
 
 echo "==> tests"
 test_out="$(cargo test --workspace $EXCLUDES --lib --bins 2>&1)" || {
-    echo "$test_out" | grep -E "FAILED|^error" | head -20 >&2
+    # Show WHY, not just WHAT. This grep used to match only "FAILED" and "^error", so a failure
+    # reported the test NAMES and nothing else — no panic, no assertion text, no expected-vs-actual.
+    # That cost a full investigation cycle on three intermittently-failing sv2 tests: the gate said
+    # they failed, and the reason had already been discarded by the time anyone looked.
+    #
+    # `panicked at` and the assertion lines are where the information is, so keep them.
+    echo "$test_out" | grep -E "FAILED|^error|panicked at|assertion|left ==|right ==|left:|right:" \
+        | head -40 >&2
     echo "FAILED: tests" >&2; exit 1; }
 grep -E "^test result" <<<"$test_out" | tail -5
-grep -qE "FAILED" <<<"$test_out" && { echo "FAILED: test failures" >&2; exit 1; }
+if grep -qE "FAILED" <<<"$test_out"; then
+    # Same reasoning as above: a run can exit 0 while individual tests report FAILED, and this path
+    # used to print nothing at all beyond its own one-line verdict.
+    echo "$test_out" | grep -E "FAILED|panicked at|assertion|left ==|right ==|left:|right:" \
+        | head -40 >&2
+    echo "FAILED: test failures" >&2
+    exit 1
+fi
 
 SHA="$(git rev-parse HEAD)"
 date +%s > "${STATE_DIR}/tested-${SHA}"
