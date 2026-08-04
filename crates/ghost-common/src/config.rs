@@ -2437,6 +2437,14 @@ pub enum BlockPriority {
 /// Pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
+    /// DNS name miners are expected to reach this pool on, e.g. `pool.example.org`.
+    ///
+    /// Optional and unset by default: it is operator-specific, so no domain is baked into the binary.
+    /// When set, `--status` resolves it and reports whether THIS node is in the answer — a direct
+    /// observation rather than a central service's claim, and the check that would have caught #596
+    /// (four nodes absent from the mining DNS for weeks while all reporting healthy).
+    #[serde(default)]
+    pub mining_dns_name: Option<String>,
     /// Treasury address for pool fees
     ///
     /// Can be either:
@@ -2540,6 +2548,8 @@ impl PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
+            // Operator-specific; no domain baked in. `--status` skips the DNS check when unset.
+            mining_dns_name: None,
             // Default placeholder - MUST be configured in production
             treasury_address: TreasuryAddress::default(),
             min_payout_sats: 100_000, // 0.001 BTC minimum

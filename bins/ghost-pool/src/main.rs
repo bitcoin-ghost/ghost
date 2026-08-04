@@ -687,30 +687,33 @@ struct Args {
     dry_run: bool,
 }
 
-/// Handle --status command: query and display node status from registry
+/// Handle `--status`: report what THIS node can establish about itself (B4).
+///
+/// This used to query a central registry for its own status, and printed "Registry not configured" when
+/// the `[registry]` block was absent — which it is on every node in the fleet, so the command told an
+/// operator nothing. The registry is being deleted; three of its fields could not be repointed at
+/// anything because they only meant something relative to a central service:
+///
+/// - `registered` — there is no authority to be registered with
+/// - `rank_in_region`, `total_in_region` — nothing ranks nodes any more
+///
+/// Reproducing those would be reimplementing the service being removed. What replaces them is what a
+/// node can observe for itself: its own `/health`, its own peer count, and — for `in_dns` — resolving
+/// the mining name and looking for itself in the answer.
 async fn handle_status_command(
     config: &NodeConfig,
     identity: &NodeIdentity,
     watch_interval: Option<u64>,
 ) -> Result<()> {
-    use ghost_pool::registry::NodeStatusResponse;
-
-    let Some(ref registry_config) = config.registry else {
-        println!("Registry not configured in config file.");
-        println!("Add [registry] section with url and region to enable load balancing.");
-        return Ok(());
-    };
-
-    // Create a simple HTTP client to query status
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let node_id = identity.node_id_hex();
-    let url = format!("{}/api/v1/nodes/{}/status", registry_config.url, node_id);
+    // The node's own API, not a peer's and not a central service's.
+    let health_url = format!("http://127.0.0.1:{}/health", config.network.http_port);
 
     loop {
-        // Clear screen in watch mode
         if watch_interval.is_some() {
             print!("\x1B[2J\x1B[1;1H");
         }
@@ -719,133 +722,125 @@ async fn handle_status_command(
         println!("║                    Ghost Pool Status                          ║");
         println!("╚══════════════════════════════════════════════════════════════╝");
         println!();
-
-        println!("Registry:    {}", registry_config.url);
         println!("Node ID:     {} ({})", identity.node_id_short(), node_id);
-        println!();
 
-        match client.get(&url).send().await {
+        match client.get(&health_url).send().await {
+            Ok(response) if response.status().is_success() => {
+                let body: serde_json::Value = response.json().await?;
+                // /health answers {"signed":…,"response":{…}} on mainnet; accept both shapes rather
+                // than depending on which is in force.
+                let h = body.get("response").unwrap_or(&body);
+                print_local_status(h);
+            }
             Ok(response) => {
-                if response.status().is_success() {
-                    let api_resp: serde_json::Value = response.json().await?;
-
-                    if let Some(data) = api_resp.get("data") {
-                        let status: NodeStatusResponse = serde_json::from_value(data.clone())?;
-                        print_status(&status);
-                    } else if let Some(error) = api_resp.get("error") {
-                        println!("Error: {}", error);
-                    }
-                } else if response.status().as_u16() == 404 {
-                    println!("Status:      NOT REGISTERED");
-                    println!();
-                    println!("This node is not registered with the registry.");
-                    println!("Start the pool service to register automatically.");
-                } else {
-                    println!("Error: Registry returned status {}", response.status());
-                }
+                println!("Status:      ○ API returned {}", response.status());
+                println!();
+                println!("The pool service is listening but its health endpoint is unhappy.");
             }
             Err(e) => {
-                println!("Error:       Could not connect to registry");
-                println!("             {}", e);
+                println!("Status:      ○ NOT RUNNING (or API unreachable)");
+                println!("             {e}");
                 println!();
-                println!("Check that the registry is running and accessible.");
+                println!("Check: systemctl status ghost-pool");
             }
         }
 
-        // Exit if not in watch mode
+        // in_dns: resolve the mining name and look for ourselves. A direct observation, and the check
+        // that would have caught #596 — four nodes absent from DNS for weeks while reporting healthy.
+        println!();
+        match config.pool.mining_dns_name.as_deref() {
+            None => println!(
+                "In mining DNS: ? not checked — set `mining_dns_name` under [pool] to have this node \
+                 verify it is actually in the DNS answer miners resolve"
+            ),
+            Some(name) => match mining_dns_membership(name).await {
+                ghost_pool::InDns::Yes => {
+                    println!("In mining DNS: ● yes — this node receives miners")
+                }
+                ghost_pool::InDns::No => println!(
+                    "In mining DNS: ○ NO — {name} does not resolve to this node, so it receives no \
+                     miners from the pool address"
+                ),
+                ghost_pool::InDns::Unknown => println!(
+                    "In mining DNS: ? could not determine ({name} did not resolve, or local \
+                     addresses unavailable) — this is NOT a report that the node is absent"
+                ),
+            },
+        }
+
         let Some(interval) = watch_interval else {
             break;
         };
-
         println!();
-        println!("─────────────────────────────────────────────────────────────────");
-        println!("Refreshing every {}s. Press Ctrl+C to exit.", interval);
-
+        println!("Refreshing every {interval}s — Ctrl-C to stop");
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
     }
 
     Ok(())
 }
 
-/// Print formatted status output
-fn print_status(status: &ghost_pool::registry::NodeStatusResponse) {
-    // Status indicator
-    let status_icon = if status.in_dns { "●" } else { "○" };
-    let status_text = if status.in_dns {
-        "IN DNS (receiving miners)"
-    } else {
-        "NOT IN DNS"
+/// Resolve the mining name and decide whether one of our own addresses is in the answer.
+///
+/// Both halves can fail independently, and either failure means `Unknown` rather than `No`, because
+/// reporting absence on a resolver problem points the operator at the wrong thing.
+async fn mining_dns_membership(name: &str) -> ghost_pool::InDns {
+    use std::net::IpAddr;
+
+    let resolved: Vec<IpAddr> = match tokio::net::lookup_host(format!("{name}:0")).await {
+        Ok(it) => it.map(|s| s.ip()).collect(),
+        Err(_) => Vec::new(),
     };
+    let local: Vec<IpAddr> = local_ip_addresses().unwrap_or_default();
+    ghost_pool::is_in_mining_dns(&resolved, &local)
+}
 
-    println!("Status:      {} {}", status_icon, status_text);
+/// This node's own routable addresses, via the OS.
+///
+/// Uses `hostname -I` rather than a crate: it is already how every deploy script on this fleet reads a
+/// node's address, so the two agree by construction.
+fn local_ip_addresses() -> Option<Vec<std::net::IpAddr>> {
+    let out = std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: Vec<std::net::IpAddr> = text
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Render the node's own health document.
+fn print_local_status(h: &serde_json::Value) {
+    let healthy = h.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
+    let icon = if healthy { "●" } else { "○" };
+    println!(
+        "Status:      {icon} {}",
+        if healthy { "HEALTHY" } else { "UNHEALTHY" }
+    );
     println!();
 
-    // Details
-    println!("┌─ Load Balancer Status ─────────────────────────────────────┐");
+    let g = |k: &str| h.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    println!("Version:     {}", g("version"));
+    println!("Block height:{}", g("block_height"));
+    println!("Round:       {}", g("round_id"));
+    println!("Miners:      {}", g("miner_count"));
+    println!("Peers:       {}", g("peer_count"));
+    println!("Uptime (s):  {}", g("uptime_secs"));
     println!(
-        "│ Registered:        {:<39} │",
-        if status.registered { "Yes" } else { "No" }
-    );
-    println!(
-        "│ In DNS:            {:<39} │",
-        if status.in_dns { "Yes" } else { "No" }
-    );
-    println!(
-        "│ Healthy:           {:<39} │",
-        if status.healthy { "Yes" } else { "No" }
-    );
-    println!(
-        "│ Accepting Miners:  {:<39} │",
-        if status.accepting_miners { "Yes" } else { "No" }
-    );
-    println!("└─────────────────────────────────────────────────────────────┘");
-    println!();
-
-    println!("┌─ Load & Ranking ────────────────────────────────────────────┐");
-    println!(
-        "│ Current Load:      {:<39} │",
-        format!("{}%", status.load_percent)
-    );
-    println!("│ Region:            {:<39} │", status.region);
-    println!(
-        "│ Rank in Region:    {:<39} │",
-        format!(
-            "{} of {} (by load)",
-            status.rank_in_region, status.healthy_in_region
-        )
-    );
-    println!(
-        "│ Total in Region:   {:<39} │",
-        format!(
-            "{} nodes ({} healthy)",
-            status.total_in_region, status.healthy_in_region
-        )
-    );
-    println!(
-        "│ Last Heartbeat:    {:<39} │",
-        format!("{}s ago", status.last_heartbeat_ago_secs)
-    );
-    println!("└─────────────────────────────────────────────────────────────┘");
-
-    // Exclusion reason if any
-    if let Some(ref reason) = status.exclusion_reason {
-        println!();
-        println!("┌─ Exclusion Reason ─────────────────────────────────────────┐");
-        println!("│ {:<59} │", reason);
-        println!("└─────────────────────────────────────────────────────────────┘");
-    }
-
-    // Tips
-    if !status.in_dns {
-        println!();
-        println!("Tip: Node is not receiving miners because it's excluded from DNS.");
-        if status.excluded_for_load {
-            println!("     Load is ≥80%. Will resume when load drops below 70%.");
-        } else if !status.healthy {
-            println!("     Node marked unhealthy. Check heartbeat connectivity.");
-        } else if !status.accepting_miners {
-            println!("     Node is not accepting miners. Check configuration.");
+        "Bitcoin RPC: {}",
+        if h.get("core_reachable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            "reachable"
+        } else {
+            "UNREACHABLE"
         }
+    );
+    if let Some(caps) = h.get("capabilities") {
+        println!("Capabilities:{caps}");
     }
 }
 
