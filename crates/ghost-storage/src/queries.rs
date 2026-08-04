@@ -9255,22 +9255,40 @@ impl Database {
     /// Returns the LOWEST gap so repeated calls walk the range forward deterministically rather
     /// than re-requesting the same window. A node with no checkpoints has no interior gap.
     pub fn lowest_l2_checkpoint_gap(&self) -> GhostResult<Option<(u64, u64)>> {
+        Ok(self.lowest_l2_checkpoint_gaps(1)?.into_iter().next())
+    }
+
+    /// The `limit` lowest interior gaps, ascending, each as `(gap_start, gap_end)` inclusive.
+    ///
+    /// The single-gap form above is not enough on its own: a gap whose checkpoint payloads have
+    /// been pruned away can never be filled, and asking for only the lowest one means the node
+    /// re-derives that same dead gap every round and never looks at the fillable gaps above it
+    /// (#621). Callers walk this list and skip the gaps they have been told are unfillable.
+    pub fn lowest_l2_checkpoint_gaps(&self, limit: u64) -> GhostResult<Vec<(u64, u64)>> {
         self.with_connection(|conn| {
-            // The first height whose successor is absent, paired with the next height present
-            // above it. Bounded by the stored range, so a node that is merely behind the tip
-            // (no interior hole) yields None rather than the whole future.
-            conn.query_row(
-                "SELECT c.height + 1, (SELECT MIN(n.height) FROM l2_checkpoints n WHERE n.height > c.height) - 1
-                 FROM l2_checkpoints c
-                 WHERE c.height < (SELECT MAX(height) FROM l2_checkpoints)
-                   AND NOT EXISTS (SELECT 1 FROM l2_checkpoints x WHERE x.height = c.height + 1)
-                 ORDER BY c.height
-                 LIMIT 1",
-                [],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .optional()
-            .map_err(|e| GhostError::Database(e.to_string()))
+            // Each height whose successor is absent, paired with the next height present above
+            // it. Bounded by the stored range, so a node that is merely behind the tip (no
+            // interior hole) yields nothing rather than the whole future.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.height + 1, (SELECT MIN(n.height) FROM l2_checkpoints n WHERE n.height > c.height) - 1
+                     FROM l2_checkpoints c
+                     WHERE c.height < (SELECT MAX(height) FROM l2_checkpoints)
+                       AND NOT EXISTS (SELECT 1 FROM l2_checkpoints x WHERE x.height = c.height + 1)
+                     ORDER BY c.height
+                     LIMIT ?1",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let gaps = stmt
+                .query_map(params![limit as i64], |r| {
+                    Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            Ok(gaps)
         })
     }
 
@@ -10328,6 +10346,53 @@ mod tests {
             db.lowest_l2_checkpoint_gap().unwrap(),
             Some((105, 107)),
             "must report the LOWEST gap so repeated calls walk forward deterministically"
+        );
+    }
+
+    /// Several gaps must be visible at once, ascending.
+    ///
+    /// One gap is not enough: if the lowest one can never be filled (its checkpoint payloads
+    /// were pruned away), a caller that can only see that gap re-asks for it every round and
+    /// never reaches the fillable gaps above it — vm1 sat on height 269433 forever (#621).
+    #[test]
+    fn lowest_l2_checkpoint_gaps_returns_several_gaps_ascending() {
+        let db = Database::in_memory().expect("in-memory db");
+        assert!(
+            db.lowest_l2_checkpoint_gaps(8).unwrap().is_empty(),
+            "empty ledger has no gaps"
+        );
+
+        db.with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO l2_epochs (epoch, start_height, initial_root) VALUES (0, 0, X'00');
+                 INSERT INTO l2_checkpoints
+                   (height, epoch, commitment_root, tx_count, proposer_id, active_node_count, block_data)
+                 VALUES (10,0,X'00',0,'p',1,X'00'), (14,0,X'00',0,'p',1,X'00'),
+                        (15,0,X'00',0,'p',1,X'00'), (20,0,X'00',0,'p',1,X'00'),
+                        (21,0,X'00',0,'p',1,X'00'), (30,0,X'00',0,'p',1,X'00');",
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("seed");
+
+        assert_eq!(
+            db.lowest_l2_checkpoint_gaps(8).unwrap(),
+            vec![(11, 13), (16, 19), (22, 29)],
+            "every interior gap, lowest first"
+        );
+
+        // The limit must bind, or a node with thousands of holes scans them all every round.
+        assert_eq!(
+            db.lowest_l2_checkpoint_gaps(2).unwrap(),
+            vec![(11, 13), (16, 19)],
+            "limit caps the candidates and keeps the lowest ones"
+        );
+
+        // The single-gap form is the same query — it must agree with the head of the list.
+        assert_eq!(
+            db.lowest_l2_checkpoint_gap().unwrap(),
+            Some((11, 13)),
+            "the single-gap form must stay the head of the list"
         );
     }
 
