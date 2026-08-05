@@ -697,6 +697,67 @@ BOOST_AUTO_TEST_CASE(reconnecting_a_stripped_block_refetches_instead_of_dying)
     chainman.CheckBlockIndex();
 }
 
+// ============================================================================
+// Binding an archive to a proof (G5, hazync#46)
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(chain_binding_refuses_a_proof_about_another_chain)
+{
+    // The definition of done for G5 is not that the binding succeeds — it is that it REFUSES when
+    // the proof does not commit to the tip the node holds. A proof about some other chain says
+    // nothing about this one, and reporting it as evidence would invert the entire claim.
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+
+    int height{0};
+    uint256 real_tip;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        BOOST_REQUIRE(tip);
+        height = tip->nHeight;
+        real_tip = tip->GetBlockHash();
+    }
+    BOOST_REQUIRE_GT(height, 2);
+
+    haze::HazyncProofState proven;
+    proven.height = static_cast<uint32_t>(height);
+    proven.tip_hash = real_tip;
+
+    // The control. Without it every refusal below could be a refusal of everything — including a
+    // binding that is broken outright.
+    haze::HazedChainBinding ok;
+    BOOST_REQUIRE(haze::VerifyHazedChainBinding(chainman, proven, 1, ok));
+    BOOST_CHECK_EQUAL(ok.blocks_checked, height);
+    BOOST_CHECK(ok.complete);
+    BOOST_CHECK(ok.archive_tip == real_tip);
+    BOOST_CHECK(ok.failure.empty());
+
+    // A proof committing to a different tip at the same height: refused, and said to be about
+    // another chain rather than merely "failed".
+    haze::HazyncProofState wrong_chain{proven};
+    wrong_chain.tip_hash = uint256::ONE;
+    haze::HazedChainBinding refused;
+    BOOST_CHECK(!haze::VerifyHazedChainBinding(chainman, wrong_chain, 1, refused));
+    BOOST_CHECK(refused.failure.find("REFUSED") != std::string::npos);
+    BOOST_CHECK(refused.failure.find("not about this chain") != std::string::npos);
+    // Nothing was walked: the join is checked before the expensive pass, so a proof about another
+    // chain costs one comparison rather than thousands of merkle roots.
+    BOOST_CHECK_EQUAL(refused.blocks_checked, 0);
+
+    // A proof reaching beyond what this node holds is refused too, and distinguishably.
+    haze::HazyncProofState too_high{proven};
+    too_high.height = static_cast<uint32_t>(height) + 1000;
+    haze::HazedChainBinding beyond;
+    BOOST_CHECK(!haze::VerifyHazedChainBinding(chainman, too_high, 1, beyond));
+    BOOST_CHECK(beyond.failure.find("does not reach") != std::string::npos);
+
+    // A suffix run binds but must not claim to have established the whole chain.
+    haze::HazedChainBinding suffix;
+    BOOST_REQUIRE(haze::VerifyHazedChainBinding(chainman, proven, height - 1, suffix));
+    BOOST_CHECK(!suffix.complete);
+    BOOST_CHECK_EQUAL(suffix.blocks_checked, 2);
+}
+
 BOOST_AUTO_TEST_CASE(reconstruct_meta_flags)
 {
     CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));

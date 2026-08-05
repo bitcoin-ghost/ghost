@@ -3593,6 +3593,86 @@ static RPCHelpMan hazyncadoptsnapshot()
     };
 }
 
+static RPCHelpMan hazyncverifychain()
+{
+    return RPCHelpMan{
+        "hazyncverifychain",
+        "Establish, from this node's own stripped archive, that the chain it holds is the real chain "
+        "and ends where its Hazync proof says it does.\n\n"
+
+        "This is the half a proof cannot supply. A proof attests that the transactions in a range were "
+        "VALID; it says nothing about whether this node holds that range. A hazed archive answers that "
+        "and only that — stripping destroys witnesses and scriptSigs but keeps the txids, and a txid "
+        "that had to be stored verbatim is not taken on trust, because the merkle root is recomputed "
+        "from whatever txids the block yields and must match its header.\n\n"
+
+        "Identity from the archive, validity from the proof. This is the join.\n\n"
+
+        "REFUSES when the proof does not commit to the tip this node holds — a proof about some other "
+        "chain must not be reported as evidence about this one.\n\n"
+
+        "Requires -hazyncproof. Reads every block in the range from disk, so it is slow over a long "
+        "one; use -rpcclienttimeout=0.",
+        {
+            {"from_height", RPCArg::Type::NUM, RPCArg::Default{1},
+             "First height to check. 1 establishes the whole chain. A higher value checks only a "
+             "suffix, which is cheaper and proves correspondingly less."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::BOOL, "bound", "whether the archive is bound to the proof"},
+                    {RPCResult::Type::NUM, "from_height", "first height checked"},
+                    {RPCResult::Type::NUM, "through_height", "last height checked, always the proven height"},
+                    {RPCResult::Type::NUM, "blocks_checked", "how many blocks were read and recomputed"},
+                    {RPCResult::Type::BOOL, "complete", "true only if checked from height 1, i.e. the whole chain rather than a suffix"},
+                    {RPCResult::Type::STR_HEX, "archive_tip", "tip the archive itself yields at the proven height"},
+                    {RPCResult::Type::STR_HEX, "proven_tip", "tip the proof commits to"},
+                    {RPCResult::Type::STR, "failure", /*optional=*/true, "why the binding does not hold, if it does not"},
+                }
+        },
+        RPCExamples{
+            HelpExampleCli("-rpcclienttimeout=0 hazyncverifychain", "")
+            + HelpExampleRpc("hazyncverifychain", "1")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+
+    const auto& proven{haze::HazyncVerifiedProof()};
+    if (!proven) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+            "no verified Hazync proof — start with -hazyncproof=<file>. Without one there is nothing "
+            "to bind the archive to.");
+    }
+
+    const int from_height{self.Arg<int>("from_height")};
+
+    haze::HazedChainBinding result;
+    const bool bound{haze::VerifyHazedChainBinding(chainman, *proven, from_height, result)};
+
+    if (bound) {
+        LogInfo("[hazync] archive BOUND to proof: %d blocks checked through height %d%s\n",
+                result.blocks_checked, result.through_height,
+                result.complete ? ", from genesis" : " (suffix only)");
+    } else {
+        LogWarning("[hazync] archive NOT bound to proof: %s\n", result.failure);
+    }
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("bound", bound);
+    obj.pushKV("from_height", result.from_height);
+    obj.pushKV("through_height", result.through_height);
+    obj.pushKV("blocks_checked", result.blocks_checked);
+    obj.pushKV("complete", result.complete);
+    obj.pushKV("archive_tip", result.archive_tip.GetHex());
+    obj.pushKV("proven_tip", proven->tip_hash.GetHex());
+    if (!bound) obj.pushKV("failure", result.failure);
+    return obj;
+},
+    };
+}
+
 const std::vector<RPCResult> RPCHelpForChainstate{
     {RPCResult::Type::NUM, "blocks", "number of blocks in this chainstate"},
     {RPCResult::Type::STR_HEX, "bestblockhash", "blockhash of the tip"},
@@ -3880,6 +3960,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &hazyncadoptsnapshot},
+        {"blockchain", &hazyncverifychain},
         {"blockchain", &getchainstates},
         {"blockchain", &generatecheckpoint},
         {"blockchain", &downloadcheckpoint},
