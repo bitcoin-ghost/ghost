@@ -78,6 +78,24 @@ std::string HazyncErrorString(int rc);
  */
 std::optional<HazyncProofState> VerifyHazyncProof(const fs::path& proof_file, std::string& error_out);
 
+/**
+ * Check that a bridge UTXO dump is exactly the set `proven` commits to.
+ *
+ * This is the step that makes assumeutxo PROVEN rather than trusted. Core's `loadtxoutset` checks a
+ * snapshot against a hash compiled into the binary by its developers; this checks one against the
+ * accumulator roots a zk proof attests to, so the trust rests on "these blocks were valid under real
+ * consensus" instead of "someone we trust picked this hash".
+ *
+ * Takes the PROOF FILE rather than an already-parsed state, deliberately: a caller cannot then check
+ * a dump against a state that was never verified, because the API gives them no way to supply one.
+ * Re-verifying costs about a second at startup, which is nothing against the cost of that mistake.
+ *
+ * SCOPE: reports only. Nothing is loaded into a chainstate — that is a separate change and must not
+ * land before this path has been reviewed and exercised.
+ */
+bool CheckHazyncUtxoDump(const fs::path& dump_file, const fs::path& proof_file,
+                         std::string& error_out);
+
 /** Guest image id this build trusts, or empty if the verifier is not compiled in. */
 std::string HazyncMethodId();
 
@@ -95,6 +113,9 @@ void HazyncProofStartupCheck(const ArgsManager& args);
  * a proof; a line in a startup log that has since scrolled away is not an answer.
  */
 const std::optional<HazyncProofState>& HazyncVerifiedProof();
+
+/** True only if a -hazyncutxo dump was supplied AND matched the proven accumulator roots. */
+bool HazyncUtxoDumpMatched();
 
 } // namespace haze
 

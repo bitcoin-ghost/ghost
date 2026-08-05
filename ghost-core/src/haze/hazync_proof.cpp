@@ -52,6 +52,13 @@ std::string HazyncErrorString(int rc)
     case HAZYNC_ERR_SELF_ID:         return "journal self_id does not match the guest image id";
     case HAZYNC_ERR_KIND:            return "wrong domain tag — not a range proof";
     case HAZYNC_ERR_TOO_MANY_ROOTS:  return "more accumulator roots than the interface can carry";
+    case HAZYNC_ERR_DUMP_MAGIC:      return "not a Hazync UTXO dump (bad magic)";
+    case HAZYNC_ERR_DUMP_VERSION:    return "unsupported UTXO dump version — regenerate it with a matching host";
+    case HAZYNC_ERR_DUMP_HEIGHT:     return "UTXO dump is for a different height than the proof";
+    case HAZYNC_ERR_DUMP_COUNT:      return "UTXO dump holds a different number of coins than the proof commits to";
+    case HAZYNC_ERR_DUMP_TRUNC:      return "UTXO dump is truncated or has trailing bytes";
+    case HAZYNC_ERR_DUMP_POS:        return "UTXO dump positions are not a permutation of 0..n-1 — it does not describe one accumulator";
+    case HAZYNC_ERR_DUMP_ROOTS:      return "UTXO SET DOES NOT MATCH THE PROOF — rebuilt accumulator roots differ from the proven ones";
     default:                         return strprintf("unknown verifier error %d", rc);
     }
 #else
@@ -62,7 +69,11 @@ std::string HazyncErrorString(int rc)
 namespace {
 //! Set once in HazyncProofStartupCheck during init, before the RPC server starts. See header.
 std::optional<HazyncProofState> g_verified_proof;
+//! Whether a -hazyncutxo dump was supplied AND matched the proof. Same single-write discipline.
+bool g_utxo_dump_ok{false};
 } // namespace
+
+bool HazyncUtxoDumpMatched() { return g_utxo_dump_ok; }
 
 const std::optional<HazyncProofState>& HazyncVerifiedProof() { return g_verified_proof; }
 
@@ -129,6 +140,48 @@ std::optional<HazyncProofState> VerifyHazyncProof(const fs::path& proof_file, st
 #endif
 }
 
+bool CheckHazyncUtxoDump(const fs::path& dump_file, const fs::path& proof_file, std::string& error_out)
+{
+#ifndef WITH_HAZYNC_VERIFY
+    error_out = "this ghostd was built without Hazync proof support (-DWITH_HAZYNC_VERIFY=ON)";
+    return false;
+#else
+    // Re-verify rather than trust a state handed in. See the header: the API deliberately offers no
+    // way to check a dump against an unverified proof.
+    std::ifstream pf{proof_file, std::ios::binary};
+    if (!pf.good()) {
+        error_out = strprintf("cannot read proof file %s", fs::PathToString(proof_file));
+        return false;
+    }
+    std::vector<uint8_t> pbuf{std::istreambuf_iterator<char>(pf), std::istreambuf_iterator<char>()};
+
+    HazyncState proven{};
+    const int prc = hazync_verify_proof(pbuf.data(), pbuf.size(), &proven);
+    if (prc != HAZYNC_OK) {
+        error_out = strprintf("proof did not verify: %s", HazyncErrorString(prc));
+        return false;
+    }
+
+    std::ifstream df{dump_file, std::ios::binary};
+    if (!df.good()) {
+        error_out = strprintf("cannot read UTXO dump %s", fs::PathToString(dump_file));
+        return false;
+    }
+    std::vector<uint8_t> dbuf{std::istreambuf_iterator<char>(df), std::istreambuf_iterator<char>()};
+    if (dbuf.empty()) {
+        error_out = strprintf("UTXO dump %s is empty", fs::PathToString(dump_file));
+        return false;
+    }
+
+    const int rc = hazync_check_utxo_dump(dbuf.data(), dbuf.size(), &proven);
+    if (rc != HAZYNC_OK) {
+        error_out = HazyncErrorString(rc);
+        return false;
+    }
+    return true;
+#endif
+}
+
 void HazyncProofStartupCheck(const ArgsManager& args)
 {
     const auto arg = args.GetArg("-hazyncproof", "");
@@ -159,6 +212,23 @@ void HazyncProofStartupCheck(const ArgsManager& args)
     LogInfo("[hazync]   UTXO set       %llu leaves, %u accumulator roots\n",
             (unsigned long long)st->utxo_leaves, (unsigned)st->utxo_roots.size());
     LogInfo("[hazync]   next-block target 0x%08x\n", st->next_bits);
+    // -hazyncutxo is optional and only meaningful alongside a proof: a UTXO dump on its own has
+    // nothing to be checked against, which is precisely the trusted-snapshot situation this avoids.
+    const auto utxo_arg = args.GetArg("-hazyncutxo", "");
+    if (!utxo_arg.empty()) {
+        const fs::path up{fs::PathFromString(utxo_arg)};
+        std::string uerr;
+        if (CheckHazyncUtxoDump(up, p, uerr)) {
+            g_utxo_dump_ok = true;
+            LogInfo("[hazync]   UTXO dump %s MATCHES the proven set (%llu coins)\n",
+                    fs::PathToString(up), (unsigned long long)st->utxo_leaves);
+        } else {
+            // Not fatal in a report-only build, but it must be impossible to miss: this is the
+            // check that would otherwise let an unproven UTXO set in.
+            LogWarning("[hazync] UTXO dump %s REJECTED: %s\n", fs::PathToString(up), uerr);
+        }
+    }
+
     LogInfo("[hazync] NOT YET ACTED ON: this build verifies and reports only. Nothing is skipped and "
             "no chainstate is adopted — every block is still validated in full.\n");
 }

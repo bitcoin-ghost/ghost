@@ -1436,6 +1436,7 @@ RPCHelpMan getblockchaininfo()
                     {RPCResult::Type::STR_HEX, "proventip", "block hash the proof commits to at that height"},
                     {RPCResult::Type::STR_HEX, "guestid", "Hazync guest image id the proof was verified against"},
                     {RPCResult::Type::NUM, "utxoleaves", "number of leaves in the UTXO accumulator the proof commits to"},
+                    {RPCResult::Type::BOOL, "utxodumpmatched", "whether a -hazyncutxo dump was supplied and matched the proven accumulator roots"},
                     {RPCResult::Type::BOOL, "actedon", "whether validation used the proof. Currently always false: proofs are verified and reported, never acted on"},
                 }},
                 (IsDeprecatedRPCEnabled("warnings") ?
@@ -1483,6 +1484,7 @@ RPCHelpMan getblockchaininfo()
         hz.pushKV("proventip", hazync_proof->tip_hash.GetHex());
         hz.pushKV("guestid", haze::HazyncMethodId());
         hz.pushKV("utxoleaves", hazync_proof->utxo_leaves);
+        hz.pushKV("utxodumpmatched", haze::HazyncUtxoDumpMatched());
         hz.pushKV("actedon", false);
         obj.pushKV("hazync", std::move(hz));
     }
