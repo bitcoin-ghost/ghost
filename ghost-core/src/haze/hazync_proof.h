@@ -29,10 +29,12 @@ namespace haze {
  * the header) but never that they were VALID. A Hazync proof supplies exactly the missing half —
  * identity from the chain, validity from the proof.
  *
- * ── SCOPE OF THIS INCREMENT ────────────────────────────────────────────────────────────────────
- * Verify and REPORT. Nothing here changes consensus behaviour, skips validation, or alters the
- * chainstate. It exists so the verification path can be exercised, reviewed and trusted before
- * anything is allowed to act on its result. Adopting proven state during IBD is a separate change.
+ * ── SCOPE ──────────────────────────────────────────────────────────────────────────────────────
+ * Verifying and reporting is unconditional and changes nothing. ADOPTION — loading the proven UTXO
+ * set as a chainstate and validating onward from there — is off unless the operator arms it with
+ * -hazyncadopt and then asks for it explicitly over RPC, and is unreachable unless the proof
+ * verified and the dump matched. See HazyncAdoption below for how that is enforced rather than
+ * merely intended.
  *
  * Verification is delegated to the Rust implementation in the hazync repo via a C ABI
  * (hazync-verify-ffi). It is NOT reimplemented here: verifying a risc0 receipt means Groth16 over
@@ -112,6 +114,72 @@ bool CheckHazyncUtxoDump(const fs::path& dump_file, const fs::path& proof_file,
  */
 bool WriteCoreSnapshotFromDump(const fs::path& dump_file, const fs::path& out_file,
                                const uint256& base_blockhash, std::string& error_out);
+
+/**
+ * Authority to load a UTXO set at a height chainparams knows nothing about.
+ *
+ * Core's `assumeutxo` will only load a snapshot whose height its developers compiled into the
+ * binary, and it checks the coins against a hash they chose. This type replaces both halves of that
+ * arrangement: a set is admitted because a zk proof attests the chain to that height was valid under
+ * real consensus, and because that same set was shown to be exactly the one the proof commits to.
+ *
+ * The constructor is private, so the only way to obtain one is Authorise(), which returns nullopt
+ * unless adoption was explicitly armed, the proof verified AND the dump matched. Holding one is
+ * therefore evidence those checks ran. This is the point of the type: the checks cannot be skipped
+ * by a caller who simply forgot them, because there is no other way to name the thing they gate.
+ */
+class HazyncAdoption
+{
+public:
+    /**
+     * Re-derive the authority from the configured proof and dump.
+     *
+     * Deliberately re-runs verification rather than caching a verdict: an authority is only ever a
+     * statement about files as they are NOW, and re-reading them costs about a second.
+     *
+     * @return nullopt with `error_out` set whenever adoption is not authorised — including the
+     *         ordinary case of it simply not being armed, which is not an error condition.
+     */
+    static std::optional<HazyncAdoption> Authorise(const ArgsManager& args, std::string& error_out);
+
+    uint256 base_blockhash;  //!< internal order, so it compares with CBlockIndex::GetBlockHash()
+    int height{0};
+    uint64_t coins_count{0}; //!< leaves in the proven accumulator; the snapshot must hold exactly this many
+
+    /**
+     * Bootstrap value for CBlockIndex::m_chain_tx_count at the base block.
+     *
+     * ⚠ This is NOT a proven transaction count — the guest's RangeState commits no such figure, so
+     * there is none to adopt. It is `height + 1`, a genuine LOWER BOUND (every block carries at
+     * least a coinbase), chosen over a plausible-looking guess because a fabricated number here
+     * would be indistinguishable from a proven one.
+     *
+     * Only its NON-ZERO-ness is load-bearing: CBlockIndex::HaveNumChainTxs() gates entry to
+     * setBlockIndexCandidates, and CheckBlockIndex asserts the snapshot base has it set. The
+     * magnitude feeds GuessVerificationProgress alone, which is reporting only — so a node that
+     * adopts a proof UNDER-REPORTS `verificationprogress` until the background chain catches up.
+     * The fix is a transaction count in the guest journal, which costs a METHOD_ID re-baseline and
+     * should ride along with the next one rather than force its own.
+     */
+    uint64_t chain_tx_count_bootstrap{0};
+
+private:
+    HazyncAdoption() = default;
+};
+
+/**
+ * The adoption authority this node was started with, or nullopt if adoption was not armed or its
+ * preconditions did not hold.
+ *
+ * Set once during init before the chainstate is loaded, and never mutated — same discipline as
+ * HazyncVerifiedProof(), and for the same reason: readers need no lock.
+ *
+ * ⚠ This is the AMBIENT authority, used where a call chain cannot carry one: bootstrapping snapshot
+ * metadata on restart, and deciding there is no background validation left to complete. It is
+ * deliberately NOT what admits coins — ActivateSnapshot takes an explicit HazyncAdoption pointer, so
+ * `loadtxoutset` cannot pick this up by accident and load an arbitrary file on a proof's authority.
+ */
+const std::optional<HazyncAdoption>& HazyncAdoptedSnapshot();
 
 /** Guest image id this build trusts, or empty if the verifier is not compiled in. */
 std::string HazyncMethodId();

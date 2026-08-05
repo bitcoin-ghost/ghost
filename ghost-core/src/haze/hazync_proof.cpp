@@ -79,11 +79,15 @@ namespace {
 std::optional<HazyncProofState> g_verified_proof;
 //! Whether a -hazyncutxo dump was supplied AND matched the proof. Same single-write discipline.
 bool g_utxo_dump_ok{false};
+//! The armed adoption authority, if any. Same single-write discipline.
+std::optional<HazyncAdoption> g_adoption;
 } // namespace
 
 bool HazyncUtxoDumpMatched() { return g_utxo_dump_ok; }
 
 const std::optional<HazyncProofState>& HazyncVerifiedProof() { return g_verified_proof; }
+
+const std::optional<HazyncAdoption>& HazyncAdoptedSnapshot() { return g_adoption; }
 
 std::optional<HazyncProofState> VerifyHazyncProof(const fs::path& proof_file, std::string& error_out)
 {
@@ -273,10 +277,62 @@ bool WriteCoreSnapshotFromDump(const fs::path& dump_file, const fs::path& out_fi
     return true;
 }
 
+std::optional<HazyncAdoption> HazyncAdoption::Authorise(const ArgsManager& args, std::string& error_out)
+{
+    // Off unless armed. Supplying a proof must not, on its own, put a node one RPC call away from
+    // replacing its chainstate — arming is a separate, deliberate act by the operator.
+    if (!args.GetBoolArg("-hazyncadopt", false)) {
+        error_out = "adoption is not armed; start with -hazyncadopt to allow it";
+        return std::nullopt;
+    }
+
+    const auto proof_arg{args.GetArg("-hazyncproof", "")};
+    if (proof_arg.empty()) {
+        error_out = "-hazyncadopt requires -hazyncproof: without a verified proof there is no "
+                    "authority to adopt anything, and adoption would be trusted assumeutxo";
+        return std::nullopt;
+    }
+    const auto utxo_arg{args.GetArg("-hazyncutxo", "")};
+    if (utxo_arg.empty()) {
+        error_out = "-hazyncadopt requires -hazyncutxo: a proof attests that a chain was valid, but "
+                    "only a matching UTXO dump says WHICH set of coins that chain arrived at";
+        return std::nullopt;
+    }
+
+    const fs::path proof_path{fs::PathFromString(proof_arg)};
+    const fs::path dump_path{fs::PathFromString(utxo_arg)};
+
+    std::string err;
+    const auto st{VerifyHazyncProof(proof_path, err)};
+    if (!st) {
+        error_out = strprintf("proof %s did not verify: %s", fs::PathToString(proof_path), err);
+        return std::nullopt;
+    }
+    if (!CheckHazyncUtxoDump(dump_path, proof_path, err)) {
+        error_out = strprintf("UTXO dump %s is not the set the proof commits to: %s",
+                              fs::PathToString(dump_path), err);
+        return std::nullopt;
+    }
+
+    HazyncAdoption a;
+    a.base_blockhash = st->tip_hash;
+    a.height = static_cast<int>(st->height);
+    a.coins_count = st->utxo_leaves;
+    a.chain_tx_count_bootstrap = static_cast<uint64_t>(st->height) + 1; // lower bound; see header
+    return a;
+}
+
 void HazyncProofStartupCheck(const ArgsManager& args)
 {
+    const bool armed{args.GetBoolArg("-hazyncadopt", false)};
     const auto arg = args.GetArg("-hazyncproof", "");
-    if (arg.empty()) return;
+    if (arg.empty()) {
+        if (armed) {
+            LogWarning("[hazync] -hazyncadopt was given without -hazyncproof. Adoption is DISARMED: "
+                       "there is nothing to derive authority from.\n");
+        }
+        return;
+    }
 
     if (!HazyncVerifyAvailable()) {
         LogWarning("-hazyncproof was given but this ghostd was built without Hazync proof support; "
@@ -288,9 +344,15 @@ void HazyncProofStartupCheck(const ArgsManager& args)
     std::string err;
     const auto st = VerifyHazyncProof(p, err);
     if (!st) {
-        // Deliberately not fatal: this increment only REPORTS. A bad proof must be impossible to
-        // miss in the log, but it cannot yet affect how this node validates anything.
+        // Deliberately not fatal: a refused proof leaves the node validating everything itself,
+        // which is the safe posture, not a broken one. It must still be impossible to miss.
         LogWarning("[hazync] proof %s REJECTED: %s\n", fs::PathToString(p), err);
+        if (armed) {
+            // Say it explicitly. An operator who asked for adoption and sees only a proof-level
+            // complaint has been told what went wrong but not what it cost them.
+            LogWarning("[hazync] Adoption is DISARMED: the proof was refused, so there is no "
+                       "authority to adopt anything.\n");
+        }
         return;
     }
 
@@ -335,8 +397,28 @@ void HazyncProofStartupCheck(const ArgsManager& args)
         }
     }
 
-    LogInfo("[hazync] NOT YET ACTED ON: this build verifies and reports only. Nothing is skipped and "
-            "no chainstate is adopted — every block is still validated in full.\n");
+    if (!armed) {
+        LogInfo("[hazync] NOT ACTED ON: nothing is skipped and no chainstate is adopted — every block "
+                "is still validated in full. Start with -hazyncadopt to allow adoption.\n");
+        return;
+    }
+
+    // Re-derive rather than assemble an authority from the results above. It costs a second run of
+    // both checks, which is the price of the authority being a statement about the files as they
+    // are, produced by exactly one code path — the same one the RPC uses.
+    std::string aerr;
+    g_adoption = HazyncAdoption::Authorise(args, aerr);
+    if (!g_adoption) {
+        // Loud, and a designed state rather than a stall: the node runs on, validating everything.
+        LogWarning("[hazync] -hazyncadopt was given but adoption is NOT AUTHORISED: %s\n", aerr);
+        return;
+    }
+
+    LogInfo("[hazync] ADOPTION ARMED at height %d, base %s, %llu coins.\n",
+            g_adoption->height, g_adoption->base_blockhash.GetHex(),
+            (unsigned long long)g_adoption->coins_count);
+    LogInfo("[hazync] Nothing has been adopted yet — call `hazyncadoptsnapshot` once headers reach "
+            "that height. Until then every block is validated in full.\n");
 }
 
 } // namespace haze

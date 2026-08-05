@@ -5817,7 +5817,8 @@ Chainstate& ChainstateManager::InitializeChainstate(CTxMemPool* mempool)
 util::Result<CBlockIndex*> ChainstateManager::ActivateSnapshot(
         AutoFile& coins_file,
         const SnapshotMetadata& metadata,
-        bool in_memory)
+        bool in_memory,
+        const haze::HazyncAdoption* hazync_authority)
 {
     uint256 base_blockhash = metadata.m_base_blockhash;
 
@@ -5825,12 +5826,22 @@ util::Result<CBlockIndex*> ChainstateManager::ActivateSnapshot(
         return util::Error{Untranslated("Can't activate a snapshot-based chainstate more than once")};
     }
 
+    // An authority is only ever an authority for the ONE base block its proof committed to. Dropping
+    // it here rather than checking piecemeal further down means every later use is already narrowed
+    // to this snapshot, and a mismatched pairing cannot reach the coin-loading path at all.
+    if (hazync_authority && hazync_authority->base_blockhash != base_blockhash) {
+        return util::Error{Untranslated(strprintf(
+            "Hazync proof commits to base block %s but this snapshot is based on %s — refusing to "
+            "load one on the other's authority",
+            hazync_authority->base_blockhash.ToString(), base_blockhash.ToString()))};
+    }
+
     CBlockIndex* snapshot_start_block{};
 
     {
         LOCK(::cs_main);
 
-        if (!GetParams().AssumeutxoForBlockhash(base_blockhash).has_value()) {
+        if (!GetParams().AssumeutxoForBlockhash(base_blockhash).has_value() && !hazync_authority) {
             auto available_heights = GetParams().GetAvailableSnapshotHeights();
             std::string heights_formatted = util::Join(available_heights, ", ", [&](const auto& i) { return util::ToString(i); });
             return util::Error{Untranslated(strprintf("assumeutxo block hash in snapshot metadata not recognized (hash: %s). The following snapshot heights are available: %s",
@@ -5923,7 +5934,7 @@ util::Result<CBlockIndex*> ChainstateManager::ActivateSnapshot(
         return util::Error{std::move(reason)};
     };
 
-    if (auto res{this->PopulateAndValidateSnapshot(*snapshot_chainstate, coins_file, metadata)}; !res) {
+    if (auto res{this->PopulateAndValidateSnapshot(*snapshot_chainstate, coins_file, metadata, hazync_authority)}; !res) {
         LOCK(::cs_main);
         return cleanup_bad_snapshot(Untranslated(strprintf("Population failed: %s", util::ErrorString(res).original)));
     }
@@ -5974,6 +5985,18 @@ util::Result<CBlockIndex*> ChainstateManager::ActivateSnapshot(
         this->MaybeRebalanceCaches();
     }
 
+    // A proof-adopted snapshot has nothing left to confirm. Core keeps a background chainstate
+    // because its snapshot is TRUSTED and must eventually be checked against a chain the node
+    // validated itself; here that chain has already been validated, under real consensus, by the
+    // guest the proof was verified against. Re-validating blocks 1..N from the network would be the
+    // very work the proof exists to replace — so it is not merely skipped, it is refused.
+    if (hazync_authority && m_ibd_chainstate) {
+        LogInfo("[snapshot] Hazync: disabling background IBD — validity to height %d is established "
+                "by the proof, not by re-downloading the chain below it", hazync_authority->height);
+        m_ibd_chainstate->m_disabled = true;
+        this->MaybeRebalanceCaches();
+    }
+
     return snapshot_start_block;
 }
 
@@ -6004,7 +6027,8 @@ static void SnapshotUTXOHashBreakpoint(const util::SignalInterrupt& interrupt)
 util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
     Chainstate& snapshot_chainstate,
     AutoFile& coins_file,
-    const SnapshotMetadata& metadata)
+    const SnapshotMetadata& metadata,
+    const haze::HazyncAdoption* hazync_authority)
 {
     // It's okay to release cs_main before we're done using `coins_cache` because we know
     // that nothing else will be referencing the newly created snapshot_chainstate yet.
@@ -6024,12 +6048,34 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
     int base_height = snapshot_start_block->nHeight;
     const auto& maybe_au_data = GetParams().AssumeutxoForHeight(base_height);
 
-    if (!maybe_au_data) {
+    // A Hazync proof is the second way a snapshot may be admitted, and the only one that does not
+    // rest on a figure the developers of this software chose. It must pin down the same block, at
+    // the same height, holding the same number of coins as the proof committed to — anything less
+    // and the "proven" set would be some other set that merely arrived under a proof's cover.
+    bool hazync_authorised{false};
+    if (hazync_authority) {
+        if (hazync_authority->base_blockhash != base_blockhash) {
+            return util::Error{Untranslated(strprintf("Hazync proof commits to base block %s, not %s",
+                      hazync_authority->base_blockhash.ToString(), base_blockhash.ToString()))};
+        }
+        if (hazync_authority->height != base_height) {
+            return util::Error{Untranslated(strprintf("Hazync proof attests height %d but the base "
+                      "block %s sits at height %d in this node's headers chain - refusing to load "
+                      "snapshot", hazync_authority->height, base_blockhash.ToString(), base_height))};
+        }
+        if (hazync_authority->coins_count != metadata.m_coins_count) {
+            return util::Error{Untranslated(strprintf("Hazync proof commits to %llu coins but the "
+                      "snapshot declares %llu - refusing to load snapshot",
+                      (unsigned long long)hazync_authority->coins_count,
+                      (unsigned long long)metadata.m_coins_count))};
+        }
+        hazync_authorised = true;
+    }
+
+    if (!maybe_au_data && !hazync_authorised) {
         return util::Error{Untranslated(strprintf("Assumeutxo height in snapshot metadata not recognized "
                   "(%d) - refusing to load snapshot", base_height))};
     }
-
-    const AssumeutxoData& au_data = *maybe_au_data;
 
     // This work comparison is a duplicate check with the one performed later in
     // ActivateSnapshot(), but is done so that we avoid doing the long work of staging
@@ -6146,22 +6192,44 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
     // about the snapshot_chainstate.
     CCoinsViewDB* snapshot_coinsdb = WITH_LOCK(::cs_main, return &snapshot_chainstate.CoinsDB());
 
-    std::optional<CCoinsStats> maybe_stats;
+    // Where chainparams DOES know this height, its hash is still checked, proof or no proof. Two
+    // independent authorities disagreeing about the same UTXO set would mean one of them is wrong,
+    // and that must be loud rather than resolved silently in favour of whichever is newer.
+    if (!maybe_au_data) {
+        // Deliberately no content hash here, and no ComputeUTXOStats pass to produce one. Core's
+        // check compares this set against `au_data.hash_serialized` — a MuHash over the coins that
+        // its developers computed and compiled in. A Hazync proof cannot satisfy that check and is
+        // not meant to: it commits Utreexo accumulator roots, a different commitment over a
+        // different thing, so at a height chainparams never heard of the check is REPLACED rather
+        // than passed.
+        //
+        // What replaced it already ran, before this chainstate existed: CheckHazyncUtxoDump rebuilt
+        // the accumulator from the dump's (leaf, position) pairs and compared its roots against the
+        // roots the verified proof commits to. The coins loaded above were written from that same
+        // dump, in this process, from a file unlinked before it was read (see the RPC), so there is
+        // no window in which a different set could have taken its place. Re-hashing them here would
+        // cost minutes at mainnet scale and would have nothing to compare the result against.
+        Assume(hazync_authorised);
+        LogInfo("[snapshot] Hazync: %d coins admitted on the authority of a verified proof at height "
+                "%d — no developer-chosen hash is involved", metadata.m_coins_count, base_height);
+    } else {
+        std::optional<CCoinsStats> maybe_stats;
 
-    try {
-        maybe_stats = ComputeUTXOStats(
-            CoinStatsHashType::HASH_SERIALIZED, snapshot_coinsdb, m_blockman, [&interrupt = m_interrupt] { SnapshotUTXOHashBreakpoint(interrupt); });
-    } catch (StopHashingException const&) {
-        return util::Error{Untranslated("Aborting after an interrupt was requested")};
-    }
-    if (!maybe_stats.has_value()) {
-        return util::Error{Untranslated("Failed to generate coins stats")};
-    }
+        try {
+            maybe_stats = ComputeUTXOStats(
+                CoinStatsHashType::HASH_SERIALIZED, snapshot_coinsdb, m_blockman, [&interrupt = m_interrupt] { SnapshotUTXOHashBreakpoint(interrupt); });
+        } catch (StopHashingException const&) {
+            return util::Error{Untranslated("Aborting after an interrupt was requested")};
+        }
+        if (!maybe_stats.has_value()) {
+            return util::Error{Untranslated("Failed to generate coins stats")};
+        }
 
-    // Assert that the deserialized chainstate contents match the expected assumeutxo value.
-    if (AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized) {
-        return util::Error{Untranslated(strprintf("Bad snapshot content hash: expected %s, got %s",
-            au_data.hash_serialized.ToString(), maybe_stats->hashSerialized.ToString()))};
+        // Assert that the deserialized chainstate contents match the expected assumeutxo value.
+        if (AssumeutxoHash{maybe_stats->hashSerialized} != maybe_au_data->hash_serialized) {
+            return util::Error{Untranslated(strprintf("Bad snapshot content hash: expected %s, got %s",
+                maybe_au_data->hash_serialized.ToString(), maybe_stats->hashSerialized.ToString()))};
+        }
     }
 
     snapshot_chainstate.m_chain.SetTip(*snapshot_start_block);
@@ -6196,7 +6264,12 @@ util::Result<void> ChainstateManager::PopulateAndValidateSnapshot(
 
     assert(index);
     assert(index == snapshot_start_block);
-    index->m_chain_tx_count = au_data.m_chain_tx_count;
+    // Only the non-zero-ness is load-bearing — HaveNumChainTxs() gates entry to
+    // setBlockIndexCandidates, and CheckBlockIndex asserts the snapshot base has it set. Under a
+    // proof there is no attested transaction count to use, so a proven lower bound stands in and
+    // GuessVerificationProgress under-reports until the chain catches up. See HazyncAdoption.
+    index->m_chain_tx_count = hazync_authorised ? hazync_authority->chain_tx_count_bootstrap
+                                                : maybe_au_data->m_chain_tx_count;
     snapshot_chainstate.setBlockIndexCandidates.insert(snapshot_start_block);
 
     LogInfo("[snapshot] validated snapshot (%.2f MB)",
@@ -6236,6 +6309,21 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation()
     if (m_blockman.m_ghost_exorcism.IsActive()) {
         LogInfo("[snapshot] Hazed mode: auto-validating snapshot "
                 "(background IBD not possible with stripped blocks)");
+        m_ibd_chainstate->m_disabled = true;
+        this->MaybeRebalanceCaches();
+        return SnapshotCompletionResult::SUCCESS;
+    }
+    // Same conclusion for a proof-adopted snapshot, reached the other way round: not "the background
+    // chain cannot be rebuilt" but "it has nothing left to tell us". ActivateSnapshot already
+    // disabled the background chainstate; this is the path taken after a RESTART, where it has been
+    // re-created from disk and would otherwise sync from genesis to re-establish what the proof
+    // already established. The authority is re-derived from the proof on every start, so a node
+    // restarted without one does not silently keep the exemption — it fails earlier, in
+    // LoadBlockIndex, with the reason stated.
+    if (const auto& adoption{haze::HazyncAdoptedSnapshot()};
+        adoption && SnapshotBlockhash() && adoption->base_blockhash == *SnapshotBlockhash()) {
+        LogInfo("[snapshot] Hazync: nothing to complete — validity to height %d rests on the proof, "
+                "not on a background re-download of the chain below it", adoption->height);
         m_ibd_chainstate->m_disabled = true;
         this->MaybeRebalanceCaches();
         return SnapshotCompletionResult::SUCCESS;

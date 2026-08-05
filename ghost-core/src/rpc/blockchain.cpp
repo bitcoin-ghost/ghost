@@ -1437,7 +1437,8 @@ RPCHelpMan getblockchaininfo()
                     {RPCResult::Type::STR_HEX, "guestid", "Hazync guest image id the proof was verified against"},
                     {RPCResult::Type::NUM, "utxoleaves", "number of leaves in the UTXO accumulator the proof commits to"},
                     {RPCResult::Type::BOOL, "utxodumpmatched", "whether a -hazyncutxo dump was supplied and matched the proven accumulator roots"},
-                    {RPCResult::Type::BOOL, "actedon", "whether validation used the proof. Currently always false: proofs are verified and reported, never acted on"},
+                    {RPCResult::Type::BOOL, "adoptionarmed", "whether -hazyncadopt authorised adoption. Armed is not adopted: see actedon"},
+                    {RPCResult::Type::BOOL, "actedon", "whether this node's active chainstate stands on the proof, i.e. the proven UTXO set was adopted and blocks below it were never validated here"},
                 }},
                 (IsDeprecatedRPCEnabled("warnings") ?
                     RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
@@ -1485,7 +1486,14 @@ RPCHelpMan getblockchaininfo()
         hz.pushKV("guestid", haze::HazyncMethodId());
         hz.pushKV("utxoleaves", hazync_proof->utxo_leaves);
         hz.pushKV("utxodumpmatched", haze::HazyncUtxoDumpMatched());
-        hz.pushKV("actedon", false);
+        hz.pushKV("adoptionarmed", haze::HazyncAdoptedSnapshot().has_value());
+        // `actedon` is the question that matters: is this node's chainstate standing on the proof?
+        // True only when a snapshot is active AND it is the one this proof authorises — an armed
+        // node that has not yet adopted, or one whose active snapshot came from somewhere else,
+        // must not read as though the proof is holding anything up.
+        const auto& adoption{haze::HazyncAdoptedSnapshot()};
+        const auto snapshot_base{chainman.SnapshotBlockhash()};
+        hz.pushKV("actedon", adoption && snapshot_base && adoption->base_blockhash == *snapshot_base);
         obj.pushKV("hazync", std::move(hz));
     }
     if (chainman.m_blockman.IsPruneMode()) {
@@ -3485,6 +3493,106 @@ static RPCHelpMan loadtxoutset()
     };
 }
 
+static RPCHelpMan hazyncadoptsnapshot()
+{
+    return RPCHelpMan{
+        "hazyncadoptsnapshot",
+        "Adopt the UTXO set a verified Hazync proof commits to, and validate onward from there.\n\n"
+
+        "This is `loadtxoutset` with the trust removed. Core's assumeutxo loads a snapshot at a "
+        "height its developers compiled in, checked against a hash they chose; this loads one at the "
+        "height a zk proof attests the chain was valid through, checked against the accumulator "
+        "roots that proof commits to. No developer-chosen value takes part.\n\n"
+
+        "Requires the node to have been started with -hazyncadopt, -hazyncproof and -hazyncutxo, and "
+        "re-runs both checks now rather than relying on the startup verdict. The base block must "
+        "already be in this node's headers chain, so call this once headers have synced past the "
+        "proven height.\n\n"
+
+        "Background validation is disabled on success: re-downloading and re-validating the chain "
+        "below the proven height is precisely the work the proof replaces.",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::NUM, "coins_loaded", "the number of coins loaded from the proven set"},
+                    {RPCResult::Type::STR_HEX, "tip_hash", "the base block of the adopted set"},
+                    {RPCResult::Type::NUM, "base_height", "the height of that base block"},
+                    {RPCResult::Type::STR_HEX, "guestid", "Hazync guest image id the proof was verified against"},
+                }
+        },
+        RPCExamples{
+            HelpExampleCli("-rpcclienttimeout=0 hazyncadoptsnapshot", "")
+            + HelpExampleRpc("hazyncadoptsnapshot", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const ArgsManager& args{EnsureArgsman(node)};
+
+    // Re-derive the authority now. The startup verdict is a statement about files as they were at
+    // startup; adoption is irreversible, so it is made on a fresh reading of them.
+    std::string err;
+    const auto authority{haze::HazyncAdoption::Authorise(args, err)};
+    if (!authority) {
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("Hazync adoption is not authorised: %s", err));
+    }
+
+    // Materialise the proven set in Core's own snapshot format. WriteCoreSnapshotFromDump is
+    // reachable only for a dump that passed the roots check, which Authorise just re-ran.
+    const fs::path snapshot_path{args.GetDataDirNet() / "hazync_snapshot.tmp"};
+    if (!haze::WriteCoreSnapshotFromDump(fs::PathFromString(args.GetArg("-hazyncutxo", "")),
+                                         snapshot_path, authority->base_blockhash, err)) {
+        fs::remove(snapshot_path);
+        throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Could not write the proven set as a snapshot: %s", err));
+    }
+
+    FILE* file{fsbridge::fopen(snapshot_path, "rb")};
+    AutoFile afile{file};
+    // Unlink immediately, keeping only the open descriptor. This closes the window between writing
+    // the file and reading it in which something else could have put a different set at that path —
+    // the coins loaded below are then, unavoidably, the ones just checked against the proof. It also
+    // means the temporary cannot be left behind by an error return.
+    fs::remove(snapshot_path);
+    if (afile.IsNull()) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Could not reopen the snapshot that was just written.");
+    }
+
+    SnapshotMetadata metadata{chainman.GetParams().MessageStart()};
+    try {
+        afile >> metadata;
+    } catch (const std::ios_base::failure& e) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf("Unable to parse metadata: %s", e.what()));
+    }
+
+    auto activation_result{chainman.ActivateSnapshot(afile, metadata, /*in_memory=*/false, &*authority)};
+    if (!activation_result) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf("Unable to adopt the proven UTXO set: %s",
+            util::ErrorString(activation_result).original));
+    }
+
+    // As for loadtxoutset: historical blocks below the base were never downloaded, so this node
+    // cannot serve them and must stop advertising that it can.
+    node.connman->RemoveLocalServices(NODE_NETWORK);
+    node.connman->AddLocalServices(NODE_NETWORK_LIMITED);
+
+    CBlockIndex& snapshot_index{*CHECK_NONFATAL(*activation_result)};
+
+    LogInfo("[hazync] ADOPTED the proven UTXO set at height %d (%llu coins). Validation continues "
+            "from height %d. Blocks below it were never downloaded and are not held by this node.\n",
+            snapshot_index.nHeight, (unsigned long long)metadata.m_coins_count, snapshot_index.nHeight + 1);
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("coins_loaded", metadata.m_coins_count);
+    result.pushKV("tip_hash", snapshot_index.GetBlockHash().ToString());
+    result.pushKV("base_height", snapshot_index.nHeight);
+    result.pushKV("guestid", haze::HazyncMethodId());
+    return result;
+},
+    };
+}
+
 const std::vector<RPCResult> RPCHelpForChainstate{
     {RPCResult::Type::NUM, "blocks", "number of blocks in this chainstate"},
     {RPCResult::Type::STR_HEX, "bestblockhash", "blockhash of the tip"},
@@ -3771,6 +3879,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockfilter},
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
+        {"blockchain", &hazyncadoptsnapshot},
         {"blockchain", &getchainstates},
         {"blockchain", &generatecheckpoint},
         {"blockchain", &downloadcheckpoint},

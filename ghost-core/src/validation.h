@@ -36,6 +36,7 @@
 #include <util/translation.h>
 #include <versionbits.h>
 
+#include <haze/hazync_proof.h>
 #include <haze/swiftsync.h>
 
 #include <algorithm>
@@ -951,7 +952,8 @@ private:
     [[nodiscard]] util::Result<void> PopulateAndValidateSnapshot(
         Chainstate& snapshot_chainstate,
         AutoFile& coins_file,
-        const node::SnapshotMetadata& metadata);
+        const node::SnapshotMetadata& metadata,
+        const haze::HazyncAdoption* hazync_authority);
 
     /**
      * If a block header hasn't already been seen, call CheckBlockHeader on it, ensure
@@ -1121,8 +1123,15 @@ public:
     //! - "Fast forward" the tip of the new chainstate to the base of the snapshot.
     //! - Move the new chainstate to `m_snapshot_chainstate` and make it our
     //!   ChainstateActive().
+    //!
+    //! `hazync_authority`, when non-null, substitutes a verified Hazync proof for the assumeutxo
+    //! chain parameters: the snapshot may then be at a height chainparams has never heard of, and
+    //! its coins are bound to the proof's accumulator roots instead of to a hash the developers
+    //! chose. It is an explicit argument, not ambient state, so that `loadtxoutset` cannot acquire
+    //! a proof's authority for an arbitrary file. The default of nullptr is the strict behaviour.
     [[nodiscard]] util::Result<CBlockIndex*> ActivateSnapshot(
-        AutoFile& coins_file, const node::SnapshotMetadata& metadata, bool in_memory);
+        AutoFile& coins_file, const node::SnapshotMetadata& metadata, bool in_memory,
+        const haze::HazyncAdoption* hazync_authority = nullptr);
 
     //! Once the background validation chainstate has reached the height which
     //! is the base of the UTXO snapshot in use, compare its coins to ensure

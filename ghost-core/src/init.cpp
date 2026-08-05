@@ -549,6 +549,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-exorcist", "Convert existing full archive to hazed format (irreversible) and exit", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-hazyncproof=<file>", "Verify a genesis-anchored Hazync range proof at startup and log the chain state it commits to. REPORTING ONLY: nothing is skipped and no chainstate is adopted \u2014 every block is still validated in full. Requires a build with -DWITH_HAZYNC_VERIFY=ON.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-hazyncutxo=<file>", "Check a Hazync bridge UTXO dump against the accumulator roots -hazyncproof commits to \u2014 proven, rather than trusted, assumeutxo. Only meaningful together with -hazyncproof: a dump on its own has nothing to be checked against. REPORTING ONLY: the set is not loaded into a chainstate.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-hazyncadopt", "Allow this node to ADOPT the UTXO set -hazyncproof commits to, instead of only reporting it: the proven set becomes the chainstate and validation continues from the proven height, with the blocks below it never downloaded or validated here. Off by default and consensus-critical. Arming alone adopts nothing — it must then be requested with the `hazyncadoptsnapshot` RPC, and is refused unless the proof verifies and -hazyncutxo matches the roots it commits to.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-hazyncsnapshotout=<file>", "After -hazyncutxo has been checked against the proof, write the proven UTXO set as a snapshot in loadtxoutset format. Written only if the dump matched, so the snapshot always describes a proven set.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-loadtxoutset=<path>", "Load a UTXO snapshot on startup and exit. The snapshot must match a hardcoded assumeutxo entry. Use with -hazemode=hazed to bootstrap a hazed node without a full archive peer. (default: disabled)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-coinstatsindex", strprintf("Maintain coinstats index used by the gettxoutsetinfo RPC (default: %u)", DEFAULT_COINSTATSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -1973,6 +1974,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     bool do_reindex{args.GetBoolArg("-reindex", false)};
     const bool do_reindex_chainstate{args.GetBoolArg("-reindex-chainstate", false)};
 
+    // Hazync proof (inbound): verify -hazyncproof=<file>, report the chain state it commits to, and
+    // arm adoption if -hazyncadopt was given.
+    //
+    // ⚠ This must run BEFORE the chainstate is loaded. A node that previously adopted a proven
+    // snapshot has a base block chainparams has never heard of, and LoadBlockIndex re-derives that
+    // snapshot's metadata from the proof — so the authority has to already exist by the time it
+    // asks. Deriving it there instead of trusting something persisted is the point: the exemption
+    // is re-earned on every start.
+    haze::HazyncProofStartupCheck(args);
+
     // Chainstate initialization and loading may be retried once with reindexing by GUI users
     auto [status, error] = InitAndLoadChainstate(
         node,
@@ -2103,10 +2114,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         node.exit_status = EXIT_SUCCESS;
         return false; // Clean shutdown
     }
-
-    // Hazync proof adoption (inbound): verify -hazyncproof=<file> and report the chain state it
-    // commits to. REPORTING ONLY in this increment — see haze/hazync_proof.h.
-    haze::HazyncProofStartupCheck(args);
 
     if (args.GetBoolArg("-haze-status", false)) {
         const fs::path datadir = args.GetDataDirNet();
