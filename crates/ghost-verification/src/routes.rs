@@ -863,8 +863,26 @@ async fn health_handler(
 ) -> impl IntoResponse {
     let response = state.get_health().await;
 
-    // Sign by default unless explicitly disabled
-    let should_sign = !query.unsigned.unwrap_or(false);
+    // Sign only when the caller supplies a nonce.
+    //
+    // Signing changes the SHAPE of this response: `response` becomes a
+    // `SignedResponse<HealthResponse>`, so `response.block_height` moves to
+    // `response.payload.block_height`. `can_sign()` was false on every node for as
+    // long as the identity field existed without a setter, so no caller has ever seen
+    // the signed shape — enabling it unconditionally would change the contract for
+    // every existing consumer at once (the dashboard, and scripts not passing
+    // `unsigned=true`).
+    //
+    // Requiring a nonce keeps every current caller on the shape it already parses,
+    // while giving an identity-bound reachability probe (H-7) exactly what it needs:
+    // a reply signed under the node's own id and bound to a nonce the prober chose.
+    //
+    // NOTE this gate is deliberately NOT applied to the `/verify/*` handlers below.
+    // The archive challenge sends no nonce (`verify_archive` builds only `block`/`tx`),
+    // so gating those on nonce presence would leave them unsigned — and an unsigned
+    // target response is exactly what makes the H-8 re-derivation defence reach
+    // `ReVerdict::Unverifiable` and record nothing.
+    let should_sign = !query.unsigned.unwrap_or(false) && query.nonce.is_some();
 
     if should_sign && state.can_sign() {
         if let Some(signed) = state.sign_response(response.clone(), query.nonce) {

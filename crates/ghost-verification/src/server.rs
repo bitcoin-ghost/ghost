@@ -2095,6 +2095,32 @@ impl VerificationState {
         self
     }
 
+    /// Give this state the node's signing identity, enabling signed HTTP responses.
+    ///
+    /// Without this, `can_sign()` is false and every endpoint answers
+    /// `"signed": false` — which is what the fleet did, because the field existed
+    /// from the initial commit with no setter. Two things depend on it:
+    ///
+    /// - An identity-bound reachability probe (H-7): a challenger dials the address a
+    ///   node CLAIMS and requires a reply signed by that node's id over a fresh nonce.
+    ///   Unsigned, the probe proves only that something answers there.
+    /// - The H-8 re-derivation defence: recipients re-derive a verdict from the
+    ///   target's own signed response instead of trusting the challenger's `passed`.
+    ///   With no signature the handler reaches `ReVerdict::Unverifiable` and records
+    ///   nothing, so the defence is present but inert.
+    ///
+    /// The id passed to `new()` must be this identity's own — `sign_response` signs
+    /// under `self.node_id`, and a verifier compares that against the node it dialled.
+    pub fn with_node_identity(mut self, identity: std::sync::Arc<NodeIdentity>) -> Self {
+        debug_assert_eq!(
+            identity.node_id_hex(),
+            self.node_id,
+            "signing identity must match the state's node_id"
+        );
+        self.identity = Some(identity);
+        self
+    }
+
     /// Set the configured Bitcoin network reported by the status/info endpoints.
     pub fn with_network(mut self, network: ghost_common::config::BitcoinNetwork) -> Self {
         self.network = network;
@@ -4360,5 +4386,88 @@ mod tests {
         // carrying no proof at all.
         assert_eq!(resp.epoch, Some(44));
         assert_eq!(resp.virtual_block, Some(100));
+    }
+
+    /// H-7 prerequisite: a node must be able to SIGN an HTTP response, or an
+    /// identity-bound reachability probe is impossible — the whole point is that
+    /// whoever answers at a claimed address proves it holds that node's key.
+    ///
+    /// `VerificationState.identity` has been `Option<Arc<NodeIdentity>>` since the
+    /// initial commit, is read by `can_sign()` and `sign_response()`, and had NO
+    /// setter — so `can_sign()` was false everywhere and every endpoint returned
+    /// `"signed": false` on the live fleet. That also left the H-8 re-derivation
+    /// defence inert: with no target signature the handler reaches
+    /// `ReVerdict::Unverifiable` and records nothing.
+    #[test]
+    fn a_state_given_an_identity_signs_a_nonce_bound_response_under_its_own_node_id() {
+        use ghost_common::identity::NodeIdentity;
+        use ghost_common::types::NodeCapabilities;
+        use ghost_policy::PolicyProfile;
+        use std::sync::Arc;
+
+        let identity = Arc::new(NodeIdentity::generate());
+        let node_id_hex = identity.node_id_hex();
+
+        let unwired = VerificationState::new(
+            node_id_hex.clone(),
+            "test".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        );
+        assert!(
+            !unwired.can_sign(),
+            "a state with no identity must not claim it can sign"
+        );
+        assert!(
+            unwired
+                .sign_response("payload", Some("n".to_string()))
+                .is_none(),
+            "signing without an identity must yield None, not an unsigned artefact"
+        );
+
+        let wired = VerificationState::new(
+            node_id_hex.clone(),
+            "test".to_string(),
+            PolicyProfile::default(),
+            NodeCapabilities::default(),
+        )
+        .with_node_identity(Arc::clone(&identity));
+
+        assert!(
+            wired.can_sign(),
+            "a state given an identity must be able to sign"
+        );
+
+        let nonce = "cafebabedeadbeef".to_string();
+        let signed = wired
+            .sign_response("payload", Some(nonce.clone()))
+            .expect("a wired state must produce a signed response");
+
+        // The signer IS the node id a challenger would compare against.
+        assert_eq!(signed.signer, node_id_hex, "signer must be this node's id");
+        // The challenge nonce must come back, or a probe cannot bind the reply to its request.
+        assert_eq!(
+            signed.challenge_nonce.as_deref(),
+            Some(nonce.as_str()),
+            "the challenge nonce must be echoed"
+        );
+
+        // And the signature must actually verify under that node id.
+        let vk = identity.verifying_key().expect("verifying key");
+        let ok = signed.verify(|signer, message, sig| {
+            use ed25519_dalek::Verifier;
+            if signer != node_id_hex {
+                return false;
+            }
+            let Ok(sig_bytes): Result<[u8; 64], _> = sig.try_into() else {
+                return false;
+            };
+            vk.verify(message, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+                .is_ok()
+        });
+        assert!(
+            ok.is_ok(),
+            "signed response must verify under its own node id: {ok:?}"
+        );
     }
 }
