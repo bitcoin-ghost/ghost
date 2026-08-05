@@ -474,6 +474,27 @@ public:
     bool ReadStrippedBlock(haze::CStrippedBlock& block, const FlatFilePos& pos) const;
     bool ReadStrippedBlock(haze::CStrippedBlock& block, const CBlockIndex& index) const;
 
+    /**
+     * Read a block in order to DISCONNECT it, rebuilding it from stripped storage where that is all
+     * that survives.
+     *
+     * A hazed node has to be able to reorg off its own history, and it can: undoing a block reads no
+     * scriptSig and no witness, and the undo data is written whether or not the block was stripped.
+     * So where ReadBlock refuses a stripped block — correctly, since the full block is gone — this
+     * returns the rebuilt structural form instead.
+     *
+     * @param[out] authoritative_txids  For a rebuilt block, the real txids, to be passed to
+     *                                  DisconnectBlock. Empty when the block was read whole, which
+     *                                  is the signal that it knows its own. A rebuilt block's
+     *                                  transactions do NOT: see haze/block_reconstruct.h.
+     *
+     * ⚠ The block this returns may be a reconstruction, and a reconstruction must never be
+     * connected, relayed, served to a peer, added to the mempool, or handed to wallet code. It
+     * carries CBlock::m_haze_reconstructed so those paths can refuse it; ConnectBlock already does.
+     */
+    bool ReadBlockForDisconnect(CBlock& block, std::vector<Txid>& authoritative_txids,
+                                const CBlockIndex& index) const;
+
     bool ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const;
 
     void CleanupBlockRevFiles() const;

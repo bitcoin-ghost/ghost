@@ -7,6 +7,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <consensus/params.h>
+#include <haze/block_reconstruct.h>
 #include <haze/block_stripper.h>
 #include <haze/exorcism.h>
 #include <haze/hazync_proof.h>
@@ -673,6 +674,36 @@ CBlockFileInfo* BlockManager::GetBlockFileInfo(size_t n)
     LOCK(cs_LastBlockFile);
 
     return &m_blockfile_info.at(n);
+}
+
+bool BlockManager::ReadBlockForDisconnect(CBlock& block, std::vector<Txid>& authoritative_txids,
+                                          const CBlockIndex& index) const
+{
+    authoritative_txids.clear();
+
+    if (!WITH_LOCK(cs_main, return index.nStatus & BLOCK_HAZED_STRIPPED)) {
+        return ReadBlock(block, index);
+    }
+
+    haze::CStrippedBlock stripped;
+    if (!ReadStrippedBlock(stripped, index)) {
+        LogError("Failed to read stripped block %d (%s) for disconnection\n",
+                 index.nHeight, index.GetBlockHash().ToString());
+        return false;
+    }
+
+    block = haze::ReconstructPartialBlock(stripped);
+
+    // The rebuilt transactions cannot compute these: their scriptSigs are gone. The stripped form
+    // kept them, which is the only reason disconnecting stripped history is possible at all.
+    authoritative_txids.reserve(stripped.GetTxCount());
+    for (size_t i = 0; i < stripped.GetTxCount(); ++i) {
+        authoritative_txids.push_back(Txid::FromUint256(stripped.GetTxid(i)));
+    }
+
+    LogDebug(BCLog::VALIDATION, "Rebuilt stripped block %d (%s) for disconnection, %u transactions\n",
+             index.nHeight, index.GetBlockHash().ToString(), (unsigned)authoritative_txids.size());
+    return true;
 }
 
 bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const
