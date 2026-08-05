@@ -1148,6 +1148,30 @@ public:
         AutoFile& coins_file, const node::SnapshotMetadata& metadata, bool in_memory,
         const haze::HazyncAdoption* hazync_authority = nullptr);
 
+    /**
+     * Forget stripped blocks that were stored but never connected (#542).
+     *
+     * A hazed node writes a block's structural form to disk and records BLOCK_HAVE_DATA before the
+     * block is connected, keeping the full block in memory only until then. Stop the node in that
+     * window and what survives is a block the index claims to have and which can never be connected
+     * from: the scriptSigs and witnesses it would need were destroyed on purpose, and the in-memory
+     * copy is gone.
+     *
+     * The claim is what is wrong, not the ordering. For an already-connected block, stripped storage
+     * genuinely is enough — its effects are in the UTXO set and it will only ever be disconnected,
+     * which needs none of what haze removes. For a block that was never connected the same storage
+     * satisfies nothing, so BLOCK_HAVE_DATA is simply false and is cleared here. The node then
+     * re-downloads it like any other missing block, it passes through the exorcism fence, and is
+     * stripped again — nothing hazeable is retained, which is why this is not "un-hazing".
+     *
+     * The alternative, keeping the full block on disk until the chainstate is flushed, would put
+     * complete blocks with witnesses and scriptSigs on disk for exactly as long as it takes to
+     * crash. That is the thing haze exists to prevent, so the ordering fix is unavailable.
+     *
+     * @return the number of blocks forgotten, for logging.
+     */
+    int DropUnconnectableStrippedBlocks() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     //! Once the background validation chainstate has reached the height which
     //! is the base of the UTXO snapshot in use, compare its coins to ensure
     //! they match those expected by the snapshot.

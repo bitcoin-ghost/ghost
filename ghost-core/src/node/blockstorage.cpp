@@ -243,6 +243,30 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
     return pindexNew;
 }
 
+void BlockManager::ForgetBlockData(CBlockIndex& index)
+{
+    AssertLockHeld(cs_main);
+
+    index.nStatus &= ~BLOCK_HAVE_DATA;
+    index.nStatus &= ~BLOCK_HAVE_UNDO;
+    index.nFile = 0;
+    index.nDataPos = 0;
+    index.nUndoPos = 0;
+    m_dirty_blockindex.insert(&index);
+
+    // Drop from m_blocks_unlinked -- a block whose data we no longer have would have
+    // to be downloaded again in order to consider its chain, at which point it would
+    // be reconsidered as a candidate for m_blocks_unlinked or setBlockIndexCandidates.
+    auto range = m_blocks_unlinked.equal_range(index.pprev);
+    while (range.first != range.second) {
+        std::multimap<CBlockIndex*, CBlockIndex*>::iterator _it = range.first;
+        range.first++;
+        if (_it->second == &index) {
+            m_blocks_unlinked.erase(_it);
+        }
+    }
+}
+
 void BlockManager::PruneOneBlockFile(const int fileNumber)
 {
     AssertLockHeld(cs_main);
@@ -251,25 +275,7 @@ void BlockManager::PruneOneBlockFile(const int fileNumber)
     for (auto& entry : m_block_index) {
         CBlockIndex* pindex = &entry.second;
         if (pindex->nFile == fileNumber) {
-            pindex->nStatus &= ~BLOCK_HAVE_DATA;
-            pindex->nStatus &= ~BLOCK_HAVE_UNDO;
-            pindex->nFile = 0;
-            pindex->nDataPos = 0;
-            pindex->nUndoPos = 0;
-            m_dirty_blockindex.insert(pindex);
-
-            // Prune from m_blocks_unlinked -- any block we prune would have
-            // to be downloaded again in order to consider its chain, at which
-            // point it would be considered as a candidate for
-            // m_blocks_unlinked or setBlockIndexCandidates.
-            auto range = m_blocks_unlinked.equal_range(pindex->pprev);
-            while (range.first != range.second) {
-                std::multimap<CBlockIndex*, CBlockIndex*>::iterator _it = range.first;
-                range.first++;
-                if (_it->second == pindex) {
-                    m_blocks_unlinked.erase(_it);
-                }
-            }
+            ForgetBlockData(*pindex);
         }
     }
 

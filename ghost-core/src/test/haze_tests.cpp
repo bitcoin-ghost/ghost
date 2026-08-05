@@ -553,6 +553,84 @@ BOOST_AUTO_TEST_CASE(connecting_a_reconstructed_block_is_refused)
     BOOST_CHECK(chainstate.ConnectBlock(block, state2, pindex, view, /*fJustCheck=*/true));
 }
 
+// ============================================================================
+// Forgetting stripped blocks that were never connected (#542)
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(unconnected_stripped_blocks_are_forgotten_connected_ones_kept)
+{
+    // A hazed node records BLOCK_HAVE_DATA when it writes a block's stripped form, before the block
+    // is connected. Stop it in that window and the index claims to have a block that can never be
+    // connected from — the scriptSigs are gone and the in-memory copy died with the process. That is
+    // #542. The claim is what is wrong, so it is withdrawn and the block re-downloaded.
+    //
+    // The discrimination is the whole point: a stripped block that IS already connected must be
+    // kept, because for it the stored form really is sufficient — it will only ever be disconnected,
+    // which needs nothing haze removed.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+
+    // Two blocks built on the SAME parent, before either is processed. The first to arrive becomes
+    // the tip; the second is accepted and stored but never connected, since it has equal work and
+    // first-seen wins. That is the state an unclean shutdown leaves behind, reached deterministically.
+    CScript other_dest = GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
+    CBlock winner = CreateBlock({}, dest, m_node.chainman->ActiveChainstate());
+    CBlock side = CreateBlock({}, other_dest, m_node.chainman->ActiveChainstate());
+    BOOST_REQUIRE(winner.GetHash() != side.GetHash());
+    BOOST_REQUIRE(winner.hashPrevBlock == side.hashPrevBlock);
+
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<const CBlock>(winner),
+                                                           /*force_processing=*/true,
+                                                           /*min_pow_checked=*/true, nullptr));
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<const CBlock>(side),
+                                                           /*force_processing=*/true,
+                                                           /*min_pow_checked=*/true, nullptr));
+
+    LOCK(cs_main);
+    ChainstateManager& chainman = *m_node.chainman;
+    CBlockIndex* side_index = chainman.m_blockman.LookupBlockIndex(side.GetHash());
+    CBlockIndex* tip = chainman.ActiveChain().Tip();
+    BOOST_REQUIRE(side_index);
+    BOOST_REQUIRE(tip);
+    // Load-bearing: if the side block became the tip there is no "unconnected" case to test.
+    BOOST_REQUIRE(side_index != tip);
+    BOOST_REQUIRE(chainman.ActiveChain().Contains(tip));
+    BOOST_REQUIRE(!chainman.ActiveChain().Contains(side_index));
+    BOOST_REQUIRE(side_index->nStatus & BLOCK_HAVE_DATA);
+    BOOST_REQUIRE(tip->nStatus & BLOCK_HAVE_DATA);
+
+    // Nothing happens off a hazed node: an archive node's stored blocks are complete and connectable.
+    side_index->nStatus |= BLOCK_HAZED_STRIPPED;
+    tip->nStatus |= BLOCK_HAZED_STRIPPED;
+    BOOST_CHECK_EQUAL(chainman.DropUnconnectableStrippedBlocks(), 0);
+    BOOST_CHECK(side_index->nStatus & BLOCK_HAVE_DATA);
+
+    chainman.m_blockman.m_ghost_exorcism.Init(haze::GhostMode::HAZED);
+    BOOST_REQUIRE(chainman.m_blockman.m_ghost_exorcism.IsActive());
+
+    BOOST_CHECK_EQUAL(chainman.DropUnconnectableStrippedBlocks(), 1);
+
+    // The unconnected one is forgotten, and forgotten completely — a lingering file position would
+    // send a later read back into the wrong file sequence, which is the original bug.
+    BOOST_CHECK(!(side_index->nStatus & BLOCK_HAVE_DATA));
+    BOOST_CHECK(!(side_index->nStatus & BLOCK_HAVE_UNDO));
+    BOOST_CHECK_EQUAL(side_index->nFile, 0);
+    BOOST_CHECK_EQUAL(side_index->nDataPos, 0U);
+
+    // The connected one is untouched.
+    BOOST_CHECK(tip->nStatus & BLOCK_HAVE_DATA);
+
+    // m_have_pruned must be set, and this is not bookkeeping pedantry: CheckBlockIndex asserts that
+    // BLOCK_HAVE_DATA and nTx > 0 agree unless it is set, and they now deliberately do not.
+    BOOST_CHECK(chainman.m_blockman.m_have_pruned);
+
+    // The assertion that matters. Everything above could be individually true while the index as a
+    // whole had been left inconsistent, and it is CheckBlockIndex that a real node would trip over.
+    chainman.CheckBlockIndex();
+
+    // Idempotent: a second pass finds nothing left to forget.
+    BOOST_CHECK_EQUAL(chainman.DropUnconnectableStrippedBlocks(), 0);
+}
+
 BOOST_AUTO_TEST_CASE(reconstruct_meta_flags)
 {
     CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));

@@ -6532,6 +6532,54 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation()
     return SnapshotCompletionResult::SUCCESS;
 }
 
+int ChainstateManager::DropUnconnectableStrippedBlocks()
+{
+    AssertLockHeld(::cs_main);
+
+    // Only a hazed node can be in this state; nothing else stores blocks it cannot connect from.
+    if (!m_blockman.m_ghost_exorcism.IsActive()) return 0;
+
+    // "Already connected" means present in some chainstate's active chain. Ancestry against the tip
+    // is the exact test — a height comparison would keep stripped blocks on abandoned side branches,
+    // which are just as unconnectable and would fail the same way on the next reorg towards them.
+    const auto is_connected = [this](const CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        for (const Chainstate* c : GetAll()) {
+            if (const CBlockIndex* tip{c->m_chain.Tip()};
+                tip && tip->GetAncestor(index.nHeight) == &index) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    int dropped{0};
+    for (CBlockIndex* pindex : m_blockman.GetAllBlockIndices()) {
+        if (!(pindex->nStatus & BLOCK_HAZED_STRIPPED)) continue;
+        if (!(pindex->nStatus & BLOCK_HAVE_DATA)) continue;
+        if (is_connected(*pindex)) continue;
+
+        LogWarning("[haze] Forgetting stripped block %s (%d): it was stored but never connected, so "
+                   "its data cannot satisfy a connect and will be downloaded again.\n",
+                   pindex->GetBlockHash().ToString(), pindex->nHeight);
+        m_blockman.ForgetBlockData(*pindex);
+        ++dropped;
+    }
+
+    if (dropped > 0) {
+        // Same bookkeeping pruning does, and for the same reason: this node has deleted block data
+        // it once held. Without it CheckBlockIndex asserts that BLOCK_HAVE_DATA and nTx > 0 agree,
+        // which they deliberately no longer do — see the assert guarded by m_have_pruned.
+        if (!m_blockman.m_have_pruned) {
+            m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true);
+            m_blockman.m_have_pruned = true;
+        }
+        LogWarning("[haze] Forgot %d stripped block(s) that were never connected; they will be "
+                   "re-downloaded. This follows an unclean shutdown and is not data loss: the blocks "
+                   "were never part of the chain this node had validated.\n", dropped);
+    }
+    return dropped;
+}
+
 Chainstate& ChainstateManager::ActiveChainstate() const
 {
     LOCK(::cs_main);

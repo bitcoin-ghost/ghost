@@ -126,6 +126,13 @@ static ChainstateLoadResult CompleteChainstateInitialization(
         }
     }
 
+    // Every chainstate now knows its tip, which is what decides whether a stripped block was ever
+    // connected. Must come before the node starts choosing blocks to connect, or it will pick one it
+    // cannot read and fail fatally — that is #542.
+    if (const int dropped{WITH_LOCK(::cs_main, return chainman.DropUnconnectableStrippedBlocks())}; dropped > 0) {
+        LogInfo("[haze] %d stripped block(s) forgotten at startup; they will be downloaded again", dropped);
+    }
+
     auto chainstates{chainman.GetAll()};
     if (std::any_of(chainstates.begin(), chainstates.end(),
                     [](const Chainstate* cs) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return cs->NeedsRedownload(); })) {
