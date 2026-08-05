@@ -714,6 +714,7 @@ impl VerificationClient {
         node_address: &str,
         block_hash: Option<&str>,
         txid: Option<&str>,
+        challenge_nonce: Option<&str>,
     ) -> GhostResult<(ArchiveResponse, Option<String>)> {
         let mut params: Vec<String> = Vec::new();
         if let Some(hash) = block_hash {
@@ -721,6 +722,14 @@ impl VerificationClient {
         }
         if let Some(tx) = txid {
             params.push(format!("tx={}", tx));
+        }
+        // Bind the target's signature to THIS challenge. Without it `SignedResponse`
+        // is bounded only by `MAX_RESPONSE_AGE_SECS` (300s), so a captured response
+        // can be replayed inside that window to keep a node earning +5 after it has
+        // stopped serving. The recipient re-derivation compares this against the
+        // nonce recorded in `challenge_data`.
+        if let Some(nonce) = challenge_nonce {
+            params.push(format!("nonce={}", nonce));
         }
 
         let path = if params.is_empty() {
@@ -1074,7 +1083,12 @@ impl VerificationClient {
         // Archive verification
         if result.claimed_capabilities.archive_mode {
             if let Some(hash) = test_block_hash {
-                match self.verify_archive(node_address, Some(hash), None).await {
+                // No challenge nonce: this path discards the signed response and
+                // feeds no consensus verdict, so there is nothing to bind a replay to.
+                match self
+                    .verify_archive(node_address, Some(hash), None, None)
+                    .await
+                {
                     Ok((resp, _signed)) => result.archive_verified = resp.success,
                     Err(e) => result.errors.push(format!("Archive: {}", e)),
                 }

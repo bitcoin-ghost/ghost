@@ -94,10 +94,17 @@ impl ResultReVerifier for ChainReVerifier {
     async fn reverify_archive(
         &self,
         target_node_id: &NodeId,
+        challenge_data: &str,
         target_signed_response: Option<&str>,
     ) -> ReVerdict {
         let oracle = RpcOracle(Arc::clone(&self.rpc));
-        reverify_archive_impl(&oracle, target_node_id, target_signed_response).await
+        reverify_archive_impl(
+            &oracle,
+            target_node_id,
+            challenge_data,
+            target_signed_response,
+        )
+        .await
     }
 
     async fn reverify_policy(
@@ -133,6 +140,7 @@ impl ResultReVerifier for ChainReVerifier {
 async fn reverify_archive_impl<O: ChainOracle + ?Sized>(
     oracle: &O,
     target_node_id: &NodeId,
+    challenge_data: &str,
     target_signed_response: Option<&str>,
 ) -> ReVerdict {
     // 1. No signed response at all — we cannot judge.
@@ -173,6 +181,36 @@ async fn reverify_archive_impl<O: ChainOracle + ?Sized>(
     });
     if verify_result.is_err() {
         return ReVerdict::Unverifiable;
+    }
+
+    // 3c. Bind the response to THIS challenge.
+    //
+    //     `SignedResponse::verify` above only bounds freshness — `MAX_RESPONSE_AGE_SECS`
+    //     is 300s — so a correct, correctly-signed response captured from an earlier
+    //     challenge can be replayed inside that window to keep a node earning the
+    //     capability after it has stopped serving it. The nonce the challenge chose is
+    //     what ties the signature to this request.
+    //
+    //     `challenge_data` is authored by the (adversarial) challenger, exactly like the
+    //     height in step 4, so a mismatch is UNVERIFIABLE and never Fail. Otherwise
+    //     naming a wrong nonce would be a free way to drag an honest node under its
+    //     pass-rate gate — the griefing vector this whole function exists to close.
+    //
+    //     A challenge_data carrying no nonce is not enforced, so challengers that
+    //     predate this still get their results judged rather than silently dropped.
+    //     That also means omitting the nonce bypasses the binding, which is why making
+    //     it mandatory needs a height gate once the fleet is known to send one.
+    if let Some(expected) = serde_json::from_str::<serde_json::Value>(challenge_data)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("nonce"))
+        .and_then(|n| n.as_str())
+        .map(str::to_owned)
+    {
+        match signed.challenge_nonce.as_deref() {
+            Some(got) if got == expected => {}
+            _ => return ReVerdict::Unverifiable,
+        }
     }
 
     // 4. Take the height from inside the TARGET-signed payload — NEVER from the
@@ -506,6 +544,120 @@ mod tests {
         serde_json::to_string(&signed).expect("serialize signed response")
     }
 
+    fn make_signed_response_bound(
+        identity: &NodeIdentity,
+        height: u64,
+        hash: &str,
+        merkle: &str,
+        challenge_nonce: Option<String>,
+    ) -> String {
+        let resp = ArchiveResponse {
+            success: true,
+            block_data: Some(BlockData {
+                hash: hash.to_string(),
+                height,
+                timestamp: 1_600_000_000,
+                tx_count: 2,
+                merkle_root: merkle.to_string(),
+            }),
+            tx_data: None,
+            error: None,
+        };
+        let signer_hex = identity.node_id_hex();
+        let signed =
+            SignedResponse::new(resp, signer_hex, |msg| identity.sign(msg), challenge_nonce);
+        serde_json::to_string(&signed).expect("serialize signed response")
+    }
+
+    /// REPLAY: a correct, correctly-signed response that was bound to a DIFFERENT
+    /// challenge must not count for this one.
+    ///
+    /// `SignedResponse::verify` only bounds freshness to `MAX_RESPONSE_AGE_SECS`
+    /// (300s), so without binding the reply to the nonce this challenge chose, a
+    /// captured response can be replayed inside that window to keep a node earning
+    /// the capability after it has stopped serving it.
+    #[tokio::test]
+    async fn a_response_bound_to_another_nonce_is_unverifiable_not_pass() {
+        let target = NodeIdentity::generate();
+        let raw = make_signed_response_bound(
+            &target,
+            500,
+            REAL_HASH,
+            REAL_MERKLE,
+            Some("aaaaaaaaaaaaaaaa".to_string()),
+        );
+        let challenge_data = r#"{"nonce":"bbbbbbbbbbbbbbbb"}"#;
+
+        let verdict = reverify_archive_impl(
+            &good_oracle(),
+            &target.node_id(),
+            challenge_data,
+            Some(&raw),
+        )
+        .await;
+
+        assert_eq!(
+            verdict,
+            ReVerdict::Unverifiable,
+            "a response bound to another nonce must not be accepted"
+        );
+    }
+
+    /// ANTI-GRIEF: the nonce comparison uses challenger-authored `challenge_data`,
+    /// so a malicious challenger can put any nonce there. A mismatch must therefore
+    /// be Unverifiable and NEVER Fail — otherwise naming a wrong nonce becomes a
+    /// free way to drag an honest node below its pass-rate gate.
+    #[tokio::test]
+    async fn a_nonce_mismatch_is_never_a_fail() {
+        let target = NodeIdentity::generate();
+        let raw = make_signed_response_bound(
+            &target,
+            500,
+            REAL_HASH,
+            REAL_MERKLE,
+            Some("honest-nonce".to_string()),
+        );
+        let lying_challenge_data = r#"{"nonce":"attacker-chosen"}"#;
+
+        let verdict = reverify_archive_impl(
+            &good_oracle(),
+            &target.node_id(),
+            lying_challenge_data,
+            Some(&raw),
+        )
+        .await;
+
+        assert_ne!(
+            verdict,
+            ReVerdict::Fail,
+            "a nonce mismatch must never grief the target"
+        );
+    }
+
+    /// The bound case still passes: nonce echoed, signature good, chain agrees.
+    #[tokio::test]
+    async fn a_response_bound_to_this_nonce_passes() {
+        let target = NodeIdentity::generate();
+        let raw = make_signed_response_bound(
+            &target,
+            500,
+            REAL_HASH,
+            REAL_MERKLE,
+            Some("cafebabecafebabe".to_string()),
+        );
+        let challenge_data = r#"{"nonce":"cafebabecafebabe"}"#;
+
+        let verdict = reverify_archive_impl(
+            &good_oracle(),
+            &target.node_id(),
+            challenge_data,
+            Some(&raw),
+        )
+        .await;
+
+        assert_eq!(verdict, ReVerdict::Pass);
+    }
+
     /// FRAUD: target signs a wrong hash for the height; our RPC disagrees => Fail,
     /// regardless of what the challenger claimed.
     #[tokio::test]
@@ -514,7 +666,8 @@ mod tests {
         let bogus_hash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef0";
         let raw = make_signed_response(&target, 500, bogus_hash, REAL_MERKLE, true);
 
-        let verdict = reverify_archive_impl(&good_oracle(), &target.node_id(), Some(&raw)).await;
+        let verdict =
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Fail);
     }
 
@@ -525,7 +678,8 @@ mod tests {
         let bogus_merkle = "2222222222222222222222222222222222222222222222222222222222222222";
         let raw = make_signed_response(&target, 500, REAL_HASH, bogus_merkle, true);
 
-        let verdict = reverify_archive_impl(&good_oracle(), &target.node_id(), Some(&raw)).await;
+        let verdict =
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Fail);
     }
 
@@ -538,7 +692,8 @@ mod tests {
         let target = NodeIdentity::generate();
         let raw = make_signed_response(&target, 500, REAL_HASH, REAL_MERKLE, true);
 
-        let verdict = reverify_archive_impl(&good_oracle(), &target.node_id(), Some(&raw)).await;
+        let verdict =
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Pass);
     }
 
@@ -549,7 +704,8 @@ mod tests {
         let target = NodeIdentity::generate();
         let raw = make_signed_response(&target, 500, REAL_HASH, REAL_MERKLE, false);
 
-        let verdict = reverify_archive_impl(&good_oracle(), &target.node_id(), Some(&raw)).await;
+        let verdict =
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Fail);
 
         // Cross-check: the free comparator agrees on the same payload.
@@ -564,11 +720,11 @@ mod tests {
     async fn missing_response_is_unverifiable() {
         let target = NodeIdentity::generate();
         assert_eq!(
-            reverify_archive_impl(&good_oracle(), &target.node_id(), None).await,
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", None).await,
             ReVerdict::Unverifiable
         );
         assert_eq!(
-            reverify_archive_impl(&good_oracle(), &target.node_id(), Some("   ")).await,
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some("   ")).await,
             ReVerdict::Unverifiable
         );
     }
@@ -578,7 +734,7 @@ mod tests {
     async fn unparseable_response_is_unverifiable() {
         let target = NodeIdentity::generate();
         assert_eq!(
-            reverify_archive_impl(&good_oracle(), &target.node_id(), Some("{not json")).await,
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some("{not json")).await,
             ReVerdict::Unverifiable
         );
     }
@@ -591,7 +747,8 @@ mod tests {
         // Imposter signs (signer field = imposter), but we judge it as `target`.
         let raw = make_signed_response(&imposter, 500, REAL_HASH, REAL_MERKLE, true);
 
-        let verdict = reverify_archive_impl(&good_oracle(), &target.node_id(), Some(&raw)).await;
+        let verdict =
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Unverifiable);
     }
 
@@ -609,7 +766,8 @@ mod tests {
         value["signature"] = serde_json::Value::String(chars.into_iter().collect());
         raw = serde_json::to_string(&value).unwrap();
 
-        let verdict = reverify_archive_impl(&good_oracle(), &target.node_id(), Some(&raw)).await;
+        let verdict =
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Unverifiable);
     }
 
@@ -621,7 +779,7 @@ mod tests {
         let mut oracle = good_oracle();
         oracle.broken = true;
 
-        let verdict = reverify_archive_impl(&oracle, &target.node_id(), Some(&raw)).await;
+        let verdict = reverify_archive_impl(&oracle, &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Unverifiable);
     }
 
@@ -632,7 +790,8 @@ mod tests {
         // Sign a response for height 5000 while our tip is only 1000.
         let raw = make_signed_response(&target, 5_000, REAL_HASH, REAL_MERKLE, true);
 
-        let verdict = reverify_archive_impl(&good_oracle(), &target.node_id(), Some(&raw)).await;
+        let verdict =
+            reverify_archive_impl(&good_oracle(), &target.node_id(), "{}", Some(&raw)).await;
         assert_eq!(verdict, ReVerdict::Unverifiable);
     }
 
