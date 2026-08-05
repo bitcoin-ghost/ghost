@@ -23,6 +23,7 @@
 #include <haze/block_reconstruct.h>
 #include <haze/checkpoint.h>
 #include <haze/checkpoint_signing.h>
+#include <haze/hazync_proof.h>
 #include <haze/stripped_block.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
@@ -1429,6 +1430,14 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::BOOL, "automatic_pruning", /*optional=*/true, "whether automatic pruning is enabled (only present if pruning is enabled)"},
                 {RPCResult::Type::NUM, "prune_target_size", /*optional=*/true, "the target size used by pruning (only present if automatic pruning is enabled)"},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "the block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)"},
+                {RPCResult::Type::OBJ, "hazync", /*optional=*/true, "Hazync proof this node verified at startup (only present if -hazyncproof was accepted)",
+                {
+                    {RPCResult::Type::NUM, "provenheight", "height through which the proof attests validity, anchored at genesis"},
+                    {RPCResult::Type::STR_HEX, "proventip", "block hash the proof commits to at that height"},
+                    {RPCResult::Type::STR_HEX, "guestid", "Hazync guest image id the proof was verified against"},
+                    {RPCResult::Type::NUM, "utxoleaves", "number of leaves in the UTXO accumulator the proof commits to"},
+                    {RPCResult::Type::BOOL, "actedon", "whether validation used the proof. Currently always false: proofs are verified and reported, never acted on"},
+                }},
                 (IsDeprecatedRPCEnabled("warnings") ?
                     RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
                     RPCResult{RPCResult::Type::ARR, "warnings", "any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)",
@@ -1465,6 +1474,18 @@ RPCHelpMan getblockchaininfo()
     obj.pushKV("chainwork", tip.nChainWork.GetHex());
     obj.pushKV("size_on_disk", chainman.m_blockman.CalculateCurrentUsage());
     obj.pushKV("pruned", chainman.m_blockman.IsPruneMode());
+    // An operator must be able to ask a RUNNING node whether it is relying on a proof. A startup log
+    // line is not an answer once it has scrolled away. `actedon` is reported explicitly rather than
+    // implied, so the field does not silently change meaning when adoption lands.
+    if (const auto& hazync_proof{haze::HazyncVerifiedProof()}) {
+        UniValue hz(UniValue::VOBJ);
+        hz.pushKV("provenheight", (uint64_t)hazync_proof->height);
+        hz.pushKV("proventip", hazync_proof->tip_hash.GetHex());
+        hz.pushKV("guestid", haze::HazyncMethodId());
+        hz.pushKV("utxoleaves", hazync_proof->utxo_leaves);
+        hz.pushKV("actedon", false);
+        obj.pushKV("hazync", std::move(hz));
+    }
     if (chainman.m_blockman.IsPruneMode()) {
         const auto prune_height{GetPruneHeight(chainman.m_blockman, active_chainstate.m_chain)};
         obj.pushKV("pruneheight", prune_height ? prune_height.value() + 1 : 0);

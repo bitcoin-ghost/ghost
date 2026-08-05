@@ -39,6 +39,21 @@ namespace haze {
  * BN254 plus risc0's receipt and claim format, and a second implementation in C++ would be a large
  * body of consensus-critical code that would inevitably drift from the one CI exercises.
  */
+/**
+ * The guest image id this ghostd is willing to trust.
+ *
+ * A Hazync proof is only meaningful relative to the guest that produced it: a different guest is a
+ * different consensus program, and a proof under a superseded id proves nothing about this chain.
+ * The linked verifier reports the id it was BUILT with, so without pinning, linking an older
+ * libhazync_verify.a would make ghostd silently honour proofs under a retired guest — and say
+ * "VERIFIED" while doing it.
+ *
+ * ⚠ This must be updated in lockstep with a Hazync re-baseline, together with hazync's
+ * reproduce/METHOD_ID. scripts/check-hazync-guest-id.sh fails the build when the two disagree.
+ */
+inline constexpr std::string_view HAZYNC_EXPECTED_METHOD_ID{
+    "4722cec826239c1b3a3598bbac284376cc7b920c9bcd9863fa34f40c9ea7bbae"};
+
 struct HazyncProofState {
     uint32_t height{0};
     uint256 tip_hash;                    //!< display order, comparable with CBlockIndex::GetBlockHash()
@@ -71,6 +86,15 @@ bool HazyncVerifyAvailable();
 
 /** Handle -hazyncproof=<file> at startup: verify, log the adopted state, and report. */
 void HazyncProofStartupCheck(const ArgsManager& args);
+
+/**
+ * The proof this node verified at startup, or nullopt if none was given or it was refused.
+ *
+ * Set once during init, before the RPC server accepts connections, and never mutated afterwards —
+ * so readers need no lock. An operator must be able to ask a RUNNING node whether it is relying on
+ * a proof; a line in a startup log that has since scrolled away is not an answer.
+ */
+const std::optional<HazyncProofState>& HazyncVerifiedProof();
 
 } // namespace haze
 

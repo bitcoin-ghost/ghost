@@ -59,12 +59,33 @@ std::string HazyncErrorString(int rc)
 #endif
 }
 
+namespace {
+//! Set once in HazyncProofStartupCheck during init, before the RPC server starts. See header.
+std::optional<HazyncProofState> g_verified_proof;
+} // namespace
+
+const std::optional<HazyncProofState>& HazyncVerifiedProof() { return g_verified_proof; }
+
 std::optional<HazyncProofState> VerifyHazyncProof(const fs::path& proof_file, std::string& error_out)
 {
 #ifndef WITH_HAZYNC_VERIFY
     error_out = "this ghostd was built without Hazync proof support (-DWITH_HAZYNC_VERIFY=ON)";
     return std::nullopt;
 #else
+    // Check the linked verifier's guest id BEFORE reading anything. A proof is only meaningful
+    // relative to the guest that produced it, so a verifier built against a different guest cannot
+    // answer the question being asked — regardless of what the proof file contains. Refusing here
+    // rather than after verification keeps the failure unambiguous: it is the BUILD that is wrong.
+    const std::string linked_id{HazyncMethodId()};
+    if (linked_id != HAZYNC_EXPECTED_METHOD_ID) {
+        error_out = strprintf(
+            "linked Hazync verifier is for guest %s but this ghostd trusts %s — refusing to verify. "
+            "The verifier and ghostd must be rebuilt together after a Hazync re-baseline.",
+            linked_id.empty() ? "(none reported)" : linked_id,
+            std::string{HAZYNC_EXPECTED_METHOD_ID});
+        return std::nullopt;
+    }
+
     std::ifstream f{proof_file, std::ios::binary};
     if (!f.good()) {
         error_out = strprintf("cannot read proof file %s", fs::PathToString(proof_file));
@@ -128,6 +149,8 @@ void HazyncProofStartupCheck(const ArgsManager& args)
         LogWarning("[hazync] proof %s REJECTED: %s\n", fs::PathToString(p), err);
         return;
     }
+
+    g_verified_proof = st;
 
     LogInfo("[hazync] proof VERIFIED against guest %s\n", HazyncMethodId());
     LogInfo("[hazync]   genesis-anchored through height %u\n", st->height);
