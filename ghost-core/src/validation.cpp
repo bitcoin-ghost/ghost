@@ -6320,13 +6320,35 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation()
     // already established. The authority is re-derived from the proof on every start, so a node
     // restarted without one does not silently keep the exemption — it fails earlier, in
     // LoadBlockIndex, with the reason stated.
+    //
+    // ⚠ SKIPPED, not SUCCESS, and the difference is not cosmetic. SUCCESS means "the background
+    // chain has independently validated up to the base, so the snapshot chainstate can be PROMOTED
+    // to an ordinary one" — node/chainstate.cpp acts on it by running ValidatedSnapshotCleanup(),
+    // which deletes the background chainstate and moves chainstate_snapshot over the top of it.
+    //
+    // For a proof-adopted node that promotion is both false and fatal. False, because blocks 1..N
+    // were never downloaded and never will be. Fatal, because promotion discards the snapshot
+    // marker that bootstraps m_chain_tx_count at the base: the base then has no transaction count,
+    // HaveNumChainTxs() is false, it never enters setBlockIndexCandidates, and the node aborts in
+    // PruneBlockIndexCandidates on the assertion that the set is non-empty. (Observed, not
+    // theorised — this is what the first restart of an adopted node actually did.) Even bootstrapping
+    // it anyway would not save the promotion, because CheckBlockIndex then asserts that NO block
+    // carries a chain_tx_count without transactions once there is no snapshot base to excuse it.
+    //
+    // The hazed branch above can return SUCCESS safely because its blocks below N were downloaded
+    // and then stripped: they have nTx set, so the count recomputes from genesis and the promoted
+    // chainstate is a genuine one. That is exactly the property this node does not have.
+    //
+    // So a proof-adopted node stays snapshot-based for good. The empty background chainstate
+    // directory stays on disk, disabled — an honest record that the chain below the base was never
+    // validated here, rather than a tidier lie.
     if (const auto& adoption{haze::HazyncAdoptedSnapshot()};
         adoption && SnapshotBlockhash() && adoption->base_blockhash == *SnapshotBlockhash()) {
         LogInfo("[snapshot] Hazync: nothing to complete — validity to height %d rests on the proof, "
                 "not on a background re-download of the chain below it", adoption->height);
         m_ibd_chainstate->m_disabled = true;
         this->MaybeRebalanceCaches();
-        return SnapshotCompletionResult::SUCCESS;
+        return SnapshotCompletionResult::SKIPPED;
     }
 
     const int snapshot_tip_height = this->ActiveHeight();
