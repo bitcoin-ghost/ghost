@@ -2290,10 +2290,27 @@ int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out)
 
 /** Undo the effects of this block (with given index) on the UTXO set represented by coins.
  *  When FAILED is returned, view is left in an indeterminate state. */
-DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
+DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
+                                             std::span<const Txid> authoritative_txids)
 {
     AssertLockHeld(::cs_main);
     bool fClean = true;
+
+    // A block rebuilt from stripped storage does not know its own txids — see the header. Refuse it
+    // rather than let it derive them: every coin lookup below is keyed on the txid, so the result
+    // would not be a failure but a set of lookups that quietly miss, leaving spent coins in the UTXO
+    // set and reporting nothing worse than "unclean".
+    if (block.m_haze_reconstructed && authoritative_txids.empty()) {
+        LogError("DisconnectBlock(): block %s was rebuilt from stripped storage but no authoritative "
+                 "txids were supplied — refusing, because its own txids are not the real ones\n",
+                 pindex->GetBlockHash().ToString());
+        return DISCONNECT_FAILED;
+    }
+    if (!authoritative_txids.empty() && authoritative_txids.size() != block.vtx.size()) {
+        LogError("DisconnectBlock(): %u authoritative txids supplied for a block of %u transactions\n",
+                 (unsigned)authoritative_txids.size(), (unsigned)block.vtx.size());
+        return DISCONNECT_FAILED;
+    }
 
     CBlockUndo blockUndo;
     if (!m_blockman.ReadBlockUndo(blockUndo, *pindex)) {
@@ -2318,7 +2335,9 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     // undo transactions in reverse order
     for (int i = block.vtx.size() - 1; i >= 0; i--) {
         const CTransaction &tx = *(block.vtx[i]);
-        Txid hash = tx.GetHash();
+        // The supplied txid wins where one was given: for a rebuilt block the transaction's own is
+        // the hash of something else. Identical to tx.GetHash() for a real block.
+        Txid hash = authoritative_txids.empty() ? tx.GetHash() : authoritative_txids[i];
         bool is_coinbase = tx.IsCoinBase();
         bool is_bip30_exception = (is_coinbase && !fEnforceBIP30);
 
@@ -2411,6 +2430,26 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 {
     AssertLockHeld(cs_main);
     assert(pindex);
+
+    // The hard guard. A block rebuilt from stripped storage has no scriptSigs and no witnesses, so
+    // connecting it is not merely unsafe but meaningless: there are no signatures to verify, no BIP34
+    // coinbase height, no BIP141 witness commitment, and neither the weight nor the sigop cost can be
+    // computed. It would not fail — it would "succeed" against a block that never existed.
+    //
+    // Rebuilt blocks are legitimate for DISCONNECTING, which is how a hazed node reorgs off its own
+    // history, so they do get constructed and they do reach validation.cpp. This is the fence
+    // between the two, and it lives on the block rather than on the index because during an initial
+    // hazed sync the index is already marked stripped while the real block is still in hand.
+    //
+    // Reported as an internal error, not an invalid block: the block itself is very probably fine,
+    // and marking it invalid would poison a legitimate part of the chain over a caller's mistake.
+    if (block.m_haze_reconstructed) {
+        LogError("ConnectBlock(): refusing to connect block %s — it was rebuilt from stripped haze "
+                 "storage, so its scriptSigs and witnesses are empty and there is nothing here to "
+                 "validate. Rebuilt blocks may only be disconnected.\n",
+                 pindex->GetBlockHash().ToString());
+        return state.Error("haze-reconstructed-block-cannot-be-connected");
+    }
 
     uint256 block_hash{block.GetHash()};
     assert(*pindex->phashBlock == block_hash);

@@ -76,6 +76,20 @@ public:
     mutable bool m_checked_witness_commitment{false}; // CheckWitnessCommitment()
     mutable bool m_checked_merkle_root{false};        // CheckMerkleRoot()
 
+    /**
+     * Memory-only: this block was rebuilt from stripped storage and is NOT the real block.
+     *
+     * Haze destroys scriptSigs and witnesses permanently, so a block rebuilt from what survives has
+     * empty ones — which makes it unusable for connecting (no signatures to verify, no BIP34 height,
+     * no witness commitment, wrong weight and sigop cost) and makes its transactions' computed txids
+     * wrong wherever a scriptSig was removed.
+     *
+     * Disconnecting, by contrast, needs none of that, so a rebuilt block is legitimate there and is
+     * how a hazed node reorgs off its own history. Not serialised: it describes where this object
+     * came from in memory, not what a block is.
+     */
+    bool m_haze_reconstructed{false};
+
     CBlock()
     {
         SetNull();
@@ -99,6 +113,7 @@ public:
         fChecked = false;
         m_checked_witness_commitment = false;
         m_checked_merkle_root = false;
+        m_haze_reconstructed = false;
     }
 
     CBlockHeader GetBlockHeader() const

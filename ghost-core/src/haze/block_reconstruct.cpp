@@ -53,6 +53,10 @@ CBlock ReconstructPartialBlock(const CStrippedBlock& stripped)
         block.vtx.push_back(MakeTransactionRef(ReconstructTransaction(stripped_tx)));
     }
 
+    // Mark it for what it is. ConnectBlock refuses a block carrying this, so the marker travels with
+    // the object rather than depending on every caller remembering where it came from.
+    block.m_haze_reconstructed = true;
+
     return block;
 }
 

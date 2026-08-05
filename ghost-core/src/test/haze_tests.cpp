@@ -14,6 +14,10 @@
 #include <script/solver.h>
 #include <uint256.h>
 
+#include <validation.h>
+#include <consensus/validation.h>
+#include <coins.h>
+#include <primitives/transaction_identifier.h>
 #include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
@@ -413,6 +417,140 @@ BOOST_AUTO_TEST_CASE(reconstructed_block_cannot_carry_txids)
     // transaction whose scriptSig is empty.
     BOOST_CHECK(reconstructed.vtx[0]->vin[0].scriptSig.empty());
     BOOST_CHECK(!block.vtx[0]->vin[0].scriptSig.empty());
+}
+
+// ============================================================================
+// Reorg from stripped storage (#545)
+// ============================================================================
+
+//! Authoritative txids for a stripped block, in transaction order — what the rebuilt CBlock cannot
+//! carry itself. Kept alive by the caller for the span handed to DisconnectBlock.
+static std::vector<Txid> AuthoritativeTxids(const haze::CStrippedBlock& stripped)
+{
+    std::vector<Txid> txids;
+    txids.reserve(stripped.GetTxCount());
+    for (size_t i = 0; i < stripped.GetTxCount(); ++i) {
+        txids.push_back(Txid::FromUint256(stripped.GetTxid(i)));
+    }
+    return txids;
+}
+
+BOOST_AUTO_TEST_CASE(disconnect_from_stripped_matches_disconnect_from_full)
+{
+    // The claim reorg-from-stripped rests on: undoing a block needs nothing haze destroyed, so a
+    // block rebuilt from stripped storage must undo to exactly the same UTXO set as the real one.
+    //
+    // Asserted by doing both and comparing, rather than by checking a handful of coins — a spot
+    // check would pass while some other coin silently differed.
+    // The spend must be properly signed, or the block is invalid, never connects, and the whole
+    // comparison below runs against a tip that is not this block at all.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CMutableTransaction spend = CreateValidMempoolTransaction(
+        /*input_transaction=*/m_coinbase_txns[0], /*input_vout=*/0, /*input_height=*/0,
+        /*input_signing_key=*/coinbaseKey, /*output_destination=*/dest,
+        /*output_amount=*/49 * COIN, /*submit=*/false);
+    CBlock block = CreateAndProcessBlock({spend}, dest);
+
+    LOCK(cs_main);
+    Chainstate& chainstate = m_node.chainman->ActiveChainstate();
+    CBlockIndex* pindex = m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash());
+    BOOST_REQUIRE(pindex);
+    // Load-bearing: if the block did not become the tip it was rejected, and disconnecting it would
+    // be measuring nothing.
+    BOOST_REQUIRE(chainstate.m_chain.Tip() == pindex);
+    BOOST_REQUIRE_EQUAL(block.vtx.size(), 2U); // coinbase + the spend, so inputs really are restored
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
+    const std::vector<Txid> txids = AuthoritativeTxids(result.stripped_block);
+
+    // Undo with the real block.
+    CCoinsViewCache from_full(&chainstate.CoinsTip());
+    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(block, pindex, from_full), DISCONNECT_OK);
+
+    // Undo with the rebuilt block plus the txids the stripped form kept.
+    CCoinsViewCache from_stripped(&chainstate.CoinsTip());
+    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, from_stripped, txids), DISCONNECT_OK);
+
+    // Same best block, and the same verdict on every coin the block touched.
+    BOOST_CHECK(from_full.GetBestBlock() == from_stripped.GetBestBlock());
+    for (const auto& tx : block.vtx) {
+        for (size_t o = 0; o < tx->vout.size(); ++o) {
+            const COutPoint out{tx->GetHash(), static_cast<uint32_t>(o)};
+            BOOST_CHECK_EQUAL(from_full.HaveCoin(out), from_stripped.HaveCoin(out));
+        }
+        if (!tx->IsCoinBase()) {
+            for (const auto& in : tx->vin) {
+                BOOST_CHECK_EQUAL(from_full.HaveCoin(in.prevout), from_stripped.HaveCoin(in.prevout));
+                BOOST_CHECK(from_full.AccessCoin(in.prevout).out == from_stripped.AccessCoin(in.prevout).out);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(disconnect_from_stripped_without_txids_is_refused)
+{
+    // The negative that makes the parameter load-bearing. Without it this call would not fail — it
+    // would look up outpoints that do not exist, miss every one, and leave spent coins in the set
+    // while reporting no worse than "unclean". It must be refused outright instead.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    LOCK(cs_main);
+    Chainstate& chainstate = m_node.chainman->ActiveChainstate();
+    CBlockIndex* pindex = m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash());
+    BOOST_REQUIRE(pindex);
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
+    BOOST_REQUIRE(rebuilt.m_haze_reconstructed);
+
+    CCoinsViewCache view(&chainstate.CoinsTip());
+    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, view), DISCONNECT_FAILED);
+
+    // A wrong-sized set is refused too, rather than read past the end or applied to the wrong txs.
+    std::vector<Txid> short_txids = AuthoritativeTxids(result.stripped_block);
+    short_txids.pop_back();
+    CCoinsViewCache view2(&chainstate.CoinsTip());
+    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, view2, short_txids), DISCONNECT_FAILED);
+}
+
+BOOST_AUTO_TEST_CASE(connecting_a_reconstructed_block_is_refused)
+{
+    // The hard guard the design asks for: rebuilt blocks may be disconnected, never connected.
+    // Without it, ConnectBlock would run against empty scriptSigs and empty witnesses — nothing to
+    // verify, no BIP34 height, no witness commitment — and could only produce a meaningless pass.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    LOCK(cs_main);
+    Chainstate& chainstate = m_node.chainman->ActiveChainstate();
+    CBlockIndex* pindex = m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash());
+    BOOST_REQUIRE(pindex);
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
+
+    // ConnectBlock asserts the view sits at pindex->pprev (validation.cpp), so disconnect first —
+    // which also makes this a genuine round trip rather than a contrived view.
+    CCoinsViewCache view(&chainstate.CoinsTip());
+    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(block, pindex, view), DISCONNECT_OK);
+    BOOST_REQUIRE(view.GetBestBlock() == pindex->pprev->GetBlockHash());
+
+    BlockValidationState state;
+    BOOST_CHECK(!chainstate.ConnectBlock(rebuilt, state, pindex, view, /*fJustCheck=*/true));
+
+    // Refused as an internal error, NOT as an invalid block: the block itself is fine and marking it
+    // invalid would poison a legitimate part of the chain over a caller's mistake.
+    BOOST_CHECK(state.IsError());
+    BOOST_CHECK(!state.IsInvalid());
+
+    // The control, from the same view: the real block connects. Without it the refusal above could
+    // be the fixture being wrong rather than the guard working. The refused call returns before
+    // touching the view, so the view is still at pprev here.
+    BOOST_REQUIRE(!block.m_haze_reconstructed);
+    BlockValidationState state2;
+    BOOST_CHECK(chainstate.ConnectBlock(block, state2, pindex, view, /*fJustCheck=*/true));
 }
 
 BOOST_AUTO_TEST_CASE(reconstruct_meta_flags)
