@@ -3931,6 +3931,12 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     pindexNew->nDataPos = pos.nPos;
     pindexNew->nUndoPos = 0;
     pindexNew->nStatus |= BLOCK_HAVE_DATA;
+    // Record WHICH file sequence nDataPos refers to. Haze writes the stripped payload to gsb*.dat,
+    // and BLOCK_HAVE_DATA alone cannot distinguish that from a full block in blk*.dat — so without
+    // this the read path has to guess, and guessed wrong.
+    if (m_blockman.m_ghost_exorcism.IsActive()) {
+        pindexNew->nStatus |= BLOCK_HAZED_STRIPPED;
+    }
     if (DeploymentActiveAt(*pindexNew, *this, Consensus::DEPLOYMENT_SEGWIT)) {
         pindexNew->nStatus |= BLOCK_OPT_WITNESS;
     }
@@ -3989,6 +3995,12 @@ void ChainstateManager::ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pin
     pindexNew->nDataPos = pos.nPos;
     pindexNew->nUndoPos = 0;
     pindexNew->nStatus |= BLOCK_HAVE_DATA;
+    // Record WHICH file sequence nDataPos refers to. Haze writes the stripped payload to gsb*.dat,
+    // and BLOCK_HAVE_DATA alone cannot distinguish that from a full block in blk*.dat — so without
+    // this the read path has to guess, and guessed wrong.
+    if (m_blockman.m_ghost_exorcism.IsActive()) {
+        pindexNew->nStatus |= BLOCK_HAZED_STRIPPED;
+    }
     if (DeploymentActiveAt(*pindexNew, *this, Consensus::DEPLOYMENT_SEGWIT)) {
         pindexNew->nStatus |= BLOCK_OPT_WITNESS;
     }

@@ -1056,6 +1056,19 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
 bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index) const
 {
+    // A stripped block cannot be returned as a CBlock: haze destroyed the witnesses and scriptSigs,
+    // permanently and on purpose. Say that, rather than reading a gsb offset out of a blk file and
+    // reporting a magic mismatch against what are really the block-file XOR key bytes — which is how
+    // this failure presented before the payload location was recorded.
+    //
+    // Callers wanting the structural data want ReadStrippedBlock. Callers wanting a full block cannot
+    // have one, and no amount of retrying will change that.
+    if (WITH_LOCK(cs_main, return index.nStatus & BLOCK_HAZED_STRIPPED)) {
+        LogError("Block %d (%s) is stored STRIPPED — the full block was destroyed by haze and cannot "
+                 "be read. Use ReadStrippedBlock for its structural data.\n",
+                 index.nHeight, index.GetBlockHash().ToString());
+        return false;
+    }
     const FlatFilePos block_pos{WITH_LOCK(cs_main, return index.GetBlockPos())};
     return ReadBlock(block, block_pos, index.GetBlockHash());
 }
