@@ -54,7 +54,8 @@ members = [
     "bins/ghost-gsp",
     # Wraith coordinator (Wraith Lite v1, single-round atomic CoinJoin)
     "bins/wraith-coordinator",
-    # Registry service for load balancing
+    # Decentralised mining-discovery shim (miner-side; verifies the signed node-list checkpoint)
+    "bins/ghost-miner-proxy",
     # Headless setup CLI
     "bins/ghost-setup",
     # Mobile Apps

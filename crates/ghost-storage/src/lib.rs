@@ -51,6 +51,7 @@ pub use models::*;
 pub use queries::BondRow;
 pub use queries::GlyphRecord;
 pub use queries::L2StateInfo;
+pub use queries::MeshNodeListCheckpointRecord;
 pub use queries::MpcContributionRecord;
 pub use queries::PayoutLedgerCheckpointRecord;
 pub use queries::{ConfidentialNoteRecord, ConfidentialTransferRecord};

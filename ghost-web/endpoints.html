@@ -1,0 +1,368 @@
+<!-- Bitcoin Ghost · Mining Endpoints -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mining endpoints · Bitcoin Ghost</title>
+  <meta name="description" content="Live list of public Ghost mining nodes. Point an ASIC at any node — the mesh load-balances you across the pool. Any node is a valid entry point, so no single address can strand you.">
+  <meta property="og:site_name" content="Bitcoin Ghost">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Mining endpoints · Bitcoin Ghost">
+  <meta property="og:description" content="Live list of public Ghost mining nodes. Point an ASIC at any node — the mesh load-balances you across the pool.">
+  <meta property="og:url" content="https://bitcoinghost.org/endpoints.html">
+  <meta property="og:image" content="https://bitcoinghost.org/logo.png">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:site" content="@defenwycke">
+  <meta name="twitter:creator" content="@defenwycke">
+  <meta name="twitter:title" content="Mining endpoints · Bitcoin Ghost">
+  <meta name="twitter:description" content="Live list of public Ghost mining nodes. Point an ASIC at any node — the mesh load-balances you across the pool.">
+  <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20260424">
+  <script>
+    (function () {
+      var saved = localStorage.getItem('ghost-theme');
+      var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', saved || system);
+    })();
+  </script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="/" class="brand bare">
+      <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+      </svg>
+      <span class="wordmark">bitcoinghost</span>
+    </a>
+    <nav class="primary">
+      <a href="/">overview</a>
+      <a href="/core.html">core</a>
+      <a href="/pool.html">pool</a>
+      <a href="/pay.html">pay</a>
+      <a href="/nodes.html">nodes</a>
+      <a href="/hazync.html">hazync</a>
+      <a href="/miners.html">miners</a>
+      <a href="/endpoints.html" class="current">endpoints</a>
+      <a href="/downloads.html">downloads</a>
+      <a href="/docs/">docs</a>
+    </nav>
+    <div class="utils">
+      <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+        </svg>
+      </a>
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle colour scheme"></button>
+    </div>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="container">
+    <span class="eyebrow">Mining endpoints</span>
+    <h1>Point at any node. Mine the whole pool.</h1>
+    <p class="lead">
+      Every public Ghost node is a valid entry point. Connect an ASIC to any
+      one of them and the mesh load-balances your hashrate across the pool
+      automatically — the balancing happens at the nodes, not at a central
+      proxy. So this list is a <strong>bootstrap seed</strong>: pick a couple,
+      set them as your pool + fallbacks, and no single address can ever strand
+      you.
+    </p>
+    <div class="hero-actions">
+      <a href="#endpoints" class="btn btn-primary">Live nodes <span class="arrow">↓</span></a>
+      <a href="#setup" class="btn btn-ghost">Resilient setup</a>
+    </div>
+  </div>
+</section>
+
+<!-- ───────── Live endpoints ───────── -->
+<section class="block" id="endpoints">
+  <div class="container">
+    <div class="section-label">live nodes</div>
+    <h2 class="section-title">Public mining endpoints.</h2>
+    <p class="section-lead">
+      Fetched live from the mesh. Every node here has <strong>public mining</strong>
+      enabled and accepts external miners. Stratum V1 is the common choice for
+      Bitaxe and CGMiner; Stratum V2 is available on the same hosts.
+    </p>
+
+    <div id="ep-status" class="pending-note" style="margin-bottom:1rem">Loading live node list…</div>
+
+    <div class="hw-table-wrap">
+      <table class="hw-table" id="ep-table" style="display:none">
+        <thead>
+          <tr>
+            <th>Node</th>
+            <th>Stratum V1</th>
+            <th>Stratum V2</th>
+            <th>Miners</th>
+            <th>Load</th>
+            <th>Hashrate</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="ep-rows"></tbody>
+      </table>
+    </div>
+
+    <p class="section-lead" style="margin-top:1rem;font-size:0.85rem;opacity:0.7">
+      List refreshes every 30s. Pulled from one node's view of the whole mesh —
+      so nodes joining or leaving appear here automatically, with no hard-coded
+      list. Load is current miners ÷ node capacity.
+    </p>
+  </div>
+</section>
+
+<!-- ───────── How routing works ───────── -->
+<section class="block" style="border-top:none">
+  <div class="container">
+    <div class="section-label">how it routes</div>
+    <h2 class="section-title">The balancing is at the nodes.</h2>
+    <p class="section-lead">
+      You don't need a smart address to reach a lightly-loaded node — you just
+      need to reach <em>any</em> node. When your miner connects, that node checks
+      the live mesh and, if a less-loaded peer exists, transparently forwards
+      your Stratum session to it. Your miner never notices. That's why any entry
+      point works, and why losing one address doesn't cost you the pool.
+    </p>
+    <div class="core-tiles core-tiles-3">
+      <div class="ct-tile">
+        <div class="k">entry</div>
+        <div class="v">any node</div>
+        <div class="sub">every public node accepts you</div>
+      </div>
+      <div class="ct-tile">
+        <div class="k">routing</div>
+        <div class="v accent">at the node</div>
+        <div class="sub">mesh-driven, no central proxy</div>
+      </div>
+      <div class="ct-tile">
+        <div class="k">failover</div>
+        <div class="v">to a peer</div>
+        <div class="sub">set fallbacks; never stranded</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────── Resilient setup ───────── -->
+<section class="block" id="setup">
+  <div class="container">
+    <div class="section-label">resilient setup</div>
+    <h2 class="section-title">Set a primary and fallbacks.</h2>
+    <p class="section-lead">
+      Mining firmware fails over automatically when a pool drops. Give it more
+      than one Ghost node — a primary plus one or two fallbacks from the list
+      above — and your rig keeps hashing even if a whole node (or an address)
+      goes offline. Use the fixed stratum ports: <code>:3333</code> for V1,
+      <code>:34255</code> for V2.
+    </p>
+
+    <ul class="feature-list node-core-pink">
+      <li>
+        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+        <div>
+          <div class="fl-name">Bitaxe / AxeOS</div>
+          <div class="fl-desc">In the web UI under <strong>Settings</strong>, set <code>pool.bitcoinghost.org:3333</code> (or any node from the list) as the <strong>Stratum</strong> host, and a second node as the <strong>Fallback Stratum</strong> host. AxeOS switches to the fallback automatically if the primary stops responding.</div>
+        </div>
+      </li>
+      <li>
+        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+        <div>
+          <div class="fl-name">CGMiner / BFGMiner</div>
+          <div class="fl-desc">Pass each node as its own <code>--url</code>; they're tried in priority order with automatic failover:<br><code>--url stratum+tcp://pool.bitcoinghost.org:3333 --url stratum+tcp://&lt;node-2&gt;:3333 --url stratum+tcp://&lt;node-3&gt;:3333</code><br>Use the same <code>--user &lt;your-bc1…-address&gt;</code> on each.</div>
+        </div>
+      </li>
+      <li>
+        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
+        <div>
+          <div class="fl-name">Your address is your username</div>
+          <div class="fl-desc">Ghost has no accounts. Your <code>bc1…</code> payout address <em>is</em> your Stratum username — set it the same on every node so all your shares aggregate to one payout, whichever node you land on.</div>
+        </div>
+      </li>
+    </ul>
+
+    <div class="pending-note" style="margin-top:1.5rem">
+      Coming: a verifiable, consensus-signed node list a small local helper can
+      follow automatically — so discovery needs neither DNS nor this page after
+      first run. For now, a primary plus a fallback or two gives you
+      address-independent resilience today.
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="colophon">
+      <div class="brand">
+        <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
+          <path d="M9 10h.01"/>
+          <path d="M15 10h.01"/>
+          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        </svg>
+        <span class="wordmark">bitcoinghost</span>
+      </div>
+      <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
+    </div>
+    <div><h4>Core</h4><ul></ul></div>
+    <div><h4>Pool</h4><ul></ul></div>
+    <div><h4>Pay</h4><ul></ul></div>
+    <div><h4>Products</h4><ul></ul></div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="https://github.com/bitcoin-ghost">GitHub</a></li>
+        <li><a href="https://x.com/defenwycke">@defenwycke</a></li>
+        <li><a href="https://defenwycke.org">defenwycke.org</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/ghost/blob/main/LICENSE">MIT License</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var html = document.documentElement;
+    var btn = document.getElementById('theme-toggle');
+    var sun = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+    var moon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+    function render() { btn.innerHTML = html.getAttribute('data-theme') === 'dark' ? sun : moon; }
+    render();
+    btn.addEventListener('click', function () {
+      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      localStorage.setItem('ghost-theme', next);
+      render();
+    });
+  })();
+
+  // ── Live public-mining endpoint list ───────────────────────────────────
+  // Bootstrap seeds = the original four load-balancer proxies. A new mesh node
+  // has no per-node proxy, so we always enter through one of these seeds; the
+  // /api/v1/pool/mesh-nodes endpoint then returns the WHOLE mesh (self + every
+  // connected peer) from that single node, so nodes 5, 6, … appear here with no
+  // hard-coded list. Same pattern the overview page uses.
+  (function () {
+    var VMS = ['vm1', 'vm2', 'vm3', 'vm4'];
+    var SV1_PORT = 3333;    // config/mainnet.toml sv1_port
+    var SV2_PORT = 34255;   // config/mainnet.toml sv2_port
+
+    async function fetchMeshNodes() {
+      for (var i = 0; i < VMS.length; i++) {
+        try {
+          var ctl = new AbortController();
+          var t = setTimeout(function () { ctl.abort(); }, 5000);
+          var r = await fetch('/api/pool/' + VMS[i] + '/api/v1/pool/mesh-nodes', { signal: ctl.signal });
+          clearTimeout(t);
+          if (r.ok) {
+            var d = await r.json();
+            if (d && Array.isArray(d.nodes) && d.nodes.length) return d.nodes;
+          }
+        } catch (e) { /* try the next seed */ }
+      }
+      return null;
+    }
+
+    function formatHashrate(ths) {
+      if (!isFinite(ths) || ths <= 0) return '0 <span class="unit">TH/s</span>';
+      if (ths < 0.001) return (ths * 1e6).toFixed(1) + ' <span class="unit">MH/s</span>';
+      if (ths < 1)     return (ths * 1000).toFixed(1) + ' <span class="unit">GH/s</span>';
+      if (ths < 1000)  return ths.toFixed(2) + ' <span class="unit">TH/s</span>';
+      if (ths < 1e6)   return (ths / 1000).toFixed(2) + ' <span class="unit">PH/s</span>';
+      return (ths / 1e6).toFixed(2) + ' <span class="unit">EH/s</span>';
+    }
+
+    // Strip the :8080 API port off an "host:port" address, leaving the bare host.
+    function hostOf(address) {
+      if (!address) return '';
+      var s = String(address);
+      var i = s.lastIndexOf(':');
+      return i > 0 ? s.slice(0, i) : s;
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+
+    function loadPct(node) {
+      var cap = Number(node.max_capacity) || 0;
+      var mc = Number(node.miner_count) || 0;
+      if (cap <= 0) return null;
+      return Math.min(100, Math.round((mc / cap) * 100));
+    }
+
+    var statusEl = document.getElementById('ep-status');
+    var tableEl = document.getElementById('ep-table');
+    var rowsEl = document.getElementById('ep-rows');
+
+    function render(nodes) {
+      // Only nodes advertising public mining accept external miners.
+      var pub = nodes.filter(function (n) {
+        return n && n.capabilities && n.capabilities.public_mining && hostOf(n.address);
+      });
+      if (!pub.length) {
+        statusEl.textContent = 'No public mining nodes are reporting right now. Try again shortly.';
+        statusEl.style.display = '';
+        tableEl.style.display = 'none';
+        return;
+      }
+      // Lightest-loaded first, so a miner picking the top row lands well.
+      pub.sort(function (a, b) {
+        var la = loadPct(a), lb = loadPct(b);
+        if (la == null) la = 999; if (lb == null) lb = 999;
+        return la - lb;
+      });
+
+      var html = '';
+      pub.forEach(function (n) {
+        var host = hostOf(n.address);
+        var lp = loadPct(n);
+        var loadStr = (lp == null) ? '—' : (lp + '%');
+        var miners = (n.miner_count != null) ? n.miner_count : '—';
+        var healthy = n.healthy !== false;
+        var elder = n.capabilities && n.capabilities.elder;
+        var nodeLabel = elder ? 'elder node' : 'node';
+        html += '<tr>'
+          + '<td><strong>' + esc(nodeLabel) + '</strong>'
+            + (elder ? ' <span class="fl-badge">elder</span>' : '') + '</td>'
+          + '<td><code>' + esc(host) + ':' + SV1_PORT + '</code></td>'
+          + '<td><code>' + esc(host) + ':' + SV2_PORT + '</code></td>'
+          + '<td>' + esc(miners) + '</td>'
+          + '<td>' + loadStr + '</td>'
+          + '<td>' + formatHashrate(Number(n.hashrate_th) || 0) + '</td>'
+          + '<td>' + (healthy ? '<span class="accent">● online</span>' : '○ syncing') + '</td>'
+          + '</tr>';
+      });
+      rowsEl.innerHTML = html;
+      tableEl.style.display = '';
+      statusEl.style.display = 'none';
+    }
+
+    async function refresh() {
+      var nodes = await fetchMeshNodes();
+      if (nodes) {
+        render(nodes);
+      } else if (tableEl.style.display === 'none') {
+        statusEl.textContent = 'Could not reach the pool right now. This list will retry automatically.';
+        statusEl.style.display = '';
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 30000);
+  })();
+</script>
+
+</body>
+</html>

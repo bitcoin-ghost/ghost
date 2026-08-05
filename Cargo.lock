@@ -3366,6 +3366,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghost-miner-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ghost-common",
+ "ghost-consensus",
+ "hex",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ghost-mpc"
 version = "0.1.0"
 dependencies = [

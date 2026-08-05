@@ -645,7 +645,7 @@ struct Args {
     #[arg(long)]
     genesis_password: Option<String>,
 
-    /// Show node status in load balancer and exit
+    /// Show what this node can establish about itself, and exit
     #[arg(long)]
     status: bool,
 
@@ -3560,7 +3560,7 @@ async fn main() -> Result<()> {
             compute_ledger_root_fn,
         )
         .with_diag(compute_ledger_root_diag_fn)
-        .with_active_voter_set_fn(active_voter_set_fn),
+        .with_active_voter_set_fn(active_voter_set_fn.clone()),
     );
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
@@ -3598,6 +3598,124 @@ async fn main() -> Result<()> {
                 // Alarm if that backfill isn't keeping up — a sustained gap means the
                 // fleet is not converging and miners are not being paid (#548).
                 mgr.check_convergence_stall(height);
+            }
+        });
+    }
+
+    // ── Mesh node-list checkpoint (decentralised mining discovery) ────────────────
+    // The same BFT lifecycle as the payout checkpoint, over the PUBLIC-MINING node set:
+    // a signed snapshot a miner-side shim verifies offline to discover pool nodes without
+    // trusting DNS. DORMANT — gated on MESH_NODE_LIST_CHECKPOINT_HEIGHT (u64::MAX today), so
+    // the propose cadence below no-ops until armed. See tasks/design_mesh_node_list_checkpoint.md.
+    let (mnlchk_tx, mut mnlchk_rx) =
+        tokio::sync::mpsc::channel::<(ghost_consensus::MessageType, Vec<u8>)>(256);
+    {
+        let mesh_c = Arc::clone(&mesh);
+        tokio::spawn(async move {
+            while let Some((ty, bytes)) = mnlchk_rx.recv().await {
+                match mesh_c.create_envelope_raw(ty, bytes) {
+                    Ok(env) => {
+                        if let Err(e) = mesh_c.broadcast(env).await {
+                            tracing::debug!(error = %e, "mesh node-list checkpoint broadcast failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "mesh node-list checkpoint envelope failed")
+                    }
+                }
+            }
+        });
+    }
+    let mnlchk_send: ghost_pool::payout_checkpoint::BroadcastFn = {
+        let tx = mnlchk_tx.clone();
+        Arc::new(move |ty, bytes| {
+            tx.try_send((ty, bytes)).map_err(|e| {
+                ghost_common::error::GhostError::P2PMessage(format!(
+                    "mesh-node-checkpoint channel: {e}"
+                ))
+            })
+        })
+    };
+    // compute_nodes: THIS node's view of the public-mining node set (self + connected
+    // public-mining peers), sorted+deduped by node_id. Stratum ports are the fixed
+    // well-known values; the shim appends them. Exact-set agreement means a divergent view
+    // simply doesn't reach quorum that round, so a transient mesh gap self-heals.
+    let compute_nodes_fn: ghost_pool::mesh_node_checkpoint::ComputeNodeListFn = {
+        let mesh_c = Arc::clone(&mesh);
+        let self_id = identity.node_id();
+        let self_addr = config.network.public_address.clone();
+        let self_public = is_public_mining;
+        Arc::new(move |_cutoff_ts, _height| {
+            use ghost_consensus::MeshNodeEntry;
+            const SV1_PORT: u16 = 3333;
+            const SV2_PORT: u16 = 34255;
+            let mut entries: Vec<MeshNodeEntry> = mesh_c
+                .peers()
+                .get_connected_peers(120)
+                .into_iter()
+                .filter(|p| p.capabilities.public_mining && !p.public_address.is_empty())
+                .map(|p| MeshNodeEntry {
+                    node_id: p.node_id,
+                    host: extract_peer_host(&p.public_address).to_string(),
+                    sv1_port: SV1_PORT,
+                    sv2_port: SV2_PORT,
+                })
+                .collect();
+            if self_public {
+                if let Some(addr) = self_addr.as_deref().filter(|a| !a.is_empty()) {
+                    entries.push(MeshNodeEntry {
+                        node_id: self_id,
+                        host: extract_peer_host(addr).to_string(),
+                        sv1_port: SV1_PORT,
+                        sv2_port: SV2_PORT,
+                    });
+                }
+            }
+            entries.sort_by_key(|n| n.node_id);
+            entries.dedup_by(|a, b| a.node_id == b.node_id);
+            if entries.is_empty() {
+                return None; // nothing to checkpoint yet
+            }
+            Some(entries)
+        })
+    };
+    let mesh_node_checkpoint_mgr = Arc::new(
+        ghost_pool::mesh_node_checkpoint::MeshNodeListCheckpointManager::new(
+            Arc::clone(&identity),
+            Arc::clone(&db),
+            mnlchk_send,
+            compute_nodes_fn,
+        )
+        .with_active_voter_set_fn(active_voter_set_fn),
+    );
+    mesh.register_handler(Arc::clone(&mesh_node_checkpoint_mgr)
+        as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+    {
+        let mgr = Arc::clone(&mesh_node_checkpoint_mgr);
+        let rpc_c = Arc::clone(&rpc);
+        tokio::spawn(async move {
+            const LAG: u64 = 6;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let tip = match rpc_c.get_block_count().await {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                if tip <= LAG {
+                    continue;
+                }
+                let height = tip - LAG;
+                let cutoff_ts = match rpc_c.get_block_hash(height).await {
+                    Ok(hash) => match rpc_c.get_block_header(&hash).await {
+                        Ok(hdr) => hdr.time as i64,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+                mgr.maybe_propose(height, cutoff_ts).await;
+                mgr.maybe_request_backfill(height);
             }
         });
     }
@@ -6653,6 +6771,57 @@ async fn main() -> Result<()> {
                 farm_port: p.farm_port,
             })
             .collect()
+    });
+
+    // Signed mesh node-list checkpoint for the public /api/v1/pool/mesh-node-list-checkpoint
+    // endpoint. Serializes the latest finalised record into the verifiable blob a miner-side
+    // shim consumes (node list + signer-set forward-chain delta/root + proposer and ≥67%
+    // approver signatures, all hex). None until a checkpoint is finalised → the handler 404s
+    // (the gate is dormant on mainnet, so this returns 404 today).
+    let db_for_mnl_ckpt = Arc::clone(&db);
+    verification_state = verification_state.with_mesh_node_list_checkpoint(move || {
+        let rec = db_for_mnl_ckpt
+            .get_latest_mesh_node_list_checkpoint()
+            .ok()
+            .flatten()?;
+        let nodes: Vec<serde_json::Value> = rec
+            .nodes
+            .iter()
+            .map(|(id, host, s1, s2)| {
+                serde_json::json!({
+                    "node_id": hex::encode(id),
+                    "host": host,
+                    "sv1_port": s1,
+                    "sv2_port": s2,
+                })
+            })
+            .collect();
+        let approvals: Vec<serde_json::Value> = rec
+            .approvals
+            .iter()
+            .map(|(v, sig)| {
+                serde_json::json!({
+                    "voter": hex::encode(v),
+                    "signature": hex::encode(sig),
+                })
+            })
+            .collect();
+        Some(serde_json::json!({
+            "version": "MeshNodeListCheckpoint/v1",
+            "height": rec.height,
+            "cutoff_ts": rec.cutoff_ts,
+            "nodes": nodes,
+            "list_root": hex::encode(rec.list_root),
+            "signer_set_root": hex::encode(rec.signer_set_root),
+            "signer_set_delta": {
+                "added": rec.signer_set_delta.0.iter().map(hex::encode).collect::<Vec<_>>(),
+                "removed": rec.signer_set_delta.1.iter().map(hex::encode).collect::<Vec<_>>(),
+            },
+            "active_node_count": rec.active_node_count,
+            "proposer": rec.proposer_id,
+            "proposer_signature": hex::encode(&rec.proposer_signature),
+            "approvals": approvals,
+        }))
     });
 
     // Live mesh node list for the public /api/v1/pool/mesh-nodes endpoint.

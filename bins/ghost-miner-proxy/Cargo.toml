@@ -1,0 +1,36 @@
+[package]
+name = "ghost-miner-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Decentralised mining discovery shim — verifies the signed Ghost node-list checkpoint and stratum-proxies a miner to a live pool node"
+license = "MIT"
+repository = "https://github.com/bitcoin-ghost"
+
+[[bin]]
+name = "ghost-miner-proxy"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+# Workspace crates: the checkpoint wire types + hashes, and the signature primitive.
+ghost-consensus = { path = "../../crates/ghost-consensus" }
+ghost-common = { path = "../../crates/ghost-common" }
+
+# Async runtime + networking (TCP proxy).
+tokio = { version = "1.0", features = ["full"] }
+
+# HTTP client to fetch the signed checkpoint, and its TLS provider.
+reqwest = { workspace = true }
+rustls = { workspace = true }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# (de)serialisation of the checkpoint blob (reqwest handles the JSON transport itself)
+serde = { version = "1.0", features = ["derive"] }
+hex = "0.4"
+
+# Errors + logging
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -112,7 +112,6 @@ pub struct NodeConfig {
     /// Reaper configuration (dead code detection in witness scripts)
     #[serde(default)]
     pub reaper: ReaperSettings,
-    /// Registry configuration (optional, for load balancer registration)
     /// Decentralised Wraith coordinator-election configuration.
     ///
     /// Read-only and gated OFF by default: when `wraith_election_enabled` is
@@ -1828,42 +1827,6 @@ impl Default for GhostPayConfig {
             wraith_enabled: true,
             payout_address: None,
         }
-    }
-}
-
-/// Geographic region for miner routing
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum Region {
-    UsEast,
-    UsWest,
-    EuWest,
-    EuCentral,
-    AsiaSoutheast,
-    AsiaNortheast,
-    Oceania,
-    SouthAmerica,
-    Africa,
-    #[default]
-    Unknown,
-}
-
-impl std::fmt::Display for Region {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::UsEast => "us-east",
-            Self::UsWest => "us-west",
-            Self::EuWest => "eu-west",
-            Self::EuCentral => "eu-central",
-            Self::AsiaSoutheast => "asia-southeast",
-            Self::AsiaNortheast => "asia-northeast",
-            Self::Oceania => "oceania",
-            Self::SouthAmerica => "south-america",
-            Self::Africa => "africa",
-            Self::Unknown => "unknown",
-        };
-        write!(f, "{}", s)
     }
 }
 
