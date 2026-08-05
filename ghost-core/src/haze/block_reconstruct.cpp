@@ -53,6 +53,15 @@ CBlock ReconstructPartialBlock(const CStrippedBlock& stripped)
         block.vtx.push_back(MakeTransactionRef(ReconstructTransaction(stripped_tx)));
     }
 
+    // Mark it for what it is, and carry the real txids with it. ConnectBlock refuses a block
+    // carrying the marker, and every consumer that matches transactions by id finds the correct ids
+    // already attached — neither depends on a caller remembering where the block came from.
+    block.m_haze_reconstructed = true;
+    block.m_haze_authoritative_txids.reserve(stripped.GetTxCount());
+    for (size_t i = 0; i < stripped.GetTxCount(); ++i) {
+        block.m_haze_authoritative_txids.push_back(Txid::FromUint256(stripped.GetTxid(i)));
+    }
+
     return block;
 }
 

@@ -326,6 +326,19 @@ public:
     CBlockIndex* InsertBlockIndex(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     //! Mark one block file as pruned (modify associated database entries)
+    /**
+     * Forget a block's stored data: clear the have-data/undo flags and file position, and drop it
+     * from m_blocks_unlinked so it is reconsidered if the block arrives again.
+     *
+     * Shared by pruning and by the haze path that discards stripped blocks which were stored but
+     * never connected (#542) — one definition of what "we no longer have this block" means, so the
+     * two cannot drift into leaving different residue behind.
+     *
+     * ⚠ Callers must set m_have_pruned. CheckBlockIndex asserts BLOCK_HAVE_DATA and nTx > 0 agree
+     * unless that flag says data has been deleted, and after this call they deliberately do not.
+     */
+    void ForgetBlockData(CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
     void PruneOneBlockFile(const int fileNumber) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     CBlockIndex* LookupBlockIndex(const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -473,6 +486,25 @@ public:
      */
     bool ReadStrippedBlock(haze::CStrippedBlock& block, const FlatFilePos& pos) const;
     bool ReadStrippedBlock(haze::CStrippedBlock& block, const CBlockIndex& index) const;
+
+    /**
+     * Read a block in order to DISCONNECT it, rebuilding it from stripped storage where that is all
+     * that survives.
+     *
+     * A hazed node has to be able to reorg off its own history, and it can: undoing a block reads no
+     * scriptSig and no witness, and the undo data is written whether or not the block was stripped.
+     * So where ReadBlock refuses a stripped block — correctly, since the full block is gone — this
+     * returns the rebuilt structural form instead.
+     *
+     * A rebuilt block arrives carrying its real txids in CBlock::m_haze_authoritative_txids,
+     * because its transactions cannot compute their own — see haze/block_reconstruct.h. Nothing
+     * further is needed at the call site; DisconnectBlock reads them from the block.
+     *
+     * ⚠ The block this returns may be a reconstruction, and a reconstruction must never be
+     * connected, relayed, served to a peer, added to the mempool, or handed to wallet code. It
+     * carries CBlock::m_haze_reconstructed so those paths can refuse it; ConnectBlock already does.
+     */
+    bool ReadBlockForDisconnect(CBlock& block, const CBlockIndex& index) const;
 
     bool ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const;
 

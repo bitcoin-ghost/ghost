@@ -7,6 +7,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <consensus/params.h>
+#include <haze/block_reconstruct.h>
 #include <haze/block_stripper.h>
 #include <haze/exorcism.h>
 #include <haze/hazync_proof.h>
@@ -242,6 +243,30 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
     return pindexNew;
 }
 
+void BlockManager::ForgetBlockData(CBlockIndex& index)
+{
+    AssertLockHeld(cs_main);
+
+    index.nStatus &= ~BLOCK_HAVE_DATA;
+    index.nStatus &= ~BLOCK_HAVE_UNDO;
+    index.nFile = 0;
+    index.nDataPos = 0;
+    index.nUndoPos = 0;
+    m_dirty_blockindex.insert(&index);
+
+    // Drop from m_blocks_unlinked -- a block whose data we no longer have would have
+    // to be downloaded again in order to consider its chain, at which point it would
+    // be reconsidered as a candidate for m_blocks_unlinked or setBlockIndexCandidates.
+    auto range = m_blocks_unlinked.equal_range(index.pprev);
+    while (range.first != range.second) {
+        std::multimap<CBlockIndex*, CBlockIndex*>::iterator _it = range.first;
+        range.first++;
+        if (_it->second == &index) {
+            m_blocks_unlinked.erase(_it);
+        }
+    }
+}
+
 void BlockManager::PruneOneBlockFile(const int fileNumber)
 {
     AssertLockHeld(cs_main);
@@ -250,25 +275,7 @@ void BlockManager::PruneOneBlockFile(const int fileNumber)
     for (auto& entry : m_block_index) {
         CBlockIndex* pindex = &entry.second;
         if (pindex->nFile == fileNumber) {
-            pindex->nStatus &= ~BLOCK_HAVE_DATA;
-            pindex->nStatus &= ~BLOCK_HAVE_UNDO;
-            pindex->nFile = 0;
-            pindex->nDataPos = 0;
-            pindex->nUndoPos = 0;
-            m_dirty_blockindex.insert(pindex);
-
-            // Prune from m_blocks_unlinked -- any block we prune would have
-            // to be downloaded again in order to consider its chain, at which
-            // point it would be considered as a candidate for
-            // m_blocks_unlinked or setBlockIndexCandidates.
-            auto range = m_blocks_unlinked.equal_range(pindex->pprev);
-            while (range.first != range.second) {
-                std::multimap<CBlockIndex*, CBlockIndex*>::iterator _it = range.first;
-                range.first++;
-                if (_it->second == pindex) {
-                    m_blocks_unlinked.erase(_it);
-                }
-            }
+            ForgetBlockData(*pindex);
         }
     }
 
@@ -673,6 +680,29 @@ CBlockFileInfo* BlockManager::GetBlockFileInfo(size_t n)
     LOCK(cs_LastBlockFile);
 
     return &m_blockfile_info.at(n);
+}
+
+bool BlockManager::ReadBlockForDisconnect(CBlock& block, const CBlockIndex& index) const
+{
+    if (!WITH_LOCK(cs_main, return index.nStatus & BLOCK_HAZED_STRIPPED)) {
+        return ReadBlock(block, index);
+    }
+
+    haze::CStrippedBlock stripped;
+    if (!ReadStrippedBlock(stripped, index)) {
+        LogError("Failed to read stripped block %d (%s) for disconnection\n",
+                 index.nHeight, index.GetBlockHash().ToString());
+        return false;
+    }
+
+    // The reconstruction carries the real txids: the rebuilt transactions cannot compute them, and
+    // the stripped form kept them. That is the only reason disconnecting stripped history is possible.
+    block = haze::ReconstructPartialBlock(stripped);
+
+    LogDebug(BCLog::VALIDATION, "Rebuilt stripped block %d (%s) for disconnection, %u transactions\n",
+             index.nHeight, index.GetBlockHash().ToString(),
+             (unsigned)block.m_haze_authoritative_txids.size());
+    return true;
 }
 
 bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const

@@ -15,6 +15,11 @@
 #include <tinyformat.h>
 #include <util/fs_helpers.h>
 #include <util/strencodings.h>
+#include <validation.h>
+#include <chain.h>
+#include <consensus/merkle.h>
+#include <pow.h>
+#include <sync.h>
 
 #include <algorithm>
 #include <array>
@@ -320,6 +325,122 @@ std::optional<HazyncAdoption> HazyncAdoption::Authorise(const ArgsManager& args,
     a.coins_count = st->utxo_leaves;
     a.chain_tx_count_bootstrap = static_cast<uint64_t>(st->height) + 1; // lower bound; see header
     return a;
+}
+
+bool VerifyHazedChainBinding(ChainstateManager& chainman, const HazyncProofState& proven,
+                             int from_height, HazedChainBinding& out)
+{
+    LOCK(::cs_main);
+
+    out = HazedChainBinding{};
+    out.through_height = static_cast<int>(proven.height);
+    out.from_height = std::max(1, from_height);
+    out.complete = (out.from_height == 1);
+
+    if (out.from_height > out.through_height) {
+        out.failure = strprintf("nothing to check: asked to start at %d but the proof only reaches %d",
+                                out.from_height, out.through_height);
+        return false;
+    }
+
+    const CBlockIndex* tip_at_proven{chainman.ActiveChain()[out.through_height]};
+    if (!tip_at_proven) {
+        out.failure = strprintf("this node's chain does not reach the proven height %d",
+                                out.through_height);
+        return false;
+    }
+    out.archive_tip = tip_at_proven->GetBlockHash();
+
+    // The join, checked before the expensive walk. A proof about some other chain must never be
+    // reported as evidence about this one, and there is no point recomputing thousands of merkle
+    // roots to establish which chain we hold if it is already the wrong one.
+    if (out.archive_tip != proven.tip_hash) {
+        out.failure = strprintf(
+            "REFUSED: the proof commits to tip %s at height %d, but this node holds %s there. The "
+            "proof is not about this chain.",
+            proven.tip_hash.GetHex(), out.through_height, out.archive_tip.GetHex());
+        return false;
+    }
+
+    for (int height = out.from_height; height <= out.through_height; ++height) {
+        const CBlockIndex* index{chainman.ActiveChain()[height]};
+        if (!index) {
+            out.failure = strprintf("no block at height %d", height);
+            return false;
+        }
+
+        // Everything below is checked against the header the ARCHIVE stores, not the one in the
+        // block index. Checking the index against itself would establish nothing — its linkage is
+        // structural, built from hashPrevBlock when the header was accepted — whereas the archive's
+        // bytes are independent data that must be made to agree with it.
+        // A stripped block yields its txids from what haze retained; a whole one yields them from its
+        // transactions. Both are the archive's own bytes, and the check that follows is the same
+        // either way — which is the point. This is not a hazed-only claim: an archive node binding
+        // its storage to a proof is doing exactly the same thing with more data than it needs.
+        CBlockHeader archived;
+        uint256 recomputed_root;
+        bool mutated{false};
+
+        if (index->nStatus & BLOCK_HAZED_STRIPPED) {
+            CStrippedBlock stripped;
+            if (!chainman.m_blockman.ReadStrippedBlock(stripped, *index)) {
+                out.failure = strprintf("block %d (%s) has no readable stripped payload", height,
+                                        index->GetBlockHash().GetHex());
+                return false;
+            }
+            archived = stripped.m_header;
+            recomputed_root = stripped.ComputeMerkleRoot(&mutated);
+        } else {
+            CBlock full;
+            if (!chainman.m_blockman.ReadBlock(full, *index)) {
+                out.failure = strprintf("block %d (%s) could not be read from storage", height,
+                                        index->GetBlockHash().GetHex());
+                return false;
+            }
+            archived = full.GetBlockHeader();
+            recomputed_root = BlockMerkleRoot(full, &mutated);
+        }
+        const uint256 archived_hash{archived.GetHash()};
+
+        // The stored payload must be the block the index says lives at this height.
+        if (archived_hash != index->GetBlockHash()) {
+            out.failure = strprintf("block %d: the archive stores %s where the chain has %s", height,
+                                    archived_hash.GetHex(), index->GetBlockHash().GetHex());
+            return false;
+        }
+        // ...and the archive's own headers must form a chain, by its own bytes.
+        if (!index->pprev || archived.hashPrevBlock != index->pprev->GetBlockHash()) {
+            out.failure = strprintf("block %d (%s): the archived header names parent %s, breaking the "
+                                    "chain", height, archived_hash.GetHex(),
+                                    archived.hashPrevBlock.GetHex());
+            return false;
+        }
+        // ...and each must have cost the work it claims. A merkle root is only evidence if the header
+        // carrying it sits in a chain that was paid for.
+        if (!CheckProofOfWork(archived_hash, archived.nBits, chainman.GetConsensus())) {
+            out.failure = strprintf("block %d (%s) does not meet its stated target", height,
+                                    archived_hash.GetHex());
+            return false;
+        }
+
+        // The crux. The archive's own txids must reproduce the header's merkle root, which is what
+        // stops a STORED txid — one that could not be recomputed because its scriptSig was destroyed
+        // — from being taken on trust. Forge one and the root no longer matches.
+        if (mutated) {
+            out.failure = strprintf("block %d has a mutated merkle tree", height);
+            return false;
+        }
+        if (recomputed_root != archived.hashMerkleRoot) {
+            out.failure = strprintf(
+                "block %d (%s): the archive's own txids give merkle root %s, but its header says %s",
+                height, archived_hash.GetHex(), recomputed_root.GetHex(),
+                archived.hashMerkleRoot.GetHex());
+            return false;
+        }
+        ++out.blocks_checked;
+    }
+
+    return true;
 }
 
 void HazyncProofStartupCheck(const ArgsManager& args)

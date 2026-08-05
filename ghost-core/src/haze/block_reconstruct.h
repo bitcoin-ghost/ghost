@@ -18,7 +18,22 @@ namespace haze {
  * - Transactions with empty scriptSig and empty witness
  * - Outputs with preserved values and scriptPubKeys
  * - Stripped OP_RETURN outputs preserved as OP_RETURN + 0x00
- * - If the original had a stored txid, the coinbase/legacy tx preserves it
+ *
+ * ⚠ THE RETURNED BLOCK'S TXIDS ARE NOT THE REAL ONES, and cannot be made so. Each transaction
+ * computes its txid from its own contents, and those contents are missing the scriptSigs — so for
+ * every transaction that had one (every coinbase, every legacy and P2SH-wrapped spend) the value
+ * `GetHash()` returns is the hash of a different transaction. `CTransaction` has nowhere to put an
+ * authoritative txid, so this is a property of the type rather than something this function could
+ * be taught to fix.
+ *
+ * An earlier version of this comment claimed the stored txid was preserved here. It never was —
+ * nothing in this file reads `m_has_stored_txid` — and believing it leads somewhere expensive:
+ * anything keying a UTXO lookup on one of these txids, as `DisconnectBlock` does for every output
+ * of every transaction, addresses outpoints that do not exist and leaves the real coins in place.
+ *
+ * **The authoritative source is `CStrippedBlock::GetTxid(i)`.** Use it, and pass the txids alongside
+ * the block rather than expecting the block to know them. See `haze_tests.cpp`,
+ * `reconstructed_block_cannot_carry_txids`.
  *
  * The block is suitable for RPC JSON serialization with haze indicators,
  * but NOT for full validation (signatures are missing).

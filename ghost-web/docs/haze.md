@@ -121,9 +121,27 @@ When a peer asks specifically for a transaction's witness data (e.g. for inscrip
 
 For a node validating the chain, neither matters: validation only needs the full witness during block acceptance, and it has it then (the block arrives over the wire fully formed). Witness data only becomes "missing" *after* validation, when it's been stripped from disk.
 
+## Reorgs, restarts, and the limits of stripped storage
+
+Stripped storage is enough to *undo* a block and not enough to *apply* one, and almost everything about how a hazed node behaves at the edges follows from that asymmetry.
+
+**Undoing needs nothing haze removes.** The disconnect path reads no scriptSig and no witness — it walks outputs and prevouts, both preserved, and the undo data it works from is written whether or not the block was stripped. So a hazed node reorgs off its own history normally, and its reorg depth is bounded by how long undo files are kept, exactly as on a pruned node.
+
+**Applying a block needs five things stripping destroys:** script verification, the BIP34 coinbase height, the BIP141 witness commitment, the block weight, and the sigop cost. No amount of care recovers them locally. A block rebuilt from stripped storage is therefore allowed to be disconnected and refused outright if anything tries to connect it.
+
+That produces three behaviours worth knowing about:
+
+- **Transactions from a disconnected stripped block do not return to the mempool.** They have no signatures, so they are no longer signable or relayable transactions by anyone — re-adding them would queue objects certain to be rejected. Anything still wanted must be re-broadcast by its owner. The node logs this each time rather than leaving it to be discovered.
+- **Wallets are still told correctly.** A rebuilt block cannot compute its own transaction ids — for anything that had a scriptSig, the computed id belongs to a different transaction — so the real ids are carried alongside it and wallets mark their own transactions unconfirmed by those. A wallet on a hazed node does not silently keep showing a reorged-away transaction as confirmed.
+- **Reorging back onto an abandoned branch re-downloads it.** The node cannot apply blocks it only holds in stripped form, so it asks peers for them again. The re-fetched block passes back through Exorcism and is stripped again before anything is written, so nothing hazeable is retained — the same posture as validating it the first time.
+
+**After an unclean shutdown, some blocks are downloaded again.** A block's stripped form is written before it is connected. If the node stops in between, what survives is a block it cannot apply, so it forgets it and fetches it again. Typically a handful of blocks, and no full block is ever kept on disk to avoid it — which would defeat the entire point.
+
+> **One surprising consequence:** because the node genuinely deletes block data in that case, it records that fact the same way a pruning node does, and `getblockchaininfo` will report `pruned: true`. It has not started pruning in the ordinary sense and has not deleted any block *file*; the flag records that some block data it once held is gone. See below.
+
 ## What Haze isn't
 
-- **It isn't pruning.** Pruned nodes delete entire old block files; they can't serve any block to anyone. Hazed nodes keep every block file on disk and can still serve them — just in stripped form. A hazed node is a full participant in the network; a pruned node is a leaf.
+- **It isn't pruning.** Pruned nodes delete entire old block files; they can't serve any block to anyone. Hazed nodes keep every block file on disk and can still serve them — just in stripped form. A hazed node is a full participant in the network; a pruned node is a leaf. (A hazed node may still report `pruned: true` after discarding a block it could not apply — see the section above. That flag is about data having been deleted, not about running in pruned mode.)
 - **It isn't encryption.** The hazeable content is removed, not protected by a key. There's no "decrypt with password" path. The data is gone.
 - **It isn't selective.** A hazed node doesn't pick and choose which content to strip — every hazeable field is stripped from every block. Selectivity would create the illusion of control over content classification, which is exactly the legal risk the design wants to eliminate.
 - **It isn't a wallet feature.** Wallets don't care whether the underlying node is hazed. UTXOs, balances, addresses, history — all available either way. Haze is purely about disk-side data.

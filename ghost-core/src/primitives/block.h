@@ -76,6 +76,34 @@ public:
     mutable bool m_checked_witness_commitment{false}; // CheckWitnessCommitment()
     mutable bool m_checked_merkle_root{false};        // CheckMerkleRoot()
 
+    /**
+     * Memory-only: this block was rebuilt from stripped storage and is NOT the real block.
+     *
+     * Haze destroys scriptSigs and witnesses permanently, so a block rebuilt from what survives has
+     * empty ones — which makes it unusable for connecting (no signatures to verify, no BIP34 height,
+     * no witness commitment, wrong weight and sigop cost) and makes its transactions' computed txids
+     * wrong wherever a scriptSig was removed.
+     *
+     * Disconnecting, by contrast, needs none of that, so a rebuilt block is legitimate there and is
+     * how a hazed node reorgs off its own history. Not serialised: it describes where this object
+     * came from in memory, not what a block is.
+     */
+    bool m_haze_reconstructed{false};
+
+    /**
+     * Memory-only: the real txid of each transaction, in order, when m_haze_reconstructed is set.
+     *
+     * A rebuilt transaction cannot supply its own. Its txid is computed from contents whose
+     * scriptSigs were destroyed, so for every transaction that had one — every coinbase, every
+     * legacy and P2SH-wrapped spend — GetHash() returns the hash of a different transaction.
+     *
+     * These travel with the block rather than beside it deliberately. Anything holding a
+     * reconstruction therefore also holds the ids it needs, and there is no call that can be made
+     * without them: a consumer matching transactions by id cannot silently miss because someone
+     * forgot to pass a second argument.
+     */
+    std::vector<Txid> m_haze_authoritative_txids;
+
     CBlock()
     {
         SetNull();
@@ -99,6 +127,8 @@ public:
         fChecked = false;
         m_checked_witness_commitment = false;
         m_checked_merkle_root = false;
+        m_haze_reconstructed = false;
+        m_haze_authoritative_txids.clear();
     }
 
     CBlockHeader GetBlockHeader() const

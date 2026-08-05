@@ -14,6 +14,7 @@
 #include <vector>
 
 class ArgsManager;
+class ChainstateManager;
 
 namespace haze {
 
@@ -180,6 +181,41 @@ private:
  * `loadtxoutset` cannot pick this up by accident and load an arbitrary file on a proof's authority.
  */
 const std::optional<HazyncAdoption>& HazyncAdoptedSnapshot();
+
+/** Outcome of binding a hazed archive to a proof. See VerifyHazedChainBinding. */
+struct HazedChainBinding {
+    int from_height{0};        //!< first height checked
+    int through_height{0};     //!< last height checked, always the proven height
+    int blocks_checked{0};
+    bool complete{false};      //!< true only when every block from 1 was checked
+    uint256 archive_tip;       //!< tip the archive itself yields at through_height
+    std::string failure;       //!< empty on success; never empty on failure
+};
+
+/**
+ * Establish, from a hazed archive alone, that the chain it holds is the real chain — and that it ends
+ * where a verified proof says it does.
+ *
+ * This is the half a proof cannot supply. A proof attests that the transactions in a range were
+ * VALID; it says nothing about whether this node is holding that range. A hazed archive can answer
+ * that and only that: stripping destroys witnesses and scriptSigs but keeps the txids, and a txid
+ * that had to be stored verbatim is not taken on trust, because the merkle root is recomputed from
+ * whatever txids the block yields and must match the header. A forged stored txid fails there.
+ *
+ * So: identity from the archive, validity from the proof, and this function is the join. It
+ * recomputes every merkle root from the archive's own retained txids, checks each header links to its
+ * parent and meets its stated target, and finally requires that the tip the archive yields at the
+ * proven height equals the tip the proof commits to.
+ *
+ * **It refuses when the proof does not commit to the tip held.** That is the point of the check, not
+ * an error path: a proof about some other chain must not be reported as evidence about this one.
+ *
+ * @param from_height  1 to establish the whole chain. A higher value checks only a suffix, which is
+ *                     cheaper and proves correspondingly less — `complete` records which was done.
+ * @return true if the binding holds. On false, `out.failure` says which block failed and how.
+ */
+bool VerifyHazedChainBinding(ChainstateManager& chainman, const HazyncProofState& proven,
+                             int from_height, HazedChainBinding& out);
 
 /** Guest image id this build trusts, or empty if the verifier is not compiled in. */
 std::string HazyncMethodId();

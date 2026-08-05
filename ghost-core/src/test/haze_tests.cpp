@@ -14,6 +14,10 @@
 #include <script/solver.h>
 #include <uint256.h>
 
+#include <validation.h>
+#include <consensus/validation.h>
+#include <coins.h>
+#include <primitives/transaction_identifier.h>
 #include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
@@ -375,6 +379,383 @@ BOOST_AUTO_TEST_CASE(reconstruct_preserves_outputs)
             }
         }
     }
+}
+
+BOOST_AUTO_TEST_CASE(reconstructed_block_cannot_carry_txids)
+{
+    // A reconstructed CBlock's transactions compute their own txid from their contents, and their
+    // contents are missing the scriptSigs. So for any transaction that HAD a scriptSig — every
+    // coinbase, every legacy and P2SH-wrapped spend — the reconstruction's txid is the hash of a
+    // different transaction. `CTransaction` has nowhere to put an authoritative txid, so this is a
+    // property of the type, not an oversight that could be patched inside ReconstructPartialBlock.
+    //
+    // This matters well beyond display. Anything that keys a UTXO lookup on a reconstructed txid —
+    // DisconnectBlock does, for every output of every transaction — would look up outpoints that do
+    // not exist, leave the real coins untouched, and report the block as merely "unclean".
+    //
+    // The authoritative source is CStrippedBlock::GetTxid(), which returns the STORED txid when
+    // there is one. Asserted here in both directions so the trap is documented rather than
+    // rediscovered.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock reconstructed = haze::ReconstructPartialBlock(result.stripped_block);
+    BOOST_REQUIRE_GT(result.stripped_block.GetTxCount(), 0U);
+
+    // A coinbase always carries scriptSig data, so it always ends up with a stored txid.
+    BOOST_REQUIRE(result.stripped_block.m_transactions[0].m_has_stored_txid);
+
+    // The control: the authoritative source is right. Without this the check below could pass
+    // because stripping is broken rather than because reconstruction cannot carry txids.
+    BOOST_CHECK(result.stripped_block.GetTxid(0) == block.vtx[0]->GetHash().ToUint256());
+
+    // The trap: the reconstruction's own txid is NOT the real one.
+    BOOST_CHECK(reconstructed.vtx[0]->GetHash().ToUint256() != block.vtx[0]->GetHash().ToUint256());
+
+    // And it is not a near miss that some later comparison might tolerate: it is the hash of a
+    // transaction whose scriptSig is empty.
+    BOOST_CHECK(reconstructed.vtx[0]->vin[0].scriptSig.empty());
+    BOOST_CHECK(!block.vtx[0]->vin[0].scriptSig.empty());
+}
+
+// ============================================================================
+// Reorg from stripped storage (#545)
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(disconnect_from_stripped_matches_disconnect_from_full)
+{
+    // The claim reorg-from-stripped rests on: undoing a block needs nothing haze destroyed, so a
+    // block rebuilt from stripped storage must undo to exactly the same UTXO set as the real one.
+    //
+    // Asserted by doing both and comparing, rather than by checking a handful of coins — a spot
+    // check would pass while some other coin silently differed.
+    // The spend must be properly signed, or the block is invalid, never connects, and the whole
+    // comparison below runs against a tip that is not this block at all.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CMutableTransaction spend = CreateValidMempoolTransaction(
+        /*input_transaction=*/m_coinbase_txns[0], /*input_vout=*/0, /*input_height=*/0,
+        /*input_signing_key=*/coinbaseKey, /*output_destination=*/dest,
+        /*output_amount=*/49 * COIN, /*submit=*/false);
+    CBlock block = CreateAndProcessBlock({spend}, dest);
+
+    LOCK(cs_main);
+    Chainstate& chainstate = m_node.chainman->ActiveChainstate();
+    CBlockIndex* pindex = m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash());
+    BOOST_REQUIRE(pindex);
+    // Load-bearing: if the block did not become the tip it was rejected, and disconnecting it would
+    // be measuring nothing.
+    BOOST_REQUIRE(chainstate.m_chain.Tip() == pindex);
+    BOOST_REQUIRE_EQUAL(block.vtx.size(), 2U); // coinbase + the spend, so inputs really are restored
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
+
+    // The reconstruction carries the real txids, so no caller has to supply them and none can
+    // forget. Checked against the original block, not against the stripped form it came from —
+    // otherwise this would only prove the two agree with each other.
+    BOOST_REQUIRE_EQUAL(rebuilt.m_haze_authoritative_txids.size(), block.vtx.size());
+    for (size_t i = 0; i < block.vtx.size(); ++i) {
+        BOOST_CHECK(rebuilt.m_haze_authoritative_txids[i] == block.vtx[i]->GetHash());
+    }
+
+    // Undo with the real block.
+    CCoinsViewCache from_full(&chainstate.CoinsTip());
+    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(block, pindex, from_full), DISCONNECT_OK);
+
+    // Undo with the rebuilt block, which needs nothing extra.
+    CCoinsViewCache from_stripped(&chainstate.CoinsTip());
+    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, from_stripped), DISCONNECT_OK);
+
+    // Same best block, and the same verdict on every coin the block touched.
+    BOOST_CHECK(from_full.GetBestBlock() == from_stripped.GetBestBlock());
+    for (const auto& tx : block.vtx) {
+        for (size_t o = 0; o < tx->vout.size(); ++o) {
+            const COutPoint out{tx->GetHash(), static_cast<uint32_t>(o)};
+            BOOST_CHECK_EQUAL(from_full.HaveCoin(out), from_stripped.HaveCoin(out));
+        }
+        if (!tx->IsCoinBase()) {
+            for (const auto& in : tx->vin) {
+                BOOST_CHECK_EQUAL(from_full.HaveCoin(in.prevout), from_stripped.HaveCoin(in.prevout));
+                BOOST_CHECK(from_full.AccessCoin(in.prevout).out == from_stripped.AccessCoin(in.prevout).out);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(disconnect_from_stripped_without_txids_is_refused)
+{
+    // The negative that makes the parameter load-bearing. Without it this call would not fail — it
+    // would look up outpoints that do not exist, miss every one, and leave spent coins in the set
+    // while reporting no worse than "unclean". It must be refused outright instead.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    LOCK(cs_main);
+    Chainstate& chainstate = m_node.chainman->ActiveChainstate();
+    CBlockIndex* pindex = m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash());
+    BOOST_REQUIRE(pindex);
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
+    BOOST_REQUIRE(rebuilt.m_haze_reconstructed);
+
+    // Stripping the ids back off is not something any caller does — they travel with the block —
+    // but the refusal is kept as defence in depth, because the alternative failure is silent.
+    CBlock without_ids = rebuilt;
+    without_ids.m_haze_authoritative_txids.clear();
+    CCoinsViewCache view(&chainstate.CoinsTip());
+    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(without_ids, pindex, view), DISCONNECT_FAILED);
+
+    // A wrong-sized set is refused too, rather than read past the end or applied to the wrong txs.
+    CBlock short_ids = rebuilt;
+    short_ids.m_haze_authoritative_txids.pop_back();
+    CCoinsViewCache view2(&chainstate.CoinsTip());
+    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(short_ids, pindex, view2), DISCONNECT_FAILED);
+}
+
+BOOST_AUTO_TEST_CASE(connecting_a_reconstructed_block_is_refused)
+{
+    // The hard guard the design asks for: rebuilt blocks may be disconnected, never connected.
+    // Without it, ConnectBlock would run against empty scriptSigs and empty witnesses — nothing to
+    // verify, no BIP34 height, no witness commitment — and could only produce a meaningless pass.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    LOCK(cs_main);
+    Chainstate& chainstate = m_node.chainman->ActiveChainstate();
+    CBlockIndex* pindex = m_node.chainman->m_blockman.LookupBlockIndex(block.GetHash());
+    BOOST_REQUIRE(pindex);
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
+
+    // ConnectBlock asserts the view sits at pindex->pprev (validation.cpp), so disconnect first —
+    // which also makes this a genuine round trip rather than a contrived view.
+    CCoinsViewCache view(&chainstate.CoinsTip());
+    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(block, pindex, view), DISCONNECT_OK);
+    BOOST_REQUIRE(view.GetBestBlock() == pindex->pprev->GetBlockHash());
+
+    BlockValidationState state;
+    BOOST_CHECK(!chainstate.ConnectBlock(rebuilt, state, pindex, view, /*fJustCheck=*/true));
+
+    // Refused as an internal error, NOT as an invalid block: the block itself is fine and marking it
+    // invalid would poison a legitimate part of the chain over a caller's mistake.
+    BOOST_CHECK(state.IsError());
+    BOOST_CHECK(!state.IsInvalid());
+
+    // The control, from the same view: the real block connects. Without it the refusal above could
+    // be the fixture being wrong rather than the guard working. The refused call returns before
+    // touching the view, so the view is still at pprev here.
+    BOOST_REQUIRE(!block.m_haze_reconstructed);
+    BlockValidationState state2;
+    BOOST_CHECK(chainstate.ConnectBlock(block, state2, pindex, view, /*fJustCheck=*/true));
+}
+
+// ============================================================================
+// Forgetting stripped blocks that were never connected (#542)
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(unconnected_stripped_blocks_are_forgotten_connected_ones_kept)
+{
+    // A hazed node records BLOCK_HAVE_DATA when it writes a block's stripped form, before the block
+    // is connected. Stop it in that window and the index claims to have a block that can never be
+    // connected from — the scriptSigs are gone and the in-memory copy died with the process. That is
+    // #542. The claim is what is wrong, so it is withdrawn and the block re-downloaded.
+    //
+    // The discrimination is the whole point: a stripped block that IS already connected must be
+    // kept, because for it the stored form really is sufficient — it will only ever be disconnected,
+    // which needs nothing haze removed.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+
+    // Two blocks built on the SAME parent, before either is processed. The first to arrive becomes
+    // the tip; the second is accepted and stored but never connected, since it has equal work and
+    // first-seen wins. That is the state an unclean shutdown leaves behind, reached deterministically.
+    CScript other_dest = GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
+    CBlock winner = CreateBlock({}, dest, m_node.chainman->ActiveChainstate());
+    CBlock side = CreateBlock({}, other_dest, m_node.chainman->ActiveChainstate());
+    BOOST_REQUIRE(winner.GetHash() != side.GetHash());
+    BOOST_REQUIRE(winner.hashPrevBlock == side.hashPrevBlock);
+
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<const CBlock>(winner),
+                                                           /*force_processing=*/true,
+                                                           /*min_pow_checked=*/true, nullptr));
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<const CBlock>(side),
+                                                           /*force_processing=*/true,
+                                                           /*min_pow_checked=*/true, nullptr));
+
+    LOCK(cs_main);
+    ChainstateManager& chainman = *m_node.chainman;
+    CBlockIndex* side_index = chainman.m_blockman.LookupBlockIndex(side.GetHash());
+    CBlockIndex* tip = chainman.ActiveChain().Tip();
+    BOOST_REQUIRE(side_index);
+    BOOST_REQUIRE(tip);
+    // Load-bearing: if the side block became the tip there is no "unconnected" case to test.
+    BOOST_REQUIRE(side_index != tip);
+    BOOST_REQUIRE(chainman.ActiveChain().Contains(tip));
+    BOOST_REQUIRE(!chainman.ActiveChain().Contains(side_index));
+    BOOST_REQUIRE(side_index->nStatus & BLOCK_HAVE_DATA);
+    BOOST_REQUIRE(tip->nStatus & BLOCK_HAVE_DATA);
+
+    // Nothing happens off a hazed node: an archive node's stored blocks are complete and connectable.
+    side_index->nStatus |= BLOCK_HAZED_STRIPPED;
+    tip->nStatus |= BLOCK_HAZED_STRIPPED;
+    BOOST_CHECK_EQUAL(chainman.DropUnconnectableStrippedBlocks(), 0);
+    BOOST_CHECK(side_index->nStatus & BLOCK_HAVE_DATA);
+
+    chainman.m_blockman.m_ghost_exorcism.Init(haze::GhostMode::HAZED);
+    BOOST_REQUIRE(chainman.m_blockman.m_ghost_exorcism.IsActive());
+
+    BOOST_CHECK_EQUAL(chainman.DropUnconnectableStrippedBlocks(), 1);
+
+    // The unconnected one is forgotten, and forgotten completely — a lingering file position would
+    // send a later read back into the wrong file sequence, which is the original bug.
+    BOOST_CHECK(!(side_index->nStatus & BLOCK_HAVE_DATA));
+    BOOST_CHECK(!(side_index->nStatus & BLOCK_HAVE_UNDO));
+    BOOST_CHECK_EQUAL(side_index->nFile, 0);
+    BOOST_CHECK_EQUAL(side_index->nDataPos, 0U);
+
+    // The connected one is untouched.
+    BOOST_CHECK(tip->nStatus & BLOCK_HAVE_DATA);
+
+    // m_have_pruned must be set, and this is not bookkeeping pedantry: CheckBlockIndex asserts that
+    // BLOCK_HAVE_DATA and nTx > 0 agree unless it is set, and they now deliberately do not.
+    BOOST_CHECK(chainman.m_blockman.m_have_pruned);
+
+    // The assertion that matters. Everything above could be individually true while the index as a
+    // whole had been left inconsistent, and it is CheckBlockIndex that a real node would trip over.
+    chainman.CheckBlockIndex();
+
+    // Idempotent: a second pass finds nothing left to forget.
+    BOOST_CHECK_EQUAL(chainman.DropUnconnectableStrippedBlocks(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(reconnecting_a_stripped_block_refetches_instead_of_dying)
+{
+    // The case archive fallback exists for: a hazed node reorgs back onto a branch it abandoned.
+    // The block was connected once, so its stripped form was sufficient then — and is not now,
+    // because connecting needs the scriptSigs and witnesses haze destroyed.
+    //
+    // Before this, ConnectTip called FatalError and the node shut down. It must instead withdraw the
+    // BLOCK_HAVE_DATA claim, which is what was false, and let the ordinary download machinery fetch
+    // the block from a peer that still has it.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+
+    CBlockIndex* pindex{nullptr};
+    CBlockIndex* parent{nullptr};
+    {
+        LOCK(cs_main);
+        pindex = chainman.m_blockman.LookupBlockIndex(block.GetHash());
+        BOOST_REQUIRE(pindex);
+        BOOST_REQUIRE(chainstate.m_chain.Tip() == pindex);
+        parent = pindex->pprev;
+        BOOST_REQUIRE(parent);
+        BOOST_REQUIRE(pindex->nStatus & BLOCK_HAVE_DATA);
+    }
+
+    // Abandon the branch, then come back to it — the reorg-back case, not a contrivance. The
+    // disconnect happens while the block is still whole, which is what really occurs: a block is
+    // only stripped storage once it has been written, and this test is about the RE-connect.
+    BlockValidationState invalidate_state;
+    BOOST_REQUIRE(chainstate.InvalidateBlock(invalidate_state, pindex));
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return chainstate.m_chain.Tip() == parent));
+
+    {
+        LOCK(cs_main);
+        // Now only the stripped form survives, so this block can no longer be read as a full one.
+        pindex->nStatus |= BLOCK_HAZED_STRIPPED;
+        chainstate.ResetBlockFailureFlags(pindex);
+        // ResetBlockFailureFlags clears the failure but does not restore m_best_header, which
+        // InvalidateBlock lowered. On a real node the header is the best one known — that is why the
+        // reorg back is being attempted at all — so the fixture is made to match. Without this,
+        // CheckBlockIndex asserts that a non-failed block outranks the best header, which is a
+        // property of this Invalidate/Reconsider sequence and nothing to do with haze: verified by
+        // running the same sequence with no stripped block involved.
+        chainman.m_best_header = pindex;
+    }
+
+    // Reconnecting must not be fatal. Whether the activation reports success is not the point —
+    // the node surviving with a consistent index, and the block queued for download, is.
+    BlockValidationState state;
+    chainstate.ActivateBestChain(state);
+    BOOST_CHECK(!state.IsError());
+
+    LOCK(cs_main);
+    // The false claim is withdrawn, so the block is fetched again rather than read from storage that
+    // cannot satisfy the read.
+    BOOST_CHECK(!(pindex->nStatus & BLOCK_HAVE_DATA));
+    BOOST_CHECK_EQUAL(pindex->nDataPos, 0U);
+    // Required, or CheckBlockIndex aborts — see ForgetStrippedBlockData.
+    BOOST_CHECK(chainman.m_blockman.m_have_pruned);
+    // The tip did not advance onto a block that could not be validated.
+    BOOST_CHECK(chainstate.m_chain.Tip() == parent);
+    // And the index is still self-consistent, which is what a real node would trip over.
+    chainman.CheckBlockIndex();
+}
+
+// ============================================================================
+// Binding an archive to a proof (G5, hazync#46)
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(chain_binding_refuses_a_proof_about_another_chain)
+{
+    // The definition of done for G5 is not that the binding succeeds — it is that it REFUSES when
+    // the proof does not commit to the tip the node holds. A proof about some other chain says
+    // nothing about this one, and reporting it as evidence would invert the entire claim.
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+
+    int height{0};
+    uint256 real_tip;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        BOOST_REQUIRE(tip);
+        height = tip->nHeight;
+        real_tip = tip->GetBlockHash();
+    }
+    BOOST_REQUIRE_GT(height, 2);
+
+    haze::HazyncProofState proven;
+    proven.height = static_cast<uint32_t>(height);
+    proven.tip_hash = real_tip;
+
+    // The control. Without it every refusal below could be a refusal of everything — including a
+    // binding that is broken outright.
+    haze::HazedChainBinding ok;
+    BOOST_REQUIRE(haze::VerifyHazedChainBinding(chainman, proven, 1, ok));
+    BOOST_CHECK_EQUAL(ok.blocks_checked, height);
+    BOOST_CHECK(ok.complete);
+    BOOST_CHECK(ok.archive_tip == real_tip);
+    BOOST_CHECK(ok.failure.empty());
+
+    // A proof committing to a different tip at the same height: refused, and said to be about
+    // another chain rather than merely "failed".
+    haze::HazyncProofState wrong_chain{proven};
+    wrong_chain.tip_hash = uint256::ONE;
+    haze::HazedChainBinding refused;
+    BOOST_CHECK(!haze::VerifyHazedChainBinding(chainman, wrong_chain, 1, refused));
+    BOOST_CHECK(refused.failure.find("REFUSED") != std::string::npos);
+    BOOST_CHECK(refused.failure.find("not about this chain") != std::string::npos);
+    // Nothing was walked: the join is checked before the expensive pass, so a proof about another
+    // chain costs one comparison rather than thousands of merkle roots.
+    BOOST_CHECK_EQUAL(refused.blocks_checked, 0);
+
+    // A proof reaching beyond what this node holds is refused too, and distinguishably.
+    haze::HazyncProofState too_high{proven};
+    too_high.height = static_cast<uint32_t>(height) + 1000;
+    haze::HazedChainBinding beyond;
+    BOOST_CHECK(!haze::VerifyHazedChainBinding(chainman, too_high, 1, beyond));
+    BOOST_CHECK(beyond.failure.find("does not reach") != std::string::npos);
+
+    // A suffix run binds but must not claim to have established the whole chain.
+    haze::HazedChainBinding suffix;
+    BOOST_REQUIRE(haze::VerifyHazedChainBinding(chainman, proven, height - 1, suffix));
+    BOOST_CHECK(!suffix.complete);
+    BOOST_CHECK_EQUAL(suffix.blocks_checked, 2);
 }
 
 BOOST_AUTO_TEST_CASE(reconstruct_meta_flags)

@@ -736,6 +736,19 @@ public:
         LOCKS_EXCLUDED(::cs_main);
 
     // Block (dis)connection on a given view:
+    /**
+     * Undo a block's effect on the UTXO set.
+     *
+     * For a block rebuilt from haze's stripped storage this uses the txids the block carries
+     * (`CBlock::m_haze_authoritative_txids`) rather than asking each transaction for its own. A
+     * rebuilt transaction has empty scriptSigs, so if it had one its computed txid belongs to a
+     * different transaction — and every coin lookup here is keyed on that txid, so deriving them
+     * would address outpoints that do not exist and leave the real coins in the set.
+     *
+     * The ids travel with the block, so there is no second argument a caller can forget. A rebuilt
+     * block that somehow arrives without them is refused rather than processed, since the failure
+     * would otherwise be a wrong answer rather than an error.
+     */
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
@@ -1133,6 +1146,39 @@ public:
         AutoFile& coins_file, const node::SnapshotMetadata& metadata, bool in_memory,
         const haze::HazyncAdoption* hazync_authority = nullptr);
 
+    /**
+     * Forget stripped blocks that were stored but never connected (#542).
+     *
+     * A hazed node writes a block's structural form to disk and records BLOCK_HAVE_DATA before the
+     * block is connected, keeping the full block in memory only until then. Stop the node in that
+     * window and what survives is a block the index claims to have and which can never be connected
+     * from: the scriptSigs and witnesses it would need were destroyed on purpose, and the in-memory
+     * copy is gone.
+     *
+     * The claim is what is wrong, not the ordering. For an already-connected block, stripped storage
+     * genuinely is enough — its effects are in the UTXO set and it will only ever be disconnected,
+     * which needs none of what haze removes. For a block that was never connected the same storage
+     * satisfies nothing, so BLOCK_HAVE_DATA is simply false and is cleared here. The node then
+     * re-downloads it like any other missing block, it passes through the exorcism fence, and is
+     * stripped again — nothing hazeable is retained, which is why this is not "un-hazing".
+     *
+     * The alternative, keeping the full block on disk until the chainstate is flushed, would put
+     * complete blocks with witnesses and scriptSigs on disk for exactly as long as it takes to
+     * crash. That is the thing haze exists to prevent, so the ordering fix is unavailable.
+     *
+     * @return the number of blocks forgotten, for logging.
+     */
+    /**
+     * Withdraw a stripped block's BLOCK_HAVE_DATA claim so it is fetched again.
+     *
+     * Wraps BlockManager::ForgetBlockData with the m_have_pruned bookkeeping that must accompany it,
+     * so no haze path can omit it — omitting it does not fail here, it aborts later in
+     * CheckBlockIndex on a node that has been running normally.
+     */
+    void ForgetStrippedBlockData(CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    int DropUnconnectableStrippedBlocks() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     //! Once the background validation chainstate has reached the height which
     //! is the base of the UTXO snapshot in use, compare its coins to ensure
     //! they match those expected by the snapshot.
@@ -1282,10 +1328,18 @@ public:
      */
     bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-    void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    //! `payload_stripped` records WHERE the payload was actually written: the gsb sequence if the
+    //! block was stripped, the blk sequence if it was written whole. It is decided by whichever
+    //! caller chose the writer, because only that caller knows. Deriving it from "is exorcism on"
+    //! marks blocks stripped that were written whole — genesis is written whole even on a hazed
+    //! node — and the read path then looks for the payload in the wrong file sequence, which is the
+    //! confusion BLOCK_HAZED_STRIPPED exists to prevent.
+    void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                   bool payload_stripped) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Overload for pre-stripped blocks where we know the tx count but don't have a CBlock. */
-    void ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                   bool payload_stripped) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
      * Try to add a transaction to the memory pool.

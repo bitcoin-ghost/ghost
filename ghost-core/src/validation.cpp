@@ -2295,6 +2295,24 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     AssertLockHeld(::cs_main);
     bool fClean = true;
 
+    const std::span<const Txid> authoritative_txids{block.m_haze_authoritative_txids};
+
+    // A block rebuilt from stripped storage does not know its own txids — see the header. Refuse it
+    // rather than let it derive them: every coin lookup below is keyed on the txid, so the result
+    // would not be a failure but a set of lookups that quietly miss, leaving spent coins in the UTXO
+    // set and reporting nothing worse than "unclean".
+    if (block.m_haze_reconstructed && authoritative_txids.empty()) {
+        LogError("DisconnectBlock(): block %s was rebuilt from stripped storage but no authoritative "
+                 "txids were supplied — refusing, because its own txids are not the real ones\n",
+                 pindex->GetBlockHash().ToString());
+        return DISCONNECT_FAILED;
+    }
+    if (!authoritative_txids.empty() && authoritative_txids.size() != block.vtx.size()) {
+        LogError("DisconnectBlock(): %u authoritative txids supplied for a block of %u transactions\n",
+                 (unsigned)authoritative_txids.size(), (unsigned)block.vtx.size());
+        return DISCONNECT_FAILED;
+    }
+
     CBlockUndo blockUndo;
     if (!m_blockman.ReadBlockUndo(blockUndo, *pindex)) {
         LogError("DisconnectBlock(): failure reading undo data\n");
@@ -2318,7 +2336,9 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     // undo transactions in reverse order
     for (int i = block.vtx.size() - 1; i >= 0; i--) {
         const CTransaction &tx = *(block.vtx[i]);
-        Txid hash = tx.GetHash();
+        // The supplied txid wins where one was given: for a rebuilt block the transaction's own is
+        // the hash of something else. Identical to tx.GetHash() for a real block.
+        Txid hash = authoritative_txids.empty() ? tx.GetHash() : authoritative_txids[i];
         bool is_coinbase = tx.IsCoinBase();
         bool is_bip30_exception = (is_coinbase && !fEnforceBIP30);
 
@@ -2411,6 +2431,26 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 {
     AssertLockHeld(cs_main);
     assert(pindex);
+
+    // The hard guard. A block rebuilt from stripped storage has no scriptSigs and no witnesses, so
+    // connecting it is not merely unsafe but meaningless: there are no signatures to verify, no BIP34
+    // coinbase height, no BIP141 witness commitment, and neither the weight nor the sigop cost can be
+    // computed. It would not fail — it would "succeed" against a block that never existed.
+    //
+    // Rebuilt blocks are legitimate for DISCONNECTING, which is how a hazed node reorgs off its own
+    // history, so they do get constructed and they do reach validation.cpp. This is the fence
+    // between the two, and it lives on the block rather than on the index because during an initial
+    // hazed sync the index is already marked stripped while the real block is still in hand.
+    //
+    // Reported as an internal error, not an invalid block: the block itself is very probably fine,
+    // and marking it invalid would poison a legitimate part of the chain over a caller's mistake.
+    if (block.m_haze_reconstructed) {
+        LogError("ConnectBlock(): refusing to connect block %s — it was rebuilt from stripped haze "
+                 "storage, so its scriptSigs and witnesses are empty and there is nothing here to "
+                 "validate. Rebuilt blocks may only be disconnected.\n",
+                 pindex->GetBlockHash().ToString());
+        return state.Error("haze-reconstructed-block-cannot-be-connected");
+    }
 
     uint256 block_hash{block.GetHash()};
     assert(*pindex->phashBlock == block_hash);
@@ -3055,7 +3095,10 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     // Read block from disk.
     std::shared_ptr<CBlock> pblock = std::make_shared<CBlock>();
     CBlock& block = *pblock;
-    if (!m_blockman.ReadBlock(block, *pindexDelete)) {
+    // On a hazed node the full block may be gone, in which case this rebuilds it from what haze
+    // kept. Undoing needs no scriptSig and no witness, so a rebuilt block is enough — but it does
+    // not know its own txids, hence the second output. See BlockManager::ReadBlockForDisconnect.
+    if (!m_blockman.ReadBlockForDisconnect(block, *pindexDelete)) {
         LogError("DisconnectTip(): Failed to read block\n");
         return false;
     }
@@ -3090,11 +3133,26 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
         return false;
     }
 
-    if (disconnectpool && m_mempool) {
-        // Save transactions to re-add to mempool at end of reorg. If any entries are evicted for
-        // exceeding memory limits, remove them and their descendants from the mempool.
-        for (auto&& evicted_tx : disconnectpool->AddTransactionsFromBlock(block.vtx)) {
-            m_mempool->removeRecursive(*evicted_tx, MemPoolRemovalReason::REORG);
+    // The mempool is the one consumer that cannot be served here, and not for want of information:
+    // a rebuilt transaction has no scriptSig and no witness, so it is not a signable transaction at
+    // all and could never be relayed or mined again by anyone. Re-adding it would put an object in
+    // the mempool that is guaranteed to be rejected. Losing it is the correct outcome, not a
+    // degraded one — the data needed to resurrect it was destroyed on purpose.
+    //
+    // Wallets and indexes ARE served: the block carries the real txids, so subscribers can match
+    // their own transactions and mark them unconfirmed. See CBlock::m_haze_authoritative_txids.
+    if (block.m_haze_reconstructed) {
+        LogWarning("[haze] Disconnected stripped block %s (%d): its transactions cannot return to "
+                   "the mempool — haze destroyed the scriptSigs, so they are no longer signable "
+                   "transactions. Any still wanted must be re-broadcast by their owners.\n",
+                   pindexDelete->GetBlockHash().ToString(), pindexDelete->nHeight);
+    } else {
+        if (disconnectpool && m_mempool) {
+            // Save transactions to re-add to mempool at end of reorg. If any entries are evicted for
+            // exceeding memory limits, remove them and their descendants from the mempool.
+            for (auto&& evicted_tx : disconnectpool->AddTransactionsFromBlock(block.vtx)) {
+                m_mempool->removeRecursive(*evicted_tx, MemPoolRemovalReason::REORG);
+            }
         }
     }
 
@@ -3178,6 +3236,29 @@ bool Chainstate::ConnectTip(
         } else {
             std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
             if (!m_blockman.ReadBlock(*pblockNew, *pindexNew)) {
+                // A stripped block cannot be connected from what survives on disk — that is the
+                // point of haze, not a fault. It happens when a hazed node reorgs back onto a branch
+                // it previously abandoned: the block was connected once, so its stored form was
+                // sufficient then, and is not now.
+                //
+                // The same invariant as at startup applies: BLOCK_HAVE_DATA is only true of a
+                // stripped block while it stays connected. Withdrawing the claim hands the block to
+                // the ordinary download machinery — FindMostWorkChain drops it as a candidate and
+                // re-queues it in m_blocks_unlinked, and it is fetched from any peer that still has
+                // it. No separate archive-peer concept is needed: an archive node is exactly that.
+                //
+                // Re-fetching restores nothing hazeable. The block arrives, passes back through the
+                // exorcism fence, and is stripped again before anything is written.
+                if (pindexNew->nStatus & BLOCK_HAZED_STRIPPED) {
+                    LogWarning("[haze] Cannot connect stripped block %s (%d) from local storage — "
+                               "haze destroyed what connecting needs. Requesting it from peers; the "
+                               "node will make no progress on this branch until one supplies it.\n",
+                               pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
+                    m_chainman.ForgetStrippedBlockData(*pindexNew);
+                    // Deliberately not fatal and not an invalid block: nothing is wrong with the
+                    // chain, this node simply no longer holds a copy it can validate from.
+                    return false;
+                }
                 return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
             }
             block_to_connect = std::move(pblockNew);
@@ -3911,7 +3992,8 @@ void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
 }
 
 /** Mark a block as having its data received and checked (up to BLOCK_VALID_TRANSACTIONS). */
-void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos)
+void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                                  bool payload_stripped)
 {
     AssertLockHeld(cs_main);
     pindexNew->nTx = block.vtx.size();
@@ -3934,7 +4016,12 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     // Record WHICH file sequence nDataPos refers to. Haze writes the stripped payload to gsb*.dat,
     // and BLOCK_HAVE_DATA alone cannot distinguish that from a full block in blk*.dat — so without
     // this the read path has to guess, and guessed wrong.
-    if (m_blockman.m_ghost_exorcism.IsActive()) {
+    //
+    // This must follow the writer that was actually used, not whether haze is enabled. Genesis is
+    // written WHOLE even on a hazed node, so keying off exorcism marked it stripped, sent the read
+    // path to the gsb sequence for a payload sitting in blk, and left a fresh hazed node unable to
+    // connect its own genesis block.
+    if (payload_stripped) {
         pindexNew->nStatus |= BLOCK_HAZED_STRIPPED;
     }
     if (DeploymentActiveAt(*pindexNew, *this, Consensus::DEPLOYMENT_SEGWIT)) {
@@ -3980,7 +4067,8 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     }
 }
 
-void ChainstateManager::ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos)
+void ChainstateManager::ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                                  bool payload_stripped)
 {
     AssertLockHeld(cs_main);
     pindexNew->nTx = nTx;
@@ -3998,7 +4086,12 @@ void ChainstateManager::ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pin
     // Record WHICH file sequence nDataPos refers to. Haze writes the stripped payload to gsb*.dat,
     // and BLOCK_HAVE_DATA alone cannot distinguish that from a full block in blk*.dat — so without
     // this the read path has to guess, and guessed wrong.
-    if (m_blockman.m_ghost_exorcism.IsActive()) {
+    //
+    // This must follow the writer that was actually used, not whether haze is enabled. Genesis is
+    // written WHOLE even on a hazed node, so keying off exorcism marked it stripped, sent the read
+    // path to the gsb sequence for a payload sitting in blk, and left a fresh hazed node unable to
+    // connect its own genesis block.
+    if (payload_stripped) {
         pindexNew->nStatus |= BLOCK_HAZED_STRIPPED;
     }
     if (DeploymentActiveAt(*pindexNew, *this, Consensus::DEPLOYMENT_SEGWIT)) {
@@ -4582,11 +4675,13 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     if (fNewBlock) *fNewBlock = true;
     try {
         FlatFilePos blockPos{};
+        bool wrote_stripped{false};
         if (dbp) {
             blockPos = *dbp;
             m_blockman.UpdateBlockInfo(block, pindex->nHeight, blockPos);
         } else if (m_blockman.m_ghost_exorcism.IsActive()) {
             // Ghost Exorcism (Hazed): strip hazeable content, write structural data only
+            wrote_stripped = true;
             blockPos = m_blockman.WriteStrippedBlock(block, pindex->nHeight);
             if (blockPos.IsNull()) {
                 state.Error(strprintf("%s: Failed to write stripped block to disk", __func__));
@@ -4600,7 +4695,9 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
                 return false;
             }
         }
-        ReceivedBlockTransactions(block, pindex, blockPos);
+        // Stripped exactly when WriteStrippedBlock was the writer above — not merely when haze is on,
+        // since the dbp path re-uses an existing position and writes nothing.
+        ReceivedBlockTransactions(block, pindex, blockPos, /*payload_stripped=*/wrote_stripped);
 
         // In Haze mode, cache the full block — GSB files cannot be deserialized
         // back into CBlock, but ConnectTip may need the full block if
@@ -5035,7 +5132,7 @@ bool Chainstate::ReplayBlocks()
     while (pindexOld != pindexFork) {
         if (pindexOld->nHeight > 0) { // Never disconnect the genesis block.
             CBlock block;
-            if (!m_blockman.ReadBlock(block, *pindexOld)) {
+            if (!m_blockman.ReadBlockForDisconnect(block, *pindexOld)) {
                 LogError("RollbackBlock(): ReadBlock() failed at %d, hash=%s\n", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
                 return false;
             }
@@ -5153,7 +5250,10 @@ bool Chainstate::LoadGenesisBlock()
             return false;
         }
         CBlockIndex* pindex = m_blockman.AddToBlockIndex(block, m_chainman.m_best_header);
-        m_chainman.ReceivedBlockTransactions(block, pindex, blockPos);
+        // Genesis goes through WriteBlock above — whole, into the blk sequence — on a hazed node as
+        // much as any other. It is hardcoded rather than received, there is nothing about it worth
+        // stripping, and it must stay readable or the node cannot connect its own first block.
+        m_chainman.ReceivedBlockTransactions(block, pindex, blockPos, /*payload_stripped=*/false);
     } catch (const std::runtime_error& e) {
         LogError("%s: failed to write genesis block: %s\n", __func__, e.what());
         return false;
@@ -6469,6 +6569,84 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation()
     this->MaybeRebalanceCaches();
 
     return SnapshotCompletionResult::SUCCESS;
+}
+
+void ChainstateManager::ForgetStrippedBlockData(CBlockIndex& index)
+{
+    AssertLockHeld(::cs_main);
+    m_blockman.ForgetBlockData(index);
+
+    // Not optional, and not merely bookkeeping: CheckBlockIndex asserts BLOCK_HAVE_DATA and nTx > 0
+    // agree unless this records that data has been deleted, and after ForgetBlockData they do not.
+    // Kept here rather than at each call site so a haze path cannot omit it — omitting it aborts,
+    // but only later, on a node that has been running fine.
+    if (!m_blockman.m_have_pruned) {
+        m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true);
+        m_blockman.m_have_pruned = true;
+    }
+}
+
+int ChainstateManager::DropUnconnectableStrippedBlocks()
+{
+    AssertLockHeld(::cs_main);
+
+    // Only a hazed node can be in this state; nothing else stores blocks it cannot connect from.
+    if (!m_blockman.m_ghost_exorcism.IsActive()) return 0;
+
+    // A node with no chain yet has nothing to compare against, and must not be asked. On a fresh
+    // hazed datadir the genesis block has just been written — stripped, because exorcism is already
+    // active — and no chainstate has a tip at this point in init. Every block then looks
+    // unconnected, genesis included, and forgetting genesis leaves the node unable to start at all.
+    //
+    // Found by running a real hazed mainnet node, which forgot genesis and could not start.
+    //
+    // ⚠ There is no unit test for this, and that is not an omission: the unit fixtures always have a
+    // tip, and a CChain cannot be emptied through its public interface, so the state cannot be built
+    // in them. With a tip present genesis is always an ancestor of it and both guards below are
+    // unreachable. The regression test is test/hazync/hazed-node.sh, which starts a real hazed node
+    // and asserts genesis is never forgotten.
+    bool any_tip{false};
+    for (const Chainstate* c : GetAll()) {
+        if (c->m_chain.Tip()) { any_tip = true; break; }
+    }
+    if (!any_tip) return 0;
+
+    // "Already connected" means present in some chainstate's active chain. Ancestry against the tip
+    // is the exact test — a height comparison would keep stripped blocks on abandoned side branches,
+    // which are just as unconnectable and would fail the same way on the next reorg towards them.
+    const auto is_connected = [this](const CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
+        for (const Chainstate* c : GetAll()) {
+            if (const CBlockIndex* tip{c->m_chain.Tip()};
+                tip && tip->GetAncestor(index.nHeight) == &index) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    int dropped{0};
+    for (CBlockIndex* pindex : m_blockman.GetAllBlockIndices()) {
+        if (!(pindex->nStatus & BLOCK_HAZED_STRIPPED)) continue;
+        if (!(pindex->nStatus & BLOCK_HAVE_DATA)) continue;
+        // Genesis is never "connected" in the sense used here — it is the base every chain hangs
+        // from, it cannot be re-downloaded, and forgetting it bricks the node before it can start.
+        // Belt and braces alongside the no-tip guard above.
+        if (pindex->nHeight == 0) continue;
+        if (is_connected(*pindex)) continue;
+
+        LogWarning("[haze] Forgetting stripped block %s (%d): it was stored but never connected, so "
+                   "its data cannot satisfy a connect and will be downloaded again.\n",
+                   pindex->GetBlockHash().ToString(), pindex->nHeight);
+        ForgetStrippedBlockData(*pindex);
+        ++dropped;
+    }
+
+    if (dropped > 0) {
+        LogWarning("[haze] Forgot %d stripped block(s) that were never connected; they will be "
+                   "re-downloaded. This follows an unclean shutdown and is not data loss: the blocks "
+                   "were never part of the chain this node had validated.\n", dropped);
+    }
+    return dropped;
 }
 
 Chainstate& ChainstateManager::ActiveChainstate() const
