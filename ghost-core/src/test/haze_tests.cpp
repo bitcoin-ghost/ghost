@@ -377,6 +377,44 @@ BOOST_AUTO_TEST_CASE(reconstruct_preserves_outputs)
     }
 }
 
+BOOST_AUTO_TEST_CASE(reconstructed_block_cannot_carry_txids)
+{
+    // A reconstructed CBlock's transactions compute their own txid from their contents, and their
+    // contents are missing the scriptSigs. So for any transaction that HAD a scriptSig — every
+    // coinbase, every legacy and P2SH-wrapped spend — the reconstruction's txid is the hash of a
+    // different transaction. `CTransaction` has nowhere to put an authoritative txid, so this is a
+    // property of the type, not an oversight that could be patched inside ReconstructPartialBlock.
+    //
+    // This matters well beyond display. Anything that keys a UTXO lookup on a reconstructed txid —
+    // DisconnectBlock does, for every output of every transaction — would look up outpoints that do
+    // not exist, leave the real coins untouched, and report the block as merely "unclean".
+    //
+    // The authoritative source is CStrippedBlock::GetTxid(), which returns the STORED txid when
+    // there is one. Asserted here in both directions so the trap is documented rather than
+    // rediscovered.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    haze::StripResult result = haze::StripBlock(block);
+    CBlock reconstructed = haze::ReconstructPartialBlock(result.stripped_block);
+    BOOST_REQUIRE_GT(result.stripped_block.GetTxCount(), 0U);
+
+    // A coinbase always carries scriptSig data, so it always ends up with a stored txid.
+    BOOST_REQUIRE(result.stripped_block.m_transactions[0].m_has_stored_txid);
+
+    // The control: the authoritative source is right. Without this the check below could pass
+    // because stripping is broken rather than because reconstruction cannot carry txids.
+    BOOST_CHECK(result.stripped_block.GetTxid(0) == block.vtx[0]->GetHash().ToUint256());
+
+    // The trap: the reconstruction's own txid is NOT the real one.
+    BOOST_CHECK(reconstructed.vtx[0]->GetHash().ToUint256() != block.vtx[0]->GetHash().ToUint256());
+
+    // And it is not a near miss that some later comparison might tolerate: it is the hash of a
+    // transaction whose scriptSig is empty.
+    BOOST_CHECK(reconstructed.vtx[0]->vin[0].scriptSig.empty());
+    BOOST_CHECK(!block.vtx[0]->vin[0].scriptSig.empty());
+}
+
 BOOST_AUTO_TEST_CASE(reconstruct_meta_flags)
 {
     CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
