@@ -9,6 +9,7 @@
 #include <consensus/params.h>
 #include <haze/block_stripper.h>
 #include <haze/exorcism.h>
+#include <haze/hazync_proof.h>
 #include <haze/stripped_block.h>
 #include <consensus/validation.h>
 #include <dbwrapper.h>
@@ -409,19 +410,32 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
 
     if (snapshot_blockhash) {
         const std::optional<AssumeutxoData> maybe_au_data = GetParams().AssumeutxoForBlockhash(*snapshot_blockhash);
-        if (!maybe_au_data) {
-            m_opts.notifications.fatalError(strprintf(_("Assumeutxo data not found for the given blockhash '%s'."), snapshot_blockhash->ToString()));
+        // A snapshot adopted from a Hazync proof sits at a height chainparams has never heard of, so
+        // its metadata cannot come from there. It comes from the proof instead — re-derived on every
+        // start, never read back from disk as a settled fact. That is why a node restarted without
+        // its proof stops here rather than carrying on: the exemption is not a property the
+        // chainstate acquired once and keeps, it is a claim that must still hold.
+        const auto& adoption{haze::HazyncAdoptedSnapshot()};
+        const bool hazync_authorised{adoption && adoption->base_blockhash == *snapshot_blockhash};
+        if (!maybe_au_data && !hazync_authorised) {
+            m_opts.notifications.fatalError(strprintf(_("Assumeutxo data not found for the given blockhash '%s'. "
+                "If this chainstate was adopted from a Hazync proof, restart with the same "
+                "-hazyncadopt -hazyncproof and -hazyncutxo it was adopted under."), snapshot_blockhash->ToString()));
             return false;
         }
-        const AssumeutxoData& au_data = *Assert(maybe_au_data);
-        m_snapshot_height = au_data.height;
+        const int height{maybe_au_data ? maybe_au_data->height : adoption->height};
+        const uint64_t chain_tx_count{maybe_au_data ? maybe_au_data->m_chain_tx_count
+                                                    : adoption->chain_tx_count_bootstrap};
+        m_snapshot_height = height;
         CBlockIndex* base{LookupBlockIndex(*snapshot_blockhash)};
 
         // Since m_chain_tx_count (responsible for estimated progress) isn't persisted
         // to disk, we must bootstrap the value for assumedvalid chainstates
-        // from the hardcoded assumeutxo chainparams.
-        base->m_chain_tx_count = au_data.m_chain_tx_count;
-        LogInfo("[snapshot] set m_chain_tx_count=%d for %s", au_data.m_chain_tx_count, snapshot_blockhash->ToString());
+        // from the hardcoded assumeutxo chainparams — or, under a proof, from the lower bound the
+        // proof does support. See haze::HazyncAdoption::chain_tx_count_bootstrap.
+        base->m_chain_tx_count = chain_tx_count;
+        LogInfo("[snapshot] set m_chain_tx_count=%d for %s%s", chain_tx_count, snapshot_blockhash->ToString(),
+                hazync_authorised && !maybe_au_data ? " (Hazync proof; lower bound, not an attested count)" : "");
     } else {
         // If this isn't called with a snapshot blockhash, make sure the cached snapshot height
         // is null. This is relevant during snapshot completion, when the blockman may be loaded
@@ -1056,6 +1070,19 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
 bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index) const
 {
+    // A stripped block cannot be returned as a CBlock: haze destroyed the witnesses and scriptSigs,
+    // permanently and on purpose. Say that, rather than reading a gsb offset out of a blk file and
+    // reporting a magic mismatch against what are really the block-file XOR key bytes — which is how
+    // this failure presented before the payload location was recorded.
+    //
+    // Callers wanting the structural data want ReadStrippedBlock. Callers wanting a full block cannot
+    // have one, and no amount of retrying will change that.
+    if (WITH_LOCK(cs_main, return index.nStatus & BLOCK_HAZED_STRIPPED)) {
+        LogError("Block %d (%s) is stored STRIPPED — the full block was destroyed by haze and cannot "
+                 "be read. Use ReadStrippedBlock for its structural data.\n",
+                 index.nHeight, index.GetBlockHash().ToString());
+        return false;
+    }
     const FlatFilePos block_pos{WITH_LOCK(cs_main, return index.GetBlockPos())};
     return ReadBlock(block, block_pos, index.GetBlockHash());
 }

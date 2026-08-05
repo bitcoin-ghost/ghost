@@ -130,6 +130,18 @@ enum BlockStatus : uint32_t {
 
     BLOCK_STATUS_RESERVED    =   256, //!< Unused flag that was previously set on assumeutxo snapshot blocks and their
                                       //!< ancestors before they were validated, and unset when they were validated.
+
+    //! Ghost Haze: this block's payload was STRIPPED, so nDataPos points into gsb*.dat, not blk*.dat.
+    //!
+    //! Without this nothing on disk records which file sequence nDataPos belongs to. BLOCK_HAVE_DATA
+    //! is set identically for a full and a stripped block, so the generic read path guessed "blk" and
+    //! read a gsb offset out of a blk file — which is how a hazed node reported a magic mismatch
+    //! against bytes that were really the block-file XOR key.
+    //!
+    //! It lives in nStatus rather than a separate field because nStatus is a VARINT: an index written
+    //! before this flag existed simply reads with the bit clear, which is correctly "not stripped",
+    //! so no reindex is forced on nodes that already have one.
+    BLOCK_HAZED_STRIPPED     =   512,
 };
 
 /** The block chain is a tree shaped structure starting with the
