@@ -4,13 +4,21 @@
 
 #include <haze/hazync_proof.h>
 
+#include <chainparams.h>
+#include <coins.h>
 #include <common/args.h>
 #include <logging.h>
+#include <node/utxo_snapshot.h>
+#include <primitives/transaction.h>
+#include <script/script.h>
 #include <streams.h>
 #include <tinyformat.h>
+#include <util/fs_helpers.h>
 #include <util/strencodings.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <fstream>
 #include <span>
 
@@ -182,6 +190,89 @@ bool CheckHazyncUtxoDump(const fs::path& dump_file, const fs::path& proof_file, 
 #endif
 }
 
+bool WriteCoreSnapshotFromDump(const fs::path& dump_file, const fs::path& out_file,
+                               const uint256& base_blockhash, std::string& error_out)
+{
+    std::ifstream df{dump_file, std::ios::binary};
+    if (!df.good()) {
+        error_out = strprintf("cannot read UTXO dump %s", fs::PathToString(dump_file));
+        return false;
+    }
+    const std::vector<uint8_t> b{std::istreambuf_iterator<char>(df), std::istreambuf_iterator<char>()};
+
+    // Header: "HZUTXO\0\0" ‖ version ‖ height ‖ count. Mirrors `host dump-snapshot`.
+    constexpr size_t HDR = 8 + 4 + 4 + 8;
+    static const std::array<uint8_t, 8> kMagic{'H', 'Z', 'U', 'T', 'X', 'O', 0, 0};
+    if (b.size() < HDR || !std::equal(kMagic.begin(), kMagic.end(), b.begin())) {
+        error_out = "not a Hazync UTXO dump (bad magic)";
+        return false;
+    }
+    auto rd32 = [&b](size_t o) { return uint32_t(b[o]) | uint32_t(b[o + 1]) << 8 | uint32_t(b[o + 2]) << 16 | uint32_t(b[o + 3]) << 24; };
+    auto rd64 = [&rd32](size_t o) { return uint64_t(rd32(o)) | uint64_t(rd32(o + 4)) << 32; };
+    if (rd32(8) != 1) { error_out = "unsupported UTXO dump version"; return false; }
+    const uint64_t count = rd64(16);
+
+    // The dump is sorted by (txid, vout), so Core's txid-grouped layout falls out of one sequential
+    // pass — no buffering of the whole set, which matters at ~180M coins.
+    AutoFile afile{fsbridge::fopen(out_file, "wb")};
+    if (afile.IsNull()) {
+        error_out = strprintf("cannot open %s for writing", fs::PathToString(out_file));
+        return false;
+    }
+    node::SnapshotMetadata metadata{Params().MessageStart(), base_blockhash, count};
+    afile << metadata;
+
+    size_t o = HDR;
+    uint64_t written = 0;
+    std::vector<std::pair<uint32_t, Coin>> group;
+    Txid group_txid;
+    auto flush_group = [&]() {
+        if (group.empty()) return;
+        afile << group_txid;
+        WriteCompactSize(afile, group.size());
+        for (const auto& [n, coin] : group) {
+            WriteCompactSize(afile, n);
+            afile << coin;      // Core's own Coin serialiser — compression is never reimplemented here
+            ++written;
+        }
+        group.clear();
+    };
+
+    for (uint64_t i = 0; i < count; ++i) {
+        if (o + 61 > b.size()) { error_out = "UTXO dump is truncated"; return false; }
+        uint256 txid_raw;
+        std::memcpy(txid_raw.begin(), b.data() + o, 32);
+        const Txid txid{Txid::FromUint256(txid_raw)};
+        const uint32_t vout = rd32(o + 32);
+        const uint64_t value = rd64(o + 36);
+        const uint32_t height = rd32(o + 44);
+        const bool is_cb = b[o + 48] != 0;
+        // o+49 coin_mtp and o+53 position are accumulator inputs; Core's snapshot carries neither.
+        const uint32_t spk_len = rd32(o + 57);
+        o += 61;
+        if (o + spk_len > b.size()) { error_out = "UTXO dump is truncated"; return false; }
+        CScript spk{b.data() + o, b.data() + o + spk_len};
+        o += spk_len;
+
+        if (!group.empty() && txid != group_txid) flush_group();
+        group_txid = txid;
+        group.emplace_back(vout, Coin{CTxOut{CAmount(value), std::move(spk)}, int(height), is_cb});
+    }
+    flush_group();
+
+    if (o != b.size()) { error_out = "UTXO dump has trailing bytes"; return false; }
+    if (written != count) {
+        error_out = strprintf("wrote %llu coins but the dump declared %llu",
+                              (unsigned long long)written, (unsigned long long)count);
+        return false;
+    }
+    if (afile.fclose() != 0) {
+        error_out = strprintf("failed to close %s", fs::PathToString(out_file));
+        return false;
+    }
+    return true;
+}
+
 void HazyncProofStartupCheck(const ArgsManager& args)
 {
     const auto arg = args.GetArg("-hazyncproof", "");
@@ -222,6 +313,21 @@ void HazyncProofStartupCheck(const ArgsManager& args)
             g_utxo_dump_ok = true;
             LogInfo("[hazync]   UTXO dump %s MATCHES the proven set (%llu coins)\n",
                     fs::PathToString(up), (unsigned long long)st->utxo_leaves);
+
+            // Only reachable once the dump has been checked against the proof. Converting an
+            // unchecked dump would emit a well-formed snapshot of an unproven UTXO set — exactly
+            // what trusted assumeutxo already does, and what this exists to replace.
+            const auto snap_arg = args.GetArg("-hazyncsnapshotout", "");
+            if (!snap_arg.empty()) {
+                const fs::path sp{fs::PathFromString(snap_arg)};
+                std::string serr;
+                if (WriteCoreSnapshotFromDump(up, sp, st->tip_hash, serr)) {
+                    LogInfo("[hazync]   wrote a loadtxoutset snapshot of the PROVEN set to %s\n",
+                            fs::PathToString(sp));
+                } else {
+                    LogWarning("[hazync] could not write snapshot %s: %s\n", fs::PathToString(sp), serr);
+                }
+            }
         } else {
             // Not fatal in a report-only build, but it must be impossible to miss: this is the
             // check that would otherwise let an unproven UTXO set in.

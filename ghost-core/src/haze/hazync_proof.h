@@ -96,6 +96,23 @@ std::optional<HazyncProofState> VerifyHazyncProof(const fs::path& proof_file, st
 bool CheckHazyncUtxoDump(const fs::path& dump_file, const fs::path& proof_file,
                          std::string& error_out);
 
+/**
+ * Convert a Hazync bridge UTXO dump into a snapshot in Core's own `loadtxoutset` format.
+ *
+ * The dump is deliberately uncompressed and Core-format-agnostic, so that the emitter (Rust, in the
+ * hazync repo) never has to reproduce `CTxOutCompressor` byte-for-byte. The conversion happens here
+ * instead, using Core's own serialisers — one implementation of that format, in the project that
+ * owns it.
+ *
+ * Call this only for a dump that has already passed CheckHazyncUtxoDump. Converting an unchecked
+ * dump produces a well-formed snapshot of an unproven UTXO set, which is precisely the thing
+ * `assumeutxo` already does and this exists to replace.
+ *
+ * `base_blockhash` must be the block hash at the dump's height — take it from the proof.
+ */
+bool WriteCoreSnapshotFromDump(const fs::path& dump_file, const fs::path& out_file,
+                               const uint256& base_blockhash, std::string& error_out);
+
 /** Guest image id this build trusts, or empty if the verifier is not compiled in. */
 std::string HazyncMethodId();
 
