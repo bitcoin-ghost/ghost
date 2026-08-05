@@ -739,19 +739,17 @@ public:
     /**
      * Undo a block's effect on the UTXO set.
      *
-     * `authoritative_txids`, when non-empty, supplies the txid of each transaction instead of asking
-     * the transaction for its own. That exists for blocks rebuilt from haze's stripped storage: they
-     * have empty scriptSigs, so any transaction that had one computes a txid belonging to a
+     * For a block rebuilt from haze's stripped storage this uses the txids the block carries
+     * (`CBlock::m_haze_authoritative_txids`) rather than asking each transaction for its own. A
+     * rebuilt transaction has empty scriptSigs, so if it had one its computed txid belongs to a
      * different transaction — and every coin lookup here is keyed on that txid, so deriving them
-     * would address outpoints that do not exist and leave the real coins in the set. The stripped
-     * form keeps the real txids (`CStrippedBlock::GetTxid`); the rebuilt `CBlock` cannot carry them.
+     * would address outpoints that do not exist and leave the real coins in the set.
      *
-     * Empty is the normal case, where the block is real and knows its own txids. A rebuilt block
-     * without them is refused rather than processed, because the failure would otherwise be a wrong
-     * answer rather than an error.
+     * The ids travel with the block, so there is no second argument a caller can forget. A rebuilt
+     * block that somehow arrives without them is refused rather than processed, since the failure
+     * would otherwise be a wrong answer rather than an error.
      */
-    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
-                                     std::span<const Txid> authoritative_txids = {})
+    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
                       CCoinsViewCache& view, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);

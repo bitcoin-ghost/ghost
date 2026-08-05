@@ -496,17 +496,15 @@ public:
      * So where ReadBlock refuses a stripped block — correctly, since the full block is gone — this
      * returns the rebuilt structural form instead.
      *
-     * @param[out] authoritative_txids  For a rebuilt block, the real txids, to be passed to
-     *                                  DisconnectBlock. Empty when the block was read whole, which
-     *                                  is the signal that it knows its own. A rebuilt block's
-     *                                  transactions do NOT: see haze/block_reconstruct.h.
+     * A rebuilt block arrives carrying its real txids in CBlock::m_haze_authoritative_txids,
+     * because its transactions cannot compute their own — see haze/block_reconstruct.h. Nothing
+     * further is needed at the call site; DisconnectBlock reads them from the block.
      *
      * ⚠ The block this returns may be a reconstruction, and a reconstruction must never be
      * connected, relayed, served to a peer, added to the mempool, or handed to wallet code. It
      * carries CBlock::m_haze_reconstructed so those paths can refuse it; ConnectBlock already does.
      */
-    bool ReadBlockForDisconnect(CBlock& block, std::vector<Txid>& authoritative_txids,
-                                const CBlockIndex& index) const;
+    bool ReadBlockForDisconnect(CBlock& block, const CBlockIndex& index) const;
 
     bool ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index) const;
 

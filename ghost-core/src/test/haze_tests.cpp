@@ -423,18 +423,6 @@ BOOST_AUTO_TEST_CASE(reconstructed_block_cannot_carry_txids)
 // Reorg from stripped storage (#545)
 // ============================================================================
 
-//! Authoritative txids for a stripped block, in transaction order — what the rebuilt CBlock cannot
-//! carry itself. Kept alive by the caller for the span handed to DisconnectBlock.
-static std::vector<Txid> AuthoritativeTxids(const haze::CStrippedBlock& stripped)
-{
-    std::vector<Txid> txids;
-    txids.reserve(stripped.GetTxCount());
-    for (size_t i = 0; i < stripped.GetTxCount(); ++i) {
-        txids.push_back(Txid::FromUint256(stripped.GetTxid(i)));
-    }
-    return txids;
-}
-
 BOOST_AUTO_TEST_CASE(disconnect_from_stripped_matches_disconnect_from_full)
 {
     // The claim reorg-from-stripped rests on: undoing a block needs nothing haze destroyed, so a
@@ -462,15 +450,22 @@ BOOST_AUTO_TEST_CASE(disconnect_from_stripped_matches_disconnect_from_full)
 
     haze::StripResult result = haze::StripBlock(block);
     CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
-    const std::vector<Txid> txids = AuthoritativeTxids(result.stripped_block);
+
+    // The reconstruction carries the real txids, so no caller has to supply them and none can
+    // forget. Checked against the original block, not against the stripped form it came from —
+    // otherwise this would only prove the two agree with each other.
+    BOOST_REQUIRE_EQUAL(rebuilt.m_haze_authoritative_txids.size(), block.vtx.size());
+    for (size_t i = 0; i < block.vtx.size(); ++i) {
+        BOOST_CHECK(rebuilt.m_haze_authoritative_txids[i] == block.vtx[i]->GetHash());
+    }
 
     // Undo with the real block.
     CCoinsViewCache from_full(&chainstate.CoinsTip());
     BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(block, pindex, from_full), DISCONNECT_OK);
 
-    // Undo with the rebuilt block plus the txids the stripped form kept.
+    // Undo with the rebuilt block, which needs nothing extra.
     CCoinsViewCache from_stripped(&chainstate.CoinsTip());
-    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, from_stripped, txids), DISCONNECT_OK);
+    BOOST_REQUIRE_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, from_stripped), DISCONNECT_OK);
 
     // Same best block, and the same verdict on every coin the block touched.
     BOOST_CHECK(from_full.GetBestBlock() == from_stripped.GetBestBlock());
@@ -505,14 +500,18 @@ BOOST_AUTO_TEST_CASE(disconnect_from_stripped_without_txids_is_refused)
     CBlock rebuilt = haze::ReconstructPartialBlock(result.stripped_block);
     BOOST_REQUIRE(rebuilt.m_haze_reconstructed);
 
+    // Stripping the ids back off is not something any caller does — they travel with the block —
+    // but the refusal is kept as defence in depth, because the alternative failure is silent.
+    CBlock without_ids = rebuilt;
+    without_ids.m_haze_authoritative_txids.clear();
     CCoinsViewCache view(&chainstate.CoinsTip());
-    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, view), DISCONNECT_FAILED);
+    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(without_ids, pindex, view), DISCONNECT_FAILED);
 
     // A wrong-sized set is refused too, rather than read past the end or applied to the wrong txs.
-    std::vector<Txid> short_txids = AuthoritativeTxids(result.stripped_block);
-    short_txids.pop_back();
+    CBlock short_ids = rebuilt;
+    short_ids.m_haze_authoritative_txids.pop_back();
     CCoinsViewCache view2(&chainstate.CoinsTip());
-    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(rebuilt, pindex, view2, short_txids), DISCONNECT_FAILED);
+    BOOST_CHECK_EQUAL(chainstate.DisconnectBlock(short_ids, pindex, view2), DISCONNECT_FAILED);
 }
 
 BOOST_AUTO_TEST_CASE(connecting_a_reconstructed_block_is_refused)

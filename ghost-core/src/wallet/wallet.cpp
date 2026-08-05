@@ -1560,6 +1560,31 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // future with a stickier abandoned state or even removing abandontransaction call.
     int disconnect_height = block.height;
 
+    // On a hazed node this block may have been rebuilt from stripped storage. Its transactions are
+    // not the real ones — no scriptSigs, no witnesses — and anything that had a scriptSig computes a
+    // txid belonging to a different transaction. They must not go through SyncTransaction: that
+    // scans them for ownership and stores them, so the wallet would either miss its own transaction
+    // entirely or overwrite its stored copy with a signature-less stand-in.
+    //
+    // What the wallet actually needs here is narrower and can be done exactly: mark its own
+    // transactions unconfirmed, by the real ids the block carries. No transaction object from the
+    // reconstruction is read or kept.
+    if (const auto& haze_txids{block.data->m_haze_authoritative_txids}; !haze_txids.empty()) {
+        for (size_t index = 0; index < haze_txids.size(); index++) {
+            // Coinbase transactions are not only inactive but also abandoned, meaning they should
+            // never be relayed standalone via the p2p protocol.
+            const bool abandoned{index == 0};
+            RecursiveUpdateTxState(haze_txids[index], [&](CWalletTx& wtx) {
+                if (wtx.state<TxStateInactive>() && wtx.state<TxStateInactive>()->abandoned == abandoned) {
+                    return TxUpdate::UNCHANGED;
+                }
+                wtx.m_state = TxStateInactive{abandoned};
+                return TxUpdate::CHANGED;
+            });
+        }
+        return;
+    }
+
     for (size_t index = 0; index < block.data->vtx.size(); index++) {
         const CTransactionRef& ptx = block.data->vtx[index];
         // Coinbase transactions are not only inactive but also abandoned,

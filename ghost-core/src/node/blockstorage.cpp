@@ -682,11 +682,8 @@ CBlockFileInfo* BlockManager::GetBlockFileInfo(size_t n)
     return &m_blockfile_info.at(n);
 }
 
-bool BlockManager::ReadBlockForDisconnect(CBlock& block, std::vector<Txid>& authoritative_txids,
-                                          const CBlockIndex& index) const
+bool BlockManager::ReadBlockForDisconnect(CBlock& block, const CBlockIndex& index) const
 {
-    authoritative_txids.clear();
-
     if (!WITH_LOCK(cs_main, return index.nStatus & BLOCK_HAZED_STRIPPED)) {
         return ReadBlock(block, index);
     }
@@ -698,17 +695,13 @@ bool BlockManager::ReadBlockForDisconnect(CBlock& block, std::vector<Txid>& auth
         return false;
     }
 
+    // The reconstruction carries the real txids: the rebuilt transactions cannot compute them, and
+    // the stripped form kept them. That is the only reason disconnecting stripped history is possible.
     block = haze::ReconstructPartialBlock(stripped);
 
-    // The rebuilt transactions cannot compute these: their scriptSigs are gone. The stripped form
-    // kept them, which is the only reason disconnecting stripped history is possible at all.
-    authoritative_txids.reserve(stripped.GetTxCount());
-    for (size_t i = 0; i < stripped.GetTxCount(); ++i) {
-        authoritative_txids.push_back(Txid::FromUint256(stripped.GetTxid(i)));
-    }
-
     LogDebug(BCLog::VALIDATION, "Rebuilt stripped block %d (%s) for disconnection, %u transactions\n",
-             index.nHeight, index.GetBlockHash().ToString(), (unsigned)authoritative_txids.size());
+             index.nHeight, index.GetBlockHash().ToString(),
+             (unsigned)block.m_haze_authoritative_txids.size());
     return true;
 }
 

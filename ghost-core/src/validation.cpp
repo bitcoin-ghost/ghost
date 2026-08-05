@@ -2290,11 +2290,12 @@ int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out)
 
 /** Undo the effects of this block (with given index) on the UTXO set represented by coins.
  *  When FAILED is returned, view is left in an indeterminate state. */
-DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
-                                             std::span<const Txid> authoritative_txids)
+DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
 {
     AssertLockHeld(::cs_main);
     bool fClean = true;
+
+    const std::span<const Txid> authoritative_txids{block.m_haze_authoritative_txids};
 
     // A block rebuilt from stripped storage does not know its own txids — see the header. Refuse it
     // rather than let it derive them: every coin lookup below is keyed on the txid, so the result
@@ -3097,8 +3098,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     // On a hazed node the full block may be gone, in which case this rebuilds it from what haze
     // kept. Undoing needs no scriptSig and no witness, so a rebuilt block is enough — but it does
     // not know its own txids, hence the second output. See BlockManager::ReadBlockForDisconnect.
-    std::vector<Txid> authoritative_txids;
-    if (!m_blockman.ReadBlockForDisconnect(block, authoritative_txids, *pindexDelete)) {
+    if (!m_blockman.ReadBlockForDisconnect(block, *pindexDelete)) {
         LogError("DisconnectTip(): Failed to read block\n");
         return false;
     }
@@ -3107,7 +3107,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     {
         CCoinsViewCache view(&CoinsTip());
         assert(view.GetBestBlock() == pindexDelete->GetBlockHash());
-        if (DisconnectBlock(block, pindexDelete, view, authoritative_txids) != DISCONNECT_OK) {
+        if (DisconnectBlock(block, pindexDelete, view) != DISCONNECT_OK) {
             LogError("DisconnectTip(): DisconnectBlock %s failed\n", pindexDelete->GetBlockHash().ToString());
             return false;
         }
@@ -3133,20 +3133,18 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
         return false;
     }
 
-    // Everything below hands this block's transactions to something that will treat them as real
-    // transactions. A rebuilt one has none: the scriptSigs are gone, so nothing here could be
-    // relayed or re-mined, and for anything that had a scriptSig even the txid is not its own.
-    // Passing them on would put unsignable objects in the mempool and tell wallets about
-    // transactions that do not exist under those ids.
+    // The mempool is the one consumer that cannot be served here, and not for want of information:
+    // a rebuilt transaction has no scriptSig and no witness, so it is not a signable transaction at
+    // all and could never be relayed or mined again by anyone. Re-adding it would put an object in
+    // the mempool that is guaranteed to be rejected. Losing it is the correct outcome, not a
+    // degraded one — the data needed to resurrect it was destroyed on purpose.
     //
-    // So a hazed node loses them instead. That is the honest outcome rather than a degraded one:
-    // the data needed to resurrect these transactions was destroyed on purpose, and no ordering of
-    // this code can bring it back. Logged at every reorg so it is visible rather than assumed.
+    // Wallets and indexes ARE served: the block carries the real txids, so subscribers can match
+    // their own transactions and mark them unconfirmed. See CBlock::m_haze_authoritative_txids.
     if (block.m_haze_reconstructed) {
         LogWarning("[haze] Disconnected stripped block %s (%d): its transactions cannot return to "
-                   "the mempool and are not reported to wallets — haze destroyed the scriptSigs, so "
-                   "they are no longer signable transactions. Any of them still wanted must be "
-                   "re-broadcast by their owners.\n",
+                   "the mempool — haze destroyed the scriptSigs, so they are no longer signable "
+                   "transactions. Any still wanted must be re-broadcast by their owners.\n",
                    pindexDelete->GetBlockHash().ToString(), pindexDelete->nHeight);
     } else {
         if (disconnectpool && m_mempool) {
@@ -3163,7 +3161,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     UpdateTip(pindexDelete->pprev);
     // Let wallets know transactions went from 1-confirmed to
     // 0-confirmed or conflicted:
-    if (m_chainman.m_options.signals && !block.m_haze_reconstructed) {
+    if (m_chainman.m_options.signals) {
         m_chainman.m_options.signals->BlockDisconnected(pblock, pindexDelete);
     }
     return true;
@@ -5095,13 +5093,12 @@ bool Chainstate::ReplayBlocks()
     while (pindexOld != pindexFork) {
         if (pindexOld->nHeight > 0) { // Never disconnect the genesis block.
             CBlock block;
-            std::vector<Txid> authoritative_txids;
-            if (!m_blockman.ReadBlockForDisconnect(block, authoritative_txids, *pindexOld)) {
+            if (!m_blockman.ReadBlockForDisconnect(block, *pindexOld)) {
                 LogError("RollbackBlock(): ReadBlock() failed at %d, hash=%s\n", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
                 return false;
             }
             LogInfo("Rolling back %s (%i)", pindexOld->GetBlockHash().ToString(), pindexOld->nHeight);
-            DisconnectResult res = DisconnectBlock(block, pindexOld, cache, authoritative_txids);
+            DisconnectResult res = DisconnectBlock(block, pindexOld, cache);
             if (res == DISCONNECT_FAILED) {
                 LogError("RollbackBlock(): DisconnectBlock failed at %d, hash=%s\n", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
                 return false;
