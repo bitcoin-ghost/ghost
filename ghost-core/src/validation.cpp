@@ -3992,7 +3992,8 @@ void Chainstate::TryAddBlockIndexCandidate(CBlockIndex* pindex)
 }
 
 /** Mark a block as having its data received and checked (up to BLOCK_VALID_TRANSACTIONS). */
-void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos)
+void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                                  bool payload_stripped)
 {
     AssertLockHeld(cs_main);
     pindexNew->nTx = block.vtx.size();
@@ -4015,7 +4016,12 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     // Record WHICH file sequence nDataPos refers to. Haze writes the stripped payload to gsb*.dat,
     // and BLOCK_HAVE_DATA alone cannot distinguish that from a full block in blk*.dat — so without
     // this the read path has to guess, and guessed wrong.
-    if (m_blockman.m_ghost_exorcism.IsActive()) {
+    //
+    // This must follow the writer that was actually used, not whether haze is enabled. Genesis is
+    // written WHOLE even on a hazed node, so keying off exorcism marked it stripped, sent the read
+    // path to the gsb sequence for a payload sitting in blk, and left a fresh hazed node unable to
+    // connect its own genesis block.
+    if (payload_stripped) {
         pindexNew->nStatus |= BLOCK_HAZED_STRIPPED;
     }
     if (DeploymentActiveAt(*pindexNew, *this, Consensus::DEPLOYMENT_SEGWIT)) {
@@ -4061,7 +4067,8 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
     }
 }
 
-void ChainstateManager::ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos)
+void ChainstateManager::ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                                  bool payload_stripped)
 {
     AssertLockHeld(cs_main);
     pindexNew->nTx = nTx;
@@ -4079,7 +4086,12 @@ void ChainstateManager::ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pin
     // Record WHICH file sequence nDataPos refers to. Haze writes the stripped payload to gsb*.dat,
     // and BLOCK_HAVE_DATA alone cannot distinguish that from a full block in blk*.dat — so without
     // this the read path has to guess, and guessed wrong.
-    if (m_blockman.m_ghost_exorcism.IsActive()) {
+    //
+    // This must follow the writer that was actually used, not whether haze is enabled. Genesis is
+    // written WHOLE even on a hazed node, so keying off exorcism marked it stripped, sent the read
+    // path to the gsb sequence for a payload sitting in blk, and left a fresh hazed node unable to
+    // connect its own genesis block.
+    if (payload_stripped) {
         pindexNew->nStatus |= BLOCK_HAZED_STRIPPED;
     }
     if (DeploymentActiveAt(*pindexNew, *this, Consensus::DEPLOYMENT_SEGWIT)) {
@@ -4663,11 +4675,13 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     if (fNewBlock) *fNewBlock = true;
     try {
         FlatFilePos blockPos{};
+        bool wrote_stripped{false};
         if (dbp) {
             blockPos = *dbp;
             m_blockman.UpdateBlockInfo(block, pindex->nHeight, blockPos);
         } else if (m_blockman.m_ghost_exorcism.IsActive()) {
             // Ghost Exorcism (Hazed): strip hazeable content, write structural data only
+            wrote_stripped = true;
             blockPos = m_blockman.WriteStrippedBlock(block, pindex->nHeight);
             if (blockPos.IsNull()) {
                 state.Error(strprintf("%s: Failed to write stripped block to disk", __func__));
@@ -4681,7 +4695,9 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
                 return false;
             }
         }
-        ReceivedBlockTransactions(block, pindex, blockPos);
+        // Stripped exactly when WriteStrippedBlock was the writer above — not merely when haze is on,
+        // since the dbp path re-uses an existing position and writes nothing.
+        ReceivedBlockTransactions(block, pindex, blockPos, /*payload_stripped=*/wrote_stripped);
 
         // In Haze mode, cache the full block — GSB files cannot be deserialized
         // back into CBlock, but ConnectTip may need the full block if
@@ -5234,7 +5250,10 @@ bool Chainstate::LoadGenesisBlock()
             return false;
         }
         CBlockIndex* pindex = m_blockman.AddToBlockIndex(block, m_chainman.m_best_header);
-        m_chainman.ReceivedBlockTransactions(block, pindex, blockPos);
+        // Genesis goes through WriteBlock above — whole, into the blk sequence — on a hazed node as
+        // much as any other. It is hardcoded rather than received, there is nothing about it worth
+        // stripping, and it must stay readable or the node cannot connect its own first block.
+        m_chainman.ReceivedBlockTransactions(block, pindex, blockPos, /*payload_stripped=*/false);
     } catch (const std::runtime_error& e) {
         LogError("%s: failed to write genesis block: %s\n", __func__, e.what());
         return false;
@@ -6574,6 +6593,24 @@ int ChainstateManager::DropUnconnectableStrippedBlocks()
     // Only a hazed node can be in this state; nothing else stores blocks it cannot connect from.
     if (!m_blockman.m_ghost_exorcism.IsActive()) return 0;
 
+    // A node with no chain yet has nothing to compare against, and must not be asked. On a fresh
+    // hazed datadir the genesis block has just been written — stripped, because exorcism is already
+    // active — and no chainstate has a tip at this point in init. Every block then looks
+    // unconnected, genesis included, and forgetting genesis leaves the node unable to start at all.
+    //
+    // Found by running a real hazed mainnet node, which forgot genesis and could not start.
+    //
+    // ⚠ There is no unit test for this, and that is not an omission: the unit fixtures always have a
+    // tip, and a CChain cannot be emptied through its public interface, so the state cannot be built
+    // in them. With a tip present genesis is always an ancestor of it and both guards below are
+    // unreachable. The regression test is test/hazync/hazed-node.sh, which starts a real hazed node
+    // and asserts genesis is never forgotten.
+    bool any_tip{false};
+    for (const Chainstate* c : GetAll()) {
+        if (c->m_chain.Tip()) { any_tip = true; break; }
+    }
+    if (!any_tip) return 0;
+
     // "Already connected" means present in some chainstate's active chain. Ancestry against the tip
     // is the exact test — a height comparison would keep stripped blocks on abandoned side branches,
     // which are just as unconnectable and would fail the same way on the next reorg towards them.
@@ -6591,6 +6628,10 @@ int ChainstateManager::DropUnconnectableStrippedBlocks()
     for (CBlockIndex* pindex : m_blockman.GetAllBlockIndices()) {
         if (!(pindex->nStatus & BLOCK_HAZED_STRIPPED)) continue;
         if (!(pindex->nStatus & BLOCK_HAVE_DATA)) continue;
+        // Genesis is never "connected" in the sense used here — it is the base every chain hangs
+        // from, it cannot be re-downloaded, and forgetting it bricks the node before it can start.
+        // Belt and braces alongside the no-tip guard above.
+        if (pindex->nHeight == 0) continue;
         if (is_connected(*pindex)) continue;
 
         LogWarning("[haze] Forgetting stripped block %s (%d): it was stored but never connected, so "

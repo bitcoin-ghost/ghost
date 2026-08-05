@@ -1328,10 +1328,18 @@ public:
      */
     bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-    void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    //! `payload_stripped` records WHERE the payload was actually written: the gsb sequence if the
+    //! block was stripped, the blk sequence if it was written whole. It is decided by whichever
+    //! caller chose the writer, because only that caller knows. Deriving it from "is exorcism on"
+    //! marks blocks stripped that were written whole — genesis is written whole even on a hazed
+    //! node — and the read path then looks for the payload in the wrong file sequence, which is the
+    //! confusion BLOCK_HAZED_STRIPPED exists to prevent.
+    void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                   bool payload_stripped) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Overload for pre-stripped blocks where we know the tx count but don't have a CBlock. */
-    void ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    void ReceivedBlockTransactions(uint32_t nTx, CBlockIndex* pindexNew, const FlatFilePos& pos,
+                                   bool payload_stripped) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
      * Try to add a transaction to the memory pool.

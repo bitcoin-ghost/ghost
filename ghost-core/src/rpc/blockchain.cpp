@@ -853,7 +853,11 @@ static RPCHelpMan getblock()
         }
     }
 
-    const bool is_hazed = chainman.m_blockman.IsHazeMode();
+    // Whether THIS block is stripped, not whether the node is hazed. A hazed node still holds some
+    // blocks whole — genesis is written by WriteBlock even in hazed mode — and routing those through
+    // the stripped reader looks for their payload in the gsb sequence while it sits in blk, so
+    // `getblock` on genesis failed with "Stripped block not found on disk".
+    const bool is_hazed = WITH_LOCK(::cs_main, return pblockindex->nStatus & BLOCK_HAZED_STRIPPED);
 
     if (is_hazed) {
         // Hazed mode: read stripped block from GSB files, reconstruct partial block

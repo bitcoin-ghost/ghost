@@ -4890,8 +4890,11 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 return;
             }
 
+            // WriteReceivedStrippedBlock put this in the gsb sequence, so the payload really is
+            // stripped — unlike genesis, which is written whole even on a hazed node.
             m_chainman.ReceivedBlockTransactions(
-                static_cast<uint32_t>(stripped.GetTxCount()), pindex, blockPos);
+                static_cast<uint32_t>(stripped.GetTxCount()), pindex, blockPos,
+                /*payload_stripped=*/true);
 
             LogDebug(BCLog::HAZE, "Stored received stripped block %s at height %d\n",
                 block_hash.ToString(), pindex->nHeight);
