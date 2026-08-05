@@ -94,6 +94,7 @@ pub trait ResultReVerifier: Send + Sync {
     async fn reverify_archive(
         &self,
         target_node_id: &NodeId,
+        challenge_data: &str,
         target_signed_response: Option<&str>,
     ) -> ReVerdict;
 
@@ -666,6 +667,7 @@ impl VerificationResultHandler {
                     match reverifier
                         .reverify_archive(
                             &msg.target_node_id,
+                            &msg.challenge_data,
                             msg.target_signed_response.as_deref(),
                         )
                         .await
@@ -1009,6 +1011,7 @@ mod tests {
         async fn reverify_archive(
             &self,
             _target_node_id: &NodeId,
+            _challenge_data: &str,
             _target_signed_response: Option<&str>,
         ) -> ReVerdict {
             self.0

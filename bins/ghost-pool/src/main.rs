@@ -6593,6 +6593,14 @@ async fn main() -> Result<()> {
         capabilities,
     );
 
+    // Give the HTTP layer the node's signing key. Without this `can_sign()` is false
+    // and every endpoint answers `"signed": false` — which is what the fleet did, for
+    // as long as the field has existed. Two things were inert as a result: an
+    // identity-bound reachability probe is impossible without a signed reply (H-7),
+    // and the H-8 re-derivation defence reaches `ReVerdict::Unverifiable` and records
+    // nothing when the target's response carries no signature.
+    verification_state = verification_state.with_node_identity(Arc::clone(&identity));
+
     // Report the node's real configured chain on the status/info endpoints
     // (dashboard + wallets) instead of the historical hardcoded "signet".
     verification_state = verification_state.with_network(config.bitcoin.network);

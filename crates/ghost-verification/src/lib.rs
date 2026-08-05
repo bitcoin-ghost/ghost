@@ -39,6 +39,9 @@
 
 #![deny(unreachable_pub)]
 
+/// H-7: prove a node controls the address it CLAIMS, by requiring a reply signed
+/// under its own node id over a nonce the prober chose.
+pub mod address_proof;
 pub mod alerts;
 pub mod auth;
 pub mod chain_health;

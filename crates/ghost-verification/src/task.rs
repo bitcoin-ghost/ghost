@@ -1313,9 +1313,26 @@ impl VerificationTask {
                 }
             };
 
+        // VER-2/replay: bind the target's signature to THIS challenge. Recorded in
+        // `challenge_data` so recipients re-deriving the verdict can require the
+        // signed response to echo it. Skipping the challenge outright when the RNG
+        // fails matches how the GhostPay challenge handles the same failure — a
+        // challenge nobody can bind is not worth issuing.
+        let challenge_nonce = match self.generate_challenge_nonce() {
+            Some(n) => n,
+            None => {
+                warn!(
+                    peer = %peer_id_hex[..8],
+                    "Skipping archive verification - failed to generate challenge nonce"
+                );
+                return Ok(());
+            }
+        };
+
         let challenge_data = serde_json::json!({
             "block_hash": block_hash,
             "block_height": block_height,
+            "nonce": challenge_nonce,
         })
         .to_string();
 
@@ -1343,6 +1360,7 @@ impl VerificationTask {
                 &peer.http_address,
                 Some(&block_hash),
                 expected_tx.as_ref().map(|e| e.txid.as_str()),
+                Some(challenge_nonce.as_str()),
             )
             .await;
 
