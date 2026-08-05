@@ -3671,7 +3671,7 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            entries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            entries.sort_by_key(|n| n.node_id);
             entries.dedup_by(|a, b| a.node_id == b.node_id);
             if entries.is_empty() {
                 return None; // nothing to checkpoint yet

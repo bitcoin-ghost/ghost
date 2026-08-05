@@ -302,7 +302,7 @@ impl MeshNodeListCheckpointManager {
             );
             return;
         };
-        nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        nodes.sort_by_key(|n| n.node_id);
         let list_root = mesh_node_list_root(&nodes);
 
         // Cadence: only checkpoint when the set changed. If the latest finalised checkpoint

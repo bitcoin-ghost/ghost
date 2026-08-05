@@ -1509,7 +1509,7 @@ pub struct MeshNodeEntry {
 pub fn mesh_node_list_root(nodes: &[MeshNodeEntry]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut sorted: Vec<&MeshNodeEntry> = nodes.iter().collect();
-    sorted.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    sorted.sort_by_key(|n| n.node_id);
     let mut hasher = Sha256::new();
     hasher.update(b"MeshNodeList/v1");
     hasher.update((sorted.len() as u32).to_le_bytes());
@@ -2209,5 +2209,49 @@ mod tests {
 
         assert!(!vote.approve);
         assert_eq!(vote.rejection_reason, Some(ZkRejectionReason::InvalidProof));
+    }
+
+    /// The list root is what makes every node derive the SAME `checkpoint_hash` from
+    /// the same node set, so it must not depend on the order the set arrives in. That
+    /// is the whole convergence property #402 is accepted on, and nothing covered it.
+    #[test]
+    fn mesh_node_list_root_is_order_independent_and_set_sensitive() {
+        let mk = |id: u8, host: &str, sv1: u16, sv2: u16| MeshNodeEntry {
+            node_id: [id; 32],
+            host: host.to_string(),
+            sv1_port: sv1,
+            sv2_port: sv2,
+        };
+        let a = mk(3, "203.0.113.7", 3333, 34255);
+        let b = mk(1, "198.51.100.9", 3333, 34255);
+        let c = mk(2, "example.invalid", 4444, 34255);
+
+        // Same set, three different input orders -> one root.
+        let r1 = mesh_node_list_root(&[a.clone(), b.clone(), c.clone()]);
+        let r2 = mesh_node_list_root(&[c.clone(), a.clone(), b.clone()]);
+        let r3 = mesh_node_list_root(&[b.clone(), c.clone(), a.clone()]);
+        assert_eq!(r1, r2, "root changed with input order");
+        assert_eq!(r1, r3, "root changed with input order");
+
+        // A different set must not collide.
+        assert_ne!(
+            r1,
+            mesh_node_list_root(&[a.clone(), b.clone()]),
+            "dropping a node kept the root"
+        );
+        let mut moved = c.clone();
+        moved.host = "203.0.113.8".to_string();
+        assert_ne!(
+            r1,
+            mesh_node_list_root(&[a.clone(), b.clone(), moved]),
+            "changing a host kept the root"
+        );
+        let mut reported = c.clone();
+        reported.sv1_port = 3334;
+        assert_ne!(
+            r1,
+            mesh_node_list_root(&[a, b, reported]),
+            "changing a port kept the root"
+        );
     }
 }
