@@ -1168,6 +1168,15 @@ public:
      *
      * @return the number of blocks forgotten, for logging.
      */
+    /**
+     * Withdraw a stripped block's BLOCK_HAVE_DATA claim so it is fetched again.
+     *
+     * Wraps BlockManager::ForgetBlockData with the m_have_pruned bookkeeping that must accompany it,
+     * so no haze path can omit it — omitting it does not fail here, it aborts later in
+     * CheckBlockIndex on a node that has been running normally.
+     */
+    void ForgetStrippedBlockData(CBlockIndex& index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
     int DropUnconnectableStrippedBlocks() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Once the background validation chainstate has reached the height which

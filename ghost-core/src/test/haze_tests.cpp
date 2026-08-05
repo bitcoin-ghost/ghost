@@ -630,6 +630,73 @@ BOOST_AUTO_TEST_CASE(unconnected_stripped_blocks_are_forgotten_connected_ones_ke
     BOOST_CHECK_EQUAL(chainman.DropUnconnectableStrippedBlocks(), 0);
 }
 
+BOOST_AUTO_TEST_CASE(reconnecting_a_stripped_block_refetches_instead_of_dying)
+{
+    // The case archive fallback exists for: a hazed node reorgs back onto a branch it abandoned.
+    // The block was connected once, so its stripped form was sufficient then — and is not now,
+    // because connecting needs the scriptSigs and witnesses haze destroyed.
+    //
+    // Before this, ConnectTip called FatalError and the node shut down. It must instead withdraw the
+    // BLOCK_HAVE_DATA claim, which is what was false, and let the ordinary download machinery fetch
+    // the block from a peer that still has it.
+    CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));
+    CBlock block = CreateAndProcessBlock({}, dest);
+
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+
+    CBlockIndex* pindex{nullptr};
+    CBlockIndex* parent{nullptr};
+    {
+        LOCK(cs_main);
+        pindex = chainman.m_blockman.LookupBlockIndex(block.GetHash());
+        BOOST_REQUIRE(pindex);
+        BOOST_REQUIRE(chainstate.m_chain.Tip() == pindex);
+        parent = pindex->pprev;
+        BOOST_REQUIRE(parent);
+        BOOST_REQUIRE(pindex->nStatus & BLOCK_HAVE_DATA);
+    }
+
+    // Abandon the branch, then come back to it — the reorg-back case, not a contrivance. The
+    // disconnect happens while the block is still whole, which is what really occurs: a block is
+    // only stripped storage once it has been written, and this test is about the RE-connect.
+    BlockValidationState invalidate_state;
+    BOOST_REQUIRE(chainstate.InvalidateBlock(invalidate_state, pindex));
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return chainstate.m_chain.Tip() == parent));
+
+    {
+        LOCK(cs_main);
+        // Now only the stripped form survives, so this block can no longer be read as a full one.
+        pindex->nStatus |= BLOCK_HAZED_STRIPPED;
+        chainstate.ResetBlockFailureFlags(pindex);
+        // ResetBlockFailureFlags clears the failure but does not restore m_best_header, which
+        // InvalidateBlock lowered. On a real node the header is the best one known — that is why the
+        // reorg back is being attempted at all — so the fixture is made to match. Without this,
+        // CheckBlockIndex asserts that a non-failed block outranks the best header, which is a
+        // property of this Invalidate/Reconsider sequence and nothing to do with haze: verified by
+        // running the same sequence with no stripped block involved.
+        chainman.m_best_header = pindex;
+    }
+
+    // Reconnecting must not be fatal. Whether the activation reports success is not the point —
+    // the node surviving with a consistent index, and the block queued for download, is.
+    BlockValidationState state;
+    chainstate.ActivateBestChain(state);
+    BOOST_CHECK(!state.IsError());
+
+    LOCK(cs_main);
+    // The false claim is withdrawn, so the block is fetched again rather than read from storage that
+    // cannot satisfy the read.
+    BOOST_CHECK(!(pindex->nStatus & BLOCK_HAVE_DATA));
+    BOOST_CHECK_EQUAL(pindex->nDataPos, 0U);
+    // Required, or CheckBlockIndex aborts — see ForgetStrippedBlockData.
+    BOOST_CHECK(chainman.m_blockman.m_have_pruned);
+    // The tip did not advance onto a block that could not be validated.
+    BOOST_CHECK(chainstate.m_chain.Tip() == parent);
+    // And the index is still self-consistent, which is what a real node would trip over.
+    chainman.CheckBlockIndex();
+}
+
 BOOST_AUTO_TEST_CASE(reconstruct_meta_flags)
 {
     CScript dest = GetScriptForDestination(WitnessV0KeyHash(coinbaseKey.GetPubKey()));

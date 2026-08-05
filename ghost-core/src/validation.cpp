@@ -3236,6 +3236,29 @@ bool Chainstate::ConnectTip(
         } else {
             std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
             if (!m_blockman.ReadBlock(*pblockNew, *pindexNew)) {
+                // A stripped block cannot be connected from what survives on disk — that is the
+                // point of haze, not a fault. It happens when a hazed node reorgs back onto a branch
+                // it previously abandoned: the block was connected once, so its stored form was
+                // sufficient then, and is not now.
+                //
+                // The same invariant as at startup applies: BLOCK_HAVE_DATA is only true of a
+                // stripped block while it stays connected. Withdrawing the claim hands the block to
+                // the ordinary download machinery — FindMostWorkChain drops it as a candidate and
+                // re-queues it in m_blocks_unlinked, and it is fetched from any peer that still has
+                // it. No separate archive-peer concept is needed: an archive node is exactly that.
+                //
+                // Re-fetching restores nothing hazeable. The block arrives, passes back through the
+                // exorcism fence, and is stripped again before anything is written.
+                if (pindexNew->nStatus & BLOCK_HAZED_STRIPPED) {
+                    LogWarning("[haze] Cannot connect stripped block %s (%d) from local storage — "
+                               "haze destroyed what connecting needs. Requesting it from peers; the "
+                               "node will make no progress on this branch until one supplies it.\n",
+                               pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
+                    m_chainman.ForgetStrippedBlockData(*pindexNew);
+                    // Deliberately not fatal and not an invalid block: nothing is wrong with the
+                    // chain, this node simply no longer holds a copy it can validate from.
+                    return false;
+                }
                 return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
             }
             block_to_connect = std::move(pblockNew);
@@ -6529,6 +6552,21 @@ SnapshotCompletionResult ChainstateManager::MaybeCompleteSnapshotValidation()
     return SnapshotCompletionResult::SUCCESS;
 }
 
+void ChainstateManager::ForgetStrippedBlockData(CBlockIndex& index)
+{
+    AssertLockHeld(::cs_main);
+    m_blockman.ForgetBlockData(index);
+
+    // Not optional, and not merely bookkeeping: CheckBlockIndex asserts BLOCK_HAVE_DATA and nTx > 0
+    // agree unless this records that data has been deleted, and after ForgetBlockData they do not.
+    // Kept here rather than at each call site so a haze path cannot omit it — omitting it aborts,
+    // but only later, on a node that has been running fine.
+    if (!m_blockman.m_have_pruned) {
+        m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true);
+        m_blockman.m_have_pruned = true;
+    }
+}
+
 int ChainstateManager::DropUnconnectableStrippedBlocks()
 {
     AssertLockHeld(::cs_main);
@@ -6558,18 +6596,11 @@ int ChainstateManager::DropUnconnectableStrippedBlocks()
         LogWarning("[haze] Forgetting stripped block %s (%d): it was stored but never connected, so "
                    "its data cannot satisfy a connect and will be downloaded again.\n",
                    pindex->GetBlockHash().ToString(), pindex->nHeight);
-        m_blockman.ForgetBlockData(*pindex);
+        ForgetStrippedBlockData(*pindex);
         ++dropped;
     }
 
     if (dropped > 0) {
-        // Same bookkeeping pruning does, and for the same reason: this node has deleted block data
-        // it once held. Without it CheckBlockIndex asserts that BLOCK_HAVE_DATA and nTx > 0 agree,
-        // which they deliberately no longer do — see the assert guarded by m_have_pruned.
-        if (!m_blockman.m_have_pruned) {
-            m_blockman.m_block_tree_db->WriteFlag("prunedblockfiles", true);
-            m_blockman.m_have_pruned = true;
-        }
         LogWarning("[haze] Forgot %d stripped block(s) that were never connected; they will be "
                    "re-downloaded. This follows an unclean shutdown and is not data loss: the blocks "
                    "were never part of the chain this node had validated.\n", dropped);
