@@ -24,6 +24,7 @@
 #include <haze/checkpoint_signing.h>
 #include <haze/chunk_downloader.h>
 #include <haze/haze_p2p.h>
+#include <haze/hazync_proof.h>
 #include <haze/stripped_block.h>
 #include <headerssync.h>
 #include <index/blockfilterindex.h>
@@ -4864,10 +4865,24 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         LogDebug(BCLog::NET, "received stripped block %s peer=%d (%zu txs)\n",
             stripped.m_header.GetHash().ToString(), pfrom.GetId(), stripped.GetTxCount());
 
-        // Store the stripped block directly to GSB if we're in Hazed mode.
-        // This is a storage-only path — it writes to GSB and updates the block
-        // index but does NOT call ActivateBestChain(). Stripped blocks cannot be
-        // connected (scriptPubKeys are modified, so UTXO construction would fail).
+        // Store the stripped block to GSB if we're in Hazed mode.
+        //
+        // This is ARCHIVE BACKFILL and nothing else: it fills in economic history for blocks this
+        // node already has in its chain — typically everything below a proven UTXO set adopted at
+        // some height N, which such a node holds no history for.
+        //
+        // It is deliberately not a way to EXTEND the chain, and a proof would not make it one. The
+        // stripper rewrites OP_RETURN and non-standard scriptPubKeys, so UTXO construction from
+        // stripped data is unsound for any output that was both non-standard and spendable. No proof
+        // supplies the UTXO effects of a block whose outputs are no longer held faithfully. Fast sync
+        // is G4's job — adopt the proven set at N and validate from N+1 — not this path's.
+        //
+        // The requirement below was previously absent, and the comment here claimed the path was
+        // storage-only because it does not call ActivateBestChain itself. It does not; but
+        // ReceivedBlockTransactions ends in TryAddBlockIndexCandidate, so the block became a
+        // connection candidate anyway and ActivateBestChain picked it up on its own schedule. It
+        // could never connect, so the node stored the block, tried to connect it, discarded it and
+        // downloaded it again as a full block.
         if (m_chainman.m_blockman.IsHazeMode()) {
             LOCK(cs_main);
 
@@ -4876,6 +4891,30 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             if (!pindex) {
                 LogDebug(BCLog::NET, "Stripped block %s not in block index\n", block_hash.ToString());
                 return;
+            }
+
+            // Already part of the chain we have chosen, so accepting it cannot change which chain
+            // that is. A block not in the active chain would be a candidate to extend it, which is
+            // exactly what stripped data cannot support.
+            if (!m_chainman.ActiveChain().Contains(pindex)) {
+                LogDebug(BCLog::NET, "Ignoring stripped block %s from peer %d: not in the active "
+                    "chain, and stripped data cannot be used to extend it\n",
+                    block_hash.ToString(), pfrom.GetId());
+                return;
+            }
+
+            // Below an adopted snapshot base this node never validated the block itself, so the
+            // merkle binding establishes only WHICH block it is. That it was VALID comes from the
+            // proof, and without one there is nothing to license storing it as history.
+            const auto snapshot_base{m_chainman.GetSnapshotBaseHeight()};
+            if (snapshot_base && pindex->nHeight < *snapshot_base) {
+                const auto& proven{haze::HazyncVerifiedProof()};
+                if (!proven || pindex->nHeight > static_cast<int>(proven->height)) {
+                    LogDebug(BCLog::NET, "Ignoring stripped block %s at height %d from peer %d: "
+                        "below the adopted snapshot base and not covered by a verified proof\n",
+                        block_hash.ToString(), pindex->nHeight, pfrom.GetId());
+                    return;
+                }
             }
 
             if (pindex->nStatus & BLOCK_HAVE_DATA) {

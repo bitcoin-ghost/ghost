@@ -98,9 +98,9 @@ A hazed node's life looks like this:
 
 ```
 1. Operator picks haze_mode = "Hazed" in pool.toml at first launch.
-2. Node syncs from peers — could be hazed peers (fast, structural-only)
-   or full peers (still works; received blocks pass through Exorcism
-   on this side and only the stripped form lands on disk).
+2. Node syncs from FULL peers. Received blocks pass through Exorcism on
+   this side, so only the stripped form lands on disk. It cannot sync from
+   a hazed peer — see below.
 3. From the very first block written, only structural data is on disk.
 4. Routine operation: blocks arrive, validate in RAM, write structural,
    zero RAM. Exorcism is invisible from the outside.
@@ -120,6 +120,31 @@ When a peer asks specifically for a transaction's witness data (e.g. for inscrip
 2. **Refuse.** Some nodes operate in environments where redirecting is itself a liability concern. Refusal is consistent with Bitcoin's protocol-level "this peer doesn't have what you want" semantics.
 
 For a node validating the chain, neither matters: validation only needs the full witness during block acceptance, and it has it then (the block arrives over the wire fully formed). Witness data only becomes "missing" *after* validation, when it's been stripped from disk.
+
+## A hazed node cannot sync from another hazed node
+
+Worth stating plainly, because it is the natural thing to assume and it is not true.
+
+**Neither party holds the full block.** A hazed node cannot serve what it destroyed, so there is no
+exchange in which the receiver obtains what it needs. This is not a matter of deferring validation or
+of a protocol that has not been written: the data does not exist on either side.
+
+Three separate things would each be enough to prevent it:
+
+- the receiver has no scriptSigs or witnesses, so it cannot validate;
+- stripping rewrites OP_RETURN and non-standard scriptPubKeys, so even building the UTXO set from
+  stripped data is unsound for any output that was both non-standard and spendable;
+- and a hazed node does not advertise `NODE_NETWORK`, precisely because it cannot serve full
+  historical blocks — so block download never selects it in the first place.
+
+Measured, not assumed: two hazed regtest nodes, one with 120 blocks, the other connected to it.
+Headers transfer fine — the second node learns the whole chain. **Zero blocks transfer, and the
+second node stays at height 0.** (`test/hazync/hazed-to-hazed.sh`.)
+
+**Fast sync is a different mechanism entirely.** A node adopts a proven UTXO set at some height and
+validates forward from there, downloading nothing below it — see [Hazync sync](#hazync). Stripped
+blocks moving between hazed nodes are *history*, filling in economic data for a chain the receiver
+already holds, and a proof is what licenses trusting it.
 
 ## Reorgs, restarts, and the limits of stripped storage
 
