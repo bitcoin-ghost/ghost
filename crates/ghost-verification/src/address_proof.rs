@@ -19,8 +19,10 @@
 //!
 //! Only then may that address's `/24` count toward diversity.
 //!
-//! The verification is a pure function of the response body so it can be tested without
-//! a network; [`probe_claimed_address`] is the thin transport around it.
+//! The verification is a pure function of the response body so it can be tested without a
+//! network. The transport that performs step 2 is deliberately NOT here yet: probing is
+//! blocked on `nodes.public_address` being populated at all — it currently holds one row in
+//! eight on every production node, so there is nothing to probe. See #629.
 
 use ghost_common::identity::verify_signature;
 
