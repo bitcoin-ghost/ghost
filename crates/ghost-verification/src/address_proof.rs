@@ -24,6 +24,7 @@
 //! blocked on `nodes.public_address` being populated at all — it currently holds one row in
 //! eight on every production node, so there is nothing to probe. See #629.
 
+use ghost_common::constants::HTTP_API_PORT;
 use ghost_common::identity::verify_signature;
 
 use crate::challenge::{HealthResponse, SignedResponse};
@@ -43,6 +44,48 @@ pub enum AddressProofFailure {
     NonceMismatch,
     /// Signature did not verify, or the response failed its freshness bounds.
     BadSignature,
+    /// Nothing could be reached at the claimed address, or the request was refused
+    /// before it was made (SSRF guard, unresolvable host, timeout).
+    ///
+    /// Deliberately distinct from every other variant: "I could not reach it" is not
+    /// evidence that the claimant lied, and must not be treated as such. A node that is
+    /// merely down would otherwise lose its subnet on the strength of a transient.
+    Unreachable,
+}
+
+/// The `/health` endpoint to probe for an address a node advertises.
+///
+/// A node's stored `public_address` carries whichever port it advertised — on this fleet
+/// that is the **mesh** port (`:8559`), and some rows carry no port at all. `/health` is on
+/// [`HTTP_API_PORT`]. Probing the stored value verbatim therefore fails for every peer:
+/// measured against a live node, `83.136.251.162:8559` gave `Unreachable` while
+/// `83.136.251.162:8080` verified.
+///
+/// That failure mode is worse than the bug this whole feature exists to fix — gating on a
+/// probe that can never succeed would exclude every subnet and collapse the challenger pool
+/// to zero, where today it is at least populated.
+///
+/// So the host is taken and the API port applied. IPv6 literals keep their brackets; a bare
+/// unbracketed IPv6 address is ambiguous (its colons are not a port separator) and is
+/// returned unchanged rather than silently truncated to nothing.
+pub(crate) fn health_endpoint_for(claimed_address: &str) -> String {
+    let trimmed = claimed_address.trim();
+
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        // Bracketed IPv6, with or without a port: [::1] / [::1]:8559
+        if let Some((host, _)) = rest.split_once(']') {
+            return format!("[{}]:{}", host, HTTP_API_PORT);
+        }
+        return trimmed.to_string();
+    }
+
+    // More than one colon and no brackets: a bare IPv6 literal. Splitting would destroy it.
+    if trimmed.matches(':').count() > 1 {
+        return trimmed.to_string();
+    }
+
+    let host = trimmed.split(':').next().unwrap_or(trimmed);
+    format!("{}:{}", host, HTTP_API_PORT)
 }
 
 /// Verify a `/health?nonce=…` reply proves `expected_node_id` is reachable at the
@@ -216,5 +259,33 @@ mod tests {
             verify_address_proof("not json", &node.node_id_hex(), "n"),
             Err(AddressProofFailure::NotSigned)
         );
+    }
+
+    /// The stored address carries the MESH port; `/health` is on the API port. Probing the
+    /// stored value verbatim fails for every peer — measured live: `:8559` was Unreachable,
+    /// `:8080` verified. Gating on that would exclude every subnet.
+    #[test]
+    fn the_probe_endpoint_uses_the_api_port_not_the_advertised_one() {
+        assert_eq!(
+            health_endpoint_for("83.136.251.162:8559"),
+            "83.136.251.162:8080"
+        );
+        // Some rows carry no port at all (a node's own row is stored that way).
+        assert_eq!(health_endpoint_for("94.237.102.192"), "94.237.102.192:8080");
+        // Whitespace must not defeat it.
+        assert_eq!(health_endpoint_for("  1.2.3.4:9999 "), "1.2.3.4:8080");
+    }
+
+    /// IPv6 must not be silently truncated: splitting on the first colon would turn
+    /// `[::1]:8559` into an empty host and probe nothing.
+    #[test]
+    fn ipv6_survives_endpoint_normalisation() {
+        assert_eq!(
+            health_endpoint_for("[2001:db8::1]:8559"),
+            "[2001:db8::1]:8080"
+        );
+        assert_eq!(health_endpoint_for("[::1]"), "[::1]:8080");
+        // Bare unbracketed IPv6 is ambiguous — returned unchanged, never truncated.
+        assert_eq!(health_endpoint_for("2001:db8::1"), "2001:db8::1");
     }
 }

@@ -1244,6 +1244,12 @@ impl VerificationTask {
         let capabilities = health.capabilities;
         let timestamp = chrono::Utc::now().timestamp();
 
+        // H-7: prove the peer holds its key at the address its /24 is derived from.
+        // Rides this existing rotation rather than adding a fan-out, so the cost scales
+        // with NODES_TO_VERIFY_PER_ROUND, not with the square of the fleet (#605, #625).
+        self.probe_claimed_address_of(peer, &peer_id_hex, short_id)
+            .await;
+
         // Verify each claimed capability
         // CRIT-VER-3: Log DB errors but continue with other capabilities
         if capabilities.archive_mode {
@@ -1280,6 +1286,59 @@ impl VerificationTask {
             {
                 warn!(peer = %short_id, error = %e, "GhostPay verification DB error");
             }
+        }
+    }
+
+    /// H-7: probe the address this peer CLAIMS, and report whether it proved it.
+    ///
+    /// The address probed is `nodes.public_address` — the value the challenger `/24`
+    /// diversity draw is derived from — NOT `peer.http_address`, which is the address we
+    /// already reach it on. Probing the latter would prove nothing about the claim, which
+    /// is the whole point: a node may advertise a `/24` it does not occupy.
+    ///
+    /// Reports only. Nothing is gated on the outcome yet, deliberately: the freshness
+    /// window and the treatment of an unprobed subnet should be chosen from an observed
+    /// pass rate, not guessed. Logged at INFO so that rate is readable without a
+    /// log-level change on a production node.
+    async fn probe_claimed_address_of(
+        &self,
+        peer: &VerifiablePeer,
+        peer_id_hex: &str,
+        short_id: &str,
+    ) {
+        let claimed = match self.db.get_node(peer_id_hex) {
+            Ok(Some(node)) => node.public_address,
+            Ok(None) => None,
+            Err(e) => {
+                debug!(peer = %short_id, error = %e, "H-7: could not read claimed address");
+                return;
+            }
+        };
+
+        let Some(address) = claimed.filter(|a| !a.is_empty()) else {
+            // Before #629 this was every peer: the health ping overwrote the discovered
+            // address with an empty string on every ping.
+            debug!(peer = %short_id, "H-7: no claimed address recorded - nothing to probe");
+            return;
+        };
+
+        match self
+            .client
+            .probe_claimed_address(&address, peer_id_hex)
+            .await
+        {
+            Ok(()) => info!(
+                peer = %short_id,
+                address = %address,
+                "H-7 address proof PASSED - peer holds its key at the address it claims"
+            ),
+            Err(failure) => info!(
+                peer = %short_id,
+                address = %address,
+                failure = ?failure,
+                reachable_at = %peer.http_address,
+                "H-7 address proof did not pass"
+            ),
         }
     }
 
