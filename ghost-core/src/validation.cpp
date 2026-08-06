@@ -3255,6 +3255,20 @@ bool Chainstate::ConnectTip(
                                "node will make no progress on this branch until one supplies it.\n",
                                pindexNew->GetBlockHash().ToString(), pindexNew->nHeight);
                     m_chainman.ForgetStrippedBlockData(*pindexNew);
+
+                    // Raise it where an operator will actually see it. This is a designed state, not
+                    // a stall: the node destroyed this block on purpose and needs a peer that still
+                    // has it. If none does, waiting will not help and nothing in the logs would say
+                    // so after the line above had scrolled away.
+                    m_chainman.GetNotifications().warningSet(
+                        kernel::Warning::HAZE_BLOCK_UNAVAILABLE,
+                        strprintf(_("This node cannot continue past block %d (%s). It is running in "
+                                    "hazed mode, so it destroyed that block's scripts and witnesses "
+                                    "and cannot validate the block itself; it has asked its peers "
+                                    "for a full copy. If no peer supplies one, connect to a "
+                                    "full-archive peer, or re-sync from a node that has it."),
+                                  pindexNew->nHeight, pindexNew->GetBlockHash().ToString()));
+
                     // Deliberately not fatal and not an invalid block: nothing is wrong with the
                     // chain, this node simply no longer holds a copy it can validate from.
                     return false;
@@ -3311,6 +3325,11 @@ bool Chainstate::ConnectTip(
              Ticks<MillisecondsDouble>(time_5 - time_4),
              Ticks<SecondsDouble>(m_chainman.time_chainstate),
              Ticks<MillisecondsDouble>(m_chainman.time_chainstate) / m_chainman.num_blocks_total);
+    // A block connected, so whatever the node was missing it is no longer stuck on. Clearing here
+    // rather than on receipt of the specific block keeps it simple and cannot leave the warning
+    // stale: progress is the condition the warning was about.
+    m_chainman.GetNotifications().warningUnset(kernel::Warning::HAZE_BLOCK_UNAVAILABLE);
+
     // Remove conflicting transactions from the mempool.;
     if (m_mempool) {
         m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);

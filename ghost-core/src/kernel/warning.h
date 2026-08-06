@@ -9,6 +9,10 @@ namespace kernel {
 enum class Warning {
     UNKNOWN_NEW_RULES_ACTIVATED,
     LARGE_WORK_INVALID_CHAIN,
+    //! A hazed node needs a block it destroyed and no peer has supplied a copy.
+    //! Not a transient condition: it is a designed state the operator has to resolve,
+    //! so it is surfaced rather than left as a log line that scrolls away.
+    HAZE_BLOCK_UNAVAILABLE,
 };
 } // namespace kernel
 #endif // BITCOIN_KERNEL_WARNING_H
