@@ -934,9 +934,19 @@ impl HealthPingHandler {
             let peer_pow_hex = ping.pow_proof.map(|(nonce, difficulty)| {
                 ghost_common::identity::NodeIdProof { nonce, difficulty }.to_hex()
             });
+            // #629: the ping carries no address post-S-7, so take the one discovery observed.
+            // Passing the ping's empty string straight through wiped the stored address on
+            // every ping, because the upsert uses `COALESCE(?2, public_address)` and an empty
+            // string is a value, not an absence.
+            let discovered = self
+                .peers
+                .get_peer(&envelope.sender)
+                .map(|p| p.public_address);
+            let address_for_db = address_to_persist(discovered.as_deref(), &ping.public_address);
+
             if let Err(e) = db.register_node_with_elder_check_and_pow(
                 &node_id_hex,
-                Some(ping.public_address.as_str()),
+                address_for_db,
                 None, // display_name not available from health ping
                 &capabilities_str,
                 peer_pow_hex.as_deref(),
@@ -1012,6 +1022,26 @@ impl MessageHandler for HealthPingHandler {
         }
         Ok(())
     }
+}
+
+/// Which address to persist for a peer, given what discovery observed and what the ping carried.
+///
+/// Post-S-7 the health ping deliberately carries no address (`mesh.rs`:
+/// `public_address: String::new(), // S-7: Don't broadcast IP in cleartext ZMQ`), and discovery
+/// is the designated path for pairing an identity with an address. But the ping handler still
+/// passed `Some(ping.public_address.as_str())` — always `Some("")` — into an upsert whose column
+/// is written as `COALESCE(?2, public_address)`. `COALESCE` accepts an empty string as a value, so
+/// every ping destroyed the address discovery had learned, at a ~10s cadence. The result:
+/// `nodes.public_address` held one populated row in eight on every production node — each node's
+/// own — and the challenger `/24` diversity draw, which reads that column, had nothing to work
+/// with (#629).
+///
+/// Returning `None` is the important case: it lets `COALESCE` preserve what is already stored
+/// instead of overwriting it with nothing.
+fn address_to_persist<'a>(discovered: Option<&'a str>, ping_address: &'a str) -> Option<&'a str> {
+    discovered
+        .filter(|a| !a.is_empty())
+        .or(Some(ping_address).filter(|a| !a.is_empty()))
 }
 
 #[cfg(test)]
@@ -1277,6 +1307,38 @@ mod tests {
         assert!(
             BASE_POW_DIFFICULTY >= 8,
             "BASE difficulty should be at least 8 for minimum security"
+        );
+    }
+
+    /// #629: post-S-7 the ping is always empty, so the address discovery observed must win.
+    #[test]
+    fn discovered_address_is_used_when_the_ping_carries_none() {
+        assert_eq!(
+            address_to_persist(Some("203.0.113.7:8555"), ""),
+            Some("203.0.113.7:8555")
+        );
+    }
+
+    /// The regression this fixes. With nothing to offer, the handler must pass `None` so the
+    /// upsert's `COALESCE(?2, public_address)` PRESERVES the stored value. Passing `Some("")`
+    /// is what silently wiped every peer's address roughly every ten seconds.
+    #[test]
+    fn nothing_to_offer_yields_none_so_coalesce_preserves() {
+        assert_eq!(address_to_persist(None, ""), None);
+        assert_eq!(address_to_persist(Some(""), ""), None);
+    }
+
+    /// If the ping ever carries an address again it is still usable — but only as a fallback.
+    #[test]
+    fn the_ping_is_a_fallback_not_a_preference() {
+        assert_eq!(
+            address_to_persist(None, "198.51.100.9:8555"),
+            Some("198.51.100.9:8555")
+        );
+        // Both available: prefer what discovery observed over what the node asserted.
+        assert_eq!(
+            address_to_persist(Some("203.0.113.7:8555"), "198.51.100.9:8555"),
+            Some("203.0.113.7:8555")
         );
     }
 }
