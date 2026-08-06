@@ -1135,6 +1135,64 @@ impl VerificationClient {
 
         result
     }
+
+    /// H-7: prove a node holds its identity key at the address it CLAIMS.
+    ///
+    /// The `/24` used for challenger diversity is derived from `nodes.public_address`,
+    /// which a node advertises about itself. A bare reachability probe cannot close that:
+    /// connecting proves only that *something* answers there, and a node may advertise any
+    /// reachable third-party address. So this dials the claimed address and requires the
+    /// answer to be signed under `expected_node_id` over a nonce chosen here.
+    ///
+    /// The nonce is fresh per call, so a reply captured from an earlier probe cannot be
+    /// replayed — `SignedResponse` bounds freshness only to `MAX_RESPONSE_AGE_SECS`.
+    ///
+    /// `build_url` applies the SSRF guard (M-11) and the DNS-rebinding re-check (M-19),
+    /// which matter more here than anywhere else in this client: the host being dialled is
+    /// attacker-supplied by construction — it is precisely the value this function exists
+    /// to distrust.
+    ///
+    /// A failure to reach the address returns
+    /// [`crate::address_proof::AddressProofFailure::Unreachable`], which callers MUST NOT
+    /// treat as evidence of a lie. Down is not dishonest.
+    pub async fn probe_claimed_address(
+        &self,
+        claimed_address: &str,
+        expected_node_id: &str,
+    ) -> Result<(), crate::address_proof::AddressProofFailure> {
+        use crate::address_proof::{verify_address_proof, AddressProofFailure};
+
+        let mut nonce_bytes = [0u8; 16];
+        if getrandom::getrandom(&mut nonce_bytes).is_err() {
+            // No randomness means no binding, and an unbound probe is worse than none —
+            // it would accept a replay. Report unreachable rather than issue it.
+            warn!("H-7: no randomness for an address-proof nonce - skipping probe");
+            return Err(AddressProofFailure::Unreachable);
+        }
+        let nonce = hex::encode(nonce_bytes);
+
+        let url = self
+            .build_url(
+                &crate::address_proof::health_endpoint_for(claimed_address),
+                &format!("/health?nonce={}", nonce),
+            )
+            .map_err(|e| {
+                debug!(address = %claimed_address, error = %e, "H-7: refusing to probe address");
+                AddressProofFailure::Unreachable
+            })?;
+
+        let response = self.client.get(&url).send().await.map_err(|e| {
+            debug!(address = %claimed_address, error = %e, "H-7: address probe did not connect");
+            AddressProofFailure::Unreachable
+        })?;
+
+        let body = response.text().await.map_err(|e| {
+            debug!(address = %claimed_address, error = %e, "H-7: address probe body unreadable");
+            AddressProofFailure::Unreachable
+        })?;
+
+        verify_address_proof(&body, expected_node_id, &nonce)
+    }
 }
 
 /// Result of full verification suite
@@ -1639,5 +1697,32 @@ mod tests {
         // Should allow public IPs
         let result = client.build_url("93.184.216.34:8080", "/health");
         assert!(result.is_ok());
+    }
+
+    /// H-7: the address being probed is attacker-supplied by construction — it is the
+    /// value the probe exists to distrust. So the SSRF guard must apply to it, and a
+    /// refusal must surface as `Unreachable` rather than as evidence the node lied.
+    ///
+    /// Uses an internal address, which `build_url` refuses (M-11), so no request is made.
+    #[tokio::test]
+    async fn probing_an_internal_address_is_refused_as_unreachable() {
+        use crate::address_proof::AddressProofFailure;
+
+        let client = VerificationClient::with_config(VerificationClientConfig {
+            use_https: false,
+            timeout: std::time::Duration::from_millis(200),
+            danger_accept_invalid_certs: false,
+            is_mainnet: false,
+        })
+        .expect("client");
+
+        for addr in ["127.0.0.1:8080", "10.0.0.1:8080", "192.168.1.1:8080"] {
+            let got = client.probe_claimed_address(addr, &"ab".repeat(32)).await;
+            assert_eq!(
+                got,
+                Err(AddressProofFailure::Unreachable),
+                "{addr} must be refused as Unreachable, not treated as a failed proof"
+            );
+        }
     }
 }
