@@ -122,11 +122,9 @@ impl<'a> Sniffer<'a> {
         //
         // Invisible on a fast machine, wide open under `cargo llvm-cov` — which is where it
         // showed up as 5h38m in a single test against 22 minutes uninstrumented (#408).
-        let std_listener =
-            std::net::TcpListener::bind(listening_address).expect("Sniffer: cannot bind");
-        std_listener
-            .set_nonblocking(true)
-            .expect("Sniffer: cannot set nonblocking");
+        // Claim the reservation rather than binding directly: `get_available_address` holds
+        // the port from the moment it is chosen, so an independent bind here fails (#612).
+        let std_listener = crate::utils::claim_listener(listening_address);
 
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener)
