@@ -7,7 +7,7 @@ use crate::{
 use async_channel::{Receiver, Sender};
 use once_cell::sync::Lazy;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     convert::TryInto,
     net::{SocketAddr, TcpListener},
     sync::{Arc, Mutex},
@@ -34,28 +34,33 @@ use stratum_apps::{
     },
 };
 
-// prevents get_available_port from ever returning the same port twice
-static UNIQUE_PORTS: Lazy<Mutex<HashSet<u16>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+/// Ports reserved by [`get_available_address`], still BOUND, awaiting [`bind_listener`].
+///
+/// The old approach bound `127.0.0.1:0`, read the port, and dropped the listener — releasing
+/// the port before anything re-bound it. Between release and re-bind any other process could
+/// take it, and `bind_listener` then panicked on `expect("Impossible to listen on given
+/// address")`. That is #612: three `mock_roles` tests failing intermittently under the full
+/// workspace run, blocking `record-tests.sh` and therefore deploys. `cargo llvm-cov` widens
+/// the window enough to make it frequent (#408).
+///
+/// De-duplicating the port numbers (the previous `UNIQUE_PORTS` set) could not fix this: it
+/// only stopped THIS process handing the same port out twice, and the port was still
+/// unbound in the interval.
+///
+/// Holding the listener removes the interval entirely — the port is never free between being
+/// chosen and being used, so nothing can take it.
+static RESERVED: Lazy<Mutex<HashMap<SocketAddr, TcpListener>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Reserve a free loopback address, keeping it bound until [`bind_listener`] claims it.
 pub fn get_available_address() -> SocketAddr {
-    let port = get_available_port();
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
-
-fn get_available_port() -> u16 {
-    let mut unique_ports = UNIQUE_PORTS.lock().unwrap();
-
-    loop {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        if !unique_ports.contains(&port) {
-            unique_ports.insert(port);
-            return port;
-        }
-    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("read the bound address");
+    RESERVED
+        .lock()
+        .expect("reserved-port registry")
+        .insert(addr, listener);
+    addr
 }
 pub async fn wait_for_client(listen_socket: SocketAddr) -> tokio::net::TcpStream {
     accept_one(bind_listener(listen_socket).await).await
@@ -71,10 +76,37 @@ pub async fn wait_for_client(listen_socket: SocketAddr) -> tokio::net::TcpStream
 ///
 /// The window is invisible on a fast machine and wide under `cargo llvm-cov`, which is exactly
 /// where the hang showed up: 5h38m in one test under instrumentation, 22 minutes without.
+/// Claim the listener [`get_available_address`] reserved for `listen_socket`, or bind fresh.
+///
+/// EVERY path that listens on a reserved address must go through this. A caller that binds
+/// the address itself will now FAIL, because the reservation still holds the port — which is
+/// exactly what happened to `Sniffer::start`, whose own `std::net::TcpListener::bind` broke
+/// the moment reservations started being held.
+///
+/// Returned non-blocking, ready for `tokio::net::TcpListener::from_std`.
+pub fn claim_listener(listen_socket: SocketAddr) -> TcpListener {
+    let reserved = RESERVED
+        .lock()
+        .expect("reserved-port registry")
+        .remove(&listen_socket);
+
+    let listener = match reserved {
+        Some(l) => l,
+        // Not reserved — an address the caller chose. Bind it directly; this path still races
+        // with the rest of the machine, which is why callers should use
+        // `get_available_address`.
+        None => TcpListener::bind(listen_socket).expect("Impossible to listen on given address"),
+    };
+
+    listener
+        .set_nonblocking(true)
+        .expect("set the listener non-blocking");
+    listener
+}
+
 pub async fn bind_listener(listen_socket: SocketAddr) -> tokio::net::TcpListener {
-    tokio::net::TcpListener::bind(listen_socket)
-        .await
-        .expect("Impossible to listen on given address")
+    tokio::net::TcpListener::from_std(claim_listener(listen_socket))
+        .expect("adopt the reserved listener")
 }
 
 /// Accept a single connection from an already-bound listener.
@@ -535,5 +567,56 @@ pub mod fs_utils {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reserved_port_tests {
+    use super::*;
+
+    /// #612: the port must NEVER be unbound between being chosen and being used.
+    ///
+    /// The old helper bound `127.0.0.1:0`, read the port and dropped the listener, so the port
+    /// sat free until `bind_listener` re-bound it. Anything on the machine could take it in
+    /// that window, and `bind_listener` panicked when it did.
+    ///
+    /// This asserts the invariant directly: right after reserving, the address is already
+    /// bound, so an independent bind FAILS. Against the old implementation this test fails —
+    /// the port was free and the bind would succeed.
+    #[test]
+    fn a_reserved_address_is_already_bound_so_nothing_can_take_it() {
+        let addr = get_available_address();
+        assert!(
+            TcpListener::bind(addr).is_err(),
+            "reserved address {addr} was free — the race window is open"
+        );
+    }
+
+    /// And the reservation must be usable: `bind_listener` adopts it rather than re-binding.
+    #[tokio::test]
+    async fn bind_listener_adopts_the_reservation() {
+        let addr = get_available_address();
+        let listener = bind_listener(addr).await;
+        assert_eq!(
+            listener.local_addr().expect("local addr"),
+            addr,
+            "bind_listener must serve the address that was reserved"
+        );
+    }
+
+    /// Two reservations never collide, and neither is released by the other.
+    #[test]
+    fn reservations_are_distinct_and_both_held() {
+        let a = get_available_address();
+        let b = get_available_address();
+        assert_ne!(a, b, "two reservations returned the same address");
+        assert!(
+            TcpListener::bind(a).is_err(),
+            "first reservation was released"
+        );
+        assert!(
+            TcpListener::bind(b).is_err(),
+            "second reservation was released"
+        );
     }
 }
