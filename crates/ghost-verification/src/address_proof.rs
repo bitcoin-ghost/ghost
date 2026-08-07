@@ -24,7 +24,6 @@
 //! blocked on `nodes.public_address` being populated at all — it currently holds one row in
 //! eight on every production node, so there is nothing to probe. See #629.
 
-use ghost_common::constants::HTTP_API_PORT;
 use ghost_common::identity::verify_signature;
 
 use crate::challenge::{HealthResponse, SignedResponse};
@@ -57,7 +56,7 @@ pub enum AddressProofFailure {
 ///
 /// A node's stored `public_address` carries whichever port it advertised — on this fleet
 /// that is the **mesh** port (`:8559`), and some rows carry no port at all. `/health` is on
-/// [`HTTP_API_PORT`]. Probing the stored value verbatim therefore fails for every peer:
+/// [`api_port`]. Probing the stored value verbatim therefore fails for every peer:
 /// measured against a live node, `83.136.251.162:8559` gave `Unreachable` while
 /// `83.136.251.162:8080` verified.
 ///
@@ -65,16 +64,29 @@ pub enum AddressProofFailure {
 /// probe that can never succeed would exclude every subnet and collapse the challenger pool
 /// to zero, where today it is at least populated.
 ///
-/// So the host is taken and the API port applied. IPv6 literals keep their brackets; a bare
-/// unbracketed IPv6 address is ambiguous (its colons are not a port separator) and is
-/// returned unchanged rather than silently truncated to nothing.
-pub(crate) fn health_endpoint_for(claimed_address: &str) -> String {
+/// So the host is taken and the caller's API port applied. The port is a PARAMETER rather
+/// than a constant because it depends on the scheme the client is configured for:
+/// `HTTP_API_PORT` (8080) serves plaintext, `VERIFICATION_HTTPS_PORT` (8443) serves TLS.
+/// Hardcoding 8080 while the production client runs with `use_https: true` builds
+/// `https://host:8080` — TLS against the plaintext port — which fails for every peer.
+/// Measured on the fleet:
+///
+/// ```text
+/// http://host:8080/health   -> 200
+/// https://host:8080/health  -> 000   (what the hardcoded version built)
+/// https://host:8443/health  -> signed response
+/// ```
+///
+/// IPv6 literals keep their brackets; a bare unbracketed IPv6 address is ambiguous (its
+/// colons are not a port separator) and is returned unchanged rather than silently
+/// truncated to nothing.
+pub(crate) fn health_endpoint_for(claimed_address: &str, api_port: u16) -> String {
     let trimmed = claimed_address.trim();
 
     if let Some(rest) = trimmed.strip_prefix('[') {
         // Bracketed IPv6, with or without a port: [::1] / [::1]:8559
         if let Some((host, _)) = rest.split_once(']') {
-            return format!("[{}]:{}", host, HTTP_API_PORT);
+            return format!("[{}]:{}", host, api_port);
         }
         return trimmed.to_string();
     }
@@ -85,7 +97,7 @@ pub(crate) fn health_endpoint_for(claimed_address: &str) -> String {
     }
 
     let host = trimmed.split(':').next().unwrap_or(trimmed);
-    format!("{}:{}", host, HTTP_API_PORT)
+    format!("{}:{}", host, api_port)
 }
 
 /// Verify a `/health?nonce=…` reply proves `expected_node_id` is reachable at the
@@ -267,13 +279,22 @@ mod tests {
     #[test]
     fn the_probe_endpoint_uses_the_api_port_not_the_advertised_one() {
         assert_eq!(
-            health_endpoint_for("83.136.251.162:8559"),
+            health_endpoint_for("83.136.251.162:8559", 8080),
             "83.136.251.162:8080"
         );
         // Some rows carry no port at all (a node's own row is stored that way).
-        assert_eq!(health_endpoint_for("94.237.102.192"), "94.237.102.192:8080");
+        assert_eq!(
+            health_endpoint_for("94.237.102.192", 8080),
+            "94.237.102.192:8080"
+        );
         // Whitespace must not defeat it.
-        assert_eq!(health_endpoint_for("  1.2.3.4:9999 "), "1.2.3.4:8080");
+        assert_eq!(health_endpoint_for("  1.2.3.4:9999 ", 8080), "1.2.3.4:8080");
+        // And an HTTPS client must get the TLS port. Hardcoding 8080 while the client
+        // speaks https built `https://host:8080` and made every probe Unreachable.
+        assert_eq!(
+            health_endpoint_for("83.136.251.162:8559", 8443),
+            "83.136.251.162:8443"
+        );
     }
 
     /// IPv6 must not be silently truncated: splitting on the first colon would turn
@@ -281,11 +302,11 @@ mod tests {
     #[test]
     fn ipv6_survives_endpoint_normalisation() {
         assert_eq!(
-            health_endpoint_for("[2001:db8::1]:8559"),
+            health_endpoint_for("[2001:db8::1]:8559", 8080),
             "[2001:db8::1]:8080"
         );
-        assert_eq!(health_endpoint_for("[::1]"), "[::1]:8080");
+        assert_eq!(health_endpoint_for("[::1]", 8080), "[::1]:8080");
         // Bare unbracketed IPv6 is ambiguous — returned unchanged, never truncated.
-        assert_eq!(health_endpoint_for("2001:db8::1"), "2001:db8::1");
+        assert_eq!(health_endpoint_for("2001:db8::1", 8080), "2001:db8::1");
     }
 }
