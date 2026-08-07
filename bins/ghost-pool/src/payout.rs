@@ -688,7 +688,7 @@ pub struct BlockFoundData {
 /// Data for solo mining mode block found event
 ///
 /// Solo shares the single fee model with pool mode (#592); see
-/// [`ProposalCreator::create_solo_proposal`] for how the `COINBASE_FEE_SPLIT_HEIGHT` gate decides
+/// [`PayoutProposalCreator::create_solo_proposal`] for how the `COINBASE_FEE_SPLIT_HEIGHT` gate decides
 /// whether the 1% is levied on `subsidy + fees` or on the subsidy alone. The hosting node
 /// participates in the node reward pool in both regimes.
 #[derive(Debug, Clone)]
@@ -2270,37 +2270,35 @@ impl PayoutHandler {
         let proposal_hash = compute_proposal_hash(&proposal);
         proposal.proposal_hash = proposal_hash;
 
-        // Store proposal in template processor BEFORE submitting to consensus
+        // The proposal must be in the cache before it can be approved: `set_approved_payout`
+        // refuses a hash whose data it cannot find (MED-POOL-6).
         self.template_processor.store_proposal(proposal.clone());
 
-        // Submit to vote handler for BFT consensus
+        // #592: solo approves its own proposal instead of submitting it to BFT.
+        //
+        // A solo node has no mesh. The BFT pipeline requires `min_voters_for_bft`, which clamps to
+        // 4..=7, so a standalone node's proposal failed with `InsufficientVoters` every time — no
+        // coinbase commitment was ever approved, and `submitblock` then refused the block. Solo
+        // could not mine at all.
+        //
+        // There is nothing for consensus to protect here: solo contributes no shares to the public
+        // ledger and its coinbase pays only its own operator, so there is no other party whose
+        // funds a vote would be safeguarding. The proposal is built by the same
+        // `create_solo_proposal` under the same fee model as pool mode, and the coinbase is built
+        // from it by the same `build_coinbase_parts_with_payout_snapshot` — one construction path,
+        // no solo-specific economics.
+        //
+        // `set_approved_payout` also sets the M-28 coinbase commitment, which is what unblocks
+        // `submitblock`.
         info!(
             round_id = proposal.round_id,
             solo_payout = proposal.miner_payouts[0].amount,
             nodes = proposal.node_payouts.len(),
-            "Submitting solo mode payout proposal to consensus"
-        );
-
-        let returned_hash = self.vote_handler.handle_proposal(proposal)?;
-
-        // SECURITY: Verify hash matches - this catches implementation bugs where
-        // the vote handler modifies the proposal or computes the hash differently
-        if proposal_hash != returned_hash {
-            tracing::error!(
-                expected = %hex::encode(&proposal_hash[..8]),
-                actual = %hex::encode(&returned_hash[..8]),
-                "CRITICAL: Solo proposal hash mismatch between local computation and vote handler"
-            );
-            return Err(ghost_common::error::GhostError::HashMismatch {
-                expected: hex::encode(proposal_hash),
-                actual: hex::encode(returned_hash),
-            });
-        }
-
-        info!(
             hash = %hex::encode(&proposal_hash[..8]),
-            "Solo mode payout proposal submitted for voting"
+            "Solo mode: approving own payout proposal (no BFT — solo has no mesh)"
         );
+
+        self.template_processor.set_approved_payout(proposal_hash);
 
         Ok(proposal_hash)
     }

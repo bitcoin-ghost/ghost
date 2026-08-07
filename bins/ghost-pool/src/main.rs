@@ -7465,7 +7465,21 @@ async fn main() -> Result<()> {
         }
 
         // Broadcast the signed share proof to other nodes via P2P.
-        if let Err(e) = share_broadcast_tx.try_send(proof) {
+        //
+        // #592: never in solo mode. A solo node pays only its own operator and takes its own
+        // payout decision locally, so a share it broadcast would credit node rewards and enter
+        // peers' unpaid ledgers on the strength of work that no public round accounted for.
+        //
+        // This was previously safe only by accident — a solo node normally has no peers, so the
+        // broadcast went nowhere. That is a property of how solo happens to be deployed, not an
+        // invariant: `config/mainnet-solo.toml` says no seed nodes are *needed*, not that peers
+        // are forbidden. Suppress at the source so reachability cannot change the answer.
+        if rm_for_shares.is_solo_mode() {
+            tracing::trace!(
+                miner_id = %share.miner_id,
+                "Solo mode: share proof not broadcast (solo cannot touch the public ledger)"
+            );
+        } else if let Err(e) = share_broadcast_tx.try_send(proof) {
             tracing::warn!(error = %e, "Share broadcast channel full or closed");
         }
 
