@@ -1136,6 +1136,19 @@ impl VerificationClient {
         result
     }
 
+    /// The API port matching this client's configured scheme.
+    ///
+    /// `HTTP_API_PORT` (8080) serves plaintext; `VERIFICATION_HTTPS_PORT` (8443) serves TLS.
+    /// They are not interchangeable: `https://host:8080` fails outright, which is what the
+    /// first version of the H-7 probe built on every peer because the port was hardcoded.
+    fn api_port(&self) -> u16 {
+        if self.config.use_https {
+            ghost_common::constants::VERIFICATION_HTTPS_PORT
+        } else {
+            ghost_common::constants::HTTP_API_PORT
+        }
+    }
+
     /// H-7: prove a node holds its identity key at the address it CLAIMS.
     ///
     /// The `/24` used for challenger diversity is derived from `nodes.public_address`,
@@ -1173,7 +1186,7 @@ impl VerificationClient {
 
         let url = self
             .build_url(
-                &crate::address_proof::health_endpoint_for(claimed_address),
+                &crate::address_proof::health_endpoint_for(claimed_address, self.api_port()),
                 &format!("/health?nonce={}", nonce),
             )
             .map_err(|e| {
