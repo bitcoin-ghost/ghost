@@ -93,7 +93,31 @@ run_gate() {
     echo "$out"
 }
 
-run_gate clippy cargo clippy --workspace $EXCLUDES --all-targets >/dev/null
+# #626: run clippy EXACTLY as CI runs it, by extracting the invocation from the workflow
+# rather than restating it here. This gate used to run
+#
+#     cargo clippy --workspace $EXCLUDES --all-targets
+#
+# against CI's
+#
+#     cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A ...
+#
+# so feature-gated code (`zk-consensus`, `mpc-ceremony`, `zk-production`) was never linted
+# locally, and without `-D warnings` clippy exited 0 on warnings — `run_gate` recorded success
+# on a commit CI would reject, and the deploy gate passed it as tested.
+#
+# Deriving the flags makes drift impossible rather than merely detectable. If they cannot be
+# derived we FAIL: a hardcoded fallback would be indistinguishable from agreement, which is
+# how the two came apart in the first place.
+CI_CLIPPY_ARGS="$(scripts/ci-clippy-args.sh)" || {
+    echo "FAILED: cannot derive clippy flags from .github/workflows — refusing to record a \
+marker that claims CI-equivalence" >&2
+    exit 1
+}
+echo "==> clippy (exactly as CI runs it: $CI_CLIPPY_ARGS)"
+# Deliberate word-splitting: $CI_CLIPPY_ARGS is a flag list, not one argument.
+# shellcheck disable=SC2086
+run_gate clippy cargo clippy $CI_CLIPPY_ARGS >/dev/null
 run_gate "check (all targets, all features)" \
     cargo check --workspace $EXCLUDES --all-targets --all-features >/dev/null
 
