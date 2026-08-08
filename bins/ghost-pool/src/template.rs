@@ -153,7 +153,9 @@ pub struct TemplateConfig {
     /// Mining mode (PublicPool, PrivatePool, PrivateSolo)
     pub mining_mode: MiningMode,
     /// Solo payout address (required for PrivateSolo mode)
-    /// All rewards (99% subsidy + 100% tx fees) go to this address
+    ///
+    /// Solo uses the same fee model as pool mode (#592): above `COINBASE_FEE_SPLIT_HEIGHT` the 1%
+    /// pool fee is levied on `subsidy + fees` and this address receives the other 99%.
     pub solo_payout_address: Option<String>,
     /// Whether to enforce the finer per-field policy knobs during tx selection.
     ///
@@ -1477,205 +1479,6 @@ impl TemplateProcessor {
             outputs_serialized,
             outputs_count,
             adjusted_commitment,
-        ))
-    }
-
-    /// Build coinbase for solo mining mode
-    ///
-    /// Solo mode reward structure:
-    /// - Output 0: 99% subsidy + ALL TX fees → solo_payout_address
-    /// - Output 1: Treasury portion of 1% pool fee → treasury_address
-    /// - Output 2: Node pool portion of 1% pool fee → treasury_address (node pool)
-    /// - Output 3: Witness commitment (if SegWit)
-    ///
-    /// The 1% pool fee is split between treasury and node pool per decay schedule.
-    /// The hosting node participates in the node reward pool calculation.
-    ///
-    /// CRIT-10: Returns an error if any address is invalid.
-    /// This prevents creating blocks with unspendable outputs.
-    ///
-    /// Returns: (coinbase1, coinbase2, witness_data, outputs_serialized, outputs_count)
-    pub fn build_coinbase_solo_mode(
-        &self,
-        height: u64,
-        subsidy: u64,
-        tx_fees: u64,
-        treasury_amount: u64,
-        node_pool_amount: u64,
-        witness_commitment: &Option<String>,
-    ) -> Result<CoinbaseBuildResult, TemplateError> {
-        // Solo mode requires solo_payout_address to be configured
-        let solo_address = match self.config.solo_payout_address.as_ref() {
-            Some(addr) if !addr.is_empty() => addr,
-            _ => {
-                return Err(TemplateError::ConfigError(
-                    "solo_payout_address is required for solo mode".to_string(),
-                ));
-            }
-        };
-
-        // Calculate solo miner's share: 99% of subsidy + ALL tx fees
-        // The 1% pool fee (treasury_amount + node_pool_amount) comes from the caller
-        let miner_pool = subsidy
-            .saturating_sub(treasury_amount)
-            .saturating_sub(node_pool_amount);
-        let solo_miner_amount = miner_pool.saturating_add(tx_fees);
-
-        info!(
-            height = height,
-            subsidy = subsidy,
-            tx_fees = tx_fees,
-            solo_miner_amount = solo_miner_amount,
-            treasury = treasury_amount,
-            node_pool = node_pool_amount,
-            "Building solo mode coinbase"
-        );
-
-        // Build coinbase1 - NON-WITNESS format
-        let mut coinbase1 = Vec::new();
-
-        // Version (4 bytes, little-endian)
-        coinbase1.extend_from_slice(&2u32.to_le_bytes()); // Version 2 for BIP68
-
-        // Input count
-        coinbase1.push(0x01);
-
-        // Previous tx hash (all zeros for coinbase)
-        coinbase1.extend_from_slice(&[0u8; 32]);
-
-        // Previous output index (0xffffffff for coinbase)
-        coinbase1.extend_from_slice(&0xffffffffu32.to_le_bytes());
-
-        // Script sig: height then the pool tag. No payout commitment — this path builds no
-        // settleable payout. See coinbase_scriptsig.
-        let scriptsig = self.coinbase_scriptsig(height, None, 8)?;
-        coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
-        coinbase1.extend_from_slice(&scriptsig);
-
-        // Coinbase2: extranonce end + sequence + outputs + locktime
-        let mut coinbase2 = Vec::new();
-
-        // Sequence
-        coinbase2.extend_from_slice(&0xffffffffu32.to_le_bytes());
-
-        // Track witness commitment for WitnessData
-        let mut witness_data = WitnessData::default();
-
-        // Track serialized outputs for TDP
-        let mut outputs_serialized = Vec::new();
-
-        // Count outputs: solo miner + treasury (if > 0) + node pool (if > 0) + witness commitment
-        let mut output_count = 1; // solo miner always present
-        if treasury_amount > 0 {
-            output_count += 1;
-        }
-        if node_pool_amount > 0 {
-            output_count += 1;
-        }
-        if witness_commitment.is_some() {
-            output_count += 1;
-        }
-
-        self.encode_varint(&mut coinbase2, output_count);
-
-        // Output 0: Solo miner (99% subsidy + ALL tx fees)
-        // CRIT-10: Validate address and fail if invalid
-        coinbase2.extend_from_slice(&solo_miner_amount.to_le_bytes());
-        self.encode_address_script(&mut coinbase2, solo_address, "solo_miner")?;
-        outputs_serialized.extend_from_slice(&solo_miner_amount.to_le_bytes());
-        self.encode_address_script(&mut outputs_serialized, solo_address, "solo_miner_tdp")?;
-
-        // Output 1: Treasury (portion of 1% pool fee per decay schedule)
-        // CRIT-10: Validate treasury address and fail if invalid
-        // H-BTC-4: No silent fallbacks - require valid treasury address when amount > 0
-        if treasury_amount > 0 {
-            // H-BTC-4: Validate address BEFORE adding amount to buffer
-            if self.config.treasury_address.is_empty() {
-                error!(
-                    treasury_amount = treasury_amount,
-                    "H-BTC-4 SECURITY: Treasury amount specified ({} sats) but no treasury address configured. \
-                     This would create an unspendable output!",
-                    treasury_amount
-                );
-                return Err(TemplateError::ConfigError(format!(
-                    "H-BTC-4: Treasury amount {} sats specified but treasury_address is empty",
-                    treasury_amount
-                )));
-            }
-            let treasury_addr = self.config.treasury_address.address();
-            coinbase2.extend_from_slice(&treasury_amount.to_le_bytes());
-            self.encode_address_script(&mut coinbase2, treasury_addr, "treasury")?;
-            outputs_serialized.extend_from_slice(&treasury_amount.to_le_bytes());
-            self.encode_address_script(&mut outputs_serialized, treasury_addr, "treasury_tdp")?;
-        }
-
-        // Output 2: Node pool (portion of 1% pool fee per decay schedule)
-        // In solo mode, this typically goes to the hosting node (operator)
-        // For simplicity, we use treasury address as the destination (can be separate)
-        // CRIT-10: Validate node_pool address and fail if invalid
-        // H-BTC-4: No silent fallbacks - require valid address when amount > 0
-        if node_pool_amount > 0 {
-            // H-BTC-4: Validate address BEFORE adding amount to buffer
-            if self.config.treasury_address.is_empty() {
-                error!(
-                    node_pool_amount = node_pool_amount,
-                    "H-BTC-4 SECURITY: Node pool amount specified ({} sats) but no treasury address configured. \
-                     This would create an unspendable output!",
-                    node_pool_amount
-                );
-                return Err(TemplateError::ConfigError(format!(
-                    "H-BTC-4: Node pool amount {} sats specified but treasury_address is empty",
-                    node_pool_amount
-                )));
-            }
-            let treasury_addr = self.config.treasury_address.address();
-            coinbase2.extend_from_slice(&node_pool_amount.to_le_bytes());
-            self.encode_address_script(&mut coinbase2, treasury_addr, "node_pool")?;
-            outputs_serialized.extend_from_slice(&node_pool_amount.to_le_bytes());
-            self.encode_address_script(&mut outputs_serialized, treasury_addr, "node_pool_tdp")?;
-        }
-
-        // Output 3: Witness commitment (0-value OP_RETURN)
-        if let Some(commitment) = witness_commitment {
-            let commitment_bytes = hex::decode(commitment).map_err(|e| {
-                TemplateError::BlockAssemblyError(format!("Invalid witness commitment hex: {}", e))
-            })?;
-
-            if !validate_witness_commitment_script(&commitment_bytes) {
-                return Err(TemplateError::BlockAssemblyError(
-                    "Invalid witness commitment script structure".to_string(),
-                ));
-            }
-
-            coinbase2.extend_from_slice(&0u64.to_le_bytes()); // 0 value
-                                                              // L-10: Validate commitment length before casting to u8
-            if commitment_bytes.len() > 255 {
-                return Err(TemplateError::BlockAssemblyError(format!(
-                    "L-10: Witness commitment script too long: {} bytes (max 255)",
-                    commitment_bytes.len()
-                )));
-            }
-            coinbase2.push(commitment_bytes.len() as u8);
-            coinbase2.extend_from_slice(&commitment_bytes);
-            witness_data.commitment_script = Some(commitment_bytes.clone());
-            outputs_serialized.extend_from_slice(&0u64.to_le_bytes());
-            outputs_serialized.push(commitment_bytes.len() as u8);
-            outputs_serialized.extend_from_slice(&commitment_bytes);
-        }
-
-        // Locktime
-        coinbase2.extend_from_slice(&0u32.to_le_bytes());
-
-        // Witness nonce
-        witness_data.nonce = [0u8; 32];
-
-        Ok((
-            coinbase1,
-            coinbase2,
-            witness_data,
-            outputs_serialized,
-            output_count as u32,
-            None, // Solo mode has no payout proposal commitment
         ))
     }
 
@@ -3795,6 +3598,92 @@ mod tests {
         // coinbase2 should end with locktime (4 bytes), NOT witness data
         let len = coinbase2.len();
         assert_eq!(&coinbase2[len - 4..], &[0x00, 0x00, 0x00, 0x00]); // locktime = 0
+    }
+
+    /// #592: a solo node has no mesh, cannot reach `min_voters_for_bft`, and so approves its own
+    /// payout proposal locally instead of submitting it to BFT.
+    ///
+    /// This pins the property that made deleting `build_coinbase_solo_mode` safe: the ordinary
+    /// proposal-driven coinbase path serves a solo proposal with no solo-specific branch, and
+    /// produces the M-28 coinbase commitment. The deleted builder returned `None` for that
+    /// commitment — which is exactly why `submitblock` refused solo blocks.
+    #[test]
+    fn solo_proposal_builds_a_coinbase_through_the_shared_path() {
+        use ghost_common::types::PayoutEntry;
+
+        const SOLO_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        let processor = TemplateProcessor::new(
+            TemplateConfig {
+                pool_payout_address: SOLO_ADDR.to_string(),
+                mining_mode: MiningMode::PrivateSolo,
+                solo_payout_address: Some(SOLO_ADDR.to_string()),
+                ..Default::default()
+            },
+            rpc,
+            PolicyProfile::permissive(),
+            ReaperConfig::default(),
+        );
+
+        // Shaped exactly as `create_solo_proposal` builds one: a single Mining entry to the solo
+        // address, plus the 1% split into treasury and node pool.
+        let subsidy: u64 = 312_500_000;
+        let fees: u64 = 1_500_000;
+        let pool_fee = (subsidy + fees) / 100;
+        let solo_amount = (subsidy + fees) - pool_fee;
+        let treasury_amount = pool_fee / 2;
+        let node_amount = pool_fee - treasury_amount;
+
+        let proposal_hash = [0x5Au8; 32];
+        let proposal = PayoutProposal {
+            proposal_hash,
+            round_id: 1,
+            block_hash: [0xAB; 32],
+            block_height: 800_000,
+            proposer: [0x11; 32],
+            miner_payouts: vec![PayoutEntry {
+                address: SOLO_ADDR.as_bytes().to_vec(),
+                amount: solo_amount,
+                recipient_id: [0x22; 32],
+                payout_type: PayoutType::Mining,
+            }],
+            node_payouts: vec![PayoutEntry {
+                address: SOLO_ADDR.as_bytes().to_vec(),
+                amount: node_amount,
+                recipient_id: [0x33; 32],
+                payout_type: PayoutType::NodeReward,
+            }],
+            treasury_amount,
+            treasury_address: SOLO_ADDR.as_bytes().to_vec(),
+            tx_fees: fees,
+            subsidy,
+            timestamp: 0,
+            tx_fees_unallocated: 0,
+        };
+
+        // The solo path stores then approves locally — no vote handler involved.
+        processor.store_proposal(proposal);
+        processor.set_approved_payout(proposal_hash);
+
+        let (_c1, _c2, _witness, _outputs, outputs_count, commitment) = processor
+            .build_coinbase_parts_with_payout_snapshot(
+                800_000,
+                subsidy + fees,
+                &None,
+                Some(proposal_hash),
+            )
+            .expect("solo proposal must build a coinbase through the shared path");
+
+        assert!(
+            commitment.is_some(),
+            "solo must produce the M-28 coinbase commitment that submitblock requires — \
+             the deleted solo builder returned None here"
+        );
+        assert!(
+            outputs_count >= 2,
+            "expected at least the solo miner and treasury outputs, got {outputs_count}"
+        );
     }
 
     /// SEC-BLOCK-TEST-1: Test that header validation correctly rejects short headers

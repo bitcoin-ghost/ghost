@@ -687,10 +687,10 @@ pub struct BlockFoundData {
 
 /// Data for solo mining mode block found event
 ///
-/// In solo mode:
-/// - 99% of subsidy + ALL TX fees → solo_payout_address
-/// - 1% pool fee split between treasury and node pool per decay schedule
-/// - Hosting node participates in node reward pool
+/// Solo shares the single fee model with pool mode (#592); see
+/// [`PayoutProposalCreator::create_solo_proposal`] for how the `COINBASE_FEE_SPLIT_HEIGHT` gate decides
+/// whether the 1% is levied on `subsidy + fees` or on the subsidy alone. The hosting node
+/// participates in the node reward pool in both regimes.
 #[derive(Debug, Clone)]
 pub struct SoloBlockFoundData {
     /// Round ID
@@ -708,7 +708,8 @@ pub struct SoloBlockFoundData {
     pub subsidy_sats: u64,
     /// PO4-M2: Treasury address snapshot taken at round start
     pub treasury_address_snapshot: Option<Vec<u8>>,
-    /// Transaction fees (satoshis) - ALL go to solo miner
+    /// Transaction fees (satoshis). Post-gate these are folded into the reward the 1% is levied
+    /// on and the remainder goes to the solo miner; pre-gate they go to the finder untouched.
     pub tx_fees_sats: u64,
     /// Node share distribution: (node_id, capability_shares)
     /// Hosting node is included in this list
@@ -1153,10 +1154,16 @@ impl PayoutProposalCreator {
 
     /// Create a solo mode payout proposal
     ///
-    /// Solo mode distribution:
-    /// - Solo miner: 99% of subsidy + ALL TX fees → solo_payout_address
-    /// - 1% pool fee → split between treasury and node pool per decay schedule
-    /// - Hosting node is included in node reward pool calculation
+    /// Solo uses the SAME fee model as pool mode (#592) — there is no solo-only regime. The split
+    /// follows the `COINBASE_FEE_SPLIT_HEIGHT` gate:
+    ///
+    /// - at/above the gate: 1% pool fee levied on `subsidy + fees`, solo miner keeps the other 99%
+    ///   of `subsidy + fees` → `solo_payout_address`
+    /// - below the gate (legacy): 1% levied on the subsidy alone, TX fees whole to the solo miner
+    ///
+    /// In both regimes the 1% is split treasury/node pool by the decay schedule, and the hosting
+    /// node is included in the node reward pool calculation. In solo the operator's own node *is*
+    /// the node pool, so that share returns to them — no special-casing is needed for it.
     pub fn create_solo_proposal(&self, data: SoloBlockFoundData) -> GhostResult<PayoutProposal> {
         // B-4/CFG-4/CFG-5: Validate block data (matching pool mode checks)
         self.validate_block_data(
@@ -1168,19 +1175,29 @@ impl PayoutProposalCreator {
 
         let now = chrono::Utc::now().timestamp() as u64;
 
-        // Calculate fee distribution using treasury decay schedule
-        // Note: In solo mode, TX fees are NOT included in pool fee calculation
-        // TX fees go 100% to solo miner, pool fee is only from subsidy
+        // #592: one fee model across all modes. This path used to pin the legacy regime — 1% levied
+        // on the subsidy alone, TX fees whole to the solo miner — by passing `0` fees to
+        // `FeeDistribution::calculate`. Above `COINBASE_FEE_SPLIT_HEIGHT` that disagrees with what
+        // every validator recomputes in `validate_proposal_split`, so a solo proposal was rejected
+        // even by a private mesh of the operator's own nodes. Derive the regime from the height
+        // exactly as the pool path does, so there is one split rule and no solo-only economics.
         // M-5 SECURITY: Use block_timestamp for deterministic decay calculation
-        let fee_dist = FeeDistribution::calculate(
+        let fee_split = data.block_height >= crate::coinbase_fee_split_height();
+        let fee_dist = FeeDistribution::calculate_at_height(
             data.subsidy_sats,
-            0, // TX fees not subject to pool fee in solo mode
+            data.tx_fees_sats,
             &data.treasury_state,
             data.block_timestamp,
+            fee_split,
         );
 
-        // Solo miner gets 99% of subsidy + ALL tx fees
-        let solo_miner_amount = fee_dist.miner_pool.saturating_add(data.tx_fees_sats);
+        // Post-gate the fees are already inside `miner_pool` (the 1% was levied on subsidy + fees)
+        // and `tx_fees_to_block_finder` is 0; pre-gate they sit outside it and go whole to the
+        // finder. Adding the field is therefore correct in both regimes without branching on the
+        // gate a second time.
+        let solo_miner_amount = fee_dist
+            .miner_pool
+            .saturating_add(fee_dist.tx_fees_to_block_finder);
 
         // H-01: Validate solo payout address before building payout entry
         self.validate_payout_address(data.solo_payout_address.as_bytes(), "solo miner")?;
@@ -2253,37 +2270,35 @@ impl PayoutHandler {
         let proposal_hash = compute_proposal_hash(&proposal);
         proposal.proposal_hash = proposal_hash;
 
-        // Store proposal in template processor BEFORE submitting to consensus
+        // The proposal must be in the cache before it can be approved: `set_approved_payout`
+        // refuses a hash whose data it cannot find (MED-POOL-6).
         self.template_processor.store_proposal(proposal.clone());
 
-        // Submit to vote handler for BFT consensus
+        // #592: solo approves its own proposal instead of submitting it to BFT.
+        //
+        // A solo node has no mesh. The BFT pipeline requires `min_voters_for_bft`, which clamps to
+        // 4..=7, so a standalone node's proposal failed with `InsufficientVoters` every time — no
+        // coinbase commitment was ever approved, and `submitblock` then refused the block. Solo
+        // could not mine at all.
+        //
+        // There is nothing for consensus to protect here: solo contributes no shares to the public
+        // ledger and its coinbase pays only its own operator, so there is no other party whose
+        // funds a vote would be safeguarding. The proposal is built by the same
+        // `create_solo_proposal` under the same fee model as pool mode, and the coinbase is built
+        // from it by the same `build_coinbase_parts_with_payout_snapshot` — one construction path,
+        // no solo-specific economics.
+        //
+        // `set_approved_payout` also sets the M-28 coinbase commitment, which is what unblocks
+        // `submitblock`.
         info!(
             round_id = proposal.round_id,
             solo_payout = proposal.miner_payouts[0].amount,
             nodes = proposal.node_payouts.len(),
-            "Submitting solo mode payout proposal to consensus"
-        );
-
-        let returned_hash = self.vote_handler.handle_proposal(proposal)?;
-
-        // SECURITY: Verify hash matches - this catches implementation bugs where
-        // the vote handler modifies the proposal or computes the hash differently
-        if proposal_hash != returned_hash {
-            tracing::error!(
-                expected = %hex::encode(&proposal_hash[..8]),
-                actual = %hex::encode(&returned_hash[..8]),
-                "CRITICAL: Solo proposal hash mismatch between local computation and vote handler"
-            );
-            return Err(ghost_common::error::GhostError::HashMismatch {
-                expected: hex::encode(proposal_hash),
-                actual: hex::encode(returned_hash),
-            });
-        }
-
-        info!(
             hash = %hex::encode(&proposal_hash[..8]),
-            "Solo mode payout proposal submitted for voting"
+            "Solo mode: approving own payout proposal (no BFT — solo has no mesh)"
         );
+
+        self.template_processor.set_approved_payout(proposal_hash);
 
         Ok(proposal_hash)
     }
@@ -4011,6 +4026,94 @@ mod tests {
             fee_dist.miner_pool as f64 / subsidy_sats as f64,
             0.99,
             "Miner should receive exactly 99% of subsidy"
+        );
+    }
+
+    /// Build solo block data at a chosen height. Everything except the height is fixed so the two
+    /// regimes below differ in exactly one input.
+    fn solo_data_at_height(block_height: u64) -> SoloBlockFoundData {
+        SoloBlockFoundData {
+            round_id: 7,
+            block_hash: [0xAB; 32],
+            block_height,
+            block_timestamp: chrono::Utc::now(),
+            // `ghost02_creator` is on Regtest, so the address must be too — `validate_payout_address`
+            // rejects a network mismatch before any fee arithmetic runs.
+            solo_payout_address: "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            subsidy_sats: 312_500_000,
+            treasury_address_snapshot: Some({
+                let mut addr = vec![0x51, 0x20];
+                addr.extend_from_slice(&[0xAA; 32]);
+                addr
+            }),
+            tx_fees_sats: 1_500_000,
+            node_shares: vec![([1u8; 32], 10)],
+            treasury_state: TreasuryState::new(),
+        }
+    }
+
+    /// #592: solo must use the SAME fee model as pool mode. This calls `create_solo_proposal` —
+    /// the two older `test_solo_mode_*` tests call `FeeDistribution::calculate` directly and then
+    /// recompute the solo sum in the test body, so they pass whatever the solo path does.
+    ///
+    /// Above the gate the 1% is levied on `subsidy + fees`. The previous implementation levied it
+    /// on the subsidy alone and added the fees whole, paying the solo miner 1% of the fees more
+    /// than every validator recomputes in `validate_proposal_split` — so this asserts the exact
+    /// figure rather than a bound.
+    #[test]
+    fn solo_uses_the_pool_fee_model_above_the_gate() {
+        let creator = ghost02_creator();
+        let data = solo_data_at_height(crate::coinbase_fee_split_height());
+
+        let subsidy = data.subsidy_sats;
+        let fees = data.tx_fees_sats;
+        let proposal = creator
+            .create_solo_proposal(data)
+            .expect("solo proposal at/above the gate");
+
+        // 1% of (312_500_000 + 1_500_000) = 3_140_000, so the miner keeps 310_860_000.
+        let total_reward = subsidy + fees;
+        let pool_fee = total_reward / 100;
+        assert_eq!(
+            proposal.miner_payouts[0].amount,
+            total_reward - pool_fee,
+            "solo miner must keep 99% of subsidy + fees above the gate"
+        );
+
+        // The pre-#592 figure, which must no longer be produced.
+        assert_ne!(
+            proposal.miner_payouts[0].amount,
+            (subsidy - subsidy / 100) + fees,
+            "solo must not levy the 1% on the subsidy alone above the gate"
+        );
+
+        // No satoshi may be created or lost across the whole coinbase.
+        let paid: u64 = proposal.miner_payouts.iter().map(|p| p.amount).sum::<u64>()
+            + proposal.node_payouts.iter().map(|p| p.amount).sum::<u64>()
+            + proposal.treasury_amount;
+        assert_eq!(
+            paid, total_reward,
+            "solo payouts must sum to subsidy + fees"
+        );
+    }
+
+    /// Below the gate the legacy regime is untouched: 1% on the subsidy alone, fees whole to the
+    /// finder. A mixed-version fleet must not split on coinbase construction.
+    #[test]
+    fn solo_keeps_the_legacy_model_below_the_gate() {
+        let creator = ghost02_creator();
+        let data = solo_data_at_height(crate::coinbase_fee_split_height() - 1);
+
+        let subsidy = data.subsidy_sats;
+        let fees = data.tx_fees_sats;
+        let proposal = creator
+            .create_solo_proposal(data)
+            .expect("solo proposal below the gate");
+
+        assert_eq!(
+            proposal.miner_payouts[0].amount,
+            (subsidy - subsidy / 100) + fees,
+            "below the gate the 1% is levied on the subsidy alone"
         );
     }
 
