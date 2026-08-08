@@ -507,8 +507,30 @@ i.e. before 2026-08-31** — target genesis by ~2026-08-20.
       Golden vector pinned in `batch_genesis.rs` against the real 960,550 bytes:
       `state_root(seq 0, cutoff_ts 1785580254)` =
       `e0c6ee483e18fa65d5a6b17b626515a38415863969441feba8d58e6a943fa9e4`
-- [ ] OPERATOR: confirm 960,550 (or a later height) as the genesis anchor — the preview says any
-      recent finalised height works, so this is a timing choice, not a technical one
+- [x] **OPERATOR: genesis anchor is height 961,642** (decided 2026-08-09). Chosen over the 960,550
+      preview because both are fleet-unanimous but 961,642 is ~1,100 blocks fresher, and every
+      block between the anchor and the shadow run is work that has to reach the chain some other
+      way — anchoring at 960,550 would have made that gap eight days wide.
+
+      Verified read-only across all 8 on 2026-08-09:
+
+      | | |
+      |---|---|
+      | `ledger_root` at 961,642 | `0FE9BAC3…FEC0CAA9` — **one distinct value fleet-wide** |
+      | `canonical_payout` | 1,316 bytes, identical on all 8 |
+      | payees / node entries | 5 miner addresses, 8 nodes |
+      | ratified work | 57,490,961,343,949,865,451,520 checkpoint units |
+      | truncation loss, whole fleet | 2,451,520 units = **2.45 micro-work** |
+
+      Golden vector pinned in `batch_genesis.rs`:
+      `state_root(seq 0, cutoff_ts 1786228093)` =
+      `cb5ac8470686192246bfc1330791e85023f2044b58f0b076b167ff89923ddc7f`
+
+      ⚠ Note the truncation figure. The 960,550 test asserts the fleet loses under ONE micro-work,
+      which held for that data by luck rather than by rule — six remainders that happened to be
+      small. The invariant is per-address: each payee truncates by at most one micro-work, so the
+      total is bounded by the payee count. 961,642 discards 2.45 micro-work across five payees and
+      is equally correct. Do not read the 960,550 number as a threshold.
 - [ ] the ceremony itself: pick it, sign it, adopt it fleet-wide
 
 ### WP-5 — shadow run + trust gate

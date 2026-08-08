@@ -326,6 +326,108 @@ mod tests {
         );
     }
 
+    /// The adopted per-address totals at height **961,642** — the CHOSEN genesis anchor.
+    ///
+    /// Operator selected 961,642 on 2026-08-09 in preference to the 960,550 candidate previewed on
+    /// 08-01. Both are fleet-unanimous; 961,642 is ~1,100 blocks fresher, and every block between
+    /// an anchor and the shadow run is work that has to reach the chain some other way. Picking the
+    /// stale one would have made the gap eight days wide.
+    ///
+    /// Verified read-only across all 8 nodes on 2026-08-09:
+    ///   - `ledger_root` at 961,642 = `0FE9BAC3023F624B99B087A9C7E6C4C8B5CD557225F0EA9EF9828608FEC0CAA9`
+    ///     — ONE distinct value across the fleet
+    ///   - `canonical_payout` 1,316 bytes, identical on all 8
+    ///   - 5 miner payees, 8 node entries
+    fn ratified_961642() -> Vec<(String, u128)> {
+        vec![
+            (
+                "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
+                52_157_533_139_126_865_362_944,
+            ),
+            (
+                "bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".to_string(),
+                2_503_874_639_417_892_143_104,
+            ),
+            (
+                "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".to_string(),
+                2_341_458_453_435_845_967_872,
+            ),
+            (
+                "148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN".to_string(),
+                478_353_203_210_592_976_896,
+            ),
+            (
+                "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h".to_string(),
+                9_741_908_758_669_000_704,
+            ),
+        ]
+    }
+
+    /// The chosen anchor converts without losing a payee or a meaningful amount of work.
+    #[test]
+    fn the_chosen_961642_anchor_converts_cleanly() {
+        let (balances, rounding) = genesis_balances(&ratified_961642());
+
+        assert_eq!(balances.len(), 5, "every payee must survive the conversion");
+        assert_eq!(
+            rounding.addresses_dropped, 0,
+            "no payee may be rounded out of existence"
+        );
+        // The real invariant is per-address, not fleet-wide: each payee truncates by at most one
+        // micro-work, so the total is bounded by the payee count. The 960,550 test asserts a
+        // fleet total under ONE micro-work, which held for that data by luck (six remainders that
+        // happened to be small) and is not a law — 961,642 discards 2,451,520 units, ~2.45
+        // micro-work across five payees, and is equally correct.
+        //
+        // 2.45 micro-work is 0.00000245 of a share. Immaterial in absolute terms; what matters is
+        // that it truncates DOWN, so no address is ever credited work nobody proved.
+        assert!(
+            rounding.units_discarded
+                < (ratified_961642().len() as u128) * CHECKPOINT_UNITS_PER_MICRO,
+            "each payee may lose under one micro-work, so the total is bounded by the payee \
+             count; lost {}",
+            rounding.units_discarded
+        );
+
+        // Conservation: the opening balances must account for the ratified total, less only the
+        // truncation remainder. A conversion that quietly loses balance is how an unexplained
+        // drift begins, and at genesis there is nothing to reconcile it against afterwards.
+        let opened: i128 = balances.values().map(|v| *v as i128).sum();
+        let ratified: u128 = ratified_961642().iter().map(|(_, w)| *w).sum();
+        let expected = (ratified - rounding.units_discarded) / CHECKPOINT_UNITS_PER_MICRO;
+        assert_eq!(
+            opened as u128, expected,
+            "opening balances must equal the ratified total minus truncation"
+        );
+    }
+
+    /// Golden vector for the CHOSEN genesis anchor.
+    ///
+    /// Pins `(seq 0, cutoff_ts 1786228093)` against the adopted bytes at 961,642. A change here
+    /// means the conversion or the state-root encoding moved, and either would silently give eight
+    /// nodes eight different opening balances — which cannot be detected after the fact, because
+    /// each node would be internally consistent.
+    #[test]
+    fn genesis_root_for_the_961642_anchor_is_pinned() {
+        const CUTOFF_TS: i64 = 1_786_228_093;
+        let (batch, _, _) = genesis_batch(
+            [0u8; 32], // the checkpoint hash is supplied at ceremony time
+            CUTOFF_TS,
+            [0u8; 32],
+            &ratified_961642(),
+            vec![],
+        );
+        let root: String = batch
+            .state_root
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            root,
+            "cb5ac8470686192246bfc1330791e85023f2044b58f0b076b167ff89923ddc7f"
+        );
+    }
+
     /// An empty checkpoint is a cold start, not a panic.
     #[test]
     fn an_empty_checkpoint_yields_an_empty_genesis() {
