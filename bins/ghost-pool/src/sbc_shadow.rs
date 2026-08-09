@@ -25,8 +25,12 @@ use parking_lot::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use ghost_common::batch_consensus::{ProposerSchedule, SeqTally, SeqVoteLock};
-use ghost_common::batch_driver::{on_batch, on_vote, Action, BatchContext, VoteAction};
+use ghost_common::batch_driver::{
+    on_batch, on_batch_phase, on_precommit, on_prevote, on_vote, Action, BatchContext, PhaseAction,
+    PrecommitAction, PrevoteAction, VoteAction,
+};
 use ghost_common::batch_quarantine::Quarantine;
+use ghost_common::batch_two_phase::SeqConsensus;
 use ghost_common::error::GhostResult;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::share_batch::{compute_state_root, fold_shares, pack_batch, ShareBatch};
@@ -73,6 +77,18 @@ pub struct ShadowChain {
     /// Votes seen per sequence. Counted per SEQUENCE rather than per batch, because equivocation
     /// is only visible when the candidates are tallied together.
     tallies: Mutex<BTreeMap<u64, SeqTally>>,
+    /// Two-phase consensus state, one per open sequence.
+    ///
+    /// Replaces `vote_lock` + `tallies` on the live path. Those two are retained only until the
+    /// single-phase code is deleted: one vote per sequence is safe but cannot recover from a round
+    /// that misses quorum, which wedged seq=1 permanently on the 2026-08-09 six-node run.
+    ///
+    /// Not persisted, deliberately. A lock is a promise about what this node has *seen*, and a
+    /// restarted node has seen nothing — replaying a lock from disk would have it refuse to
+    /// prevote a value the fleet has since agreed, with no evidence to justify the refusal. The
+    /// cost of forgetting is that a restarted node participates from scratch; the cost of
+    /// remembering wrongly is a node that cannot rejoin consensus.
+    consensus: Mutex<BTreeMap<u64, SeqConsensus>>,
 }
 
 /// What a finalisation produced, for the trust gate and for logs.
@@ -117,6 +133,7 @@ impl ShadowChain {
             restored_quarantine: RwLock::new(restored),
             vote_lock: Mutex::new(SeqVoteLock::new()),
             tallies: Mutex::new(BTreeMap::new()),
+            consensus: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -248,6 +265,48 @@ impl ShadowChain {
         self.build_batch(now, budget_bytes)
     }
 
+    /// The parent BATCH this node would judge `batch_seq` against.
+    ///
+    /// Shared by the single-phase and two-phase paths deliberately. Two copies of this resolution
+    /// is how the mesh and HTTP hashrate providers came to swallow the same error twice on
+    /// 2026-08-09, reporting a confident zero from a node doing 94 TH/s.
+    ///
+    /// A head held only as a summary is not enough — the driver judges against the batch itself.
+    /// Every failure here is a DEFER, never a fault: not holding the parent is a sync condition,
+    /// and branding a peer for our own gap is the one mistake a terminal fault cannot take back.
+    fn parent_for(
+        &self,
+        batch_seq: u64,
+    ) -> Result<ShareBatch, ghost_common::batch_consensus::DeferReason> {
+        use ghost_common::batch_consensus::DeferReason;
+
+        let Some(head) = self.head() else {
+            // No genesis yet: we cannot judge anything and must catch up first.
+            return Err(DeferReason::AheadOfUs {
+                batch_seq,
+                our_seq: 0,
+            });
+        };
+        // Outside the retention window means we are too far behind to judge, not that the peer is
+        // wrong.
+        let Ok(Some(parent_json)) = self.db.sbc_get_batch(head.seq) else {
+            return Err(DeferReason::AheadOfUs {
+                batch_seq,
+                our_seq: head.seq,
+            });
+        };
+        serde_json::from_str::<ShareBatch>(&parent_json).map_err(|_| {
+            warn!(
+                seq = head.seq,
+                "SBC shadow: stored parent will not deserialise — holding rather than judging"
+            );
+            DeferReason::AheadOfUs {
+                batch_seq,
+                our_seq: head.seq,
+            }
+        })
+    }
+
     /// Judge an incoming batch and record what follows.
     ///
     /// The decision is entirely `batch_driver::on_batch`'s — this supplies the context and applies
@@ -267,38 +326,9 @@ impl ShadowChain {
             return Action::ProposerQuarantined;
         }
 
-        let Some(parent_head) = self.head() else {
-            // No genesis yet: we cannot judge anything and must catch up first.
-            return Action::Hold {
-                reason: ghost_common::batch_consensus::DeferReason::AheadOfUs {
-                    batch_seq: batch.seq,
-                    our_seq: 0,
-                },
-            };
-        };
-
-        // The driver judges against the parent BATCH, so a head we hold only as a summary is not
-        // enough — fetch what we adopted. If it is outside the retention window we are too far
-        // behind to judge and must sync, which is a defer, not a fault.
-        let Ok(Some(parent_json)) = self.db.sbc_get_batch(parent_head.seq) else {
-            return Action::Hold {
-                reason: ghost_common::batch_consensus::DeferReason::AheadOfUs {
-                    batch_seq: batch.seq,
-                    our_seq: parent_head.seq,
-                },
-            };
-        };
-        let Ok(parent) = serde_json::from_str::<ShareBatch>(&parent_json) else {
-            warn!(
-                seq = parent_head.seq,
-                "SBC shadow: stored parent will not deserialise — holding rather than judging"
-            );
-            return Action::Hold {
-                reason: ghost_common::batch_consensus::DeferReason::AheadOfUs {
-                    batch_seq: batch.seq,
-                    our_seq: parent_head.seq,
-                },
-            };
+        let parent = match self.parent_for(batch.seq) {
+            Ok(p) => p,
+            Err(reason) => return Action::Hold { reason },
         };
 
         let balances = self.balances();
@@ -329,6 +359,118 @@ impl ShadowChain {
         }
 
         action
+    }
+
+    /// Judge an incoming batch under TWO-PHASE and say what to prevote.
+    ///
+    /// The returned hash is what the locking rule chose, which may not be the batch that arrived.
+    pub fn on_proposal_phase<C: ghost_common::batch_consensus::BatchChecks>(
+        &self,
+        batch: &ShareBatch,
+        schedule: &ProposerSchedule,
+        checks: &C,
+        now: i64,
+    ) -> PhaseAction {
+        if self.restored_quarantine.read().contains(&batch.proposer) {
+            return PhaseAction::ProposerQuarantined;
+        }
+
+        let parent = match self.parent_for(batch.seq) {
+            Ok(p) => p,
+            Err(reason) => return PhaseAction::Hold { reason },
+        };
+
+        let balances = self.balances();
+        let ctx = BatchContext {
+            parent: &parent,
+            parent_balances: &balances,
+            schedule,
+            checks,
+            now,
+        };
+
+        let action = {
+            let mut quarantine = self.quarantine.lock();
+            let mut consensus = self.consensus.lock();
+            let entry = consensus
+                .entry(batch.seq)
+                .or_insert_with(|| SeqConsensus::new(batch.seq, schedule.quorum()));
+            on_batch_phase(batch, &ctx, &mut quarantine, entry)
+        };
+
+        if let PhaseAction::Quarantine { reason, .. } = &action {
+            let reason = format!("{reason:?}");
+            if let Err(e) = self
+                .db
+                .sbc_quarantine(batch.proposer, &reason, Some(batch.seq), now)
+            {
+                warn!(error = %e, "SBC shadow: could not persist quarantine");
+            }
+            self.restored_quarantine.write().insert(batch.proposer);
+        }
+
+        action
+    }
+
+    /// Record a peer's PREVOTE. A quorum of them is a polka.
+    pub fn on_batch_prevote(
+        &self,
+        voter: [u8; 32],
+        round: u32,
+        batch_hash: [u8; 32],
+        seq: u64,
+        schedule: &ProposerSchedule,
+        now: i64,
+    ) -> PrevoteAction {
+        let mut consensus = self.consensus.lock();
+        let entry = consensus
+            .entry(seq)
+            .or_insert_with(|| SeqConsensus::new(seq, schedule.quorum()));
+        let mut quarantine = self.quarantine.lock();
+        on_prevote(
+            voter,
+            round,
+            batch_hash,
+            entry,
+            &mut quarantine,
+            schedule,
+            now,
+        )
+    }
+
+    /// Record a peer's PRECOMMIT. A quorum of them commits the sequence.
+    pub fn on_batch_precommit(
+        &self,
+        voter: [u8; 32],
+        round: u32,
+        batch_hash: [u8; 32],
+        seq: u64,
+        schedule: &ProposerSchedule,
+        now: i64,
+    ) -> PrecommitAction {
+        let mut consensus = self.consensus.lock();
+        let entry = consensus
+            .entry(seq)
+            .or_insert_with(|| SeqConsensus::new(seq, schedule.quorum()));
+        let mut quarantine = self.quarantine.lock();
+        on_precommit(
+            voter,
+            round,
+            batch_hash,
+            entry,
+            &mut quarantine,
+            schedule,
+            now,
+        )
+    }
+
+    /// Forget two-phase state below a finalised sequence.
+    ///
+    /// Bounded memory matters, but the bound must sit BELOW what is final: dropping the state for
+    /// a sequence still in flight would let this node prevote twice in one round, which is the one
+    /// thing the per-round tally exists to prevent.
+    pub fn prune_consensus_below(&self, seq: u64) {
+        self.consensus.lock().retain(|k, _| *k >= seq);
     }
 
     /// Record a vote and report whether it carried the sequence.
@@ -862,6 +1004,48 @@ mod tests {
             Action::ProposerQuarantined,
             "a peer excluded before the restart must not be judged again"
         );
+    }
+
+    /// Both paths resolve the parent identically, because they share one implementation.
+    ///
+    /// Written after two copies of the local-hashrate query drifted apart on 2026-08-09 — the mesh
+    /// and HTTP providers each swallowed the same error, and a node doing 94 TH/s reported a
+    /// confident zero. One resolution, exercised from both entry points.
+    #[test]
+    fn single_phase_and_two_phase_hold_on_the_same_missing_parent() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        // No genesis installed: neither path can judge anything.
+        let chain = ShadowChain::load(id.clone(), db).expect("load");
+
+        let batch = ShareBatch {
+            seq: 1,
+            prev_batch_hash: [0u8; 32],
+            close_ts: 600,
+            proposer: id.node_id(),
+            shares: Vec::new(),
+            settled_blocks: Vec::new(),
+            node_shares: Vec::new(),
+            state_root: [0u8; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: Vec::new(),
+        };
+        let schedule = ProposerSchedule::new([id.node_id()]);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+
+        let single = chain.on_proposal(&batch, &schedule, &checks, 600);
+        let two = chain.on_proposal_phase(&batch, &schedule, &checks, 600);
+
+        match (single, two) {
+            (Action::Hold { reason: a }, PhaseAction::Hold { reason: b }) => assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "the two paths must not disagree about why they cannot judge"
+            ),
+            (a, b) => panic!("both must hold without a parent; got {a:?} and {b:?}"),
+        }
     }
 
     /// An operator release readmits a peer to judgement on the next start.
