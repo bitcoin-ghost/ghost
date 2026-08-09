@@ -697,6 +697,22 @@ struct Args {
     /// With --ledger-import: report what WOULD change and write nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// List every node this one has quarantined from the share-batch chain, and exit.
+    #[arg(long)]
+    sbc_quarantined: bool,
+
+    /// Release a node from share-batch-chain quarantine, and exit.
+    ///
+    /// Quarantine is a TERMINAL fault — a peer that proposed a structurally invalid batch is
+    /// excluded from consensus and, by design, never readmits itself. That design is only
+    /// coherent if an operator can actually let it back in, and until this flag existed the
+    /// release function had no caller anywhere: quarantine was a one-way door and the only
+    /// recovery was hand-editing an encrypted database.
+    ///
+    /// Takes the 32-byte node id as hex. `--sbc-quarantined` prints the ids to pass here.
+    #[arg(long, value_name = "NODE_ID_HEX")]
+    sbc_release: Option<String>,
 }
 
 /// Handle `--status`: report what THIS node can establish about itself (B4).
@@ -2478,6 +2494,49 @@ async fn main() -> Result<()> {
     // nodes holding fabricated ones — each node's set is a subset of the truth. It is trusted
     // rather than verified, and it is only defensible because every node in the mesh belongs to
     // the same operator. New shares (v41 onward) carry their proof and converge verifiably.
+    // SHARE-BATCH-CHAIN QUARANTINE (runs after DB encryption is configured, and exits).
+    //
+    // Quarantine is deliberately terminal and deliberately persistent: a peer that proposed a
+    // structurally invalid batch stays out of consensus across restarts until an operator looks
+    // at it. Both halves of that contract need an operator-facing command — without one, the
+    // "operator releases it" half is a comment rather than a behaviour.
+    if args.sbc_quarantined {
+        let quarantined = db.sbc_quarantined()?;
+        if quarantined.is_empty() {
+            println!("No nodes are quarantined from the share-batch chain.");
+        } else {
+            println!(
+                "{} node(s) quarantined from the share-batch chain:",
+                quarantined.len()
+            );
+            for (node_id, reason) in &quarantined {
+                println!("  {}  {}", hex::encode(node_id), reason);
+            }
+            println!("\nRelease one with: ghost-pool --sbc-release <NODE_ID_HEX>");
+        }
+        return Ok(());
+    }
+
+    if let Some(node_hex) = &args.sbc_release {
+        let raw = hex::decode(node_hex.trim())
+            .map_err(|e| anyhow::anyhow!("node id must be hex: {e}"))?;
+        let node_id: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!("node id must be 32 bytes (64 hex chars), got {}", raw.len())
+        })?;
+        if db.sbc_release(node_id)? {
+            println!(
+                "Released {} from share-batch-chain quarantine.",
+                hex::encode(node_id)
+            );
+        } else {
+            println!(
+                "{} was not quarantined; nothing to do.",
+                hex::encode(node_id)
+            );
+        }
+        return Ok(());
+    }
+
     if let Some(path) = &args.ledger_export {
         // STREAMING export. The previous version called `export_unpaid_shares()` (which
         // materialises the ledger twice) and then `serde_json::to_vec` (a third copy, as one

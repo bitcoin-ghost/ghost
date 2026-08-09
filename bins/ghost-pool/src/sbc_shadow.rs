@@ -859,6 +859,53 @@ mod tests {
         );
     }
 
+    /// An operator release readmits a peer to judgement on the next start.
+    ///
+    /// This is the other half of `quarantine_survives_a_restart`, and it is the half that had no
+    /// caller: `sbc_release` existed but nothing outside its own unit test ever invoked it, so a
+    /// quarantined node could never come back. The pair pins both directions — a restart alone
+    /// must NOT readmit, a release must.
+    #[test]
+    fn an_operator_release_readmits_a_peer_on_the_next_start() {
+        let id = Arc::new(NodeIdentity::generate());
+        let bad = NodeIdentity::generate();
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        db.sbc_quarantine(bad.node_id(), "wrong state root", Some(3), 0)
+            .expect("quarantine");
+
+        // The operator releases it, then the node restarts.
+        assert!(
+            db.sbc_release(bad.node_id()).expect("release"),
+            "release must report a change"
+        );
+
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        genesis(&chain, BTreeMap::new());
+
+        let batch = ShareBatch {
+            seq: 1,
+            prev_batch_hash: [0u8; 32],
+            close_ts: 600,
+            proposer: bad.node_id(),
+            shares: Vec::new(),
+            settled_blocks: Vec::new(),
+            node_shares: Vec::new(),
+            state_root: [0u8; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: Vec::new(),
+        };
+        let schedule = ProposerSchedule::new([id.node_id(), bad.node_id()]);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+
+        assert_ne!(
+            chain.on_proposal(&batch, &schedule, &checks, 600),
+            Action::ProposerQuarantined,
+            "a released peer must be judged on merit again, not rejected on sight"
+        );
+    }
+
     /// Judging must never happen against a parent we do not hold — that is a sync condition, not a
     /// disagreement, and faulting it would have honest nodes quarantining each other.
     #[test]
