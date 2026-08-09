@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use ghost_common::batch_consensus::ProposerSchedule;
-use ghost_common::batch_driver::{Action, VoteAction};
+use ghost_common::batch_driver::{PhaseAction, PrecommitAction, PrevoteAction};
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::share_batch::ShareBatch;
@@ -73,30 +73,31 @@ impl ShareBatchHandler {
 
         let schedule = self.schedule();
         let checks = (self.checks)();
-        let action = self.chain.on_proposal(&batch, &schedule, &checks, now);
+        // TWO-PHASE is the live path. The single-phase driver is still compiled and tested, but
+        // nothing routes to it any more: one vote per sequence cannot recover from a round that
+        // misses quorum, and that wedged seq=1 permanently on the 2026-08-09 six-node run.
+        let action = self
+            .chain
+            .on_proposal_phase(&batch, &schedule, &checks, now);
 
         match action {
-            Action::Vote { batch_hash, seq } => {
-                // Signed via the message's OWN helper, not a hand-rolled copy. This built the
-                // bytes inline and produced a DIFFERENT string to `signing_bytes` — no domain
-                // tag — which nothing noticed because nothing verified votes at all.
-                let mut vote = ShareBatchVoteMessage {
+            PhaseAction::Prevote {
+                batch_hash,
+                seq,
+                round,
+            } => {
+                // `batch_hash` is what the LOCKING RULE chose, which is not necessarily the batch
+                // that just arrived — a locked node prevotes its lock. Broadcasting the arriving
+                // hash here instead would defeat the lock entirely.
+                self.broadcast_phase_vote(
                     seq,
+                    round,
                     batch_hash,
-                    voter: self.identity.node_id(),
-                    signature: [0u8; 64],
-                };
-                vote.signature = self.identity.sign(&vote.signing_bytes());
-                let payload = serde_json::to_vec(&vote)
-                    .map_err(|e| GhostError::Serialization(format!("share batch vote: {e}")))?;
-                (self.send)(MessageType::ShareBatchVote, payload)?;
-
-                // Count our own vote. Without this a node never contributes to the quorum it is
-                // waiting on, and a two-node fleet could never finalise anything.
-                self.record_vote(self.identity.node_id(), batch_hash, seq, &batch, now);
-                debug!(seq, "SBC: voted");
+                    ghost_consensus::message::BatchVotePhase::Prevote,
+                )?;
+                debug!(seq, round, "SBC: prevoted");
             }
-            Action::Hold { reason } => {
+            PhaseAction::Hold { reason } => {
                 debug!(seq = batch.seq, ?reason, "SBC: holding");
                 // Being behind is recoverable, and the answer is to ask rather than to wait.
                 if let ghost_common::batch_consensus::DeferReason::AheadOfUs { our_seq, .. } =
@@ -108,7 +109,7 @@ impl ShareBatchHandler {
                     }
                 }
             }
-            Action::Quarantine { reason, outcome } => {
+            PhaseAction::Quarantine { reason, outcome } => {
                 // A terminal fault and a fleet-level quorum loss are different facts and an
                 // operator needs both — the driver reports them separately for that reason.
                 warn!(
@@ -119,10 +120,7 @@ impl ShareBatchHandler {
                     "SBC: quarantined a proposer"
                 );
             }
-            Action::AlreadyVotedElsewhere { .. } => {
-                debug!(seq = batch.seq, "SBC: already voted at this sequence");
-            }
-            Action::ProposerQuarantined => {
+            PhaseAction::ProposerQuarantined => {
                 debug!(
                     proposer = %hex::encode(&batch.proposer[..4]),
                     "SBC: ignoring a quarantined proposer"
@@ -132,43 +130,204 @@ impl ShareBatchHandler {
         Ok(())
     }
 
-    /// Tally a vote, and adopt if it carried.
-    fn record_vote(
-        &self,
-        voter: NodeId,
-        batch_hash: [u8; 32],
-        seq: u64,
-        batch: &ShareBatch,
-        now: i64,
-    ) {
-        let schedule = self.schedule();
-        match self
-            .chain
-            .on_batch_vote(voter, batch_hash, seq, &schedule, now)
-        {
-            VoteAction::Adopt { .. } => {
-                match self.chain.finalise(batch, now) {
-                    Ok(f) => info!(
-                        seq = f.seq,
-                        state_root = %hex::encode(&f.state_root[..8]),
-                        credited = f.credited,
-                        "SBC: adopted"
-                    ),
-                    // Refusing here is the correct outcome, not a failure to handle: the batch
-                    // reached quorum but does not reproduce locally, which is exactly the
-                    // divergence the chain exists to surface rather than absorb.
-                    Err(e) => warn!(seq, error = %e, "SBC: refused to adopt a finalised batch"),
-                }
-                self.chain.note_seq_opened(now);
-            }
-            other => debug!(seq, ?other, "SBC: vote recorded"),
-        }
-    }
-
     /// Answer a sync request from what we adopted, or apply a response.
     ///
     /// Request and response are told apart by trial-deserialise, as the payout-checkpoint sync
     /// does — they share a message type and only the shapes distinguish them.
+    /// Handle a peer's PREVOTE or PRECOMMIT.
+    ///
+    /// One function for both phases because the payload is identical and the handling is
+    /// symmetric; the phase decides which signing domain is checked and which tally is fed. It is
+    /// NOT a place to be clever about sharing further — verifying against the wrong domain would
+    /// let a prevote be counted as a precommit, which is the forgery two-phase exists to stop.
+    fn on_phase_vote(
+        &self,
+        envelope: &MessageEnvelope,
+        phase: ghost_consensus::message::BatchVotePhase,
+        now: i64,
+    ) -> GhostResult<()> {
+        use ghost_consensus::message::{BatchVotePhase, ShareBatchPhaseVoteMessage};
+
+        let vote: ShareBatchPhaseVoteMessage = serde_json::from_slice(&envelope.payload)
+            .map_err(|e| GhostError::Serialization(format!("share batch phase vote: {e}")))?;
+
+        // Verified against THIS phase's domain. A prevote's signature does not verify as a
+        // precommit, so a replayed prevote is dropped here rather than counted as a commitment.
+        if !ghost_common::identity::verify_signature(
+            &vote.voter,
+            &vote.signing_bytes(phase),
+            &vote.signature,
+        )
+        .unwrap_or(false)
+        {
+            debug!(
+                seq = vote.seq,
+                ?phase,
+                "SBC: phase vote signature invalid, dropped"
+            );
+            return Ok(());
+        }
+
+        let schedule = self.schedule();
+        match phase {
+            BatchVotePhase::Prevote => {
+                let action = self.chain.on_batch_prevote(
+                    vote.voter,
+                    vote.round,
+                    vote.batch_hash,
+                    vote.seq,
+                    &schedule,
+                    now,
+                );
+                if let PrevoteAction::LockAndPrecommit { batch_hash, round } = action {
+                    // A polka. We are now locked on this value — precommit it, and ONLY it.
+                    self.broadcast_phase_vote(
+                        vote.seq,
+                        round,
+                        batch_hash,
+                        BatchVotePhase::Precommit,
+                    )?;
+                    info!(
+                        seq = vote.seq,
+                        round, "SBC: polka — locked and precommitted"
+                    );
+                } else {
+                    debug!(seq = vote.seq, round = vote.round, ?action, "SBC: prevote");
+                }
+            }
+            BatchVotePhase::Precommit => {
+                let action = self.chain.on_batch_precommit(
+                    vote.voter,
+                    vote.round,
+                    vote.batch_hash,
+                    vote.seq,
+                    &schedule,
+                    now,
+                );
+                if let PrecommitAction::Commit { batch_hash, votes } = action {
+                    info!(
+                        seq = vote.seq,
+                        round = vote.round,
+                        votes,
+                        batch = %hex::encode(&batch_hash[..8]),
+                        "SBC: COMMITTED"
+                    );
+                    // Adoption needs the batch itself, which a vote does not carry. If we do not
+                    // hold it this is a sync condition, not a failure — the committed hash is
+                    // decided and will not change, so fetching later still adopts the right thing.
+                    self.adopt_committed(vote.seq, batch_hash, now);
+                } else {
+                    debug!(
+                        seq = vote.seq,
+                        round = vote.round,
+                        ?action,
+                        "SBC: precommit"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sign and broadcast a phase vote.
+    fn broadcast_phase_vote(
+        &self,
+        seq: u64,
+        round: u32,
+        batch_hash: [u8; 32],
+        phase: ghost_consensus::message::BatchVotePhase,
+    ) -> GhostResult<()> {
+        use ghost_consensus::message::{BatchVotePhase, ShareBatchPhaseVoteMessage};
+
+        let mut vote = ShareBatchPhaseVoteMessage {
+            seq,
+            round,
+            batch_hash,
+            voter: self.identity.node_id(),
+            signature: [0u8; 64],
+        };
+        vote.signature = self.identity.sign(&vote.signing_bytes(phase));
+        let payload = serde_json::to_vec(&vote)
+            .map_err(|e| GhostError::Serialization(format!("share batch phase vote: {e}")))?;
+        let ty = match phase {
+            BatchVotePhase::Prevote => MessageType::ShareBatchPrevote,
+            BatchVotePhase::Precommit => MessageType::ShareBatchPrecommit,
+        };
+        (self.send)(ty, payload)?;
+
+        // Count our own vote. Without this a node never contributes to the quorum it is waiting
+        // on, and a small fleet could never reach one.
+        let schedule = self.schedule();
+        let now = chrono::Utc::now().timestamp();
+        match phase {
+            BatchVotePhase::Prevote => {
+                let action = self.chain.on_batch_prevote(
+                    self.identity.node_id(),
+                    round,
+                    batch_hash,
+                    seq,
+                    &schedule,
+                    now,
+                );
+                // Our own prevote can itself complete the polka on a small fleet.
+                if let PrevoteAction::LockAndPrecommit { batch_hash, round } = action {
+                    self.broadcast_phase_vote(seq, round, batch_hash, BatchVotePhase::Precommit)?;
+                }
+            }
+            BatchVotePhase::Precommit => {
+                let action = self.chain.on_batch_precommit(
+                    self.identity.node_id(),
+                    round,
+                    batch_hash,
+                    seq,
+                    &schedule,
+                    now,
+                );
+                if let PrecommitAction::Commit { batch_hash, .. } = action {
+                    self.adopt_committed(seq, batch_hash, now);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopt a committed batch if we hold it.
+    ///
+    /// Not holding it is a sync condition and not a failure: the decision is final, so fetching
+    /// the batch later still adopts exactly the value the fleet agreed.
+    fn adopt_committed(&self, seq: u64, batch_hash: [u8; 32], now: i64) {
+        let Ok(Some(json)) = self.chain.batch_at(seq) else {
+            warn!(
+                seq,
+                batch = %hex::encode(&batch_hash[..8]),
+                "SBC: committed a batch we do not hold — sync required before adoption"
+            );
+            return;
+        };
+        let Ok(batch) = serde_json::from_str::<ShareBatch>(&json) else {
+            warn!(seq, "SBC: committed batch will not deserialise");
+            return;
+        };
+        if batch.batch_hash() != batch_hash {
+            warn!(
+                seq,
+                "SBC: stored batch is not the committed one — sync required"
+            );
+            return;
+        }
+        match self.chain.finalise(&batch, now) {
+            Ok(f) => info!(
+                seq = f.seq,
+                state_root = %hex::encode(&f.state_root[..8]),
+                credited = f.credited,
+                "SBC: adopted"
+            ),
+            // The batch reached quorum but does not reproduce locally — exactly the divergence
+            // the chain exists to surface rather than absorb.
+            Err(e) => warn!(seq, error = %e, "SBC: refused to adopt a committed batch"),
+        }
+    }
+
     fn on_sync(&self, envelope: &MessageEnvelope, now: i64) -> GhostResult<()> {
         let msg: ShareBatchSyncMessage = serde_json::from_slice(&envelope.payload)
             .map_err(|e| GhostError::Serialization(format!("share batch sync: {e}")))?;
@@ -195,8 +354,21 @@ impl ShareBatchHandler {
                 // our parent and reproduce its own state root.
                 let schedule = self.schedule();
                 let checks = (self.checks)();
-                match self.chain.on_proposal(&batch, &schedule, &checks, now) {
-                    Action::Vote { .. } => match self.chain.finalise(&batch, now) {
+                // Judged with the two-phase driver, but note carefully what is being used and
+                // what is NOT. `Prevote` here means only "this batch verified and links to our
+                // parent" — it is emphatically not a commitment, and the hash it carries may be
+                // this node's LOCKED value rather than the batch in hand. So the verdict gates
+                // adoption while the batch being adopted is the one that arrived.
+                //
+                // That is the correct semantic for catching up: the fleet's decision already
+                // happened elsewhere, and what makes a synced batch safe is that it hash-chains
+                // to our head and reproduces its own state root. Requiring a local quorum to
+                // adopt history would mean a node behind by one link could never rejoin.
+                match self
+                    .chain
+                    .on_proposal_phase(&batch, &schedule, &checks, now)
+                {
+                    PhaseAction::Prevote { .. } => match self.chain.finalise(&batch, now) {
                         Ok(f) => info!(seq = f.seq, "SBC: adopted a synced batch"),
                         Err(e) => warn!(seq, error = %e, "SBC: synced batch does not reproduce"),
                     },
@@ -239,6 +411,16 @@ impl MessageHandler for ShareBatchHandler {
                 debug!(seq = vote.seq, ?action, "SBC: peer vote");
                 Ok(())
             }
+            MessageType::ShareBatchPrevote => self.on_phase_vote(
+                &envelope,
+                ghost_consensus::message::BatchVotePhase::Prevote,
+                now,
+            ),
+            MessageType::ShareBatchPrecommit => self.on_phase_vote(
+                &envelope,
+                ghost_consensus::message::BatchVotePhase::Precommit,
+                now,
+            ),
             MessageType::ShareBatchSync => self.on_sync(&envelope, now),
             // Silent, not a warning. `Mesh::register_handler` pushes onto a LIST — every handler
             // is offered every message, so "not mine" is the overwhelmingly common case, not an
