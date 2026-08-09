@@ -612,6 +612,40 @@ impl PeerProvider for PeerProviderAdapter {
     }
 }
 
+/// What a node should report as its own hashrate, given a query outcome.
+///
+/// Pure so the failure path can actually be tested — the failure path is the whole point. Both the
+/// mesh gossip and the HTTP route used to call `.unwrap_or(0.0)` here, so a node whose database was
+/// too slow to answer announced ZERO hashes to the entire mesh. That is indistinguishable from
+/// having no miners and logged nothing. It hid 94 TH/s on ghost-vm5 (88% of the pool) behind a
+/// database stalled by #554, and the public site reported 13.8 TH/s against a real ~107 TH/s.
+///
+/// `query` is `None` when the database could not answer. A genuine idle node returns `Some(0.0)`
+/// and is reported as zero, which is correct — only a FAILED query takes the fallback.
+///
+/// Returns the value to report and how it was arrived at, so the caller can log accordingly.
+fn reported_hashrate(
+    query: Option<f64>,
+    last_good: Option<(f64, u64)>,
+    grace_secs: u64,
+) -> (f64, HashrateSource) {
+    match query {
+        Some(th) => (th, HashrateSource::Measured),
+        None => match last_good {
+            Some((th, age)) if age <= grace_secs => (th, HashrateSource::Stale { age_secs: age }),
+            _ => (0.0, HashrateSource::Unavailable),
+        },
+    }
+}
+
+/// Where a reported hashrate came from. `Unavailable` means the pool-wide total is understated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HashrateSource {
+    Measured,
+    Stale { age_secs: u64 },
+    Unavailable,
+}
+
 /// Ghost Pool - Decentralized Bitcoin Mining Pool
 #[derive(Parser, Debug)]
 #[command(name = "ghost-pool")]
@@ -3041,13 +3075,57 @@ async fn main() -> Result<()> {
     // share-proofs are excluded, which is what keeps the mesh sum from
     // double-counting (each share counted once, by its origin node).
     let self_received_by = hex::encode(&identity.node_id()[..8]);
-    let db_for_local_hr = Arc::clone(&db);
-    let self_rx_for_provider = self_received_by.clone();
-    mesh_inner.set_local_hashrate_provider(Arc::new(move || {
-        db_for_local_hr
-            .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_provider)
-            .unwrap_or(0.0)
-    }));
+
+    // ONE provider, shared by the mesh gossip and the HTTP route, because both used to swallow
+    // the same error in the same way and the two paths must never disagree about this node's
+    // own hashrate.
+    //
+    // Both sites read `.unwrap_or(0.0)`. A node whose database is too slow to answer therefore
+    // told the entire mesh it was doing ZERO hashes — indistinguishable from having no miners,
+    // with no error logged anywhere. On 2026-08-09 that hid 94 TH/s: ghost-vm5 carried 88% of
+    // the pool's hashrate behind a database stalled by #554, so the pool-wide total read 13.8
+    // TH/s against a real ~107 TH/s, and the public site reported the wrong figure all day.
+    //
+    // A genuine zero still passes through untouched — an idle node's query SUCCEEDS with 0.0.
+    // Only a FAILED query takes the fallback, and the fallback is the last value this node
+    // actually measured rather than a fabricated zero. Bounded, because stale-forever is its own
+    // lie: past the grace period it reports zero and says so at WARN.
+    let local_hashrate_provider: Arc<dyn Fn() -> f64 + Send + Sync> = {
+        const STALE_GRACE_SECS: u64 = 600;
+        let db_for_local_hr = Arc::clone(&db);
+        let self_rx = self_received_by.clone();
+        let last_good: Arc<parking_lot::Mutex<Option<(f64, std::time::Instant)>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        Arc::new(move || {
+            let outcome = db_for_local_hr.local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx);
+            let err = outcome.as_ref().err().map(|e| e.to_string());
+            let cached = last_good
+                .lock()
+                .map(|(th, at): (f64, std::time::Instant)| (th, at.elapsed().as_secs()));
+            let (th, source) = reported_hashrate(outcome.ok(), cached, STALE_GRACE_SECS);
+            match source {
+                HashrateSource::Measured => {
+                    *last_good.lock() = Some((th, std::time::Instant::now()));
+                }
+                HashrateSource::Stale { age_secs } => tracing::warn!(
+                    error = err.unwrap_or_default(),
+                    reusing_th = th,
+                    age_secs,
+                    "local hashrate query FAILED; reusing the last measured value rather than \
+                     reporting zero, which would deflate the pool-wide total"
+                ),
+                HashrateSource::Unavailable => tracing::warn!(
+                    error = err.unwrap_or_default(),
+                    "local hashrate query FAILED and no recent measurement is available; \
+                     reporting 0 TH/s. The pool-wide total is UNDERSTATED by this node's real \
+                     hashrate until its database responds again"
+                ),
+            }
+            th
+        })
+    };
+
+    mesh_inner.set_local_hashrate_provider(Arc::clone(&local_hashrate_provider));
 
     // Gossip THIS node's best (rarest) valid share per records window so every
     // node converges on the pool-wide rarest record per window. Without this,
@@ -7159,13 +7237,8 @@ async fn main() -> Result<()> {
 
     // This node's own contribution to that total, surfaced as `local_hashrate_th`
     // so the per-node and mesh figures reconcile (same windowed value it gossips).
-    let db_for_local_hr_route = Arc::clone(&db);
-    let self_rx_for_route = self_received_by.clone();
-    verification_state = verification_state.with_local_hashrate(move || {
-        db_for_local_hr_route
-            .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_route)
-            .unwrap_or(0.0)
-    });
+    let local_hr_for_route = Arc::clone(&local_hashrate_provider);
+    verification_state = verification_state.with_local_hashrate(move || local_hr_for_route());
     // Scope the operator/peer detailed miner list to this node's own miners
     // (shares stored under our `received_by`), so "This Node's Miners" and the
     // /miners/full peer feed are local — not the mesh-wide gossiped set.
@@ -10617,6 +10690,65 @@ fn resolve_signer_path(
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hashrate_reporting_tests {
+    use super::{reported_hashrate, HashrateSource};
+
+    /// A node that genuinely has no miners reports zero, and that zero is REAL.
+    ///
+    /// The distinction this whole function exists for: an idle node's query succeeds with 0.0 and
+    /// must not be papered over with a stale value.
+    #[test]
+    fn a_successful_zero_is_reported_as_measured() {
+        let (th, src) = reported_hashrate(Some(0.0), Some((94.0, 5)), 600);
+        assert_eq!(
+            th, 0.0,
+            "a real zero must not be replaced by a cached value"
+        );
+        assert_eq!(src, HashrateSource::Measured);
+    }
+
+    /// A FAILED query must not be reported as zero while a recent measurement exists.
+    ///
+    /// This is the ghost-vm5 case: 94 TH/s behind a stalled database. Reporting 0 deflated the
+    /// pool-wide total by 88% and logged nothing at all.
+    #[test]
+    fn a_failed_query_reuses_the_last_measurement_instead_of_reporting_zero() {
+        let (th, src) = reported_hashrate(None, Some((94.13, 42)), 600);
+        assert_eq!(th, 94.13, "a database failure must not read as 'no miners'");
+        assert_eq!(src, HashrateSource::Stale { age_secs: 42 });
+    }
+
+    /// Stale-forever is its own lie. Past the grace period it reports zero and says so.
+    #[test]
+    fn a_measurement_older_than_the_grace_period_is_not_reused() {
+        let (th, src) = reported_hashrate(None, Some((94.13, 601)), 600);
+        assert_eq!(th, 0.0);
+        assert_eq!(
+            src,
+            HashrateSource::Unavailable,
+            "an ancient reading must be surfaced as unavailable, not presented as current"
+        );
+    }
+
+    /// A failure with nothing cached is unavailable — reported as zero, but flagged.
+    #[test]
+    fn a_failure_with_no_history_is_flagged_unavailable() {
+        let (th, src) = reported_hashrate(None, None, 600);
+        assert_eq!(th, 0.0);
+        assert_eq!(src, HashrateSource::Unavailable);
+    }
+
+    /// Exactly at the boundary the cached value is still good — an off-by-one here silently
+    /// switches a healthy node to reporting zero.
+    #[test]
+    fn the_grace_boundary_is_inclusive() {
+        let (th, src) = reported_hashrate(None, Some((12.0, 600)), 600);
+        assert_eq!(th, 12.0);
+        assert_eq!(src, HashrateSource::Stale { age_secs: 600 });
     }
 }
 
