@@ -49,7 +49,17 @@ pub struct ChainHead {
     pub seq: u64,
     pub batch_hash: [u8; 32],
     pub state_root: [u8; 32],
+    /// When the PROPOSER closed this batch. Advisory — it says nothing about when this node
+    /// adopted it, and for genesis it is the converted checkpoint's cutoff, which can be days old.
     pub close_ts: i64,
+    /// When THIS node adopted the batch.
+    ///
+    /// Distinct from `close_ts` and not interchangeable with it. The next sequence opens when this
+    /// batch is adopted, so this is what the stall-escalation clock must run from. Using
+    /// `close_ts` instead made escalation start from the genesis checkpoint's cutoff — three days
+    /// stale on ghost-vm8 — which left the rota permanently in escalated mode, rotating the turn
+    /// every 90 s instead of giving a proposer a stable one.
+    pub finalised_at: i64,
 }
 
 fn blob32(v: Vec<u8>, what: &str) -> GhostResult<[u8; 32]> {
@@ -138,8 +148,8 @@ impl Database {
         self.with_connection(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT seq, batch_hash, state_root, close_ts FROM sbc_batches \
-                     ORDER BY seq DESC LIMIT 1",
+                    "SELECT seq, batch_hash, state_root, close_ts, finalised_at \
+                     FROM sbc_batches ORDER BY seq DESC LIMIT 1",
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             let mut rows = stmt
@@ -149,6 +159,7 @@ impl Database {
                         r.get::<_, Vec<u8>>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
                     ))
                 })
                 .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -156,13 +167,14 @@ impl Database {
             match rows.next() {
                 None => Ok(None),
                 Some(row) => {
-                    let (seq, hash, root, close_ts) =
+                    let (seq, hash, root, close_ts, finalised_at) =
                         row.map_err(|e| GhostError::Database(e.to_string()))?;
                     Ok(Some(ChainHead {
                         seq: seq as u64,
                         batch_hash: blob32(hash, "batch_hash")?,
                         state_root: blob32(root, "state_root")?,
                         close_ts,
+                        finalised_at,
                     }))
                 }
             }
@@ -424,6 +436,36 @@ mod tests {
         // The original must still be the one on record.
         let head = db.sbc_head().expect("head").expect("some head");
         assert_eq!(head.batch_hash, [1u8; 32]);
+    }
+
+    /// `close_ts` and `finalised_at` are different facts and must not be conflated.
+    ///
+    /// `close_ts` is when the PROPOSER closed the batch; `finalised_at` is when THIS node adopted
+    /// it. The next sequence opens on adoption, so the stall-escalation clock runs from
+    /// `finalised_at`. Reading `close_ts` instead started escalation from the genesis checkpoint's
+    /// cutoff — three days stale on ghost-vm8 — leaving the rota permanently escalated and
+    /// rotating the turn every 90 s instead of giving a proposer a stable one.
+    #[test]
+    fn the_head_reports_adoption_time_separately_from_close_time() {
+        let db = db();
+        let close_ts = 1_786_228_093; // a genesis checkpoint's cutoff: days in the past
+        let adopted_at = 1_786_470_000; // when this node actually took it
+
+        db.sbc_store_batch(
+            0, [1u8; 32], [0u8; 32], [0u8; 32], close_ts, [2u8; 32], 0, "{}", adopted_at,
+        )
+        .expect("adopt");
+
+        let head = db.sbc_head().expect("head").expect("some");
+        assert_eq!(head.close_ts, close_ts, "close_ts is the proposer's claim");
+        assert_eq!(
+            head.finalised_at, adopted_at,
+            "finalised_at is when we adopted it — the escalation clock reads THIS"
+        );
+        assert_ne!(
+            head.close_ts, head.finalised_at,
+            "the two must stay distinguishable; conflating them is the defect"
+        );
     }
 
     /// The head is the highest sequence, and is `None` before genesis.

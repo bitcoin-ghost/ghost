@@ -104,7 +104,10 @@ impl ShadowChain {
             info!(count = restored.len(), "SBC shadow: restored quarantine");
         }
 
-        let opened = head.as_ref().map(|h| h.close_ts).unwrap_or(0);
+        // The next sequence opened when the head was ADOPTED, not when its proposer closed it.
+        // Using close_ts started escalation from the genesis checkpoint's cutoff — three days
+        // stale on ghost-vm8 — so the rota sat permanently escalated, rotating every 90 s.
+        let opened = head.as_ref().map(|h| h.finalised_at).unwrap_or(0);
         Ok(Self {
             identity,
             db,
@@ -132,6 +135,14 @@ impl ShadowChain {
 
     pub fn pending_count(&self) -> usize {
         self.pending.lock().len()
+    }
+
+    /// When the current sequence opened — the instant stall escalation is measured from.
+    ///
+    /// Exposed because it is the input to whose-turn-it-is, and a wrong value here is invisible
+    /// from the outside: the rota still functions, it simply never lets a proposer hold a turn.
+    pub fn seq_opened(&self) -> i64 {
+        *self.seq_opened_ts.read()
     }
 
     /// Record a share THIS node received.
@@ -384,6 +395,7 @@ impl ShadowChain {
             batch_hash,
             state_root: batch.state_root,
             close_ts: batch.close_ts,
+            finalised_at: now,
         });
 
         // Drain exactly what was adopted. Anything not in this batch stays pending and lands in a
@@ -529,7 +541,10 @@ impl ShadowChain {
             batch_hash,
             state_root: batch.state_root,
             close_ts: batch.close_ts,
+            finalised_at: now,
         });
+        // The first real sequence opens NOW, not at the checkpoint's cutoff.
+        *self.seq_opened_ts.write() = now;
 
         info!(
             seq = batch.seq,
@@ -1230,6 +1245,67 @@ mod tests {
         assert_eq!(
             balances.get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
             Some(&52_157_533_139_126_865i64)
+        );
+    }
+
+    /// The escalation clock must read ADOPTION time, not the proposer's close time.
+    ///
+    /// A genesis head carries the converted checkpoint's `cutoff_ts`, which on ghost-vm8 was three
+    /// days old. Reading that as "when this sequence opened" put escalation at ~2,689 steps the
+    /// instant the node started, leaving the rota permanently escalated — rotating the turn every
+    /// 90 s rather than giving a proposer a stable one.
+    ///
+    /// Invisible from outside: the rota still works, nobody diverges, and every node agrees. It is
+    /// simply always wrong in the same way, which is why it needs an explicit assertion.
+    #[test]
+    fn the_escalation_clock_reads_adoption_time_not_close_time() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+
+        let stale_close = 1_786_228_093; // a checkpoint cutoff, days in the past
+        let adopted_at = 1_786_470_000; // when this node took it
+        db.sbc_store_batch(
+            0,
+            [1u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            stale_close,
+            [2u8; 32],
+            0,
+            "{}",
+            adopted_at,
+        )
+        .expect("adopt");
+
+        let chain = ShadowChain::load(id, db).expect("load");
+        assert_eq!(
+            chain.seq_opened(),
+            adopted_at,
+            "escalation must run from adoption; reading close_ts starts it days in the past"
+        );
+        assert_ne!(chain.seq_opened(), stale_close);
+    }
+
+    /// Genesis opens the first real sequence NOW, not at the checkpoint's cutoff.
+    #[test]
+    fn genesis_opens_the_next_sequence_at_bootstrap_time() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+
+        let chain = ShadowChain::load(id, Arc::clone(&db)).expect("load");
+        let bootstrap_at = 1_786_470_000;
+        chain
+            .bootstrap_genesis(961_642, bootstrap_at)
+            .expect("bootstrap")
+            .expect("converted");
+
+        assert_eq!(
+            chain.seq_opened(),
+            bootstrap_at,
+            "the first sequence opens when the chain starts, not when the checkpoint closed"
         );
     }
 }
