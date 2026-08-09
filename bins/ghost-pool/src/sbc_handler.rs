@@ -76,26 +76,30 @@ impl ShareBatchHandler {
         let action = self.chain.on_proposal(&batch, &schedule, &checks, now);
 
         match action {
-            Action::Vote { batch_hash, seq } => {
-                // Sign sequence AND hash together: the hash alone replays at another sequence, and
-                // the sequence alone makes every vote at that height interchangeable.
-                let mut signing = Vec::with_capacity(40);
-                signing.extend_from_slice(&seq.to_le_bytes());
-                signing.extend_from_slice(&batch_hash);
-                let vote = ShareBatchVoteMessage {
+            Action::Vote {
+                batch_hash,
+                seq,
+                round,
+            } => {
+                // Signed via the message's OWN helper, not a hand-rolled copy. The handler used to
+                // build these bytes inline and produced a different string to `signing_bytes` —
+                // no domain tag — which nothing noticed because nothing verified votes at all.
+                let mut vote = ShareBatchVoteMessage {
                     seq,
                     batch_hash,
                     voter: self.identity.node_id(),
-                    signature: self.identity.sign(&signing),
+                    round,
+                    signature: [0u8; 64],
                 };
+                vote.signature = self.identity.sign(&vote.signing_bytes());
                 let payload = serde_json::to_vec(&vote)
                     .map_err(|e| GhostError::Serialization(format!("share batch vote: {e}")))?;
                 (self.send)(MessageType::ShareBatchVote, payload)?;
 
                 // Count our own vote. Without this a node never contributes to the quorum it is
                 // waiting on, and a two-node fleet could never finalise anything.
-                self.record_vote(self.identity.node_id(), batch_hash, seq, &batch, now);
-                debug!(seq, "SBC: voted");
+                self.record_vote(self.identity.node_id(), batch_hash, seq, round, &batch, now);
+                debug!(seq, round, "SBC: voted");
             }
             Action::Hold { reason } => {
                 debug!(seq = batch.seq, ?reason, "SBC: holding");
@@ -134,18 +138,20 @@ impl ShareBatchHandler {
     }
 
     /// Tally a vote, and adopt if it carried.
+    #[allow(clippy::too_many_arguments)]
     fn record_vote(
         &self,
         voter: NodeId,
         batch_hash: [u8; 32],
         seq: u64,
+        round: u32,
         batch: &ShareBatch,
         now: i64,
     ) {
         let schedule = self.schedule();
         match self
             .chain
-            .on_batch_vote(voter, batch_hash, seq, &schedule, now)
+            .on_batch_vote(voter, batch_hash, round, seq, &schedule, now)
         {
             VoteAction::Adopt { .. } => {
                 match self.chain.finalise(batch, now) {
@@ -220,11 +226,34 @@ impl MessageHandler for ShareBatchHandler {
                     .map_err(|e| GhostError::Serialization(format!("share batch vote: {e}")))?;
                 // A vote alone cannot finalise: adoption needs the batch itself, and holding a
                 // vote for a batch we have not seen is what sync is for.
+                // Verify before counting. `signing_bytes` had no caller anywhere in the tree, so
+                // every vote was taken on trust: any node could have forged a vote from any peer,
+                // at any sequence, for any batch. Quorum built on unverified votes is not quorum.
+                if !ghost_common::identity::verify_signature(
+                    &vote.voter,
+                    &vote.signing_bytes(),
+                    &vote.signature,
+                )
+                .unwrap_or(false)
+                {
+                    debug!(seq = vote.seq, "SBC: vote signature invalid, dropped");
+                    return Ok(());
+                }
                 let schedule = self.schedule();
-                let action =
-                    self.chain
-                        .on_batch_vote(vote.voter, vote.batch_hash, vote.seq, &schedule, now);
-                debug!(seq = vote.seq, ?action, "SBC: peer vote");
+                let action = self.chain.on_batch_vote(
+                    vote.voter,
+                    vote.batch_hash,
+                    vote.round,
+                    vote.seq,
+                    &schedule,
+                    now,
+                );
+                debug!(
+                    seq = vote.seq,
+                    round = vote.round,
+                    ?action,
+                    "SBC: peer vote"
+                );
                 Ok(())
             }
             MessageType::ShareBatchSync => self.on_sync(&envelope, now),

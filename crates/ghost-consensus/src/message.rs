@@ -1295,7 +1295,17 @@ pub struct ShareBatchVoteMessage {
     /// Who is voting.
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub voter: NodeId,
-    /// Signature over `(seq, batch_hash)`.
+    /// The escalation step this vote belongs to.
+    ///
+    /// Escalation appoints a new proposer every 90 s while a sequence is open, so one `seq` can
+    /// have several candidate batches. Without the round a receiver cannot tell which attempt a
+    /// vote was cast in, and votes for abandoned candidates are counted alongside live ones.
+    ///
+    /// Defaults on absence so a vote from a node that predates this field still deserialises; such
+    /// a vote reads as round 0, which is what it effectively was.
+    #[serde(default)]
+    pub round: u32,
+    /// Signature over `(seq, round, batch_hash)`.
     #[serde(with = "ghost_common::serde_hex::bytes64")]
     pub signature: [u8; 64],
 }
@@ -1303,14 +1313,22 @@ pub struct ShareBatchVoteMessage {
 impl ShareBatchVoteMessage {
     /// The bytes a vote signs.
     ///
-    /// **Both** the sequence and the hash, domain-separated. Signing the hash alone would let a
+    /// The sequence, the round and the hash, domain-separated. Signing the hash alone would let a
     /// vote be replayed at a different sequence, and signing the sequence alone would make every
-    /// vote at that height interchangeable — either one turns a signature into a formality.
+    /// vote at that height interchangeable — either one turns a signature into a formality. The
+    /// round is covered for the same reason: without it, a vote cast in a losing round could be
+    /// replayed into the round that is still live.
+    ///
+    /// The domain tag stays `v1` and the round is appended at the END, so a round-0 vote signs
+    /// bytes that differ from the old format only by four trailing zeros. That is a deliberate
+    /// break, not an oversight — the old inline signer in the handler never matched this helper
+    /// and nothing verified either, so there is no deployed signature to stay compatible with.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 32 + 24);
+        let mut out = Vec::with_capacity(17 + 8 + 32 + 4);
         out.extend_from_slice(b"ShareBatchVote/v1");
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.batch_hash);
+        out.extend_from_slice(&self.round.to_le_bytes());
         out
     }
 }

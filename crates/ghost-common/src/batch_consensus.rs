@@ -57,9 +57,13 @@ pub enum VoteDecision {
     Fresh,
     /// The same batch again — idempotent, so a resend costs nothing.
     Repeat,
-    /// A *different* batch at a sequence already voted on. Refused: this is the guard that stops
-    /// two valid batches both reaching quorum.
+    /// A *different* batch at the same sequence AND the same round. Refused, and a fault: one
+    /// proposer is authorised per round, so two batches from one voter at one round is
+    /// equivocation, not a retry.
     Conflict { already: [u8; 32] },
+    /// A vote at a round we have already moved past. Ignored, not punished — a late-arriving
+    /// message from an abandoned round is ordinary, not evidence of anything.
+    Stale { locked_at: u32 },
 }
 
 /// The proposer rota over a voter set.
@@ -214,8 +218,13 @@ pub enum FaultReason {
 /// The outcome of judging a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchVerdict {
-    /// Valid — vote for it.
-    Valid,
+    /// Valid — vote for it, at this round.
+    ///
+    /// The round is the escalation step the proposer was authorised at. It is carried out of
+    /// verification rather than recomputed by the caller because this is the only place that
+    /// establishes WHICH attempt the batch belongs to, and a vote naming a different round than
+    /// the one that authorised it would be counted against the wrong candidate.
+    Valid { round: u32 },
     /// Cannot judge yet. Recoverable.
     Defer(DeferReason),
     /// Defective. Terminal.
@@ -274,13 +283,13 @@ pub fn verify_batch<C: BatchChecks>(
     }
 
     // --- whose turn: the sequence opened when its parent closed, which every node agrees on ---
-    match schedule.authorise(batch.seq, &batch.proposer, parent.close_ts, now) {
-        Authorisation::Authorised { .. } => {}
+    let round = match schedule.authorise(batch.seq, &batch.proposer, parent.close_ts, now) {
+        Authorisation::Authorised { escalation } => escalation,
         Authorisation::TooEarly { escalation } => {
             return BatchVerdict::Defer(DeferReason::ProposerTooEarly { escalation })
         }
         Authorisation::NotAProposer => return BatchVerdict::Defer(DeferReason::ProposerNotDue),
-    }
+    };
 
     // --- from here on, every failure is the batch's own fault ---
     if batch.close_ts <= parent.close_ts {
@@ -339,7 +348,7 @@ pub fn verify_batch<C: BatchChecks>(
         return BatchVerdict::Fault(FaultReason::ProposerSignatureInvalid);
     }
 
-    BatchVerdict::Valid
+    BatchVerdict::Valid { round }
 }
 
 /// What recording a peer's vote did.
@@ -371,7 +380,7 @@ pub struct SeqTally {
     seq: u64,
     quorum: usize,
     /// Who each voter approved. One entry per voter — the second, differing entry is equivocation.
-    choice: BTreeMap<[u8; 32], [u8; 32]>,
+    choice: BTreeMap<[u8; 32], (u32, [u8; 32])>,
     /// Voters whose votes are void.
     equivocators: std::collections::BTreeSet<[u8; 32]>,
     finalised: Option<[u8; 32]>,
@@ -400,11 +409,17 @@ impl SeqTally {
         self.equivocators.iter()
     }
 
-    /// Approvals for one candidate, excluding voters whose word is worthless.
-    pub fn approvals_for(&self, batch_hash: &[u8; 32]) -> usize {
+    /// Approvals for one candidate at one round, excluding voters whose word is worthless.
+    ///
+    /// Counted per round on purpose. Votes from an abandoned round must not prop up a candidate
+    /// the fleet has moved on from, and — more importantly — a voter appears at most once here,
+    /// which is what bounds any single instant to one batch at quorum.
+    pub fn approvals_for_round(&self, round: u32, batch_hash: &[u8; 32]) -> usize {
         self.choice
             .iter()
-            .filter(|(voter, chosen)| *chosen == batch_hash && !self.equivocators.contains(*voter))
+            .filter(|(voter, (r, chosen))| {
+                *r == round && chosen == batch_hash && !self.equivocators.contains(*voter)
+            })
             .count()
     }
 
@@ -412,14 +427,19 @@ impl SeqTally {
     ///
     /// Finalisation is reported once and only once: a batch that has reached quorum is final, and
     /// re-announcing it on every later vote would have a caller applying it repeatedly.
-    pub fn record(&mut self, voter: [u8; 32], batch_hash: [u8; 32]) -> TallyEvent {
+    pub fn record(&mut self, voter: [u8; 32], round: u32, batch_hash: [u8; 32]) -> TallyEvent {
         if self.equivocators.contains(&voter) {
             return TallyEvent::Duplicate;
         }
 
         match self.choice.get(&voter) {
-            Some(existing) if *existing == batch_hash => return TallyEvent::Duplicate,
-            Some(existing) => {
+            // Same round, same batch: a resend.
+            Some((r, existing)) if *r == round && *existing == batch_hash => {
+                return TallyEvent::Duplicate
+            }
+            // Same round, different batch: two contradictory claims about one attempt. Still a
+            // fault, and still terminal — this is what equivocation actually means.
+            Some((r, existing)) if *r == round => {
                 let first = *existing;
                 self.equivocators.insert(voter);
                 self.choice.remove(&voter);
@@ -429,12 +449,18 @@ impl SeqTally {
                     second: batch_hash,
                 };
             }
-            None => {
-                self.choice.insert(voter, batch_hash);
+            // A round already passed. Ignore rather than let a straggler pull a voter back to an
+            // abandoned candidate.
+            Some((r, _)) if round < *r => return TallyEvent::Duplicate,
+            // A higher round REPLACES the voter's choice rather than adding to it. That is what
+            // keeps at most one candidate at quorum at any instant: every voter contributes to
+            // exactly one (round, batch), and quorum exceeds half the voter set.
+            _ => {
+                self.choice.insert(voter, (round, batch_hash));
             }
         }
 
-        let approvals = self.approvals_for(&batch_hash);
+        let approvals = self.approvals_for_round(round, &batch_hash);
         if approvals >= self.quorum && self.finalised.is_none() {
             self.finalised = Some(batch_hash);
             return TallyEvent::Finalised {
@@ -457,7 +483,7 @@ impl SeqTally {
 /// would fork at a height that by construction cannot fork.
 #[derive(Debug, Default, Clone)]
 pub struct SeqVoteLock {
-    voted: BTreeMap<u64, [u8; 32]>,
+    voted: BTreeMap<u64, (u32, [u8; 32])>,
 }
 
 impl SeqVoteLock {
@@ -469,19 +495,20 @@ impl SeqVoteLock {
     ///
     /// Re-voting for the same batch is allowed and reported as `Repeat`: proposals are resent, and
     /// treating a resend as equivocation would punish an honest peer for a dropped packet.
-    pub fn try_vote(&mut self, seq: u64, batch_hash: [u8; 32]) -> VoteDecision {
+    pub fn try_vote(&mut self, seq: u64, round: u32, batch_hash: [u8; 32]) -> VoteDecision {
         match self.voted.get(&seq) {
-            Some(existing) if *existing == batch_hash => VoteDecision::Repeat,
-            Some(existing) => VoteDecision::Conflict { already: *existing },
-            None => {
-                self.voted.insert(seq, batch_hash);
+            Some((r, existing)) if *r == round && *existing == batch_hash => VoteDecision::Repeat,
+            Some((r, existing)) if *r == round => VoteDecision::Conflict { already: *existing },
+            Some((r, _)) if round < *r => VoteDecision::Stale { locked_at: *r },
+            _ => {
+                self.voted.insert(seq, (round, batch_hash));
                 VoteDecision::Fresh
             }
         }
     }
 
-    /// What we voted for at a sequence, if anything.
-    pub fn vote_at(&self, seq: u64) -> Option<[u8; 32]> {
+    /// What we voted for at a sequence, and at which round, if anything.
+    pub fn vote_at(&self, seq: u64) -> Option<(u32, [u8; 32])> {
         self.voted.get(&seq).copied()
     }
 
@@ -675,22 +702,22 @@ mod tests {
     #[test]
     fn a_second_batch_at_the_same_sequence_is_refused() {
         let mut lock = SeqVoteLock::new();
-        assert_eq!(lock.try_vote(7, [0xAA; 32]), VoteDecision::Fresh);
+        assert_eq!(lock.try_vote(7, 0, [0xAA; 32]), VoteDecision::Fresh);
         assert_eq!(
-            lock.try_vote(7, [0xBB; 32]),
+            lock.try_vote(7, 0, [0xBB; 32]),
             VoteDecision::Conflict {
                 already: [0xAA; 32]
             }
         );
-        assert_eq!(lock.vote_at(7), Some([0xAA; 32]));
+        assert_eq!(lock.vote_at(7), Some((0, [0xAA; 32])));
     }
 
     /// A resent proposal is not equivocation. Punishing it would make packet loss look Byzantine.
     #[test]
     fn voting_for_the_same_batch_again_is_idempotent() {
         let mut lock = SeqVoteLock::new();
-        lock.try_vote(7, [0xAA; 32]);
-        assert_eq!(lock.try_vote(7, [0xAA; 32]), VoteDecision::Repeat);
+        lock.try_vote(7, 0, [0xAA; 32]);
+        assert_eq!(lock.try_vote(7, 0, [0xAA; 32]), VoteDecision::Repeat);
         assert_eq!(lock.len(), 1);
     }
 
@@ -698,8 +725,8 @@ mod tests {
     #[test]
     fn other_sequences_are_unaffected() {
         let mut lock = SeqVoteLock::new();
-        lock.try_vote(7, [0xAA; 32]);
-        assert_eq!(lock.try_vote(8, [0xBB; 32]), VoteDecision::Fresh);
+        lock.try_vote(7, 0, [0xAA; 32]);
+        assert_eq!(lock.try_vote(8, 0, [0xBB; 32]), VoteDecision::Fresh);
     }
 
     // ---- verify_batch ----
@@ -814,7 +841,7 @@ mod tests {
         let (batch, balances) = a_child(&parent, &s);
         assert_eq!(
             verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
-            BatchVerdict::Valid
+            BatchVerdict::Valid { round: 0 }
         );
     }
 
@@ -962,7 +989,7 @@ mod tests {
         batch.state_root = compute_state_root(&expected, batch.seq, batch.close_ts);
         assert_eq!(
             verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
-            BatchVerdict::Valid
+            BatchVerdict::Valid { round: 0 }
         );
     }
 
@@ -1047,19 +1074,19 @@ mod tests {
         let batch = [0xAA; 32];
         for n in 1..=5u8 {
             assert!(matches!(
-                t.record(voter(n), batch),
+                t.record(voter(n), 0, batch),
                 TallyEvent::Recorded { .. }
             ));
         }
         assert_eq!(
-            t.record(voter(6), batch),
+            t.record(voter(6), 0, batch),
             TallyEvent::Finalised {
                 batch_hash: batch,
                 votes: 6
             }
         );
         assert!(
-            matches!(t.record(voter(7), batch), TallyEvent::Recorded { .. }),
+            matches!(t.record(voter(7), 0, batch), TallyEvent::Recorded { .. }),
             "a later vote must not re-announce finalisation, or the caller applies it twice"
         );
         assert_eq!(t.finalised(), Some(batch));
@@ -1075,12 +1102,12 @@ mod tests {
         let a = [0xAA; 32];
         let b = [0xBB; 32];
 
-        t.record(voter(1), a);
-        t.record(voter(2), a);
-        assert_eq!(t.approvals_for(&a), 2);
+        t.record(voter(1), 0, a);
+        t.record(voter(2), 0, a);
+        assert_eq!(t.approvals_for_round(0, &a), 2);
 
         assert_eq!(
-            t.record(voter(1), b),
+            t.record(voter(1), 0, b),
             TallyEvent::Equivocation {
                 voter: voter(1),
                 first: a,
@@ -1088,16 +1115,16 @@ mod tests {
             }
         );
         assert_eq!(
-            t.approvals_for(&a),
+            t.approvals_for_round(0, &a),
             1,
             "the first vote must be withdrawn too"
         );
-        assert_eq!(t.approvals_for(&b), 0);
+        assert_eq!(t.approvals_for_round(0, &b), 0);
         assert_eq!(t.equivocators().count(), 1);
 
         // And they cannot buy their way back in.
-        assert_eq!(t.record(voter(1), a), TallyEvent::Duplicate);
-        assert_eq!(t.approvals_for(&a), 1);
+        assert_eq!(t.record(voter(1), 0, a), TallyEvent::Duplicate);
+        assert_eq!(t.approvals_for_round(0, &a), 1);
     }
 
     /// Two candidates at one sequence is the normal consequence of escalation, not an attack. Both
@@ -1109,13 +1136,13 @@ mod tests {
         let a = [0xAA; 32];
         let b = [0xBB; 32];
         for n in 1..=4u8 {
-            t.record(voter(n), a);
+            t.record(voter(n), 0, a);
         }
         for n in 5..=8u8 {
-            t.record(voter(n), b);
+            t.record(voter(n), 0, b);
         }
-        assert_eq!(t.approvals_for(&a), 4);
-        assert_eq!(t.approvals_for(&b), 4);
+        assert_eq!(t.approvals_for_round(0, &a), 4);
+        assert_eq!(t.approvals_for_round(0, &b), 4);
         assert_eq!(t.finalised(), None, "neither reaches 6 of 8 — correct");
     }
 
@@ -1123,9 +1150,9 @@ mod tests {
     fn a_resent_vote_is_not_equivocation() {
         let mut t = SeqTally::new(9, 6);
         let a = [0xAA; 32];
-        t.record(voter(1), a);
-        assert_eq!(t.record(voter(1), a), TallyEvent::Duplicate);
-        assert_eq!(t.approvals_for(&a), 1);
+        t.record(voter(1), 0, a);
+        assert_eq!(t.record(voter(1), 0, a), TallyEvent::Duplicate);
+        assert_eq!(t.approvals_for_round(0, &a), 1);
     }
 
     /// Pruning bounds the memory, and must only ever drop what is already final: a lock released
@@ -1134,15 +1161,169 @@ mod tests {
     fn pruning_keeps_the_finalised_boundary_and_above() {
         let mut lock = SeqVoteLock::new();
         for seq in 0..10u64 {
-            lock.try_vote(seq, [seq as u8; 32]);
+            lock.try_vote(seq, 0, [seq as u8; 32]);
         }
         lock.prune_below(6);
         assert_eq!(lock.vote_at(5), None);
         assert_eq!(
             lock.vote_at(6),
-            Some([6u8; 32]),
+            Some((0, [6u8; 32])),
             "the boundary itself stays"
         );
         assert_eq!(lock.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod round_tests {
+    use super::*;
+
+    fn voter(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    /// **The deadlock, reproduced.** This is what wedged the six-node fleet on 2026-08-09.
+    ///
+    /// Escalation appoints a new proposer every 90 s while a sequence is open, so `seq=1` collects
+    /// several candidate batches. Under the old one-vote-per-sequence rule every voter was frozen
+    /// on whichever candidate reached it first, votes scattered, and no candidate could ever reach
+    /// quorum — permanently, because the lock never expired. Approvals sat at 1 of 6 for an hour.
+    ///
+    /// Against the old code this cannot compile, let alone pass: `round` was not a parameter, and
+    /// the second `try_vote` returned `Conflict` for every voter.
+    #[test]
+    fn a_round_that_missed_quorum_does_not_block_the_next_one() {
+        let quorum = 6;
+        let mut tally = SeqTally::new(1, quorum);
+        let mut locks: Vec<SeqVoteLock> = (0..8).map(|_| SeqVoteLock::new()).collect();
+
+        let candidate_a = [0xAA; 32];
+        let candidate_b = [0xBB; 32];
+
+        // Round 0: only three nodes see candidate A before the round lapses. Short of 6.
+        for n in 0..3u8 {
+            assert_eq!(
+                locks[n as usize].try_vote(1, 0, candidate_a),
+                VoteDecision::Fresh
+            );
+            tally.record(voter(n), 0, candidate_a);
+        }
+        assert!(
+            tally.finalised().is_none(),
+            "three of six is not quorum — the round genuinely failed"
+        );
+
+        // Round 1: escalation appoints a new proposer, and every node votes for its batch.
+        for n in 0..8u8 {
+            assert_eq!(
+                locks[n as usize].try_vote(1, 1, candidate_b),
+                VoteDecision::Fresh,
+                "voter {n} must be free to vote in a later round; this is the deadlock"
+            );
+        }
+        let mut finalised_at = None;
+        for n in 0..8u8 {
+            if let TallyEvent::Finalised { batch_hash, votes } =
+                tally.record(voter(n), 1, candidate_b)
+            {
+                finalised_at = Some((batch_hash, votes));
+            }
+        }
+        assert_eq!(
+            finalised_at,
+            Some((candidate_b, quorum)),
+            "the second round must be able to finalise"
+        );
+    }
+
+    /// Equivocation still means equivocation — two batches at the SAME round.
+    #[test]
+    fn two_batches_at_one_round_is_still_a_fault() {
+        let mut lock = SeqVoteLock::new();
+        let mut tally = SeqTally::new(1, 6);
+
+        assert_eq!(lock.try_vote(1, 4, [0xAA; 32]), VoteDecision::Fresh);
+        assert_eq!(
+            lock.try_vote(1, 4, [0xBB; 32]),
+            VoteDecision::Conflict {
+                already: [0xAA; 32]
+            },
+            "a different batch at the same round is not a retry"
+        );
+
+        tally.record(voter(1), 4, [0xAA; 32]);
+        assert!(
+            matches!(
+                tally.record(voter(1), 4, [0xBB; 32]),
+                TallyEvent::Equivocation { .. }
+            ),
+            "the tally must still catch a voter backing two batches in one round"
+        );
+    }
+
+    /// A vote from a round already passed is ignored — not counted, and not punished.
+    #[test]
+    fn a_vote_from_an_abandoned_round_is_ignored() {
+        let mut lock = SeqVoteLock::new();
+        let mut tally = SeqTally::new(1, 6);
+
+        assert_eq!(lock.try_vote(1, 5, [0xBB; 32]), VoteDecision::Fresh);
+        assert_eq!(
+            lock.try_vote(1, 2, [0xAA; 32]),
+            VoteDecision::Stale { locked_at: 5 },
+            "a straggler must not pull us back to a candidate the fleet abandoned"
+        );
+
+        tally.record(voter(1), 5, [0xBB; 32]);
+        assert!(
+            matches!(tally.record(voter(1), 2, [0xAA; 32]), TallyEvent::Duplicate),
+            "a late vote from an older round is ignored, not treated as equivocation"
+        );
+        assert_eq!(tally.approvals_for_round(2, &[0xAA; 32]), 0);
+        assert_eq!(tally.approvals_for_round(5, &[0xBB; 32]), 1);
+    }
+
+    /// Approvals from different rounds must never be summed into one quorum.
+    #[test]
+    fn approvals_do_not_accumulate_across_rounds() {
+        let mut tally = SeqTally::new(1, 6);
+        let candidate = [0xCC; 32];
+
+        for n in 0..4u8 {
+            tally.record(voter(n), 0, candidate);
+        }
+        for n in 4..8u8 {
+            tally.record(voter(n), 1, candidate);
+        }
+
+        assert!(
+            tally.finalised().is_none(),
+            "4 + 4 across two rounds is not quorum in either round"
+        );
+        assert_eq!(tally.approvals_for_round(0, &candidate), 4);
+        assert_eq!(tally.approvals_for_round(1, &candidate), 4);
+    }
+
+    /// A voter moving to a higher round REPLACES its earlier choice rather than adding to it.
+    ///
+    /// This is the property that bounds any single instant to one candidate at quorum: every voter
+    /// contributes to exactly one `(round, batch)`, and quorum exceeds half the voter set.
+    #[test]
+    fn moving_to_a_higher_round_replaces_a_voters_earlier_choice() {
+        let mut tally = SeqTally::new(1, 6);
+        for n in 0..5u8 {
+            tally.record(voter(n), 0, [0xAA; 32]);
+        }
+        assert_eq!(tally.approvals_for_round(0, &[0xAA; 32]), 5);
+
+        for n in 0..5u8 {
+            tally.record(voter(n), 1, [0xBB; 32]);
+        }
+        assert_eq!(
+            tally.approvals_for_round(0, &[0xAA; 32]),
+            0,
+            "the old round must not retain voters who have moved on"
+        );
+        assert_eq!(tally.approvals_for_round(1, &[0xBB; 32]), 5);
     }
 }
