@@ -79,6 +79,9 @@ pub mod terminal_reject_cache;
 /// Bridge from the share-batch chain to this node's share verification (WP-5).
 pub mod sbc_checks;
 
+/// The share-batch chain running in shadow (WP-5) — computes, persists, pays nobody.
+pub mod sbc_shadow;
+
 pub mod round;
 
 /// Stratum JSON-RPC request parsing.

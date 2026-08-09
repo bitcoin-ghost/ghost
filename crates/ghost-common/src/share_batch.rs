@@ -13,6 +13,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::types::ShareProof;
@@ -132,16 +133,23 @@ const BATCH_HASH_DOMAIN: &[u8] = b"ShareBatch/v1";
 /// `seq` is independent of block height. Share consensus runs on its own cadence and never waits on
 /// a block — the whole point of the redesign is that a tip change *consumes* the latest agreed
 /// batch rather than triggering agreement.
-#[derive(Debug, Clone)]
+/// Serialisation is by hex for byte arrays, matching every other wire type here. The encoding is
+/// free to change: `batch_hash` is computed over CANONICAL bytes, never over the serialized form,
+/// precisely so two nodes need not produce byte-identical JSON to agree on a batch's identity.
+/// What the encoding must do is round-trip faithfully, since a stored batch is served verbatim to
+/// a syncing peer who then recomputes the hash for itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareBatch {
     /// Position in the chain. Increments by one per adopted batch; unrelated to block height.
     pub seq: u64,
     /// Hash of the previous batch, making the chain a chain.
+    #[serde(with = "crate::serde_hex::bytes32")]
     pub prev_batch_hash: [u8; 32],
     /// When the proposer closed this batch. Advisory — a share's eligibility is decided by chain
     /// membership, not by landing inside a window.
     pub close_ts: i64,
     /// Who proposed it, per the deterministic round-robin.
+    #[serde(with = "crate::serde_hex::bytes32")]
     pub proposer: [u8; 32],
     /// The shares, in canonical order.
     pub shares: Vec<ShareProof>,
@@ -156,6 +164,7 @@ pub struct ShareBatch {
     /// Qualified-node shares (the 5-4-3-2-1 snapshot) as of this batch.
     pub node_shares: Vec<([u8; 32], i32)>,
     /// Commitment to the running per-address balances after applying this batch.
+    #[serde(with = "crate::serde_hex::bytes32")]
     pub state_root: [u8; 32],
     /// Whether shares were deferred to the next batch for want of room.
     ///
