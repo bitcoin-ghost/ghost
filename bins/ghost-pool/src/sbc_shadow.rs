@@ -117,6 +117,20 @@ pub struct ShadowChain {
     /// quarantined it. Any 30 s window without a polka would have turned honest nodes into
     /// self-quarantined equivocators fleet-wide.
     my_proposal: Mutex<Option<((u64, u32), ShareBatch)>>,
+    /// The qualified-node set this chain agrees on, carried forward from the head batch.
+    ///
+    /// THE VOTER SET IS CONSENSUS DATA. It used to be a live per-node database query, and that one
+    /// fact defeated four successive mechanisms for proving a sequence had committed — quorum is
+    /// `bft_threshold(view)` so nodes disagreed on the bar, and a commit certificate hashes the
+    /// membership so it could never match. Anchoring the query's CUTOFF to `head.close_ts` was not
+    /// enough either: identical input still gave different output, because the query scans local
+    /// eventually-consistent tables that are also subject to per-node retention pruning.
+    ///
+    /// Seeded at genesis from the ratified payout checkpoint's `node_shares` — an object the fleet
+    /// already agreed on — then carried forward by every batch, with `verify_batch` treating any
+    /// change as a terminal fault. Every node therefore derives the same set from the same chain,
+    /// and no query touches the consensus path at all.
+    membership: RwLock<Vec<([u8; 32], i32)>>,
     /// Precommit signatures, so a commit can be PROVED to a node that missed it.
     ///
     /// Signatures used to be verified and thrown away — the tally only ever needed to count
@@ -178,6 +192,19 @@ impl ShadowChain {
             info!(count = restored.len(), "SBC shadow: restored quarantine");
         }
 
+        // A restart must recover membership from the chain, not start empty: an empty set means a
+        // zero quorum, and the whole point is that this value is derived from consensus data
+        // rather than from whatever this process happens to know.
+        let membership = head
+            .as_ref()
+            .and_then(|h| db.sbc_get_batch(h.seq).ok().flatten())
+            .and_then(|j| serde_json::from_str::<ShareBatch>(&j).ok())
+            .map(|b| b.node_shares)
+            .unwrap_or_default();
+        if !membership.is_empty() {
+            info!(voters = membership.len(), "SBC shadow: membership resumed");
+        }
+
         Ok(Self {
             identity,
             db,
@@ -189,6 +216,7 @@ impl ShadowChain {
             vote_lock: Mutex::new(SeqVoteLock::new()),
             tallies: Mutex::new(BTreeMap::new()),
             consensus: Mutex::new(BTreeMap::new()),
+            membership: RwLock::new(membership),
             precommit_sigs: Mutex::new(BTreeMap::new()),
             certs: Mutex::new(BTreeMap::new()),
             proposals: Mutex::new(BTreeMap::new()),
@@ -292,7 +320,8 @@ impl ShadowChain {
             proposer: self.identity.node_id(),
             shares: packed.included,
             settled_blocks: Vec::new(),
-            node_shares: Vec::new(),
+            // Carried forward, never re-derived. `verify_batch` faults any change.
+            node_shares: self.membership.read().clone(),
             state_root,
             truncated: packed.truncated,
             pending_count: packed.deferred.len() as u32,
@@ -668,6 +697,15 @@ impl ShadowChain {
         self.certs.lock().get(&seq).cloned()
     }
 
+    /// The qualified-node ids this chain agrees on.
+    ///
+    /// Derived entirely from the chain, so every node holding the same head returns the same set.
+    pub fn voter_ids(&self) -> Vec<[u8; 32]> {
+        let mut ids: Vec<[u8; 32]> = self.membership.read().iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// What this node is LOCKED on at `seq`, if anything.
     ///
     /// Exposed so the handler can tell "locked but never managed to precommit" from "not locked",
@@ -875,6 +913,11 @@ impl ShadowChain {
             finalised_at: now,
         });
 
+        // Carry membership forward from what we just adopted. Identical to the parent's by
+        // construction — `verify_batch` faults any change — so this is a restatement, not a
+        // decision, and it keeps the value correct across a restart that resumes from the store.
+        *self.membership.write() = batch.node_shares.clone();
+
         // Everything at or below the adopted sequence is decided, so its consensus and proposal
         // state is dead weight. Pruning here rather than on a timer means the bound is always
         // relative to what is final — the one place it is safe to cut.
@@ -1015,6 +1058,11 @@ impl ShadowChain {
             &batch_json,
             now,
         )?;
+
+        // Seed membership from the ratified checkpoint this genesis batch was built from. That
+        // set is the one thing the fleet provably agreed on, which is why it is the right root of
+        // trust for everything the chain later counts.
+        *self.membership.write() = batch.node_shares.clone();
 
         *self.balances.write() = balances;
         *self.head.write() = Some(ChainHead {
@@ -1402,6 +1450,117 @@ mod tests {
                 .map(|b| b.batch_hash()),
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Audit 7.** Membership comes from the chain, seeded by the ratified checkpoint.
+    ///
+    /// Not from a live query. That query is a per-node scan of eventually-consistent tables which
+    /// are also pruned on each node's own clock, so identical arguments still gave different
+    /// answers — and every mechanism for proving a commit foundered on it, because a quorum cannot
+    /// be proved over a membership the two parties do not share.
+    #[test]
+    fn membership_is_seeded_from_the_ratified_checkpoint_and_carried_by_the_chain() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+
+        assert!(
+            chain.voter_ids().is_empty(),
+            "before genesis there is no agreed membership to report"
+        );
+
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        let from_chain = chain.voter_ids();
+        let from_checkpoint: Vec<[u8; 32]> = {
+            let cp = db
+                .get_payout_ledger_checkpoint_at_or_before(961_642)
+                .expect("cp")
+                .expect("some");
+            let mut v: Vec<[u8; 32]> = cp.node_shares.iter().map(|(n, _)| *n).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            from_chain, from_checkpoint,
+            "genesis membership must BE the set the fleet ratified"
+        );
+
+        // A batch we build carries it forward rather than re-deriving it.
+        for salt in 0..3u8 {
+            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+        }
+        let schedule = ProposerSchedule::new(chain.voter_ids());
+        let head = chain.head().expect("head");
+        if let Some(batch) = chain.try_propose(&schedule, head.close_ts + 5, 64_000) {
+            let mut carried: Vec<[u8; 32]> = batch.node_shares.iter().map(|(n, _)| *n).collect();
+            carried.sort_unstable();
+            assert_eq!(
+                carried, from_chain,
+                "a proposal must carry membership forward"
+            );
+        }
+    }
+
+    /// A batch that changes membership is a terminal FAULT, not a defer.
+    ///
+    /// A proposer able to rewrite the voter set could hand itself a quorum.
+    #[test]
+    fn changing_membership_is_a_fault() {
+        use ghost_common::batch_consensus::{verify_batch, BatchVerdict, FaultReason};
+
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        let head = chain.head().expect("head");
+        let parent: ShareBatch =
+            serde_json::from_str(&chain.batch_at(head.seq).expect("get").expect("some"))
+                .expect("parse");
+
+        let mut child = parent.clone();
+        child.seq = parent.seq + 1;
+        child.prev_batch_hash = parent.batch_hash();
+        child.close_ts = parent.close_ts + 30;
+        child.shares = Vec::new();
+        // The attack: quietly add yourself to the voter set.
+        child.node_shares.push(([0xEE; 32], 5));
+
+        // Position is judged BEFORE contents, so the batch must come from the node actually due
+        // — otherwise it defers on the rota and never reaches the membership check.
+        let schedule = ProposerSchedule::new(chain.voter_ids());
+        let escalation = schedule.escalation_at(parent.close_ts, child.close_ts);
+        child.proposer = schedule
+            .proposer_at(child.seq, escalation)
+            .expect("a due proposer");
+
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let verdict = verify_batch(
+            &child,
+            &parent,
+            &chain.balances(),
+            &schedule,
+            child.close_ts,
+            &checks,
+        );
+        assert!(
+            matches!(
+                verdict,
+                BatchVerdict::Fault(FaultReason::MembershipChanged { .. })
+            ),
+            "rewriting membership must be terminal, got {verdict:?}"
         );
     }
 

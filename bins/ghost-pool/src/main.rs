@@ -3777,35 +3777,26 @@ async fn main() -> Result<()> {
         // The voter set is the SAME scoped query the checkpoint root uses, so the two systems
         // cannot disagree about who is entitled to vote while both are live.
         let sbc_voters: ghost_pool::sbc_handler::VoterSetFn = {
-            let f = active_voter_set_fn.clone();
-            let rm_c = Arc::clone(&round_manager);
             let chain_c = Arc::clone(chain);
             Arc::new(move || {
-                let height = rm_c.current_height();
-                // ANCHORED TO CONSENSUS DATA, not to this node's clock.
+                // READ FROM THE CHAIN, NOT THE DATABASE.
                 //
-                // The cutoff scopes the qualification query, so it decides MEMBERSHIP. It used to
-                // be `Utc::now()`, which meant every node computed a different voter set from a
-                // different window — and the comment above it claimed tip-anchoring that was never
-                // implemented (`let _ = &rpc_c;` was the tell).
+                // This was a live per-node qualification query, and that single fact defeated four
+                // successive mechanisms for proving a sequence had committed. Quorum is
+                // `bft_threshold(view)`, so nodes disagreed on the bar; a commit certificate hashes
+                // the voter set, so it could never match. You cannot prove a quorum over a
+                // membership the two parties do not share.
                 //
-                // Nothing built on top could then work. Quorum is `bft_threshold(view)`, so nodes
-                // disagreed on the bar; commit certificates hash the voter set, so they could
-                // never match; and four successive mechanisms for "was this sequence committed?"
-                // each foundered on the same thing — you cannot prove a quorum over a membership
-                // the two parties do not share.
+                // Anchoring the query's CUTOFF to consensus data was not enough — identical input
+                // still gave different output, because the query scans local eventually-consistent
+                // tables that are also pruned on each node's own clock. So the query is gone from
+                // the consensus path: membership is seeded at genesis from the ratified payout
+                // checkpoint and carried forward by every batch, with any change a terminal fault.
                 //
-                // `head.close_ts` is inside the adopted batch and feeds `batch_hash`, so every
-                // node that adopted the head holds it byte for byte. This is the same fix the rota
-                // clock needed, and for the same reason: a voter set that is a function of local
-                // time is not a voter set.
-                //
-                // No head means no genesis, and a node that cannot judge a batch has no business
-                // asserting who may vote on one.
-                let Some(head) = chain_c.head() else {
-                    return Vec::new();
-                };
-                f(head.close_ts, height)
+                // It also takes the heaviest synchronous scan off the hot path — `schedule()` ran
+                // it up to three times per message, against the same SQLite already carrying
+                // #554's load.
+                chain_c.voter_ids()
             })
         };
 

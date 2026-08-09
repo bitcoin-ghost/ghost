@@ -209,6 +209,23 @@ pub enum FaultReason {
     TruncationContradiction { truncated: bool, pending_count: u32 },
     /// The proposer did not sign the batch it proposed.
     ProposerSignatureInvalid,
+    /// The batch changed the qualified-node set without authority to.
+    ///
+    /// Membership is CONSENSUS DATA carried by the chain, not something each node re-derives. It
+    /// used to come from a live per-node database query, and that single fact defeated four
+    /// successive mechanisms for proving a sequence had committed: quorum is
+    /// `bft_threshold(view)`, so nodes disagreed on the bar, and a commit certificate hashes the
+    /// voter set, so it could never match. You cannot prove a quorum over a membership the two
+    /// parties do not share.
+    ///
+    /// Carrying it forward makes every node derive the same set from the same chain, with no query
+    /// on the consensus path at all. Genesis seeds it from the ratified payout checkpoint — an
+    /// object the fleet already agreed on — and it is fixed from there. Changing it is a fault
+    /// because a proposer that could rewrite membership could vote itself a quorum.
+    MembershipChanged {
+        parent_count: usize,
+        batch_count: usize,
+    },
 }
 
 /// The outcome of judging a batch.
@@ -288,6 +305,16 @@ pub fn verify_batch<C: BatchChecks>(
     };
 
     // --- from here on, every failure is the batch's own fault ---
+
+    // Membership is carried by the chain, not re-derived per node. A proposer that could rewrite
+    // it could hand itself a quorum, so any change is terminal rather than a defer.
+    if batch.node_shares != parent.node_shares {
+        return BatchVerdict::Fault(FaultReason::MembershipChanged {
+            parent_count: parent.node_shares.len(),
+            batch_count: batch.node_shares.len(),
+        });
+    }
+
     if batch.close_ts <= parent.close_ts {
         return BatchVerdict::Fault(FaultReason::CloseTimeNotForward {
             close_ts: batch.close_ts,
