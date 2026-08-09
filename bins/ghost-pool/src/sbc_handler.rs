@@ -228,10 +228,12 @@ impl MessageHandler for ShareBatchHandler {
                 Ok(())
             }
             MessageType::ShareBatchSync => self.on_sync(&envelope, now),
-            other => {
-                warn!(?other, "SBC handler received a message it does not handle");
-                Ok(())
-            }
+            // Silent, not a warning. `Mesh::register_handler` pushes onto a LIST — every handler
+            // is offered every message, so "not mine" is the overwhelmingly common case, not an
+            // anomaly. Warning on it produced 168 lines in two minutes on ghost-vm8 (~5,000/hour
+            // per node) for entirely normal traffic, which is the log volume #582/#583 exist to
+            // stop. Matches the fallback every other handler uses.
+            _ => Ok(()),
         }
     }
 }
