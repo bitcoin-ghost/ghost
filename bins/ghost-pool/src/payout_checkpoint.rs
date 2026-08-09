@@ -79,6 +79,18 @@ pub type VoterReport = (Vec<(String, u128)>, Vec<(NodeId, i32)>);
 
 pub type ComputeRootFn = Arc<dyn Fn(i64, u64) -> Option<CanonicalPayout> + Send + Sync>;
 
+/// How long a resolved voter set stays usable.
+///
+/// Short on purpose. The storm this exists to stop is many messages about ONE `(height,
+/// cutoff_ts)` arriving within seconds of each other, so even a few seconds collapses it; the TTL
+/// only has to outlive a checkpoint round, not a checkpoint. Long-lived caching would risk pinning
+/// a stale voter set — and therefore a wrong deterministic proposer — after a late
+/// `verification_ledger` row changes qualification at a cutoff already passed.
+const VOTER_SET_CACHE_TTL_SECS: u64 = 30;
+
+/// Resolved voter sets, keyed by the `(height, cutoff_ts)` they were resolved for.
+type VoterSetCache = HashMap<(u64, i64), (Vec<NodeId>, std::time::Instant)>;
+
 /// Miner-work tolerance for option (c). The share SET converges (proven by the union)
 /// but attribution (same share → different miner_id representation) and float-sum-order
 /// leave a per-address work difference; a voter approves the proposer's canonical payout
@@ -428,6 +440,24 @@ pub struct PayoutCheckpointManager {
     last_stall_alarm: RwLock<u64>,
     /// Server-side per-peer serve cooldown: requesting node -> last time we served it (ms).
     sync_serves: RwLock<HashMap<NodeId, u64>>,
+    /// Memoised voter sets, keyed by the `(height, cutoff_ts)` they were resolved for.
+    ///
+    /// `voter_set_for` resolves the active voter set by walking qualification, which reaches
+    /// `get_all_qualified_nodes_at_cutoff_from_db` -> `majority_capability_qualified` and joins
+    /// `verification_ledger` against `nodes`. On a 2026-08-09 profile of ghost-vm6 that chain was
+    /// the single largest term in the process — `voter_set_for` alone drew 636 samples against 174
+    /// for the canonical-payout recompute everyone assumed was the cost.
+    ///
+    /// It is called from the MESSAGE path, not a timer: every checkpoint proposal, vote and sync
+    /// reply resolves it again. Because a stalled height is re-proposed, the fleet re-resolved the
+    /// SAME `(height, cutoff_ts)` continuously — ~2,200 database page reads per second, sustained,
+    /// on every node, which is what starved the HTTP API into 504s fleet-wide.
+    ///
+    /// Keyed rather than global because the answer legitimately differs per height. TTL'd rather
+    /// than permanent because a late `verification_ledger` row can change qualification at a cutoff
+    /// already passed, and a voter set that can never be revised would pin a wrong proposer for as
+    /// long as the process lived.
+    voter_set_cache: RwLock<VoterSetCache>,
 }
 
 fn now_ms() -> u64 {
@@ -480,6 +510,7 @@ impl PayoutCheckpointManager {
             last_sync_request: RwLock::new(0),
             last_stall_alarm: RwLock::new(0),
             sync_serves: RwLock::new(HashMap::new()),
+            voter_set_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -550,10 +581,36 @@ impl PayoutCheckpointManager {
         let elders = self.elders_sorted();
         if height >= crate::active_voter_set_height() {
             if let Some(resolve) = &self.active_voter_set {
-                return widen_voter_set(elders, resolve(cutoff_ts, height));
+                if let Some(hit) = self.cached_voter_set(height, cutoff_ts) {
+                    return hit;
+                }
+                let resolved = widen_voter_set(elders, resolve(cutoff_ts, height));
+                self.store_voter_set(height, cutoff_ts, &resolved);
+                return resolved;
             }
         }
         elders
+    }
+
+    /// A cached voter set for this key, if one is present and still fresh.
+    fn cached_voter_set(&self, height: u64, cutoff_ts: i64) -> Option<Vec<NodeId>> {
+        let cache = self.voter_set_cache.read();
+        let (set, at) = cache.get(&(height, cutoff_ts))?;
+        (at.elapsed().as_secs() < VOTER_SET_CACHE_TTL_SECS).then(|| set.clone())
+    }
+
+    /// Record a resolved voter set, evicting anything already expired.
+    ///
+    /// Eviction is a full sweep rather than an LRU because the map is small by construction — one
+    /// entry per in-flight `(height, cutoff_ts)` — and a sweep cannot leak an entry whose height
+    /// the node never revisits, which an LRU bounded only by size can.
+    fn store_voter_set(&self, height: u64, cutoff_ts: i64, set: &[NodeId]) {
+        let mut cache = self.voter_set_cache.write();
+        cache.retain(|_, (_, at)| at.elapsed().as_secs() < VOTER_SET_CACHE_TTL_SECS);
+        cache.insert(
+            (height, cutoff_ts),
+            (set.to_vec(), std::time::Instant::now()),
+        );
     }
 
     /// Deterministic proposer for `height` (round-robin over the voter set at `cutoff_ts`).
@@ -1325,6 +1382,121 @@ mod tests {
     /// "outside tolerance" — three of the four causes are not about tolerance at all,
     /// and the single shared message is what kept the four-day 2026-07-25 stall
     /// pointed at the wrong constant. → #548.
+    #[test]
+    /// The voter set must be resolved ONCE per (height, cutoff_ts), not once per message.
+    ///
+    /// This is the #554 hot path. `voter_set_for` reaches
+    /// `get_all_qualified_nodes_at_cutoff_from_db` -> `majority_capability_qualified` and joins
+    /// `verification_ledger` against `nodes`; a 2026-08-09 profile of ghost-vm6 put it at 636
+    /// samples, the largest single term in the process and 3.6x the canonical-payout recompute.
+    /// It was called from the MESSAGE path, so a re-proposed height re-resolved the same answer
+    /// forever — ~2,200 db page reads/sec on every node, which is what 504'd the HTTP API.
+    fn the_voter_set_is_resolved_once_per_height_not_once_per_call() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        let elders: Vec<NodeId> = (1..=3u8).map(|n| [n; 32]).collect();
+        register_elders(&db, &elders);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let resolved: Vec<NodeId> = (1..=5u8).map(|n| [n; 32]).collect();
+        let resolved_c = resolved.clone();
+
+        let mgr = PayoutCheckpointManager::new(
+            Arc::new(NodeIdentity::generate()),
+            Arc::clone(&db),
+            Arc::new(|_, _| Ok(())),
+            Arc::new(|_c, _h| None),
+        )
+        .with_active_voter_set_fn(Arc::new(move |_cutoff, _height| {
+            calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            resolved_c.clone()
+        }));
+
+        let height = crate::active_voter_set_height();
+        let first = mgr.voter_set_for(height, 1_786_228_093);
+        for _ in 0..24 {
+            let again = mgr.voter_set_for(height, 1_786_228_093);
+            assert_eq!(
+                again, first,
+                "a cached voter set must equal the resolved one"
+            );
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "25 calls for one (height, cutoff) must resolve the voter set exactly once"
+        );
+    }
+
+    /// A different height must NOT reuse another height's voter set.
+    ///
+    /// The cache is keyed, not global: the voter set legitimately differs per height, and serving
+    /// one height's answer for another would pin the wrong deterministic proposer.
+    #[test]
+    fn a_different_height_resolves_its_own_voter_set() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        let elders: Vec<NodeId> = (1..=3u8).map(|n| [n; 32]).collect();
+        register_elders(&db, &elders);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        // Answer depends on height, so a key collision is observable in the RESULT, not just the
+        // call count — a cache that ignored height would return node [9;32] for both.
+        let mgr = PayoutCheckpointManager::new(
+            Arc::new(NodeIdentity::generate()),
+            Arc::clone(&db),
+            Arc::new(|_, _| Ok(())),
+            Arc::new(|_c, _h| None),
+        )
+        .with_active_voter_set_fn(Arc::new(move |_cutoff, height| {
+            calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![[(height % 251) as u8; 32], [1u8; 32], [2u8; 32], [3u8; 32]]
+        }));
+
+        let base = crate::active_voter_set_height();
+        let a = mgr.voter_set_for(base, 1_786_228_093);
+        let b = mgr.voter_set_for(base + 1, 1_786_228_093);
+
+        assert_ne!(a, b, "distinct heights must not share a cached voter set");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each distinct height resolves once"
+        );
+    }
+
+    /// A different cutoff at the same height must also resolve separately.
+    #[test]
+    fn a_different_cutoff_resolves_its_own_voter_set() {
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        let elders: Vec<NodeId> = (1..=3u8).map(|n| [n; 32]).collect();
+        register_elders(&db, &elders);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let mgr = PayoutCheckpointManager::new(
+            Arc::new(NodeIdentity::generate()),
+            Arc::clone(&db),
+            Arc::new(|_, _| Ok(())),
+            Arc::new(|_c, _h| None),
+        )
+        .with_active_voter_set_fn(Arc::new(move |cutoff, _height| {
+            calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![[(cutoff % 251) as u8; 32], [1u8; 32], [2u8; 32], [3u8; 32]]
+        }));
+
+        let h = crate::active_voter_set_height();
+        let a = mgr.voter_set_for(h, 1_786_228_093);
+        let b = mgr.voter_set_for(h, 1_786_228_094);
+
+        assert_ne!(a, b, "the cutoff is part of the key, not decoration");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn disagreement_names_the_check_that_actually_failed() {
         let local = cp(&[("addr_a", 1_000_000_000_000_000), ("addr_b", 500)]);
