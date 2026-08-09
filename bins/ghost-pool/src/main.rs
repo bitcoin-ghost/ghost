@@ -3686,10 +3686,41 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // One status line every STATUS_EVERY ticks (~5 min). The escalation clock is the
+                // input to whose-turn-it-is and was previously unobservable in production — a fix
+                // to it could only be INFERRED from the database, never seen. If nodes disagree
+                // about the rota during the soak, this is the line that says why.
+                //
+                // Five minutes, not every tick: eight nodes logging every 30 s is ~960 lines/hour
+                // for values that change slowly, and this module has already caused one
+                // log-volume incident.
+                const STATUS_EVERY: u32 = 10;
+                let mut ticks: u32 = 0;
                 loop {
                     interval.tick().await;
                     let now = chrono::Utc::now().timestamp();
                     let schedule = ghost_common::batch_consensus::ProposerSchedule::new(voters_c());
+
+                    ticks = ticks.wrapping_add(1);
+                    if ticks % STATUS_EVERY == 1 {
+                        let opened = chain_c.seq_opened();
+                        let head = chain_c.head();
+                        tracing::info!(
+                            seq = head.as_ref().map(|h| h.seq),
+                            state_root = head
+                                .as_ref()
+                                .map(|h| hex::encode(&h.state_root[..8]))
+                                .unwrap_or_else(|| "none".into()),
+                            seq_opened = opened,
+                            escalation = schedule.escalation_at(opened, now),
+                            voters = schedule.len(),
+                            quorum = schedule.quorum(),
+                            pending = chain_c.pending_count(),
+                            balances = chain_c.balance_count(),
+                            "SBC status"
+                        );
+                    }
+
                     if schedule.is_empty() {
                         continue;
                     }

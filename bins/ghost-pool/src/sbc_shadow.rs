@@ -137,6 +137,11 @@ impl ShadowChain {
         self.pending.lock().len()
     }
 
+    /// How many addresses carry a balance. Cheap — does not clone the map.
+    pub fn balance_count(&self) -> usize {
+        self.balances.read().len()
+    }
+
     /// When the current sequence opened — the instant stall escalation is measured from.
     ///
     /// Exposed because it is the input to whose-turn-it-is, and a wrong value here is invisible
