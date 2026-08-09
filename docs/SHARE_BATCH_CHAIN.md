@@ -533,11 +533,69 @@ i.e. before 2026-08-31** — target genesis by ~2026-08-20.
       is equally correct. Do not read the 960,550 number as a threshold.
 - [ ] the ceremony itself: pick it, sign it, adopt it fleet-wide
 
-### WP-5 — shadow run + trust gate
+### WP-5 — shadow run + trust gate (CODE COMPLETE 2026-08-09, NOT YET RUN)
 Both systems live; only checkpoints feed the coinbase. Gate: byte-identical `(seq, state_root)`
 across all 8 for a sustained window, zero quorum stalls, drift vs checkpoints bounded and
 non-growing, plus a regtest settlement+reorg rehearsal on the shipping binary. **Nothing is armed or
 deleted until this passes.**
+
+Branch `feat/wp5-shadow-run`, 13 commits, `record-tests.sh` green at `5e0ba6d79`.
+
+- [x] **v50 persistence** — `sbc_balances` (the payable state, ~68 rows), `sbc_batches` (the adopted
+      chain, keyed by seq, BOUNDED window), `sbc_quarantine` (operator-release-only, so it cannot
+      live in memory). Deliberately NOT a share archive: the programme exists because payable state
+      is O(shares) rather than O(addresses), and a share-per-row table here would rebuild that one
+      layer down. A test asserts `sbc_batches` has no per-share columns.
+      Balances key on H(plaintext address), not the ciphertext — `encrypt_sensitive` draws a fresh
+      random nonce per call, so a ciphertext key could never be looked up and every fold would
+      scatter a miner's balance across duplicate rows. The hash is also portable between nodes,
+      which the per-node ciphertext is not.
+- [x] **storage accessors** — `crates/ghost-storage/src/sbc_store.rs`, 8 tests. Replace-not-merge on
+      save (a stale row keeps contributing to the next root); a DIFFERENT batch at the same seq is
+      refused as equivocation while a resend is idempotent; pruning measures from the batch being
+      written rather than MAX(seq) and never drops the head; sync is served verbatim because a
+      re-serialisation differing by one byte is a batch hash that no longer verifies.
+- [x] **`BatchChecks`** — `bins/ghost-pool/src/sbc_checks.rs`, 9 tests. Validity is PoW preimage +
+      GHOST-09 signature and nothing else. Deliberately NARROWER than `handle_share_proof`, which
+      also applies C5 dedup, M-6, template staleness, L-7 and M-29 — those decide whether this node
+      files a share it was handed, none is a property of the share.
+      ⚠ **The shadow run is therefore EXPECTED to credit slightly MORE work than the live ledger.**
+      M-6 refuses a remote share for a missing `template_id` on a path that never reads the field,
+      stranding historical shares at ~2,000-2,900 rejections/hour on every node. That drift is the
+      defect being corrected; the gate needs it BOUNDED and NON-GROWING, not absent.
+- [x] **shadow chain** — `bins/ghost-pool/src/sbc_shadow.rs`, 13 tests. A node batches only shares
+      IT received; taking a peer's would credit the same work twice with both batches individually
+      valid. Persist balances THEN batch, so a crash replays an idempotent fold rather than leaving
+      a head ahead of its balances. `build_batch` does not drain the pending pool — only adoption
+      does, and only of what was adopted, which is what makes a missed batch a deferral not a loss.
+      `finalise` refuses a batch whose stated root does not reproduce locally.
+- [x] **propose/vote over the rota**, including stall escalation and persisted quarantine. Judging
+      happens against the parent BATCH read back from storage; a parent outside the window is a
+      Hold, never a fault, because faulting it would have honest nodes quarantining each other for
+      being behind.
+- [x] **mesh handler** — `bins/ghost-pool/src/sbc_handler.rs`. A vote signs seq AND hash (the hash
+      alone replays at another sequence). The node counts its own vote. Falling behind sends a sync
+      REQUEST rather than waiting. A request we cannot answer gets no response rather than a
+      fabricated one.
+      Added `Serialize`/`Deserialize` to `ShareBatch`, which WP-3 left off — the message types and
+      size limits existed but the proposal payload could not be encoded, so the wire path was
+      unreachable.
+- [x] **runtime wiring behind `pool.share_batch_shadow`**, default FALSE. A config flag rather than
+      a height gate on purpose: a height gate flips all eight at once, which is the opposite of what
+      a shadow run is for, and this is safe to enable one node at a time.
+- [x] **three-node convergence test** — separate ShadowChains, separate databases, separate
+      encryption keys, byte-identical `(seq, state_root)` through a full SQLite round trip.
+      ⚠ Found by mutation while writing it: **a convergence assertion cannot catch a uniform
+      arithmetic error.** Every node runs the same fold, so a fold wrong the same way everywhere
+      still agrees — adding 1 to every credit left the roots identical and the test green. Expected
+      balances are now pinned BY VALUE as well as by agreement. **Eight nodes agreeing does not by
+      itself mean they are right**, which matters for how the gate result is read.
+- [ ] OPERATOR: genesis ceremony at 961,642 — must complete while single-operator
+- [ ] OPERATOR: canary or fleet for enabling the shadow run. The gate needs all 8 agreeing, so a
+      canary cannot demonstrate the property — but it can find whatever stops the process starting.
+- [ ] the soak itself, and the regtest settlement+reorg rehearsal
+
+**Nothing here has executed on a real node.** Every claim above rests on unit tests and reading.
 
 ### WP-6 — consumption cutover
 Tip change reads the `ArmedPayout`; proposal binding moves from `cutoff_ts` equality to
