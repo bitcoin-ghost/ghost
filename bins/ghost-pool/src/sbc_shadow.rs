@@ -1110,4 +1110,126 @@ mod tests {
         );
         assert!(chain.head().is_none());
     }
+
+    /// Convert the REAL adopted checkpoint at 961,642 — the pinned genesis anchor — through the
+    /// real storage accessor and the real bootstrap, and check it lands on the golden vector.
+    ///
+    /// The other genesis tests use a fixture. This one uses the exact bytes all 8 nodes ratified,
+    /// read back the way a node will read them, so it tests the PATH and not just the arithmetic.
+    /// If this ever disagrees with `batch_genesis.rs`'s pinned root, either the conversion or the
+    /// state-root encoding has moved and the ceremony would open eight different chains.
+    #[test]
+    fn the_real_961642_checkpoint_converts_to_the_pinned_genesis_root() {
+        fn hexid(h: &str) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).expect("hex");
+            }
+            out
+        }
+
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+
+        // Exactly what the fleet adopted, read from ghost-vm8 2026-08-09: 5 payees, 8 node
+        // entries, cutoff_ts 1786228093.
+        let record = ghost_storage::queries::PayoutLedgerCheckpointRecord {
+            height: 961_642,
+            cutoff_ts: 1_786_228_093,
+            ledger_root: hexid("0fe9bac3023f624b99b087a9c7e6c4c8b5cd557225f0ea9ef9828608fec0caa9"),
+            proposer_id: "unused-by-genesis".to_string(),
+            active_node_count: 8,
+            miner_payouts: vec![
+                (
+                    "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
+                    52_157_533_139_126_865_362_944u128,
+                ),
+                (
+                    "bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".to_string(),
+                    2_503_874_639_417_892_143_104u128,
+                ),
+                (
+                    "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".to_string(),
+                    2_341_458_453_435_845_967_872u128,
+                ),
+                (
+                    "148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN".to_string(),
+                    478_353_203_210_592_976_896u128,
+                ),
+                (
+                    "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h".to_string(),
+                    9_741_908_758_669_000_704u128,
+                ),
+            ],
+            node_shares: vec![
+                (
+                    hexid("5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393"),
+                    6,
+                ),
+                (
+                    hexid("e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927"),
+                    10,
+                ),
+                (
+                    hexid("fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622"),
+                    10,
+                ),
+                (
+                    hexid("849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c"),
+                    10,
+                ),
+                (
+                    hexid("9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"),
+                    10,
+                ),
+                (
+                    hexid("46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b"),
+                    6,
+                ),
+                (
+                    hexid("f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f"),
+                    6,
+                ),
+                (
+                    hexid("4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132"),
+                    6,
+                ),
+            ],
+        };
+        db.upsert_payout_ledger_checkpoint(&record).expect("seed");
+
+        let chain = ShadowChain::load(id, Arc::clone(&db)).expect("load");
+        let h = chain
+            .bootstrap_genesis(crate::SBC_GENESIS_ANCHOR_HEIGHT, 0)
+            .expect("bootstrap")
+            .expect("the anchor checkpoint is present");
+        assert_eq!(h, 961_642);
+
+        let head = chain.head().expect("head");
+        let root: String = head.state_root.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            root, "cb5ac8470686192246bfc1330791e85023f2044b58f0b076b167ff89923ddc7f",
+            "the real checkpoint must convert to the golden vector pinned in batch_genesis.rs"
+        );
+
+        // The first link must point at the object that authorises it.
+        assert!(
+            chain.batch_at(0).expect("stored").is_some(),
+            "genesis must be retrievable for a peer syncing from seq 0"
+        );
+
+        // Five payees survive; the dominant one holds ~90% of the ledger and is where a
+        // conversion bug would actually cost someone money.
+        let balances = chain.balances();
+        assert_eq!(
+            balances.len(),
+            5,
+            "every ratified payee must open with a balance"
+        );
+        assert_eq!(
+            balances.get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
+            Some(&52_157_533_139_126_865i64)
+        );
+    }
 }
