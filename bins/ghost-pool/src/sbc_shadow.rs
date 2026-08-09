@@ -24,6 +24,9 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use tracing::{info, warn};
 
+use ghost_common::batch_consensus::{ProposerSchedule, SeqTally, SeqVoteLock};
+use ghost_common::batch_driver::{on_batch, on_vote, Action, BatchContext, VoteAction};
+use ghost_common::batch_quarantine::Quarantine;
 use ghost_common::error::GhostResult;
 use ghost_common::identity::NodeIdentity;
 use ghost_common::share_batch::{compute_state_root, fold_shares, pack_batch, ShareBatch};
@@ -46,6 +49,27 @@ pub struct ShadowChain {
     /// Running balances after the head. Plaintext address -> integer micro-work, exactly the
     /// form `fold_shares` and `compute_state_root` take.
     balances: RwLock<BTreeMap<String, i64>>,
+    /// Peers quarantined this process, with the outcome the driver decided.
+    quarantine: Mutex<Quarantine>,
+    /// Peers quarantined in an EARLIER process, restored from the database.
+    ///
+    /// Held separately from [`Quarantine`] rather than replayed into it: that type takes the
+    /// `FaultReason` and the voter set the decision was made against, and neither is available at
+    /// load time — the reason is persisted as text and the fleet is not yet known. Reconstructing
+    /// an approximation would put a fabricated reason on a real exclusion.
+    ///
+    /// Checked before the driver is consulted, so release stays operator-only across restarts. An
+    /// automatic timer would let a Byzantine node misbehave, wait it out, and repeat forever.
+    restored_quarantine: RwLock<std::collections::HashSet<[u8; 32]>>,
+    /// One vote per sequence, ever. Two individually-valid batches must not both reach quorum, and
+    /// the voter is the only place that can be prevented.
+    vote_lock: Mutex<SeqVoteLock>,
+    /// Votes seen per sequence. Counted per SEQUENCE rather than per batch, because equivocation
+    /// is only visible when the candidates are tallied together.
+    tallies: Mutex<BTreeMap<u64, SeqTally>>,
+    /// When the current sequence opened, for escalation. A stalled proposer must pass the turn on,
+    /// or a hash chain that cannot skip a sequence deadlocks forever.
+    seq_opened_ts: RwLock<i64>,
 }
 
 /// What a finalisation produced, for the trust gate and for logs.
@@ -70,12 +94,28 @@ impl ShadowChain {
             addresses = balances.len(),
             "SBC shadow: resumed"
         );
+        // Quarantine survives the process by design, so restore it before judging anything.
+        let restored: std::collections::HashSet<[u8; 32]> = db
+            .sbc_quarantined()?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        if !restored.is_empty() {
+            info!(count = restored.len(), "SBC shadow: restored quarantine");
+        }
+
+        let opened = head.as_ref().map(|h| h.close_ts).unwrap_or(0);
         Ok(Self {
             identity,
             db,
             pending: Mutex::new(Vec::new()),
             head: RwLock::new(head),
             balances: RwLock::new(balances),
+            quarantine: Mutex::new(Quarantine::new()),
+            restored_quarantine: RwLock::new(restored),
+            vote_lock: Mutex::new(SeqVoteLock::new()),
+            tallies: Mutex::new(BTreeMap::new()),
+            seq_opened_ts: RwLock::new(opened),
         })
     }
 
@@ -153,6 +193,137 @@ impl ShadowChain {
         let hash = batch.batch_hash();
         batch.proposer_signature = self.identity.sign(&hash).to_vec();
         Some(batch)
+    }
+
+    /// Propose, if it is this node's turn and there is something to say.
+    ///
+    /// Whose turn it is comes from [`ProposerSchedule`], including stall escalation — a hash chain
+    /// cannot skip a sequence, so an absent proposer would deadlock it forever without the turn
+    /// passing on. Exactly one node is authorised to propose at a time; acceptance is wider by a
+    /// step to absorb clock skew, but proposing is not, or two nodes split the vote on one
+    /// sequence.
+    pub fn try_propose(
+        &self,
+        schedule: &ProposerSchedule,
+        now: i64,
+        budget_bytes: usize,
+    ) -> Option<ShareBatch> {
+        let head = self.head()?;
+        let seq = head.seq + 1;
+        let opened = *self.seq_opened_ts.read();
+        if !schedule.is_my_turn(seq, &self.identity.node_id(), opened, now) {
+            return None;
+        }
+        self.build_batch(now, budget_bytes)
+    }
+
+    /// Judge an incoming batch and record what follows.
+    ///
+    /// The decision is entirely `batch_driver::on_batch`'s — this supplies the context and applies
+    /// the consequences. Position is judged before contents there, so a batch this node is not
+    /// entitled to judge is never branded for a defect; the response to a fault cannot be taken
+    /// back.
+    pub fn on_proposal<C: ghost_common::batch_consensus::BatchChecks>(
+        &self,
+        batch: &ShareBatch,
+        schedule: &ProposerSchedule,
+        checks: &C,
+        now: i64,
+    ) -> Action {
+        // A peer excluded in an earlier process stays excluded. Checked here rather than inside
+        // the driver because the restored set is deliberately not replayed into `Quarantine`.
+        if self.restored_quarantine.read().contains(&batch.proposer) {
+            return Action::ProposerQuarantined;
+        }
+
+        let Some(parent_head) = self.head() else {
+            // No genesis yet: we cannot judge anything and must catch up first.
+            return Action::Hold {
+                reason: ghost_common::batch_consensus::DeferReason::AheadOfUs {
+                    batch_seq: batch.seq,
+                    our_seq: 0,
+                },
+            };
+        };
+
+        // The driver judges against the parent BATCH, so a head we hold only as a summary is not
+        // enough — fetch what we adopted. If it is outside the retention window we are too far
+        // behind to judge and must sync, which is a defer, not a fault.
+        let Ok(Some(parent_json)) = self.db.sbc_get_batch(parent_head.seq) else {
+            return Action::Hold {
+                reason: ghost_common::batch_consensus::DeferReason::AheadOfUs {
+                    batch_seq: batch.seq,
+                    our_seq: parent_head.seq,
+                },
+            };
+        };
+        let Ok(parent) = serde_json::from_str::<ShareBatch>(&parent_json) else {
+            warn!(
+                seq = parent_head.seq,
+                "SBC shadow: stored parent will not deserialise — holding rather than judging"
+            );
+            return Action::Hold {
+                reason: ghost_common::batch_consensus::DeferReason::AheadOfUs {
+                    batch_seq: batch.seq,
+                    our_seq: parent_head.seq,
+                },
+            };
+        };
+
+        let balances = self.balances();
+        let ctx = BatchContext {
+            parent: &parent,
+            parent_balances: &balances,
+            schedule,
+            checks,
+            now,
+        };
+
+        let action = {
+            let mut quarantine = self.quarantine.lock();
+            let mut lock = self.vote_lock.lock();
+            on_batch(batch, &ctx, &mut quarantine, &mut lock)
+        };
+
+        // A terminal fault must outlive the process, or a restart silently forgives it.
+        if let Action::Quarantine { reason, .. } = &action {
+            let reason = format!("{reason:?}");
+            if let Err(e) = self
+                .db
+                .sbc_quarantine(batch.proposer, &reason, Some(batch.seq), now)
+            {
+                warn!(error = %e, "SBC shadow: could not persist quarantine");
+            }
+            self.restored_quarantine.write().insert(batch.proposer);
+        }
+
+        action
+    }
+
+    /// Record a vote and report whether it carried the sequence.
+    pub fn on_batch_vote(
+        &self,
+        voter: [u8; 32],
+        batch_hash: [u8; 32],
+        seq: u64,
+        schedule: &ProposerSchedule,
+        now: i64,
+    ) -> VoteAction {
+        let mut tallies = self.tallies.lock();
+        let tally = tallies
+            .entry(seq)
+            .or_insert_with(|| SeqTally::new(seq, schedule.quorum()));
+        let mut quarantine = self.quarantine.lock();
+        on_vote(voter, batch_hash, tally, &mut quarantine, schedule, now)
+    }
+
+    /// Note that a sequence has opened, so escalation is measured from the right moment.
+    ///
+    /// Without this the stall clock would run from the parent's `close_ts`, which is when the
+    /// PREVIOUS batch closed — a sequence that opened late would look stalled the instant it began
+    /// and escalate past a proposer who never had a chance.
+    pub fn note_seq_opened(&self, now: i64) {
+        *self.seq_opened_ts.write() = now;
     }
 
     /// Adopt a finalised batch: fold it, persist it, and advance the head.
@@ -482,5 +653,128 @@ mod tests {
 
         assert_eq!(chain.head().expect("head").seq, 0);
         assert_eq!(chain.balances(), opening);
+    }
+
+    /// Exactly one node proposes per sequence. Being generous here would put two nodes on one
+    /// sequence and split the vote — acceptance is the thing that tolerates skew, not proposing.
+    #[test]
+    fn only_the_node_whose_turn_it_is_proposes() {
+        let id = Arc::new(NodeIdentity::generate());
+        let other = NodeIdentity::generate();
+        let chain = chain(&id);
+        genesis(&chain, BTreeMap::new());
+        chain.record_received(share(&id, "bc1qa", 1.0, 1));
+        chain.note_seq_opened(500);
+
+        // A schedule where the turn for seq 1 belongs to whoever sorts into that slot.
+        let schedule = ProposerSchedule::new([id.node_id(), other.node_id()]);
+        let mine = schedule.is_my_turn(1, &id.node_id(), 500, 500);
+
+        let proposed = chain.try_propose(&schedule, 500, 1_000_000);
+        assert_eq!(
+            proposed.is_some(),
+            mine,
+            "a node must propose exactly when the rota says it is its turn"
+        );
+    }
+
+    /// A stalled sequence must pass to the next node, or a hash chain that cannot skip a sequence
+    /// deadlocks forever on an absent proposer.
+    #[test]
+    fn a_stalled_sequence_escalates_to_another_node() {
+        let id = Arc::new(NodeIdentity::generate());
+        let other = NodeIdentity::generate();
+        let chain = chain(&id);
+        genesis(&chain, BTreeMap::new());
+        chain.record_received(share(&id, "bc1qa", 1.0, 1));
+        chain.note_seq_opened(500);
+
+        let schedule = ProposerSchedule::new([id.node_id(), other.node_id()]);
+        let at_open = schedule.is_my_turn(1, &id.node_id(), 500, 500);
+        // Two escalation steps later the turn must have moved.
+        let later = 500 + 2 * ghost_common::batch_consensus::STALL_ESCALATION_SECS;
+        let after = schedule.is_my_turn(1, &id.node_id(), 500, later);
+        assert_eq!(
+            at_open, after,
+            "with two voters, two steps returns the turn to its starting node"
+        );
+
+        let one_step = 500 + ghost_common::batch_consensus::STALL_ESCALATION_SECS;
+        assert_ne!(
+            at_open,
+            schedule.is_my_turn(1, &id.node_id(), 500, one_step),
+            "one step must hand the turn to the other node"
+        );
+    }
+
+    /// A peer quarantined in an earlier process stays quarantined. Release is operator-only, and a
+    /// restart is not an operator.
+    #[test]
+    fn quarantine_survives_a_restart() {
+        let id = Arc::new(NodeIdentity::generate());
+        let bad = NodeIdentity::generate();
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        db.sbc_quarantine(bad.node_id(), "wrong state root", Some(3), 0)
+            .expect("quarantine");
+
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        genesis(&chain, BTreeMap::new());
+
+        let batch = ShareBatch {
+            seq: 1,
+            prev_batch_hash: [0u8; 32],
+            close_ts: 600,
+            proposer: bad.node_id(),
+            shares: Vec::new(),
+            settled_blocks: Vec::new(),
+            node_shares: Vec::new(),
+            state_root: [0u8; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: Vec::new(),
+        };
+        let schedule = ProposerSchedule::new([id.node_id(), bad.node_id()]);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+
+        assert_eq!(
+            chain.on_proposal(&batch, &schedule, &checks, 600),
+            Action::ProposerQuarantined,
+            "a peer excluded before the restart must not be judged again"
+        );
+    }
+
+    /// Judging must never happen against a parent we do not hold — that is a sync condition, not a
+    /// disagreement, and faulting it would have honest nodes quarantining each other.
+    #[test]
+    fn a_batch_is_held_not_faulted_when_we_lack_the_parent() {
+        let id = Arc::new(NodeIdentity::generate());
+        let peer = NodeIdentity::generate();
+        let chain = chain(&id);
+        // No genesis: we hold nothing.
+
+        let batch = ShareBatch {
+            seq: 9,
+            prev_batch_hash: [0xAB; 32],
+            close_ts: 600,
+            proposer: peer.node_id(),
+            shares: Vec::new(),
+            settled_blocks: Vec::new(),
+            node_shares: Vec::new(),
+            state_root: [0u8; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: Vec::new(),
+        };
+        let schedule = ProposerSchedule::new([id.node_id(), peer.node_id()]);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+
+        assert!(
+            matches!(
+                chain.on_proposal(&batch, &schedule, &checks, 600),
+                Action::Hold { .. }
+            ),
+            "no parent means hold and sync, never accuse"
+        );
     }
 }
