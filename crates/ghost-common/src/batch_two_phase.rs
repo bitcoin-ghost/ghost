@@ -120,6 +120,11 @@ impl SeqConsensus {
         self.seq
     }
 
+    /// Votes needed in one phase, at one round, to carry it.
+    pub fn quorum(&self) -> usize {
+        self.quorum
+    }
+
     pub fn committed(&self) -> Option<[u8; 32]> {
         self.committed
     }
@@ -561,5 +566,70 @@ mod tests {
             Some(B),
             "a failed round must be recoverable, or the chain wedges forever"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regression_tests {
+    use super::*;
+
+    fn v(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+    const A: [u8; 32] = [0xAA; 32];
+    const B: [u8; 32] = [0xBB; 32];
+
+    /// **Audit finding 5.** A polka we REFUSE must not be precommitted.
+    ///
+    /// `apply_polka` correctly declines evidence from a round below our lock, but the driver
+    /// discarded the answer and precommitted anyway — so a node locked on `(5, A)` that
+    /// late-received a polka for `B` at round 2 would sign a precommit for `B` while locked on
+    /// `A`. That is the one act two-phase exists to forbid, and it breaks the quorum-intersection
+    /// argument the whole design rests on.
+    #[test]
+    fn a_refused_polka_leaves_the_lock_alone() {
+        let mut c = SeqConsensus::new(1, 6);
+        c.apply_polka(5, A);
+
+        assert!(!c.apply_polka(2, B), "stale evidence must be refused");
+        assert_eq!(c.lock(), Some((5, A)), "and must not move the lock");
+
+        // The caller's guard is "am I locked on the polka'd value" — which is false here, so no
+        // precommit is emitted. Expressed as the same check the driver makes.
+        let locked_on_b = matches!(c.lock(), Some((_, h)) if h == B);
+        assert!(!locked_on_b, "we must not precommit B while locked on A");
+    }
+
+    /// A polka confirming the value we ALREADY hold must still precommit.
+    ///
+    /// `apply_polka` returns false both for a refused stale polka and for one that merely confirms
+    /// the current value — so the driver cannot use that bool directly. It must ask the lock.
+    #[test]
+    fn a_polka_confirming_our_lock_still_precommits() {
+        let mut c = SeqConsensus::new(1, 6);
+        c.apply_polka(3, A);
+
+        let changed = c.apply_polka(3, A);
+        assert!(!changed, "confirming is not a change of mind");
+
+        let locked_on_a = matches!(c.lock(), Some((_, h)) if h == A);
+        assert!(
+            locked_on_a,
+            "the driver must precommit here — using the bool would wrongly skip it"
+        );
+    }
+
+    /// The quorum a sequence was created with is reported honestly.
+    ///
+    /// The driver reports `needed` in its Counted outcome; hardcoding it produced a log line that
+    /// said `needed=0`, which is exactly the sort of confidently-wrong telemetry that sends an
+    /// operator down the wrong path.
+    #[test]
+    fn quorum_is_reported_not_invented() {
+        let c = SeqConsensus::new(1, 6);
+        assert_eq!(c.quorum(), 6);
+        for n in 0..3u8 {
+            let _ = v(n);
+        }
     }
 }

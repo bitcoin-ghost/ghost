@@ -550,10 +550,32 @@ pub fn on_prevote(
         PrevoteOutcome::Counted { votes, needed } => PrevoteAction::Counted { votes, needed },
         PrevoteOutcome::Ignored => PrevoteAction::Ignored,
         PrevoteOutcome::Polka { batch_hash, .. } => {
-            // Apply the polka to our own lock first. `apply_polka` refuses stale evidence, so a
-            // polka from a round below our lock cannot drag us back to an abandoned candidate.
+            // Apply the polka to our own lock, then precommit ONLY what we are actually locked on.
+            //
+            // `apply_polka` correctly refuses evidence from a round below our lock — but the
+            // return value used to be discarded and `LockAndPrecommit` returned regardless, so a
+            // node locked on (5, A) that late-received a polka for B at round 2 would sign a
+            // precommit for B while locked on A. Precommitting a value this node is not locked on
+            // is precisely what two-phase exists to forbid, and it breaks the quorum-intersection
+            // argument that makes the protocol safe under partition.
+            //
+            // Checked against the lock rather than against `apply_polka`'s bool because that
+            // returns false BOTH for a refused stale polka and for a polka confirming the value we
+            // already hold — and the second of those must still precommit.
             consensus.apply_polka(round, batch_hash);
-            PrevoteAction::LockAndPrecommit { batch_hash, round }
+            match consensus.lock() {
+                Some((locked_round, locked_hash)) if locked_hash == batch_hash => {
+                    PrevoteAction::LockAndPrecommit {
+                        batch_hash,
+                        round: locked_round,
+                    }
+                }
+                // Stale evidence for a value we have moved past. Counted, not acted on.
+                _ => PrevoteAction::Counted {
+                    votes: consensus.prevotes_for(round, &batch_hash),
+                    needed: consensus.quorum(),
+                },
+            }
         }
         PrevoteOutcome::Equivocation { .. } => {
             let outcome = quarantine.quarantine(
@@ -768,6 +790,39 @@ mod phase_driver_tests {
             }
             other => panic!("expected a prevote, got {other:?}"),
         }
+    }
+
+    /// **Audit finding 5, at the driver.** A polka below our lock must NOT produce a precommit.
+    ///
+    /// `on_prevote` used to discard `apply_polka`'s answer and return `LockAndPrecommit`
+    /// regardless, so a node locked at round 5 that late-received a polka for a different batch at
+    /// round 2 would broadcast a precommit for a value it was not locked on.
+    #[test]
+    fn a_polka_below_the_lock_does_not_produce_a_precommit() {
+        let s = eight();
+        let mut q = Quarantine::new();
+        let mut c = SeqConsensus::new(1, 6);
+        let old = [0xAA; 32];
+        let new_val = [0xBB; 32];
+
+        // Lock at round 5 on `new_val`.
+        c.apply_polka(5, new_val);
+
+        // A full quorum now prevotes `old` at round 2 — stale evidence.
+        let mut precommitted = false;
+        for n in 1..=8u8 {
+            if let PrevoteAction::LockAndPrecommit { .. } =
+                on_prevote([n; 32], 2, old, &mut c, &mut q, &s, 0)
+            {
+                precommitted = true;
+            }
+        }
+
+        assert!(
+            !precommitted,
+            "a polka from a round below the lock must not be precommitted"
+        );
+        assert_eq!(c.lock(), Some((5, new_val)), "and the lock must not move");
     }
 
     /// A polka drives lock-then-precommit, and a quorum of precommits commits.

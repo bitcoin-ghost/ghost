@@ -77,6 +77,28 @@ pub struct ShadowChain {
     /// Votes seen per sequence. Counted per SEQUENCE rather than per batch, because equivocation
     /// is only visible when the candidates are tallied together.
     tallies: Mutex<BTreeMap<u64, SeqTally>>,
+    /// Batches we have SEEN and verified but not yet adopted, keyed by `(seq, batch_hash)`.
+    ///
+    /// Without this a commit can never be adopted. A precommit carries a hash, not contents, and
+    /// the batch store holds only ALREADY-ADOPTED batches — so at the first commit every node
+    /// looked for a batch nobody had stored, found nothing, and stopped. That reproduced the exact
+    /// seq=1 wedge two-phase was built to remove, one layer later.
+    ///
+    /// Holds our OWN proposal too: `broadcast` filters self, so a proposer never receives its own
+    /// batch back and would otherwise be the one node unable to adopt what it proposed.
+    ///
+    /// In memory by choice. Losing it on restart costs a node the ability to adopt a commit it
+    /// has already forgotten the contents of, which sync repairs; persisting it would mean a
+    /// schema migration for data that is worthless the moment the sequence closes.
+    proposals: Mutex<BTreeMap<(u64, [u8; 32]), ShareBatch>>,
+    /// Our own proposal for a `(seq, round)`, so a re-propose re-sends IDENTICAL bytes.
+    ///
+    /// The propose loop ticks every 30 s while a round lasts 90 s, and `build_batch` stamps
+    /// `close_ts = now` — so rebuilding produced a DIFFERENT hash in the SAME round. Peers saw one
+    /// node prevote two batches at one round, which is the definition of equivocation, and
+    /// quarantined it. Any 30 s window without a polka would have turned honest nodes into
+    /// self-quarantined equivocators fleet-wide.
+    my_proposal: Mutex<Option<((u64, u32), ShareBatch)>>,
     /// Two-phase consensus state, one per open sequence.
     ///
     /// Replaces `vote_lock` + `tallies` on the live path. Those two are retained only until the
@@ -134,6 +156,8 @@ impl ShadowChain {
             vote_lock: Mutex::new(SeqVoteLock::new()),
             tallies: Mutex::new(BTreeMap::new()),
             consensus: Mutex::new(BTreeMap::new()),
+            proposals: Mutex::new(BTreeMap::new()),
+            my_proposal: Mutex::new(None),
         })
     }
 
@@ -262,7 +286,24 @@ impl ShadowChain {
         if !schedule.is_my_turn(seq, &self.identity.node_id(), opened, now) {
             return None;
         }
-        self.build_batch(now, budget_bytes)
+
+        // Re-proposing within one round must re-send IDENTICAL bytes.
+        //
+        // The propose loop ticks every 30 s while a round lasts 90 s, and `build_batch` stamps
+        // `close_ts = now` — so rebuilding produced a DIFFERENT batch_hash inside the SAME round.
+        // Peers saw one node prevote two different batches at one round, which is exactly the
+        // definition of equivocation, and quarantined it; the node also caught its own on the
+        // self-count and quarantined itself. Any 30 s window without a polka would have converted
+        // honest nodes into excluded equivocators fleet-wide — worst precisely when the fleet is
+        // already struggling to reach quorum.
+        let round = schedule.escalation_at(opened, now);
+        if let Some(existing) = self.my_proposal_for(seq, round) {
+            return Some(existing);
+        }
+
+        let batch = self.build_batch(now, budget_bytes)?;
+        self.remember_my_proposal(seq, round, &batch);
+        Some(batch)
     }
 
     /// The parent BATCH this node would judge `batch_seq` against.
@@ -390,6 +431,10 @@ impl ShadowChain {
         };
 
         let action = {
+            // LOCK ORDER: quarantine, then consensus. Every path taking both takes them in this
+            // order — the prevote/precommit paths took them the other way round, and two messages
+            // arriving together on separate tokio tasks would have deadlocked both workers on
+            // parking_lot mutexes held across an await boundary.
             let mut quarantine = self.quarantine.lock();
             let mut consensus = self.consensus.lock();
             let entry = consensus
@@ -397,6 +442,11 @@ impl ShadowChain {
                 .or_insert_with(|| SeqConsensus::new(batch.seq, schedule.quorum()));
             on_batch_phase(batch, &ctx, &mut quarantine, entry)
         };
+
+        // Keep any batch that VERIFIED, so a later commit for it has something to adopt.
+        if matches!(action, PhaseAction::Prevote { .. }) {
+            self.remember_proposal(batch);
+        }
 
         if let PhaseAction::Quarantine { reason, .. } = &action {
             let reason = format!("{reason:?}");
@@ -412,6 +462,82 @@ impl ShadowChain {
         action
     }
 
+    /// How far above the head a sequence may be before we refuse to hold any state for it.
+    ///
+    /// A signed vote naming `seq = 10^18` would otherwise create a map entry no head-relative
+    /// prune could ever reach, and one peer can send as many distinct sequences as it likes.
+    const SEQ_LOOKAHEAD: u64 = 8;
+
+    /// Whether a sequence is close enough to our head to be worth holding state for.
+    fn seq_in_window(&self, seq: u64) -> bool {
+        let head = self.head().map(|h| h.seq).unwrap_or(0);
+        seq > head.saturating_sub(1) && seq <= head.saturating_add(Self::SEQ_LOOKAHEAD)
+    }
+
+    /// Keep a verified batch so a later commit for it has contents to adopt.
+    fn remember_proposal(&self, batch: &ShareBatch) {
+        if !self.seq_in_window(batch.seq) {
+            return;
+        }
+        let head = self.head().map(|h| h.seq).unwrap_or(0);
+        let mut proposals = self.proposals.lock();
+        // Bounded on the way in as well as by pruning: escalation legitimately produces several
+        // candidates per sequence, but not an unbounded number.
+        proposals.retain(|(seq, _), _| *seq + 1 > head);
+        if proposals.len() < 64 {
+            proposals.insert((batch.seq, batch.batch_hash()), batch.clone());
+        }
+    }
+
+    /// The verified batch matching a committed hash, if we hold it.
+    pub fn remembered_proposal(&self, seq: u64, batch_hash: [u8; 32]) -> Option<ShareBatch> {
+        self.proposals.lock().get(&(seq, batch_hash)).cloned()
+    }
+
+    /// Our own proposal for `(seq, round)`, if we already made one.
+    ///
+    /// Re-proposing must re-send IDENTICAL bytes: `build_batch` stamps `close_ts = now`, so
+    /// rebuilding on the 30 s propose tick produced a different hash inside one 90 s round, and
+    /// prevoting both is equivocation by any peer's reckoning.
+    pub fn my_proposal_for(&self, seq: u64, round: u32) -> Option<ShareBatch> {
+        let guard = self.my_proposal.lock();
+        guard
+            .as_ref()
+            .filter(|((s, r), _)| *s == seq && *r == round)
+            .map(|(_, b)| b.clone())
+    }
+
+    /// Record our own proposal, and keep a copy in the adoption cache.
+    ///
+    /// `broadcast` filters self, so a proposer never receives its own batch back — without this
+    /// it would be the one node that cannot adopt the batch it proposed.
+    pub fn remember_my_proposal(&self, seq: u64, round: u32, batch: &ShareBatch) {
+        *self.my_proposal.lock() = Some(((seq, round), batch.clone()));
+        self.remember_proposal(batch);
+    }
+
+    /// What this node believes was COMMITTED at `seq`, if it holds an opinion.
+    ///
+    /// `None` means no opinion — either we never had state for that sequence or it was pruned.
+    /// That is the honest answer for a node catching up on history, and the caller must treat it
+    /// as "unknown", never as "nothing was committed".
+    pub fn committed_at(&self, seq: u64) -> Option<[u8; 32]> {
+        self.consensus.lock().get(&seq).and_then(|c| c.committed())
+    }
+
+    /// Forget consensus and proposal state below a finalised sequence.
+    ///
+    /// The bound sits BELOW what is final: dropping state for a sequence still in flight would let
+    /// this node vote twice in one round, which is the one thing the per-round tally prevents.
+    pub fn prune_below(&self, seq: u64) {
+        self.consensus.lock().retain(|k, _| *k >= seq);
+        self.proposals.lock().retain(|(s, _), _| *s >= seq);
+        let mut mine = self.my_proposal.lock();
+        if mine.as_ref().is_some_and(|((s, _), _)| *s < seq) {
+            *mine = None;
+        }
+    }
+
     /// Record a peer's PREVOTE. A quorum of them is a polka.
     pub fn on_batch_prevote(
         &self,
@@ -422,11 +548,17 @@ impl ShadowChain {
         schedule: &ProposerSchedule,
         now: i64,
     ) -> PrevoteAction {
+        // A signed vote naming a far-future sequence must not create state a head-relative
+        // prune can never reach.
+        if !self.seq_in_window(seq) {
+            return PrevoteAction::Ignored;
+        }
+        // Same lock order as `on_proposal_phase`: quarantine, then consensus.
+        let mut quarantine = self.quarantine.lock();
         let mut consensus = self.consensus.lock();
         let entry = consensus
             .entry(seq)
             .or_insert_with(|| SeqConsensus::new(seq, schedule.quorum()));
-        let mut quarantine = self.quarantine.lock();
         on_prevote(
             voter,
             round,
@@ -448,11 +580,17 @@ impl ShadowChain {
         schedule: &ProposerSchedule,
         now: i64,
     ) -> PrecommitAction {
+        // Same lock order as `on_proposal_phase`: quarantine, then consensus.
+        // A signed vote naming a far-future sequence must not create state a head-relative
+        // prune can never reach.
+        if !self.seq_in_window(seq) {
+            return PrecommitAction::Ignored;
+        }
+        let mut quarantine = self.quarantine.lock();
         let mut consensus = self.consensus.lock();
         let entry = consensus
             .entry(seq)
             .or_insert_with(|| SeqConsensus::new(seq, schedule.quorum()));
-        let mut quarantine = self.quarantine.lock();
         on_precommit(
             voter,
             round,
@@ -462,15 +600,6 @@ impl ShadowChain {
             schedule,
             now,
         )
-    }
-
-    /// Forget two-phase state below a finalised sequence.
-    ///
-    /// Bounded memory matters, but the bound must sit BELOW what is final: dropping the state for
-    /// a sequence still in flight would let this node prevote twice in one round, which is the one
-    /// thing the per-round tally exists to prevent.
-    pub fn prune_consensus_below(&self, seq: u64) {
-        self.consensus.lock().retain(|k, _| *k >= seq);
     }
 
     /// Record a vote and report whether it carried the sequence.
@@ -561,6 +690,11 @@ impl ShadowChain {
             close_ts: batch.close_ts,
             finalised_at: now,
         });
+
+        // Everything at or below the adopted sequence is decided, so its consensus and proposal
+        // state is dead weight. Pruning here rather than on a timer means the bound is always
+        // relative to what is final — the one place it is safe to cut.
+        self.prune_below(batch.seq + 1);
 
         // Drain exactly what was adopted. Anything not in this batch stays pending and lands in a
         // later one — which is why a share that misses its batch is deferred, never lost.
@@ -1003,6 +1137,114 @@ mod tests {
             chain.on_proposal(&batch, &schedule, &checks, 600),
             Action::ProposerQuarantined,
             "a peer excluded before the restart must not be judged again"
+        );
+    }
+
+    /// **Audit finding 4.** Re-proposing in one round must re-send IDENTICAL bytes.
+    ///
+    /// The propose loop ticks every 30 s while a round lasts 90 s, and `build_batch` stamps
+    /// `close_ts = now` — so rebuilding produced a different `batch_hash` in the SAME round. Peers
+    /// saw one node prevote two batches at one round, branded it an equivocator and quarantined
+    /// it; it also caught its own on the self-count and quarantined itself. Any 30 s window
+    /// without a polka would have excluded honest nodes fleet-wide.
+    #[test]
+    fn re_proposing_within_one_round_returns_the_identical_batch() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        // A single-node schedule makes every turn ours.
+        // `build_batch` refuses an empty pool, so give it something to pack.
+        for salt in 0..3u8 {
+            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+        }
+
+        let schedule = ProposerSchedule::new([id.node_id()]);
+        let head = chain.head().expect("head");
+        let now = head.close_ts + 5;
+
+        let first = chain.try_propose(&schedule, now, 64_000).expect("first");
+        // 30 s later — same round (90 s steps), so the same batch must come back.
+        let second = chain
+            .try_propose(&schedule, now + 30, 64_000)
+            .expect("second");
+
+        assert_eq!(
+            first.batch_hash(),
+            second.batch_hash(),
+            "a re-propose inside one round must not mint a new hash — that is self-equivocation"
+        );
+        assert_eq!(first.close_ts, second.close_ts, "including its close_ts");
+    }
+
+    /// **Audit finding 1.** A verified batch is retained so a commit has something to adopt.
+    ///
+    /// Adoption used to read the ADOPTED-batch store, which by definition never contains the batch
+    /// about to be adopted. Every node looked, found nothing, and the chain stopped at its first
+    /// commit — the same wedge two-phase was built to remove, one layer later.
+    #[test]
+    fn our_own_proposal_is_retained_for_adoption() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        for salt in 0..3u8 {
+            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+        }
+
+        let schedule = ProposerSchedule::new([id.node_id()]);
+        let head = chain.head().expect("head");
+        let batch = chain
+            .try_propose(&schedule, head.close_ts + 5, 64_000)
+            .expect("proposed");
+
+        // `broadcast` filters self, so without this the PROPOSER is the one node that cannot adopt
+        // the batch it proposed.
+        assert_eq!(
+            chain
+                .remembered_proposal(batch.seq, batch.batch_hash())
+                .map(|b| b.batch_hash()),
+            Some(batch.batch_hash()),
+            "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Audit finding 7.** A vote naming a far-future sequence creates no state.
+    ///
+    /// Otherwise one peer can mint entries at seq 10^18 that no head-relative prune ever reaches.
+    #[test]
+    fn a_vote_at_an_absurd_sequence_is_ignored() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        let schedule = ProposerSchedule::new([id.node_id()]);
+        let action =
+            chain.on_batch_prevote(id.node_id(), 0, [0xAA; 32], u64::MAX / 2, &schedule, 0);
+
+        assert_eq!(action, PrevoteAction::Ignored);
+        assert_eq!(
+            chain.committed_at(u64::MAX / 2),
+            None,
+            "no state may be created for an out-of-window sequence"
         );
     }
 

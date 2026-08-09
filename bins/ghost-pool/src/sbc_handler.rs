@@ -17,9 +17,7 @@ use ghost_common::identity::NodeIdentity;
 use ghost_common::share_batch::ShareBatch;
 use ghost_common::types::NodeId;
 use ghost_consensus::mesh::MessageHandler;
-use ghost_consensus::message::{
-    MessageEnvelope, MessageType, ShareBatchSyncMessage, ShareBatchVoteMessage,
-};
+use ghost_consensus::message::{MessageEnvelope, MessageType, ShareBatchSyncMessage};
 use tracing::{debug, info, warn};
 
 use crate::sbc_checks::NodeBatchChecks;
@@ -103,10 +101,7 @@ impl ShareBatchHandler {
                 if let ghost_common::batch_consensus::DeferReason::AheadOfUs { our_seq, .. } =
                     reason
                 {
-                    let req = ShareBatchSyncMessage::Request { seq: our_seq + 1 };
-                    if let Ok(payload) = serde_json::to_vec(&req) {
-                        let _ = (self.send)(MessageType::ShareBatchSync, payload);
-                    }
+                    let _ = self.request_sync(our_seq + 1);
                 }
             }
             PhaseAction::Quarantine { reason, outcome } => {
@@ -134,6 +129,18 @@ impl ShareBatchHandler {
     ///
     /// Request and response are told apart by trial-deserialise, as the payout-checkpoint sync
     /// does — they share a message type and only the shapes distinguish them.
+    /// Ask peers for the adopted batch at `seq`.
+    ///
+    /// One implementation, used both when we fall behind and when a sequence commits to a batch we
+    /// never saw. Adoption on the commit path used to have no way to ask at all, so a node that
+    /// missed the proposal was simply stuck.
+    fn request_sync(&self, seq: u64) -> GhostResult<()> {
+        let req = ShareBatchSyncMessage::Request { seq };
+        let payload = serde_json::to_vec(&req)
+            .map_err(|e| GhostError::Serialization(format!("share batch sync request: {e}")))?;
+        (self.send)(MessageType::ShareBatchSync, payload)
+    }
+
     /// Handle a peer's PREVOTE or PRECOMMIT.
     ///
     /// One function for both phases because the payload is identical and the handling is
@@ -150,6 +157,32 @@ impl ShareBatchHandler {
 
         let vote: ShareBatchPhaseVoteMessage = serde_json::from_slice(&envelope.payload)
             .map_err(|e| GhostError::Serialization(format!("share batch phase vote: {e}")))?;
+
+        let schedule = self.schedule();
+
+        // MEMBERSHIP FIRST, and it is not optional. Verifying a signature against the key the
+        // MESSAGE ITSELF names authenticates nothing: any reachable peer could mint six fresh
+        // keypairs, sign six prevotes and six precommits for a batch of its choosing, and drive
+        // this node to lock and latch `committed` on a value the real fleet never proposed —
+        // after which the commit latch makes it refuse the fleet's genuine decision forever.
+        if !schedule.voters().contains(&vote.voter) {
+            debug!(
+                seq = vote.seq,
+                ?phase,
+                "SBC: phase vote from a non-voter, dropped"
+            );
+            return Ok(());
+        }
+        // The envelope signature is verified before dispatch, so `sender` is authenticated. A vote
+        // claiming to be from someone other than the peer that sent it is a relay attempt.
+        if vote.voter != envelope.sender {
+            debug!(
+                seq = vote.seq,
+                ?phase,
+                "SBC: phase vote voter does not match sender, dropped"
+            );
+            return Ok(());
+        }
 
         // Verified against THIS phase's domain. A prevote's signature does not verify as a
         // precommit, so a replayed prevote is dropped here rather than counted as a commitment.
@@ -168,7 +201,6 @@ impl ShareBatchHandler {
             return Ok(());
         }
 
-        let schedule = self.schedule();
         match phase {
             BatchVotePhase::Prevote => {
                 let action = self.chain.on_batch_prevote(
@@ -296,25 +328,22 @@ impl ShareBatchHandler {
     /// Not holding it is a sync condition and not a failure: the decision is final, so fetching
     /// the batch later still adopts exactly the value the fleet agreed.
     fn adopt_committed(&self, seq: u64, batch_hash: [u8; 32], now: i64) {
-        let Ok(Some(json)) = self.chain.batch_at(seq) else {
+        // From the cache of batches we VERIFIED, not the adopted-batch store — that store holds
+        // only what has ALREADY been adopted, so looking there for the batch we are about to adopt
+        // found nothing on every node and stopped the chain dead at its first commit.
+        let Some(batch) = self.chain.remembered_proposal(seq, batch_hash) else {
             warn!(
                 seq,
                 batch = %hex::encode(&batch_hash[..8]),
-                "SBC: committed a batch we do not hold — sync required before adoption"
+                "SBC: committed a batch we never saw — requesting it before adoption"
             );
+            // Ask for it. The decision is final and will not change, so adopting later still
+            // adopts exactly what the fleet agreed.
+            if let Err(e) = self.request_sync(seq) {
+                warn!(seq, error = %e, "SBC: could not request the committed batch");
+            }
             return;
         };
-        let Ok(batch) = serde_json::from_str::<ShareBatch>(&json) else {
-            warn!(seq, "SBC: committed batch will not deserialise");
-            return;
-        };
-        if batch.batch_hash() != batch_hash {
-            warn!(
-                seq,
-                "SBC: stored batch is not the committed one — sync required"
-            );
-            return;
-        }
         match self.chain.finalise(&batch, now) {
             Ok(f) => info!(
                 seq = f.seq,
@@ -364,6 +393,24 @@ impl ShareBatchHandler {
                 // happened elsewhere, and what makes a synced batch safe is that it hash-chains
                 // to our head and reproduces its own state root. Requiring a local quorum to
                 // adopt history would mean a node behind by one link could never rejoin.
+                // If we hold an OPINION about what was committed here, it binds. Adopting on
+                // chain-validity alone let a peer push an unsolicited response carrying a valid
+                // but never-committed batch at the OPEN sequence, forking the receiver against
+                // whatever the fleet decided next.
+                //
+                // `None` means no opinion — a node genuinely catching up on history — and there
+                // chain validity IS the argument: the batch must link to our head and reproduce
+                // its own state root. Demanding a local quorum to adopt HISTORY would leave a node
+                // one link behind permanently unable to rejoin.
+                if let Some(decided) = self.chain.committed_at(seq) {
+                    if decided != batch.batch_hash() {
+                        warn!(
+                            seq,
+                            "SBC: synced batch is not the one committed here — refused"
+                        );
+                        return Ok(());
+                    }
+                }
                 match self
                     .chain
                     .on_proposal_phase(&batch, &schedule, &checks, now)
@@ -386,31 +433,10 @@ impl MessageHandler for ShareBatchHandler {
         let now = chrono::Utc::now().timestamp();
         match envelope.msg_type {
             MessageType::ShareBatchProposal => self.on_proposal(&envelope, now),
-            MessageType::ShareBatchVote => {
-                let vote: ShareBatchVoteMessage = serde_json::from_slice(&envelope.payload)
-                    .map_err(|e| GhostError::Serialization(format!("share batch vote: {e}")))?;
-                // A vote alone cannot finalise: adoption needs the batch itself, and holding a
-                // vote for a batch we have not seen is what sync is for.
-                // Verify before counting. `signing_bytes` had no caller anywhere in the tree, so
-                // every vote was taken on trust: any node could have forged a vote from any peer,
-                // at any sequence, for any batch. Quorum built on unverified votes is not quorum.
-                if !ghost_common::identity::verify_signature(
-                    &vote.voter,
-                    &vote.signing_bytes(),
-                    &vote.signature,
-                )
-                .unwrap_or(false)
-                {
-                    debug!(seq = vote.seq, "SBC: vote signature invalid, dropped");
-                    return Ok(());
-                }
-                let schedule = self.schedule();
-                let action =
-                    self.chain
-                        .on_batch_vote(vote.voter, vote.batch_hash, vote.seq, &schedule, now);
-                debug!(seq = vote.seq, ?action, "SBC: peer vote");
-                Ok(())
-            }
+            // The single-phase vote type is no longer honoured. Counting it fed a tally nothing
+            // reads, and leaving a live route to a dead consensus path is how a reader comes to
+            // believe the wrong protocol is running. Old peers emitting it are simply ignored —
+            // a mixed fleet cannot reach quorum either way, which is why all eight roll together.
             MessageType::ShareBatchPrevote => self.on_phase_vote(
                 &envelope,
                 ghost_consensus::message::BatchVotePhase::Prevote,
