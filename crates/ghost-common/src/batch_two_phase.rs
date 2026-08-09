@@ -414,6 +414,44 @@ mod tests {
         assert_eq!(c.committed(), None);
     }
 
+    /// Prevotes must not top up a precommit tally to quorum.
+    ///
+    /// An earlier version of this test recorded only prevotes, so the precommit path never ran and
+    /// a mutation that summed the two phases survived it untouched. A test that cannot execute the
+    /// line it is about proves nothing. This one drives BOTH: enough prevotes that the sum would
+    /// clear quorum, and strictly fewer precommits than quorum.
+    #[test]
+    fn prevotes_cannot_top_up_a_precommit_tally() {
+        let quorum = 6;
+        let mut c = SeqConsensus::new(1, quorum);
+
+        // 8 prevotes — well past quorum on its own.
+        for n in 0..8u8 {
+            c.record_prevote(0, v(n), A);
+        }
+        // 3 precommits — short of quorum. Summed with the prevotes it would be 11.
+        for n in 0..3u8 {
+            c.record_precommit(0, v(n), A);
+        }
+
+        assert_eq!(
+            c.precommits_for(0, &A),
+            3,
+            "only precommits count as precommits"
+        );
+        assert_eq!(
+            c.committed(),
+            None,
+            "3 precommits is short of 6 — prevotes must not make up the difference"
+        );
+
+        // And the remaining precommits DO commit it, so this is not passing by inertia.
+        for n in 3..6u8 {
+            c.record_precommit(0, v(n), A);
+        }
+        assert_eq!(c.committed(), Some(A), "6 real precommits commit");
+    }
+
     /// **The property the reverted design could not satisfy.**
     ///
     /// Two different batches must never both commit at one sequence, driven over an explicit
