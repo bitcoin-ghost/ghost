@@ -332,12 +332,10 @@ impl ShadowChain {
     }
 
     /// Record a vote and report whether it carried the sequence.
-    #[allow(clippy::too_many_arguments)]
     pub fn on_batch_vote(
         &self,
         voter: [u8; 32],
         batch_hash: [u8; 32],
-        round: u32,
         seq: u64,
         schedule: &ProposerSchedule,
         now: i64,
@@ -347,15 +345,7 @@ impl ShadowChain {
             .entry(seq)
             .or_insert_with(|| SeqTally::new(seq, schedule.quorum()));
         let mut quarantine = self.quarantine.lock();
-        on_vote(
-            voter,
-            batch_hash,
-            round,
-            tally,
-            &mut quarantine,
-            schedule,
-            now,
-        )
+        on_vote(voter, batch_hash, tally, &mut quarantine, schedule, now)
     }
 
     /// The adopted batch at `seq`, verbatim, for answering a sync request.

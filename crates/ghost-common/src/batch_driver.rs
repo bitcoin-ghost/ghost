@@ -23,14 +23,7 @@ use crate::share_batch::ShareBatch;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Vote for it, and broadcast that vote.
-    Vote {
-        batch_hash: [u8; 32],
-        seq: u64,
-        /// The escalation step this batch was authorised at. Carried into the vote message so
-        /// peers count it against the right attempt — a vote that omits the round is a vote for
-        /// whichever candidate the receiver happens to be holding.
-        round: u32,
-    },
+    Vote { batch_hash: [u8; 32], seq: u64 },
     /// Do nothing yet. Recoverable — the reason says whether to sync, wait, or ignore.
     Hold { reason: DeferReason },
     /// The batch is defective. Quarantine its proposer and alarm.
@@ -101,22 +94,16 @@ pub fn on_batch<C: BatchChecks>(
             );
             Action::Quarantine { reason, outcome }
         }
-        BatchVerdict::Valid { round } => {
+        BatchVerdict::Valid => {
             let hash = batch.batch_hash();
-            match lock.try_vote(batch.seq, round, hash) {
+            match lock.try_vote(batch.seq, hash) {
                 VoteDecision::Fresh | VoteDecision::Repeat => Action::Vote {
                     batch_hash: hash,
                     seq: batch.seq,
-                    round,
                 },
                 VoteDecision::Conflict { already } => {
                     Action::AlreadyVotedElsewhere { voted_for: already }
                 }
-                // A proposal from a round the fleet has moved past. Not a fault and not a vote:
-                // voting for it would drag this node back to a candidate that cannot win.
-                VoteDecision::Stale { .. } => Action::Hold {
-                    reason: DeferReason::ProposerNotDue,
-                },
             }
         }
     }
@@ -146,7 +133,6 @@ pub enum VoteAction {
 pub fn on_vote(
     voter: [u8; 32],
     batch_hash: [u8; 32],
-    round: u32,
     tally: &mut SeqTally,
     quarantine: &mut Quarantine,
     schedule: &ProposerSchedule,
@@ -156,7 +142,7 @@ pub fn on_vote(
         return VoteAction::Ignored;
     }
 
-    match tally.record(voter, round, batch_hash) {
+    match tally.record(voter, batch_hash) {
         TallyEvent::Recorded { approvals, needed } => VoteAction::Counted { approvals, needed },
         TallyEvent::Duplicate => VoteAction::Ignored,
         TallyEvent::Finalised { batch_hash, votes } => VoteAction::Adopt { batch_hash, votes },
@@ -282,8 +268,7 @@ mod tests {
             on_batch(&batch, &c, &mut Quarantine::new(), &mut SeqVoteLock::new()),
             Action::Vote {
                 batch_hash: batch.batch_hash(),
-                seq: batch.seq,
-                round: 0,
+                seq: batch.seq
             }
         );
     }
@@ -395,12 +380,12 @@ mod tests {
 
         for n in 1..=5u8 {
             assert!(matches!(
-                on_vote(voter(n), hash, 0, &mut tally, &mut q, &schedule, 0),
+                on_vote(voter(n), hash, &mut tally, &mut q, &schedule, 0),
                 VoteAction::Counted { .. }
             ));
         }
         assert_eq!(
-            on_vote(voter(6), hash, 0, &mut tally, &mut q, &schedule, 0),
+            on_vote(voter(6), hash, &mut tally, &mut q, &schedule, 0),
             VoteAction::Adopt {
                 batch_hash: hash,
                 votes: 6
@@ -416,13 +401,13 @@ mod tests {
         let mut tally = SeqTally::new(42, schedule.quorum());
         let mut q = Quarantine::new();
 
-        on_vote(voter(2), [0xAA; 32], 0, &mut tally, &mut q, &schedule, 0);
-        match on_vote(voter(2), [0xBB; 32], 0, &mut tally, &mut q, &schedule, 0) {
+        on_vote(voter(2), [0xAA; 32], &mut tally, &mut q, &schedule, 0);
+        match on_vote(voter(2), [0xBB; 32], &mut tally, &mut q, &schedule, 0) {
             VoteAction::Equivocation { voter: v, .. } => assert_eq!(v, voter(2)),
             other => panic!("expected equivocation, got {other:?}"),
         }
         assert!(q.is_quarantined(&voter(2)));
-        assert_eq!(tally.approvals_for_round(0, &[0xAA; 32]), 0);
+        assert_eq!(tally.approvals_for(&[0xAA; 32]), 0);
     }
 
     /// A quarantined peer's vote is not counted at all.
@@ -440,9 +425,9 @@ mod tests {
         );
 
         assert_eq!(
-            on_vote(voter(3), [0xAA; 32], 0, &mut tally, &mut q, &schedule, 0),
+            on_vote(voter(3), [0xAA; 32], &mut tally, &mut q, &schedule, 0),
             VoteAction::Ignored
         );
-        assert_eq!(tally.approvals_for_round(0, &[0xAA; 32]), 0);
+        assert_eq!(tally.approvals_for(&[0xAA; 32]), 0);
     }
 }

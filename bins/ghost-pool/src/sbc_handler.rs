@@ -76,19 +76,14 @@ impl ShareBatchHandler {
         let action = self.chain.on_proposal(&batch, &schedule, &checks, now);
 
         match action {
-            Action::Vote {
-                batch_hash,
-                seq,
-                round,
-            } => {
-                // Signed via the message's OWN helper, not a hand-rolled copy. The handler used to
-                // build these bytes inline and produced a different string to `signing_bytes` —
-                // no domain tag — which nothing noticed because nothing verified votes at all.
+            Action::Vote { batch_hash, seq } => {
+                // Signed via the message's OWN helper, not a hand-rolled copy. This built the
+                // bytes inline and produced a DIFFERENT string to `signing_bytes` — no domain
+                // tag — which nothing noticed because nothing verified votes at all.
                 let mut vote = ShareBatchVoteMessage {
                     seq,
                     batch_hash,
                     voter: self.identity.node_id(),
-                    round,
                     signature: [0u8; 64],
                 };
                 vote.signature = self.identity.sign(&vote.signing_bytes());
@@ -98,8 +93,8 @@ impl ShareBatchHandler {
 
                 // Count our own vote. Without this a node never contributes to the quorum it is
                 // waiting on, and a two-node fleet could never finalise anything.
-                self.record_vote(self.identity.node_id(), batch_hash, seq, round, &batch, now);
-                debug!(seq, round, "SBC: voted");
+                self.record_vote(self.identity.node_id(), batch_hash, seq, &batch, now);
+                debug!(seq, "SBC: voted");
             }
             Action::Hold { reason } => {
                 debug!(seq = batch.seq, ?reason, "SBC: holding");
@@ -138,20 +133,18 @@ impl ShareBatchHandler {
     }
 
     /// Tally a vote, and adopt if it carried.
-    #[allow(clippy::too_many_arguments)]
     fn record_vote(
         &self,
         voter: NodeId,
         batch_hash: [u8; 32],
         seq: u64,
-        round: u32,
         batch: &ShareBatch,
         now: i64,
     ) {
         let schedule = self.schedule();
         match self
             .chain
-            .on_batch_vote(voter, batch_hash, round, seq, &schedule, now)
+            .on_batch_vote(voter, batch_hash, seq, &schedule, now)
         {
             VoteAction::Adopt { .. } => {
                 match self.chain.finalise(batch, now) {
@@ -240,20 +233,10 @@ impl MessageHandler for ShareBatchHandler {
                     return Ok(());
                 }
                 let schedule = self.schedule();
-                let action = self.chain.on_batch_vote(
-                    vote.voter,
-                    vote.batch_hash,
-                    vote.round,
-                    vote.seq,
-                    &schedule,
-                    now,
-                );
-                debug!(
-                    seq = vote.seq,
-                    round = vote.round,
-                    ?action,
-                    "SBC: peer vote"
-                );
+                let action =
+                    self.chain
+                        .on_batch_vote(vote.voter, vote.batch_hash, vote.seq, &schedule, now);
+                debug!(seq = vote.seq, ?action, "SBC: peer vote");
                 Ok(())
             }
             MessageType::ShareBatchSync => self.on_sync(&envelope, now),
