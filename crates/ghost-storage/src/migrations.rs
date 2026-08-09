@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 50;
+const SCHEMA_VERSION: u32 = 51;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -127,6 +127,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (48, migrate_v48),
         (49, migrate_v49),
         (50, migrate_v50),
+        (51, migrate_v51),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2601,6 +2602,41 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
 ///
 /// Additive and dormant: nothing reads these until the shadow run is wired, so a node on the old
 /// path is unaffected and a downgrade ignores them.
+/// v51: persist share-batch COMMIT CERTIFICATES.
+///
+/// A certificate is the quorum of signed precommits that decided a sequence. It is the only thing
+/// that lets a node which missed a sequence's consensus adopt it later — the receiver cannot
+/// establish "was this committed?" from local state, so the peer that watched it close supplies
+/// the proof.
+///
+/// Held only in memory, that proof evaporated on restart. A rolling fleet restart — the ordinary
+/// deploy — left NO node holding a certificate for any committed sequence, so any node that was
+/// behind at that moment could never adopt those sequences from anyone, permanently. Catch-up was
+/// correctly gated on a verifiable certificate, which turned "lost proof" into "wedged node".
+///
+/// Small and immutable: one row per committed sequence, a few hundred bytes of signatures, written
+/// once and never updated. Bounded by the same retention as the batch window.
+fn migrate_v51(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v51: sbc_certs");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sbc_certs (
+            seq             INTEGER PRIMARY KEY,
+            round           INTEGER NOT NULL,
+            batch_hash      BLOB    NOT NULL,
+            voter_set_hash  BLOB    NOT NULL,
+            -- The signatures, as the JSON the wire type carries. Stored verbatim so what is
+            -- served is byte-identical to what was verified when it was minted.
+            cert_json       TEXT    NOT NULL,
+            minted_at       INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_sbc_certs_hash ON sbc_certs(batch_hash);",
+    )
+    .map_err(|e| GhostError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
 fn migrate_v50(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v50: sbc_balances, sbc_batches, sbc_quarantine");
 

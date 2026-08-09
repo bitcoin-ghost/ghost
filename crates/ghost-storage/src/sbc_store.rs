@@ -271,6 +271,69 @@ impl Database {
         })
     }
 
+    /// Persist a commit certificate for `seq`.
+    ///
+    /// Written once at the moment of commit and never updated — a sequence has exactly one
+    /// decision, so a second certificate for the same seq is either the same proof or a bug, and
+    /// `INSERT OR IGNORE` keeps the first either way.
+    ///
+    /// This is what makes catch-up survive a restart. Certificates lived only in memory, so a
+    /// rolling fleet restart left NO node able to prove any commit, and a node that was behind at
+    /// that moment could never adopt those sequences from anyone again.
+    pub fn sbc_store_cert(
+        &self,
+        seq: u64,
+        round: u32,
+        batch_hash: [u8; 32],
+        voter_set_hash: [u8; 32],
+        cert_json: &str,
+        minted_at: i64,
+    ) -> GhostResult<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO sbc_certs \
+                 (seq, round, batch_hash, voter_set_hash, cert_json, minted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    seq as i64,
+                    round as i64,
+                    batch_hash.to_vec(),
+                    voter_set_hash.to_vec(),
+                    cert_json,
+                    minted_at
+                ],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// The stored certificate for `seq`, verbatim.
+    ///
+    /// Returned as the JSON it was stored as, so what is served is byte-identical to what was
+    /// verified when it was minted.
+    pub fn sbc_get_cert(&self, seq: u64) -> GhostResult<Option<String>> {
+        self.with_connection(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT cert_json FROM sbc_certs WHERE seq = ?1",
+                    params![seq as i64],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok())
+        })
+    }
+
+    /// Drop certificates below `seq`, keeping the store bounded alongside the batch window.
+    pub fn sbc_prune_certs_below(&self, seq: u64) -> GhostResult<usize> {
+        self.with_connection(|conn| {
+            let n = conn
+                .execute("DELETE FROM sbc_certs WHERE seq < ?1", params![seq as i64])
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(n)
+        })
+    }
+
     /// Quarantine a peer. Idempotent — the first reason is kept, since it is the one that was
     /// actually decided on evidence.
     pub fn sbc_quarantine(

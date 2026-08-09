@@ -660,6 +660,7 @@ impl ShadowChain {
         round: u32,
         batch_hash: [u8; 32],
         schedule: &ProposerSchedule,
+        now: i64,
     ) {
         const MAX_CERTS: usize = 64;
         let Some(sigs) = self
@@ -682,6 +683,22 @@ impl ShadowChain {
                 .map(|(v, sig)| (hex::encode(v), hex::encode(sig)))
                 .collect(),
         };
+        // PERSIST IT. Held only in memory, this proof evaporated on restart — and a rolling fleet
+        // restart is the ordinary deploy, which left no node able to prove any commit and wedged
+        // any node that happened to be behind at that moment. Catch-up is correctly gated on a
+        // verifiable certificate, so a lost proof is a lost node.
+        match serde_json::to_string(&cert) {
+            Ok(json) => {
+                if let Err(e) =
+                    self.db
+                        .sbc_store_cert(seq, round, batch_hash, cert.voter_set_hash, &json, now)
+                {
+                    warn!(seq, error = %e, "SBC: could not persist the commit certificate");
+                }
+            }
+            Err(e) => warn!(seq, error = %e, "SBC: certificate will not serialise"),
+        }
+
         let mut certs = self.certs.lock();
         while certs.len() >= MAX_CERTS {
             let Some(oldest) = certs.keys().next().copied() else {
@@ -694,7 +711,16 @@ impl ShadowChain {
 
     /// The certificate proving what we committed at `seq`, if we still hold it.
     pub fn certificate_at(&self, seq: u64) -> Option<ghost_consensus::message::CommitCertificate> {
-        self.certs.lock().get(&seq).cloned()
+        if let Some(c) = self.certs.lock().get(&seq).cloned() {
+            return Some(c);
+        }
+        // Fall through to the store. The in-memory map is a cache of what THIS process minted; the
+        // table is what survives the restart that used to strand every node behind the fleet.
+        self.db
+            .sbc_get_cert(seq)
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str(&j).ok())
     }
 
     /// The qualified-node ids this chain agrees on.
@@ -819,7 +845,7 @@ impl ShadowChain {
         // signature map with the rest of the sequence's state moments later, and that is exactly
         // when other nodes start needing it.
         if let PrecommitAction::Commit { .. } = action {
-            self.mint_certificate(seq, round, batch_hash, schedule);
+            self.mint_certificate(seq, round, batch_hash, schedule, now);
         }
         action
     }
@@ -1450,6 +1476,58 @@ mod tests {
                 .map(|b| b.batch_hash()),
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Audit 8, finding A1.** A commit certificate must survive a restart.
+    ///
+    /// Certificates lived only in memory, and catch-up is — correctly — gated on holding a
+    /// verifiable one. So a rolling fleet restart, which is the ORDINARY deploy, left no node able
+    /// to prove any commit, and any node that happened to be behind at that moment could never
+    /// adopt those sequences from anyone again. A lost proof was a lost node.
+    #[test]
+    fn a_commit_certificate_survives_a_restart() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+
+        let seq = 7u64;
+        let round = 3u32;
+        let batch_hash = [0xAB; 32];
+        let cert = ghost_consensus::message::CommitCertificate {
+            seq,
+            round,
+            batch_hash,
+            voter_set_hash: [0xCD; 32],
+            precommits: vec![("aa".into(), "bb".into())],
+        };
+        db.sbc_store_cert(
+            seq,
+            round,
+            batch_hash,
+            cert.voter_set_hash,
+            &serde_json::to_string(&cert).expect("json"),
+            0,
+        )
+        .expect("store");
+
+        // A FRESH ShadowChain — nothing in memory, exactly as after a restart.
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        let found = chain.certificate_at(seq).expect("cert must survive");
+
+        assert_eq!(found.seq, seq);
+        assert_eq!(found.round, round);
+        assert_eq!(found.batch_hash, batch_hash);
+        assert_eq!(
+            found.voter_set_hash, cert.voter_set_hash,
+            "the membership binding must survive too, or it verifies against nothing"
+        );
+        assert_eq!(found.precommits, cert.precommits, "signatures verbatim");
+
+        assert!(
+            chain.certificate_at(seq + 1).is_none(),
+            "and a sequence we never committed has no certificate"
         );
     }
 
