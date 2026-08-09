@@ -56,8 +56,9 @@ pub struct ChainHead {
     ///
     /// Distinct from `close_ts` and not interchangeable with it. The next sequence opens when this
     /// batch is adopted, so this is what the stall-escalation clock must run from. Using
-    /// `close_ts` instead made escalation start from the genesis checkpoint's cutoff — three days
-    /// stale on ghost-vm8 — which left the rota permanently in escalated mode, rotating the turn
+    /// `close_ts` instead made escalation start from the genesis checkpoint's cutoff. Measured on
+    /// ghost-vm8: cutoff 1786228093, adopted 1786260566 — a 32,473 s gap, so escalation read 416
+    /// steps where it should have read ~34. The rota sat permanently escalated, rotating the turn
     /// every 90 s instead of giving a proposer a stable one.
     pub finalised_at: i64,
 }
@@ -443,8 +444,8 @@ mod tests {
     /// `close_ts` is when the PROPOSER closed the batch; `finalised_at` is when THIS node adopted
     /// it. The next sequence opens on adoption, so the stall-escalation clock runs from
     /// `finalised_at`. Reading `close_ts` instead started escalation from the genesis checkpoint's
-    /// cutoff — three days stale on ghost-vm8 — leaving the rota permanently escalated and
-    /// rotating the turn every 90 s instead of giving a proposer a stable one.
+    /// cutoff, which on ghost-vm8 was 32,473 s (9 h) before adoption — leaving the rota permanently
+    /// escalated and rotating the turn every 90 s instead of giving a proposer a stable one.
     #[test]
     fn the_head_reports_adoption_time_separately_from_close_time() {
         let db = db();

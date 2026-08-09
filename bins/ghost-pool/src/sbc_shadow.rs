@@ -105,8 +105,8 @@ impl ShadowChain {
         }
 
         // The next sequence opened when the head was ADOPTED, not when its proposer closed it.
-        // Using close_ts started escalation from the genesis checkpoint's cutoff — three days
-        // stale on ghost-vm8 — so the rota sat permanently escalated, rotating every 90 s.
+        // Using close_ts started escalation from the genesis checkpoint's cutoff, which on
+        // ghost-vm8 was 32,473 s (9 h) before adoption — so the rota sat permanently escalated.
         let opened = head.as_ref().map(|h| h.finalised_at).unwrap_or(0);
         Ok(Self {
             identity,
@@ -1250,9 +1250,9 @@ mod tests {
 
     /// The escalation clock must read ADOPTION time, not the proposer's close time.
     ///
-    /// A genesis head carries the converted checkpoint's `cutoff_ts`, which on ghost-vm8 was three
-    /// days old. Reading that as "when this sequence opened" put escalation at ~2,689 steps the
-    /// instant the node started, leaving the rota permanently escalated — rotating the turn every
+    /// A genesis head carries the converted checkpoint's `cutoff_ts`. Measured on ghost-vm8:
+    /// cutoff 1786228093, adopted 1786260566 — a 32,473 s (9 h) gap, so escalation read 416 steps
+    /// where it should have read ~34. The rota sat permanently escalated, rotating the turn every
     /// 90 s rather than giving a proposer a stable one.
     ///
     /// Invisible from outside: the rota still works, nobody diverges, and every node agrees. It is
