@@ -782,4 +782,140 @@ mod tests {
             "no parent means hold and sync, never accuse"
         );
     }
+
+    /// The property the WP-5 trust gate is defined by: separate nodes, separate databases, and a
+    /// byte-identical `(seq, state_root)` after adopting the same chain.
+    ///
+    /// `share_batch.rs` already proves the pure fold agrees across simulated nodes. This proves it
+    /// survives the parts that are NOT pure — three independent stores, three encryption keys, and
+    /// a round trip through SQLite in between. A divergence introduced by persistence would be
+    /// invisible to the fold's own tests and fatal to the gate.
+    ///
+    /// ⚠ A convergence assertion alone CANNOT catch a uniform arithmetic error: every node runs the
+    /// same fold, so a fold that is wrong the same way everywhere still agrees. Verified by
+    /// mutation — adding 1 to every credit leaves the roots identical and this test green. So the
+    /// expected balances are pinned by value below, and correctness of the quantisation itself is
+    /// `share_batch.rs`'s job. Agreement and correctness are different claims and need different
+    /// assertions.
+    #[test]
+    fn separate_nodes_with_separate_stores_converge_on_one_state_root() {
+        let ids: Vec<Arc<NodeIdentity>> =
+            (0..3).map(|_| Arc::new(NodeIdentity::generate())).collect();
+
+        // Distinct encryption keys per node, as the fleet has: the ciphertext differs everywhere,
+        // and only the plaintext balances may agree.
+        let chains: Vec<ShadowChain> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let db = Arc::new(Database::in_memory().expect("db"));
+                db.set_encryption_key([(0x40 + i) as u8; 32]);
+                ShadowChain::load(Arc::clone(id), db).expect("load")
+            })
+            .collect();
+
+        let opening: BTreeMap<String, i64> =
+            [("bc1qopen".to_string(), 5_000i64)].into_iter().collect();
+        for c in &chains {
+            genesis(c, opening.clone());
+        }
+
+        // Node 0 receives work and proposes; the others adopt what it produced.
+        chains[0].record_received(share(&ids[0], "bc1qa", 2.0, 1));
+        chains[0].record_received(share(&ids[0], "bc1qb", 3.0, 2));
+        let batch = chains[0].build_batch(600, 1_000_000).expect("batch");
+
+        for c in &chains {
+            c.finalise(&batch, 0)
+                .expect("every node must adopt the same batch");
+        }
+
+        let heads: Vec<_> = chains.iter().map(|c| c.head().expect("head")).collect();
+        for h in &heads[1..] {
+            assert_eq!(h.seq, heads[0].seq, "sequences must match");
+            assert_eq!(
+                h.state_root, heads[0].state_root,
+                "state roots must be byte-identical — this is the trust gate's criterion"
+            );
+        }
+        for c in &chains[1..] {
+            assert_eq!(
+                c.balances(),
+                chains[0].balances(),
+                "balances must agree despite different encryption keys"
+            );
+        }
+
+        // Pinned by VALUE, not merely by agreement — see the mutation note above.
+        let expected: BTreeMap<String, i64> = [
+            ("bc1qopen".to_string(), 5_000i64),
+            ("bc1qa".to_string(), micro_work(2.0)),
+            ("bc1qb".to_string(), micro_work(3.0)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            chains[0].balances(),
+            expected,
+            "opening balance carried forward plus each share credited exactly once"
+        );
+
+        // And it must survive the round trip through storage, which is where a divergence the
+        // fold's own tests cannot see would appear.
+        for (i, c) in chains.iter().enumerate() {
+            let reloaded = c.db.sbc_load_balances().expect("reload");
+            assert_eq!(
+                reloaded,
+                chains[0].balances(),
+                "node {i} disagrees after a store round trip"
+            );
+        }
+    }
+
+    /// A second batch must chain onto the first on every node, so convergence is a property of the
+    /// chain rather than of one lucky adoption.
+    #[test]
+    fn convergence_holds_across_successive_batches() {
+        let ids: Vec<Arc<NodeIdentity>> =
+            (0..3).map(|_| Arc::new(NodeIdentity::generate())).collect();
+        let chains: Vec<ShadowChain> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let db = Arc::new(Database::in_memory().expect("db"));
+                db.set_encryption_key([(0x40 + i) as u8; 32]);
+                ShadowChain::load(Arc::clone(id), db).expect("load")
+            })
+            .collect();
+        for c in &chains {
+            genesis(c, BTreeMap::new());
+        }
+
+        // Each node takes a turn proposing, so the chain is not built by one node alone.
+        for (round, proposer) in [0usize, 1, 2].into_iter().enumerate() {
+            let salt = (round + 1) as u8;
+            chains[proposer].record_received(share(&ids[proposer], "bc1qa", 1.0, salt));
+            let batch = chains[proposer]
+                .build_batch(600 + round as i64, 1_000_000)
+                .expect("batch");
+            for c in &chains {
+                c.finalise(&batch, 0).expect("adopt");
+            }
+        }
+
+        let heads: Vec<_> = chains.iter().map(|c| c.head().expect("head")).collect();
+        assert_eq!(heads[0].seq, 3, "three batches on top of genesis");
+        for h in &heads[1..] {
+            assert_eq!(
+                h.state_root, heads[0].state_root,
+                "roots must still agree at seq 3"
+            );
+        }
+        // Work from three different proposers, all credited once.
+        assert_eq!(
+            chains[0].balances().get("bc1qa"),
+            Some(&(3 * micro_work(1.0))),
+            "each proposer's share must be credited exactly once"
+        );
+    }
 }
