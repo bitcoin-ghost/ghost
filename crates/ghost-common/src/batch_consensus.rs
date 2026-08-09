@@ -214,8 +214,13 @@ pub enum FaultReason {
 /// The outcome of judging a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchVerdict {
-    /// Valid — vote for it.
-    Valid,
+    /// Valid — vote for it, at this round.
+    ///
+    /// The round is the escalation step the proposer was authorised at, carried out of
+    /// verification rather than recomputed by the caller: this is the only place that establishes
+    /// WHICH attempt the batch belongs to, and a vote naming a different round than the one that
+    /// authorised it would be counted against the wrong candidate.
+    Valid { round: u32 },
     /// Cannot judge yet. Recoverable.
     Defer(DeferReason),
     /// Defective. Terminal.
@@ -274,13 +279,13 @@ pub fn verify_batch<C: BatchChecks>(
     }
 
     // --- whose turn: the sequence opened when its parent closed, which every node agrees on ---
-    match schedule.authorise(batch.seq, &batch.proposer, parent.close_ts, now) {
-        Authorisation::Authorised { .. } => {}
+    let round = match schedule.authorise(batch.seq, &batch.proposer, parent.close_ts, now) {
+        Authorisation::Authorised { escalation } => escalation,
         Authorisation::TooEarly { escalation } => {
             return BatchVerdict::Defer(DeferReason::ProposerTooEarly { escalation })
         }
         Authorisation::NotAProposer => return BatchVerdict::Defer(DeferReason::ProposerNotDue),
-    }
+    };
 
     // --- from here on, every failure is the batch's own fault ---
     if batch.close_ts <= parent.close_ts {
@@ -339,7 +344,7 @@ pub fn verify_batch<C: BatchChecks>(
         return BatchVerdict::Fault(FaultReason::ProposerSignatureInvalid);
     }
 
-    BatchVerdict::Valid
+    BatchVerdict::Valid { round }
 }
 
 /// What recording a peer's vote did.
@@ -814,7 +819,7 @@ mod tests {
         let (batch, balances) = a_child(&parent, &s);
         assert_eq!(
             verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
-            BatchVerdict::Valid
+            BatchVerdict::Valid { round: 0 }
         );
     }
 
@@ -962,7 +967,7 @@ mod tests {
         batch.state_root = compute_state_root(&expected, batch.seq, batch.close_ts);
         assert_eq!(
             verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
-            BatchVerdict::Valid
+            BatchVerdict::Valid { round: 0 }
         );
     }
 
