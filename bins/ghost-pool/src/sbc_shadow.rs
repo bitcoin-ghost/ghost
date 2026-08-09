@@ -443,6 +443,20 @@ impl ShadowChain {
             now,
         };
 
+        // The window guard belongs HERE too, not only on the vote paths. `verify_batch` defers on
+        // POSITION before it checks any signature, so an unsigned proposal naming seq 10^18 needs
+        // no credentials — and creating the consensus entry before judging left one per distinct
+        // sequence that `prune_below` (which retains `k >= bound`) can never reach. The previous
+        // fix guarded the two vote paths and missed this one.
+        if !self.seq_in_window(batch.seq) {
+            return PhaseAction::Hold {
+                reason: ghost_common::batch_consensus::DeferReason::AheadOfUs {
+                    batch_seq: batch.seq,
+                    our_seq: self.head().map(|h| h.seq).unwrap_or(0),
+                },
+            };
+        }
+
         let action = {
             // LOCK ORDER: quarantine, then consensus. Every path taking both takes them in this
             // order — the prevote/precommit paths took them the other way round, and two messages
@@ -558,6 +572,20 @@ impl ShadowChain {
     pub fn remember_my_proposal(&self, seq: u64, round: u32, batch: &ShareBatch) {
         *self.my_proposal.lock() = Some(((seq, round), batch.clone()));
         self.remember_proposal(batch);
+    }
+
+    /// Do we hold a verified batch at `seq + 1` that names `batch_hash` as its parent?
+    ///
+    /// This is what "we are genuinely behind" looks like as evidence rather than as a feeling. A
+    /// peer can induce us to REQUEST a sequence (a junk proposal at head+2 defers on position, and
+    /// the hold path asks for head+1), so having asked proves nothing. It cannot as easily
+    /// manufacture a valid successor batch naming a specific parent — that is the work the hash
+    /// chain exists to make expensive.
+    pub fn remembered_proposal_extending(&self, seq: u64, batch_hash: [u8; 32]) -> bool {
+        self.proposals
+            .lock()
+            .iter()
+            .any(|((s, _), (_, b))| *s == seq + 1 && b.prev_batch_hash == batch_hash)
     }
 
     /// What this node is LOCKED on at `seq`, if anything.
@@ -1270,6 +1298,105 @@ mod tests {
                 .map(|b| b.batch_hash()),
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Audit 3, finding 3.** A far-future PROPOSAL creates no consensus state.
+    ///
+    /// The window guard covered the two vote paths and missed this one. `verify_batch` defers on
+    /// POSITION before checking any signature, so an unsigned proposal naming seq 10^18 needs no
+    /// credentials — and the entry was created before judging, where `prune_below` (which retains
+    /// `k >= bound`) could never reach it.
+    #[test]
+    fn a_far_future_proposal_creates_no_consensus_state() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        let absurd = u64::MAX / 2;
+        let batch = ShareBatch {
+            seq: absurd,
+            prev_batch_hash: [0u8; 32],
+            close_ts: 600,
+            proposer: id.node_id(),
+            shares: Vec::new(),
+            settled_blocks: Vec::new(),
+            node_shares: Vec::new(),
+            state_root: [0u8; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: Vec::new(),
+        };
+        let schedule = ProposerSchedule::new([id.node_id()]);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+
+        let action = chain.on_proposal_phase(&batch, &schedule, &checks, 600);
+        assert!(
+            matches!(action, PhaseAction::Hold { .. }),
+            "a far-future proposal must hold, not be judged"
+        );
+        assert_eq!(
+            chain.committed_at(absurd),
+            None,
+            "and must leave no consensus state behind"
+        );
+        assert_eq!(chain.lock_at(absurd), None);
+    }
+
+    /// **Audit 3, finding 2.** Chain-extension evidence, not "we once asked".
+    ///
+    /// A peer can INDUCE a sync request for the open sequence by sending a junk proposal at
+    /// head+2. Real proof of being behind is a successor batch naming this one as its parent.
+    #[test]
+    fn extension_evidence_requires_a_real_successor() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        let head = chain.head().expect("head");
+        let seq = head.seq + 1;
+        let candidate_hash = [0xAA; 32];
+
+        assert!(
+            !chain.remembered_proposal_extending(seq, candidate_hash),
+            "no successor held: this is the open sequence, not history"
+        );
+
+        // A successor naming our candidate as its parent IS the evidence.
+        let successor = ShareBatch {
+            seq: seq + 1,
+            prev_batch_hash: candidate_hash,
+            close_ts: head.close_ts + 60,
+            proposer: id.node_id(),
+            shares: Vec::new(),
+            settled_blocks: Vec::new(),
+            node_shares: Vec::new(),
+            state_root: [0u8; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: Vec::new(),
+        };
+        chain.remember_proposal_for_test(&successor);
+
+        assert!(
+            chain.remembered_proposal_extending(seq, candidate_hash),
+            "a successor naming it as parent proves the chain moved past it"
+        );
+        assert!(
+            !chain.remembered_proposal_extending(seq, [0xBB; 32]),
+            "and proves nothing about a DIFFERENT candidate at the same sequence"
         );
     }
 

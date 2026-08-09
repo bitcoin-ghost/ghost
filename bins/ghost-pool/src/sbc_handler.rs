@@ -167,7 +167,18 @@ impl ShareBatchHandler {
         // Remember that WE asked. An unsolicited response is not evidence of anything: a peer can
         // relay a currently-authorised proposal as a `Response`, and adopting it at the open
         // sequence forks us against whatever the fleet actually commits.
-        self.awaiting_sync.lock().insert(seq);
+        {
+            let mut awaiting = self.awaiting_sync.lock();
+            // Bounded: entries are only removed on a successful adoption, so a request that is
+            // never answered would otherwise sit forever, one per sequence ever asked for.
+            while awaiting.len() >= 64 {
+                let Some(oldest) = awaiting.iter().next().copied() else {
+                    break;
+                };
+                awaiting.remove(&oldest);
+            }
+            awaiting.insert(seq);
+        }
         let req = ShareBatchSyncMessage::Request { seq };
         let payload = serde_json::to_vec(&req)
             .map_err(|e| GhostError::Serialization(format!("share batch sync request: {e}")))?;
@@ -291,6 +302,13 @@ impl ShareBatchHandler {
                 }
             }
         }
+
+        // Every message for this SEQUENCE is a retry point for a precommit we owe but never got
+        // out. Deliberately here and not inside `broadcast_phase_vote`: putting it there made the
+        // two mutually recursive, so a full channel recursed until the process stack overflowed —
+        // turning the fix for a dropped precommit into a crash triggered by the exact backpressure
+        // it was written for. It compiled only because both scopes bind a `vote` with a `.seq`.
+        self.retry_owed_precommit(vote.seq);
         Ok(())
     }
 
@@ -325,7 +343,16 @@ impl ShareBatchHandler {
         // path deal with the broadcast.
         let sent = (self.send)(ty, payload);
         if let (Ok(()), BatchVotePhase::Precommit) = (&sent, phase) {
-            self.precommitted.lock().insert((seq, round, batch_hash));
+            let mut done = self.precommitted.lock();
+            // Bounded. Nothing removes these on their own — one entry per precommit for the life
+            // of the process is a slow but monotone leak on a consensus path.
+            while done.len() >= 512 {
+                let Some(oldest) = done.iter().next().copied() else {
+                    break;
+                };
+                done.remove(&oldest);
+            }
+            done.insert((seq, round, batch_hash));
         }
         if let Err(e) = &sent {
             warn!(
@@ -371,10 +398,6 @@ impl ShareBatchHandler {
             }
         }
 
-        // Every message for this sequence is a retry point for a precommit we owe but never got
-        // out. Free when nothing is owed, and the only thing that un-sticks a node whose precommit
-        // was dropped by a full channel.
-        self.retry_owed_precommit(vote.seq);
         Ok(())
     }
 
@@ -497,16 +520,30 @@ impl ShareBatchHandler {
                         );
                         return Ok(());
                     }
-                } else if !self.awaiting_sync.lock().remove(&seq) {
-                    // No opinion AND we never asked. Holding no opinion is the normal state for
-                    // the OPEN sequence, not a sign we are catching up on history — so adopting
-                    // on chain-validity here is exactly the fork vector. A batch we solicited,
-                    // because a peer told us we were behind, is a different matter.
-                    debug!(
-                        seq,
-                        "SBC: unsolicited sync response at a sequence we hold no decision for — ignored"
-                    );
-                    return Ok(());
+                } else {
+                    // No commit opinion. "We once asked" is NOT proof we are behind: a peer can
+                    // INDUCE the request by sending a junk proposal at head+2 — `verify_batch`
+                    // defers on position before checking any signature, and the Hold path then
+                    // requests head+1, the OPEN sequence. It can then replay a genuine,
+                    // currently-authorised, uncommitted candidate as the response and we would
+                    // finalise a batch the fleet never committed, forking at that sequence with no
+                    // recovery path (later proposals hit ParentMismatch, which requests nothing).
+                    //
+                    // Real proof of being behind is a chain that EXTENDS past this sequence. We
+                    // require a batch at seq+1 naming this one as its parent — evidence a peer
+                    // cannot fabricate without also producing a valid successor, which is exactly
+                    // the work the hash chain exists to make expensive.
+                    let extended = self
+                        .chain
+                        .remembered_proposal_extending(seq, batch.batch_hash());
+                    if !extended {
+                        debug!(
+                            seq,
+                            "SBC: sync response at an undecided sequence with no successor — ignored"
+                        );
+                        return Ok(());
+                    }
+                    self.awaiting_sync.lock().remove(&seq);
                 }
                 match self
                     .chain
