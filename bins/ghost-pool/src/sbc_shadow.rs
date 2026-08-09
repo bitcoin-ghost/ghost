@@ -44,6 +44,12 @@ use ghost_storage::sbc_store::ChainHead;
 /// `BTreeMap` keyed this way orders by hash, which is arbitrary.
 type ProposalCache = BTreeMap<(u64, [u8; 32]), (u64, ShareBatch)>;
 
+/// Verified precommit signatures, `(seq, round, batch_hash) -> voter -> signature`.
+///
+/// These ARE the certificate. Retaining them is the only reason a node that witnessed a commit can
+/// prove it to one that did not.
+type PrecommitSigs = BTreeMap<(u64, u32, [u8; 32]), BTreeMap<[u8; 32], [u8; 64]>>;
+
 /// The chain's view on this node.
 pub struct ShadowChain {
     identity: Arc<NodeIdentity>,
@@ -111,6 +117,21 @@ pub struct ShadowChain {
     /// quarantined it. Any 30 s window without a polka would have turned honest nodes into
     /// self-quarantined equivocators fleet-wide.
     my_proposal: Mutex<Option<((u64, u32), ShareBatch)>>,
+    /// Precommit signatures, so a commit can be PROVED to a node that missed it.
+    ///
+    /// Signatures used to be verified and thrown away — the tally only ever needed to count
+    /// voters. But a certificate is exactly those signatures, so without retaining them a node
+    /// that witnessed a commit has no way to demonstrate it, and a node that missed one has no way
+    /// to check. Keyed `(seq, round, batch_hash) -> voter -> signature`; duplicates from a resend
+    /// overwrite harmlessly.
+    precommit_sigs: Mutex<PrecommitSigs>,
+    /// Certificates for sequences this node has COMMITTED, kept so they can be served.
+    ///
+    /// Held separately from `precommit_sigs` because that map is pruned with the consensus state
+    /// the moment a sequence closes — which is precisely when the certificate becomes useful to
+    /// everyone else. Bounded; a node that has pruned past a sequence simply cannot answer for it
+    /// and the requester asks another peer.
+    certs: Mutex<BTreeMap<u64, ghost_consensus::message::CommitCertificate>>,
     /// Two-phase consensus state, one per open sequence.
     ///
     /// Replaces `vote_lock` + `tallies` on the live path. Those two are retained only until the
@@ -168,6 +189,8 @@ impl ShadowChain {
             vote_lock: Mutex::new(SeqVoteLock::new()),
             tallies: Mutex::new(BTreeMap::new()),
             consensus: Mutex::new(BTreeMap::new()),
+            precommit_sigs: Mutex::new(BTreeMap::new()),
+            certs: Mutex::new(BTreeMap::new()),
             proposals: Mutex::new(BTreeMap::new()),
             proposal_seq_no: Mutex::new(0),
             my_proposal: Mutex::new(None),
@@ -574,6 +597,45 @@ impl ShadowChain {
         self.remember_proposal(batch);
     }
 
+    /// Freeze the proof that `batch_hash` was committed at `(seq, round)`.
+    ///
+    /// Called at the moment of commit, while the signatures are still held — `prune_below` drops
+    /// them with the rest of the sequence's state immediately afterwards, and that is precisely
+    /// when every other node starts needing them.
+    fn mint_certificate(&self, seq: u64, round: u32, batch_hash: [u8; 32]) {
+        const MAX_CERTS: usize = 64;
+        let Some(sigs) = self
+            .precommit_sigs
+            .lock()
+            .get(&(seq, round, batch_hash))
+            .cloned()
+        else {
+            return;
+        };
+        let cert = ghost_consensus::message::CommitCertificate {
+            seq,
+            round,
+            batch_hash,
+            precommits: sigs
+                .into_iter()
+                .map(|(v, sig)| (hex::encode(v), hex::encode(sig)))
+                .collect(),
+        };
+        let mut certs = self.certs.lock();
+        while certs.len() >= MAX_CERTS {
+            let Some(oldest) = certs.keys().next().copied() else {
+                break;
+            };
+            certs.remove(&oldest);
+        }
+        certs.insert(seq, cert);
+    }
+
+    /// The certificate proving what we committed at `seq`, if we still hold it.
+    pub fn certificate_at(&self, seq: u64) -> Option<ghost_consensus::message::CommitCertificate> {
+        self.certs.lock().get(&seq).cloned()
+    }
+
     /// What this node is LOCKED on at `seq`, if anything.
     ///
     /// Exposed so the handler can tell "locked but never managed to precommit" from "not locked",
@@ -597,6 +659,9 @@ impl ShadowChain {
     /// this node vote twice in one round, which is the one thing the per-round tally prevents.
     pub fn prune_below(&self, seq: u64) {
         self.consensus.lock().retain(|k, _| *k >= seq);
+        // Signatures go with the consensus state; the CERTIFICATE minted at commit is what
+        // survives, in `certs`.
+        self.precommit_sigs.lock().retain(|(s, _, _), _| *s >= seq);
         self.proposals.lock().retain(|(s, _), _| *s >= seq);
         let mut mine = self.my_proposal.lock();
         if mine.as_ref().is_some_and(|((s, _), _)| *s < seq) {
@@ -637,12 +702,14 @@ impl ShadowChain {
     }
 
     /// Record a peer's PRECOMMIT. A quorum of them commits the sequence.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_batch_precommit(
         &self,
         voter: [u8; 32],
         round: u32,
         batch_hash: [u8; 32],
         seq: u64,
+        signature: [u8; 64],
         schedule: &ProposerSchedule,
         now: i64,
     ) -> PrecommitAction {
@@ -657,7 +724,7 @@ impl ShadowChain {
         let entry = consensus
             .entry(seq)
             .or_insert_with(|| SeqConsensus::new(seq, schedule.quorum()));
-        on_precommit(
+        let action = on_precommit(
             voter,
             round,
             batch_hash,
@@ -665,7 +732,26 @@ impl ShadowChain {
             &mut quarantine,
             schedule,
             now,
-        )
+        );
+        drop(consensus);
+        drop(quarantine);
+
+        // Retain it. The caller has already verified this signature against the precommit domain,
+        // so what is stored is exactly what a certificate needs and nothing has to be re-derived.
+        {
+            let mut sigs = self.precommit_sigs.lock();
+            sigs.entry((seq, round, batch_hash))
+                .or_default()
+                .insert(voter, signature);
+        }
+
+        // On commit, freeze the proof while we still hold the parts. `prune_below` drops the
+        // signature map with the rest of the sequence's state moments later, and that is exactly
+        // when other nodes start needing it.
+        if let PrecommitAction::Commit { .. } = action {
+            self.mint_certificate(seq, round, batch_hash);
+        }
+        action
     }
 
     /// Record a vote and report whether it carried the sequence.

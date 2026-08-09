@@ -277,6 +277,7 @@ impl ShareBatchHandler {
                     vote.round,
                     vote.batch_hash,
                     vote.seq,
+                    vote.signature,
                     &schedule,
                     now,
                 );
@@ -389,6 +390,7 @@ impl ShareBatchHandler {
                     round,
                     batch_hash,
                     seq,
+                    vote.signature,
                     &schedule,
                     now,
                 );
@@ -470,7 +472,15 @@ impl ShareBatchHandler {
         match msg {
             ShareBatchSyncMessage::Request { seq } => {
                 if let Ok(Some(batch_json)) = self.chain.batch_at(seq) {
-                    let resp = ShareBatchSyncMessage::Response { seq, batch_json };
+                    // Attach the proof if we still hold it. Without it the requester can only
+                    // fall back to the weaker local-opinion path, which a node that missed this
+                    // sequence's consensus can never satisfy.
+                    let cert = self.chain.certificate_at(seq);
+                    let resp = ShareBatchSyncMessage::Response {
+                        seq,
+                        batch_json,
+                        cert,
+                    };
                     let payload = serde_json::to_vec(&resp).map_err(|e| {
                         GhostError::Serialization(format!("share batch sync response: {e}"))
                     })?;
@@ -481,7 +491,11 @@ impl ShareBatchHandler {
                     debug!(seq, "SBC: sync request outside our window");
                 }
             }
-            ShareBatchSyncMessage::Response { seq, batch_json } => {
+            ShareBatchSyncMessage::Response {
+                seq,
+                batch_json,
+                cert,
+            } => {
                 let batch: ShareBatch = serde_json::from_str(&batch_json)
                     .map_err(|e| GhostError::Serialization(format!("synced batch {seq}: {e}")))?;
                 // A synced batch is judged exactly like a proposed one. It arrives from a peer we
@@ -520,6 +534,26 @@ impl ShareBatchHandler {
                         );
                         return Ok(());
                     }
+                } else if let Some(cert) = cert.as_ref().filter(|c| {
+                    c.seq == seq
+                        && c.batch_hash == batch.batch_hash()
+                        && c.verify(schedule.voters(), schedule.quorum())
+                }) {
+                    // A VERIFIED certificate settles it outright. Every signature checks against
+                    // the precommit domain for exactly this (seq, round, hash), every signer is a
+                    // known voter, and there are at least a quorum of them — so a quorum really
+                    // did commit this batch, and no local belief is needed or consulted.
+                    //
+                    // This is what four rounds of local heuristics were failing to approximate.
+                    // The node cannot answer "was this sequence closed?" from its own state; the
+                    // peer that watched it close supplies the proof instead.
+                    info!(
+                        seq,
+                        round = cert.round,
+                        signers = cert.precommits.len(),
+                        "SBC: adopting a synced batch on a verified commit certificate"
+                    );
+                    self.awaiting_sync.lock().remove(&seq);
                 } else if !self.awaiting_sync.lock().remove(&seq) {
                     // No commit opinion and we never asked. Ignoring an UNSOLICITED response is
                     // cheap and closes the easiest version of the fork.

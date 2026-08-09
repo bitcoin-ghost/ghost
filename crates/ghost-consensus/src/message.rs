@@ -1413,11 +1413,89 @@ pub enum ShareBatchSyncMessage {
     /// By sequence rather than hash, because a node that is behind does not know the hash — that
     /// is precisely what it is missing.
     Request { seq: u64 },
-    /// The batch, as stored JSON.
+    /// The batch, as stored JSON, with the certificate that proves it was committed.
     ///
-    /// Verified by rehashing against the parent the *next* batch names, never by trusting the
-    /// sender. The chain is the anchor, so a forged batch cannot link.
-    Response { seq: u64, batch_json: String },
+    /// The certificate is what makes catch-up both safe and possible. A node that missed a
+    /// sequence's consensus cannot tell from local state whether a batch it is offered was
+    /// actually decided — every local heuristic for that question is either forgeable (an
+    /// attacker induces the condition) or unreachable (an honest node can never satisfy it, which
+    /// wedges catch-up entirely). The answer is not to infer it: the peer that HAS the proof
+    /// supplies it, and the receiver checks it against the voter set.
+    ///
+    /// Optional so a node that adopted before certificates existed can still answer with the
+    /// batch alone; such a response is only adoptable on the older, weaker path.
+    Response {
+        seq: u64,
+        batch_json: String,
+        #[serde(default)]
+        cert: Option<CommitCertificate>,
+    },
+}
+
+/// Proof that a quorum committed a specific batch at a specific `(seq, round)`.
+///
+/// Just the precommit signatures. It is unforgeable without an actual quorum of voter keys,
+/// cannot be induced by manipulating a victim's local state, and is always available to any node
+/// that witnessed the commit — the three properties every local heuristic lacked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitCertificate {
+    pub seq: u64,
+    /// The round the precommits were cast at. Signatures cover it, so a certificate cannot be
+    /// re-presented for a different round.
+    pub round: u32,
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub batch_hash: [u8; 32],
+    /// `(voter, signature)` pairs over the PRECOMMIT signing domain.
+    pub precommits: Vec<(String, String)>,
+}
+
+impl CommitCertificate {
+    /// Check this certificate against a voter set and a required quorum.
+    ///
+    /// Fail-closed and independent of any local opinion: every signature must verify over the
+    /// precommit domain for exactly this `(seq, round, batch_hash)`, every signer must be a known
+    /// voter, duplicates count once, and the total must reach quorum. Nothing here consults what
+    /// the receiver believes, which is the point — a node catching up believes nothing.
+    pub fn verify(&self, voters: &[NodeId], quorum: usize) -> bool {
+        use std::collections::BTreeSet;
+
+        let mut seen: BTreeSet<NodeId> = BTreeSet::new();
+        for (voter_hex, sig_hex) in &self.precommits {
+            let Ok(voter_raw) = hex::decode(voter_hex) else {
+                return false;
+            };
+            let Ok(voter) = <[u8; 32]>::try_from(voter_raw.as_slice()) else {
+                return false;
+            };
+            if !voters.contains(&voter) {
+                return false;
+            }
+            let Ok(sig_raw) = hex::decode(sig_hex) else {
+                return false;
+            };
+            let Ok(sig) = <[u8; 64]>::try_from(sig_raw.as_slice()) else {
+                return false;
+            };
+            let probe = ShareBatchPhaseVoteMessage {
+                seq: self.seq,
+                round: self.round,
+                batch_hash: self.batch_hash,
+                voter,
+                signature: sig,
+            };
+            if !ghost_common::identity::verify_signature(
+                &voter,
+                &probe.signing_bytes(BatchVotePhase::Precommit),
+                &sig,
+            )
+            .unwrap_or(false)
+            {
+                return false;
+            }
+            seen.insert(voter);
+        }
+        seen.len() >= quorum
+    }
 }
 
 /// Payout-ledger checkpoint vote (validator → all).
@@ -1987,6 +2065,131 @@ pub struct GhostGlyphRegisteredMessage {
 
 #[cfg(test)]
 mod tests {
+
+    use ghost_common::identity::NodeIdentity;
+
+    fn signed_precommit(
+        id: &NodeIdentity,
+        seq: u64,
+        round: u32,
+        batch_hash: [u8; 32],
+    ) -> (String, String) {
+        let mut v = ShareBatchPhaseVoteMessage {
+            seq,
+            round,
+            batch_hash,
+            voter: id.node_id(),
+            signature: [0u8; 64],
+        };
+        v.signature = id.sign(&v.signing_bytes(BatchVotePhase::Precommit));
+        (hex::encode(id.node_id()), hex::encode(v.signature))
+    }
+
+    /// A genuine quorum of precommits verifies.
+    #[test]
+    fn a_real_quorum_produces_a_valid_certificate() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            precommits: ids[..6]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(cert.verify(&voters, 6));
+    }
+
+    /// Short of quorum is refused. The count is the whole guarantee.
+    #[test]
+    fn fewer_than_quorum_is_refused() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            precommits: ids[..5]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(!cert.verify(&voters, 6));
+    }
+
+    /// **The forgery this exists to stop.** Signatures from non-voters do not count.
+    ///
+    /// Minting six fresh keypairs is exactly the attack that beat the earlier local heuristics.
+    /// Here it produces six perfectly valid signatures over the right bytes — and still fails,
+    /// because none of the signers is in the voter set.
+    #[test]
+    fn minted_keypairs_cannot_forge_a_certificate() {
+        let real: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = real.iter().map(|i| i.node_id()).collect();
+        let attackers: Vec<NodeIdentity> = (0..6).map(|_| NodeIdentity::generate()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            precommits: attackers
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(
+            !cert.verify(&voters, 6),
+            "six self-minted signatures must not pass — this is the attack the design turns on"
+        );
+    }
+
+    /// One voter repeated does not reach quorum on its own.
+    #[test]
+    fn duplicate_signers_count_once() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            precommits: (0..6).map(|_| signed_precommit(&ids[0], 7, 3, h)).collect(),
+        };
+        assert!(!cert.verify(&voters, 6), "one voter six times is one voter");
+    }
+
+    /// A certificate cannot be replayed at another sequence, round, or batch.
+    #[test]
+    fn a_certificate_does_not_transfer() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let good: Vec<(String, String)> = ids[..6]
+            .iter()
+            .map(|i| signed_precommit(i, 7, 3, h))
+            .collect();
+
+        for (seq, round, hash, what) in [
+            (8u64, 3u32, h, "sequence"),
+            (7, 4, h, "round"),
+            (7, 3, [0xCD; 32], "batch"),
+        ] {
+            let cert = CommitCertificate {
+                seq,
+                round,
+                batch_hash: hash,
+                precommits: good.clone(),
+            };
+            assert!(
+                !cert.verify(&voters, 6),
+                "signatures must not carry to a different {what}"
+            );
+        }
+    }
 
     /// A prevote's signed bytes must NOT verify as a precommit.
     ///
