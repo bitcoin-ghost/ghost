@@ -76,6 +76,9 @@ pub mod skeleton_store;
 pub mod terminal_reject_cache;
 
 /// Mining round lifecycle and share accounting.
+/// Bridge from the share-batch chain to this node's share verification (WP-5).
+pub mod sbc_checks;
+
 pub mod round;
 
 /// Stratum JSON-RPC request parsing.
