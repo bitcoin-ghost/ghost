@@ -48,14 +48,6 @@ pub struct ShareBatchHandler {
     /// but never commit-voting, with no alarm. Recording what actually went out lets the next
     /// message for that sequence notice the gap and retry.
     precommitted: parking_lot::Mutex<std::collections::BTreeSet<(u64, u32, [u8; 32])>>,
-    /// Sequences we have actually ASKED a peer for.
-    ///
-    /// A sync `Response` we did not solicit is not evidence. Any peer can relay a
-    /// currently-authorised proposal as a response, and adopting it at the OPEN sequence — where
-    /// we hold no commit opinion yet — forks this node against whatever the fleet commits. That
-    /// is precisely the "two nodes adopt different batches at one sequence" failure two-phase
-    /// exists to prevent, so chain-validity alone cannot be the bar.
-    awaiting_sync: parking_lot::Mutex<std::collections::BTreeSet<u64>>,
 }
 
 impl ShareBatchHandler {
@@ -73,7 +65,6 @@ impl ShareBatchHandler {
             voters,
             checks,
             precommitted: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
-            awaiting_sync: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -167,18 +158,6 @@ impl ShareBatchHandler {
         // Remember that WE asked. An unsolicited response is not evidence of anything: a peer can
         // relay a currently-authorised proposal as a `Response`, and adopting it at the open
         // sequence forks us against whatever the fleet actually commits.
-        {
-            let mut awaiting = self.awaiting_sync.lock();
-            // Bounded: entries are only removed on a successful adoption, so a request that is
-            // never answered would otherwise sit forever, one per sequence ever asked for.
-            while awaiting.len() >= 64 {
-                let Some(oldest) = awaiting.iter().next().copied() else {
-                    break;
-                };
-                awaiting.remove(&oldest);
-            }
-            awaiting.insert(seq);
-        }
         let req = ShareBatchSyncMessage::Request { seq };
         let payload = serde_json::to_vec(&req)
             .map_err(|e| GhostError::Serialization(format!("share batch sync request: {e}")))?;
@@ -553,34 +532,24 @@ impl ShareBatchHandler {
                         signers = cert.precommits.len(),
                         "SBC: adopting a synced batch on a verified commit certificate"
                     );
-                    self.awaiting_sync.lock().remove(&seq);
-                } else if !self.awaiting_sync.lock().remove(&seq) {
-                    // No commit opinion and we never asked. Ignoring an UNSOLICITED response is
-                    // cheap and closes the easiest version of the fork.
+                } else {
+                    // No certificate and no commit opinion: we cannot establish that this sequence
+                    // was decided, so we do not adopt. Full stop.
                     //
-                    // KNOWN RESIDUAL RISK, recorded rather than papered over. Having asked is not
-                    // proof we are behind: a peer can induce the request with a junk proposal at
-                    // head+2, because `verify_batch` defers on POSITION before checking any
-                    // signature, and the hold path then requests head+1 — the open sequence. Such
-                    // a peer can answer with a real but uncommitted candidate and fork us there.
+                    // The previous fallback accepted a response merely because we had ASKED for
+                    // it, and that was inducible: a peer sends a junk proposal at head+2,
+                    // `verify_batch` defers on POSITION before checking any signature, the hold
+                    // path auto-requests head+1 — the open sequence — and the attacker answers it
+                    // with a real-but-uncommitted batch. Trying the certificate first protected
+                    // nothing, because an attacker simply omits the certificate.
                     //
-                    // Accepted deliberately for the shadow soak: exploiting it requires a
-                    // MALICIOUS AUTHENTICATED MESH PEER, and the fleet is presently one operator's
-                    // own nodes. The stronger rule tried previously — demanding a cached successor
-                    // batch as chain-extension evidence — was UNSATISFIABLE: `parent_for` pins the
-                    // parent to `head.seq`, so `verify_batch` only ever returns Valid for `head+1`
-                    // and a batch at `head+2` is never cached. It made catch-up impossible for any
-                    // node that missed one sequence, which is every restart. A certain wedge is
-                    // worse than a conditional fork.
-                    //
-                    // The correct fix is a COMMIT CERTIFICATE on the sync response — the quorum of
-                    // signed precommits, verified against the voter set. Unforgeable, not
-                    // inducible, and always satisfiable because the evidence is SUPPLIED rather
-                    // than required to be pre-held. That is a wire change and MUST land before
-                    // multi-operator. See docs/SBC_TWO_PHASE.md.
+                    // Removing it costs nothing now: a peer that witnessed the commit HAS the
+                    // certificate and will supply it. A peer that has pruned past it cannot help
+                    // either way, and the requester asks another. Refusing to adopt what we cannot
+                    // verify is the correct answer, not a degradation.
                     debug!(
                         seq,
-                        "SBC: unsolicited sync response at an undecided sequence — ignored"
+                        "SBC: sync response carries no verifiable commit proof — not adopted"
                     );
                     return Ok(());
                 }

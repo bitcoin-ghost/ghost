@@ -602,7 +602,13 @@ impl ShadowChain {
     /// Called at the moment of commit, while the signatures are still held — `prune_below` drops
     /// them with the rest of the sequence's state immediately afterwards, and that is precisely
     /// when every other node starts needing them.
-    fn mint_certificate(&self, seq: u64, round: u32, batch_hash: [u8; 32]) {
+    fn mint_certificate(
+        &self,
+        seq: u64,
+        round: u32,
+        batch_hash: [u8; 32],
+        schedule: &ProposerSchedule,
+    ) {
         const MAX_CERTS: usize = 64;
         let Some(sigs) = self
             .precommit_sigs
@@ -616,6 +622,9 @@ impl ShadowChain {
             seq,
             round,
             batch_hash,
+            // Stamp the membership we counted this quorum over, so a receiver can only check it
+            // against the same one.
+            voter_set_hash: ghost_consensus::message::voter_set_hash(schedule.voters()),
             precommits: sigs
                 .into_iter()
                 .map(|(v, sig)| (hex::encode(v), hex::encode(sig)))
@@ -749,7 +758,7 @@ impl ShadowChain {
         // signature map with the rest of the sequence's state moments later, and that is exactly
         // when other nodes start needing it.
         if let PrecommitAction::Commit { .. } = action {
-            self.mint_certificate(seq, round, batch_hash);
+            self.mint_certificate(seq, round, batch_hash, schedule);
         }
         action
     }

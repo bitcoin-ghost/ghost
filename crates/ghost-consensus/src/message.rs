@@ -1445,8 +1445,38 @@ pub struct CommitCertificate {
     pub round: u32,
     #[serde(with = "ghost_common::serde_hex::bytes32")]
     pub batch_hash: [u8; 32],
+    /// The VOTER SET this certificate was minted against, as a hash of the sorted ids.
+    ///
+    /// Without this the proof is only as strong as the receiver's own membership view — and that
+    /// view is a live per-node database query that shrinks during discovery warmup, restart and
+    /// partition. A shrunken view lowers `bft_threshold`, so a bundle of GENUINE sub-quorum
+    /// precommits from a losing round would verify: at a view of six the bar falls to four, and
+    /// precommits are public signed gossip that anyone can collect. No key compromise, no
+    /// inducement, no request needed.
+    ///
+    /// Binding the certificate to a membership means a receiver can only check a quorum it agrees
+    /// on the shape of. Disagreeing is not a fault — it means "I cannot judge this", which is the
+    /// honest answer.
+    #[serde(default, with = "ghost_common::serde_hex::bytes32")]
+    pub voter_set_hash: [u8; 32],
     /// `(voter, signature)` pairs over the PRECOMMIT signing domain.
     pub precommits: Vec<(String, String)>,
+}
+
+/// Identity of a voter set: SHA256 over its sorted, concatenated node ids.
+///
+/// Sorted so every node derives the same hash from the same membership regardless of the order it
+/// learned them in — the same reason `ProposerSchedule` sorts.
+pub fn voter_set_hash(voters: &[NodeId]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<NodeId> = voters.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut h = Sha256::new();
+    for v in &sorted {
+        h.update(v);
+    }
+    h.finalize().into()
 }
 
 impl CommitCertificate {
@@ -1458,6 +1488,20 @@ impl CommitCertificate {
     /// the receiver believes, which is the point — a node catching up believes nothing.
     pub fn verify(&self, voters: &[NodeId], quorum: usize) -> bool {
         use std::collections::BTreeSet;
+
+        // A quorum of zero is not a quorum. `bft_threshold(0) == 0`, so an empty voter view plus
+        // an empty `precommits` vec satisfied `0 >= 0` and adopted anything — fail-open at exactly
+        // the moment a node knows least, which is startup before discovery completes.
+        if quorum == 0 || self.precommits.is_empty() {
+            return false;
+        }
+
+        // The certificate must have been minted against the membership we are checking it with.
+        // Otherwise the bar is set by OUR view, and a degraded view lowers it far enough that
+        // genuine sub-quorum signatures from a losing round pass.
+        if self.voter_set_hash != voter_set_hash(voters) {
+            return false;
+        }
 
         let mut seen: BTreeSet<NodeId> = BTreeSet::new();
         for (voter_hex, sig_hex) in &self.precommits {
@@ -2095,6 +2139,7 @@ mod tests {
             seq: 7,
             round: 3,
             batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
             precommits: ids[..6]
                 .iter()
                 .map(|i| signed_precommit(i, 7, 3, h))
@@ -2113,6 +2158,7 @@ mod tests {
             seq: 7,
             round: 3,
             batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
             precommits: ids[..5]
                 .iter()
                 .map(|i| signed_precommit(i, 7, 3, h))
@@ -2136,6 +2182,7 @@ mod tests {
             seq: 7,
             round: 3,
             batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
             precommits: attackers
                 .iter()
                 .map(|i| signed_precommit(i, 7, 3, h))
@@ -2157,9 +2204,89 @@ mod tests {
             seq: 7,
             round: 3,
             batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
             precommits: (0..6).map(|_| signed_precommit(&ids[0], 7, 3, h)).collect(),
         };
         assert!(!cert.verify(&voters, 6), "one voter six times is one voter");
+    }
+
+    /// **Audit-5 blocker A.** Genuine SUB-QUORUM signatures must not pass under a shrunken view.
+    ///
+    /// The voter set is a live per-node database query that shrinks during discovery warmup,
+    /// restart and partition. Quorum came from THAT view, so at a view of six the bar fell to
+    /// four — and precommits are public signed gossip. An attacker collects four real signatures
+    /// from a losing round and the node adopts a batch that never committed. No key compromise, no
+    /// inducement, no request. The certificate is now bound to the membership it was minted
+    /// against, so a receiver can only check a quorum it agrees on the shape of.
+    #[test]
+    fn genuine_subquorum_signatures_do_not_pass_under_a_degraded_view() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let full: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+
+        // Four REAL signatures — a losing round that never reached the true quorum of 6.
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            voter_set_hash: voter_set_hash(&full),
+            precommits: ids[..4]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+
+        // The receiver's view has shrunk to six, so its own threshold is only four.
+        let degraded: Vec<NodeId> = full[..6].to_vec();
+        assert!(
+            !cert.verify(&degraded, 4),
+            "four genuine signatures must not adopt just because our view shrank"
+        );
+        // And against the full set it is still short of six.
+        assert!(!cert.verify(&full, 6));
+    }
+
+    /// A certificate minted against a DIFFERENT membership is not checkable here.
+    ///
+    /// Disagreeing about the voter set is not a fault — it means "I cannot judge this", which is
+    /// the honest answer and strictly safer than judging against the wrong bar.
+    #[test]
+    fn a_certificate_from_another_voter_set_is_refused() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let full: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            // Minted against a set that is not the one we will check against.
+            voter_set_hash: voter_set_hash(&full[..7]),
+            precommits: ids[..6]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(!cert.verify(&full, 6));
+    }
+
+    /// **Audit-5 blocker B.** An empty certificate must not pass an empty voter set.
+    ///
+    /// `bft_threshold(0) == 0`, so `0 >= 0` adopted anything — fail-open at exactly the moment a
+    /// node knows least, which is startup before discovery completes.
+    #[test]
+    fn an_empty_certificate_never_passes() {
+        let empty: Vec<NodeId> = Vec::new();
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: [0xAB; 32],
+            voter_set_hash: voter_set_hash(&empty),
+            precommits: Vec::new(),
+        };
+        assert!(
+            !cert.verify(&empty, 0),
+            "a quorum of zero is not a quorum, and no signatures prove nothing"
+        );
     }
 
     /// A certificate cannot be replayed at another sequence, round, or batch.
@@ -2182,6 +2309,7 @@ mod tests {
                 seq,
                 round,
                 batch_hash: hash,
+                voter_set_hash: voter_set_hash(&voters),
                 precommits: good.clone(),
             };
             assert!(
