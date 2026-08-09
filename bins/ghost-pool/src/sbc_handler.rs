@@ -41,6 +41,13 @@ pub struct ShareBatchHandler {
     send: BroadcastFn,
     voters: VoterSetFn,
     checks: ChecksFn,
+    /// Precommits we have successfully broadcast, as `(seq, round, batch_hash)`.
+    ///
+    /// A polka is EDGE-triggered — reported once per `(round, batch)` — so if the precommit it
+    /// produces is lost to a full broadcast channel, nothing re-emits it and the node sits locked
+    /// but never commit-voting, with no alarm. Recording what actually went out lets the next
+    /// message for that sequence notice the gap and retry.
+    precommitted: parking_lot::Mutex<std::collections::BTreeSet<(u64, u32, [u8; 32])>>,
     /// Sequences we have actually ASKED a peer for.
     ///
     /// A sync `Response` we did not solicit is not evidence. Any peer can relay a
@@ -65,6 +72,7 @@ impl ShareBatchHandler {
             send,
             voters,
             checks,
+            precommitted: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             awaiting_sync: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
@@ -310,7 +318,24 @@ impl ShareBatchHandler {
             BatchVotePhase::Prevote => MessageType::ShareBatchPrevote,
             BatchVotePhase::Precommit => MessageType::ShareBatchPrecommit,
         };
-        (self.send)(ty, payload)?;
+        // Send is fallible (bounded channel, `try_send`). It is attempted BEFORE the self-count
+        // was the bug: `?` returned early, so a full channel cost us the broadcast AND our own
+        // vote, while the polka edge was already consumed and nothing would re-emit it. Our vote
+        // is ours whether or not the network heard it, so count it regardless and let the retry
+        // path deal with the broadcast.
+        let sent = (self.send)(ty, payload);
+        if let (Ok(()), BatchVotePhase::Precommit) = (&sent, phase) {
+            self.precommitted.lock().insert((seq, round, batch_hash));
+        }
+        if let Err(e) = &sent {
+            warn!(
+                seq,
+                round,
+                ?phase,
+                error = %e,
+                "SBC: phase vote not broadcast — will retry on the next message for this sequence"
+            );
+        }
 
         // Count our own vote. Without this a node never contributes to the quorum it is waiting
         // on, and a small fleet could never reach one.
@@ -345,7 +370,40 @@ impl ShareBatchHandler {
                 }
             }
         }
+
+        // Every message for this sequence is a retry point for a precommit we owe but never got
+        // out. Free when nothing is owed, and the only thing that un-sticks a node whose precommit
+        // was dropped by a full channel.
+        self.retry_owed_precommit(vote.seq);
         Ok(())
+    }
+
+    /// Re-emit a precommit this node owes but never managed to broadcast.
+    ///
+    /// The polka that produced it fires once per `(round, batch)`, so a precommit lost to a full
+    /// channel is lost for that round — the node stays locked and never commit-votes, and under
+    /// sustained backpressure the sequence cannot close at all. Every subsequent message for the
+    /// sequence is a natural retry point, and retrying is free when nothing is owed.
+    fn retry_owed_precommit(&self, seq: u64) {
+        let Some((round, batch_hash)) = self.chain.lock_at(seq) else {
+            return;
+        };
+        if self.precommitted.lock().contains(&(seq, round, batch_hash)) {
+            return;
+        }
+        if let Err(e) = self.broadcast_phase_vote(
+            seq,
+            round,
+            batch_hash,
+            ghost_consensus::message::BatchVotePhase::Precommit,
+        ) {
+            debug!(seq, round, error = %e, "SBC: precommit retry still blocked");
+        } else {
+            info!(
+                seq,
+                round, "SBC: re-emitted a precommit that had been dropped"
+            );
+        }
     }
 
     /// Adopt a committed batch if we hold it.

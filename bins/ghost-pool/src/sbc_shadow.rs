@@ -483,7 +483,13 @@ impl ShadowChain {
 
     /// Whether a sequence is close enough to our head to be worth holding state for.
     fn seq_in_window(&self, seq: u64) -> bool {
-        let head = self.head().map(|h| h.seq).unwrap_or(0);
+        // No genesis, no window. Before genesis this node cannot judge a batch at ANY sequence,
+        // so consensus state for one is state nothing will ever resolve — and because
+        // `prune_below` only runs on finalise, nothing would ever remove it either. Treating an
+        // absent head as seq 0 admitted votes for 0..=8 from any voter and kept them.
+        let Some(head) = self.head().map(|h| h.seq) else {
+            return false;
+        };
         seq > head.saturating_sub(1) && seq <= head.saturating_add(Self::SEQ_LOOKAHEAD)
     }
 
@@ -552,6 +558,14 @@ impl ShadowChain {
     pub fn remember_my_proposal(&self, seq: u64, round: u32, batch: &ShareBatch) {
         *self.my_proposal.lock() = Some(((seq, round), batch.clone()));
         self.remember_proposal(batch);
+    }
+
+    /// What this node is LOCKED on at `seq`, if anything.
+    ///
+    /// Exposed so the handler can tell "locked but never managed to precommit" from "not locked",
+    /// which is the difference between a sequence that will recover and one silently stuck.
+    pub fn lock_at(&self, seq: u64) -> Option<(u32, [u8; 32])> {
+        self.consensus.lock().get(&seq).and_then(|c| c.lock())
     }
 
     /// What this node believes was COMMITTED at `seq`, if it holds an opinion.
@@ -1257,6 +1271,32 @@ mod tests {
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
         );
+    }
+
+    /// **Re-audit B5.** Before genesis a node holds no consensus state at all.
+    ///
+    /// An absent head used to read as seq 0, admitting votes for 0..=8 from any voter. Nothing
+    /// resolves those sequences pre-genesis, and `prune_below` only runs on finalise — so the
+    /// state was created and then never removed.
+    #[test]
+    fn a_node_without_genesis_creates_no_consensus_state() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        // Deliberately NO genesis.
+        let chain = ShadowChain::load(Arc::clone(&id), db).expect("load");
+        assert!(chain.head().is_none(), "precondition: no genesis");
+
+        let schedule = ProposerSchedule::new([id.node_id()]);
+        for seq in 0..=8u64 {
+            assert_eq!(
+                chain.on_batch_prevote(id.node_id(), 0, [0xAA; 32], seq, &schedule, 0),
+                PrevoteAction::Ignored,
+                "seq {seq} must be refused before genesis"
+            );
+            assert_eq!(chain.committed_at(seq), None);
+            assert_eq!(chain.lock_at(seq), None, "and no lock may be created");
+        }
     }
 
     /// **Re-audit B4.** A full cache evicts its OLDEST entry, not the newest arrival.
