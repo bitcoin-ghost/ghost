@@ -1,6 +1,6 @@
 //! The bridge from the batch chain to this node's share verification (WP-5).
 //!
-//! [`BatchChecks`] is what `verify_batch` calls to decide whether a share in a peer's proposed
+//! [`ghost_common::batch_consensus::BatchChecks`] is what `verify_batch` calls to decide whether a share in a peer's proposed
 //! batch is real. It must answer that question **exactly** as this node would for its own shares,
 //! or the shadow chain diverges for reasons that have nothing to do with consensus and the trust
 //! gate cannot tell the two apart.

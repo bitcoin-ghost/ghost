@@ -317,6 +317,11 @@ impl ShadowChain {
         on_vote(voter, batch_hash, tally, &mut quarantine, schedule, now)
     }
 
+    /// The adopted batch at `seq`, verbatim, for answering a sync request.
+    pub fn batch_at(&self, seq: u64) -> GhostResult<Option<String>> {
+        self.db.sbc_get_batch(seq)
+    }
+
     /// Note that a sequence has opened, so escalation is measured from the right moment.
     ///
     /// Without this the stall clock would run from the parent's `close_ts`, which is when the

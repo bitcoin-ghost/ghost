@@ -82,6 +82,9 @@ pub mod sbc_checks;
 /// The share-batch chain running in shadow (WP-5) — computes, persists, pays nobody.
 pub mod sbc_shadow;
 
+/// Mesh handler routing batch traffic into the shadow chain (WP-5).
+pub mod sbc_handler;
+
 pub mod round;
 
 /// Stratum JSON-RPC request parsing.
