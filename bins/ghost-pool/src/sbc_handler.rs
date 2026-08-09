@@ -520,30 +520,35 @@ impl ShareBatchHandler {
                         );
                         return Ok(());
                     }
-                } else {
-                    // No commit opinion. "We once asked" is NOT proof we are behind: a peer can
-                    // INDUCE the request by sending a junk proposal at head+2 — `verify_batch`
-                    // defers on position before checking any signature, and the Hold path then
-                    // requests head+1, the OPEN sequence. It can then replay a genuine,
-                    // currently-authorised, uncommitted candidate as the response and we would
-                    // finalise a batch the fleet never committed, forking at that sequence with no
-                    // recovery path (later proposals hit ParentMismatch, which requests nothing).
+                } else if !self.awaiting_sync.lock().remove(&seq) {
+                    // No commit opinion and we never asked. Ignoring an UNSOLICITED response is
+                    // cheap and closes the easiest version of the fork.
                     //
-                    // Real proof of being behind is a chain that EXTENDS past this sequence. We
-                    // require a batch at seq+1 naming this one as its parent — evidence a peer
-                    // cannot fabricate without also producing a valid successor, which is exactly
-                    // the work the hash chain exists to make expensive.
-                    let extended = self
-                        .chain
-                        .remembered_proposal_extending(seq, batch.batch_hash());
-                    if !extended {
-                        debug!(
-                            seq,
-                            "SBC: sync response at an undecided sequence with no successor — ignored"
-                        );
-                        return Ok(());
-                    }
-                    self.awaiting_sync.lock().remove(&seq);
+                    // KNOWN RESIDUAL RISK, recorded rather than papered over. Having asked is not
+                    // proof we are behind: a peer can induce the request with a junk proposal at
+                    // head+2, because `verify_batch` defers on POSITION before checking any
+                    // signature, and the hold path then requests head+1 — the open sequence. Such
+                    // a peer can answer with a real but uncommitted candidate and fork us there.
+                    //
+                    // Accepted deliberately for the shadow soak: exploiting it requires a
+                    // MALICIOUS AUTHENTICATED MESH PEER, and the fleet is presently one operator's
+                    // own nodes. The stronger rule tried previously — demanding a cached successor
+                    // batch as chain-extension evidence — was UNSATISFIABLE: `parent_for` pins the
+                    // parent to `head.seq`, so `verify_batch` only ever returns Valid for `head+1`
+                    // and a batch at `head+2` is never cached. It made catch-up impossible for any
+                    // node that missed one sequence, which is every restart. A certain wedge is
+                    // worse than a conditional fork.
+                    //
+                    // The correct fix is a COMMIT CERTIFICATE on the sync response — the quorum of
+                    // signed precommits, verified against the voter set. Unforgeable, not
+                    // inducible, and always satisfiable because the evidence is SUPPLIED rather
+                    // than required to be pre-held. That is a wire change and MUST land before
+                    // multi-operator. See docs/SBC_TWO_PHASE.md.
+                    debug!(
+                        seq,
+                        "SBC: unsolicited sync response at an undecided sequence — ignored"
+                    );
+                    return Ok(());
                 }
                 match self
                     .chain

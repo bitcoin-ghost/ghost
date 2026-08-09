@@ -574,20 +574,6 @@ impl ShadowChain {
         self.remember_proposal(batch);
     }
 
-    /// Do we hold a verified batch at `seq + 1` that names `batch_hash` as its parent?
-    ///
-    /// This is what "we are genuinely behind" looks like as evidence rather than as a feeling. A
-    /// peer can induce us to REQUEST a sequence (a junk proposal at head+2 defers on position, and
-    /// the hold path asks for head+1), so having asked proves nothing. It cannot as easily
-    /// manufacture a valid successor batch naming a specific parent — that is the work the hash
-    /// chain exists to make expensive.
-    pub fn remembered_proposal_extending(&self, seq: u64, batch_hash: [u8; 32]) -> bool {
-        self.proposals
-            .lock()
-            .iter()
-            .any(|((s, _), (_, b))| *s == seq + 1 && b.prev_batch_hash == batch_hash)
-    }
-
     /// What this node is LOCKED on at `seq`, if anything.
     ///
     /// Exposed so the handler can tell "locked but never managed to precommit" from "not locked",
@@ -1347,57 +1333,6 @@ mod tests {
             "and must leave no consensus state behind"
         );
         assert_eq!(chain.lock_at(absurd), None);
-    }
-
-    /// **Audit 3, finding 2.** Chain-extension evidence, not "we once asked".
-    ///
-    /// A peer can INDUCE a sync request for the open sequence by sending a junk proposal at
-    /// head+2. Real proof of being behind is a successor batch naming this one as its parent.
-    #[test]
-    fn extension_evidence_requires_a_real_successor() {
-        let id = Arc::new(NodeIdentity::generate());
-        let db = Arc::new(Database::in_memory().expect("db"));
-        db.set_encryption_key([0x42u8; 32]);
-        seed_checkpoint(&db, 961_642, 1_786_228_093);
-        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
-        chain
-            .bootstrap_genesis(961_642, 1_786_228_093)
-            .expect("bootstrap")
-            .expect("converted");
-
-        let head = chain.head().expect("head");
-        let seq = head.seq + 1;
-        let candidate_hash = [0xAA; 32];
-
-        assert!(
-            !chain.remembered_proposal_extending(seq, candidate_hash),
-            "no successor held: this is the open sequence, not history"
-        );
-
-        // A successor naming our candidate as its parent IS the evidence.
-        let successor = ShareBatch {
-            seq: seq + 1,
-            prev_batch_hash: candidate_hash,
-            close_ts: head.close_ts + 60,
-            proposer: id.node_id(),
-            shares: Vec::new(),
-            settled_blocks: Vec::new(),
-            node_shares: Vec::new(),
-            state_root: [0u8; 32],
-            truncated: false,
-            pending_count: 0,
-            proposer_signature: Vec::new(),
-        };
-        chain.remember_proposal_for_test(&successor);
-
-        assert!(
-            chain.remembered_proposal_extending(seq, candidate_hash),
-            "a successor naming it as parent proves the chain moved past it"
-        );
-        assert!(
-            !chain.remembered_proposal_extending(seq, [0xBB; 32]),
-            "and proves nothing about a DIFFERENT candidate at the same sequence"
-        );
     }
 
     /// **Re-audit B5.** Before genesis a node holds no consensus state at all.
