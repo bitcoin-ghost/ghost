@@ -3778,15 +3778,34 @@ async fn main() -> Result<()> {
         // cannot disagree about who is entitled to vote while both are live.
         let sbc_voters: ghost_pool::sbc_handler::VoterSetFn = {
             let f = active_voter_set_fn.clone();
-            let rpc_c = Arc::clone(&rpc);
             let rm_c = Arc::clone(&round_manager);
+            let chain_c = Arc::clone(chain);
             Arc::new(move || {
                 let height = rm_c.current_height();
-                // The voter set is taken at a cutoff; using the tip's own time keeps it aligned
-                // with what the checkpoint path scopes to.
-                let cutoff = chrono::Utc::now().timestamp();
-                let _ = &rpc_c;
-                f(cutoff, height)
+                // ANCHORED TO CONSENSUS DATA, not to this node's clock.
+                //
+                // The cutoff scopes the qualification query, so it decides MEMBERSHIP. It used to
+                // be `Utc::now()`, which meant every node computed a different voter set from a
+                // different window — and the comment above it claimed tip-anchoring that was never
+                // implemented (`let _ = &rpc_c;` was the tell).
+                //
+                // Nothing built on top could then work. Quorum is `bft_threshold(view)`, so nodes
+                // disagreed on the bar; commit certificates hash the voter set, so they could
+                // never match; and four successive mechanisms for "was this sequence committed?"
+                // each foundered on the same thing — you cannot prove a quorum over a membership
+                // the two parties do not share.
+                //
+                // `head.close_ts` is inside the adopted batch and feeds `batch_hash`, so every
+                // node that adopted the head holds it byte for byte. This is the same fix the rota
+                // clock needed, and for the same reason: a voter set that is a function of local
+                // time is not a voter set.
+                //
+                // No head means no genesis, and a node that cannot judge a batch has no business
+                // asserting who may vote on one.
+                let Some(head) = chain_c.head() else {
+                    return Vec::new();
+                };
+                f(head.close_ts, height)
             })
         };
 

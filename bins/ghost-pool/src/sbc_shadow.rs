@@ -480,6 +480,22 @@ impl ShadowChain {
             };
         }
 
+        // A voter set this small cannot produce a meaningful quorum, and freezing one from it is
+        // a SAFETY defect, not just a liveness one: `SeqConsensus::new` captures `quorum` at first
+        // touch and never refreshes it, so an entry created during one degraded read of the
+        // qualification query keeps that bar forever. `bft_threshold(0) == 0` and
+        // `bft_threshold(1) == 1`, so a single later precommit — for any candidate, including a
+        // losing round's — would latch `committed`, and the sync path then treats that latch as
+        // binding and refuses the fleet's real batch for good.
+        //
+        // The query returns EMPTY on database error by design, so this is an ordinary failure
+        // mode, not an attack.
+        if schedule.quorum() < Self::MIN_QUORUM {
+            return PhaseAction::Hold {
+                reason: ghost_common::batch_consensus::DeferReason::ProposerNotDue,
+            };
+        }
+
         let action = {
             // LOCK ORDER: quarantine, then consensus. Every path taking both takes them in this
             // order — the prevote/precommit paths took them the other way round, and two messages
@@ -517,6 +533,13 @@ impl ShadowChain {
     /// A signed vote naming `seq = 10^18` would otherwise create a map entry no head-relative
     /// prune could ever reach, and one peer can send as many distinct sequences as it likes.
     const SEQ_LOOKAHEAD: u64 = 8;
+
+    /// The smallest quorum this node will hold consensus state against.
+    ///
+    /// Below this the voter view is degraded rather than small — the qualification query returns
+    /// EMPTY on a database error — and a frozen low quorum is worse than no state at all, because
+    /// `SeqConsensus` captures `quorum` at first touch and defends whatever it later latches.
+    const MIN_QUORUM: usize = 3;
 
     /// Whether a sequence is close enough to our head to be worth holding state for.
     fn seq_in_window(&self, seq: u64) -> bool {
@@ -690,7 +713,7 @@ impl ShadowChain {
     ) -> PrevoteAction {
         // A signed vote naming a far-future sequence must not create state a head-relative
         // prune can never reach.
-        if !self.seq_in_window(seq) {
+        if !self.seq_in_window(seq) || schedule.quorum() < Self::MIN_QUORUM {
             return PrevoteAction::Ignored;
         }
         // Same lock order as `on_proposal_phase`: quarantine, then consensus.
@@ -725,7 +748,7 @@ impl ShadowChain {
         // Same lock order as `on_proposal_phase`: quarantine, then consensus.
         // A signed vote naming a far-future sequence must not create state a head-relative
         // prune can never reach.
-        if !self.seq_in_window(seq) {
+        if !self.seq_in_window(seq) || schedule.quorum() < Self::MIN_QUORUM {
             return PrecommitAction::Ignored;
         }
         let mut quarantine = self.quarantine.lock();
@@ -1380,6 +1403,72 @@ mod tests {
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
         );
+    }
+
+    /// **Audit 6, finding 1.** A degraded voter view must not create consensus state.
+    ///
+    /// `SeqConsensus::new` captures `quorum` at first touch and never refreshes it. The
+    /// qualification query returns EMPTY on a database error — an ordinary failure, not an attack
+    /// — and `bft_threshold(0) == 0`, `bft_threshold(1) == 1`. So an entry created during one bad
+    /// read keeps that bar forever, and a single later precommit for ANY candidate latches
+    /// `committed`. The sync path then treats that latch as binding and refuses the fleet's real
+    /// batch permanently. That is a safety defect, not merely liveness.
+    #[test]
+    fn a_degraded_voter_view_creates_no_consensus_state() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        let head = chain.head().expect("head");
+        let seq = head.seq + 1;
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+
+        // Every degraded view the query can actually return.
+        for n in 0..3usize {
+            let voters: Vec<[u8; 32]> = (0..n as u8).map(|i| [i; 32]).collect();
+            let degraded = ProposerSchedule::new(voters);
+            assert!(
+                degraded.quorum() < 3,
+                "precondition: a view of {n} yields a sub-floor quorum"
+            );
+
+            let batch = ShareBatch {
+                seq,
+                prev_batch_hash: head.batch_hash,
+                close_ts: head.close_ts + 30,
+                proposer: id.node_id(),
+                shares: Vec::new(),
+                settled_blocks: Vec::new(),
+                node_shares: Vec::new(),
+                state_root: [0u8; 32],
+                truncated: false,
+                pending_count: 0,
+                proposer_signature: Vec::new(),
+            };
+            assert!(
+                matches!(
+                    chain.on_proposal_phase(&batch, &degraded, &checks, head.close_ts + 30),
+                    PhaseAction::Hold { .. }
+                ),
+                "a view of {n} must hold, not create an entry"
+            );
+            assert_eq!(
+                chain.on_batch_precommit(id.node_id(), 0, [0xAA; 32], seq, [0u8; 64], &degraded, 0),
+                PrecommitAction::Ignored,
+                "and must not accept a precommit that could latch a commit"
+            );
+            assert_eq!(
+                chain.committed_at(seq),
+                None,
+                "no commit may be latched from a view of {n}"
+            );
+        }
     }
 
     /// **Audit 3, finding 3.** A far-future PROPOSAL creates no consensus state.
