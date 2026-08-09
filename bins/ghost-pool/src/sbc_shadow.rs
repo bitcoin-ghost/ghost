@@ -414,6 +414,87 @@ impl ShadowChain {
         })
     }
 
+    /// Bootstrap `seq 0` from a ratified payout checkpoint, if the chain has not started.
+    ///
+    /// Every node performs this conversion INDEPENDENTLY and must arrive at the same bytes. That is
+    /// only true because the checkpoint is adopted verbatim by the fleet rather than recomputed —
+    /// the raw share ledgers differ, the adopted `canonical_payout` does not. Recomputing genesis
+    /// from local shares would reintroduce exactly the divergence the checkpoint exists to have
+    /// settled.
+    ///
+    /// ## The proposer is ZERO, and that is load-bearing
+    ///
+    /// `batch_hash` commits to `proposer` (`share_batch.rs`). If each node used its own node id,
+    /// all eight would derive an identical `state_root` and EIGHT DIFFERENT `batch_hash`es — and
+    /// since `seq 1` names its parent by hash, the chain would fork at its very first link while
+    /// every node believed it was correct. A zero proposer is also honest: genesis was converted,
+    /// not proposed by anyone.
+    ///
+    /// `prev_batch_hash` is the checkpoint's `ledger_root`, so the first link points at the object
+    /// that authorises it. A zero parent would be a chain anyone could start.
+    ///
+    /// Returns `Ok(None)` if the chain has already started (idempotent — a restart must not
+    /// re-run genesis) or if no ratified checkpoint exists at or below `anchor_height`.
+    pub fn bootstrap_genesis(&self, anchor_height: u64, now: i64) -> GhostResult<Option<u64>> {
+        if self.head().is_some() {
+            return Ok(None);
+        }
+
+        let Some(cp) = self
+            .db
+            .get_payout_ledger_checkpoint_at_or_before(anchor_height)?
+        else {
+            warn!(
+                anchor_height,
+                "SBC genesis: no ratified checkpoint at or below the anchor — cannot start"
+            );
+            return Ok(None);
+        };
+
+        if cp.miner_payouts.is_empty() {
+            // A pre-option-(c) row carries no canonical payout. Starting from it would open every
+            // balance at zero and silently write off every miner's accrued work.
+            warn!(
+                height = cp.height,
+                "SBC genesis: checkpoint carries no canonical payout — refusing to open empty"
+            );
+            return Ok(None);
+        }
+
+        let (batch, balances, rounding) = ghost_accounting::batch_genesis::genesis_batch(
+            cp.ledger_root,
+            cp.cutoff_ts,
+            [0u8; 32],
+            &cp.miner_payouts,
+            cp.node_shares.clone(),
+        );
+
+        info!(
+            height = cp.height,
+            cutoff_ts = cp.cutoff_ts,
+            payees = balances.len(),
+            state_root = %hex::encode(&batch.state_root[..8]),
+            ledger_root = %hex::encode(&cp.ledger_root[..8]),
+            addresses_rounded = rounding.addresses_rounded,
+            addresses_dropped = rounding.addresses_dropped,
+            units_discarded = rounding.units_discarded,
+            "SBC genesis: converting a ratified checkpoint"
+        );
+
+        // Reported, never swallowed: a conversion that quietly loses balance is how an unexplained
+        // drift begins, and at genesis there is nothing to reconcile against afterwards.
+        if rounding.addresses_dropped > 0 {
+            warn!(
+                dropped = rounding.addresses_dropped,
+                "SBC genesis: addresses rounded out of existence — their work is below one \
+                 micro-work and cannot be represented"
+            );
+        }
+
+        self.install_genesis(&batch, balances, now)?;
+        Ok(Some(cp.height))
+    }
+
     /// Install the genesis batch and its opening balances.
     ///
     /// Separate from [`ShadowChain::finalise`] because genesis is adopted by conversion of a
@@ -917,5 +998,116 @@ mod tests {
             Some(&(3 * micro_work(1.0))),
             "each proposer's share must be credited exactly once"
         );
+    }
+
+    fn seed_checkpoint(db: &Database, height: u64, cutoff_ts: i64) {
+        // Built through the real accessor rather than raw SQL: a fixture that writes the row its
+        // own way proves the reader agrees with the fixture, not that it agrees with the writer.
+        // Uses the actual adopted figures from 961,642 — the chosen genesis anchor.
+        let record = ghost_storage::queries::PayoutLedgerCheckpointRecord {
+            height,
+            cutoff_ts,
+            ledger_root: [0xABu8; 32],
+            proposer_id: "deadbeef".to_string(),
+            active_node_count: 8,
+            miner_payouts: vec![
+                (
+                    "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
+                    52_157_533_139_126_865_362_944u128,
+                ),
+                (
+                    "bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".to_string(),
+                    2_503_874_639_417_892_143_104u128,
+                ),
+            ],
+            node_shares: vec![([1u8; 32], 10), ([2u8; 32], 6)],
+        };
+        db.upsert_payout_ledger_checkpoint(&record)
+            .expect("seed checkpoint");
+    }
+
+    /// THE genesis correctness property: every node converts the same checkpoint into the same
+    /// bytes, independently.
+    ///
+    /// `batch_hash` commits to `proposer`. If genesis used each node's own id, all eight would
+    /// derive an identical state_root and EIGHT DIFFERENT batch hashes — and since seq 1 names its
+    /// parent by hash, the chain would fork at its first link with every node believing it was
+    /// correct. This asserts the HASH, not just the root.
+    #[test]
+    fn genesis_is_byte_identical_across_independently_converting_nodes() {
+        let mut hashes = Vec::new();
+        let mut roots = Vec::new();
+
+        for i in 0..3u8 {
+            let id = Arc::new(NodeIdentity::generate());
+            let db = Arc::new(Database::in_memory().expect("db"));
+            db.set_encryption_key([0x40 + i; 32]);
+            seed_checkpoint(&db, 961_642, 1_786_228_093);
+
+            let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+            let height = chain
+                .bootstrap_genesis(961_642, 0)
+                .expect("bootstrap")
+                .expect("a checkpoint was available");
+            assert_eq!(height, 961_642);
+
+            let head = chain.head().expect("head");
+            hashes.push(head.batch_hash);
+            roots.push(head.state_root);
+        }
+
+        for h in &hashes[1..] {
+            assert_eq!(
+                *h, hashes[0],
+                "genesis BATCH HASH must be identical — differing hashes fork the chain at seq 1 \
+                 even when every state_root agrees"
+            );
+        }
+        for r in &roots[1..] {
+            assert_eq!(*r, roots[0], "genesis state root must be identical");
+        }
+    }
+
+    /// A restart must not re-run genesis, or the chain restarts from the anchor and every batch
+    /// adopted since is silently discarded.
+    #[test]
+    fn genesis_is_idempotent() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        assert!(chain
+            .bootstrap_genesis(961_642, 0)
+            .expect("first")
+            .is_some());
+        assert!(
+            chain
+                .bootstrap_genesis(961_642, 0)
+                .expect("second")
+                .is_none(),
+            "a chain that has already started must not be re-genesised"
+        );
+        assert_eq!(chain.head().expect("head").seq, 0);
+    }
+
+    /// Without a ratified checkpoint there is nothing to convert, and opening every balance at zero
+    /// would write off every miner's accrued work.
+    #[test]
+    fn genesis_refuses_when_there_is_nothing_ratified_to_convert() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+
+        let chain = ShadowChain::load(id, db).expect("load");
+        assert!(
+            chain
+                .bootstrap_genesis(961_642, 0)
+                .expect("bootstrap")
+                .is_none(),
+            "no checkpoint means no chain, not an empty one"
+        );
+        assert!(chain.head().is_none());
     }
 }

@@ -77,6 +77,18 @@ pub mod terminal_reject_cache;
 
 /// Mining round lifecycle and share accounting.
 /// Bridge from the share-batch chain to this node's share verification (WP-5).
+/// The ratified payout checkpoint the share-batch chain opens from (WP-4).
+///
+/// Operator decision 2026-08-09. Verified read-only across all 8 nodes before pinning: one distinct
+/// `ledger_root` fleet-wide, `canonical_payout` identical on every node, 5 payees and 8 node
+/// entries. Chosen over the 960,550 candidate because every block between the anchor and the shadow
+/// run is work that has to reach the chain some other way — and 960,550 was already eight days
+/// stale.
+///
+/// Every node converts this SAME adopted checkpoint independently; genesis is not negotiated. See
+/// `ShadowChain::bootstrap_genesis` for why that is safe and why the genesis proposer is zero.
+pub const SBC_GENESIS_ANCHOR_HEIGHT: u64 = 961_642;
+
 pub mod sbc_checks;
 
 /// The share-batch chain running in shadow (WP-5) — computes, persists, pays nobody.

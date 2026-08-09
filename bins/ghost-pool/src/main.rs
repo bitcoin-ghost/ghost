@@ -3576,6 +3576,21 @@ async fn main() -> Result<()> {
             {
                 Ok(chain) => {
                     info!("SBC shadow: enabled");
+                    // Bootstrap seq 0 from the ratified checkpoint if the chain has not started.
+                    // Idempotent: a restart RESUMES rather than re-genesising, which would discard
+                    // every batch adopted since. Every node converts the SAME adopted bytes
+                    // independently and must reach the same genesis — see `bootstrap_genesis` for
+                    // why that is safe and why the genesis proposer is zero.
+                    match chain.bootstrap_genesis(
+                        ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT,
+                        chrono::Utc::now().timestamp(),
+                    ) {
+                        Ok(Some(h)) => info!(anchor_height = h, "SBC genesis: chain started"),
+                        Ok(None) => {
+                            debug!("SBC genesis: already started, or nothing ratified to convert")
+                        }
+                        Err(e) => error!(error = %e, "SBC genesis: bootstrap failed"),
+                    }
                     Some(Arc::new(chain))
                 }
                 Err(e) => {
