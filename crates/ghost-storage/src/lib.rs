@@ -42,6 +42,7 @@ pub mod migrations;
 pub mod models;
 pub mod mpc_lineage;
 pub mod queries;
+pub mod sbc_store;
 pub mod snapshot;
 
 pub use audit_log::*;
