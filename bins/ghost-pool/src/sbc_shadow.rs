@@ -38,12 +38,18 @@ use ghost_storage::sbc_store::ChainHead;
 pub struct ShadowChain {
     identity: Arc<NodeIdentity>,
     db: Arc<Database>,
-    /// Shares this node received and has not yet packed into a batch.
+    /// Shares this node received and has not yet packed into a batch, KEYED BY SHARE HASH.
+    ///
+    /// A map, not a Vec, because the pending pool must not hold the same share twice. The share
+    /// recorder can fire more than once for a share, and a duplicate inside a proposed batch is a
+    /// TERMINAL fault: `verify_batch` returns `DuplicateShare`, every peer quarantines the
+    /// proposer, and quarantine is operator-release-only. On the 2026-08-09 four-node run that
+    /// excluded ghost-vm5 — the one canary carrying a real miner — from consensus permanently.
     ///
     /// Bounded by the pack budget on the way out, not on the way in: dropping a share here is work
     /// a miner never gets paid for, whereas a large pool merely produces a truncated batch and the
     /// remainder is carried to the next one.
-    pending: Mutex<Vec<ShareProof>>,
+    pending: Mutex<BTreeMap<[u8; 32], ShareProof>>,
     /// The adopted head, or `None` before genesis.
     head: RwLock<Option<ChainHead>>,
     /// Running balances after the head. Plaintext address -> integer micro-work, exactly the
@@ -111,7 +117,7 @@ impl ShadowChain {
         Ok(Self {
             identity,
             db,
-            pending: Mutex::new(Vec::new()),
+            pending: Mutex::new(BTreeMap::new()),
             head: RwLock::new(head),
             balances: RwLock::new(balances),
             quarantine: Mutex::new(Quarantine::new()),
@@ -155,11 +161,15 @@ impl ShadowChain {
     /// Returns false — and keeps nothing — for a share received by a peer. That share belongs in
     /// the peer's batch; taking it here would credit the same work twice once both batches were
     /// adopted, and the two batches would each be individually valid.
+    ///
+    /// Idempotent on `share_hash`. Recording the same share twice must be harmless: a duplicate
+    /// reaching a proposed batch is terminal, and the node that receives the most shares is the
+    /// most likely to trip it — precisely the node the fleet can least afford to exclude.
     pub fn record_received(&self, share: ShareProof) -> bool {
         if share.received_by != self.identity.node_id() {
             return false;
         }
-        self.pending.lock().push(share);
+        self.pending.lock().insert(share.share_hash, share);
         true
     }
 
@@ -173,7 +183,7 @@ impl ShadowChain {
     /// failed to reach quorum — see [`ShadowChain::finalise`], which drains what was actually
     /// adopted.
     pub fn build_batch(&self, close_ts: i64, budget_bytes: usize) -> Option<ShareBatch> {
-        let pending = self.pending.lock().clone();
+        let pending: Vec<ShareProof> = self.pending.lock().values().cloned().collect();
         if pending.is_empty() {
             return None;
         }
@@ -406,11 +416,10 @@ impl ShadowChain {
         // Drain exactly what was adopted. Anything not in this batch stays pending and lands in a
         // later one — which is why a share that misses its batch is deferred, never lost.
         {
-            let adopted: std::collections::HashSet<&[u8; 32]> =
-                batch.shares.iter().map(|s| &s.share_hash).collect();
-            self.pending
-                .lock()
-                .retain(|s| !adopted.contains(&s.share_hash));
+            let mut pending = self.pending.lock();
+            for s in &batch.shares {
+                pending.remove(&s.share_hash);
+            }
         }
 
         info!(
@@ -1311,6 +1320,66 @@ mod tests {
             chain.seq_opened(),
             bootstrap_at,
             "the first sequence opens when the chain starts, not when the checkpoint closed"
+        );
+    }
+
+    /// Recording the same share twice must NOT put it in a batch twice.
+    ///
+    /// Found on the live four-node run, 2026-08-09. `record_received` pushed onto a Vec with no
+    /// dedup, the share recorder fired more than once for a share, and ghost-vm5 proposed a batch
+    /// containing a duplicate. `verify_batch` correctly ruled it `DuplicateShare` — a TERMINAL
+    /// fault — so vm6, vm7 and vm8 all quarantined vm5, and quarantine is operator-release-only.
+    ///
+    /// The node receiving the most shares is the most likely to trip this, which is exactly the
+    /// node a pool can least afford to exclude from its own consensus. No unit test caught it
+    /// because nothing in-process delivered the same share twice.
+    #[test]
+    fn recording_a_share_twice_does_not_duplicate_it_in_a_batch() {
+        let id = Arc::new(NodeIdentity::generate());
+        let chain = chain(&id);
+        genesis(&chain, BTreeMap::new());
+
+        let a = share(&id, "bc1qa", 2.0, 1);
+        let b = share(&id, "bc1qb", 3.0, 2);
+        assert_ne!(
+            a.share_hash, b.share_hash,
+            "fixture must produce distinct shares"
+        );
+
+        assert!(chain.record_received(a.clone()));
+        assert!(
+            chain.record_received(a.clone()),
+            "a repeat must be accepted, not rejected"
+        );
+        assert!(chain.record_received(a), "and again");
+        assert!(chain.record_received(b));
+
+        // TWO distinct shares must survive. Asserting only that a repeat collapses would pass even
+        // if the pool keyed every share under one constant — verified by mutation.
+        assert_eq!(
+            chain.pending_count(),
+            2,
+            "distinct shares must not collapse together"
+        );
+
+        let batch = chain.build_batch(600, 1_000_000).expect("batch");
+        assert_eq!(
+            batch.shares.len(),
+            2,
+            "a duplicate in a batch is a terminal fault"
+        );
+
+        // And the credit must be for one share, not three.
+        chain.finalise(&batch, 0).expect("finalise");
+        assert_eq!(
+            chain.balances().get("bc1qa"),
+            Some(&micro_work(2.0)),
+            "a share recorded three times must be credited once"
+        );
+        assert_eq!(
+            chain.balances().get("bc1qb"),
+            Some(&micro_work(3.0)),
+            "the other share must still be credited"
         );
     }
 }
