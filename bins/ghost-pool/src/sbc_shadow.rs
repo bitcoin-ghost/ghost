@@ -73,9 +73,6 @@ pub struct ShadowChain {
     /// Votes seen per sequence. Counted per SEQUENCE rather than per batch, because equivocation
     /// is only visible when the candidates are tallied together.
     tallies: Mutex<BTreeMap<u64, SeqTally>>,
-    /// When the current sequence opened, for escalation. A stalled proposer must pass the turn on,
-    /// or a hash chain that cannot skip a sequence deadlocks forever.
-    seq_opened_ts: RwLock<i64>,
 }
 
 /// What a finalisation produced, for the trust gate and for logs.
@@ -110,10 +107,6 @@ impl ShadowChain {
             info!(count = restored.len(), "SBC shadow: restored quarantine");
         }
 
-        // The next sequence opened when the head was ADOPTED, not when its proposer closed it.
-        // Using close_ts started escalation from the genesis checkpoint's cutoff, which on
-        // ghost-vm8 was 32,473 s (9 h) before adoption — so the rota sat permanently escalated.
-        let opened = head.as_ref().map(|h| h.finalised_at).unwrap_or(0);
         Ok(Self {
             identity,
             db,
@@ -124,7 +117,6 @@ impl ShadowChain {
             restored_quarantine: RwLock::new(restored),
             vote_lock: Mutex::new(SeqVoteLock::new()),
             tallies: Mutex::new(BTreeMap::new()),
-            seq_opened_ts: RwLock::new(opened),
         })
     }
 
@@ -150,10 +142,23 @@ impl ShadowChain {
 
     /// When the current sequence opened — the instant stall escalation is measured from.
     ///
-    /// Exposed because it is the input to whose-turn-it-is, and a wrong value here is invisible
-    /// from the outside: the rota still functions, it simply never lets a proposer hold a turn.
+    /// This is the head's `close_ts`, which is CONSENSUS DATA: it lives inside the batch and feeds
+    /// `batch_hash`, so every node that adopted the head holds the same value byte for byte. It is
+    /// deliberately not stored in a field, because the only way this can be wrong is if some code
+    /// path sets it from a local clock, and a value that is derived cannot be set at all.
+    ///
+    /// It was a field, briefly, holding local wall-clock at adoption. That is the one thing it must
+    /// never be. Whose turn it is comes from `(seq + escalation) % voters` and escalation is
+    /// `(now - opened) / 90`, so two nodes whose `opened` differs by more than the ±1-step grace
+    /// window wait on DIFFERENT proposers and neither ever proposes. On the fleet, ghost-vm8
+    /// installed genesis 11,574 s before the others — 128 steps apart — and held every batch with
+    /// `ProposerNotDue`. A rota that is a function of local time is not a rota.
+    ///
+    /// The cost is that a sequence following a long gap opens already escalated. That is harmless:
+    /// escalation is only a rotation offset, every node computes the SAME offset, and the turn
+    /// still passes every 90 s.
     pub fn seq_opened(&self) -> i64 {
-        *self.seq_opened_ts.read()
+        self.head.read().as_ref().map(|h| h.close_ts).unwrap_or(0)
     }
 
     /// Record a share THIS node received.
@@ -236,7 +241,7 @@ impl ShadowChain {
     ) -> Option<ShareBatch> {
         let head = self.head()?;
         let seq = head.seq + 1;
-        let opened = *self.seq_opened_ts.read();
+        let opened = head.close_ts;
         if !schedule.is_my_turn(seq, &self.identity.node_id(), opened, now) {
             return None;
         }
@@ -353,8 +358,10 @@ impl ShadowChain {
     /// Without this the stall clock would run from the parent's `close_ts`, which is when the
     /// PREVIOUS batch closed — a sequence that opened late would look stalled the instant it began
     /// and escalate past a proposer who never had a chance.
-    pub fn note_seq_opened(&self, now: i64) {
-        *self.seq_opened_ts.write() = now;
+    pub fn note_seq_opened(&self, _now: i64) {
+        // Deliberately a no-op. The rota clock is the head's `close_ts`, derived on read — see
+        // `seq_opened`. This used to stamp a local wall-clock here, which is exactly how the fleet
+        // came to disagree on whose turn it was.
     }
 
     /// Adopt a finalised batch: fold it, persist it, and advance the head.
@@ -557,8 +564,6 @@ impl ShadowChain {
             close_ts: batch.close_ts,
             finalised_at: now,
         });
-        // The first real sequence opens NOW, not at the checkpoint's cutoff.
-        *self.seq_opened_ts.write() = now;
 
         info!(
             seq = batch.seq,
@@ -1319,54 +1324,63 @@ mod tests {
     /// Invisible from outside: the rota still works, nobody diverges, and every node agrees. It is
     /// simply always wrong in the same way, which is why it needs an explicit assertion.
     #[test]
-    fn the_escalation_clock_reads_adoption_time_not_close_time() {
-        let id = Arc::new(NodeIdentity::generate());
-        let db = Arc::new(Database::in_memory().expect("db"));
-        db.set_encryption_key([0x42u8; 32]);
+    fn the_escalation_clock_reads_consensus_time_not_local_adoption_time() {
+        let close_ts = 1_786_228_093; // in the batch, identical on every node
+        let mut opened = Vec::new();
 
-        let stale_close = 1_786_228_093; // a checkpoint cutoff, days in the past
-        let adopted_at = 1_786_470_000; // when this node took it
-        db.sbc_store_batch(
-            0,
-            [1u8; 32],
-            [0u8; 32],
-            [0u8; 32],
-            stale_close,
-            [2u8; 32],
-            0,
-            "{}",
-            adopted_at,
-        )
-        .expect("adopt");
+        // Same batch, adopted at two very different local instants.
+        for adopted_at in [1_786_470_000_i64, 1_786_470_000 + 11_574] {
+            let id = Arc::new(NodeIdentity::generate());
+            let db = Arc::new(Database::in_memory().expect("db"));
+            db.set_encryption_key([0x42u8; 32]);
+            db.sbc_store_batch(
+                0, [1u8; 32], [0u8; 32], [0u8; 32], close_ts, [2u8; 32], 0, "{}", adopted_at,
+            )
+            .expect("adopt");
 
-        let chain = ShadowChain::load(id, db).expect("load");
+            let chain = ShadowChain::load(id, db).expect("load");
+            opened.push(chain.seq_opened());
+        }
+
         assert_eq!(
-            chain.seq_opened(),
-            adopted_at,
-            "escalation must run from adoption; reading close_ts starts it days in the past"
+            opened[0], opened[1],
+            "the rota clock must not vary with when this node adopted the head"
         );
-        assert_ne!(chain.seq_opened(), stale_close);
+        assert_eq!(opened[0], close_ts, "it must be the batch's close_ts");
     }
 
     /// Genesis opens the first real sequence NOW, not at the checkpoint's cutoff.
     #[test]
-    fn genesis_opens_the_next_sequence_at_bootstrap_time() {
-        let id = Arc::new(NodeIdentity::generate());
-        let db = Arc::new(Database::in_memory().expect("db"));
-        db.set_encryption_key([0x42u8; 32]);
-        seed_checkpoint(&db, 961_642, 1_786_228_093);
+    fn two_nodes_bootstrapping_hours_apart_open_the_sequence_at_the_same_instant() {
+        let cutoff = 1_786_228_093;
 
-        let chain = ShadowChain::load(id, Arc::clone(&db)).expect("load");
-        let bootstrap_at = 1_786_470_000;
-        chain
-            .bootstrap_genesis(961_642, bootstrap_at)
-            .expect("bootstrap")
-            .expect("converted");
+        // Two nodes convert the SAME checkpoint at wildly different local times — which is what
+        // actually happens, because genesis is installed as each node is deployed.
+        let mut opened = Vec::new();
+        for bootstrap_at in [1_786_470_000_i64, 1_786_470_000 + 11_574] {
+            let id = Arc::new(NodeIdentity::generate());
+            let db = Arc::new(Database::in_memory().expect("db"));
+            db.set_encryption_key([0x42u8; 32]);
+            seed_checkpoint(&db, 961_642, cutoff);
 
+            let chain = ShadowChain::load(id, Arc::clone(&db)).expect("load");
+            chain
+                .bootstrap_genesis(961_642, bootstrap_at)
+                .expect("bootstrap")
+                .expect("converted");
+            opened.push(chain.seq_opened());
+        }
+
+        // The exact value matters less than the agreement, but pin both: it must be the
+        // checkpoint's cutoff, which is consensus data every node reads identically.
         assert_eq!(
-            chain.seq_opened(),
-            bootstrap_at,
-            "the first sequence opens when the chain starts, not when the checkpoint closed"
+            opened[0], opened[1],
+            "nodes that installed genesis 11,574 s apart must still open the sequence together — \
+             otherwise they compute different escalation steps and wait on different proposers"
+        );
+        assert_eq!(
+            opened[0], cutoff,
+            "the rota clock must come from the batch, not from whenever this node happened to boot"
         );
     }
 
