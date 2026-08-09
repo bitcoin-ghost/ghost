@@ -38,6 +38,12 @@ use ghost_common::types::ShareProof;
 use ghost_storage::database::Database;
 use ghost_storage::sbc_store::ChainHead;
 
+/// Verified batches awaiting a commit, keyed by `(seq, batch_hash)`.
+///
+/// The `u64` in the value is a monotonic insertion number, so eviction can mean OLDEST — a
+/// `BTreeMap` keyed this way orders by hash, which is arbitrary.
+type ProposalCache = BTreeMap<(u64, [u8; 32]), (u64, ShareBatch)>;
+
 /// The chain's view on this node.
 pub struct ShadowChain {
     identity: Arc<NodeIdentity>,
@@ -90,7 +96,13 @@ pub struct ShadowChain {
     /// In memory by choice. Losing it on restart costs a node the ability to adopt a commit it
     /// has already forgotten the contents of, which sync repairs; persisting it would mean a
     /// schema migration for data that is worthless the moment the sequence closes.
-    proposals: Mutex<BTreeMap<(u64, [u8; 32]), ShareBatch>>,
+    /// Value carries a monotonic insertion number so eviction can mean OLDEST.
+    ///
+    /// Keyed by `(seq, batch_hash)`, a `BTreeMap`'s first key is the lowest HASH — which is
+    /// arbitrary, not oldest. Evicting on that would discard a live candidate at random.
+    proposals: Mutex<ProposalCache>,
+    /// Monotonic counter stamping cache insertions.
+    proposal_seq_no: Mutex<u64>,
     /// Our own proposal for a `(seq, round)`, so a re-propose re-sends IDENTICAL bytes.
     ///
     /// The propose loop ticks every 30 s while a round lasts 90 s, and `build_batch` stamps
@@ -157,6 +169,7 @@ impl ShadowChain {
             tallies: Mutex::new(BTreeMap::new()),
             consensus: Mutex::new(BTreeMap::new()),
             proposals: Mutex::new(BTreeMap::new()),
+            proposal_seq_no: Mutex::new(0),
             my_proposal: Mutex::new(None),
         })
     }
@@ -480,18 +493,43 @@ impl ShadowChain {
             return;
         }
         let head = self.head().map(|h| h.seq).unwrap_or(0);
+        const MAX_CACHED: usize = 64;
         let mut proposals = self.proposals.lock();
-        // Bounded on the way in as well as by pruning: escalation legitimately produces several
-        // candidates per sequence, but not an unbounded number.
         proposals.retain(|(seq, _), _| *seq + 1 > head);
-        if proposals.len() < 64 {
-            proposals.insert((batch.seq, batch.batch_hash()), batch.clone());
+        // Evict the OLDEST rather than refuse the newest. Refusing the newcomer was backwards:
+        // each 90 s escalation round mints a distinct authorised candidate, so under a long stall
+        // the cache filled with losing candidates and dropped the one most likely to be committed
+        // — sending adoption down the sync-request path for the batch it was most certain to need.
+        while proposals.len() >= MAX_CACHED {
+            let Some(oldest) = proposals
+                .iter()
+                .min_by_key(|(_, (n, _))| *n)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            proposals.remove(&oldest);
         }
+        let n = {
+            let mut counter = self.proposal_seq_no.lock();
+            *counter += 1;
+            *counter
+        };
+        proposals.insert((batch.seq, batch.batch_hash()), (n, batch.clone()));
+    }
+
+    /// Test-only access to the caching path, which is otherwise driven by a verdict.
+    #[cfg(test)]
+    pub fn remember_proposal_for_test(&self, batch: &ShareBatch) {
+        self.remember_proposal(batch);
     }
 
     /// The verified batch matching a committed hash, if we hold it.
     pub fn remembered_proposal(&self, seq: u64, batch_hash: [u8; 32]) -> Option<ShareBatch> {
-        self.proposals.lock().get(&(seq, batch_hash)).cloned()
+        self.proposals
+            .lock()
+            .get(&(seq, batch_hash))
+            .map(|(_, b)| b.clone())
     }
 
     /// Our own proposal for `(seq, round)`, if we already made one.
@@ -1218,6 +1256,60 @@ mod tests {
                 .map(|b| b.batch_hash()),
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Re-audit B4.** A full cache evicts its OLDEST entry, not the newest arrival.
+    ///
+    /// Refusing the newcomer was backwards: each escalation round mints a distinct authorised
+    /// candidate, so under a long stall the cache filled with losing candidates and dropped the
+    /// one most likely to be committed — sending adoption down the sync path for the batch it was
+    /// most certain to need.
+    #[test]
+    fn a_full_proposal_cache_evicts_the_oldest_not_the_newest() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        chain
+            .bootstrap_genesis(961_642, 1_786_228_093)
+            .expect("bootstrap")
+            .expect("converted");
+
+        let head = chain.head().expect("head");
+        let seq = head.seq + 1;
+
+        // Fill well past the cap with distinct candidates at the same sequence.
+        let mut hashes = Vec::new();
+        for n in 0..80u8 {
+            let mut b = ShareBatch {
+                seq,
+                prev_batch_hash: head.batch_hash,
+                close_ts: head.close_ts + 30,
+                proposer: [n; 32],
+                shares: Vec::new(),
+                settled_blocks: Vec::new(),
+                node_shares: Vec::new(),
+                state_root: [0u8; 32],
+                truncated: false,
+                pending_count: 0,
+                proposer_signature: Vec::new(),
+            };
+            b.close_ts = head.close_ts + 30 + n as i64;
+            hashes.push(b.batch_hash());
+            chain.remember_proposal_for_test(&b);
+        }
+
+        let newest = hashes.last().copied().expect("newest");
+        assert!(
+            chain.remembered_proposal(seq, newest).is_some(),
+            "the most recent candidate must survive — it is the likeliest to be committed"
+        );
+        let oldest = hashes[0];
+        assert!(
+            chain.remembered_proposal(seq, oldest).is_none(),
+            "the oldest must have been evicted"
         );
     }
 

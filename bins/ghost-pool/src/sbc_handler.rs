@@ -41,6 +41,14 @@ pub struct ShareBatchHandler {
     send: BroadcastFn,
     voters: VoterSetFn,
     checks: ChecksFn,
+    /// Sequences we have actually ASKED a peer for.
+    ///
+    /// A sync `Response` we did not solicit is not evidence. Any peer can relay a
+    /// currently-authorised proposal as a response, and adopting it at the OPEN sequence — where
+    /// we hold no commit opinion yet — forks this node against whatever the fleet commits. That
+    /// is precisely the "two nodes adopt different batches at one sequence" failure two-phase
+    /// exists to prevent, so chain-validity alone cannot be the bar.
+    awaiting_sync: parking_lot::Mutex<std::collections::BTreeSet<u64>>,
 }
 
 impl ShareBatchHandler {
@@ -57,6 +65,7 @@ impl ShareBatchHandler {
             send,
             voters,
             checks,
+            awaiting_sync: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -68,7 +77,19 @@ impl ShareBatchHandler {
     fn on_proposal(&self, envelope: &MessageEnvelope, now: i64) -> GhostResult<()> {
         let batch: ShareBatch = serde_json::from_slice(&envelope.payload)
             .map_err(|e| GhostError::Serialization(format!("share batch proposal: {e}")))?;
+        self.judge_and_vote(&batch, now)
+    }
 
+    /// Judge a batch and cast whatever vote follows.
+    ///
+    /// Shared by the message path and by the PROPOSER, which must run its own batch through
+    /// exactly this path. `broadcast` filters self, so a proposer never receives its own proposal
+    /// back — and without judging it locally it never prevotes it, leaving only N-1 prevoters.
+    /// With N=8 and quorum 6 that is fatal at f=2: six live nodes, one of them the silent
+    /// proposer, gives five prevotes against a quorum of six. The chain would wedge at exactly the
+    /// fault level `bft_threshold(8)=6` advertises it tolerates, and would do it silently.
+    pub fn judge_and_vote(&self, batch: &ShareBatch, now: i64) -> GhostResult<()> {
+        let batch = batch.clone();
         let schedule = self.schedule();
         let checks = (self.checks)();
         // TWO-PHASE is the live path. The single-phase driver is still compiled and tested, but
@@ -135,6 +156,10 @@ impl ShareBatchHandler {
     /// never saw. Adoption on the commit path used to have no way to ask at all, so a node that
     /// missed the proposal was simply stuck.
     fn request_sync(&self, seq: u64) -> GhostResult<()> {
+        // Remember that WE asked. An unsolicited response is not evidence of anything: a peer can
+        // relay a currently-authorised proposal as a `Response`, and adopting it at the open
+        // sequence forks us against whatever the fleet actually commits.
+        self.awaiting_sync.lock().insert(seq);
         let req = ShareBatchSyncMessage::Request { seq };
         let payload = serde_json::to_vec(&req)
             .map_err(|e| GhostError::Serialization(format!("share batch sync request: {e}")))?;
@@ -402,6 +427,10 @@ impl ShareBatchHandler {
                 // chain validity IS the argument: the batch must link to our head and reproduce
                 // its own state root. Demanding a local quorum to adopt HISTORY would leave a node
                 // one link behind permanently unable to rejoin.
+                // Two independent bars, because neither alone is enough.
+                //
+                // If we hold a commit OPINION it binds — a response disagreeing with the decision
+                // we watched being made is simply wrong.
                 if let Some(decided) = self.chain.committed_at(seq) {
                     if decided != batch.batch_hash() {
                         warn!(
@@ -410,6 +439,16 @@ impl ShareBatchHandler {
                         );
                         return Ok(());
                     }
+                } else if !self.awaiting_sync.lock().remove(&seq) {
+                    // No opinion AND we never asked. Holding no opinion is the normal state for
+                    // the OPEN sequence, not a sign we are catching up on history — so adopting
+                    // on chain-validity here is exactly the fork vector. A batch we solicited,
+                    // because a peer told us we were behind, is a different matter.
+                    debug!(
+                        seq,
+                        "SBC: unsolicited sync response at a sequence we hold no decision for — ignored"
+                    );
+                    return Ok(());
                 }
                 match self
                     .chain

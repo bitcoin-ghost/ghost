@@ -3810,6 +3810,9 @@ async fn main() -> Result<()> {
             sbc_voters.clone(),
             sbc_checks.clone(),
         ));
+        // Kept typed before the cast: the propose loop must run our OWN batch through the same
+        // judging path a received proposal takes, or the proposer never prevotes what it proposed.
+        let sbc_handler_for_propose = Arc::clone(&sbc_handler);
         mesh.register_handler(
             sbc_handler as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>,
         );
@@ -3820,6 +3823,7 @@ async fn main() -> Result<()> {
             let chain_c = Arc::clone(chain);
             let voters_c = sbc_voters.clone();
             let send_c = sbc_send.clone();
+            let handler_c = Arc::clone(&sbc_handler_for_propose);
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3877,6 +3881,16 @@ async fn main() -> Result<()> {
                                     shares = batch.shares.len(),
                                     "SBC: proposed"
                                 );
+                                // Judge our own batch exactly as a peer would. Without this the
+                                // proposer is a silent abstainer every round it leads, so only
+                                // N-1 nodes ever prevote and the fleet cannot make a polka at
+                                // f=2 — the very tolerance the design claims.
+                                if let Err(e) = handler_c.judge_and_vote(&batch, now) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "SBC: could not prevote our own proposal"
+                                    );
+                                }
                             }
                         }
                         Err(e) => tracing::warn!(error = %e, "SBC: proposal would not serialise"),
