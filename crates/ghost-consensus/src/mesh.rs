@@ -1798,7 +1798,9 @@ impl MeshNetwork {
             MessageType::Discovery | MessageType::HealthPing => false,
 
             // Sensitive messages use Noise encryption
-            MessageType::ShareProof
+            MessageType::ShareBatchPrevote
+            | MessageType::ShareBatchPrecommit
+            | MessageType::ShareProof
             | MessageType::ShareConvergence
             | MessageType::BlockFound
             | MessageType::Vote
@@ -2162,7 +2164,9 @@ impl MeshNetwork {
             // before a single batch could flow, which is a deployment step that buys nothing.
             | MessageType::ShareBatchProposal
             | MessageType::ShareBatchSync => self.config.ports.share_propagation,
-            MessageType::ShareBatchVote => self.config.ports.consensus_voting,
+            MessageType::ShareBatchVote
+            | MessageType::ShareBatchPrevote
+            | MessageType::ShareBatchPrecommit => self.config.ports.consensus_voting,
             MessageType::BlockFound => self.config.ports.block_announcement,
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
@@ -3260,7 +3264,9 @@ impl MeshNetwork {
             // before a single batch could flow, which is a deployment step that buys nothing.
             | MessageType::ShareBatchProposal
             | MessageType::ShareBatchSync => self.config.ports.share_propagation,
-            MessageType::ShareBatchVote => self.config.ports.consensus_voting,
+            MessageType::ShareBatchVote
+            | MessageType::ShareBatchPrevote
+            | MessageType::ShareBatchPrecommit => self.config.ports.consensus_voting,
             MessageType::BlockFound => self.config.ports.block_announcement,
             MessageType::Vote => self.config.ports.consensus_voting,
             MessageType::HealthPing => self.config.ports.health_monitoring,
@@ -4217,6 +4223,8 @@ mod tests {
                 | MessageType::PayoutProposalSync
                 | MessageType::ShareBatchProposal
                 | MessageType::ShareBatchVote
+                | MessageType::ShareBatchPrevote
+                | MessageType::ShareBatchPrecommit
                 | MessageType::ShareBatchSync
                 | MessageType::MeshNodeListCheckpoint
                 | MessageType::MeshNodeListCheckpointVote

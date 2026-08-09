@@ -75,6 +75,10 @@ pub mod topics {
     pub const SHARE_BATCH_VOTE: &[u8] = b"sbvote";
     /// Share-batch chain: on-demand backfill of adopted batches
     pub const SHARE_BATCH_SYNC: &[u8] = b"sbsync";
+    /// Share-batch chain, two-phase: first-round vote. Evidence, not a decision.
+    pub const SHARE_BATCH_PREVOTE: &[u8] = b"sbprev";
+    /// Share-batch chain, two-phase: second-round vote. A quorum of these commits.
+    pub const SHARE_BATCH_PRECOMMIT: &[u8] = b"sbprec";
     /// Mesh node-list checkpoint proposal (signed public-mining node set for discovery)
     pub const MESH_NODE_LIST_CHECKPOINT: &[u8] = b"mnlchk";
     /// Mesh node-list checkpoint vote
@@ -286,6 +290,18 @@ pub enum MessageType {
     ShareBatchProposal,
     /// Share-batch chain: a vote for a batch at a sequence. Hash plus signature; small.
     ShareBatchVote,
+    /// Share-batch chain, two-phase: a PREVOTE for a batch at a `(seq, round)`.
+    ///
+    /// Separate from `ShareBatchVote` and from `ShareBatchPrecommit` rather than a phase field on
+    /// one type, so a prevote can never be counted as a precommit by a receiver that mishandles
+    /// the discriminant. A quorum of prevotes is a *polka* — evidence that a quorum considered the
+    /// batch valid — which is what releases a lock. It decides nothing on its own.
+    ShareBatchPrevote,
+    /// Share-batch chain, two-phase: a PRECOMMIT for a batch at a `(seq, round)`.
+    ///
+    /// Sent only after seeing a polka, and only for the value the sender is locked on. A quorum of
+    /// these at one round commits the sequence; nothing else adopts.
+    ShareBatchPrecommit,
     /// Share-batch chain: request/response for an adopted batch a node missed.
     ///
     /// The chain is a hash chain, so a node that misses one link cannot verify any later batch
@@ -337,6 +353,8 @@ impl MessageType {
             Self::ShareBatchProposal => topics::SHARE_BATCH,
             Self::ShareBatchVote => topics::SHARE_BATCH_VOTE,
             Self::ShareBatchSync => topics::SHARE_BATCH_SYNC,
+            Self::ShareBatchPrevote => topics::SHARE_BATCH_PREVOTE,
+            Self::ShareBatchPrecommit => topics::SHARE_BATCH_PRECOMMIT,
             Self::MeshNodeListCheckpoint => topics::MESH_NODE_LIST_CHECKPOINT,
             Self::MeshNodeListCheckpointVote => topics::MESH_NODE_LIST_VOTE,
             Self::MeshNodeListCheckpointSync => topics::MESH_NODE_LIST_SYNC,
@@ -381,6 +399,8 @@ impl MessageType {
             Self::PayoutProposalSync => "ppsync",
             Self::ShareBatchProposal => "sbatch",
             Self::ShareBatchVote => "sbvote",
+            Self::ShareBatchPrevote => "sbprev",
+            Self::ShareBatchPrecommit => "sbprec",
             Self::ShareBatchSync => "sbsync",
             Self::MeshNodeListCheckpoint => "mnlchk",
             Self::MeshNodeListCheckpointVote => "mnlvote",
@@ -1315,6 +1335,73 @@ impl ShareBatchVoteMessage {
     }
 }
 
+/// A two-phase vote on a share batch: prevote or precommit, distinguished by `MessageType`.
+///
+/// One struct for both phases because the payload is identical; the PHASE is carried by the
+/// message type and, critically, by the signing domain. `signing_bytes` takes the phase and
+/// domain-separates on it, so a prevote's signature does not verify as a precommit. Without that
+/// separation an attacker could replay a node's prevote as a precommit and manufacture a commit
+/// from evidence that was only ever meant to release a lock — which collapses two-phase back into
+/// the single-phase design that cannot be made safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareBatchPhaseVoteMessage {
+    /// Chain position being voted on.
+    pub seq: u64,
+    /// The escalation step this vote belongs to. A sequence can have several candidates; without
+    /// the round a receiver cannot tell which attempt a vote was cast in.
+    pub round: u32,
+    /// The batch being voted for.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub batch_hash: [u8; 32],
+    /// Who is voting.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub voter: NodeId,
+    /// Signature over `(phase, seq, round, batch_hash)`.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub signature: [u8; 64],
+}
+
+/// Which phase a [`ShareBatchPhaseVoteMessage`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchVotePhase {
+    /// Evidence that a quorum considered a batch valid. Releases locks; decides nothing.
+    Prevote,
+    /// A commitment to a locked value. A quorum of these decides the sequence.
+    Precommit,
+}
+
+impl BatchVotePhase {
+    /// The domain tag this phase signs under. Distinct by construction — see
+    /// [`ShareBatchPhaseVoteMessage::signing_bytes`] for why sharing one would be fatal.
+    pub fn domain(&self) -> &'static [u8] {
+        match self {
+            Self::Prevote => b"ShareBatchPrevote/v1",
+            Self::Precommit => b"ShareBatchPrecommit/v1",
+        }
+    }
+}
+
+impl ShareBatchPhaseVoteMessage {
+    /// The bytes this vote signs, domain-separated **by phase**.
+    ///
+    /// The phase tag is the first thing in the buffer and differs in length as well as content, so
+    /// no prevote payload can be reinterpreted as a precommit payload by shifting bytes.
+    ///
+    /// Everything else is covered for the reasons the single-phase vote already documented: the
+    /// hash alone replays at another sequence, the sequence alone makes every vote at that height
+    /// interchangeable, and the round alone lets a vote from a losing round be replayed into the
+    /// live one.
+    pub fn signing_bytes(&self, phase: BatchVotePhase) -> Vec<u8> {
+        let domain = phase.domain();
+        let mut out = Vec::with_capacity(domain.len() + 8 + 4 + 32);
+        out.extend_from_slice(domain);
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&self.round.to_le_bytes());
+        out.extend_from_slice(&self.batch_hash);
+        out
+    }
+}
+
 /// Request or response for an adopted batch a node is missing.
 ///
 /// One type for both directions, disambiguated on deserialize — the same shape the convergence and
@@ -1900,6 +1987,68 @@ pub struct GhostGlyphRegisteredMessage {
 
 #[cfg(test)]
 mod tests {
+
+    /// A prevote's signed bytes must NOT verify as a precommit.
+    ///
+    /// This is the property two-phase rests on. If both phases signed the same bytes, an attacker
+    /// could replay a node's prevote — which is only ever evidence that releases a lock — as a
+    /// precommit, and manufacture a commit from votes nobody cast. That collapses the protocol
+    /// back to single-phase, which cannot be made safe.
+    #[test]
+    fn a_prevote_cannot_be_replayed_as_a_precommit() {
+        let v = ShareBatchPhaseVoteMessage {
+            seq: 7,
+            round: 3,
+            batch_hash: [0xAB; 32],
+            voter: [1u8; 32],
+            signature: [0u8; 64],
+        };
+        let pre = v.signing_bytes(BatchVotePhase::Prevote);
+        let com = v.signing_bytes(BatchVotePhase::Precommit);
+        assert_ne!(pre, com, "the two phases must not sign identical bytes");
+        assert!(
+            pre.starts_with(b"ShareBatchPrevote/v1"),
+            "the phase tag must lead the buffer"
+        );
+        assert!(com.starts_with(b"ShareBatchPrecommit/v1"));
+    }
+
+    /// Seq, round and batch_hash are each covered by the signature.
+    ///
+    /// Each omission is separately exploitable: without seq a vote replays at another height,
+    /// without round a vote from a losing round replays into the live one, and without the hash
+    /// every vote at that position is interchangeable.
+    #[test]
+    fn every_field_that_identifies_the_vote_is_signed() {
+        let base = ShareBatchPhaseVoteMessage {
+            seq: 7,
+            round: 3,
+            batch_hash: [0xAB; 32],
+            voter: [1u8; 32],
+            signature: [0u8; 64],
+        };
+        let b0 = base.signing_bytes(BatchVotePhase::Prevote);
+
+        let mut other_seq = base.clone();
+        other_seq.seq = 8;
+        assert_ne!(b0, other_seq.signing_bytes(BatchVotePhase::Prevote), "seq");
+
+        let mut other_round = base.clone();
+        other_round.round = 4;
+        assert_ne!(
+            b0,
+            other_round.signing_bytes(BatchVotePhase::Prevote),
+            "round"
+        );
+
+        let mut other_hash = base.clone();
+        other_hash.batch_hash = [0xCD; 32];
+        assert_ne!(
+            b0,
+            other_hash.signing_bytes(BatchVotePhase::Prevote),
+            "batch_hash"
+        );
+    }
 
     /// #606: the reported values MUST be covered by the signature.
     ///
