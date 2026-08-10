@@ -19,10 +19,11 @@
 //! by the caller rather than read here so the tests can drive it.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use ghost_common::batch_consensus::{ProposerSchedule, SeqTally, SeqVoteLock};
 use ghost_common::batch_driver::{
@@ -37,6 +38,13 @@ use ghost_common::share_batch::{compute_state_root, fold_shares, pack_batch, Sha
 use ghost_common::types::ShareProof;
 use ghost_storage::database::Database;
 use ghost_storage::sbc_store::ChainHead;
+
+/// Ceiling on the pending pool.
+///
+/// Far above any healthy backlog — a draining chain empties this every sequence — so reaching it
+/// means the node is stuck, not busy. Sized so the pool cannot become the largest thing in a pool
+/// process that shares a box with ghostd.
+const MAX_PENDING_SHARES: usize = 50_000;
 
 /// Verified batches awaiting a commit, keyed by `(seq, batch_hash)`.
 ///
@@ -66,6 +74,8 @@ pub struct ShadowChain {
     /// a miner never gets paid for, whereas a large pool merely produces a truncated batch and the
     /// remainder is carried to the next one.
     pending: Mutex<BTreeMap<[u8; 32], ShareProof>>,
+    /// Shares dropped because the pool hit its ceiling. Non-zero means the chain is not draining.
+    pending_dropped: std::sync::atomic::AtomicU64,
     /// The adopted head, or `None` before genesis.
     head: RwLock<Option<ChainHead>>,
     /// Running balances after the head. Plaintext address -> integer micro-work, exactly the
@@ -201,14 +211,29 @@ impl ShadowChain {
             .and_then(|j| serde_json::from_str::<ShareBatch>(&j).ok())
             .map(|b| b.node_shares)
             .unwrap_or_default();
-        if !membership.is_empty() {
-            info!(voters = membership.len(), "SBC shadow: membership resumed");
+        match (head.as_ref(), membership.is_empty()) {
+            (Some(_), true) => {
+                // A head with no membership is silently dead: every quorum check fails the
+                // MIN_QUORUM floor, so the node defers everything forever, and no certificate can
+                // verify against an empty set. Safe, but indistinguishable from a quiet chain
+                // unless it says so. The only previous tell was the ABSENCE of a log line.
+                error!(
+                    "SBC shadow: head present but membership could not be recovered — this node \
+                     will defer every batch and adopt nothing. Its head batch row is missing or \
+                     will not deserialise; it needs resync."
+                );
+            }
+            (Some(_), false) => {
+                info!(voters = membership.len(), "SBC shadow: membership resumed")
+            }
+            (None, _) => {}
         }
 
         Ok(Self {
             identity,
             db,
             pending: Mutex::new(BTreeMap::new()),
+            pending_dropped: std::sync::atomic::AtomicU64::new(0),
             head: RwLock::new(head),
             balances: RwLock::new(balances),
             quarantine: Mutex::new(Quarantine::new()),
@@ -279,8 +304,47 @@ impl ShadowChain {
         if share.received_by != self.identity.node_id() {
             return false;
         }
-        self.pending.lock().insert(share.share_hash, share);
+        let mut pending = self.pending.lock();
+
+        // BOUNDED. Dropping a share here is work a miner is never credited for, which is why this
+        // pool was deliberately unbounded on the way in — a large pool merely produces a truncated
+        // batch, and the remainder is carried forward.
+        //
+        // That reasoning holds only while the chain closes sequences. A node that cannot reach
+        // quorum never drains, so it accumulates every share it receives, forever, inside the
+        // production ghost-pool process — and the node receiving the most shares fills fastest. On
+        // a fleet where one box is already at 90% disk and another runs ghostd at 1.7 GB in 3.8 GB
+        // of RAM, an unbounded pool on a wedged node is a production incident, not a corner case.
+        //
+        // So: a ceiling far above any healthy backlog, and when it is reached the OLDEST share
+        // goes. Oldest first because a share from a stalled era is the least likely to still be
+        // payable, and because losing recent work would hide the fact that the node is stuck.
+        if pending.len() >= MAX_PENDING_SHARES && !pending.contains_key(&share.share_hash) {
+            let oldest = pending
+                .iter()
+                .min_by_key(|(_, s)| s.timestamp)
+                .map(|(h, _)| *h);
+            if let Some(h) = oldest {
+                pending.remove(&h);
+                let dropped = self.pending_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                // Loud, and counted. Silent loss here would read as "this node received fewer
+                // shares", which is indistinguishable from a miner leaving.
+                warn!(
+                    dropped_total = dropped,
+                    pending = pending.len(),
+                    "SBC: pending pool at capacity — dropping the oldest share. The chain is not \
+                     draining; shares are being lost to a stalled sequence"
+                );
+            }
+        }
+
+        pending.insert(share.share_hash, share);
         true
+    }
+
+    /// How many shares this node has dropped for want of a draining chain.
+    pub fn pending_dropped(&self) -> u64 {
+        self.pending_dropped.load(Ordering::Relaxed)
     }
 
     /// Build the next batch from the pending pool, without proposing it.
@@ -1520,6 +1584,68 @@ mod tests {
                 .map(|b| b.batch_hash()),
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Audit 8, finding A5.** The pending pool is bounded, and says so when it bites.
+    ///
+    /// It was deliberately unbounded on the way in, because dropping a share is work a miner is
+    /// never credited for. That holds only while the chain drains: a node that cannot reach quorum
+    /// accumulates every share it receives, forever, inside the production ghost-pool process —
+    /// and the node receiving the most shares fills fastest.
+    #[test]
+    fn the_pending_pool_is_bounded_and_drops_the_oldest() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        let chain = ShadowChain::load(Arc::clone(&id), db).expect("load");
+
+        // Fill to the ceiling with ascending timestamps, so "oldest" is unambiguous.
+        for n in 0..MAX_PENDING_SHARES {
+            let mut sp = share(&id, "bc1qalice", 1.0, 0);
+            sp.share_hash = {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&(n as u64).to_le_bytes());
+                h
+            };
+            sp.timestamp = 1_000 + n as u64;
+            chain.record_received(sp);
+        }
+        assert_eq!(chain.pending_count(), MAX_PENDING_SHARES);
+        assert_eq!(
+            chain.pending_dropped(),
+            0,
+            "a full pool has dropped nothing yet"
+        );
+
+        // One more evicts exactly one, and it is the oldest.
+        let mut newest = share(&id, "bc1qalice", 1.0, 0);
+        newest.share_hash = [0xFF; 32];
+        newest.timestamp = 9_999_999;
+        chain.record_received(newest);
+
+        assert_eq!(
+            chain.pending_count(),
+            MAX_PENDING_SHARES,
+            "the pool must not grow past its ceiling"
+        );
+        assert_eq!(
+            chain.pending_dropped(),
+            1,
+            "and the loss must be counted, not silent"
+        );
+
+        // Re-recording something already held must NOT evict — that would turn an idempotent
+        // recorder into a slow leak of other people's shares.
+        let before = chain.pending_dropped();
+        let mut dup = share(&id, "bc1qalice", 1.0, 0);
+        dup.share_hash = [0xFF; 32];
+        dup.timestamp = 9_999_999;
+        chain.record_received(dup);
+        assert_eq!(
+            chain.pending_dropped(),
+            before,
+            "a duplicate is not a new share and must evict nothing"
         );
     }
 

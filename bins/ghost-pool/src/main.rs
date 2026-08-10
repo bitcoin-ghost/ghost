@@ -3872,6 +3872,28 @@ async fn main() -> Result<()> {
                         );
                     }
 
+                    // Genesis is otherwise ONE-SHOT at startup. A node that comes up before
+                    // the anchor checkpoint has reached its database never genesises, holds no
+                    // head, has no membership, and is silently inert until someone restarts it —
+                    // with nothing to say so. Retrying here costs a cheap `head()` check per tick
+                    // and is a no-op once the chain has started.
+                    if chain_c.head().is_none() {
+                        match chain_c.bootstrap_genesis(ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT, now)
+                        {
+                            Ok(Some(h)) => {
+                                tracing::info!(
+                                    anchor_height = h,
+                                    "SBC genesis: chain started (retry)"
+                                )
+                            }
+                            Ok(None) => tracing::debug!(
+                                "SBC genesis: still no ratified checkpoint at the anchor"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "SBC genesis: retry failed"),
+                        }
+                        continue;
+                    }
+
                     if schedule.is_empty() {
                         continue;
                     }
