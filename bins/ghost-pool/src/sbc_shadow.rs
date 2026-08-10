@@ -53,6 +53,10 @@ const MAX_PENDING_SHARES: usize = 50_000;
 /// moment a sequence closes.
 const CERT_RETENTION: u64 = 4_096;
 
+/// Certificates held in memory. One bound shared by minting and by remembering a verified peer's,
+/// so neither path can grow without the other's ceiling applying.
+const MAX_CERTS: usize = 64;
+
 /// Verified batches awaiting a commit, keyed by `(seq, batch_hash)`.
 ///
 /// The `u64` in the value is a monotonic insertion number, so eviction can mean OLDEST — a
@@ -232,6 +236,23 @@ impl ShadowChain {
             .and_then(|j| serde_json::from_str::<ShareBatch>(&j).ok())
             .map(|b| b.node_shares)
             .unwrap_or_default();
+        // Detect a crash BETWEEN the two writes in `finalise`. Balances go first so a head is
+        // never ahead of its state; the reverse is survivable but must not be silent, because
+        // `sbc_store_batch` is idempotent while the FOLD is not — re-adopting that sequence would
+        // fold it twice, and every later state root would be wrong for good.
+        if let (Some(h), Ok(Some(bal_seq))) = (head.as_ref(), db.sbc_balances_seq()) {
+            if bal_seq > h.seq {
+                error!(
+                    head_seq = h.seq,
+                    balances_seq = bal_seq,
+                    "SBC shadow: balances are folded PAST the head — this node crashed between \
+                     persisting balances and persisting the batch. Re-adopting that sequence would \
+                     double-fold it. The chain will refuse to advance; this node needs its SBC \
+                     state reset from a peer."
+                );
+            }
+        }
+
         match (head.as_ref(), membership.is_empty()) {
             (Some(_), true) => {
                 // A head with no membership is silently dead: every quorum check fails the
@@ -392,10 +413,17 @@ impl ShadowChain {
         // Before genesis there is nothing to build on. The caller must run the genesis ceremony
         // first; proposing seq 0 from here would be starting a chain from nothing, which is a
         // chain anybody could start.
-        let head = self.head()?;
+        // Same consistent snapshot as the judging path. A torn read here emits a batch whose
+        // `prev_batch_hash` names one head while its `state_root` was computed from another's
+        // balances — self-inconsistent, and every peer still on the old head FAULTS it, so this
+        // node quarantines itself across the fleet for its own race.
+        let (head, balances_snapshot) = {
+            let _snapshot = self.adoption.read();
+            (self.head()?, self.balances())
+        };
         let (seq, prev_batch_hash) = (head.seq + 1, head.batch_hash);
 
-        let mut balances = self.balances();
+        let mut balances = balances_snapshot;
         fold_shares(&mut balances, &packed.included);
         let state_root = compute_state_root(&balances, seq, close_ts);
 
@@ -567,12 +595,21 @@ impl ShadowChain {
             return PhaseAction::ProposerQuarantined;
         }
 
-        let parent = match self.parent_for(batch.seq) {
-            Ok(p) => p,
-            Err(reason) => return PhaseAction::Hold { reason },
+        // ONE consistent snapshot, under the adoption guard. Reading the parent and the balances
+        // separately lets a commit finalising on another tokio task land between them, so the fold
+        // starts from state that ALREADY includes this batch — a `StateRootMismatch`, which is a
+        // FAULT, so an honest peer collects a persistent, operator-release-only quarantine for our
+        // race. Via the propose loop's self-judge the victim can be this node.
+        //
+        // Released before `quarantine`/`consensus` are taken, so `adoption` stays outermost.
+        let (parent, balances) = {
+            let _snapshot = self.adoption.read();
+            let parent = match self.parent_for(batch.seq) {
+                Ok(p) => p,
+                Err(reason) => return PhaseAction::Hold { reason },
+            };
+            (parent, self.balances())
         };
-
-        let balances = self.balances();
         let ctx = BatchContext {
             parent: &parent,
             parent_balances: &balances,
@@ -748,7 +785,6 @@ impl ShadowChain {
         schedule: &ProposerSchedule,
         now: i64,
     ) {
-        const MAX_CERTS: usize = 64;
         let Some(sigs) = self
             .precommit_sigs
             .lock()
@@ -819,7 +855,17 @@ impl ShadowChain {
         ) {
             warn!(seq = cert.seq, error = %e, "SBC: could not store a verified certificate");
         }
-        self.certs.lock().insert(cert.seq, cert.clone());
+        let mut certs = self.certs.lock();
+        // Bounded like the mint path. Without this a node in prolonged catch-up adds one
+        // certificate per synced sequence and only sheds them the next time it MINTS one — so a
+        // node that never resumes head participation grows monotonically inside the pool process.
+        while certs.len() >= MAX_CERTS {
+            let Some(oldest) = certs.keys().next().copied() else {
+                break;
+            };
+            certs.remove(&oldest);
+        }
+        certs.insert(cert.seq, cert.clone());
     }
 
     /// The certificate proving what we committed at `seq`, if we still hold it.
@@ -874,7 +920,12 @@ impl ShadowChain {
         //
         // Bounded well BELOW the head so a certificate outlives the sequence it proves: a peer
         // catching up needs the proof for a sequence we closed some time ago.
-        let cert_floor = seq.saturating_sub(CERT_RETENTION);
+        // One deeper than the batch window, not one shallower. `prune_below` is called with
+        // `batch.seq + 1`, so subtracting the retention from `seq` left the floor at `head-4095`
+        // while batches are retained to `head-4096` — the oldest retained batch was always served
+        // with no certificate, and a requester with no local opinion refuses that outright. The
+        // extra step means a proof always outlives the batch it proves.
+        let cert_floor = seq.saturating_sub(CERT_RETENTION + 1);
         if let Err(e) = self.db.sbc_prune_certs_below(cert_floor) {
             warn!(error = %e, "SBC: could not prune old certificates");
         }
@@ -1654,6 +1705,43 @@ mod tests {
                 .map(|b| b.batch_hash()),
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Audit 10, finding 1.** Every path that snapshots the chain takes the adoption guard.
+    ///
+    /// This is a source-level assertion on purpose. The guard was written, documented, and claimed
+    /// in a commit message — and applied to only ONE of the three paths, because a multi-edit
+    /// script asserted on two patterns, the second failed, and nothing was written at all. The
+    /// behaviour it prevents (a torn head/balances read producing a spurious `StateRootMismatch`,
+    /// which is a FAULT and therefore a persistent quarantine of an honest peer) is a race, so no
+    /// ordinary test reliably catches its absence. Checking the source does.
+    #[test]
+    fn every_snapshot_path_takes_the_adoption_guard() {
+        let src = include_str!("sbc_shadow.rs");
+
+        // Each of these reads the head and the balances and must see one consistent pair.
+        for f in [
+            "pub fn on_proposal_phase",
+            "pub fn adopt_committed_batch",
+            "fn build_batch",
+        ] {
+            let start = src.find(f).unwrap_or_else(|| panic!("{f} not found"));
+            // Look only at the function's opening span, where the snapshot is taken.
+            let window = &src[start..(start + 2_000).min(src.len())];
+            assert!(
+                window.contains("self.adoption.read()"),
+                "{f} snapshots head+balances and MUST take the adoption guard — without it a \
+                 concurrent finalise makes it fault an honest peer"
+            );
+        }
+
+        // And the mutation side must take it exclusively.
+        let fin = src.find("pub fn finalise").expect("finalise");
+        let window = &src[fin..(fin + 3_000).min(src.len())];
+        assert!(
+            window.contains("self.adoption.write()"),
+            "finalise must hold the guard exclusively while head and balances disagree"
         );
     }
 

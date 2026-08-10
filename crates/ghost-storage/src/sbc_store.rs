@@ -90,6 +90,24 @@ impl Database {
     /// remove a miner's balance from the state root, and every node that could decrypt it would
     /// then compute a different root — a divergence that looks like consensus failure rather than
     /// like the key problem it actually is.
+    /// The sequence the stored balances were last folded to.
+    ///
+    /// Balances and the batch are two separate transactions, written balances-first so a crash
+    /// can never leave a head ahead of its state. The reverse — state ahead of the head — is
+    /// survivable but NOT silent: re-adopting that sequence would fold it twice, because
+    /// `sbc_store_batch` is idempotent while the fold is not. This is what lets a node notice.
+    pub fn sbc_balances_seq(&self) -> GhostResult<Option<u64>> {
+        self.with_connection(|conn| {
+            Ok(conn
+                .query_row("SELECT MAX(updated_seq) FROM sbc_balances", [], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })
+                .ok()
+                .flatten()
+                .map(|v| v as u64))
+        })
+    }
+
     pub fn sbc_load_balances(&self) -> GhostResult<BTreeMap<String, i64>> {
         let rows: Vec<(String, i64)> = self.with_connection(|conn| {
             let mut stmt = conn
