@@ -200,6 +200,23 @@ pub struct DownstreamDifficultyConfig {
     /// frequently enough (e.g., due to low Bitcoin mempool activity).
     /// Set to 0 to disable keepalive jobs.
     pub job_keepalive_interval_secs: u16,
+    /// Quantise every assigned difficulty to a power-of-two tier (SHARE_TIER_BIND).
+    ///
+    /// The emitting half of ghost-pool's `SHARE_TIER_BIND_HEIGHT`: a share can only commit to
+    /// its difficulty tier inside the hashed coinbase if the difficulty it was ASSIGNED is a
+    /// tier — `2^n`, floored at `2^10` (the authority for both numbers is
+    /// `ghost_common::coinbase_tags`, see `difficulty_manager::MIN_DIFFICULTY_TIER_LOG2`).
+    ///
+    /// **Defaults to `false` and must stay false until the gate arms.** The translator has no
+    /// view of the chain height, so this config flag IS its gate: the release that arms
+    /// `SHARE_TIER_BIND_HEIGHT` must ship this flag on, and nothing before it may. Off, every
+    /// target is byte-identical to today's — quantisation is not applied anywhere.
+    ///
+    /// Quantisation rounds difficulty DOWN to the tier below (target gets easier), except below
+    /// the floor tier where it rounds UP to `2^10` — the floor is the smallest tier any node
+    /// may assign, sitting just under the smallest difficulty the fleet serves.
+    #[serde(default)]
+    pub quantise_to_tiers: bool,
 }
 
 /// Second listener for farm-scale and rented hashrate, on its own port with its own floor.
@@ -233,6 +250,8 @@ impl DownstreamDifficultyConfig {
             shares_per_minute,
             enable_vardiff,
             job_keepalive_interval_secs,
+            // Dormant until SHARE_TIER_BIND_HEIGHT arms; see the field doc.
+            quantise_to_tiers: false,
         }
     }
 }

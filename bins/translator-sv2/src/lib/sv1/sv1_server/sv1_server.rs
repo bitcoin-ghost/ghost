@@ -241,7 +241,17 @@ impl Sv1Server {
         let Some(downstream) = self.downstreams.get(&downstream_id) else {
             return;
         };
-        let pending_target = hash_rate_to_target(clamped, shares_per_minute).ok();
+        // SHARE_TIER_BIND: a miner-suggested difficulty is quantised like any other assignment
+        // when the tier flag is armed (dormant by default).
+        let pending_target = hash_rate_to_target(clamped, shares_per_minute)
+            .ok()
+            .map(|t| {
+                if config.quantise_to_tiers {
+                    super::difficulty_manager::quantise_target_to_tier(&t)
+                } else {
+                    t
+                }
+            });
         downstream.downstream_data.super_safe_lock(|data| {
             data.suggested_hashrate = Some(clamped as Hashrate);
             data.hashrate = Some(clamped as Hashrate);
@@ -481,8 +491,19 @@ impl Sv1Server {
             .downstream_difficulty_config
             .min_individual_miner_hashrate;
         let shares_per_minute = self.config.downstream_difficulty_config.shares_per_minute as f64;
+        // SHARE_TIER_BIND: with tier quantisation armed, connections START on a tier too —
+        // otherwise every share mined before the first vardiff tick sits between tiers.
+        // Dormant by default; see `DownstreamDifficultyConfig::quantise_to_tiers`.
+        let quantise = self.config.downstream_difficulty_config.quantise_to_tiers;
+        let snap = |t: Target| {
+            if quantise {
+                super::difficulty_manager::quantise_target_to_tier(&t)
+            } else {
+                t
+            }
+        };
         let first_target: Target =
-            hash_rate_to_target(hobby_floor_hs as f64, shares_per_minute).unwrap();
+            snap(hash_rate_to_target(hobby_floor_hs as f64, shares_per_minute).unwrap());
 
         // Optional farm/rental listener. `None` leaves the single-listener behaviour exactly
         // as it was, which is what every existing config produces.
@@ -494,9 +515,10 @@ impl Sv1Server {
                     error!("Failed to bind farm listener to {}: {}", addr, e);
                     TproxyError::shutdown(e)
                 })?;
-                let target =
+                let target = snap(
                     hash_rate_to_target(t.min_individual_miner_hashrate as f64, shares_per_minute)
-                        .unwrap();
+                        .unwrap(),
+                );
                 info!(
                     "Translator Proxy: farm/rental listening on {} (floor {} H/s)",
                     addr, t.min_individual_miner_hashrate
@@ -1498,7 +1520,22 @@ impl Sv1Server {
         let vardiff_enabled = config.enable_vardiff;
 
         let max_target = if vardiff_enabled {
-            hash_rate_to_target(hashrate, shares_per_min).unwrap()
+            // SHARE_TIER_BIND: the channel-open target is quantised like every other assignment
+            // when the tier flag is armed (dormant by default), exactly as the suggested-difficulty
+            // and listener paths above already do.
+            //
+            // Missing it here was not cosmetic. This target is what the SV2 extended channel opens
+            // with, so it is BOTH what the miner works to AND what pool_sv2 floors to derive the
+            // committed tier. Un-quantised, a miner assigned e.g. difficulty 4656 mines at 4656 but
+            // commits to — and is credited — tier 12 (4096); just under a power of two the loss
+            // approaches half the work. Quantising here makes assigned difficulty equal 2^tier, which
+            // is the invariant the whole tier design assumes.
+            let t = hash_rate_to_target(hashrate, shares_per_min).unwrap();
+            if config.quantise_to_tiers {
+                super::difficulty_manager::quantise_target_to_tier(&t)
+            } else {
+                t
+            }
         } else {
             // If translator doesn't manage vardiff, we rely on upstream to do that,
             // so we give it more freedom by setting max_target to maximum possible value

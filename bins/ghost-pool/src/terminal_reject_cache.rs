@@ -57,16 +57,35 @@ pub type VerdictKey = [u8; 16];
 
 /// Derive the cache key from exactly the inputs to the PoW verification.
 ///
-/// Must stay in step with `DifficultyCalculator::verify_pow_preimage`: if that ever considers a
-/// further input, it belongs in here too, or a proof could be cached under a verdict that no longer
-/// follows from its key.
-pub fn verdict_key(header80: &[u8; 80], share_hash: &[u8; 32], difficulty: f64) -> VerdictKey {
+/// Must stay in step with `DifficultyCalculator::verify_pow_preimage` — and, at/above
+/// `SHARE_TIER_BIND_HEIGHT`, with `verify_pow_preimage_tier` plus the difficulty-equals-tier-target
+/// rule in `handle_share_proof`: if either ever considers a further input, it belongs in here too,
+/// or a proof could be cached under a verdict that no longer follows from its key.
+///
+/// `tier_log2` is the committed tier the verdict was judged against, `None` below the tier gate.
+/// It is part of the key for the same anti-poisoning reason difficulty is: a hostile peer must not
+/// be able to suppress a correctly-tiered claim by first gossiping the same share under a wrong
+/// tier. An absent tier appends nothing, so below the gate the key is byte-identical to the
+/// pre-tier derivation (the cache is in-memory and never crosses a process, but byte-identity makes
+/// "no behaviour change below the gate" checkable rather than argued).
+pub fn verdict_key(
+    header80: &[u8; 80],
+    share_hash: &[u8; 32],
+    difficulty: f64,
+    tier_log2: Option<u32>,
+) -> VerdictKey {
     use bitcoin::hashes::{sha256, Hash};
-    let mut buf = Vec::with_capacity(80 + 32 + 8);
+    let mut buf = Vec::with_capacity(80 + 32 + 8 + 5);
     buf.extend_from_slice(header80);
     buf.extend_from_slice(share_hash);
     // to_bits() so NaN and -0.0 are distinguished bit-exactly rather than by float comparison.
     buf.extend_from_slice(&difficulty.to_bits().to_be_bytes());
+    // A presence byte plus the value, so (difficulty x, tier absent) can never collide with a
+    // crafted difficulty whose trailing bytes spell a tier.
+    if let Some(t) = tier_log2 {
+        buf.push(0x01);
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
     let d = sha256::Hash::hash(&buf).to_byte_array();
     let mut k = [0u8; 16];
     k.copy_from_slice(&d[..16]);
@@ -141,10 +160,10 @@ mod tests {
     #[test]
     fn a_repeated_identical_claim_hits() {
         let c = TerminalRejectCache::default();
-        let k = verdict_key(&hdr(1), &hash(2), 1000.0);
+        let k = verdict_key(&hdr(1), &hash(2), 1000.0, None);
         assert!(!c.contains(&k));
         c.insert(k);
-        assert!(c.contains(&verdict_key(&hdr(1), &hash(2), 1000.0)));
+        assert!(c.contains(&verdict_key(&hdr(1), &hash(2), 1000.0, None)));
     }
 
     // The poisoning guard. This is the reason the key is not just the share hash.
@@ -152,26 +171,43 @@ mod tests {
     fn a_different_difficulty_for_the_same_share_is_not_suppressed() {
         let c = TerminalRejectCache::default();
         // Hostile: real share, inflated difficulty. Gets judged terminal and cached.
-        c.insert(verdict_key(&hdr(1), &hash(2), 999_999.0));
+        c.insert(verdict_key(&hdr(1), &hash(2), 999_999.0, None));
         // Honest delivery of the SAME share with its true difficulty must still be verified.
         assert!(
-            !c.contains(&verdict_key(&hdr(1), &hash(2), 1000.0)),
+            !c.contains(&verdict_key(&hdr(1), &hash(2), 1000.0, None)),
             "an attacker must not be able to suppress a share by over-claiming it once"
+        );
+    }
+
+    /// The tier-era poisoning guard, mirroring the difficulty one: judging a share under a WRONG
+    /// tier must not suppress the correctly-tiered claim, and a tier-less claim (below-gate era)
+    /// must not suppress a tiered one.
+    #[test]
+    fn a_different_tier_for_the_same_share_is_not_suppressed() {
+        let c = TerminalRejectCache::default();
+        c.insert(verdict_key(&hdr(1), &hash(2), 1024.0, Some(20)));
+        assert!(
+            !c.contains(&verdict_key(&hdr(1), &hash(2), 1024.0, Some(10))),
+            "a wrong-tier verdict must not suppress the correctly-tiered claim"
+        );
+        assert!(
+            !c.contains(&verdict_key(&hdr(1), &hash(2), 1024.0, None)),
+            "a tiered verdict must not suppress the tier-less form of the claim, nor vice versa"
         );
     }
 
     #[test]
     fn a_different_header_for_the_same_share_is_not_suppressed() {
         let c = TerminalRejectCache::default();
-        c.insert(verdict_key(&hdr(9), &hash(2), 1000.0));
-        assert!(!c.contains(&verdict_key(&hdr(1), &hash(2), 1000.0)));
+        c.insert(verdict_key(&hdr(9), &hash(2), 1000.0, None));
+        assert!(!c.contains(&verdict_key(&hdr(1), &hash(2), 1000.0, None)));
     }
 
     #[test]
     fn it_stays_bounded_and_evicts_oldest_first() {
         let c = TerminalRejectCache::new(4);
         let keys: Vec<_> = (0..6u8)
-            .map(|i| verdict_key(&hdr(i), &hash(i), 1.0))
+            .map(|i| verdict_key(&hdr(i), &hash(i), 1.0, None))
             .collect();
         for k in &keys {
             c.insert(*k);
@@ -185,22 +221,22 @@ mod tests {
     #[test]
     fn reinserting_a_known_key_does_not_consume_capacity() {
         let c = TerminalRejectCache::new(3);
-        let hot = verdict_key(&hdr(1), &hash(1), 1.0);
+        let hot = verdict_key(&hdr(1), &hash(1), 1.0, None);
         for _ in 0..50 {
             c.insert(hot);
         }
         // A share redelivered in a loop must not evict everything else — that is the exact
         // behaviour #583 exhibits.
-        c.insert(verdict_key(&hdr(2), &hash(2), 1.0));
-        c.insert(verdict_key(&hdr(3), &hash(3), 1.0));
+        c.insert(verdict_key(&hdr(2), &hash(2), 1.0, None));
+        c.insert(verdict_key(&hdr(3), &hash(3), 1.0, None));
         assert!(c.contains(&hot));
         assert_eq!(c.len(), 3);
     }
 
     #[test]
     fn nan_and_zero_difficulties_do_not_collide() {
-        let a = verdict_key(&hdr(1), &hash(1), 0.0);
-        let b = verdict_key(&hdr(1), &hash(1), -0.0);
+        let a = verdict_key(&hdr(1), &hash(1), 0.0, None);
+        let b = verdict_key(&hdr(1), &hash(1), -0.0, None);
         assert_ne!(a, b, "to_bits must distinguish these");
     }
 }

@@ -121,6 +121,33 @@ type CoinbaseBuildResult = (
     Option<CoinbaseCommitment>,
 );
 
+/// The encoded node tag for one coinbase build: which of the two commitment forms is stamped.
+///
+/// Pure in its inputs so both branches are testable without touching the process-wide gate:
+/// `tier_bound` is `binds_difficulty_tier(height)` at the real call site.
+///
+/// - No identity → no tag, exactly as before the tag existed.
+/// - Below the gate, or no tier known → `node_commitment_plain(node_id)`, byte-identical to the
+///   `sha256(node_id)[..20]` always stamped (pinned by
+///   `coinbase_tags::tests::the_plain_commitment_matches_the_live_encoding`).
+/// - At/above the gate with a tier → `node_commitment_for_tier(node_id, tier)`: same 20-byte
+///   width, but the tier is folded into the hash so the share's credit is fixed inside the
+///   hashed coinbase before the hash exists.
+fn node_tag_bytes(
+    node_id: Option<ghost_common::types::NodeId>,
+    tier: Option<u32>,
+    tier_bound: bool,
+) -> Vec<u8> {
+    let Some(id) = node_id else {
+        return Vec::new();
+    };
+    let commitment = match tier {
+        Some(t) if tier_bound => ghost_common::coinbase_tags::node_commitment_for_tier(&id, t),
+        _ => ghost_common::coinbase_tags::node_commitment_plain(&id),
+    };
+    ghost_common::coinbase_tags::encode_node_tag(&commitment)
+}
+
 /// Template processor configuration
 #[derive(Debug, Clone)]
 pub struct TemplateConfig {
@@ -132,17 +159,25 @@ pub struct TemplateConfig {
     pub target_weight: u64,
     /// Coinbase extra data (pool signature)
     pub coinbase_extra: String,
-    /// This node's commitment, stamped into the coinbase so a share mined here is provably mined
-    /// *here*.
+    /// This node's identity, from which the coinbase's node tag is derived at scriptSig build
+    /// time so a share mined here is provably mined *here*.
     ///
-    /// `sha256(node_id)[..20]` rather than the full 32-byte id: the scriptSig has a 100-byte
-    /// ceiling shared with the height push, the payout tag, the pool tag and the extranonce, and
-    /// 20 bytes of second-preimage resistance is ample for binding an identity.
+    /// The stamped tag is 20 bytes, not the 32-byte id: the scriptSig has a 100-byte ceiling
+    /// shared with the height push, the payout tag, the pool tag and the extranonce, and 20
+    /// bytes of second-preimage resistance is ample for binding an identity. The identity is
+    /// carried instead of a pre-hashed commitment because the tag has TWO forms, chosen per
+    /// build (see `coinbase_scriptsig`):
+    ///
+    /// - below `SHARE_TIER_BIND_HEIGHT`: `node_commitment_plain(node_id)` =
+    ///   `sha256(node_id)[..20]`, byte-identical to what was always stamped;
+    /// - at/above the gate, for a build that knows its difficulty tier:
+    ///   `node_commitment_for_tier(node_id, tier)`, folding the tier into the same 20 bytes so
+    ///   the credit is fixed before the hash exists.
     ///
     /// Without it, a peer can lift a relayed share's header and re-sign it claiming it received the
     /// work — `has_valid_received_by_signature` only proves the *named* node signed, never that it
     /// was the one mined to. `None` leaves the coinbase exactly as it was.
-    pub node_commitment: Option<[u8; 20]>,
+    pub node_id: Option<ghost_common::types::NodeId>,
     /// Treasury address for pool fees (supports multi-sig)
     pub treasury_address: TreasuryAddress,
     /// Pool payout address for fallback coinbase (bech32)
@@ -182,7 +217,7 @@ impl Default for TemplateConfig {
             min_fee_rate: 1.0,
             target_weight: 3_992_000, // ~99% of 4MW limit
             coinbase_extra: "GHOST".to_string(),
-            node_commitment: None,
+            node_id: None,
             treasury_address: TreasuryAddress::default(), // Must be configured
             pool_payout_address: String::new(),           // Must be configured
             network: BitcoinNetwork::Mainnet,
@@ -1261,7 +1296,9 @@ impl TemplateProcessor {
         coinbase1.extend_from_slice(&0xffffffffu32.to_le_bytes());
 
         // Script sig: height, the payout commitment, then the pool tag. See coinbase_scriptsig.
-        let scriptsig = self.coinbase_scriptsig(height, payout_snapshot, 8)?;
+        // No tier: this coinbase is built once per TEMPLATE and serves every difficulty; the
+        // tier-bound tag can only be stamped where the per-job tier is known (the SRI layer).
+        let scriptsig = self.coinbase_scriptsig(height, payout_snapshot, 8, None)?;
         coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
         coinbase1.extend_from_slice(&scriptsig);
 
@@ -2478,7 +2515,8 @@ impl TemplateProcessor {
 
         // Script sig: height then the pool tag. No payout commitment — this path builds no
         // settleable payout. See coinbase_scriptsig.
-        let scriptsig = self.coinbase_scriptsig(height, None, 8)?;
+        // No tier for the same reason as the primary builder: template-level, difficulty-blind.
+        let scriptsig = self.coinbase_scriptsig(height, None, 8, None)?;
         coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
         coinbase1.extend_from_slice(&scriptsig);
 
@@ -2568,11 +2606,22 @@ impl TemplateProcessor {
     /// hand-rolling one. A hand-written fixture proves the parser agrees with the fixture, not
     /// that it agrees with the builder — and those two drifting apart is precisely the failure
     /// that only shows up on a won block.
+    ///
+    /// `tier` is the power-of-two difficulty tier this coinbase's job serves, when the caller
+    /// knows one. It only takes effect at/above `SHARE_TIER_BIND_HEIGHT` (dormant); below the
+    /// gate the plain tag is stamped regardless, byte-identical to today. Every current caller
+    /// passes `None`, honestly: this builder runs once per TEMPLATE, and a template serves every
+    /// miner at every difficulty — the tier only becomes knowable per JOB, in the SRI layer,
+    /// which is where the tier-bound form must ultimately be stamped (see
+    /// `SHARE_TIER_BIND_HEIGHT` in `lib.rs` for the boundary). The parameter exists so the one
+    /// scriptSig assembler already speaks both forms and the SRI work cannot grow a second,
+    /// drifting spelling of the tag.
     pub(crate) fn coinbase_scriptsig(
         &self,
         height: u64,
         payout_snapshot: Option<[u8; 32]>,
         extranonce_len: usize,
+        tier: Option<u32>,
     ) -> Result<Vec<u8>, TemplateError> {
         let height_bytes = self.encode_height(height);
         let payout_tag = payout_snapshot
@@ -2584,11 +2633,11 @@ impl TemplateProcessor {
             .unwrap_or_default();
         // Commit to this node, so a peer cannot lift the header off a relayed share and claim it
         // received the work. Goes before the raw pool tag for the same reason the payout tag does.
-        let node_tag = self
-            .config
-            .node_commitment
-            .map(|c| ghost_common::coinbase_tags::encode_node_tag(&c))
-            .unwrap_or_default();
+        let node_tag = node_tag_bytes(
+            self.config.node_id,
+            tier,
+            crate::binds_difficulty_tier(height),
+        );
 
         let extra = self.config.coinbase_extra.as_bytes();
 
@@ -4631,13 +4680,14 @@ mod tests {
     #[test]
     fn both_commitments_reach_the_built_coinbase() {
         let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
-        let node_commitment = [0x7Au8; 20];
+        let node_id = [0x7Au8; 32];
+        let node_commitment = ghost_common::coinbase_tags::node_commitment_plain(&node_id);
         let processor = TemplateProcessor::new(
             TemplateConfig {
                 coinbase_extra: "GHOST PublicPool".to_string(),
                 pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
                 mining_mode: MiningMode::PublicPool,
-                node_commitment: Some(node_commitment),
+                node_id: Some(node_id),
                 ..Default::default()
             },
             rpc,
@@ -4646,7 +4696,7 @@ mod tests {
         );
 
         let scriptsig = processor
-            .coinbase_scriptsig(960_000, Some([0xC3u8; 32]), 20)
+            .coinbase_scriptsig(960_000, Some([0xC3u8; 32]), 20, None)
             .expect("scriptsig must build");
 
         let mut expected_payout = [0u8; 16];
@@ -4688,7 +4738,7 @@ mod tests {
                 coinbase_extra: "GHOST PublicPool".to_string(),
                 pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
                 mining_mode: MiningMode::PublicPool,
-                node_commitment: Some([0x11u8; 20]),
+                node_id: Some([0x11u8; 32]),
                 ..Default::default()
             },
             rpc,
@@ -4697,7 +4747,7 @@ mod tests {
         );
 
         let scriptsig = processor
-            .coinbase_scriptsig(960_000, None, 20)
+            .coinbase_scriptsig(960_000, None, 20, None)
             .expect("scriptsig must build");
 
         assert_eq!(
@@ -4707,7 +4757,97 @@ mod tests {
         );
         assert_eq!(
             ghost_common::coinbase_tags::extract_node_tag(&scriptsig),
-            Some([0x11u8; 20])
+            Some(ghost_common::coinbase_tags::node_commitment_plain(
+                &[0x11u8; 32]
+            ))
+        );
+    }
+
+    /// SHARE_TIER_BIND, both halves of the emission switch, driven through the pure helper so
+    /// neither branch needs the process-wide gate moved.
+    ///
+    /// Below the gate (`tier_bound = false`) the stamped tag must be byte-identical to the
+    /// historical `sha256(node_id)[..20]` REGARDLESS of any tier a caller offers — that is the
+    /// no-behaviour-change bar. At/above it, a known tier folds into the same 20 bytes.
+    #[test]
+    fn the_node_tag_switches_form_only_at_the_tier_gate() {
+        let node_id: ghost_common::types::NodeId = [0x42u8; 32];
+        let plain = ghost_common::coinbase_tags::encode_node_tag(
+            &ghost_common::coinbase_tags::node_commitment_plain(&node_id),
+        );
+        let tiered = ghost_common::coinbase_tags::encode_node_tag(
+            &ghost_common::coinbase_tags::node_commitment_for_tier(&node_id, 13),
+        );
+
+        // Below the gate: plain, even when a tier is offered.
+        assert_eq!(node_tag_bytes(Some(node_id), None, false), plain);
+        assert_eq!(
+            node_tag_bytes(Some(node_id), Some(13), false),
+            plain,
+            "below the gate the tag must not change, whatever the caller knows"
+        );
+
+        // At/above the gate: a known tier folds in; no tier still stamps plain (a
+        // difficulty-blind builder keeps working, its shares simply cannot claim a tier).
+        assert_eq!(node_tag_bytes(Some(node_id), Some(13), true), tiered);
+        assert_eq!(node_tag_bytes(Some(node_id), None, true), plain);
+        assert_ne!(tiered, plain);
+        assert_eq!(
+            tiered.len(),
+            plain.len(),
+            "the tier costs zero scriptSig bytes"
+        );
+
+        // No identity, no tag — unchanged.
+        assert!(node_tag_bytes(None, Some(13), true).is_empty());
+    }
+
+    /// The same switch through the REAL builder: the height decides, and while the gate is
+    /// dormant (`u64::MAX`) only a build at `u64::MAX` itself could ever take the tier branch —
+    /// which conveniently makes both branches reachable in a test without touching the gate.
+    #[test]
+    fn coinbase_scriptsig_stamps_the_tier_bound_tag_only_at_the_gate() {
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "user", "pass").unwrap());
+        let node_id: ghost_common::types::NodeId = [0x42u8; 32];
+        let processor = TemplateProcessor::new(
+            TemplateConfig {
+                coinbase_extra: "GHOST PublicPool".to_string(),
+                pool_payout_address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                mining_mode: MiningMode::PublicPool,
+                node_id: Some(node_id),
+                ..Default::default()
+            },
+            rpc,
+            PolicyProfile::permissive(),
+            ReaperConfig::default(),
+        );
+
+        // Below the (dormant) gate, offering a tier changes nothing: byte-identical scriptSigs.
+        let without = processor
+            .coinbase_scriptsig(960_000, None, 20, None)
+            .expect("scriptsig must build");
+        let with_ignored_tier = processor
+            .coinbase_scriptsig(960_000, None, 20, Some(13))
+            .expect("scriptsig must build");
+        assert_eq!(
+            without, with_ignored_tier,
+            "below the gate a tier must be byte-invisible in the built scriptSig"
+        );
+        assert_eq!(
+            ghost_common::coinbase_tags::extract_node_tag(&without),
+            Some(ghost_common::coinbase_tags::node_commitment_plain(&node_id))
+        );
+
+        // At the gate (u64::MAX ≥ the dormant u64::MAX), the tier folds into the tag.
+        let at_gate = processor
+            .coinbase_scriptsig(u64::MAX, None, 20, Some(13))
+            .expect("scriptsig must build");
+        assert_eq!(
+            ghost_common::coinbase_tags::extract_node_tag(&at_gate),
+            Some(ghost_common::coinbase_tags::node_commitment_for_tier(
+                &node_id, 13
+            )),
+            "at/above the gate the stamped tag must commit to the tier"
         );
     }
 

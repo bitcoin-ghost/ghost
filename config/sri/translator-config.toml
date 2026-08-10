@@ -80,6 +80,17 @@ idle_timeout_secs = 600
 # Keepalive interval for downstream miners (seconds)
 job_keepalive_interval_secs = 60
 
+# Quantise every assigned difficulty to a power-of-two tier (SHARE_TIER_BIND).
+# ⚠ DORMANT: leave this OFF (absent/false) until the release that arms
+# `SHARE_TIER_BIND_HEIGHT` in ghost-pool — the translator has no chain view, so
+# this flag IS its half of that gate and must flip in the SAME release as
+# ghost-pool's height AND pool_sv2's `[share_tier_binding]` section
+# (pool-config.toml). pool_sv2 logs a SHARE_TIER_BIND DESYNC error if the halves
+# disagree. When armed, vardiff targets snap down to the tier below (2^n,
+# floored at 2^10 = 1024) so a share's coinbase can commit to the tier it was
+# assigned.
+# quantise_to_tiers = true
+
 # Upstream SRI Pool connection
 [[upstreams]]
 address = "127.0.0.1"

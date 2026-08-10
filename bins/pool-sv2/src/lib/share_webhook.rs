@@ -58,6 +58,16 @@ pub struct ShareData {
     /// [`ShareBatch::skeletons`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skeleton_id: Option<String>,
+    /// The power-of-two difficulty tier (`log2`) this share's job COMMITTED to in its coinbase
+    /// (SHARE_TIER_BIND). Populated from the job's build-time label
+    /// (`StandardChannel/ExtendedChannel::job_tier_log2`) whenever per-tier jobs are active —
+    /// i.e. `[share_tier_binding]` is configured AND the template height is at/above the
+    /// activation height. `None` below the gate (the only shipped state), and
+    /// `skip_serializing_if` keeps those payloads byte-identical to the pre-tier wire format.
+    /// When `Some`, `share_work` is exactly `2^tier_log2` — ghost-pool's verifier enforces that
+    /// equality at/above its gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_log2: Option<u32>,
 }
 
 /// A coinbase skeleton, carried once for the job rather than once per share.
@@ -477,6 +487,7 @@ mod tests {
             header: None,
             extranonce: None,
             skeleton_id: Some("aa".to_string()),
+            tier_log2: None,
         }];
         let mut skeletons = vec![a_skeleton("aa")];
         worker.send_batch(&mut batch, &mut skeletons).await;
@@ -513,6 +524,7 @@ mod tests {
             header: None,
             extranonce: None,
             skeleton_id: None,
+            tier_log2: None,
         };
 
         let json = serde_json::to_string(&share).unwrap();

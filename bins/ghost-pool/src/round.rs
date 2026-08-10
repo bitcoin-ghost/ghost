@@ -286,6 +286,14 @@ pub struct RoundManager {
     /// Terminal verdicts, so a permanently-invalid proof is judged once rather than for ever.
     terminal_rejects: crate::terminal_reject_cache::TerminalRejectCache,
     pow_reject_no_header: std::sync::atomic::AtomicU64,
+    /// Shares at/above `SHARE_TIER_BIND_HEIGHT` carrying no committed tier. Kept apart from the
+    /// tier-credit mismatch below because they mean different things: this one says the EMITTING
+    /// side (translator/pool_sv2) is not stamping tiers yet, which during a roll is a deploy-order
+    /// problem, not an attack.
+    pow_reject_no_tier: std::sync::atomic::AtomicU64,
+    /// Shares whose numeric `difficulty` does not equal their committed tier's target. An emitter
+    /// that quantises vardiff but reports a different number would show up here, not as an attack.
+    pow_reject_tier_credit: std::sync::atomic::AtomicU64,
     /// Unix seconds of the last emitted summary.
     pow_reject_last_log: std::sync::atomic::AtomicI64,
     /// Current round ID
@@ -371,6 +379,8 @@ impl RoundManager {
             pow_reject_cached: std::sync::atomic::AtomicU64::new(0),
             terminal_rejects: crate::terminal_reject_cache::TerminalRejectCache::default(),
             pow_reject_no_header: std::sync::atomic::AtomicU64::new(0),
+            pow_reject_no_tier: std::sync::atomic::AtomicU64::new(0),
+            pow_reject_tier_credit: std::sync::atomic::AtomicU64::new(0),
             pow_reject_last_log: std::sync::atomic::AtomicI64::new(0),
             current_round: RwLock::new(0),
             current_height: RwLock::new(0),
@@ -709,6 +719,16 @@ impl RoundManager {
         // across the fleet over hours, so every share genuinely in flight carries its header.
         let height = self.current_height();
         let height_established = height > 0;
+        // SHARE_TIER_BIND: whether shares at this height commit to a difficulty tier and are
+        // credited exactly that tier. Deliberately NOT the pow gate's fail-closed
+        // `!height_established ||` sense: that sense turns a check ON while the height is
+        // unknown, which is right for the ARMED pow gate but would activate this DORMANT one on
+        // every restart (height reads 0 until the first template) — a below-gate behaviour
+        // change. The residual once armed is bounded: during the height-0 window the pow
+        // preimage check below still runs (its fail-closed sense unchanged), so a fabricated
+        // hash cannot enter; only the tier-credit selection waits for an established height,
+        // during which a share is judged by the legacy numeric claim exactly as below the gate.
+        let tier_bound = height_established && crate::binds_difficulty_tier(height);
         if !height_established || height >= crate::share_pow_verify_height() {
             let header80 = match proof.header.as_deref() {
                 Some(h) if h.len() == 80 => {
@@ -723,14 +743,33 @@ impl RoundManager {
                     return Err(ShareError::InvalidShareHash);
                 }
             };
+            // At/above the tier gate a share must state the tier its coinbase committed to.
+            // Like `missing_header` this is NOT a terminal verdict — a different, correctly
+            // emitted claim about the same work must still be judged on its merits — so it is
+            // rejected before the terminal-reject cache, not recorded in it.
+            let tier = if tier_bound {
+                match proof.tier_log2 {
+                    Some(t) => Some(t),
+                    None => {
+                        self.pow_reject_no_tier
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.maybe_summarise_pow_rejects();
+                        return Err(ShareError::InvalidShareHash);
+                    }
+                }
+            } else {
+                None
+            };
             // #583: a proof this node has already judged unfixable is dropped here rather than
-            // verified again. The key covers the header, the hash and the claimed difficulty —
-            // exactly the inputs the verdict is a function of — so a *different* claim about the
-            // same share is still judged on its merits and cannot be suppressed by a forged one.
+            // verified again. The key covers the header, the hash, the claimed difficulty and
+            // (at/above the tier gate) the committed tier — exactly the inputs the verdict is a
+            // function of — so a *different* claim about the same share is still judged on its
+            // merits and cannot be suppressed by a forged one.
             let verdict_key = crate::terminal_reject_cache::verdict_key(
                 &header80,
                 &proof.share_hash,
                 proof.difficulty,
+                tier,
             );
             if self.terminal_rejects.contains(&verdict_key) {
                 self.pow_reject_cached
@@ -762,7 +801,67 @@ impl RoundManager {
                 );
                 return Err(ShareError::InvalidShareHash);
             }
-            if !ghost_accounting::DifficultyCalculator::verify_pow_preimage(
+            // At/above the tier gate the share is judged against its COMMITTED tier and credited
+            // exactly the tier's target, never the difficulty it happened to achieve — that is
+            // the whole anti-post-hoc-claim mechanism. Requiring the proof's numeric
+            // `difficulty` to BE the tier's target (±0.01%, the M-9 tolerance) is what makes the
+            // credit equal the commitment: the M-9 work-consistency check below already binds
+            // `work` to `difficulty`, so binding `difficulty` to the tier closes the chain
+            // `work == difficulty == 2^tier_log2`.
+            //
+            // The tier BINDING — that the coinbase really committed to `(node_id, tier)` —
+            // cannot be judged here: it needs the coinbase skeleton, which travels once per job
+            // and may not have arrived yet. It is judged where skeletons live
+            // (`binding_recheck`, `verify_share_tier_binding`); this path fixes the PoW and the
+            // credit.
+            if let Some(t) = tier {
+                let credited =
+                    match ghost_accounting::DifficultyCalculator::verify_pow_preimage_tier(
+                        &header80,
+                        &proof.share_hash,
+                        t,
+                    ) {
+                        Some(credited) => credited,
+                        None => {
+                            self.pow_reject_below_diff
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Terminal: this hash cannot reach this tier, and neither can change.
+                            self.terminal_rejects.insert(verdict_key);
+                            self.maybe_summarise_pow_rejects();
+                            let achieved =
+                                ghost_accounting::DifficultyCalculator::difficulty_from_hash(
+                                    &proof.share_hash,
+                                );
+                            debug!(
+                                round_id = proof.round_id,
+                                miner = %hex::encode(&proof.miner_id[..8]),
+                                share = %hex::encode(&proof.share_hash[..8]),
+                                from = %hex::encode(&proof.received_by[..8]),
+                                committed_tier_log2 = t,
+                                achieved_difficulty = achieved,
+                                "share hash is genuine but misses its committed tier"
+                            );
+                            return Err(ShareError::InvalidShareHash);
+                        }
+                    };
+                if (proof.difficulty - credited).abs() > credited * 0.0001 {
+                    self.pow_reject_tier_credit
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Terminal: the mismatch is a function of the proof's own fields.
+                    self.terminal_rejects.insert(verdict_key);
+                    self.maybe_summarise_pow_rejects();
+                    warn!(
+                        round_id = proof.round_id,
+                        miner = %hex::encode(&proof.miner_id[..8]),
+                        share = %hex::encode(&proof.share_hash[..8]),
+                        claimed_difficulty = proof.difficulty,
+                        committed_tier_log2 = t,
+                        tier_target = credited,
+                        "share states a difficulty other than its committed tier's target"
+                    );
+                    return Err(ShareError::InvalidShareHash);
+                }
+            } else if !ghost_accounting::DifficultyCalculator::verify_pow_preimage(
                 &header80,
                 &proof.share_hash,
                 proof.difficulty,
@@ -1205,14 +1304,21 @@ impl RoundManager {
         let mismatched = self.pow_reject_counts.swap(0, Relaxed);
         let below = self.pow_reject_below_diff.swap(0, Relaxed);
         let no_header = self.pow_reject_no_header.swap(0, Relaxed);
+        let no_tier = self.pow_reject_no_tier.swap(0, Relaxed);
+        let tier_credit = self.pow_reject_tier_credit.swap(0, Relaxed);
         let cached = self.pow_reject_cached.swap(0, Relaxed);
-        if mismatched + below + no_header + cached == 0 {
+        if mismatched + below + no_header + no_tier + tier_credit + cached == 0 {
             return;
         }
         warn!(
             hash_mismatch = mismatched,
             below_difficulty = below,
             missing_header = no_header,
+            // Both zero until SHARE_TIER_BIND_HEIGHT arms. Non-zero missing_tier during a roll
+            // means the emitting side (translator/pool_sv2) is behind; tier_credit_mismatch
+            // means an emitter states a difficulty other than its committed tier's target.
+            missing_tier = no_tier,
+            tier_credit_mismatch = tier_credit,
             // Redeliveries dropped without re-verifying. A high number here against low
             // first-judgement counts is the #583 signature: few bad shares, endlessly resent.
             already_judged = cached,
@@ -1972,6 +2078,7 @@ mod tests {
         let share_hash = [42u8; 32];
         let proof = ShareProof {
             header: None,
+            tier_log2: None,
             round_id: 1,
             miner_id: [1u8; 32],
             difficulty: 1500.0, // Above pool minimum
@@ -2029,6 +2136,7 @@ mod tests {
             template_id: Some([3u8; 32]),
             payout_address: None,
             header: None,
+            tier_log2: None,
             signature: None,
         };
 
@@ -2050,6 +2158,131 @@ mod tests {
                 Err(ShareError::InvalidShareHash)
             ),
             "a header that isn't the share's PoW preimage must be rejected"
+        );
+    }
+
+    /// A share with REAL PoW at a deterministically-known tier: the Bitcoin genesis header
+    /// achieves difficulty ~2536 — tier 11 (target 2048) and no higher. No mining in tests, no
+    /// 1-in-256 flake.
+    fn genesis_proof(round_id: u64, difficulty: f64, tier_log2: Option<u32>) -> ShareProof {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::Hash;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut header = Vec::new();
+        genesis.header.consensus_encode(&mut header).unwrap();
+        ShareProof {
+            round_id,
+            miner_id: [2u8; 32],
+            difficulty,
+            work: difficulty,
+            share_hash: genesis.header.block_hash().to_byte_array(),
+            timestamp: 0,
+            received_by: [9u8; 32], // a peer → skips the local-template check
+            template_id: Some([3u8; 32]),
+            payout_address: None,
+            header: Some(header),
+            tier_log2,
+            signature: None,
+        }
+    }
+
+    /// SHARE_TIER_BIND below the gate: the acceptance bar for this whole change. With the gate
+    /// dormant, a share is judged EXACTLY as today — the legacy numeric claim decides, a tier
+    /// riding along is not consulted, and the post-hoc achieved-difficulty claim (the very
+    /// attack the gate will close) still passes, because closing it early would BE a
+    /// below-gate behaviour change.
+    #[test]
+    fn below_the_tier_gate_shares_are_judged_exactly_as_today() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        // At the (armed) pow gate but far below the (dormant) tier gate.
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+        assert!(!crate::binds_difficulty_tier(manager.current_height()));
+
+        // The post-hoc claim: genesis achieves ~2536 and claims ~2500. Legacy rules admit it.
+        assert!(
+            manager
+                .handle_share_proof(genesis_proof(1, 2500.0, None))
+                .is_ok(),
+            "below the gate the legacy numeric claim must stand unchanged"
+        );
+
+        // A tier riding along must change nothing (different work value to dodge C5 dedup —
+        // dedup is by share_hash, so reuse of genesis needs a fresh manager).
+        let manager2 = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager2.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+        assert!(
+            manager2
+                .handle_share_proof(genesis_proof(1, 2500.0, Some(11)))
+                .is_ok(),
+            "below the gate a present tier field must not be consulted"
+        );
+    }
+
+    /// SHARE_TIER_BIND at the gate: the committed tier is required, judged, and credited —
+    /// exactly `2^tier_log2`, never the achieved difficulty.
+    #[test]
+    fn at_the_tier_gate_the_committed_tier_is_required_and_credited() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        // The gate is u64::MAX (dormant); put the round height AT it so the gated path runs —
+        // the same trick the pow-gate test above uses with its own constant.
+        manager.start_round(crate::SHARE_TIER_BIND_HEIGHT);
+        assert!(crate::binds_difficulty_tier(manager.current_height()));
+        // Park the summariser so counters are observable (see the terminal-reject test).
+        manager.pow_reject_last_log.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            Relaxed,
+        );
+
+        // No tier at/above the gate → refused, and counted as an emitter gap, not cached (a
+        // later, correctly-emitted claim about the same work must still be judged).
+        assert!(matches!(
+            manager.handle_share_proof(genesis_proof(1, 2048.0, None)),
+            Err(ShareError::InvalidShareHash)
+        ));
+        assert_eq!(manager.pow_reject_no_tier.load(Relaxed), 1);
+        assert_eq!(
+            manager.terminal_rejects.len(),
+            0,
+            "missing tier is retryable"
+        );
+
+        // The post-hoc claim, now refused: real hash, committed tier 11, but stating the
+        // achieved ~2536 rather than the tier's 2048.
+        assert!(matches!(
+            manager.handle_share_proof(genesis_proof(1, 2536.0, Some(11))),
+            Err(ShareError::InvalidShareHash)
+        ));
+        assert_eq!(manager.pow_reject_tier_credit.load(Relaxed), 1);
+
+        // A committed tier the hash does not reach earns nothing (genesis misses 4096).
+        assert!(matches!(
+            manager.handle_share_proof(genesis_proof(1, 4096.0, Some(12))),
+            Err(ShareError::InvalidShareHash)
+        ));
+        assert_eq!(manager.pow_reject_below_diff.load(Relaxed), 1);
+
+        // Committed tier 11, stated as exactly 2^11: admitted, credited the tier.
+        assert!(
+            manager
+                .handle_share_proof(genesis_proof(1, 2048.0, Some(11)))
+                .is_ok(),
+            "real PoW at its committed tier must be admitted"
+        );
+
+        // Redelivery of a judged-terminal claim is dropped from the cache, tier included in the
+        // key: the accepted (tier 11, 2048) claim was never poisoned by the rejected ones.
+        assert!(matches!(
+            manager.handle_share_proof(genesis_proof(1, 2536.0, Some(11))),
+            Err(ShareError::InvalidShareHash)
+        ));
+        assert_eq!(
+            manager.pow_reject_cached.load(Relaxed),
+            1,
+            "an identical terminal claim must be dropped without re-judging"
         );
     }
 
@@ -2141,6 +2374,7 @@ mod tests {
             template_id: Some([3u8; 32]),
             payout_address: None,
             header: None,
+            tier_log2: None,
             signature: None,
         };
         assert!(
@@ -2179,6 +2413,7 @@ mod tests {
             template_id: Some([3u8; 32]),
             payout_address: None,
             header: Some(header),
+            tier_log2: None,
             signature: None,
         };
 
@@ -2255,6 +2490,7 @@ mod tests {
             template_id: Some([3u8; 32]),
             payout_address: None,
             header: Some(header.clone()),
+            tier_log2: None,
             signature: None,
         };
         assert!(manager.handle_share_proof(hostile.clone()).is_err());

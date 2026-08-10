@@ -471,7 +471,9 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         // One proposal per response, so the existing proposal bound applies.
         MessageType::PayoutProposalSync => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::ShareBatchProposal => MAX_SHARE_BATCH_SIZE,
-        MessageType::ShareBatchVote => MAX_SHARE_BATCH_VOTE_SIZE,
+        MessageType::ShareBatchVote
+        | MessageType::ShareBatchPrevote
+        | MessageType::ShareBatchPrecommit => MAX_SHARE_BATCH_VOTE_SIZE,
         MessageType::ShareBatchSync => MAX_SHARE_BATCH_SYNC_SIZE,
         MessageType::MeshNodeListCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::MeshNodeListCheckpointVote => MAX_VOTE_SIZE,

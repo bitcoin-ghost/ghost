@@ -52,6 +52,9 @@ pub struct BatchContext<'a, C: BatchChecks> {
     pub parent: &'a ShareBatch,
     /// Running balances after the parent.
     pub parent_balances: &'a std::collections::BTreeMap<String, i64>,
+    /// Per-proposer high-water marks after the parent — the cross-batch replay guard. Adopted
+    /// state exactly like the balances, and snapshotted under the same guard by the caller.
+    pub watermarks: &'a crate::share_batch::ProposerWatermarks,
     /// The voter set.
     pub schedule: &'a ProposerSchedule,
     /// Share and signature checks.
@@ -79,6 +82,7 @@ pub fn on_batch<C: BatchChecks>(
         batch,
         ctx.parent,
         ctx.parent_balances,
+        ctx.watermarks,
         ctx.schedule,
         ctx.now,
         ctx.checks,
@@ -94,7 +98,7 @@ pub fn on_batch<C: BatchChecks>(
             );
             Action::Quarantine { reason, outcome }
         }
-        BatchVerdict::Valid => {
+        BatchVerdict::Valid { .. } => {
             let hash = batch.batch_hash();
             match lock.try_vote(batch.seq, hash) {
                 VoteDecision::Fresh | VoteDecision::Repeat => Action::Vote {
@@ -201,6 +205,7 @@ mod tests {
             proposer: voter(1),
             shares: vec![],
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root: [0x22; 32],
             truncated: false,
@@ -211,30 +216,34 @@ mod tests {
 
     fn a_child(parent: &ShareBatch, schedule: &ProposerSchedule) -> ShareBatch {
         let balances: BTreeMap<String, i64> = BTreeMap::new();
+        let proposer = schedule.proposer_at(parent.seq + 1, 0).unwrap();
+        let close_ts = parent.close_ts + 30;
         let mut shares = vec![ShareProof {
             round_id: 1,
             miner_id: [1u8; 32],
             difficulty: 1.0,
             work: 1.0,
             share_hash: [1u8; 32],
-            timestamp: 1000,
-            received_by: [0u8; 32],
+            // Inside the D10 window, and received by the proposer — verification checks both.
+            timestamp: parent.close_ts as u64 + 10,
+            received_by: proposer,
             template_id: None,
             payout_address: Some("bc1qalice".into()),
             header: None,
+            tier_log2: None,
             signature: None,
         }];
         crate::share_batch::canonical_sort(&mut shares);
         let mut after = balances.clone();
         fold_shares(&mut after, &shares);
-        let close_ts = parent.close_ts + 30;
         ShareBatch {
             seq: parent.seq + 1,
             prev_batch_hash: parent.batch_hash(),
             close_ts,
-            proposer: schedule.proposer_at(parent.seq + 1, 0).unwrap(),
+            proposer,
             shares,
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root: compute_state_root(&after, parent.seq + 1, close_ts),
             truncated: false,
@@ -246,12 +255,14 @@ mod tests {
     fn ctx<'a>(
         parent: &'a ShareBatch,
         balances: &'a BTreeMap<String, i64>,
+        watermarks: &'a crate::share_batch::ProposerWatermarks,
         schedule: &'a ProposerSchedule,
         checks: &'a AllGood,
     ) -> BatchContext<'a, AllGood> {
         BatchContext {
             parent,
             parent_balances: balances,
+            watermarks,
             schedule,
             checks,
             now: PARENT_CLOSE + 1,
@@ -261,8 +272,9 @@ mod tests {
     #[test]
     fn a_valid_batch_is_voted_for() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let batch = a_child(&parent, &schedule);
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
 
         assert_eq!(
             on_batch(&batch, &c, &mut Quarantine::new(), &mut SeqVoteLock::new()),
@@ -279,6 +291,7 @@ mod tests {
     #[test]
     fn a_quarantined_proposer_is_not_even_judged() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let batch = a_child(&parent, &schedule);
 
         let mut q = Quarantine::new();
@@ -290,7 +303,7 @@ mod tests {
             &schedule,
         );
 
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
         assert_eq!(
             on_batch(&batch, &c, &mut q, &mut SeqVoteLock::new()),
             Action::ProposerQuarantined
@@ -302,11 +315,12 @@ mod tests {
     #[test]
     fn a_defective_batch_quarantines_its_proposer() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let mut batch = a_child(&parent, &schedule);
         batch.state_root = [0xAB; 32];
 
         let mut q = Quarantine::new();
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
         match on_batch(&batch, &c, &mut q, &mut SeqVoteLock::new()) {
             Action::Quarantine { reason, outcome } => {
                 assert!(matches!(reason, FaultReason::StateRootMismatch { .. }));
@@ -327,11 +341,12 @@ mod tests {
     #[test]
     fn an_out_of_position_batch_only_holds() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let mut batch = a_child(&parent, &schedule);
         batch.seq = parent.seq + 7;
 
         let mut q = Quarantine::new();
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
         assert!(matches!(
             on_batch(&batch, &c, &mut q, &mut SeqVoteLock::new()),
             Action::Hold { .. }
@@ -345,6 +360,7 @@ mod tests {
     #[test]
     fn a_second_valid_batch_at_one_sequence_is_refused_without_blame() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let first = a_child(&parent, &schedule);
         let mut second = a_child(&parent, &schedule);
         second.close_ts += 1; // a different, equally valid batch
@@ -356,7 +372,7 @@ mod tests {
 
         let mut q = Quarantine::new();
         let mut lock = SeqVoteLock::new();
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
 
         assert!(matches!(
             on_batch(&first, &c, &mut q, &mut lock),
@@ -429,5 +445,439 @@ mod tests {
             VoteAction::Ignored
         );
         assert_eq!(tally.approvals_for(&[0xAA; 32]), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two-phase driver
+//
+// Parallel to `on_batch` / `on_vote` above rather than replacing them, so the single-phase path
+// stays intact and testable while the shadow chain is migrated. The single-phase path is retained
+// ONLY for that migration and must not outlive it: it cannot recover from a round that misses
+// quorum, which is what wedged seq=1 on the six-node run of 2026-08-09.
+// ---------------------------------------------------------------------------
+
+use crate::batch_two_phase::{PrecommitOutcome, PrevoteOutcome, SeqConsensus};
+
+/// What to do about a batch under two-phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhaseAction {
+    /// Prevote for this batch at this round, and broadcast it.
+    ///
+    /// The hash is what the LOCKING RULE selected, which is not necessarily the batch that
+    /// arrived: a locked node prevotes its locked value instead. That substitution is the entire
+    /// mechanism preventing a committed batch from being contradicted at a later round.
+    Prevote {
+        batch_hash: [u8; 32],
+        seq: u64,
+        round: u32,
+    },
+    /// Nothing to do yet; recoverable.
+    Hold { reason: DeferReason },
+    /// Defective batch. Quarantine the proposer.
+    Quarantine {
+        reason: FaultReason,
+        outcome: QuarantineOutcome,
+    },
+    /// The proposer is already excluded, so the batch is not judged at all.
+    ProposerQuarantined,
+}
+
+/// Judge an incoming batch and say what to prevote.
+pub fn on_batch_phase<C: BatchChecks>(
+    batch: &ShareBatch,
+    ctx: &BatchContext<'_, C>,
+    quarantine: &mut Quarantine,
+    consensus: &SeqConsensus,
+) -> PhaseAction {
+    if quarantine.is_quarantined(&batch.proposer) {
+        return PhaseAction::ProposerQuarantined;
+    }
+
+    match verify_batch(
+        batch,
+        ctx.parent,
+        ctx.parent_balances,
+        ctx.watermarks,
+        ctx.schedule,
+        ctx.now,
+        ctx.checks,
+    ) {
+        BatchVerdict::Defer(reason) => PhaseAction::Hold { reason },
+        BatchVerdict::Fault(reason) => {
+            let outcome = quarantine.quarantine(
+                batch.proposer,
+                reason.clone(),
+                batch.seq,
+                ctx.now,
+                ctx.schedule,
+            );
+            PhaseAction::Quarantine { reason, outcome }
+        }
+        BatchVerdict::Valid { round } => {
+            let offered = batch.batch_hash();
+            // The locking rule decides what we prevote — NOT the batch that arrived.
+            match consensus.what_to_prevote(Some(offered)) {
+                Some(batch_hash) => PhaseAction::Prevote {
+                    batch_hash,
+                    seq: batch.seq,
+                    round,
+                },
+                // Unreachable while `offered` is Some, but expressed rather than unwrapped: a
+                // future caller passing None must hold, not panic on a consensus path.
+                None => PhaseAction::Hold {
+                    reason: DeferReason::ProposerNotDue,
+                },
+            }
+        }
+    }
+}
+
+/// What a peer's prevote produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrevoteAction {
+    /// Counted; no polka yet.
+    Counted { votes: usize, needed: usize },
+    /// A polka. Lock on this value and precommit it — in that order, because precommitting a value
+    /// this node is not locked on is exactly the behaviour two-phase exists to forbid.
+    LockAndPrecommit { batch_hash: [u8; 32], round: u32 },
+    /// A resend, or a voter whose word is already worthless.
+    Ignored,
+    /// Two prevotes for different batches in one round. Provable, terminal.
+    Equivocation {
+        voter: [u8; 32],
+        outcome: QuarantineOutcome,
+    },
+}
+
+/// Record a peer's prevote and say what follows.
+pub fn on_prevote(
+    voter: [u8; 32],
+    round: u32,
+    batch_hash: [u8; 32],
+    consensus: &mut SeqConsensus,
+    quarantine: &mut Quarantine,
+    schedule: &ProposerSchedule,
+    now: i64,
+) -> PrevoteAction {
+    if quarantine.is_quarantined(&voter) {
+        return PrevoteAction::Ignored;
+    }
+    match consensus.record_prevote(round, voter, batch_hash) {
+        PrevoteOutcome::Counted { votes, needed } => PrevoteAction::Counted { votes, needed },
+        PrevoteOutcome::Ignored => PrevoteAction::Ignored,
+        PrevoteOutcome::Polka { batch_hash, .. } => {
+            // Apply the polka to our own lock, then precommit ONLY what we are actually locked on.
+            //
+            // `apply_polka` correctly refuses evidence from a round below our lock — but the
+            // return value used to be discarded and `LockAndPrecommit` returned regardless, so a
+            // node locked on (5, A) that late-received a polka for B at round 2 would sign a
+            // precommit for B while locked on A. Precommitting a value this node is not locked on
+            // is precisely what two-phase exists to forbid, and it breaks the quorum-intersection
+            // argument that makes the protocol safe under partition.
+            //
+            // Checked against the lock rather than against `apply_polka`'s bool because that
+            // returns false BOTH for a refused stale polka and for a polka confirming the value we
+            // already hold — and the second of those must still precommit.
+            consensus.apply_polka(round, batch_hash);
+            match consensus.lock() {
+                Some((locked_round, locked_hash)) if locked_hash == batch_hash => {
+                    PrevoteAction::LockAndPrecommit {
+                        batch_hash,
+                        round: locked_round,
+                    }
+                }
+                // Stale evidence for a value we have moved past. Counted, not acted on.
+                _ => PrevoteAction::Counted {
+                    votes: consensus.prevotes_for(round, &batch_hash),
+                    needed: consensus.quorum(),
+                },
+            }
+        }
+        PrevoteOutcome::Equivocation { .. } => {
+            let outcome = quarantine.quarantine(
+                voter,
+                FaultReason::ProposerSignatureInvalid,
+                consensus.seq(),
+                now,
+                schedule,
+            );
+            PrevoteAction::Equivocation { voter, outcome }
+        }
+    }
+}
+
+/// What a peer's precommit produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrecommitAction {
+    Counted {
+        votes: usize,
+        needed: usize,
+    },
+    /// Final. Adopt this batch — the only path to adoption under two-phase.
+    Commit {
+        batch_hash: [u8; 32],
+        votes: usize,
+    },
+    Ignored,
+    Equivocation {
+        voter: [u8; 32],
+        outcome: QuarantineOutcome,
+    },
+}
+
+/// Record a peer's precommit and say whether the sequence is decided.
+pub fn on_precommit(
+    voter: [u8; 32],
+    round: u32,
+    batch_hash: [u8; 32],
+    consensus: &mut SeqConsensus,
+    quarantine: &mut Quarantine,
+    schedule: &ProposerSchedule,
+    now: i64,
+) -> PrecommitAction {
+    if quarantine.is_quarantined(&voter) {
+        return PrecommitAction::Ignored;
+    }
+    match consensus.record_precommit(round, voter, batch_hash) {
+        PrecommitOutcome::Counted { votes, needed } => PrecommitAction::Counted { votes, needed },
+        PrecommitOutcome::Ignored => PrecommitAction::Ignored,
+        PrecommitOutcome::Commit { batch_hash, votes } => {
+            PrecommitAction::Commit { batch_hash, votes }
+        }
+        PrecommitOutcome::Equivocation { .. } => {
+            let outcome = quarantine.quarantine(
+                voter,
+                FaultReason::ProposerSignatureInvalid,
+                consensus.seq(),
+                now,
+                schedule,
+            );
+            PrecommitAction::Equivocation { voter, outcome }
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase_driver_tests {
+    use super::*;
+    use crate::batch_two_phase::SeqConsensus;
+    use crate::share_batch::{compute_state_root, fold_shares};
+    use crate::types::ShareProof;
+    use std::collections::BTreeMap;
+
+    struct AllGood;
+    impl BatchChecks for AllGood {
+        fn share_is_valid(&self, _: &ShareProof) -> bool {
+            true
+        }
+        fn proposer_signed(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    const PARENT_CLOSE: i64 = 1_000;
+
+    fn eight() -> ProposerSchedule {
+        ProposerSchedule::new((1..=8u8).map(|n| [n; 32]))
+    }
+
+    fn a_parent() -> ShareBatch {
+        ShareBatch {
+            seq: 0,
+            prev_batch_hash: [0u8; 32],
+            close_ts: PARENT_CLOSE,
+            proposer: [0u8; 32],
+            shares: vec![],
+            settled_blocks: vec![],
+            reversed_blocks: vec![],
+            node_shares: vec![],
+            state_root: compute_state_root(&BTreeMap::new(), 0, PARENT_CLOSE),
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: vec![],
+        }
+    }
+
+    /// A child proposed by whoever is due at `escalation`, so the driver's reported round can be
+    /// checked against a known value rather than assumed.
+    fn a_child_at(parent: &ShareBatch, schedule: &ProposerSchedule, escalation: u32) -> ShareBatch {
+        let proposer = schedule.proposer_at(parent.seq + 1, escalation).unwrap();
+        let close_ts = parent.close_ts + 30;
+        let mut shares = vec![ShareProof {
+            round_id: 1,
+            miner_id: [1u8; 32],
+            difficulty: 1.0,
+            work: 1.0,
+            share_hash: [1u8; 32],
+            // Inside the D10 window, and received by the proposer — verification checks both.
+            timestamp: parent.close_ts as u64 + 10,
+            received_by: proposer,
+            template_id: None,
+            payout_address: Some("bc1qalice".into()),
+            header: None,
+            tier_log2: None,
+            signature: None,
+        }];
+        crate::share_batch::canonical_sort(&mut shares);
+        let mut after: BTreeMap<String, i64> = BTreeMap::new();
+        fold_shares(&mut after, &shares);
+        ShareBatch {
+            seq: parent.seq + 1,
+            prev_batch_hash: parent.batch_hash(),
+            close_ts,
+            proposer,
+            shares,
+            settled_blocks: vec![],
+            reversed_blocks: vec![],
+            node_shares: vec![],
+            state_root: compute_state_root(&after, parent.seq + 1, close_ts),
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: vec![9],
+        }
+    }
+
+    /// The prevote must name the round the proposer was AUTHORISED at, not a constant.
+    ///
+    /// This caught a real defect while being written: the two-phase driver hardcoded `round: 0`,
+    /// so every batch would have been prevoted as round 0 regardless of escalation — collapsing
+    /// distinct attempts into one tally and defeating the whole point of rounds.
+    #[test]
+    fn the_prevote_carries_the_round_the_proposer_was_authorised_at() {
+        let s = eight();
+        let parent = a_parent();
+        let balances = BTreeMap::new();
+        let checks = AllGood;
+
+        // Escalation 2 means `now` is two stall intervals past the parent's close.
+        let escalation = 2u32;
+        let batch = a_child_at(&parent, &s, escalation);
+        let now =
+            PARENT_CLOSE + (crate::batch_consensus::STALL_ESCALATION_SECS * escalation as i64);
+
+        let wm = crate::share_batch::ProposerWatermarks::new();
+        let ctx = BatchContext {
+            parent: &parent,
+            parent_balances: &balances,
+            watermarks: &wm,
+            schedule: &s,
+            checks: &checks,
+            now,
+        };
+        let consensus = SeqConsensus::new(1, 6);
+        let action = on_batch_phase(&batch, &ctx, &mut Quarantine::new(), &consensus);
+
+        match action {
+            PhaseAction::Prevote { round, seq, .. } => {
+                assert_eq!(seq, 1);
+                assert_eq!(
+                    round, escalation,
+                    "a hardcoded round collapses every attempt into one tally"
+                );
+            }
+            other => panic!("expected a prevote, got {other:?}"),
+        }
+    }
+
+    /// **The locking rule at the driver boundary.** A locked node prevotes its LOCK, not the batch
+    /// that arrived — even though that batch verified cleanly.
+    #[test]
+    fn a_locked_node_prevotes_its_lock_not_the_arriving_batch() {
+        let s = eight();
+        let parent = a_parent();
+        let balances = BTreeMap::new();
+        let checks = AllGood;
+        let batch = a_child_at(&parent, &s, 0);
+        let offered = batch.batch_hash();
+
+        let mut consensus = SeqConsensus::new(1, 6);
+        let locked_value = [0xEE; 32];
+        consensus.apply_polka(0, locked_value);
+
+        let wm = crate::share_batch::ProposerWatermarks::new();
+        let ctx = BatchContext {
+            parent: &parent,
+            parent_balances: &balances,
+            watermarks: &wm,
+            schedule: &s,
+            checks: &checks,
+            now: PARENT_CLOSE,
+        };
+        let action = on_batch_phase(&batch, &ctx, &mut Quarantine::new(), &consensus);
+
+        match action {
+            PhaseAction::Prevote { batch_hash, .. } => {
+                assert_eq!(
+                    batch_hash, locked_value,
+                    "a valid batch must NOT displace a lock — that is the fork this prevents"
+                );
+                assert_ne!(batch_hash, offered);
+            }
+            other => panic!("expected a prevote, got {other:?}"),
+        }
+    }
+
+    /// **Audit finding 5, at the driver.** A polka below our lock must NOT produce a precommit.
+    ///
+    /// `on_prevote` used to discard `apply_polka`'s answer and return `LockAndPrecommit`
+    /// regardless, so a node locked at round 5 that late-received a polka for a different batch at
+    /// round 2 would broadcast a precommit for a value it was not locked on.
+    #[test]
+    fn a_polka_below_the_lock_does_not_produce_a_precommit() {
+        let s = eight();
+        let mut q = Quarantine::new();
+        let mut c = SeqConsensus::new(1, 6);
+        let old = [0xAA; 32];
+        let new_val = [0xBB; 32];
+
+        // Lock at round 5 on `new_val`.
+        c.apply_polka(5, new_val);
+
+        // A full quorum now prevotes `old` at round 2 — stale evidence.
+        let mut precommitted = false;
+        for n in 1..=8u8 {
+            if let PrevoteAction::LockAndPrecommit { .. } =
+                on_prevote([n; 32], 2, old, &mut c, &mut q, &s, 0)
+            {
+                precommitted = true;
+            }
+        }
+
+        assert!(
+            !precommitted,
+            "a polka from a round below the lock must not be precommitted"
+        );
+        assert_eq!(c.lock(), Some((5, new_val)), "and the lock must not move");
+    }
+
+    /// A polka drives lock-then-precommit, and a quorum of precommits commits.
+    #[test]
+    fn a_polka_leads_to_precommit_and_a_quorum_of_those_commits() {
+        let s = eight();
+        let mut q = Quarantine::new();
+        let mut c = SeqConsensus::new(1, 6);
+        let target = [0xAB; 32];
+
+        let mut locked = None;
+        for n in 1..=8u8 {
+            if let PrevoteAction::LockAndPrecommit { batch_hash, round } =
+                on_prevote([n; 32], 0, target, &mut c, &mut q, &s, 0)
+            {
+                locked = Some((batch_hash, round));
+            }
+        }
+        assert_eq!(locked, Some((target, 0)), "a quorum of prevotes is a polka");
+        assert_eq!(c.lock(), Some((0, target)), "the polka must set our lock");
+
+        let mut committed = None;
+        for n in 1..=8u8 {
+            if let PrecommitAction::Commit { batch_hash, votes } =
+                on_precommit([n; 32], 0, target, &mut c, &mut q, &s, 0)
+            {
+                committed = Some((batch_hash, votes));
+            }
+        }
+        assert_eq!(committed, Some((target, 6)));
     }
 }

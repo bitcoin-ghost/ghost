@@ -75,6 +75,10 @@ pub mod topics {
     pub const SHARE_BATCH_VOTE: &[u8] = b"sbvote";
     /// Share-batch chain: on-demand backfill of adopted batches
     pub const SHARE_BATCH_SYNC: &[u8] = b"sbsync";
+    /// Share-batch chain, two-phase: first-round vote. Evidence, not a decision.
+    pub const SHARE_BATCH_PREVOTE: &[u8] = b"sbprev";
+    /// Share-batch chain, two-phase: second-round vote. A quorum of these commits.
+    pub const SHARE_BATCH_PRECOMMIT: &[u8] = b"sbprec";
     /// Mesh node-list checkpoint proposal (signed public-mining node set for discovery)
     pub const MESH_NODE_LIST_CHECKPOINT: &[u8] = b"mnlchk";
     /// Mesh node-list checkpoint vote
@@ -286,6 +290,18 @@ pub enum MessageType {
     ShareBatchProposal,
     /// Share-batch chain: a vote for a batch at a sequence. Hash plus signature; small.
     ShareBatchVote,
+    /// Share-batch chain, two-phase: a PREVOTE for a batch at a `(seq, round)`.
+    ///
+    /// Separate from `ShareBatchVote` and from `ShareBatchPrecommit` rather than a phase field on
+    /// one type, so a prevote can never be counted as a precommit by a receiver that mishandles
+    /// the discriminant. A quorum of prevotes is a *polka* — evidence that a quorum considered the
+    /// batch valid — which is what releases a lock. It decides nothing on its own.
+    ShareBatchPrevote,
+    /// Share-batch chain, two-phase: a PRECOMMIT for a batch at a `(seq, round)`.
+    ///
+    /// Sent only after seeing a polka, and only for the value the sender is locked on. A quorum of
+    /// these at one round commits the sequence; nothing else adopts.
+    ShareBatchPrecommit,
     /// Share-batch chain: request/response for an adopted batch a node missed.
     ///
     /// The chain is a hash chain, so a node that misses one link cannot verify any later batch
@@ -337,6 +353,8 @@ impl MessageType {
             Self::ShareBatchProposal => topics::SHARE_BATCH,
             Self::ShareBatchVote => topics::SHARE_BATCH_VOTE,
             Self::ShareBatchSync => topics::SHARE_BATCH_SYNC,
+            Self::ShareBatchPrevote => topics::SHARE_BATCH_PREVOTE,
+            Self::ShareBatchPrecommit => topics::SHARE_BATCH_PRECOMMIT,
             Self::MeshNodeListCheckpoint => topics::MESH_NODE_LIST_CHECKPOINT,
             Self::MeshNodeListCheckpointVote => topics::MESH_NODE_LIST_VOTE,
             Self::MeshNodeListCheckpointSync => topics::MESH_NODE_LIST_SYNC,
@@ -381,6 +399,8 @@ impl MessageType {
             Self::PayoutProposalSync => "ppsync",
             Self::ShareBatchProposal => "sbatch",
             Self::ShareBatchVote => "sbvote",
+            Self::ShareBatchPrevote => "sbprev",
+            Self::ShareBatchPrecommit => "sbprec",
             Self::ShareBatchSync => "sbsync",
             Self::MeshNodeListCheckpoint => "mnlchk",
             Self::MeshNodeListCheckpointVote => "mnlvote",
@@ -1315,6 +1335,73 @@ impl ShareBatchVoteMessage {
     }
 }
 
+/// A two-phase vote on a share batch: prevote or precommit, distinguished by `MessageType`.
+///
+/// One struct for both phases because the payload is identical; the PHASE is carried by the
+/// message type and, critically, by the signing domain. `signing_bytes` takes the phase and
+/// domain-separates on it, so a prevote's signature does not verify as a precommit. Without that
+/// separation an attacker could replay a node's prevote as a precommit and manufacture a commit
+/// from evidence that was only ever meant to release a lock — which collapses two-phase back into
+/// the single-phase design that cannot be made safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareBatchPhaseVoteMessage {
+    /// Chain position being voted on.
+    pub seq: u64,
+    /// The escalation step this vote belongs to. A sequence can have several candidates; without
+    /// the round a receiver cannot tell which attempt a vote was cast in.
+    pub round: u32,
+    /// The batch being voted for.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub batch_hash: [u8; 32],
+    /// Who is voting.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub voter: NodeId,
+    /// Signature over `(phase, seq, round, batch_hash)`.
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub signature: [u8; 64],
+}
+
+/// Which phase a [`ShareBatchPhaseVoteMessage`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchVotePhase {
+    /// Evidence that a quorum considered a batch valid. Releases locks; decides nothing.
+    Prevote,
+    /// A commitment to a locked value. A quorum of these decides the sequence.
+    Precommit,
+}
+
+impl BatchVotePhase {
+    /// The domain tag this phase signs under. Distinct by construction — see
+    /// [`ShareBatchPhaseVoteMessage::signing_bytes`] for why sharing one would be fatal.
+    pub fn domain(&self) -> &'static [u8] {
+        match self {
+            Self::Prevote => b"ShareBatchPrevote/v1",
+            Self::Precommit => b"ShareBatchPrecommit/v1",
+        }
+    }
+}
+
+impl ShareBatchPhaseVoteMessage {
+    /// The bytes this vote signs, domain-separated **by phase**.
+    ///
+    /// The phase tag is the first thing in the buffer and differs in length as well as content, so
+    /// no prevote payload can be reinterpreted as a precommit payload by shifting bytes.
+    ///
+    /// Everything else is covered for the reasons the single-phase vote already documented: the
+    /// hash alone replays at another sequence, the sequence alone makes every vote at that height
+    /// interchangeable, and the round alone lets a vote from a losing round be replayed into the
+    /// live one.
+    pub fn signing_bytes(&self, phase: BatchVotePhase) -> Vec<u8> {
+        let domain = phase.domain();
+        let mut out = Vec::with_capacity(domain.len() + 8 + 4 + 32);
+        out.extend_from_slice(domain);
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&self.round.to_le_bytes());
+        out.extend_from_slice(&self.batch_hash);
+        out
+    }
+}
+
 /// Request or response for an adopted batch a node is missing.
 ///
 /// One type for both directions, disambiguated on deserialize — the same shape the convergence and
@@ -1326,11 +1413,133 @@ pub enum ShareBatchSyncMessage {
     /// By sequence rather than hash, because a node that is behind does not know the hash — that
     /// is precisely what it is missing.
     Request { seq: u64 },
-    /// The batch, as stored JSON.
+    /// The batch, as stored JSON, with the certificate that proves it was committed.
     ///
-    /// Verified by rehashing against the parent the *next* batch names, never by trusting the
-    /// sender. The chain is the anchor, so a forged batch cannot link.
-    Response { seq: u64, batch_json: String },
+    /// The certificate is what makes catch-up both safe and possible. A node that missed a
+    /// sequence's consensus cannot tell from local state whether a batch it is offered was
+    /// actually decided — every local heuristic for that question is either forgeable (an
+    /// attacker induces the condition) or unreachable (an honest node can never satisfy it, which
+    /// wedges catch-up entirely). The answer is not to infer it: the peer that HAS the proof
+    /// supplies it, and the receiver checks it against the voter set.
+    ///
+    /// Optional so a node that adopted before certificates existed can still answer with the
+    /// batch alone; such a response is only adoptable on the older, weaker path.
+    Response {
+        seq: u64,
+        batch_json: String,
+        #[serde(default)]
+        cert: Option<CommitCertificate>,
+    },
+}
+
+/// Proof that a quorum committed a specific batch at a specific `(seq, round)`.
+///
+/// Just the precommit signatures. It is unforgeable without an actual quorum of voter keys,
+/// cannot be induced by manipulating a victim's local state, and is always available to any node
+/// that witnessed the commit — the three properties every local heuristic lacked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitCertificate {
+    pub seq: u64,
+    /// The round the precommits were cast at. Signatures cover it, so a certificate cannot be
+    /// re-presented for a different round.
+    pub round: u32,
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub batch_hash: [u8; 32],
+    /// The VOTER SET this certificate was minted against, as a hash of the sorted ids.
+    ///
+    /// Without this the proof is only as strong as the receiver's own membership view — and that
+    /// view is a live per-node database query that shrinks during discovery warmup, restart and
+    /// partition. A shrunken view lowers `bft_threshold`, so a bundle of GENUINE sub-quorum
+    /// precommits from a losing round would verify: at a view of six the bar falls to four, and
+    /// precommits are public signed gossip that anyone can collect. No key compromise, no
+    /// inducement, no request needed.
+    ///
+    /// Binding the certificate to a membership means a receiver can only check a quorum it agrees
+    /// on the shape of. Disagreeing is not a fault — it means "I cannot judge this", which is the
+    /// honest answer.
+    #[serde(default, with = "ghost_common::serde_hex::bytes32")]
+    pub voter_set_hash: [u8; 32],
+    /// `(voter, signature)` pairs over the PRECOMMIT signing domain.
+    pub precommits: Vec<(String, String)>,
+}
+
+/// Identity of a voter set: SHA256 over its sorted, concatenated node ids.
+///
+/// Sorted so every node derives the same hash from the same membership regardless of the order it
+/// learned them in — the same reason `ProposerSchedule` sorts.
+pub fn voter_set_hash(voters: &[NodeId]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<NodeId> = voters.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut h = Sha256::new();
+    for v in &sorted {
+        h.update(v);
+    }
+    h.finalize().into()
+}
+
+impl CommitCertificate {
+    /// Check this certificate against a voter set and a required quorum.
+    ///
+    /// Fail-closed and independent of any local opinion: every signature must verify over the
+    /// precommit domain for exactly this `(seq, round, batch_hash)`, every signer must be a known
+    /// voter, duplicates count once, and the total must reach quorum. Nothing here consults what
+    /// the receiver believes, which is the point — a node catching up believes nothing.
+    pub fn verify(&self, voters: &[NodeId], quorum: usize) -> bool {
+        use std::collections::BTreeSet;
+
+        // A quorum of zero is not a quorum. `bft_threshold(0) == 0`, so an empty voter view plus
+        // an empty `precommits` vec satisfied `0 >= 0` and adopted anything — fail-open at exactly
+        // the moment a node knows least, which is startup before discovery completes.
+        if quorum == 0 || self.precommits.is_empty() {
+            return false;
+        }
+
+        // The certificate must have been minted against the membership we are checking it with.
+        // Otherwise the bar is set by OUR view, and a degraded view lowers it far enough that
+        // genuine sub-quorum signatures from a losing round pass.
+        if self.voter_set_hash != voter_set_hash(voters) {
+            return false;
+        }
+
+        let mut seen: BTreeSet<NodeId> = BTreeSet::new();
+        for (voter_hex, sig_hex) in &self.precommits {
+            let Ok(voter_raw) = hex::decode(voter_hex) else {
+                return false;
+            };
+            let Ok(voter) = <[u8; 32]>::try_from(voter_raw.as_slice()) else {
+                return false;
+            };
+            if !voters.contains(&voter) {
+                return false;
+            }
+            let Ok(sig_raw) = hex::decode(sig_hex) else {
+                return false;
+            };
+            let Ok(sig) = <[u8; 64]>::try_from(sig_raw.as_slice()) else {
+                return false;
+            };
+            let probe = ShareBatchPhaseVoteMessage {
+                seq: self.seq,
+                round: self.round,
+                batch_hash: self.batch_hash,
+                voter,
+                signature: sig,
+            };
+            if !ghost_common::identity::verify_signature(
+                &voter,
+                &probe.signing_bytes(BatchVotePhase::Precommit),
+                &sig,
+            )
+            .unwrap_or(false)
+            {
+                return false;
+            }
+            seen.insert(voter);
+        }
+        seen.len() >= quorum
+    }
 }
 
 /// Payout-ledger checkpoint vote (validator → all).
@@ -1900,6 +2109,277 @@ pub struct GhostGlyphRegisteredMessage {
 
 #[cfg(test)]
 mod tests {
+
+    use ghost_common::identity::NodeIdentity;
+
+    fn signed_precommit(
+        id: &NodeIdentity,
+        seq: u64,
+        round: u32,
+        batch_hash: [u8; 32],
+    ) -> (String, String) {
+        let mut v = ShareBatchPhaseVoteMessage {
+            seq,
+            round,
+            batch_hash,
+            voter: id.node_id(),
+            signature: [0u8; 64],
+        };
+        v.signature = id.sign(&v.signing_bytes(BatchVotePhase::Precommit));
+        (hex::encode(id.node_id()), hex::encode(v.signature))
+    }
+
+    /// A genuine quorum of precommits verifies.
+    #[test]
+    fn a_real_quorum_produces_a_valid_certificate() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
+            precommits: ids[..6]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(cert.verify(&voters, 6));
+    }
+
+    /// Short of quorum is refused. The count is the whole guarantee.
+    #[test]
+    fn fewer_than_quorum_is_refused() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
+            precommits: ids[..5]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(!cert.verify(&voters, 6));
+    }
+
+    /// **The forgery this exists to stop.** Signatures from non-voters do not count.
+    ///
+    /// Minting six fresh keypairs is exactly the attack that beat the earlier local heuristics.
+    /// Here it produces six perfectly valid signatures over the right bytes — and still fails,
+    /// because none of the signers is in the voter set.
+    #[test]
+    fn minted_keypairs_cannot_forge_a_certificate() {
+        let real: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = real.iter().map(|i| i.node_id()).collect();
+        let attackers: Vec<NodeIdentity> = (0..6).map(|_| NodeIdentity::generate()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
+            precommits: attackers
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(
+            !cert.verify(&voters, 6),
+            "six self-minted signatures must not pass — this is the attack the design turns on"
+        );
+    }
+
+    /// One voter repeated does not reach quorum on its own.
+    #[test]
+    fn duplicate_signers_count_once() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            voter_set_hash: voter_set_hash(&voters),
+            precommits: (0..6).map(|_| signed_precommit(&ids[0], 7, 3, h)).collect(),
+        };
+        assert!(!cert.verify(&voters, 6), "one voter six times is one voter");
+    }
+
+    /// **Audit-5 blocker A.** Genuine SUB-QUORUM signatures must not pass under a shrunken view.
+    ///
+    /// The voter set is a live per-node database query that shrinks during discovery warmup,
+    /// restart and partition. Quorum came from THAT view, so at a view of six the bar fell to
+    /// four — and precommits are public signed gossip. An attacker collects four real signatures
+    /// from a losing round and the node adopts a batch that never committed. No key compromise, no
+    /// inducement, no request. The certificate is now bound to the membership it was minted
+    /// against, so a receiver can only check a quorum it agrees on the shape of.
+    #[test]
+    fn genuine_subquorum_signatures_do_not_pass_under_a_degraded_view() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let full: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+
+        // Four REAL signatures — a losing round that never reached the true quorum of 6.
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            voter_set_hash: voter_set_hash(&full),
+            precommits: ids[..4]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+
+        // The receiver's view has shrunk to six, so its own threshold is only four.
+        let degraded: Vec<NodeId> = full[..6].to_vec();
+        assert!(
+            !cert.verify(&degraded, 4),
+            "four genuine signatures must not adopt just because our view shrank"
+        );
+        // And against the full set it is still short of six.
+        assert!(!cert.verify(&full, 6));
+    }
+
+    /// A certificate minted against a DIFFERENT membership is not checkable here.
+    ///
+    /// Disagreeing about the voter set is not a fault — it means "I cannot judge this", which is
+    /// the honest answer and strictly safer than judging against the wrong bar.
+    #[test]
+    fn a_certificate_from_another_voter_set_is_refused() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let full: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: h,
+            // Minted against a set that is not the one we will check against.
+            voter_set_hash: voter_set_hash(&full[..7]),
+            precommits: ids[..6]
+                .iter()
+                .map(|i| signed_precommit(i, 7, 3, h))
+                .collect(),
+        };
+        assert!(!cert.verify(&full, 6));
+    }
+
+    /// **Audit-5 blocker B.** An empty certificate must not pass an empty voter set.
+    ///
+    /// `bft_threshold(0) == 0`, so `0 >= 0` adopted anything — fail-open at exactly the moment a
+    /// node knows least, which is startup before discovery completes.
+    #[test]
+    fn an_empty_certificate_never_passes() {
+        let empty: Vec<NodeId> = Vec::new();
+        let cert = CommitCertificate {
+            seq: 7,
+            round: 3,
+            batch_hash: [0xAB; 32],
+            voter_set_hash: voter_set_hash(&empty),
+            precommits: Vec::new(),
+        };
+        assert!(
+            !cert.verify(&empty, 0),
+            "a quorum of zero is not a quorum, and no signatures prove nothing"
+        );
+    }
+
+    /// A certificate cannot be replayed at another sequence, round, or batch.
+    #[test]
+    fn a_certificate_does_not_transfer() {
+        let ids: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let voters: Vec<NodeId> = ids.iter().map(|i| i.node_id()).collect();
+        let h = [0xAB; 32];
+        let good: Vec<(String, String)> = ids[..6]
+            .iter()
+            .map(|i| signed_precommit(i, 7, 3, h))
+            .collect();
+
+        for (seq, round, hash, what) in [
+            (8u64, 3u32, h, "sequence"),
+            (7, 4, h, "round"),
+            (7, 3, [0xCD; 32], "batch"),
+        ] {
+            let cert = CommitCertificate {
+                seq,
+                round,
+                batch_hash: hash,
+                voter_set_hash: voter_set_hash(&voters),
+                precommits: good.clone(),
+            };
+            assert!(
+                !cert.verify(&voters, 6),
+                "signatures must not carry to a different {what}"
+            );
+        }
+    }
+
+    /// A prevote's signed bytes must NOT verify as a precommit.
+    ///
+    /// This is the property two-phase rests on. If both phases signed the same bytes, an attacker
+    /// could replay a node's prevote — which is only ever evidence that releases a lock — as a
+    /// precommit, and manufacture a commit from votes nobody cast. That collapses the protocol
+    /// back to single-phase, which cannot be made safe.
+    #[test]
+    fn a_prevote_cannot_be_replayed_as_a_precommit() {
+        let v = ShareBatchPhaseVoteMessage {
+            seq: 7,
+            round: 3,
+            batch_hash: [0xAB; 32],
+            voter: [1u8; 32],
+            signature: [0u8; 64],
+        };
+        let pre = v.signing_bytes(BatchVotePhase::Prevote);
+        let com = v.signing_bytes(BatchVotePhase::Precommit);
+        assert_ne!(pre, com, "the two phases must not sign identical bytes");
+        assert!(
+            pre.starts_with(b"ShareBatchPrevote/v1"),
+            "the phase tag must lead the buffer"
+        );
+        assert!(com.starts_with(b"ShareBatchPrecommit/v1"));
+    }
+
+    /// Seq, round and batch_hash are each covered by the signature.
+    ///
+    /// Each omission is separately exploitable: without seq a vote replays at another height,
+    /// without round a vote from a losing round replays into the live one, and without the hash
+    /// every vote at that position is interchangeable.
+    #[test]
+    fn every_field_that_identifies_the_vote_is_signed() {
+        let base = ShareBatchPhaseVoteMessage {
+            seq: 7,
+            round: 3,
+            batch_hash: [0xAB; 32],
+            voter: [1u8; 32],
+            signature: [0u8; 64],
+        };
+        let b0 = base.signing_bytes(BatchVotePhase::Prevote);
+
+        let mut other_seq = base.clone();
+        other_seq.seq = 8;
+        assert_ne!(b0, other_seq.signing_bytes(BatchVotePhase::Prevote), "seq");
+
+        let mut other_round = base.clone();
+        other_round.round = 4;
+        assert_ne!(
+            b0,
+            other_round.signing_bytes(BatchVotePhase::Prevote),
+            "round"
+        );
+
+        let mut other_hash = base.clone();
+        other_hash.batch_hash = [0xCD; 32];
+        assert_ne!(
+            b0,
+            other_hash.signing_bytes(BatchVotePhase::Prevote),
+            "batch_hash"
+        );
+    }
 
     /// #606: the reported values MUST be covered by the signature.
     ///

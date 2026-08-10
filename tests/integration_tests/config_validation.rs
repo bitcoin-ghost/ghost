@@ -537,6 +537,8 @@ fn test_pool_config_validate_success() {
         treasury_address: TreasuryAddress::single("bc1qtest"),
         min_payout_sats: 10000,
         payout_interval_blocks: 100,
+        // WP-5 share-batch chain: dark unless a node opts in.
+        share_batch_shadow: false,
         node_payout_address: None,
         pool_name: None,
         coinbase_extra: None,

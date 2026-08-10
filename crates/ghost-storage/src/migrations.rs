@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 49;
+const SCHEMA_VERSION: u32 = 52;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -126,6 +126,9 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (47, migrate_v47),
         (48, migrate_v48),
         (49, migrate_v49),
+        (50, migrate_v50),
+        (51, migrate_v51),
+        (52, migrate_v52),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2579,6 +2582,158 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v50: share-batch chain persistence (WP-5 shadow run).
+///
+/// See `docs/SHARE_BATCH_CHAIN.md`. The defect being replaced is stated there in one line:
+/// **"payable state is O(shares), not O(addresses)"**. Today the payable state is 1.5M unpaid
+/// share rows that every node rescans to produce ~68 numbers. Here it is the ~68 numbers.
+///
+/// So this deliberately does NOT archive shares. Shares travel *inside* a batch so new work can
+/// enter the chain, but once a batch is folded the balance carries the value forward and the share
+/// rows are no longer payable state. Persisting every batch's shares would rebuild the same
+/// O(shares) problem one layer down.
+///
+/// What must survive a restart, and why:
+///
+/// - **balances** — the payable state itself.
+/// - **the adopted chain, bounded** — enough to judge the next batch's parent and to serve sync to
+///   a node that fell behind. Not history for its own sake.
+/// - **quarantine** — release is operator-only by design (an automatic timer lets a Byzantine node
+///   misbehave, wait, and repeat), so it cannot live in memory.
+///
+/// Additive and dormant: nothing reads these until the shadow run is wired, so a node on the old
+/// path is unaffected and a downgrade ignores them.
+/// v51: persist share-batch COMMIT CERTIFICATES.
+///
+/// A certificate is the quorum of signed precommits that decided a sequence. It is the only thing
+/// that lets a node which missed a sequence's consensus adopt it later — the receiver cannot
+/// establish "was this committed?" from local state, so the peer that watched it close supplies
+/// the proof.
+///
+/// Held only in memory, that proof evaporated on restart. A rolling fleet restart — the ordinary
+/// deploy — left NO node holding a certificate for any committed sequence, so any node that was
+/// behind at that moment could never adopt those sequences from anyone, permanently. Catch-up was
+/// correctly gated on a verifiable certificate, which turned "lost proof" into "wedged node".
+///
+/// Small and immutable: one row per committed sequence, a few hundred bytes of signatures, written
+/// once and never updated. Bounded by the same retention as the batch window.
+/// v52: `sbc_watermarks` — the share-batch chain's per-proposer replay guard.
+///
+/// One row per proposer: the canonical position `(ts, share_hash)` of the last share that
+/// proposer has had adopted. `verify_batch` requires a batch's shares to sort strictly after this
+/// mark, which is what stops the same share being credited in two batches — WITHOUT a per-share
+/// index, which this schema deliberately does not have (payable state is O(addresses), and the
+/// guard is O(proposers): 8 rows).
+///
+/// Written in the same transaction as `sbc_balances` because both are the fold's running state:
+/// a watermark ahead of the balances would fault honest proposers for shares never actually
+/// credited, and one behind would re-credit what already was.
+fn migrate_v52(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v52: sbc_watermarks");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sbc_watermarks (
+            proposer    BLOB    PRIMARY KEY,
+            ts          INTEGER NOT NULL,
+            share_hash  BLOB    NOT NULL,
+            updated_seq INTEGER NOT NULL
+         );",
+    )
+    .map_err(|e| GhostError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
+fn migrate_v51(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v51: sbc_certs");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sbc_certs (
+            seq             INTEGER PRIMARY KEY,
+            round           INTEGER NOT NULL,
+            batch_hash      BLOB    NOT NULL,
+            voter_set_hash  BLOB    NOT NULL,
+            -- The signatures, as the JSON the wire type carries. Stored verbatim so what is
+            -- served is byte-identical to what was verified when it was minted.
+            cert_json       TEXT    NOT NULL,
+            minted_at       INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_sbc_certs_hash ON sbc_certs(batch_hash);",
+    )
+    .map_err(|e| GhostError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
+fn migrate_v50(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v50: sbc_balances, sbc_batches, sbc_quarantine");
+
+    conn.execute_batch(
+        // The payable state. ~68 rows, bounded by miner count rather than by history.
+        //
+        // `micro_work` is INTEGER because the fold is `BTreeMap<String, i64>` with
+        // `saturating_add` (share_batch::fold_shares). Storing it as TEXT would invite a
+        // conversion at every read and let the stored type drift from the type the state root is
+        // actually computed over — and the root is what nodes compare.
+        //
+        // KEYED BY HASH, NOT CIPHERTEXT. `encrypt_sensitive` draws a fresh random nonce per call,
+        // so the same address encrypts differently every time and a ciphertext key could never be
+        // looked up: every fold would insert a new row and a miner's balance would scatter across
+        // duplicates. The hash is deterministic, so it can. It also happens to be portable between
+        // nodes, whereas the ciphertext is not — the encryption key is per-node.
+        //
+        // `address_enc` holds the encrypted plaintext, decrypted into the fold's map on load. The
+        // state root commits to PLAINTEXT addresses, so plaintext is what has to reach the fold;
+        // at ~68 rows the decrypt cost is immaterial.
+        "CREATE TABLE IF NOT EXISTS sbc_balances (
+            address_hash BLOB    PRIMARY KEY,
+            address_enc  TEXT    NOT NULL,
+            micro_work   INTEGER NOT NULL,
+            updated_seq  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sbc_balances_seq ON sbc_balances(updated_seq);
+
+        -- The adopted chain, retained as a BOUNDED WINDOW rather than forever.
+        --
+        -- Two jobs: `MAX(seq)` is the head a new batch is judged against, and the recent entries
+        -- are what a lagging node's ShareBatchSync is answered from. Neither needs deep history.
+        --
+        -- `batch_json` is the full adopted batch, so a sync response is served verbatim rather
+        -- than reconstructed — a reconstruction that differs by one byte is a batch hash that no
+        -- longer verifies. It is the one place shares are held, and only inside the window.
+        --
+        -- `state_root` is duplicated out of the JSON deliberately: it is the value the trust gate
+        -- compares across all 8 nodes, and it should be readable without parsing a blob.
+        CREATE TABLE IF NOT EXISTS sbc_batches (
+            seq          INTEGER PRIMARY KEY,
+            batch_hash   BLOB    NOT NULL,
+            prev_hash    BLOB    NOT NULL,
+            proposer     BLOB    NOT NULL,
+            close_ts     INTEGER NOT NULL,
+            state_root   BLOB    NOT NULL,
+            share_count  INTEGER NOT NULL,
+            batch_json   TEXT    NOT NULL,
+            finalised_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sbc_batches_hash ON sbc_batches(batch_hash);
+
+        -- Quarantined peers. Release is OPERATOR-ONLY: an automatic timer would let a Byzantine
+        -- node misbehave, wait it out, and repeat forever. So this outlives the process.
+        CREATE TABLE IF NOT EXISTS sbc_quarantine (
+            node_id        BLOB    PRIMARY KEY,
+            reason         TEXT    NOT NULL,
+            batch_seq      INTEGER,
+            quarantined_at INTEGER NOT NULL
+        );",
+    )
+    .map_err(|e| GhostError::Migration(e.to_string()))?;
+
+    info!("v50: created sbc_balances, sbc_batches and sbc_quarantine (share-batch chain, dormant)");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3494,6 +3649,69 @@ mod tests {
             Some(1),
             "payouts must survive a failed migration"
         );
+    }
+
+    /// v50 exists to make payable state O(addresses), not O(shares) — so it must NOT provide a
+    /// place to archive every share.
+    ///
+    /// `docs/SHARE_BATCH_CHAIN.md` names the defect being replaced: today the payable state is
+    /// 1.5M unpaid share rows rescanned to produce ~68 numbers. If a future change adds a
+    /// share-per-row table here, that problem is rebuilt one layer down and the reason for the
+    /// whole programme is quietly lost. Shares live inside a batch, inside a bounded window.
+    #[test]
+    fn v50_stores_balances_and_a_bounded_chain_but_not_a_share_archive() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let tables = get_table_names(&conn);
+        for t in ["sbc_balances", "sbc_batches", "sbc_quarantine"] {
+            assert!(tables.contains(&t.to_string()), "{t} missing from schema");
+        }
+
+        // The chain is keyed by seq — one row per adopted batch, prunable to a window — rather
+        // than by share. A share-keyed table here would be the regression this test guards.
+        let batch_cols = get_column_names(&conn, "sbc_batches");
+        assert!(
+            batch_cols.contains(&"seq".to_string()),
+            "sbc_batches must be keyed by seq, found: {batch_cols:?}"
+        );
+        assert!(
+            !batch_cols
+                .iter()
+                .any(|c| c == "share_hash" || c == "miner_id"),
+            "sbc_batches must not hold per-share columns — payable state is O(addresses); \
+             found: {batch_cols:?}"
+        );
+
+        // Balances hold i64 micro-work, matching `fold_shares`'s BTreeMap<String, i64> exactly.
+        // A different stored type means a conversion at every read, and the value the state root
+        // is computed over is the one that must round-trip.
+        let mut stmt = conn.prepare("PRAGMA table_info(sbc_balances)").unwrap();
+        let ty = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .unwrap()
+            .filter_map(|c| c.ok())
+            .find(|(n, _)| n == "micro_work")
+            .map(|(_, t)| t)
+            .expect("micro_work column");
+        assert_eq!(ty, "INTEGER", "micro_work must match the i64 fold type");
+
+        // A balance must survive a round trip, including a negative one — settlement reversal on
+        // a reorg subtracts, and a column that cannot hold the result would corrupt the root.
+        conn.execute(
+            "INSERT INTO sbc_balances (address_hash, address_enc, micro_work, updated_seq) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![vec![1u8; 32], "enc", -42i64, 7i64],
+        )
+        .expect("insert");
+        let back: i64 = conn
+            .query_row(
+                "SELECT micro_work FROM sbc_balances WHERE address_hash = ?1",
+                rusqlite::params![vec![1u8; 32]],
+                |r| r.get(0),
+            )
+            .expect("read back");
+        assert_eq!(back, -42);
     }
 
     #[test]

@@ -97,6 +97,13 @@ where
     job_store: J,
     job_factory: JobFactory,
     chain_tip: Option<ChainTip>,
+    /// The difficulty-tier commitment to stamp into jobs built by this channel's own factory
+    /// (SHARE_TIER_BIND): `(tier_log2, encoded scriptSig push)`. `None` — the default, and the
+    /// only value below the gate — leaves every build byte-identical to before the field
+    /// existed. The push bytes are opaque here (Ghost semantics stay out of the vendored fork);
+    /// the tier label rides along so jobs can be credited by commitment, not by after-the-fact
+    /// target lookup.
+    tier_commitment: Option<(u32, Vec<u8>)>,
     phantom: PhantomData<&'a ()>,
 }
 
@@ -234,8 +241,35 @@ where
             job_factory: JobFactory::new(true, pool_tag_string, miner_tag_string),
             chain_tip: None,
             job_store,
+            tier_commitment: None,
             phantom: PhantomData,
         })
+    }
+
+    /// Sets (or clears) the difficulty-tier commitment stamped into subsequently built jobs.
+    ///
+    /// `Some((tier_log2, push_bytes))` makes every later `on_new_template` build carry
+    /// `push_bytes` as an extra scriptSig push (through the factory's budget guard, never
+    /// spliced) and label the job with `tier_log2`. Call it before each build — the tier follows
+    /// the channel's target, which vardiff moves. `None` restores the pre-tier build exactly.
+    pub fn set_tier_commitment(&mut self, commitment: Option<(u32, Vec<u8>)>) {
+        self.tier_commitment = commitment;
+    }
+
+    /// The tier (`log2`) committed by the coinbase of the job `job_id`, if that job is known
+    /// (active, past or stale) and was built with a tier commitment.
+    ///
+    /// This is the value a share reporter must attach to shares for `job_id` — read from the
+    /// job's build-time label, NOT re-derived from `job_id_to_target`, which binds at activation
+    /// and can disagree with what the coinbase committed to.
+    pub fn job_tier_log2(&self, job_id: u32) -> Option<u32> {
+        let job = self
+            .job_store
+            .get_active_job()
+            .filter(|j| j.get_job_id() == job_id)
+            .or_else(|| self.job_store.get_past_job(job_id))
+            .or_else(|| self.job_store.get_stale_job(job_id))?;
+        job.get_tier_log2()
     }
 
     /// Returns the unique channel ID for this channel.
@@ -259,9 +293,13 @@ where
         job: &StandardJob<'_>,
         extranonce: &[u8],
     ) -> Result<Transaction, JobFactoryError> {
-        let mut script_sig = self.job_factory.script_sig_before_extranonce(
+        // The JOB's captured extra pushes, never the factory's current ones: the factory's value
+        // is whatever the last build set, and under per-tier jobs it moves between builds. Using
+        // it here would reassemble a coinbase the miner never hashed — discovered on a won block.
+        let mut script_sig = self.job_factory.script_sig_before_extranonce_with(
             &job.get_template().coinbase_prefix.to_vec(),
             self.extranonce_prefix.len(),
+            job.get_extra_script_sig(),
         )?;
         script_sig.extend_from_slice(extranonce);
 
@@ -299,9 +337,10 @@ where
 
         let script_sig_head = self
             .job_factory
-            .script_sig_before_extranonce(
+            .script_sig_before_extranonce_with(
                 &job.get_template().coinbase_prefix.to_vec(),
                 extranonce_len,
+                job.get_extra_script_sig(),
             )
             .ok()?;
         let coinbase = self.build_coinbase(&job, &vec![0u8; extranonce_len]).ok()?;
@@ -520,9 +559,18 @@ where
         template: NewTemplate<'a>,
         coinbase_reward_outputs: Vec<TxOut>,
     ) -> Result<(), StandardChannelError> {
+        // Stamp the tier commitment (if any) into this build. `None` sets an empty extra, which
+        // is byte-identical to the pre-tier factory — proven by the pinned job-byte tests.
+        self.job_factory.set_extra_script_sig(
+            self.tier_commitment
+                .as_ref()
+                .map(|(_, push)| push.clone())
+                .unwrap_or_default(),
+        );
+        let tier_log2 = self.tier_commitment.as_ref().map(|(t, _)| *t);
         match template.future_template {
             true => {
-                let new_job = self
+                let mut new_job = self
                     .job_factory
                     .new_standard_job(
                         self.channel_id,
@@ -532,6 +580,7 @@ where
                         coinbase_reward_outputs,
                     )
                     .map_err(StandardChannelError::JobFactoryError)?;
+                new_job.set_tier_log2(tier_log2);
                 self.job_store.add_future_job(template.template_id, new_job);
             }
             false => {
@@ -539,7 +588,7 @@ where
                     // we can only create non-future jobs if we have a chain tip
                     None => return Err(StandardChannelError::ChainTipNotSet),
                     Some(chain_tip) => {
-                        let new_job = self
+                        let mut new_job = self
                             .job_factory
                             .new_standard_job(
                                 self.channel_id,
@@ -549,10 +598,11 @@ where
                                 coinbase_reward_outputs,
                             )
                             .map_err(StandardChannelError::JobFactoryError)?;
+                        new_job.set_tier_log2(tier_log2);
 
-                        // associate the new active job with the current target
+                        // associate the new active job with its validation target
                         self.job_id_to_target
-                            .insert(new_job.get_job_id(), self.target);
+                            .insert(new_job.get_job_id(), self.job_validation_target(&new_job));
 
                         // add the new active job to the job store
                         self.job_store.add_active_job(new_job);
@@ -562,6 +612,21 @@ where
         }
 
         Ok(())
+    }
+
+    /// The target shares for `job` are validated against.
+    ///
+    /// A tier-stamped job binds to its TIER's exact target rather than the channel's current
+    /// one: the coinbase committed to `2^tier` at build time, the accounting layer credits
+    /// exactly `2^tier`, and validating against anything else opens a gap where a share passes
+    /// validation but misses its committed tier (or vice versa) whenever vardiff moved the
+    /// channel target between build and activation. An unstamped job keeps today's behaviour:
+    /// the channel target at bind time.
+    fn job_validation_target(&self, job: &StandardJob<'a>) -> Target {
+        match job.get_tier_log2() {
+            Some(t) => crate::target::tier_target(t),
+            None => self.target,
+        }
     }
 
     /// Used as an alternative to `on_new_template` when an extended job is meant to be broadcast
@@ -583,9 +648,12 @@ where
                     .add_future_job(standard_job.get_template().template_id, standard_job);
             }
             false => {
-                // associate the new active job with the current target
-                self.job_id_to_target
-                    .insert(standard_job.get_job_id(), self.target);
+                // associate the new active job with its validation target (the tier's exact
+                // target for a tier-stamped job, the channel target otherwise)
+                self.job_id_to_target.insert(
+                    standard_job.get_job_id(),
+                    self.job_validation_target(&standard_job),
+                );
 
                 // add the new active job to the job store
                 self.job_store.add_active_job(standard_job);
@@ -621,13 +689,14 @@ where
                     return Err(StandardChannelError::TemplateIdNotFound);
                 }
 
-                // associate the new active job with the current target
-                let job_id = self
+                // associate the new active job with its validation target (the tier's exact
+                // target for a tier-stamped job, the channel target otherwise)
+                let job = self
                     .job_store
                     .get_active_job()
-                    .expect("active job must exist")
-                    .get_job_id();
-                self.job_id_to_target.insert(job_id, self.target);
+                    .expect("active job must exist");
+                self.job_id_to_target
+                    .insert(job.get_job_id(), self.job_validation_target(&job));
             }
         }
 
@@ -1804,5 +1873,228 @@ mod tests {
         assert!(channel
             .set_extranonce_prefix(new_extranonce_prefix_too_long)
             .is_err());
+    }
+}
+
+/// The difficulty-tier commitment (SHARE_TIER_BIND), at the channel level.
+///
+/// The Ghost semantics of the push bytes (`GHNT` + `sha256(node_id ‖ tier)[..20]`) live in the
+/// pool layer; here the commitment is opaque bytes plus a tier label, and what these tests pin is
+/// the MACHINERY: byte-identity when the commitment is absent, capture-at-build when it is
+/// present, and reassembly from the job's own capture rather than the channel's current state.
+#[cfg(test)]
+mod tier_commitment_tests {
+    use crate::{
+        chain_tip::ChainTip,
+        server::{
+            jobs::{job_store::DefaultJobStore, standard::StandardJob},
+            standard::StandardChannel,
+        },
+        target::tier_target,
+    };
+    use bitcoin::{transaction::TxOut, Amount, ScriptBuf, Target};
+    use std::convert::TryInto;
+    use template_distribution_sv2::NewTemplate;
+
+    const SATS: u64 = 5_000_000_000;
+
+    fn a_channel() -> StandardChannel<'static, DefaultJobStore<StandardJob<'static>>> {
+        let mut channel = StandardChannel::new_for_pool(
+            1,
+            "user".to_string(),
+            vec![7u8; 20],
+            Target::from_le_bytes([0xff; 32]),
+            10.0,
+            100,
+            1.0,
+            DefaultJobStore::new(),
+            "GHOST PublicPool".to_string(),
+        )
+        .unwrap();
+        channel.set_chain_tip(ChainTip::new(
+            [
+                200, 53, 253, 129, 214, 31, 43, 84, 179, 58, 58, 76, 128, 213, 24, 53, 38, 144,
+                205, 88, 172, 20, 251, 22, 217, 141, 21, 221, 21, 0, 0, 0,
+            ]
+            .into(),
+            503543726,
+            1745596960,
+        ));
+        channel
+    }
+
+    /// `coinbase_prefix` shaped like Ghost's TDP hand-off: BIP34 height + 21-byte payout tag,
+    /// optionally followed by the 25-byte (plain) node tag.
+    fn a_template(with_node_tag: bool) -> NewTemplate<'static> {
+        let mut p = vec![0x03, 0x40, 0x1f, 0x0e];
+        p.extend_from_slice(&[20u8; 21]);
+        if with_node_tag {
+            p.extend_from_slice(&[24u8; 25]);
+        }
+        NewTemplate {
+            template_id: 1,
+            future_template: false,
+            version: 536870912,
+            coinbase_tx_version: 2,
+            coinbase_prefix: p.try_into().unwrap(),
+            coinbase_tx_input_sequence: 4294967294,
+            coinbase_tx_value_remaining: SATS,
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_outputs: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 38, 106, 36, 170, 33, 169, 237, 226, 246, 28, 63, 113, 209,
+                222, 253, 63, 169, 153, 223, 163, 105, 83, 117, 92, 105, 6, 137, 121, 153, 98, 180,
+                139, 235, 216, 54, 151, 78, 140, 249,
+            ]
+            .try_into()
+            .unwrap(),
+            coinbase_tx_locktime: 158,
+            merkle_path: vec![].try_into().unwrap(),
+        }
+    }
+
+    fn reward() -> Vec<TxOut> {
+        let mut script_bytes = vec![0u8, 20];
+        script_bytes.extend_from_slice(&[0xABu8; 20]);
+        vec![TxOut {
+            value: Amount::from_sat(SATS),
+            script_pubkey: ScriptBuf::from(script_bytes),
+        }]
+    }
+
+    /// A 25-byte push shaped like an encoded node tag: `[0x18]["GHNT"][20 payload bytes]`.
+    fn a_tier_push(fill: u8) -> Vec<u8> {
+        let mut push = vec![0x18];
+        push.extend_from_slice(b"GHNT");
+        push.extend_from_slice(&[fill; 20]);
+        push
+    }
+
+    /// **The acceptance bar: below-gate builds are byte-identical.** A channel that has been
+    /// through the tier machinery (commitment set, then cleared) must produce exactly the bytes
+    /// of a channel that has never touched it — compared on the serialized coinbase, not argued.
+    #[test]
+    fn a_cleared_commitment_restores_byte_identical_builds() {
+        let mut untouched = a_channel();
+        untouched
+            .on_new_template(a_template(true), reward())
+            .unwrap();
+        let job = untouched.get_active_job().unwrap();
+        let pristine = untouched.build_coinbase(&job, &[0u8; 20]).unwrap();
+
+        let mut cycled = a_channel();
+        cycled.set_tier_commitment(Some((13, a_tier_push(0x5A))));
+        cycled.set_tier_commitment(None);
+        cycled.on_new_template(a_template(true), reward()).unwrap();
+        let job = cycled.get_active_job().unwrap();
+        let rebuilt = cycled.build_coinbase(&job, &[0u8; 20]).unwrap();
+
+        assert_eq!(
+            bitcoin::consensus::serialize(&pristine),
+            bitcoin::consensus::serialize(&rebuilt),
+            "with no commitment the coinbase must be byte-identical to the pre-tier build"
+        );
+        assert_eq!(cycled.get_active_job().unwrap().get_tier_log2(), None);
+    }
+
+    /// Moving the node tag from the template prefix into the extra push costs ZERO scriptSig
+    /// bytes: a stripped-prefix + tier-push build serializes to exactly the same length as
+    /// today's full-prefix build. This is the budget claim the whole design rests on — the live
+    /// scriptSig is at 99/100.
+    #[test]
+    fn the_tier_stamped_coinbase_is_the_same_length_as_todays() {
+        let mut today = a_channel();
+        today.on_new_template(a_template(true), reward()).unwrap();
+        let job = today.get_active_job().unwrap();
+        let todays_bytes =
+            bitcoin::consensus::serialize(&today.build_coinbase(&job, &[0u8; 20]).unwrap());
+
+        let mut tiered = a_channel();
+        tiered.set_tier_commitment(Some((13, a_tier_push(0x5A))));
+        tiered.on_new_template(a_template(false), reward()).unwrap();
+        let job = tiered.get_active_job().unwrap();
+        let tiered_bytes =
+            bitcoin::consensus::serialize(&tiered.build_coinbase(&job, &[0u8; 20]).unwrap());
+
+        assert_eq!(
+            todays_bytes.len(),
+            tiered_bytes.len(),
+            "binding the tier must not change the coinbase length"
+        );
+        // And the push really is in there, as its own push after the pool tag.
+        let needle = a_tier_push(0x5A);
+        assert!(
+            tiered_bytes
+                .windows(needle.len())
+                .any(|w| w == needle.as_slice()),
+            "the tier push must appear in the tiered coinbase"
+        );
+        assert!(
+            !todays_bytes
+                .windows(needle.len())
+                .any(|w| w == needle.as_slice()),
+            "and must not appear in today's"
+        );
+    }
+
+    /// **Capture at build.** The tier and its push are the JOB's, frozen at build time: moving
+    /// the channel's commitment afterwards must change neither the job's label nor the bytes its
+    /// coinbase reassembles to. Deriving either from channel state at share time was the failure
+    /// mode this design exists to avoid — it would rebuild a coinbase the miner never hashed,
+    /// discovered on a won block.
+    #[test]
+    fn a_jobs_tier_and_bytes_survive_the_channel_moving_on() {
+        let mut channel = a_channel();
+        channel.set_tier_commitment(Some((13, a_tier_push(0x5A))));
+        channel
+            .on_new_template(a_template(false), reward())
+            .unwrap();
+        let job = channel.get_active_job().unwrap();
+        let job_id = job.get_job_id();
+        let built =
+            bitcoin::consensus::serialize(&channel.build_coinbase(&job, &[0u8; 20]).unwrap());
+        let skeleton = channel.coinbase_skeleton().expect("skeleton");
+
+        // The channel's tier moves on (vardiff crossed a boundary before the next build).
+        channel.set_tier_commitment(Some((14, a_tier_push(0xA5))));
+
+        assert_eq!(
+            channel.job_tier_log2(job_id),
+            Some(13),
+            "the job keeps the tier its coinbase committed to"
+        );
+        let job_again = channel.get_active_job().unwrap();
+        let rebuilt =
+            bitcoin::consensus::serialize(&channel.build_coinbase(&job_again, &[0u8; 20]).unwrap());
+        assert_eq!(
+            built, rebuilt,
+            "reassembly must use the job's captured push, not the channel's current one"
+        );
+        assert_eq!(
+            channel.coinbase_skeleton().expect("skeleton"),
+            skeleton,
+            "the skeleton must be equally immune"
+        );
+    }
+
+    /// A tier-stamped job validates against its TIER's exact target, not the channel target —
+    /// the coinbase committed to `2^tier`, and the accounting layer credits exactly that, so the
+    /// validation threshold has to be the same number.
+    #[test]
+    fn a_tier_stamped_job_binds_to_its_tiers_exact_target() {
+        let mut channel = a_channel();
+        channel.set_tier_commitment(Some((13, a_tier_push(0x5A))));
+        channel
+            .on_new_template(a_template(false), reward())
+            .unwrap();
+        let job_id = channel.get_active_job().unwrap().get_job_id();
+        assert_eq!(
+            channel.job_target(job_id),
+            Some(&tier_target(13)),
+            "a stamped job's validation target must be its tier's exact target"
+        );
+        assert_eq!(
+            channel.job_target(job_id).unwrap().difficulty_float(),
+            8192.0
+        );
     }
 }

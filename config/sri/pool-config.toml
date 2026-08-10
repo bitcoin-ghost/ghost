@@ -65,6 +65,19 @@ batch_size = 50
 batch_timeout_ms = 2000
 max_retries = 3
 
+# SHARE_TIER_BIND (difficulty-tier commitment) — pool_sv2's half of a DORMANT two-part gate.
+# LEAVE COMMENTED OUT until the gate arms. Enabling it requires, in the SAME release:
+#   - activation_height equal to ghost-pool's SHARE_TIER_BIND_HEIGHT (a real block height,
+#     currently dormant at u64::MAX),
+#   - node_id equal to THIS node's 32-byte identity (hex) — the one ghost-pool derives its
+#     coinbase node tags from (`ghost-pool --show-identity`),
+#   - the translator shipped with quantise_to_tiers = true (translator-config.toml).
+# At/above the height, jobs are built per channel, each coinbase committing to the channel's
+# power-of-two difficulty tier; below it, behaviour is byte-identical to today.
+# [share_tier_binding]
+# node_id = "<64-hex node id>"
+# activation_height = 99999999
+
 # Template Provider Configuration
 # Connects to ghost-pool's TDP server
 [template_provider_type.Sv2Tp]

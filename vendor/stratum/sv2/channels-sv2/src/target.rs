@@ -119,6 +119,29 @@ pub fn hash_rate_to_target(
     Ok(Target::from_le_bytes(target_bytes))
 }
 
+/// The exact target of a power-of-two difficulty tier: `diff1_target / 2^tier` =
+/// `0xFFFF * 2^(208 - tier)`.
+///
+/// Built directly in bytes rather than through floats: `0xFFFF * 2^208` and every power of two
+/// are exact, so a tier's target is the same 32 bytes on every platform. That matters because a
+/// tier-stamped job's shares are validated against this target AND credited exactly `2^tier` by
+/// the accounting layer — the two must be the same number, not two float approximations of it.
+///
+/// The exponent is clamped at 63: a share difficulty at or above `2^63` exceeds any conceivable
+/// network difficulty, and clamping keeps the byte-index arithmetic in range.
+pub fn tier_target(tier_log2: u32) -> Target {
+    let tier = tier_log2.min(63);
+    // 0xFFFF occupies bits s..s+16 of the 256-bit target, where s = 208 - tier.
+    let s = (208 - tier) as usize;
+    let v: u32 = 0xFFFFu32 << (s % 8);
+    let idx = s / 8;
+    let mut le = [0u8; 32];
+    le[idx] = (v & 0xFF) as u8;
+    le[idx + 1] = ((v >> 8) & 0xFF) as u8;
+    le[idx + 2] = ((v >> 16) & 0xFF) as u8;
+    Target::from_le_bytes(le)
+}
+
 /// Converts a `u128` to a [`U256`].
 pub fn from_u128_to_u256(input: u128) -> U256Primitive {
     let input: [u8; 16] = input.to_be_bytes();
@@ -199,4 +222,30 @@ pub fn hash_rate_from_target(target: U256<'static>, share_per_min: f64) -> Resul
     let result = numerator.div(denominator).low_u128();
     // we multiply back by 100 so that it cancels with the same factor at the denominator
     Ok(result as f64)
+}
+
+#[cfg(test)]
+mod tier_target_tests {
+    use super::*;
+
+    /// A tier target must stand for EXACTLY `2^tier`. Both `0xFFFF * 2^(208-t)` and `2^t` are
+    /// exact in f64, so equality here is legitimate rather than a tolerance in disguise.
+    #[test]
+    fn tier_targets_are_exact_powers_of_two() {
+        for tier in [0u32, 1, 10, 11, 13, 16, 20, 33, 40, 63] {
+            let d = tier_target(tier).difficulty_float();
+            assert_eq!(
+                d,
+                2.0_f64.powi(tier as i32),
+                "tier {tier} target must stand for exactly 2^{tier}"
+            );
+        }
+    }
+
+    /// The ceiling clamp: an absurd exponent saturates at 63 instead of underflowing the
+    /// byte-index arithmetic.
+    #[test]
+    fn the_exponent_clamps_at_63() {
+        assert_eq!(tier_target(200), tier_target(63));
+    }
 }

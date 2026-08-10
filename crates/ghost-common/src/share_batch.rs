@@ -13,6 +13,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::types::ShareProof;
@@ -28,6 +29,32 @@ const STATE_ROOT_DOMAIN: &[u8] = b"SbcStateRoot/v1";
 /// (`get_top_unpaid_addresses`), and the shadow-run compares batch totals against that path, so any
 /// difference here shows up as a false divergence.
 const MICRO: f64 = 1_000_000.0;
+
+/// Hard ceiling on a single share's creditable difficulty.
+///
+/// `micro_work` is `(canonical_json_f64(x) * 1e6).round() as i64`, and Rust's float-to-int cast
+/// SATURATES — so without a ceiling, one share claiming `f64::MAX` difficulty is credited
+/// `i64::MAX` micro-work and captures an entire balance in a single fold. The cast saturates at
+/// `i64::MAX / 1e6 ≈ 9.22e12`; 1e12 keeps an order of magnitude of headroom below that (so the
+/// JSON round-trip and the rounding can never tip a "legal" value over the edge), while sitting
+/// about six orders of magnitude above the largest difficulty this pool's vardiff actually
+/// assigns (farm tier peaks around 1e6) — no honest share is anywhere near it.
+///
+/// ⚠ This is a SATURATION guard, not the fix for the adaptive-claim attack: `difficulty` is still
+/// a value the claiming side chooses post hoc, merely bounded and PoW-checked. The real fix is
+/// the difficulty-tier commitment in the WP-1b tag, which is a separate, later change.
+pub const MAX_CREDIT_DIFFICULTY: f64 = 1.0e12;
+
+/// Whether a share's claimed difficulty may be credited at all.
+///
+/// One spelling of the predicate, shared by verification (where a violation is a terminal fault)
+/// and by ingest (where such a share is refused before it can poison this node's own proposals).
+/// Non-finite and non-positive values are excluded because `micro_work` maps NaN to 0 and an
+/// infinity or a negative to a saturated or negative credit — all of them "numbers" no proof of
+/// work can stand behind.
+pub fn creditable_difficulty(difficulty: f64) -> bool {
+    difficulty.is_finite() && difficulty > 0.0 && difficulty <= MAX_CREDIT_DIFFICULTY
+}
 
 /// Quantise a share's work to integer micro-work.
 ///
@@ -63,6 +90,42 @@ pub fn canonical_sort(shares: &mut [ShareProof]) {
     shares.sort_by(canonical_cmp);
 }
 
+/// A proposer's high-water mark: the canonical position of the last share it has had adopted.
+///
+/// Compared exactly as [`canonical_cmp`] compares shares — `(timestamp, share_hash)`
+/// lexicographically, with `share_hash` in internal byte order — so "after the watermark" and
+/// "later in canonical order" are the same statement.
+pub type ShareWatermark = (u64, [u8; 32]);
+
+/// Per-proposer high-water marks, part of the chain's adopted state.
+///
+/// This is the O(1) cross-batch replay guard: `verify_batch` requires every share in a batch to
+/// sort STRICTLY after its proposer's watermark, and adoption advances the watermark to the
+/// batch's last share. Combined with the strictly-increasing canonical order already enforced
+/// WITHIN a batch, no share can appear in two adopted batches from the same proposer — without a
+/// per-share index, which the schema deliberately does not have.
+pub type ProposerWatermarks = BTreeMap<[u8; 32], ShareWatermark>;
+
+/// Advance a proposer's watermark past an adopted batch.
+///
+/// Called at adoption, for every adopted batch — including ones synced from history — so the
+/// watermarks are a pure function of the adopted chain and every node derives the same map.
+/// A batch with no shares moves nothing: there is no position to advance to, and an empty
+/// heartbeat batch must not disturb the guard.
+///
+/// Advance-only: verification guarantees an adopted batch's shares sort after the existing mark,
+/// so the `max` is normally a no-op — it is kept so that no caller, ever, can move a watermark
+/// backwards and reopen a replay window.
+pub fn advance_watermarks(watermarks: &mut ProposerWatermarks, batch: &ShareBatch) {
+    if let Some(last) = batch.shares.last() {
+        let candidate = (last.timestamp, last.share_hash);
+        let entry = watermarks.entry(batch.proposer).or_insert(candidate);
+        if candidate > *entry {
+            *entry = candidate;
+        }
+    }
+}
+
 /// Outcome of folding shares into the running balances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FoldOutcome {
@@ -81,6 +144,15 @@ pub struct FoldOutcome {
 /// is `saturating_add` over `i64` micro-work, mirroring the existing Rust fold so the shadow-run
 /// compares like with like.
 ///
+/// Credits `share.difficulty`, NOT `share.work`. `work` is a free field the claiming node signs
+/// for itself and nothing ever checks it against anything; `difficulty` is the field the PoW
+/// preimage check (`sbc_checks::pow_ok`) actually verifies the header against, so it is the only
+/// number in the proof with work standing behind it. The live ingest path stamps the two fields
+/// with the same value, so for honestly produced shares this changes nothing — it changes what a
+/// dishonest claim can be worth. Verification rejects any share whose difficulty fails
+/// [`creditable_difficulty`], so an adopted batch can never fold a saturating credit; see the
+/// caveat on [`MAX_CREDIT_DIFFICULTY`] for what this does NOT fix.
+///
 /// Order-independent by construction: integer addition commutes, so a node that receives the same
 /// shares in a different order reaches the same balances.
 pub fn fold_shares(balances: &mut BTreeMap<String, i64>, shares: &[ShareProof]) -> FoldOutcome {
@@ -91,7 +163,7 @@ pub fn fold_shares(balances: &mut BTreeMap<String, i64>, shares: &[ShareProof]) 
             continue;
         };
         let entry = balances.entry(addr.clone()).or_insert(0);
-        *entry = entry.saturating_add(micro_work(share.work));
+        *entry = entry.saturating_add(micro_work(share.difficulty));
         outcome.credited += 1;
     }
     outcome
@@ -121,7 +193,11 @@ pub fn compute_state_root(balances: &BTreeMap<String, i64>, seq: u64, close_ts: 
 
 /// Domain tag for the batch commitment. Same versioning rule as the state root — a batch hashed
 /// under a different encoding is not comparable, so any change bumps the version and is gated.
-const BATCH_HASH_DOMAIN: &[u8] = b"ShareBatch/v1";
+///
+/// v2: `reversed_blocks` joined the commitment. Bumped while the chain is still dark and nothing
+/// is deployed, so no gate is needed — any pre-v2 local chain simply fails to link and is
+/// re-grown from genesis.
+const BATCH_HASH_DOMAIN: &[u8] = b"ShareBatch/v2";
 
 /// One link in the share-batch chain.
 ///
@@ -132,16 +208,23 @@ const BATCH_HASH_DOMAIN: &[u8] = b"ShareBatch/v1";
 /// `seq` is independent of block height. Share consensus runs on its own cadence and never waits on
 /// a block — the whole point of the redesign is that a tip change *consumes* the latest agreed
 /// batch rather than triggering agreement.
-#[derive(Debug, Clone)]
+/// Serialisation is by hex for byte arrays, matching every other wire type here. The encoding is
+/// free to change: `batch_hash` is computed over CANONICAL bytes, never over the serialized form,
+/// precisely so two nodes need not produce byte-identical JSON to agree on a batch's identity.
+/// What the encoding must do is round-trip faithfully, since a stored batch is served verbatim to
+/// a syncing peer who then recomputes the hash for itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareBatch {
     /// Position in the chain. Increments by one per adopted batch; unrelated to block height.
     pub seq: u64,
     /// Hash of the previous batch, making the chain a chain.
+    #[serde(with = "crate::serde_hex::bytes32")]
     pub prev_batch_hash: [u8; 32],
     /// When the proposer closed this batch. Advisory — a share's eligibility is decided by chain
     /// membership, not by landing inside a window.
     pub close_ts: i64,
     /// Who proposed it, per the deterministic round-robin.
+    #[serde(with = "crate::serde_hex::bytes32")]
     pub proposer: [u8; 32],
     /// The shares, in canonical order.
     pub shares: Vec<ShareProof>,
@@ -153,9 +236,27 @@ pub struct ShareBatch {
     /// included, because nodes observe blocks at different moments relative to a batch close, and
     /// without a stated cut point two honest nodes fold different sets and their roots diverge.
     pub settled_blocks: Vec<[u8; 32]>,
+    /// Blocks whose settlements are REVERSED by this batch — the undo channel for
+    /// [`ShareBatch::settled_blocks`].
+    ///
+    /// A settlement folded at one batch can be reorged out of the chain later. Without a stated
+    /// reversal, the first real reorg would leave nodes disagreeing about whether the settlement
+    /// still counts, and their roots would diverge at exactly the moment the chain most needs to
+    /// agree. Like `settled_blocks`, this is a CUT-POINT declaration: which reversals this batch
+    /// applies, so every validator folds the same set.
+    ///
+    /// Only the channel exists today. Settlement folding is dark until WP-6, so both lists are
+    /// always empty at runtime — the field is added now, while the format is still cheap to
+    /// change, precisely so the first reorg after WP-6 has somewhere to speak.
+    ///
+    /// `serde(default)` so a JSON without the field still decodes; any such batch predates the
+    /// `ShareBatch/v2` domain and fails hash verification anyway.
+    #[serde(default)]
+    pub reversed_blocks: Vec<[u8; 32]>,
     /// Qualified-node shares (the 5-4-3-2-1 snapshot) as of this batch.
     pub node_shares: Vec<([u8; 32], i32)>,
     /// Commitment to the running per-address balances after applying this batch.
+    #[serde(with = "crate::serde_hex::bytes32")]
     pub state_root: [u8; 32],
     /// Whether shares were deferred to the next batch for want of room.
     ///
@@ -195,6 +296,14 @@ impl ShareBatch {
 
         h.update((self.settled_blocks.len() as u32).to_le_bytes());
         for block in &self.settled_blocks {
+            h.update(block);
+        }
+
+        // Committed exactly like `settled_blocks`: length-prefixed, then each hash. An uncommitted
+        // reversal channel would let a proposer un-settle a block without changing the batch
+        // identity a quorum signs.
+        h.update((self.reversed_blocks.len() as u32).to_le_bytes());
+        for block in &self.reversed_blocks {
             h.update(block);
         }
 
@@ -328,6 +437,7 @@ mod tests {
             template_id: None,
             payout_address: Some(addr.to_string()),
             header: None,
+            tier_log2: None,
             signature: None,
         }
     }
@@ -436,6 +546,92 @@ mod tests {
         assert_eq!(
             outcome.unattributed, 2,
             "empty and absent both count as unattributed"
+        );
+    }
+
+    /// **The fold credits the PROVEN field.** `work` is a free field the claiming node signs for
+    /// itself; `difficulty` is what the PoW preimage check verifies the header against. A fold
+    /// that read `work` would credit whatever was claimed regardless of what was proven.
+    #[test]
+    fn the_fold_credits_difficulty_not_claimed_work() {
+        let mut s = share(100, 1, "bc1qalice", 1.0);
+        s.difficulty = 1.0;
+        s.work = 999_999.0; // an inflated claim nothing verifies
+
+        let mut balances = BTreeMap::new();
+        fold_shares(&mut balances, &[s]);
+        assert_eq!(
+            balances.get("bc1qalice"),
+            Some(&micro_work(1.0)),
+            "credit must follow the PoW-verified difficulty, not the self-signed work claim"
+        );
+    }
+
+    /// The saturation the credit cap exists to stop: one absurd difficulty is worth `i64::MAX`
+    /// micro-work under the raw cast. The cap is the LAST value that cannot saturate with an
+    /// order of magnitude to spare, and everything beyond or beneath the creditable range is
+    /// refused.
+    #[test]
+    fn the_credit_cap_excludes_everything_that_could_saturate() {
+        // The hazard is real: the raw cast saturates.
+        assert_eq!(micro_work(f64::MAX), i64::MAX);
+        assert_eq!(micro_work(1e19), i64::MAX);
+
+        // The cap itself is safely representable...
+        assert!(creditable_difficulty(MAX_CREDIT_DIFFICULTY));
+        assert!(micro_work(MAX_CREDIT_DIFFICULTY) < i64::MAX / 9);
+
+        // ...and everything unprovable or saturating is not creditable.
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -1.0,
+            MAX_CREDIT_DIFFICULTY * 1.001,
+            f64::MAX,
+        ] {
+            assert!(!creditable_difficulty(bad), "{bad} must not be creditable");
+        }
+        assert!(
+            creditable_difficulty(1e-9),
+            "tiny real difficulties stay creditable"
+        );
+        assert!(
+            creditable_difficulty(1_000_000.0),
+            "farm-tier vardiff stays creditable"
+        );
+    }
+
+    /// The watermark advances to the adopted batch's last share, never backwards, and an empty
+    /// batch moves nothing.
+    #[test]
+    fn watermarks_advance_and_never_regress() {
+        let mut wm = ProposerWatermarks::new();
+        let mut batch = a_batch();
+
+        advance_watermarks(&mut wm, &batch);
+        let last = batch.shares.last().expect("shares");
+        assert_eq!(
+            wm.get(&batch.proposer),
+            Some(&(last.timestamp, last.share_hash)),
+            "the watermark is the last share's canonical position"
+        );
+
+        // A batch with no shares moves nothing — a heartbeat must not disturb the guard.
+        let held = *wm.get(&batch.proposer).expect("set");
+        let mut empty = batch.clone();
+        empty.shares.clear();
+        advance_watermarks(&mut wm, &empty);
+        assert_eq!(wm.get(&batch.proposer), Some(&held));
+
+        // And an out-of-order replay of an OLDER batch cannot move it backwards.
+        batch.shares.truncate(1);
+        advance_watermarks(&mut wm, &batch);
+        assert_eq!(
+            wm.get(&batch.proposer),
+            Some(&held),
+            "a watermark must never regress — that reopens the replay window"
         );
     }
 
@@ -642,6 +838,7 @@ mod tests {
             proposer: [0x22; 32],
             shares,
             settled_blocks: vec![[0x33; 32]],
+            reversed_blocks: vec![[0x66; 32]],
             node_shares: vec![([0x44; 32], 15)],
             state_root: compute_state_root(&balances, 500, 1_700_000_000),
             truncated: false,
@@ -680,6 +877,21 @@ mod tests {
         let mut b = base.clone();
         b.settled_blocks.push([0x77; 32]);
         assert_ne!(h, b.batch_hash(), "settled_blocks not covered");
+
+        let mut b = base.clone();
+        b.reversed_blocks.push([0x78; 32]);
+        assert_ne!(h, b.batch_hash(), "reversed_blocks not covered");
+
+        // And the two channels must not be confusable: moving a hash from one list to the other
+        // is a different claim — settled versus reversed — and must be a different identity.
+        let mut b = base.clone();
+        b.settled_blocks = base.reversed_blocks.clone();
+        b.reversed_blocks = base.settled_blocks.clone();
+        assert_ne!(
+            h,
+            b.batch_hash(),
+            "swapping settled and reversed must change the identity"
+        );
 
         let mut b = base.clone();
         b.node_shares[0].1 = 14;

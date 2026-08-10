@@ -612,6 +612,40 @@ impl PeerProvider for PeerProviderAdapter {
     }
 }
 
+/// What a node should report as its own hashrate, given a query outcome.
+///
+/// Pure so the failure path can actually be tested — the failure path is the whole point. Both the
+/// mesh gossip and the HTTP route used to call `.unwrap_or(0.0)` here, so a node whose database was
+/// too slow to answer announced ZERO hashes to the entire mesh. That is indistinguishable from
+/// having no miners and logged nothing. It hid 94 TH/s on ghost-vm5 (88% of the pool) behind a
+/// database stalled by #554, and the public site reported 13.8 TH/s against a real ~107 TH/s.
+///
+/// `query` is `None` when the database could not answer. A genuine idle node returns `Some(0.0)`
+/// and is reported as zero, which is correct — only a FAILED query takes the fallback.
+///
+/// Returns the value to report and how it was arrived at, so the caller can log accordingly.
+fn reported_hashrate(
+    query: Option<f64>,
+    last_good: Option<(f64, u64)>,
+    grace_secs: u64,
+) -> (f64, HashrateSource) {
+    match query {
+        Some(th) => (th, HashrateSource::Measured),
+        None => match last_good {
+            Some((th, age)) if age <= grace_secs => (th, HashrateSource::Stale { age_secs: age }),
+            _ => (0.0, HashrateSource::Unavailable),
+        },
+    }
+}
+
+/// Where a reported hashrate came from. `Unavailable` means the pool-wide total is understated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HashrateSource {
+    Measured,
+    Stale { age_secs: u64 },
+    Unavailable,
+}
+
 /// Ghost Pool - Decentralized Bitcoin Mining Pool
 #[derive(Parser, Debug)]
 #[command(name = "ghost-pool")]
@@ -697,6 +731,22 @@ struct Args {
     /// With --ledger-import: report what WOULD change and write nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// List every node this one has quarantined from the share-batch chain, and exit.
+    #[arg(long)]
+    sbc_quarantined: bool,
+
+    /// Release a node from share-batch-chain quarantine, and exit.
+    ///
+    /// Quarantine is a TERMINAL fault — a peer that proposed a structurally invalid batch is
+    /// excluded from consensus and, by design, never readmits itself. That design is only
+    /// coherent if an operator can actually let it back in, and until this flag existed the
+    /// release function had no caller anywhere: quarantine was a one-way door and the only
+    /// recovery was hand-editing an encrypted database.
+    ///
+    /// Takes the 32-byte node id as hex. `--sbc-quarantined` prints the ids to pass here.
+    #[arg(long, value_name = "NODE_ID_HEX")]
+    sbc_release: Option<String>,
 }
 
 /// Handle `--status`: report what THIS node can establish about itself (B4).
@@ -2478,6 +2528,49 @@ async fn main() -> Result<()> {
     // nodes holding fabricated ones — each node's set is a subset of the truth. It is trusted
     // rather than verified, and it is only defensible because every node in the mesh belongs to
     // the same operator. New shares (v41 onward) carry their proof and converge verifiably.
+    // SHARE-BATCH-CHAIN QUARANTINE (runs after DB encryption is configured, and exits).
+    //
+    // Quarantine is deliberately terminal and deliberately persistent: a peer that proposed a
+    // structurally invalid batch stays out of consensus across restarts until an operator looks
+    // at it. Both halves of that contract need an operator-facing command — without one, the
+    // "operator releases it" half is a comment rather than a behaviour.
+    if args.sbc_quarantined {
+        let quarantined = db.sbc_quarantined()?;
+        if quarantined.is_empty() {
+            println!("No nodes are quarantined from the share-batch chain.");
+        } else {
+            println!(
+                "{} node(s) quarantined from the share-batch chain:",
+                quarantined.len()
+            );
+            for (node_id, reason) in &quarantined {
+                println!("  {}  {}", hex::encode(node_id), reason);
+            }
+            println!("\nRelease one with: ghost-pool --sbc-release <NODE_ID_HEX>");
+        }
+        return Ok(());
+    }
+
+    if let Some(node_hex) = &args.sbc_release {
+        let raw = hex::decode(node_hex.trim())
+            .map_err(|e| anyhow::anyhow!("node id must be hex: {e}"))?;
+        let node_id: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!("node id must be 32 bytes (64 hex chars), got {}", raw.len())
+        })?;
+        if db.sbc_release(node_id)? {
+            println!(
+                "Released {} from share-batch-chain quarantine.",
+                hex::encode(node_id)
+            );
+        } else {
+            println!(
+                "{} was not quarantined; nothing to do.",
+                hex::encode(node_id)
+            );
+        }
+        return Ok(());
+    }
+
     if let Some(path) = &args.ledger_export {
         // STREAMING export. The previous version called `export_unpaid_shares()` (which
         // materialises the ledger twice) and then `serde_json::to_vec` (a third copy, as one
@@ -2872,13 +2965,11 @@ async fn main() -> Result<()> {
         mining_mode,
         solo_payout_address: config.network.solo_payout_address.clone(),
         coinbase_extra: coinbase_tag,
-        node_commitment: {
-            // sha256(node_id)[..20] — see TemplateConfig::node_commitment.
-            let digest = ghost_common::identity::hash_message(&identity.node_id());
-            let mut c = [0u8; 20];
-            c.copy_from_slice(&digest[..20]);
-            Some(c)
-        },
+        // The identity itself, not a pre-hashed commitment: the scriptSig builder derives the
+        // tag per build — `node_commitment_plain` below SHARE_TIER_BIND_HEIGHT (byte-identical
+        // to the sha256(node_id)[..20] always stamped), `node_commitment_for_tier` above it for
+        // builds that know their tier. See TemplateConfig::node_id.
+        node_id: Some(identity.node_id()),
         min_fee_rate: template_min_fee_rate,
         enforce_custom_policy_fields,
         // Block-priority lever (max_fee default | payments_first). Resolved once
@@ -2982,13 +3073,57 @@ async fn main() -> Result<()> {
     // share-proofs are excluded, which is what keeps the mesh sum from
     // double-counting (each share counted once, by its origin node).
     let self_received_by = hex::encode(&identity.node_id()[..8]);
-    let db_for_local_hr = Arc::clone(&db);
-    let self_rx_for_provider = self_received_by.clone();
-    mesh_inner.set_local_hashrate_provider(Arc::new(move || {
-        db_for_local_hr
-            .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_provider)
-            .unwrap_or(0.0)
-    }));
+
+    // ONE provider, shared by the mesh gossip and the HTTP route, because both used to swallow
+    // the same error in the same way and the two paths must never disagree about this node's
+    // own hashrate.
+    //
+    // Both sites read `.unwrap_or(0.0)`. A node whose database is too slow to answer therefore
+    // told the entire mesh it was doing ZERO hashes — indistinguishable from having no miners,
+    // with no error logged anywhere. On 2026-08-09 that hid 94 TH/s: ghost-vm5 carried 88% of
+    // the pool's hashrate behind a database stalled by #554, so the pool-wide total read 13.8
+    // TH/s against a real ~107 TH/s, and the public site reported the wrong figure all day.
+    //
+    // A genuine zero still passes through untouched — an idle node's query SUCCEEDS with 0.0.
+    // Only a FAILED query takes the fallback, and the fallback is the last value this node
+    // actually measured rather than a fabricated zero. Bounded, because stale-forever is its own
+    // lie: past the grace period it reports zero and says so at WARN.
+    let local_hashrate_provider: Arc<dyn Fn() -> f64 + Send + Sync> = {
+        const STALE_GRACE_SECS: u64 = 600;
+        let db_for_local_hr = Arc::clone(&db);
+        let self_rx = self_received_by.clone();
+        let last_good: Arc<parking_lot::Mutex<Option<(f64, std::time::Instant)>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        Arc::new(move || {
+            let outcome = db_for_local_hr.local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx);
+            let err = outcome.as_ref().err().map(|e| e.to_string());
+            let cached = last_good
+                .lock()
+                .map(|(th, at): (f64, std::time::Instant)| (th, at.elapsed().as_secs()));
+            let (th, source) = reported_hashrate(outcome.ok(), cached, STALE_GRACE_SECS);
+            match source {
+                HashrateSource::Measured => {
+                    *last_good.lock() = Some((th, std::time::Instant::now()));
+                }
+                HashrateSource::Stale { age_secs } => tracing::warn!(
+                    error = err.unwrap_or_default(),
+                    reusing_th = th,
+                    age_secs,
+                    "local hashrate query FAILED; reusing the last measured value rather than \
+                     reporting zero, which would deflate the pool-wide total"
+                ),
+                HashrateSource::Unavailable => tracing::warn!(
+                    error = err.unwrap_or_default(),
+                    "local hashrate query FAILED and no recent measurement is available; \
+                     reporting 0 TH/s. The pool-wide total is UNDERSTATED by this node's real \
+                     hashrate until its database responds again"
+                ),
+            }
+            th
+        })
+    };
+
+    mesh_inner.set_local_hashrate_provider(Arc::clone(&local_hashrate_provider));
 
     // Gossip THIS node's best (rarest) valid share per records window so every
     // node converges on the pool-wide rarest record per window. Without this,
@@ -3562,8 +3697,248 @@ async fn main() -> Result<()> {
         .with_diag(compute_ledger_root_diag_fn)
         .with_active_voter_set_fn(active_voter_set_fn.clone()),
     );
+    // WP-5: the share-batch chain, in shadow. Dark unless `pool.share_batch_shadow` is set — see
+    // docs/SHARE_BATCH_CHAIN.md. It computes, folds and persists its own state and pays nobody;
+    // the coinbase still reads the ratified checkpoint until WP-6.
+    //
+    // Constructed here so the share recorder below can hand it what THIS node received. A failure
+    // to load is not fatal to the pool: the shadow chain is an observation, and taking the node
+    // down because an observation could not start would make the safer configuration the riskier
+    // one to deploy.
+    let sbc_chain: Option<Arc<ghost_pool::sbc_shadow::ShadowChain>> =
+        if config.pool.share_batch_shadow {
+            match ghost_pool::sbc_shadow::ShadowChain::load(Arc::clone(&identity), Arc::clone(&db))
+            {
+                Ok(chain) => {
+                    info!("SBC shadow: enabled");
+                    // Bootstrap seq 0 from the ratified checkpoint if the chain has not started.
+                    // Idempotent: a restart RESUMES rather than re-genesising, which would discard
+                    // every batch adopted since. Every node converts the SAME adopted bytes
+                    // independently and must reach the same genesis — see `bootstrap_genesis` for
+                    // why that is safe and why the genesis proposer is zero.
+                    match chain.bootstrap_genesis(
+                        ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT,
+                        chrono::Utc::now().timestamp(),
+                    ) {
+                        Ok(Some(h)) => info!(anchor_height = h, "SBC genesis: chain started"),
+                        Ok(None) => {
+                            debug!("SBC genesis: already started, or nothing ratified to convert")
+                        }
+                        Err(e) => error!(error = %e, "SBC genesis: bootstrap failed"),
+                    }
+                    Some(Arc::new(chain))
+                }
+                Err(e) => {
+                    error!(error = %e, "SBC shadow: could not load — continuing without it");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+
+    // WP-5: the share-batch chain in shadow. Registered and ticked only when
+    // `pool.share_batch_shadow` is set, so a deployed binary puts no batch traffic on the mesh
+    // until a node is deliberately opted in. See docs/SHARE_BATCH_CHAIN.md.
+    if let Some(ref chain) = sbc_chain {
+        // Same channel-plus-relay shape as the checkpoint path: the handler is synchronous and
+        // must not await a broadcast while holding consensus state.
+        let (sbc_tx, mut sbc_rx) =
+            tokio::sync::mpsc::channel::<(ghost_consensus::MessageType, Vec<u8>)>(256);
+        {
+            let mesh_c = Arc::clone(&mesh);
+            tokio::spawn(async move {
+                while let Some((ty, bytes)) = sbc_rx.recv().await {
+                    match mesh_c.create_envelope_raw(ty, bytes) {
+                        Ok(env) => {
+                            if let Err(e) = mesh_c.broadcast(env).await {
+                                tracing::debug!(error = %e, "SBC broadcast failed");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "SBC envelope failed"),
+                    }
+                }
+            });
+        }
+        let sbc_send: ghost_pool::sbc_handler::BroadcastFn = {
+            let tx = sbc_tx.clone();
+            Arc::new(move |ty, bytes| {
+                tx.try_send((ty, bytes)).map_err(|e| {
+                    ghost_common::error::GhostError::P2PMessage(format!("SBC channel: {e}"))
+                })
+            })
+        };
+
+        // The voter set is the SAME scoped query the checkpoint root uses, so the two systems
+        // cannot disagree about who is entitled to vote while both are live.
+        let sbc_voters: ghost_pool::sbc_handler::VoterSetFn = {
+            let chain_c = Arc::clone(chain);
+            Arc::new(move || {
+                // READ FROM THE CHAIN, NOT THE DATABASE.
+                //
+                // This was a live per-node qualification query, and that single fact defeated four
+                // successive mechanisms for proving a sequence had committed. Quorum is
+                // `bft_threshold(view)`, so nodes disagreed on the bar; a commit certificate hashes
+                // the voter set, so it could never match. You cannot prove a quorum over a
+                // membership the two parties do not share.
+                //
+                // Anchoring the query's CUTOFF to consensus data was not enough — identical input
+                // still gave different output, because the query scans local eventually-consistent
+                // tables that are also pruned on each node's own clock. So the query is gone from
+                // the consensus path: membership is seeded at genesis from the ratified payout
+                // checkpoint and carried forward by every batch, with any change a terminal fault.
+                //
+                // It also takes the heaviest synchronous scan off the hot path — `schedule()` ran
+                // it up to three times per message, against the same SQLite already carrying
+                // #554's load.
+                chain_c.voter_ids()
+            })
+        };
+
+        // Rebuilt per call: the PoW predicate depends on the current height, and a handler that
+        // captured it once would keep applying the rules in force when the process started.
+        let sbc_checks: ghost_pool::sbc_handler::ChecksFn = {
+            let rm_c = Arc::clone(&round_manager);
+            Arc::new(move || {
+                ghost_pool::sbc_checks::NodeBatchChecks::at_height(
+                    rm_c.current_height(),
+                    rm_c.addr_bind_activation_round(),
+                    ghost_pool::share_pow_verify_height(),
+                    ghost_pool::share_tier_bind_height(),
+                )
+            })
+        };
+
+        let sbc_handler = Arc::new(ghost_pool::sbc_handler::ShareBatchHandler::new(
+            Arc::clone(chain),
+            Arc::clone(&identity),
+            sbc_send.clone(),
+            sbc_voters.clone(),
+            sbc_checks.clone(),
+        ));
+        // Kept typed before the cast: the propose loop must run our OWN batch through the same
+        // judging path a received proposal takes, or the proposer never prevotes what it proposed.
+        let sbc_handler_for_propose = Arc::clone(&sbc_handler);
+        mesh.register_handler(
+            sbc_handler as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>,
+        );
+
+        // Propose cadence. Independent of block arrival by design: share agreement runs on its own
+        // clock and a tip change CONSUMES the latest agreed batch rather than triggering agreement.
+        {
+            let chain_c = Arc::clone(chain);
+            let voters_c = sbc_voters.clone();
+            let send_c = sbc_send.clone();
+            let handler_c = Arc::clone(&sbc_handler_for_propose);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // One status line every STATUS_EVERY ticks (~5 min). The escalation clock is the
+                // input to whose-turn-it-is and was previously unobservable in production — a fix
+                // to it could only be INFERRED from the database, never seen. If nodes disagree
+                // about the rota during the soak, this is the line that says why.
+                //
+                // Five minutes, not every tick: eight nodes logging every 30 s is ~960 lines/hour
+                // for values that change slowly, and this module has already caused one
+                // log-volume incident.
+                const STATUS_EVERY: u32 = 10;
+                let mut ticks: u32 = 0;
+                loop {
+                    interval.tick().await;
+                    let now = chrono::Utc::now().timestamp();
+                    let schedule = ghost_common::batch_consensus::ProposerSchedule::new(voters_c());
+
+                    ticks = ticks.wrapping_add(1);
+                    if ticks % STATUS_EVERY == 1 {
+                        let opened = chain_c.seq_opened();
+                        let head = chain_c.head();
+                        tracing::info!(
+                            seq = head.as_ref().map(|h| h.seq),
+                            state_root = head
+                                .as_ref()
+                                .map(|h| hex::encode(&h.state_root[..8]))
+                                .unwrap_or_else(|| "none".into()),
+                            seq_opened = opened,
+                            escalation = schedule.escalation_at(opened, now),
+                            voters = schedule.len(),
+                            quorum = schedule.quorum(),
+                            pending = chain_c.pending_count(),
+                            balances = chain_c.balance_count(),
+                            "SBC status"
+                        );
+                    }
+
+                    // Genesis is otherwise ONE-SHOT at startup. A node that comes up before
+                    // the anchor checkpoint has reached its database never genesises, holds no
+                    // head, has no membership, and is silently inert until someone restarts it —
+                    // with nothing to say so. Retrying here costs a cheap `head()` check per tick
+                    // and is a no-op once the chain has started.
+                    if chain_c.head().is_none() {
+                        match chain_c.bootstrap_genesis(ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT, now)
+                        {
+                            Ok(Some(h)) => {
+                                tracing::info!(
+                                    anchor_height = h,
+                                    "SBC genesis: chain started (retry)"
+                                )
+                            }
+                            // Reported on a slow cadence rather than every tick: a node waiting
+                            // for its anchor checkpoint would otherwise emit ~120 lines an hour
+                            // saying nothing new.
+                            Ok(None) => {
+                                if ticks % STATUS_EVERY == 1 {
+                                    tracing::warn!(
+                                        anchor = ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT,
+                                        "SBC genesis: waiting for the ratified checkpoint at the \
+                                         anchor — this node is SBC-inert until it arrives"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "SBC genesis: retry failed"),
+                        }
+                        continue;
+                    }
+
+                    if schedule.is_empty() {
+                        continue;
+                    }
+                    let budget = ghost_consensus::message_validator::share_batch_pack_budget();
+                    let Some(batch) = chain_c.try_propose(&schedule, now, budget) else {
+                        continue;
+                    };
+                    match serde_json::to_vec(&batch) {
+                        Ok(payload) => {
+                            if let Err(e) =
+                                send_c(ghost_consensus::MessageType::ShareBatchProposal, payload)
+                            {
+                                tracing::debug!(error = %e, "SBC: could not enqueue proposal");
+                            } else {
+                                tracing::info!(
+                                    seq = batch.seq,
+                                    shares = batch.shares.len(),
+                                    "SBC: proposed"
+                                );
+                                // Judge our own batch exactly as a peer would. Without this the
+                                // proposer is a silent abstainer every round it leads, so only
+                                // N-1 nodes ever prevote and the fleet cannot make a polka at
+                                // f=2 — the very tolerance the design claims.
+                                if let Err(e) = handler_c.judge_and_vote(&batch, now) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "SBC: could not prevote our own proposal"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "SBC: proposal would not serialise"),
+                    }
+                }
+            });
+        }
+    }
     // Propose cadence: every ~30s the deterministic proposer for (tip - LAG)
     // proposes that checkpoint. LAG keeps the anchor far enough behind the tip that
     // the share/qualification ledgers have converged there (else validators reject).
@@ -6604,6 +6979,12 @@ async fn main() -> Result<()> {
     // Report the node's real configured chain on the status/info endpoints
     // (dashboard + wallets) instead of the historical hardcoded "signet".
     verification_state = verification_state.with_network(config.bitcoin.network);
+    // SHARE_TIER_BIND: hand the webhook ingest the resolved tier gate so its H-13 check can
+    // switch to tier-credit judging at the same block as everything else. The authority stays
+    // `share_tier_bind_height()` here in ghost-pool; verification only receives the value
+    // (its default is the dormant u64::MAX, so an unwired embedder cannot arm early).
+    verification_state =
+        verification_state.with_share_tier_bind_height(ghost_pool::share_tier_bind_height());
     // A-2b: hand the verification server the same warm block-hash oracle the payout
     // checkpoint uses, so /api/v1/qualification/scoped-set can compute the
     // assignment-scoped set (the convergence proof for arming CHALLENGER_ASSIGNMENT).
@@ -6916,13 +7297,8 @@ async fn main() -> Result<()> {
 
     // This node's own contribution to that total, surfaced as `local_hashrate_th`
     // so the per-node and mesh figures reconcile (same windowed value it gossips).
-    let db_for_local_hr_route = Arc::clone(&db);
-    let self_rx_for_route = self_received_by.clone();
-    verification_state = verification_state.with_local_hashrate(move || {
-        db_for_local_hr_route
-            .local_hashrate_th(MESH_HASHRATE_WINDOW_SECS, &self_rx_for_route)
-            .unwrap_or(0.0)
-    });
+    let local_hr_for_route = Arc::clone(&local_hashrate_provider);
+    verification_state = verification_state.with_local_hashrate(move || local_hr_for_route());
     // Scope the operator/peer detailed miner list to this node's own miners
     // (shares stored under our `received_by`), so "This Node's Miners" and the
     // /miners/full peer feed are local — not the mesh-wide gossiped set.
@@ -7243,6 +7619,7 @@ async fn main() -> Result<()> {
     let rm_for_shares = Arc::clone(&round_manager);
     let identity_for_shares = Arc::clone(&identity);
     let db_for_shares = Arc::clone(&db);
+    let sbc_for_shares = sbc_chain.clone();
     verification_state = verification_state.with_share_recorder(move |share| {
         // Get current round ID for database record
         let round_id = rm_for_shares.current_round_id();
@@ -7303,6 +7680,27 @@ async fn main() -> Result<()> {
             None
         };
 
+        // SHARE_TIER_BIND: at/above the gate the proof carries the tier its job's coinbase
+        // committed to, so peers judge and credit exactly that tier. Below the gate it stays
+        // None → signing_bytes byte-identical to today, mirroring `header` above. The tier
+        // comes from the SRI layer (which stamped the coinbase); a missing tier at/above the
+        // gate means the emitting side is behind, and the proof will be rejected by peers —
+        // warned here so the deploy-order fault is visible at its source.
+        let tier_log2 = if ghost_pool::binds_difficulty_tier(rm_for_shares.current_height()) {
+            let t = share.tier_log2;
+            if t.is_none() {
+                tracing::warn!(
+                    miner_id = %share.miner_id,
+                    share_hash = %share.share_hash,
+                    "SHARE_TIER_BIND active but SRI submission carried no committed tier; \
+                     proof will not verify at peers (upgrade pool_sv2/translator)"
+                );
+            }
+            t
+        } else {
+            None
+        };
+
         let mut proof = ghost_common::types::ShareProof {
             round_id,
             miner_id: miner_hash,
@@ -7314,6 +7712,7 @@ async fn main() -> Result<()> {
             template_id: rm_for_shares.current_template_id(),
             payout_address: share.payout_address.clone(),
             header,
+            tier_log2,
             signature: None,
         };
         // GHOST-09: sign as the receiving node so peers can authenticate the
@@ -7354,7 +7753,9 @@ async fn main() -> Result<()> {
         // skeleton, which travels once per job — so a share can legitimately arrive first, and a
         // share we cannot judge yet must be recorded rather than given a verdict it did not earn.
         //
-        // Dark: nothing acts on the verdict below `SHARE_ADDR_BIND_HEIGHT`, which is unarmed.
+        // Advisory here: a failed binding is logged, and an unjudgeable one deferred — this path
+        // rejects nothing either way. Note `SHARE_ADDR_BIND_HEIGHT` is ARMED (961_100); an earlier
+        // note here called it unarmed, which stopped being true when the gate was set.
         if let (Some(sid_hex), Some(extranonce_hex), Some(header_hex)) = (
             share.skeleton_id.as_deref(),
             share.extranonce.as_deref(),
@@ -7366,12 +7767,22 @@ async fn main() -> Result<()> {
                 hex::decode(header_hex),
             ) {
                 (Some(skeleton_id), Ok(extranonce), Ok(header)) => {
-                    let expected = {
-                        let digest =
-                            ghost_common::identity::hash_message(&identity_for_shares.node_id());
-                        let mut c = [0u8; ghost_common::coinbase_tags::NODE_ID_LEN];
-                        c.copy_from_slice(&digest[..ghost_common::coinbase_tags::NODE_ID_LEN]);
-                        c
+                    // The commitment this node's coinbase stamped for this share's job: plain
+                    // below SHARE_TIER_BIND_HEIGHT, tier-bound at/above it (the tier folds into
+                    // the same 20 bytes — see `node_commitment_for_tier`). Computed HERE and
+                    // stored with the deferral, so the recheck pass judges the share against
+                    // the rule in force when it was mined, not whenever its skeleton arrives.
+                    let expected = match (
+                        ghost_pool::binds_difficulty_tier(rm_for_shares.current_height()),
+                        tier_log2,
+                    ) {
+                        (true, Some(t)) => ghost_common::coinbase_tags::node_commitment_for_tier(
+                            &identity_for_shares.node_id(),
+                            t,
+                        ),
+                        _ => ghost_common::coinbase_tags::node_commitment_plain(
+                            &identity_for_shares.node_id(),
+                        ),
                     };
 
                     match db_for_shares.get_skeleton(&skeleton_id) {
@@ -7474,6 +7885,18 @@ async fn main() -> Result<()> {
         // broadcast went nowhere. That is a property of how solo happens to be deployed, not an
         // invariant: `config/mainnet-solo.toml` says no seed nodes are *needed*, not that peers
         // are forbidden. Suppress at the source so reachability cannot change the answer.
+        // WP-5: hand the shadow chain what THIS node received, before the broadcast consumes the
+        // proof. Only own shares: a gossiped share was received by a peer and belongs in that
+        // peer's batch, so taking it here would credit the same work twice.
+        //
+        // Solo is excluded for the same reason it does not broadcast — a solo node's work is its
+        // own and must not enter a shared chain.
+        if !rm_for_shares.is_solo_mode() {
+            if let Some(ref chain) = sbc_for_shares {
+                chain.record_received(proof.clone());
+            }
+        }
+
         if rm_for_shares.is_solo_mode() {
             tracing::trace!(
                 miner_id = %share.miner_id,
@@ -10361,6 +10784,65 @@ fn resolve_signer_path(
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hashrate_reporting_tests {
+    use super::{reported_hashrate, HashrateSource};
+
+    /// A node that genuinely has no miners reports zero, and that zero is REAL.
+    ///
+    /// The distinction this whole function exists for: an idle node's query succeeds with 0.0 and
+    /// must not be papered over with a stale value.
+    #[test]
+    fn a_successful_zero_is_reported_as_measured() {
+        let (th, src) = reported_hashrate(Some(0.0), Some((94.0, 5)), 600);
+        assert_eq!(
+            th, 0.0,
+            "a real zero must not be replaced by a cached value"
+        );
+        assert_eq!(src, HashrateSource::Measured);
+    }
+
+    /// A FAILED query must not be reported as zero while a recent measurement exists.
+    ///
+    /// This is the ghost-vm5 case: 94 TH/s behind a stalled database. Reporting 0 deflated the
+    /// pool-wide total by 88% and logged nothing at all.
+    #[test]
+    fn a_failed_query_reuses_the_last_measurement_instead_of_reporting_zero() {
+        let (th, src) = reported_hashrate(None, Some((94.13, 42)), 600);
+        assert_eq!(th, 94.13, "a database failure must not read as 'no miners'");
+        assert_eq!(src, HashrateSource::Stale { age_secs: 42 });
+    }
+
+    /// Stale-forever is its own lie. Past the grace period it reports zero and says so.
+    #[test]
+    fn a_measurement_older_than_the_grace_period_is_not_reused() {
+        let (th, src) = reported_hashrate(None, Some((94.13, 601)), 600);
+        assert_eq!(th, 0.0);
+        assert_eq!(
+            src,
+            HashrateSource::Unavailable,
+            "an ancient reading must be surfaced as unavailable, not presented as current"
+        );
+    }
+
+    /// A failure with nothing cached is unavailable — reported as zero, but flagged.
+    #[test]
+    fn a_failure_with_no_history_is_flagged_unavailable() {
+        let (th, src) = reported_hashrate(None, None, 600);
+        assert_eq!(th, 0.0);
+        assert_eq!(src, HashrateSource::Unavailable);
+    }
+
+    /// Exactly at the boundary the cached value is still good — an off-by-one here silently
+    /// switches a healthy node to reporting zero.
+    #[test]
+    fn the_grace_boundary_is_inclusive() {
+        let (th, src) = reported_hashrate(None, Some((12.0, 600)), 600);
+        assert_eq!(th, 12.0);
+        assert_eq!(src, HashrateSource::Stale { age_secs: 600 });
     }
 }
 

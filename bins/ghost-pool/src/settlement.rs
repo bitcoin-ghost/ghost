@@ -725,7 +725,7 @@ mod tests {
             TemplateConfig {
                 coinbase_extra: "GHOST PublicPool".to_string(),
                 pool_payout_address: ADDRESS.to_string(),
-                node_commitment: Some([0x7Au8; 20]),
+                node_id: Some([0x7Au8; 32]),
                 ..Default::default()
             },
             rpc,
@@ -733,7 +733,7 @@ mod tests {
             Default::default(),
         );
         processor
-            .coinbase_scriptsig(960_001, Some(payout), 20)
+            .coinbase_scriptsig(960_001, Some(payout), 20, None)
             .expect("the real builder must produce a scriptSig")
     }
 

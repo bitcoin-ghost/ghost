@@ -76,6 +76,27 @@ pub mod skeleton_store;
 pub mod terminal_reject_cache;
 
 /// Mining round lifecycle and share accounting.
+/// Bridge from the share-batch chain to this node's share verification (WP-5).
+/// The ratified payout checkpoint the share-batch chain opens from (WP-4).
+///
+/// Operator decision 2026-08-09. Verified read-only across all 8 nodes before pinning: one distinct
+/// `ledger_root` fleet-wide, `canonical_payout` identical on every node, 5 payees and 8 node
+/// entries. Chosen over the 960,550 candidate because every block between the anchor and the shadow
+/// run is work that has to reach the chain some other way — and 960,550 was already eight days
+/// stale.
+///
+/// Every node converts this SAME adopted checkpoint independently; genesis is not negotiated. See
+/// `ShadowChain::bootstrap_genesis` for why that is safe and why the genesis proposer is zero.
+pub const SBC_GENESIS_ANCHOR_HEIGHT: u64 = 961_642;
+
+pub mod sbc_checks;
+
+/// The share-batch chain running in shadow (WP-5) — computes, persists, pays nobody.
+pub mod sbc_shadow;
+
+/// Mesh handler routing batch traffic into the shadow chain (WP-5).
+pub mod sbc_handler;
+
 pub mod round;
 
 /// Stratum JSON-RPC request parsing.
@@ -207,6 +228,98 @@ pub const COINBASE_FEE_SPLIT_HEIGHT: u64 = 959_290;
 /// reversible by re-releasing with a higher height. The fleet must be fully on v1.11.1
 /// BEFORE the tip reaches this height (canary roll finishes ~959_022, ~8-block margin).
 pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
+
+/// Bind a share's difficulty TIER into the coinbase preimage, and credit the committed tier.
+///
+/// `SHARE_POW_VERIFY_HEIGHT` established that a share's hash is a real header's PoW. This gate
+/// additionally binds WHICH difficulty that share is credited. The tier is committed inside the
+/// hashed coinbase when the job is built, so it is fixed before the hash exists and is recomputable
+/// by any node judging the share — rather than resting on a figure supplied alongside it, which a
+/// remote validator cannot check against per-node vardiff state it never sees.
+///
+/// (Operational detail of what the pre-gate encoding permits is deliberately kept out of the public
+/// tree until the gate is armed; see the team notes.)
+///
+/// At and above this height a share commits to a power-of-two difficulty tier INSIDE the hashed
+/// coinbase: the node tag becomes `sha256(node_id ‖ tier_log2)[..20]` instead of
+/// `sha256(node_id)[..20]` (same 20-byte payload, so ZERO extra scriptSig bytes — the live
+/// scriptSig is already 99/100). A validator reassembles the coinbase from the skeleton, folds it to
+/// the header's merkle root, recomputes the tag from the share's stated `(node_id, tier)`, requires
+/// the hash to achieve the tier, and credits EXACTLY the tier
+/// (`DifficultyCalculator::verify_pow_preimage_tier` +
+/// `ghost_common::share_binding::verify_share_tier_binding`). Choosing the tier after hashing
+/// changes the header, so the work is discarded.
+///
+/// A share's credited work is consensus-visible (it decides the coinbase split), so this is a
+/// height gate: below it the coinbase carries the plain `sha256(node_id)[..20]` tag and the legacy
+/// numeric credit stands, byte-identical to today, so a mixed-version fleet computes identical
+/// ledgers during the roll. Both code paths exist in the new binary; every node switches at the
+/// same block.
+///
+/// DORMANT (`u64::MAX`).
+///
+/// ## Where the emitting side stands (2026-08-10)
+///
+/// Built, dark, behind this gate:
+/// - `ShareProof.tier_log2`, GHOST-09-bound when present, absent → `signing_bytes`
+///   byte-identical to today (`ghost-common/src/types.rs`);
+/// - every verification path selects the tier check at/above this gate and credits exactly
+///   `2^tier_log2`: gossip/backfill ingest (`round.rs`), the batch chain (`sbc_checks.rs`), the
+///   local webhook ingest (`ghost-verification` H-13, gate injected via
+///   `with_share_tier_bind_height`), with the terminal-reject key tier-aware
+///   (`terminal_reject_cache.rs`);
+/// - the one scriptSig assembler speaks both tag forms, switched by height
+///   (`template.rs::coinbase_scriptsig`, `node_tag_bytes`), and `TemplateConfig` now carries the
+///   node identity rather than a pre-hashed commitment;
+/// - the SV1 translator can quantise every assigned difficulty to a power-of-two tier
+///   (`difficulty_manager.rs::quantise_target_to_tier`), behind
+///   `downstream_difficulty_config.quantise_to_tiers`, default OFF — the translator has no
+///   chain view, so that config flag IS its gate and must ship ON in the arming release;
+/// - the webhook wire interface carries `tier_log2` end to end
+///   (`pool_sv2::ShareData` → `ghost-verification::ShareBatch/ShareNotification` →
+///   `ShareProof`), absent on every payload until pool_sv2 populates it.
+///
+/// ## The emitting side is now built too (2026-08-10), dark behind config
+///
+/// Per-tier JOB GENERATION exists in pool_sv2 + the vendored `channels-sv2`, behind the
+/// `[share_tier_binding]` config section (ABSENT by default — the only shipped state — which
+/// keeps the single group-broadcast job and today's bytes exactly):
+///
+/// - pool_sv2 derives its per-template gate from the BIP34 height ghost-pool stamps into the
+///   TDP `coinbase_prefix` (`tier_binding.rs::bip34_height`), against the configured
+///   `activation_height` — so with the same height configured, both binaries flip at the same
+///   BLOCK, not at a restart;
+/// - at/above the gate every channel gets its OWN job from its own factory: the plain node tag
+///   is stripped from the template prefix (`strip_plain_node_tag`) and the tier-bound tag
+///   `node_commitment_for_tier(node_id, tier)` is stamped back as the factory's budget-guarded
+///   extra push (`JobFactory::set_extra_script_sig`) — same 25 encoded bytes out and in, so the
+///   99/100 scriptSig does not move (pinned by test on assembled bytes on both sides);
+/// - the channel's tier is `difficulty_to_tier_log2(target)`, its target is quantised to the
+///   tier's EXACT byte-built target (`channels_sv2::target::tier_target`), and each job
+///   captures `(tier, push)` AT BUILD (`StandardJob/ExtendedJob::tier_log2`,
+///   `extra_script_sig`) — never re-read from `job_id_to_target`, which binds at activation
+///   after vardiff may have moved the channel;
+/// - stamped jobs validate against their tier's exact target and the webhook reports
+///   `tier_log2` plus `share_work == 2^tier` (`ShareData`), matching this gate's
+///   `difficulty == 2^tier` check;
+/// - a desync of the two halves is LOUD: pool_sv2 refuses to start on a malformed `node_id`,
+///   warns at startup naming both halves, and flags per channel both
+///   pool-on/translator-off (non-tier-shaped client max while tiering is active) and
+///   translator-on/pool-off (tier-shaped client max with no `[share_tier_binding]`).
+///
+/// KNOWN LIMIT: Job-Declaration custom work (`SetCustomMiningJob`) carries the declaring
+/// client's own coinbase and cannot commit to a tier — above the gate its shares would be
+/// rejected (`missing_tier`). No JD client exists on the fleet today; resolve before arming if
+/// one does. (The old direct-SV1 path in ghost-pool is gone — SRI is the only mining path.)
+///
+/// A concrete height is set only once fleet-wide convergence is proven, like the rest. Arming
+/// checklist, in addition: finalise `MIN_DIFFICULTY_TIER_LOG2` against the then-current vardiff
+/// floor AND update the duplicated floor constant in `translator-sv2::difficulty_manager` (that
+/// crate cannot link ghost-common); in ONE release ship the translator with
+/// `quantise_to_tiers = true` AND pool_sv2 with `[share_tier_binding]` (`node_id` = this node's
+/// identity, `activation_height` = this constant's value); verify on the roll that
+/// `missing_tier`/`tier_credit_mismatch` stay zero.
+pub const SHARE_TIER_BIND_HEIGHT: u64 = u64::MAX;
 
 /// Bind the miner's payout address into the GHOST-09 share signature.
 ///
@@ -412,6 +525,7 @@ mod gates {
     pub(super) static VOTER_SET_QUALIFICATION: OnceLock<u64> = OnceLock::new();
     pub(super) static CHALLENGER_ASSIGNMENT: OnceLock<u64> = OnceLock::new();
     pub(super) static SHARE_POW_VERIFY: OnceLock<u64> = OnceLock::new();
+    pub(super) static SHARE_TIER_BIND: OnceLock<u64> = OnceLock::new();
     pub(super) static PAYOUT_MEDIAN_ADOPTION: OnceLock<u64> = OnceLock::new();
     pub(super) static STRATUM_HANDSHAKE_PROOF: OnceLock<u64> = OnceLock::new();
     pub(super) static ARCHIVE_TX_PROOF: OnceLock<u64> = OnceLock::new();
@@ -458,6 +572,11 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         network,
         SHARE_POW_VERIFY_HEIGHT,
     );
+    let share_tier_bind = gates::from_env(
+        "GHOST_SHARE_TIER_BIND_HEIGHT",
+        network,
+        SHARE_TIER_BIND_HEIGHT,
+    );
     let active_voter_set = gates::from_env(
         "GHOST_ACTIVE_VOTER_SET_HEIGHT",
         network,
@@ -498,6 +617,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
     let _ = gates::VOTER_SET_QUALIFICATION.set(voter_set);
     let _ = gates::CHALLENGER_ASSIGNMENT.set(challenger_assignment);
     let _ = gates::SHARE_POW_VERIFY.set(share_pow_verify);
+    let _ = gates::SHARE_TIER_BIND.set(share_tier_bind);
     let _ = gates::ACTIVE_VOTER_SET.set(active_voter_set);
     let _ = gates::SHARE_ADDR_BIND.set(share_addr_bind);
     let _ = gates::OBSERVED_SETTLEMENT.set(observed_settlement);
@@ -511,6 +631,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
         || voter_set != VOTER_SET_QUALIFICATION_HEIGHT
         || challenger_assignment != CHALLENGER_ASSIGNMENT_HEIGHT
         || share_pow_verify != SHARE_POW_VERIFY_HEIGHT
+        || share_tier_bind != SHARE_TIER_BIND_HEIGHT
         || active_voter_set != ACTIVE_VOTER_SET_HEIGHT
         || share_addr_bind != SHARE_ADDR_BIND_HEIGHT
         || observed_settlement != OBSERVED_SETTLEMENT_HEIGHT
@@ -522,6 +643,7 @@ pub fn init_activation_heights(network: &ghost_common::config::BitcoinNetwork) {
             voter_set_qualification_height = voter_set,
             challenger_assignment_height = challenger_assignment,
             share_pow_verify_height = share_pow_verify,
+            share_tier_bind_height = share_tier_bind,
             active_voter_set_height = active_voter_set,
             share_addr_bind_height = share_addr_bind,
             observed_settlement_height = observed_settlement,
@@ -560,6 +682,21 @@ pub fn challenger_assignment_height() -> u64 {
 /// (Surface B). Accessor form so the gate is env-overridable off-mainnet like the rest.
 pub fn share_pow_verify_height() -> u64 {
     *gates::SHARE_POW_VERIFY.get_or_init(|| SHARE_POW_VERIFY_HEIGHT)
+}
+
+/// Height at/above which a share commits to its difficulty tier in the coinbase and is credited the
+/// committed tier rather than the difficulty claimed after hashing. DORMANT (`u64::MAX`) — see
+/// [`SHARE_TIER_BIND_HEIGHT`]. Accessor form so it is env-overridable off-mainnet like the rest.
+pub fn share_tier_bind_height() -> u64 {
+    *gates::SHARE_TIER_BIND.get_or_init(|| SHARE_TIER_BIND_HEIGHT)
+}
+
+/// Whether a share seen at `height` commits to its difficulty tier and is credited that tier.
+///
+/// One predicate for the emitter (coinbase tag format, share tier field) and every verifier (tier
+/// binding + tier credit), so the two cannot disagree about which rule is in force at a given block.
+pub fn binds_difficulty_tier(height: u64) -> bool {
+    height >= share_tier_bind_height()
 }
 
 /// Height at and above which the GHOST-09 share signature also binds `payout_address`.
@@ -740,5 +877,34 @@ mod in_dns_tests {
         let resolved = vec![ip("83.136.251.162"), ip("2001:db8::1")];
         let local = vec![ip("10.0.0.5"), ip("2001:db8::1")];
         assert_eq!(is_in_mining_dns(&resolved, &local), InDns::Yes);
+    }
+}
+
+#[cfg(test)]
+mod tier_gate_tests {
+    use super::{binds_difficulty_tier, share_tier_bind_height, SHARE_TIER_BIND_HEIGHT};
+
+    /// **The dark-landing proof.** The tier gate ships dormant, so no live height binds a tier and
+    /// the credit path is byte-identical to today across the whole mainnet range. The predicate is
+    /// still genuinely wired — it fires at/above the resolved gate — so this is not a check that
+    /// cannot fail.
+    #[test]
+    fn the_tier_gate_is_dormant_and_behaviour_neutral() {
+        assert_eq!(
+            SHARE_TIER_BIND_HEIGHT,
+            u64::MAX,
+            "the tier gate must ship dormant — arming it must be a deliberate edit"
+        );
+
+        // Nothing in the mainnet range reaches the dormant gate, so nothing is tier-bound in
+        // production: the coinbase keeps the plain node tag and the legacy credit stands.
+        assert!(!binds_difficulty_tier(960_000));
+        assert!(!binds_difficulty_tier(1_000_000));
+        assert!(!binds_difficulty_tier(u64::MAX - 1));
+
+        // But the predicate does fire at/above the resolved gate — proving it is wired to the
+        // height, not hard-coded to false.
+        let gate = share_tier_bind_height();
+        assert!(binds_difficulty_tier(gate));
     }
 }

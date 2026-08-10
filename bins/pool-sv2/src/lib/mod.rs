@@ -45,6 +45,7 @@ mod io_task;
 mod monitoring;
 pub mod share_webhook;
 pub mod template_receiver;
+pub mod tier_binding;
 pub mod utils;
 
 #[derive(Debug, Clone)]

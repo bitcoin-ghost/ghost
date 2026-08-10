@@ -176,6 +176,36 @@ pub fn verify_share_node_binding(
     }
 }
 
+/// Prove a share was mined to `node_id` **for a specific difficulty tier**, from the data supplied.
+///
+/// Identical in shape to [`verify_share_node_binding`], but the coinbase carries a tier-bound node
+/// tag — `sha256(node_id ‖ tier_log2)[..20]` — instead of the plain `sha256(node_id)[..20]`. The
+/// verifier recomputes that tag from the share's *stated* `(node_id, claimed_tier_log2)` and
+/// requires it to match what the coinbase committed to.
+///
+/// This is the anti-post-hoc-claim property. The difficulty a share is credited is chosen BEFORE
+/// the hash exists, because it lives in the coinbase that the header commits to. A share that
+/// re-states a higher tier recomputes a different expected tag, which will not match the coinbase's
+/// — a [`BindingError::WrongNode`]. A share that keeps the tag but alters the coinbase to carry a
+/// different tier changes the coinbase txid, so it no longer folds to the header's merkle root — a
+/// [`BindingError::MerkleRootMismatch`]. Either way the work would have to be re-mined.
+///
+/// This function proves only the *binding*: that the header was mined against a coinbase committing
+/// to `(node_id, claimed_tier_log2)`. The separate obligation that the hash actually *achieves*
+/// `2^claimed_tier_log2`, and the decision to credit exactly that tier, live in the accounting
+/// layer (`DifficultyCalculator::verify_pow_preimage_tier`), because that is where PoW difficulty
+/// is judged and where credit is assigned.
+pub fn verify_share_tier_binding(
+    skeleton: &CoinbaseSkeleton,
+    extranonce: &[u8],
+    header80: &[u8],
+    node_id: &[u8],
+    claimed_tier_log2: u32,
+) -> Result<(), BindingError> {
+    let expected = crate::coinbase_tags::node_commitment_for_tier(node_id, claimed_tier_log2);
+    verify_share_node_binding(skeleton, extranonce, header80, &expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +393,82 @@ mod tests {
         assert_eq!(
             verify_share_node_binding(&skeleton, &extranonce, &[0u8; 79], &HONEST),
             Err(BindingError::MalformedHeader)
+        );
+    }
+
+    const NODE_ID_32: [u8; 32] = [0xC7; 32];
+
+    /// A share whose coinbase commits to `sha256(node_id ‖ tier)` verifies when the verifier is
+    /// told the same tier.
+    #[test]
+    fn a_tier_bound_share_verifies_at_its_own_tier() {
+        let tier = 13u32;
+        let commitment = crate::coinbase_tags::node_commitment_for_tier(&NODE_ID_32, tier);
+        let (skeleton, extranonce) = skeleton_for(commitment, vec![[0x11; 32], [0x22; 32]]);
+        let header = header_for(&skeleton, &extranonce);
+        assert_eq!(
+            verify_share_tier_binding(&skeleton, &extranonce, &header, &NODE_ID_32, tier),
+            Ok(())
+        );
+    }
+
+    /// **The attack this closes.** Re-stating a HIGHER tier after the hash is known recomputes a
+    /// different expected tag, which the coinbase never committed to — so the claim is refuted. The
+    /// only way to be credited a higher tier is to have committed to it before hashing.
+    #[test]
+    fn restating_a_higher_tier_after_the_fact_is_refuted() {
+        let mined_tier = 13u32;
+        let commitment = crate::coinbase_tags::node_commitment_for_tier(&NODE_ID_32, mined_tier);
+        let (skeleton, extranonce) = skeleton_for(commitment, vec![[0x11; 32]]);
+        let header = header_for(&skeleton, &extranonce);
+
+        // Same header, same coinbase, but the sharer now claims a fatter tier.
+        assert_eq!(
+            verify_share_tier_binding(&skeleton, &extranonce, &header, &NODE_ID_32, mined_tier + 4),
+            Err(BindingError::WrongNode),
+            "a tier the coinbase never committed to must not verify"
+        );
+    }
+
+    /// Rebuilding the coinbase to carry the fatter tier's tag changes the coinbase txid, so it no
+    /// longer folds to the stolen header's merkle root — the work would have to be re-mined.
+    #[test]
+    fn rebuilding_the_coinbase_for_a_higher_tier_breaks_the_header() {
+        let mined_tier = 13u32;
+        let honest_commit = crate::coinbase_tags::node_commitment_for_tier(&NODE_ID_32, mined_tier);
+        let (honest_skeleton, extranonce) = skeleton_for(honest_commit, vec![[0x11; 32]]);
+        let stolen_header = header_for(&honest_skeleton, &extranonce);
+
+        let fat_commit =
+            crate::coinbase_tags::node_commitment_for_tier(&NODE_ID_32, mined_tier + 4);
+        let (fat_skeleton, fat_extranonce) = skeleton_for(fat_commit, vec![[0x11; 32]]);
+
+        assert_eq!(
+            verify_share_tier_binding(
+                &fat_skeleton,
+                &fat_extranonce,
+                &stolen_header,
+                &NODE_ID_32,
+                mined_tier + 4
+            ),
+            Err(BindingError::MerkleRootMismatch),
+            "a coinbase carrying the fatter tier cannot fold to the honest header's root"
+        );
+    }
+
+    /// A different node claiming a correctly-tiered share still fails: the tag folds node identity
+    /// and tier together, so neither can be swapped alone.
+    #[test]
+    fn a_different_node_cannot_claim_a_tiered_share() {
+        let tier = 13u32;
+        let commitment = crate::coinbase_tags::node_commitment_for_tier(&NODE_ID_32, tier);
+        let (skeleton, extranonce) = skeleton_for(commitment, vec![[0x11; 32]]);
+        let header = header_for(&skeleton, &extranonce);
+
+        let other_node = [0xEEu8; 32];
+        assert_eq!(
+            verify_share_tier_binding(&skeleton, &extranonce, &header, &other_node, tier),
+            Err(BindingError::WrongNode)
         );
     }
 }

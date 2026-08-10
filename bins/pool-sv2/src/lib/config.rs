@@ -52,6 +52,32 @@ pub struct ShareWebhookConfig {
     pub max_retries: u32,
 }
 
+/// Configuration for the difficulty-tier commitment (SHARE_TIER_BIND) — pool_sv2's half of the
+/// two-part gate.
+///
+/// ghost-pool's half is the height constant `SHARE_TIER_BIND_HEIGHT` (dormant at `u64::MAX`);
+/// this binary has no chain view of its own, so its half is configured here and derives the
+/// per-template decision from the BIP34 height ghost-pool stamps into every template's
+/// `coinbase_prefix` — both binaries then flip at the same BLOCK, not at a restart.
+///
+/// **Absent (the default, and the only shipped state) = dormant**: one group job per template,
+/// plain node tag, byte-identical to today. Both fields are mandatory when the section is
+/// present, so a half-written section fails config parse loudly instead of running half-armed.
+///
+/// Arming requires, in ONE release: this section with `activation_height` equal to ghost-pool's
+/// `SHARE_TIER_BIND_HEIGHT`, `node_id` equal to the identity ghost-pool stamps and verifies, and
+/// the translator shipped with `quantise_to_tiers = true`. A desync is detected and logged, not
+/// silently absorbed — see `tier_binding.rs`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ShareTierBindingConfig {
+    /// This node's 32-byte identity, hex (64 chars) — MUST equal the `node_id` ghost-pool derives
+    /// its coinbase node tags from, or every tier-stamped share fails its binding check.
+    pub node_id: String,
+    /// Block height at/above which per-tier jobs are emitted. MUST equal ghost-pool's
+    /// `SHARE_TIER_BIND_HEIGHT` in the same release.
+    pub activation_height: u64,
+}
+
 /// Configuration for the Pool, including connection, authority, and coinbase settings.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PoolConfig {
@@ -80,11 +106,18 @@ pub struct PoolConfig {
     monitoring_cache_refresh_secs: Option<u64>,
     #[serde(default)]
     share_webhook: Option<ShareWebhookConfig>,
+    #[serde(default)]
+    share_tier_binding: Option<ShareTierBindingConfig>,
 }
 
 impl PoolConfig {
     pub fn share_webhook(&self) -> Option<&ShareWebhookConfig> {
         self.share_webhook.as_ref()
+    }
+
+    /// The SHARE_TIER_BIND configuration, when present. `None` = dormant, today's behaviour.
+    pub fn share_tier_binding(&self) -> Option<&ShareTierBindingConfig> {
+        self.share_tier_binding.as_ref()
     }
 }
 
@@ -127,6 +160,7 @@ impl PoolConfig {
             monitoring_cache_refresh_secs,
             jds,
             share_webhook: None,
+            share_tier_binding: None,
         }
     }
 
