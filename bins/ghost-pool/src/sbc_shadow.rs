@@ -46,6 +46,13 @@ use ghost_storage::sbc_store::ChainHead;
 /// process that shares a box with ghostd.
 const MAX_PENDING_SHARES: usize = 50_000;
 
+/// How many sequences of commit certificates to keep behind the head.
+///
+/// A certificate has to outlive the sequence it proves — the node that needs it is by definition
+/// behind — so this is deliberately generous relative to the consensus state, which is pruned the
+/// moment a sequence closes.
+const CERT_RETENTION: u64 = 4_096;
+
 /// Verified batches awaiting a commit, keyed by `(seq, batch_hash)`.
 ///
 /// The `u64` in the value is a monotonic insertion number, so eviction can mean OLDEST — a
@@ -74,6 +81,20 @@ pub struct ShadowChain {
     /// a miner never gets paid for, whereas a large pool merely produces a truncated batch and the
     /// remainder is carried to the next one.
     pending: Mutex<BTreeMap<[u8; 32], ShareProof>>,
+    /// Serialises ADOPTION against JUDGING, so a judge sees one consistent chain state.
+    ///
+    /// `head` and `balances` are separate locks, and judging reads both: the parent comes from the
+    /// head, the fold starts from the balances. `finalise` writes both. Mesh dispatch is one tokio
+    /// task per connection, so a commit landing on one connection can interleave with a proposal
+    /// being judged on another — and the judge then folds a batch onto balances that already
+    /// include it. The result is a `StateRootMismatch`, which is a FAULT: an honest peer is
+    /// quarantined, persistently, operator-release-only. Via the propose loop the victim can be
+    /// this node itself.
+    ///
+    /// Outermost lock everywhere it appears. A judge takes it shared for the span of the snapshot;
+    /// `finalise` takes it exclusive for the span of the mutation. Nothing takes it while holding
+    /// `quarantine` or `consensus`, so the established quarantine -> consensus order is untouched.
+    adoption: parking_lot::RwLock<()>,
     /// Shares dropped because the pool hit its ceiling. Non-zero means the chain is not draining.
     pending_dropped: std::sync::atomic::AtomicU64,
     /// The adopted head, or `None` before genesis.
@@ -233,6 +254,7 @@ impl ShadowChain {
             identity,
             db,
             pending: Mutex::new(BTreeMap::new()),
+            adoption: parking_lot::RwLock::new(()),
             pending_dropped: std::sync::atomic::AtomicU64::new(0),
             head: RwLock::new(head),
             balances: RwLock::new(balances),
@@ -773,6 +795,33 @@ impl ShadowChain {
         certs.insert(seq, cert);
     }
 
+    /// Keep a certificate we verified from a peer, so we can prove that commit onward.
+    ///
+    /// Without this, proof coverage only ever SHRINKS: a certificate exists solely on nodes that
+    /// witnessed the commit, and a node that caught up via sync answered later requests with no
+    /// proof at all — so a laggard behind a laggard could never adopt. Storing what we verified
+    /// makes coverage grow with adoption instead.
+    pub fn remember_certificate(
+        &self,
+        cert: &ghost_consensus::message::CommitCertificate,
+        now: i64,
+    ) {
+        let Ok(json) = serde_json::to_string(cert) else {
+            return;
+        };
+        if let Err(e) = self.db.sbc_store_cert(
+            cert.seq,
+            cert.round,
+            cert.batch_hash,
+            cert.voter_set_hash,
+            &json,
+            now,
+        ) {
+            warn!(seq = cert.seq, error = %e, "SBC: could not store a verified certificate");
+        }
+        self.certs.lock().insert(cert.seq, cert.clone());
+    }
+
     /// The certificate proving what we committed at `seq`, if we still hold it.
     pub fn certificate_at(&self, seq: u64) -> Option<ghost_consensus::message::CommitCertificate> {
         if let Some(c) = self.certs.lock().get(&seq).cloned() {
@@ -818,6 +867,17 @@ impl ShadowChain {
     /// The bound sits BELOW what is final: dropping state for a sequence still in flight would let
     /// this node vote twice in one round, which is the one thing the per-round tally prevents.
     pub fn prune_below(&self, seq: u64) {
+        // Certificates go too. `sbc_prune_certs_below` had ZERO callers, so the table grew one row
+        // per committed sequence forever — roughly a gigabyte a year per node, on a fleet where
+        // one box already sits at 90% disk — while the migration comment claimed it was "bounded
+        // by the same retention as the batch window". Now it is.
+        //
+        // Bounded well BELOW the head so a certificate outlives the sequence it proves: a peer
+        // catching up needs the proof for a sequence we closed some time ago.
+        let cert_floor = seq.saturating_sub(CERT_RETENTION);
+        if let Err(e) = self.db.sbc_prune_certs_below(cert_floor) {
+            warn!(error = %e, "SBC: could not prune old certificates");
+        }
         self.consensus.lock().retain(|k, _| *k >= seq);
         // Signatures go with the consensus state; the CERTIFICATE minted at commit is what
         // survives, in `certs`.
@@ -848,18 +908,23 @@ impl ShadowChain {
     ) -> GhostResult<Option<Finalised>> {
         use ghost_common::batch_consensus::{verify_committed_batch, BatchVerdict};
 
-        let parent = match self.parent_for(batch.seq) {
-            Ok(p) => p,
-            Err(reason) => {
-                debug!(
-                    seq = batch.seq,
-                    ?reason,
-                    "SBC: cannot place a committed batch yet"
-                );
-                return Ok(None);
-            }
+        // Same consistent snapshot as the judging path, and released before `finalise` — which
+        // takes the exclusive side, so a read guard held across it would deadlock.
+        let (parent, balances) = {
+            let _snapshot = self.adoption.read();
+            let parent = match self.parent_for(batch.seq) {
+                Ok(p) => p,
+                Err(reason) => {
+                    debug!(
+                        seq = batch.seq,
+                        ?reason,
+                        "SBC: cannot place a committed batch yet"
+                    );
+                    return Ok(None);
+                }
+            };
+            (parent, self.balances())
         };
-        let balances = self.balances();
         match verify_committed_batch(batch, &parent, &balances, checks) {
             BatchVerdict::Valid { .. } => self.finalise(batch, now).map(Some),
             other => {
@@ -1038,19 +1103,21 @@ impl ShadowChain {
             now,
         )?;
 
-        *self.balances.write() = balances;
-        *self.head.write() = Some(ChainHead {
-            seq: batch.seq,
-            batch_hash,
-            state_root: batch.state_root,
-            close_ts: batch.close_ts,
-            finalised_at: now,
-        });
-
-        // Carry membership forward from what we just adopted. Identical to the parent's by
-        // construction — `verify_batch` faults any change — so this is a restatement, not a
-        // decision, and it keeps the value correct across a restart that resumes from the store.
-        *self.membership.write() = batch.node_shares.clone();
+        // EXCLUSIVE for the span that makes head and balances disagree. A judge holding the
+        // shared side cannot observe the half-updated state that produced spurious
+        // `StateRootMismatch` faults — and therefore spurious, persistent quarantines.
+        {
+            let _adopting = self.adoption.write();
+            *self.balances.write() = balances;
+            *self.head.write() = Some(ChainHead {
+                seq: batch.seq,
+                batch_hash,
+                state_root: batch.state_root,
+                close_ts: batch.close_ts,
+                finalised_at: now,
+            });
+            *self.membership.write() = batch.node_shares.clone();
+        }
 
         // Everything at or below the adopted sequence is decided, so its consensus and proposal
         // state is dead weight. Pruning here rather than on a timer means the bound is always
@@ -1114,9 +1181,12 @@ impl ShadowChain {
             .db
             .get_payout_ledger_checkpoint_at_or_before(anchor_height)?
         else {
-            warn!(
+            // DEBUG, not WARN. Genesis now retries every propose tick, so a node waiting for its
+            // anchor checkpoint emitted ~120 of these an hour — in a module that has already had
+            // one log-volume incident. The condition is reported once by the caller instead.
+            debug!(
                 anchor_height,
-                "SBC genesis: no ratified checkpoint at or below the anchor — cannot start"
+                "SBC genesis: no ratified checkpoint at or below the anchor yet"
             );
             return Ok(None);
         };

@@ -49,17 +49,28 @@ pub struct ChainHead {
     pub seq: u64,
     pub batch_hash: [u8; 32],
     pub state_root: [u8; 32],
-    /// When the PROPOSER closed this batch. Advisory — it says nothing about when this node
-    /// adopted it, and for genesis it is the converted checkpoint's cutoff, which can be days old.
-    pub close_ts: i64,
-    /// When THIS node adopted the batch.
+    /// When the PROPOSER closed this batch — and the clock the stall escalation runs from.
     ///
-    /// Distinct from `close_ts` and not interchangeable with it. The next sequence opens when this
-    /// batch is adopted, so this is what the stall-escalation clock must run from. Using
-    /// `close_ts` instead made escalation start from the genesis checkpoint's cutoff. Measured on
-    /// ghost-vm8: cutoff 1786228093, adopted 1786260566 — a 32,473 s gap, so escalation read 416
-    /// steps where it should have read ~34. The rota sat permanently escalated, rotating the turn
-    /// every 90 s instead of giving a proposer a stable one.
+    /// It lives inside the batch and feeds `batch_hash`, so every node that adopted this head
+    /// holds it byte for byte. That is exactly why the rota uses it: whose turn it is comes from
+    /// `(seq + escalation) % voters` with escalation `(now - opened) / 90`, so `opened` is a
+    /// CONSENSUS input. Two nodes disagreeing about it by more than the ±1-step grace wait on
+    /// different proposers and neither ever proposes.
+    ///
+    /// For genesis it is the converted checkpoint's cutoff, which can be days old — so the first
+    /// sequence opens already escalated. That is harmless: escalation is only a rotation offset,
+    /// every node computes the SAME offset, and the turn still passes every 90 s.
+    pub close_ts: i64,
+    /// When THIS node adopted the batch. Advisory only.
+    ///
+    /// Deliberately NOT the escalation clock, though an earlier version made it so and this doc
+    /// used to argue for it. It is local wall-clock, so nodes disagree: ghost-vm8 installed
+    /// genesis 11,574 s before its peers and read escalation 173 against their 42 — 128 steps
+    /// apart, against a grace window of 1 — so it held every batch with `ProposerNotDue` and the
+    /// chain could not close a sequence. A rota that is a function of local time is not a rota.
+    ///
+    /// Kept because "when did I adopt this" is genuinely useful for diagnosis; it simply must not
+    /// decide anything.
     pub finalised_at: i64,
 }
 

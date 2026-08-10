@@ -3886,9 +3886,18 @@ async fn main() -> Result<()> {
                                     "SBC genesis: chain started (retry)"
                                 )
                             }
-                            Ok(None) => tracing::debug!(
-                                "SBC genesis: still no ratified checkpoint at the anchor"
-                            ),
+                            // Reported on a slow cadence rather than every tick: a node waiting
+                            // for its anchor checkpoint would otherwise emit ~120 lines an hour
+                            // saying nothing new.
+                            Ok(None) => {
+                                if ticks % STATUS_EVERY == 1 {
+                                    tracing::warn!(
+                                        anchor = ghost_pool::SBC_GENESIS_ANCHOR_HEIGHT,
+                                        "SBC genesis: waiting for the ratified checkpoint at the \
+                                         anchor — this node is SBC-inert until it arrives"
+                                    );
+                                }
+                            }
                             Err(e) => tracing::warn!(error = %e, "SBC genesis: retry failed"),
                         }
                         continue;

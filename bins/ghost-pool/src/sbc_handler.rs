@@ -155,9 +155,11 @@ impl ShareBatchHandler {
     /// never saw. Adoption on the commit path used to have no way to ask at all, so a node that
     /// missed the proposal was simply stuck.
     fn request_sync(&self, seq: u64) -> GhostResult<()> {
-        // Remember that WE asked. An unsolicited response is not evidence of anything: a peer can
-        // relay a currently-authorised proposal as a `Response`, and adopting it at the open
-        // sequence forks us against whatever the fleet actually commits.
+        // NOTE: nothing is remembered here, and deliberately so. Request tracking was tried and
+        // removed — "we asked" is not proof of being behind, because a peer can induce the request
+        // with a junk proposal at head+2 (`verify_batch` defers on POSITION before checking any
+        // signature). Adoption is gated on a verified COMMIT CERTIFICATE or our own commit
+        // opinion; this function only asks.
         let req = ShareBatchSyncMessage::Request { seq };
         let payload = serde_json::to_vec(&req)
             .map_err(|e| GhostError::Serialization(format!("share batch sync request: {e}")))?;
@@ -554,6 +556,10 @@ impl ShareBatchHandler {
                         signers = cert.precommits.len(),
                         "SBC: adopting a synced batch on a verified commit certificate"
                     );
+                    // Keep the proof. Otherwise coverage only ever shrinks — a node that caught up
+                    // via sync answered later requests with no certificate at all, so a laggard
+                    // behind a laggard could never adopt.
+                    self.chain.remember_certificate(cert, now);
                 } else {
                     // No certificate and no commit opinion: we cannot establish that this sequence
                     // was decided, so we do not adopt. Full stop.
