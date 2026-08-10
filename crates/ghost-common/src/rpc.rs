@@ -657,7 +657,15 @@ impl BitcoinRpc {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let age = now.saturating_sub(last);
+        // A backwards clock step (NTP correction, VM/host time sync, suspend-resume) makes `now`
+        // earlier than the recorded success. `saturating_sub` reports that as age 0 — i.e. a
+        // success that may be arbitrarily old reads as the freshest possible, and a dead Core
+        // passes the very check that exists to notice silence. Age we cannot compute is not
+        // evidence of liveness, so report it the same way as "never succeeded": not reachable,
+        // age unknown.
+        let Some(age) = now.checked_sub(last) else {
+            return (false, u64::MAX);
+        };
         (age <= stale_after, age)
     }
 
@@ -2188,6 +2196,44 @@ mod tests {
         assert!(
             !reachable,
             "a success {age}s old must not count with a 0s budget"
+        );
+    }
+
+    /// A backwards clock step must not resurrect a stale success.
+    ///
+    /// This test exists because the sleep-based test above failed intermittently on a host whose
+    /// clock stepped backwards under load: `now < last` fed `saturating_sub`, which reported age 0,
+    /// and the deadest possible Core read as the freshest. Driven by stamping a success in the
+    /// FUTURE, which is the same arithmetic a backwards step produces, and needs no sleep — so
+    /// unlike the test above it cannot be perturbed by the very clock behaviour it checks.
+    #[test]
+    fn a_clock_step_backwards_does_not_make_a_stale_success_look_fresh() {
+        let rpc = BitcoinRpc::new("127.0.0.1", 8332, "u", "p").expect("rpc");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Success recorded an hour "ahead" — what a node sees after its clock is corrected back.
+        rpc.last_success_ts
+            .store(now + 3_600, std::sync::atomic::Ordering::Relaxed);
+
+        let (reachable, age) = rpc.core_liveness(0);
+        assert!(
+            !reachable,
+            "an uncomputable age must not count as reachable (got age {age})"
+        );
+        assert_eq!(
+            age,
+            u64::MAX,
+            "an uncomputable age reports as unknown, like a client that never succeeded"
+        );
+
+        // And a generous budget must not rescue it either — the point is that the age is unknown,
+        // not that it is merely large.
+        let (reachable_generous, _) = rpc.core_liveness(86_400);
+        assert!(
+            !reachable_generous,
+            "a budget cannot make an uncomputable age into evidence of liveness"
         );
     }
 
