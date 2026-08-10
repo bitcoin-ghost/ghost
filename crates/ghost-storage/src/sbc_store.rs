@@ -533,11 +533,16 @@ mod tests {
 
     /// `close_ts` and `finalised_at` are different facts and must not be conflated.
     ///
-    /// `close_ts` is when the PROPOSER closed the batch; `finalised_at` is when THIS node adopted
-    /// it. The next sequence opens on adoption, so the stall-escalation clock runs from
-    /// `finalised_at`. Reading `close_ts` instead started escalation from the genesis checkpoint's
-    /// cutoff, which on ghost-vm8 was 32,473 s (9 h) before adoption — leaving the rota permanently
-    /// escalated and rotating the turn every 90 s instead of giving a proposer a stable one.
+    /// `close_ts` is when the PROPOSER closed the batch and lives inside it, so every node that
+    /// adopted a head holds it byte for byte. `finalised_at` is when THIS node adopted it — local
+    /// wall-clock, and therefore different on every node.
+    ///
+    /// The stall-escalation clock runs from `close_ts`, because whose turn it is is a CONSENSUS
+    /// decision. An earlier version ran it from `finalised_at` — and this doc used to argue for
+    /// that — which left ghost-vm8 reading escalation 173 where its peers read 42: 128 steps
+    /// apart against a grace window of 1, so it held every batch with `ProposerNotDue` and the
+    /// chain could not close a sequence. Both columns are stored because "when did I adopt this"
+    /// is useful for diagnosis; only `close_ts` decides anything.
     #[test]
     fn the_head_reports_adoption_time_separately_from_close_time() {
         let db = db();

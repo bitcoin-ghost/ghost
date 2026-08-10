@@ -99,6 +99,16 @@ pub struct ShadowChain {
     /// `finalise` takes it exclusive for the span of the mutation. Nothing takes it while holding
     /// `quarantine` or `consensus`, so the established quarantine -> consensus order is untouched.
     adoption: parking_lot::RwLock<()>,
+    /// Set when this node's balances are folded PAST its head — it crashed between the two
+    /// writes in `finalise`.
+    ///
+    /// Latched, not merely logged. Detecting that and carrying on is the "check that cannot fail"
+    /// pattern: while the affected sequence is open, this node would build a batch whose
+    /// `state_root` came from over-folded balances (every peer still on the old head FAULTS it, so
+    /// the crashed node is quarantined fleet-wide) and would judge peers' proposals against the
+    /// same poisoned state, quarantining honest proposers. Both are persistent and
+    /// operator-release-only — precisely the damage class this design keeps removing.
+    poisoned: std::sync::atomic::AtomicBool,
     /// Shares dropped because the pool hit its ceiling. Non-zero means the chain is not draining.
     pending_dropped: std::sync::atomic::AtomicU64,
     /// The adopted head, or `None` before genesis.
@@ -240,8 +250,10 @@ impl ShadowChain {
         // never ahead of its state; the reverse is survivable but must not be silent, because
         // `sbc_store_batch` is idempotent while the FOLD is not — re-adopting that sequence would
         // fold it twice, and every later state root would be wrong for good.
+        let mut poisoned = false;
         if let (Some(h), Ok(Some(bal_seq))) = (head.as_ref(), db.sbc_balances_seq()) {
             if bal_seq > h.seq {
+                poisoned = true;
                 error!(
                     head_seq = h.seq,
                     balances_seq = bal_seq,
@@ -276,6 +288,7 @@ impl ShadowChain {
             db,
             pending: Mutex::new(BTreeMap::new()),
             adoption: parking_lot::RwLock::new(()),
+            poisoned: std::sync::atomic::AtomicBool::new(poisoned),
             pending_dropped: std::sync::atomic::AtomicU64::new(0),
             head: RwLock::new(head),
             balances: RwLock::new(balances),
@@ -385,6 +398,14 @@ impl ShadowChain {
         true
     }
 
+    /// Whether this node's persisted state is internally inconsistent after a crash.
+    ///
+    /// While set, the node neither proposes nor judges — both would quarantine somebody
+    /// permanently for a fault that is ours.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
+    }
+
     /// How many shares this node has dropped for want of a draining chain.
     pub fn pending_dropped(&self) -> u64 {
         self.pending_dropped.load(Ordering::Relaxed)
@@ -413,6 +434,12 @@ impl ShadowChain {
         // Before genesis there is nothing to build on. The caller must run the genesis ceremony
         // first; proposing seq 0 from here would be starting a chain from nothing, which is a
         // chain anybody could start.
+        // Proposing from over-folded balances emits a batch every peer on the old head FAULTS,
+        // so this node would quarantine ITSELF fleet-wide for its own crash.
+        if self.is_poisoned() {
+            return None;
+        }
+
         // Same consistent snapshot as the judging path. A torn read here emits a batch whose
         // `prev_batch_hash` names one head while its `state_root` was computed from another's
         // balances — self-inconsistent, and every peer still on the old head FAULTS it, so this
@@ -593,6 +620,15 @@ impl ShadowChain {
     ) -> PhaseAction {
         if self.restored_quarantine.read().contains(&batch.proposer) {
             return PhaseAction::ProposerQuarantined;
+        }
+
+        // A node whose balances are folded past its head judges against over-folded state, and
+        // `StateRootMismatch` is a FAULT — it would quarantine honest proposers for its own crash.
+        // Hold everything until an operator resets it.
+        if self.is_poisoned() {
+            return PhaseAction::Hold {
+                reason: ghost_common::batch_consensus::DeferReason::ParentMismatch,
+            };
         }
 
         // ONE consistent snapshot, under the adoption guard. Reading the parent and the balances
@@ -1705,6 +1741,77 @@ mod tests {
                 .map(|b| b.batch_hash()),
             Some(batch.batch_hash()),
             "the proposer must hold its own batch"
+        );
+    }
+
+    /// **Audit 11, finding 1.** A node with balances folded past its head proposes and judges
+    /// NOTHING.
+    ///
+    /// Detecting that and carrying on is the "check that cannot fail" pattern. While the affected
+    /// sequence is open, such a node builds batches whose `state_root` came from over-folded
+    /// balances — which every peer still on the old head FAULTS, quarantining the crashed node
+    /// fleet-wide — and judges peers' proposals against the same poisoned state, quarantining
+    /// honest proposers. Both are persistent and operator-release-only.
+    #[test]
+    fn a_node_whose_balances_outran_its_head_refuses_to_propose_or_judge() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        seed_checkpoint(&db, 961_642, 1_786_228_093);
+
+        // Genesis, then fold the balances forward WITHOUT storing a batch — exactly the state a
+        // crash between `finalise`'s two writes leaves behind.
+        {
+            let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+            chain
+                .bootstrap_genesis(961_642, 1_786_228_093)
+                .expect("bootstrap")
+                .expect("converted");
+            let head = chain.head().expect("head");
+            db.sbc_save_balances(&chain.balances(), head.seq + 1)
+                .expect("save ahead");
+        }
+
+        // A fresh load must notice and latch.
+        let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+        assert!(
+            chain.is_poisoned(),
+            "balances ahead of the head must be detected at load"
+        );
+
+        for salt in 0..3u8 {
+            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+        }
+        let schedule = ProposerSchedule::new(chain.voter_ids());
+        let head = chain.head().expect("head");
+
+        assert!(
+            chain
+                .try_propose(&schedule, head.close_ts + 5, 64_000)
+                .is_none(),
+            "a poisoned node must not propose — peers would fault the batch and quarantine it"
+        );
+
+        let batch = ShareBatch {
+            seq: head.seq + 1,
+            prev_batch_hash: head.batch_hash,
+            close_ts: head.close_ts + 30,
+            proposer: id.node_id(),
+            shares: Vec::new(),
+            settled_blocks: Vec::new(),
+            node_shares: Vec::new(),
+            state_root: [0u8; 32],
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: Vec::new(),
+        };
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        assert!(
+            matches!(
+                chain.on_proposal_phase(&batch, &schedule, &checks, head.close_ts + 30),
+                PhaseAction::Hold { .. }
+            ),
+            "a poisoned node must HOLD, never fault — the inconsistency is ours, not the peer's"
         );
     }
 
