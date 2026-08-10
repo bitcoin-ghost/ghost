@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use ghost_common::batch_consensus::{ProposerSchedule, SeqTally, SeqVoteLock};
 use ghost_common::batch_driver::{
@@ -762,6 +762,50 @@ impl ShadowChain {
         let mut mine = self.my_proposal.lock();
         if mine.as_ref().is_some_and(|((s, _), _)| *s < seq) {
             *mine = None;
+        }
+    }
+
+    /// Adopt a batch a COMMIT CERTIFICATE has already proved was committed.
+    ///
+    /// The proposer rota is not consulted — a quorum of signed precommits settles whose turn it
+    /// was far more strongly than re-deriving the rota from a clock. That matters because
+    /// `authorise` measures escalation from `(now - parent.close_ts)`, so for history `now` is
+    /// arbitrary and the original proposer falls inside the +/-1 window only about a quarter of the
+    /// time: cert-verified batches were being bounced with `ProposerNotDue` on most attempts, and
+    /// the failure path does not re-request.
+    ///
+    /// Everything else is still checked — linkage, membership, share validity, canonical order,
+    /// and the state root reproducing locally.
+    pub fn adopt_committed_batch<C: ghost_common::batch_consensus::BatchChecks>(
+        &self,
+        batch: &ShareBatch,
+        checks: &C,
+        now: i64,
+    ) -> GhostResult<Option<Finalised>> {
+        use ghost_common::batch_consensus::{verify_committed_batch, BatchVerdict};
+
+        let parent = match self.parent_for(batch.seq) {
+            Ok(p) => p,
+            Err(reason) => {
+                debug!(
+                    seq = batch.seq,
+                    ?reason,
+                    "SBC: cannot place a committed batch yet"
+                );
+                return Ok(None);
+            }
+        };
+        let balances = self.balances();
+        match verify_committed_batch(batch, &parent, &balances, checks) {
+            BatchVerdict::Valid { .. } => self.finalise(batch, now).map(Some),
+            other => {
+                warn!(
+                    seq = batch.seq,
+                    ?other,
+                    "SBC: a certified batch does not verify locally — refusing to adopt"
+                );
+                Ok(None)
+            }
         }
     }
 

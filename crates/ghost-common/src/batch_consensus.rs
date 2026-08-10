@@ -272,7 +272,6 @@ pub fn verify_batch<C: BatchChecks>(
     now: i64,
     checks: &C,
 ) -> BatchVerdict {
-    use crate::share_batch::{canonical_cmp, compute_state_root, fold_shares};
     use std::cmp::Ordering;
 
     // --- position in the chain: are we even looking at the same place? ---
@@ -296,6 +295,7 @@ pub fn verify_batch<C: BatchChecks>(
     }
 
     // --- whose turn: the sequence opened when its parent closed, which every node agrees on ---
+    //
     let round = match schedule.authorise(batch.seq, &batch.proposer, parent.close_ts, now) {
         Authorisation::Authorised { escalation } => escalation,
         Authorisation::TooEarly { escalation } => {
@@ -303,6 +303,68 @@ pub fn verify_batch<C: BatchChecks>(
         }
         Authorisation::NotAProposer => return BatchVerdict::Defer(DeferReason::ProposerNotDue),
     };
+
+    verify_batch_contents(batch, parent, parent_balances, checks, round)
+}
+
+/// Verify a batch that a COMMIT CERTIFICATE has already proved was committed.
+///
+/// Identical to [`verify_batch`] except the proposer rota is not consulted. That is not a
+/// relaxation: a certificate is a quorum of signed precommits, and a quorum deciding a batch
+/// settles whose turn it was far more strongly than re-deriving the rota from a clock could.
+///
+/// Everything that makes a synced batch safe is still checked — it must link to our parent,
+/// declare the same membership, carry only valid shares in canonical order, and reproduce its own
+/// state root.
+pub fn verify_committed_batch<C: BatchChecks>(
+    batch: &crate::share_batch::ShareBatch,
+    parent: &crate::share_batch::ShareBatch,
+    parent_balances: &BTreeMap<String, i64>,
+    checks: &C,
+) -> BatchVerdict {
+    use std::cmp::Ordering;
+
+    // Position still matters: a batch that does not follow our head cannot be folded onto it,
+    // certificate or not.
+    match batch.seq.cmp(&parent.seq.saturating_add(1)) {
+        Ordering::Less => {
+            return BatchVerdict::Defer(DeferReason::Stale {
+                batch_seq: batch.seq,
+                our_seq: parent.seq,
+            })
+        }
+        Ordering::Greater => {
+            return BatchVerdict::Defer(DeferReason::AheadOfUs {
+                batch_seq: batch.seq,
+                our_seq: parent.seq,
+            })
+        }
+        Ordering::Equal => {}
+    }
+    if batch.prev_batch_hash != parent.batch_hash() {
+        return BatchVerdict::Defer(DeferReason::ParentMismatch);
+    }
+    verify_batch_contents(batch, parent, parent_balances, checks, 0)
+}
+
+/// Everything about a batch that is its own fault, independent of whose turn it was.
+///
+/// Split out so a batch already proved committed can be checked without the rota. A commit
+/// certificate is a quorum of signed precommits, which SUBSUMES "was the proposer due" — the fleet
+/// settled that when it committed. Re-asking is not extra safety, it is a bug: `authorise`
+/// measures escalation from `(now - parent.close_ts)`, and for a batch synced long after the fact
+/// `now` is arbitrary, so the original proposer sits inside the +/-1 window only about a quarter of
+/// the time. A cert-verified batch was being bounced with `ProposerNotDue` on most attempts, and
+/// the failure path does not even re-request.
+fn verify_batch_contents<C: BatchChecks>(
+    batch: &crate::share_batch::ShareBatch,
+    parent: &crate::share_batch::ShareBatch,
+    parent_balances: &BTreeMap<String, i64>,
+    checks: &C,
+    round: u32,
+) -> BatchVerdict {
+    use crate::share_batch::{canonical_cmp, compute_state_root, fold_shares};
+    use std::cmp::Ordering;
 
     // --- from here on, every failure is the batch's own fault ---
 
@@ -1176,5 +1238,141 @@ mod tests {
             "the boundary itself stays"
         );
         assert_eq!(lock.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod committed_history_tests {
+    use super::*;
+    use crate::share_batch::{compute_state_root, fold_shares, ShareBatch};
+    use crate::types::ShareProof;
+
+    struct AllGood;
+    impl BatchChecks for AllGood {
+        fn share_is_valid(&self, _: &ShareProof) -> bool {
+            true
+        }
+        fn proposer_signed(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    const PARENT_CLOSE: i64 = 1_000;
+
+    fn parent() -> ShareBatch {
+        ShareBatch {
+            seq: 0,
+            prev_batch_hash: [0u8; 32],
+            close_ts: PARENT_CLOSE,
+            proposer: [0u8; 32],
+            shares: vec![],
+            settled_blocks: vec![],
+            node_shares: vec![([1u8; 32], 5)],
+            state_root: compute_state_root(&BTreeMap::new(), 0, PARENT_CLOSE),
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: vec![],
+        }
+    }
+
+    fn child(p: &ShareBatch, proposer: [u8; 32]) -> ShareBatch {
+        let mut after: BTreeMap<String, i64> = BTreeMap::new();
+        let shares: Vec<ShareProof> = vec![];
+        fold_shares(&mut after, &shares);
+        let close_ts = p.close_ts + 30;
+        ShareBatch {
+            seq: p.seq + 1,
+            prev_batch_hash: p.batch_hash(),
+            close_ts,
+            proposer,
+            shares,
+            settled_blocks: vec![],
+            node_shares: p.node_shares.clone(),
+            state_root: compute_state_root(&after, p.seq + 1, close_ts),
+            truncated: false,
+            pending_count: 0,
+            proposer_signature: vec![9],
+        }
+    }
+
+    /// **Audit 8, finding A2.** A certified batch adopts whatever the rota says now.
+    ///
+    /// `authorise` measures escalation from `(now - parent.close_ts)`, so for a batch synced long
+    /// after the fact `now` is arbitrary and the original proposer lands inside the ±1 window only
+    /// about a quarter of the time. A batch whose commit certificate had ALREADY verified was
+    /// bounced with `ProposerNotDue` on most attempts — and that path does not re-request.
+    #[test]
+    fn a_certified_batch_verifies_whatever_the_rota_says_now() {
+        let s = ProposerSchedule::new((1..=8u8).map(|n| [n; 32]));
+        let p = parent();
+        let balances = BTreeMap::new();
+
+        let due = s.proposer_at(1, 0).expect("due");
+        let b = child(&p, due);
+
+        // Sample a full rotation rather than one arbitrary instant. Writing this with a single
+        // "an hour later" picked +3600 s — escalation 40, and 40 % 8 == 0, so the rota had turned
+        // all the way back to the SAME proposer and the precondition silently did not hold. A
+        // magic offset here tests the calendar, not the code.
+        let mut rejected_somewhere = false;
+        for step in 2..12u32 {
+            let later = PARENT_CLOSE + (STALL_ESCALATION_SECS * step as i64);
+            if matches!(
+                verify_batch(&b, &p, &balances, &s, later, &AllGood),
+                BatchVerdict::Defer(DeferReason::ProposerNotDue)
+            ) {
+                rejected_somewhere = true;
+                // And at that very same instant the committed path must accept it.
+                assert!(
+                    matches!(
+                        verify_committed_batch(&b, &p, &balances, &AllGood),
+                        BatchVerdict::Valid { .. }
+                    ),
+                    "certified history must adopt at step {step}, where the rota rejects it"
+                );
+            }
+        }
+        assert!(
+            rejected_somewhere,
+            "precondition: the ordinary path must reject history on the rota at some step"
+        );
+
+        assert!(
+            matches!(
+                verify_committed_batch(&b, &p, &balances, &AllGood),
+                BatchVerdict::Valid { .. }
+            ),
+            "a batch already proved committed must not be re-judged on whose turn it was"
+        );
+    }
+
+    /// Skipping the rota must NOT skip anything that makes a synced batch safe.
+    #[test]
+    fn a_certified_batch_still_has_to_link_and_reproduce() {
+        let s = ProposerSchedule::new((1..=8u8).map(|n| [n; 32]));
+        let p = parent();
+        let balances = BTreeMap::new();
+        let due = s.proposer_at(1, 0).expect("due");
+
+        let mut orphan = child(&p, due);
+        orphan.prev_batch_hash = [0xFF; 32];
+        assert!(matches!(
+            verify_committed_batch(&orphan, &p, &balances, &AllGood),
+            BatchVerdict::Defer(DeferReason::ParentMismatch)
+        ));
+
+        let mut wrong = child(&p, due);
+        wrong.state_root = [0xFF; 32];
+        assert!(matches!(
+            verify_committed_batch(&wrong, &p, &balances, &AllGood),
+            BatchVerdict::Fault(FaultReason::StateRootMismatch { .. })
+        ));
+
+        let mut rewritten = child(&p, due);
+        rewritten.node_shares.push(([0xEE; 32], 5));
+        assert!(matches!(
+            verify_committed_batch(&rewritten, &p, &balances, &AllGood),
+            BatchVerdict::Fault(FaultReason::MembershipChanged { .. })
+        ));
     }
 }

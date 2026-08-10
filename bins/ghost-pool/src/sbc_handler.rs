@@ -514,9 +514,31 @@ impl ShareBatchHandler {
                         return Ok(());
                     }
                 } else if let Some(cert) = cert.as_ref().filter(|c| {
+                    // Verified against the membership IN FORCE AT THAT SEQUENCE, not the current
+                    // set. Those are the same today only because membership is fixed from genesis;
+                    // the moment it can change, checking against `schedule()` would make every
+                    // certificate minted before the change unverifiable, stranding all prior
+                    // history exactly when catch-up matters most.
+                    //
+                    // The batch carries the membership it was agreed under, and `verify_batch`
+                    // faults any batch whose set differs from its parent's — so requiring it to
+                    // match OUR set first means the certificate is checked against a membership we
+                    // and the chain both agree on, rather than one the sender chose.
+                    let batch_voters: Vec<ghost_common::types::NodeId> = {
+                        let mut v: Vec<_> = batch.node_shares.iter().map(|(n, _)| *n).collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    if batch_voters != self.chain.voter_ids() {
+                        warn!(
+                            seq,
+                            "SBC: synced batch declares a membership we do not hold — refused"
+                        );
+                        return false;
+                    }
                     c.seq == seq
                         && c.batch_hash == batch.batch_hash()
-                        && c.verify(schedule.voters(), schedule.quorum())
+                        && c.verify(&batch_voters, schedule.quorum())
                 }) {
                     // A VERIFIED certificate settles it outright. Every signature checks against
                     // the precommit domain for exactly this (seq, round, hash), every signer is a
@@ -553,15 +575,26 @@ impl ShareBatchHandler {
                     );
                     return Ok(());
                 }
-                match self
-                    .chain
-                    .on_proposal_phase(&batch, &schedule, &checks, now)
-                {
-                    PhaseAction::Prevote { .. } => match self.chain.finalise(&batch, now) {
-                        Ok(f) => info!(seq = f.seq, "SBC: adopted a synced batch"),
-                        Err(e) => warn!(seq, error = %e, "SBC: synced batch does not reproduce"),
-                    },
-                    other => debug!(seq, ?other, "SBC: synced batch not adopted"),
+                // Adopted WITHOUT re-asking the rota. Reaching here means either a verified
+                // certificate or our own commit opinion already established that a quorum decided
+                // this batch, and that settles whose turn it was more strongly than re-deriving
+                // the rota from a clock could. Re-asking was not extra safety: `authorise`
+                // measures escalation from `(now - parent.close_ts)`, so for history `now` is
+                // arbitrary and a certified batch was bounced with `ProposerNotDue` most of the
+                // time — with no re-request on that path.
+                match self.chain.adopt_committed_batch(&batch, &checks, now) {
+                    Ok(Some(f)) => {
+                        info!(seq = f.seq, "SBC: adopted a synced batch");
+                        // Keep going while we are behind. Catch-up used to advance at most one
+                        // sequence per incoming trigger, which is at or below the fleet's own
+                        // commit rate — so a gap never closed even when every certificate
+                        // verified.
+                        if let Err(e) = self.request_sync(seq + 1) {
+                            debug!(seq = seq + 1, error = %e, "SBC: could not chain the next sync");
+                        }
+                    }
+                    Ok(None) => debug!(seq, "SBC: synced batch not adopted"),
+                    Err(e) => warn!(seq, error = %e, "SBC: synced batch does not reproduce"),
                 }
             }
         }
