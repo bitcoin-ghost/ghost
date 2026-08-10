@@ -39,6 +39,16 @@ pub const STALL_ESCALATION_SECS: i64 = 90;
 /// proposing at once and splitting its own vote.
 pub const ESCALATION_GRACE_STEPS: u32 = 1;
 
+/// D10: how much older than its batch's `close_ts` a share may be — 30 days.
+///
+/// From `docs/SHARE_BATCH_CHAIN.md`: "Share age bound is batch-relative:
+/// `0 ≤ close_ts − share.timestamp ≤ 30 days`, evaluated identically by every node (never against
+/// local clocks)." Generous on purpose — a tight bound destroys real miner work during a stall,
+/// and this fleet has had a 4-day one. The bound is measured against the batch's OWN `close_ts`,
+/// which is consensus data, so history re-verified during sync judges the same way it was judged
+/// live.
+pub const MAX_SHARE_AGE_SECS: i64 = 30 * 86_400;
+
 /// Whether a node may propose a given sequence right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authorisation {
@@ -199,6 +209,35 @@ pub enum FaultReason {
     DuplicateShare { share_hash: [u8; 32] },
     /// A share does not prove itself: bad PoW or a bad GHOST-09 signature.
     InvalidShare { share_hash: [u8; 32] },
+    /// A share attributed to a node other than the batch's proposer.
+    ///
+    /// A node batches only what IT received (`received_by == proposer`) — that is the invariant
+    /// that makes eight per-node batches sum to the pool without double-counting, and it was
+    /// enforced only at honest ingest. Decidable from the batch's own bytes, so it belongs here:
+    /// the GHOST-09 signature already binds `received_by`, meaning a batch tripping this is a
+    /// proposer claiming another node's work, not a view difference.
+    ShareNotReceivedByProposer { share_hash: [u8; 32] },
+    /// A share whose claimed difficulty is not creditable: non-finite, non-positive, or beyond
+    /// [`crate::share_batch::MAX_CREDIT_DIFFICULTY`] — the range where `micro_work`'s saturating
+    /// cast would let one share capture an entire balance.
+    ShareDifficultyNotCreditable { share_hash: [u8; 32] },
+    /// A share outside the D10 age bound: `0 ≤ close_ts − timestamp ≤ 30 days`.
+    ///
+    /// Both sides are the batch's fault: a share "from the future" relative to the proposer's own
+    /// stated `close_ts`, or one so old it predates any window the fleet has agreed to honour.
+    /// Judged against the batch's own `close_ts` — consensus data — never a local clock, so no
+    /// honest node can reach a different verdict.
+    ShareOutsideAgeBound {
+        share_hash: [u8; 32],
+        timestamp: u64,
+        close_ts: i64,
+    },
+    /// A share at or before the proposer's adopted high-water mark — the same share re-batched.
+    ///
+    /// In-batch duplication is `DuplicateShare`; this is the CROSS-batch replay it never covered.
+    /// The watermark is derived from the adopted chain, so like `StateRootMismatch` it is
+    /// decidable from the batch's bytes plus finalised state every node shares.
+    ShareReplayed { share_hash: [u8; 32] },
     /// The claimed state root is not what folding these shares onto the parent state gives.
     StateRootMismatch {
         claimed: [u8; 32],
@@ -264,10 +303,13 @@ pub trait BatchChecks {
 /// one, because the response to a bad one cannot be taken back.
 ///
 /// `parent_balances` are the running balances after the parent — the state this batch folds onto.
+/// `watermarks` are the per-proposer high-water marks after the parent, the same kind of adopted
+/// state, guarding cross-batch share replay.
 pub fn verify_batch<C: BatchChecks>(
     batch: &crate::share_batch::ShareBatch,
     parent: &crate::share_batch::ShareBatch,
     parent_balances: &BTreeMap<String, i64>,
+    watermarks: &crate::share_batch::ProposerWatermarks,
     schedule: &ProposerSchedule,
     now: i64,
     checks: &C,
@@ -304,7 +346,7 @@ pub fn verify_batch<C: BatchChecks>(
         Authorisation::NotAProposer => return BatchVerdict::Defer(DeferReason::ProposerNotDue),
     };
 
-    verify_batch_contents(batch, parent, parent_balances, checks, round)
+    verify_batch_contents(batch, parent, parent_balances, watermarks, checks, round)
 }
 
 /// Verify a batch that a COMMIT CERTIFICATE has already proved was committed.
@@ -320,6 +362,7 @@ pub fn verify_committed_batch<C: BatchChecks>(
     batch: &crate::share_batch::ShareBatch,
     parent: &crate::share_batch::ShareBatch,
     parent_balances: &BTreeMap<String, i64>,
+    watermarks: &crate::share_batch::ProposerWatermarks,
     checks: &C,
 ) -> BatchVerdict {
     use std::cmp::Ordering;
@@ -344,7 +387,7 @@ pub fn verify_committed_batch<C: BatchChecks>(
     if batch.prev_batch_hash != parent.batch_hash() {
         return BatchVerdict::Defer(DeferReason::ParentMismatch);
     }
-    verify_batch_contents(batch, parent, parent_balances, checks, 0)
+    verify_batch_contents(batch, parent, parent_balances, watermarks, checks, 0)
 }
 
 /// Everything about a batch that is its own fault, independent of whose turn it was.
@@ -360,10 +403,13 @@ fn verify_batch_contents<C: BatchChecks>(
     batch: &crate::share_batch::ShareBatch,
     parent: &crate::share_batch::ShareBatch,
     parent_balances: &BTreeMap<String, i64>,
+    watermarks: &crate::share_batch::ProposerWatermarks,
     checks: &C,
     round: u32,
 ) -> BatchVerdict {
-    use crate::share_batch::{canonical_cmp, compute_state_root, fold_shares};
+    use crate::share_batch::{
+        canonical_cmp, compute_state_root, creditable_difficulty, fold_shares,
+    };
     use std::cmp::Ordering;
 
     // --- from here on, every failure is the batch's own fault ---
@@ -401,6 +447,51 @@ fn verify_batch_contents<C: BatchChecks>(
             }
             Ordering::Greater => {
                 return BatchVerdict::Fault(FaultReason::SharesOutOfOrder { at_index: i + 1 })
+            }
+        }
+    }
+
+    // Cross-batch replay: every share must sort STRICTLY after this proposer's adopted
+    // high-water mark. The loop above has already proved the shares strictly increasing, so
+    // checking the FIRST share suffices — this is the O(1) that replaces a per-share index.
+    if let (Some(watermark), Some(first)) = (watermarks.get(&batch.proposer), batch.shares.first())
+    {
+        if (first.timestamp, first.share_hash) <= *watermark {
+            return BatchVerdict::Fault(FaultReason::ShareReplayed {
+                share_hash: first.share_hash,
+            });
+        }
+    }
+
+    // Cheap per-share structural checks before the expensive cryptographic ones, so a batch that
+    // is wrong on its face costs no hashing.
+    for share in &batch.shares {
+        // A node batches only what IT received. Ingest enforces this for a node's own pool;
+        // verification is where it binds a PROPOSER, or a batch could carry shares attributed to
+        // other nodes.
+        if share.received_by != batch.proposer {
+            return BatchVerdict::Fault(FaultReason::ShareNotReceivedByProposer {
+                share_hash: share.share_hash,
+            });
+        }
+        // The credit range guard: `micro_work`'s saturating cast means an unbounded difficulty is
+        // an unbounded credit. See `MAX_CREDIT_DIFFICULTY` — and note this is NOT the fix for
+        // adaptive difficulty claims; that is the WP-1b tier commitment.
+        if !creditable_difficulty(share.difficulty) {
+            return BatchVerdict::Fault(FaultReason::ShareDifficultyNotCreditable {
+                share_hash: share.share_hash,
+            });
+        }
+        // D10: 0 ≤ close_ts − timestamp ≤ 30 days, against the batch's OWN close_ts. A timestamp
+        // that does not even fit i64 is out of bound by construction.
+        match i64::try_from(share.timestamp) {
+            Ok(ts) if ts <= batch.close_ts && batch.close_ts - ts <= MAX_SHARE_AGE_SECS => {}
+            _ => {
+                return BatchVerdict::Fault(FaultReason::ShareOutsideAgeBound {
+                    share_hash: share.share_hash,
+                    timestamp: share.timestamp,
+                    close_ts: batch.close_ts,
+                })
             }
         }
     }
@@ -833,7 +924,7 @@ mod tests {
         }
     }
 
-    fn a_share(ts: u64, byte: u8, addr: &str, work: f64) -> ShareProof {
+    fn a_share(ts: u64, byte: u8, addr: &str, work: f64, received_by: [u8; 32]) -> ShareProof {
         ShareProof {
             round_id: 1,
             miner_id: [byte; 32],
@@ -841,7 +932,7 @@ mod tests {
             work,
             share_hash: [byte; 32],
             timestamp: ts,
-            received_by: [0u8; 32],
+            received_by,
             template_id: None,
             payout_address: Some(addr.to_string()),
             header: None,
@@ -850,6 +941,12 @@ mod tests {
     }
 
     const PARENT_CLOSE: i64 = 1_700_000_000;
+    /// Share timestamps sit just before the child's close, inside the D10 age bound.
+    const SHARE_TS: u64 = PARENT_CLOSE as u64 + 10;
+
+    fn no_wm() -> crate::share_batch::ProposerWatermarks {
+        crate::share_batch::ProposerWatermarks::new()
+    }
 
     fn a_parent() -> ShareBatch {
         ShareBatch {
@@ -859,6 +956,7 @@ mod tests {
             proposer: voter(1),
             shares: vec![],
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root: [0x22; 32],
             truncated: false,
@@ -868,15 +966,18 @@ mod tests {
     }
 
     /// A well-formed child of `a_parent()`, proposed by whoever is actually due at escalation 0.
+    /// Its shares are received by the proposer and timestamped inside the D10 window, because
+    /// verification now checks both.
     fn a_child(
         parent: &ShareBatch,
         schedule: &ProposerSchedule,
     ) -> (ShareBatch, BTreeMap<String, i64>) {
         let parent_balances: BTreeMap<String, i64> = BTreeMap::new();
+        let proposer = schedule.proposer_at(parent.seq + 1, 0).unwrap();
         let mut shares = vec![
-            a_share(1000, 1, "bc1qalice", 1.5),
-            a_share(1000, 2, "bc1qbob", 2.5),
-            a_share(1001, 3, "bc1qalice", 0.25),
+            a_share(SHARE_TS, 1, "bc1qalice", 1.5, proposer),
+            a_share(SHARE_TS, 2, "bc1qbob", 2.5, proposer),
+            a_share(SHARE_TS + 1, 3, "bc1qalice", 0.25, proposer),
         ];
         crate::share_batch::canonical_sort(&mut shares);
 
@@ -889,9 +990,10 @@ mod tests {
             seq: parent.seq + 1,
             prev_batch_hash: parent.batch_hash(),
             close_ts,
-            proposer: schedule.proposer_at(parent.seq + 1, 0).unwrap(),
+            proposer,
             shares,
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root,
             truncated: false,
@@ -907,7 +1009,15 @@ mod tests {
         let parent = a_parent();
         let (batch, balances) = a_child(&parent, &s);
         assert_eq!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Valid { round: 0 }
         );
     }
@@ -924,7 +1034,7 @@ mod tests {
         let mut stale = good.clone();
         stale.seq = parent.seq;
         assert_eq!(
-            verify_batch(&stale, &parent, &balances, &s, now, &AllGood),
+            verify_batch(&stale, &parent, &balances, &no_wm(), &s, now, &AllGood),
             BatchVerdict::Defer(DeferReason::Stale {
                 batch_seq: parent.seq,
                 our_seq: parent.seq
@@ -934,7 +1044,7 @@ mod tests {
         let mut ahead = good.clone();
         ahead.seq = parent.seq + 5;
         assert_eq!(
-            verify_batch(&ahead, &parent, &balances, &s, now, &AllGood),
+            verify_batch(&ahead, &parent, &balances, &no_wm(), &s, now, &AllGood),
             BatchVerdict::Defer(DeferReason::AheadOfUs {
                 batch_seq: parent.seq + 5,
                 our_seq: parent.seq
@@ -944,7 +1054,15 @@ mod tests {
         let mut other_parent = good.clone();
         other_parent.prev_batch_hash = [0xFF; 32];
         assert_eq!(
-            verify_batch(&other_parent, &parent, &balances, &s, now, &AllGood),
+            verify_batch(
+                &other_parent,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                now,
+                &AllGood
+            ),
             BatchVerdict::Defer(DeferReason::ParentMismatch),
             "a different parent may be us on the wrong chain — sync, never accuse"
         );
@@ -952,7 +1070,7 @@ mod tests {
         let mut not_due = good.clone();
         not_due.proposer = s.proposer_at(parent.seq + 1, 4).unwrap();
         assert_eq!(
-            verify_batch(&not_due, &parent, &balances, &s, now, &AllGood),
+            verify_batch(&not_due, &parent, &balances, &no_wm(), &s, now, &AllGood),
             BatchVerdict::Defer(DeferReason::ProposerNotDue),
             "voter sets are not always identical across the fleet, so this cannot be terminal"
         );
@@ -960,7 +1078,7 @@ mod tests {
         let mut early = good.clone();
         early.proposer = s.proposer_at(parent.seq + 1, 1).unwrap();
         assert_eq!(
-            verify_batch(&early, &parent, &balances, &s, now, &AllGood),
+            verify_batch(&early, &parent, &balances, &no_wm(), &s, now, &AllGood),
             BatchVerdict::Defer(DeferReason::ProposerTooEarly { escalation: 1 })
         );
     }
@@ -982,7 +1100,15 @@ mod tests {
 
         assert!(
             matches!(
-                verify_batch(&broken, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+                verify_batch(
+                    &broken,
+                    &parent,
+                    &balances,
+                    &no_wm(),
+                    &s,
+                    PARENT_CLOSE + 1,
+                    &AllGood
+                ),
                 BatchVerdict::Defer(_)
             ),
             "out of position wins over any defect — the response to a fault cannot be taken back"
@@ -997,7 +1123,15 @@ mod tests {
         let (mut batch, balances) = a_child(&parent, &s);
         batch.shares.reverse();
         assert!(matches!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Fault(FaultReason::SharesOutOfOrder { .. })
         ));
     }
@@ -1011,7 +1145,15 @@ mod tests {
         let dup = batch.shares[0].clone();
         batch.shares.insert(1, dup);
         assert_eq!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Fault(FaultReason::DuplicateShare {
                 share_hash: batch.shares[0].share_hash
             })
@@ -1026,7 +1168,15 @@ mod tests {
         let (mut batch, balances) = a_child(&parent, &s);
         batch.state_root = [0xAB; 32];
         assert!(matches!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Fault(FaultReason::StateRootMismatch { .. })
         ));
     }
@@ -1043,7 +1193,15 @@ mod tests {
 
         assert!(
             matches!(
-                verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+                verify_batch(
+                    &batch,
+                    &parent,
+                    &balances,
+                    &no_wm(),
+                    &s,
+                    PARENT_CLOSE + 1,
+                    &AllGood
+                ),
                 BatchVerdict::Fault(FaultReason::StateRootMismatch { .. })
             ),
             "the root exists so that nearly the same is not the same"
@@ -1055,7 +1213,15 @@ mod tests {
         fold_shares(&mut expected, &batch.shares);
         batch.state_root = compute_state_root(&expected, batch.seq, batch.close_ts);
         assert_eq!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Valid { round: 0 }
         );
     }
@@ -1070,7 +1236,15 @@ mod tests {
 
         batch.pending_count = 12; // still truncated: false
         assert_eq!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Fault(FaultReason::TruncationContradiction {
                 truncated: false,
                 pending_count: 12
@@ -1080,7 +1254,15 @@ mod tests {
         batch.truncated = true;
         batch.pending_count = 0;
         assert!(matches!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Fault(FaultReason::TruncationContradiction { .. })
         ));
     }
@@ -1092,7 +1274,15 @@ mod tests {
         let (mut batch, balances) = a_child(&parent, &s);
         batch.close_ts = parent.close_ts;
         assert!(matches!(
-            verify_batch(&batch, &parent, &balances, &s, PARENT_CLOSE + 1, &AllGood),
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
             BatchVerdict::Fault(FaultReason::CloseTimeNotForward { .. })
         ));
     }
@@ -1107,6 +1297,7 @@ mod tests {
                 &batch,
                 &parent,
                 &balances,
+                &no_wm(),
                 &s,
                 PARENT_CLOSE + 1,
                 &RejectsShares
@@ -1125,11 +1316,224 @@ mod tests {
                 &batch,
                 &parent,
                 &balances,
+                &no_wm(),
                 &s,
                 PARENT_CLOSE + 1,
                 &RejectsSignature
             ),
             BatchVerdict::Fault(FaultReason::ProposerSignatureInvalid)
+        );
+    }
+
+    /// Recompute the state root after a test edits the shares, so a Valid expectation tests the
+    /// new check and not an incidental root mismatch.
+    fn reroot(batch: &mut ShareBatch, parent_balances: &BTreeMap<String, i64>) {
+        let mut after = parent_balances.clone();
+        fold_shares(&mut after, &batch.shares);
+        batch.state_root = compute_state_root(&after, batch.seq, batch.close_ts);
+    }
+
+    /// **A proposer may only batch what IT received.** Enforced at honest ingest since WP-5, but
+    /// ingest binds nobody — verification is where a proposer claiming another node's shares is
+    /// caught, and the GHOST-09 signature over `received_by` makes it provably deliberate.
+    #[test]
+    fn a_share_received_by_another_node_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.shares[1].received_by = [0xFE; 32];
+
+        assert_eq!(
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
+            BatchVerdict::Fault(FaultReason::ShareNotReceivedByProposer {
+                share_hash: batch.shares[1].share_hash
+            })
+        );
+    }
+
+    /// **The saturation capture.** `micro_work` saturates its cast, so one absurd difficulty used
+    /// to be worth `i64::MAX` micro-work. Anything non-finite, non-positive or beyond the credit
+    /// cap is a fault; the cap itself remains creditable.
+    #[test]
+    fn an_uncreditable_difficulty_is_a_fault_and_the_cap_itself_is_not() {
+        let s = eight();
+        let parent = a_parent();
+
+        for bad in [f64::MAX, f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let (mut batch, balances) = a_child(&parent, &s);
+            batch.shares[0].difficulty = bad;
+            assert_eq!(
+                verify_batch(
+                    &batch,
+                    &parent,
+                    &balances,
+                    &no_wm(),
+                    &s,
+                    PARENT_CLOSE + 1,
+                    &AllGood
+                ),
+                BatchVerdict::Fault(FaultReason::ShareDifficultyNotCreditable {
+                    share_hash: batch.shares[0].share_hash
+                }),
+                "difficulty {bad} must be a fault"
+            );
+        }
+
+        // The cap is the boundary of the creditable range, not the first illegal value.
+        let (mut batch, balances) = a_child(&parent, &s);
+        for share in &mut batch.shares {
+            share.difficulty = crate::share_batch::MAX_CREDIT_DIFFICULTY;
+        }
+        reroot(&mut batch, &balances);
+        assert_eq!(
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
+            BatchVerdict::Valid { round: 0 },
+            "the cap itself must remain creditable"
+        );
+    }
+
+    /// **D10.** A share older than 30 days relative to the batch's own `close_ts`, or timestamped
+    /// after it, is a fault — and both boundaries are inclusive-valid, so the bound cannot creep.
+    #[test]
+    fn a_share_outside_the_d10_age_bound_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+
+        // Too old: one second past the bound.
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.shares[0].timestamp = (batch.close_ts - MAX_SHARE_AGE_SECS - 1) as u64;
+        assert!(
+            matches!(
+                verify_batch(
+                    &batch,
+                    &parent,
+                    &balances,
+                    &no_wm(),
+                    &s,
+                    PARENT_CLOSE + 1,
+                    &AllGood
+                ),
+                BatchVerdict::Fault(FaultReason::ShareOutsideAgeBound { .. })
+            ),
+            "a share a second beyond 30 days must fault"
+        );
+
+        // From the future: after the proposer's own stated close.
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.shares[2].timestamp = (batch.close_ts + 1) as u64;
+        assert!(
+            matches!(
+                verify_batch(
+                    &batch,
+                    &parent,
+                    &balances,
+                    &no_wm(),
+                    &s,
+                    PARENT_CLOSE + 1,
+                    &AllGood
+                ),
+                BatchVerdict::Fault(FaultReason::ShareOutsideAgeBound { .. })
+            ),
+            "a share timestamped after close_ts must fault"
+        );
+
+        // A timestamp that does not even fit i64 is out of bound by construction, not a panic.
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.shares[2].timestamp = u64::MAX;
+        assert!(matches!(
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
+            BatchVerdict::Fault(FaultReason::ShareOutsideAgeBound { .. })
+        ));
+
+        // Both boundaries are valid: exactly 30 days old, and exactly at close.
+        let (mut batch, balances) = a_child(&parent, &s);
+        batch.shares[0].timestamp = (batch.close_ts - MAX_SHARE_AGE_SECS) as u64;
+        batch.shares[2].timestamp = batch.close_ts as u64;
+        assert_eq!(
+            verify_batch(
+                &batch,
+                &parent,
+                &balances,
+                &no_wm(),
+                &s,
+                PARENT_CLOSE + 1,
+                &AllGood
+            ),
+            BatchVerdict::Valid { round: 0 },
+            "the D10 boundaries themselves are legal"
+        );
+    }
+
+    /// **The cross-batch replay guard.** In-batch dedup never covered the same share re-batched a
+    /// sequence later; the proposer's high-water mark does, in O(1), because in-batch canonical
+    /// order is already strict.
+    #[test]
+    fn a_share_at_or_before_the_proposers_watermark_is_a_fault() {
+        let s = eight();
+        let parent = a_parent();
+        let (batch, balances) = a_child(&parent, &s);
+        let now = PARENT_CLOSE + 1;
+        let first = &batch.shares[0];
+        let last = batch.shares.last().expect("shares");
+
+        // The mark the fleet would hold after adopting THIS batch: replaying any of it must fault.
+        let mut adopted = no_wm();
+        crate::share_batch::advance_watermarks(&mut adopted, &batch);
+        assert_eq!(
+            verify_batch(&batch, &parent, &balances, &adopted, &s, now, &AllGood),
+            BatchVerdict::Fault(FaultReason::ShareReplayed {
+                share_hash: first.share_hash
+            }),
+            "a batch re-proposed after adoption is a replay"
+        );
+
+        // Equality is already a replay — strictly after, not at.
+        let mut at_first = no_wm();
+        at_first.insert(batch.proposer, (first.timestamp, first.share_hash));
+        assert!(matches!(
+            verify_batch(&batch, &parent, &balances, &at_first, &s, now, &AllGood),
+            BatchVerdict::Fault(FaultReason::ShareReplayed { .. })
+        ));
+
+        // A mark strictly below the first share allows the batch...
+        let mut below = no_wm();
+        below.insert(batch.proposer, (first.timestamp - 1, [0xFF; 32]));
+        assert_eq!(
+            verify_batch(&batch, &parent, &balances, &below, &s, now, &AllGood),
+            BatchVerdict::Valid { round: 0 }
+        );
+
+        // ...and ANOTHER proposer's mark, however high, is not this proposer's problem.
+        let mut other = no_wm();
+        other.insert([0xEE; 32], (last.timestamp + 100, [0xFF; 32]));
+        assert_eq!(
+            verify_batch(&batch, &parent, &balances, &other, &s, now, &AllGood),
+            BatchVerdict::Valid { round: 0 },
+            "watermarks are per-proposer"
         );
     }
 
@@ -1259,6 +1663,10 @@ mod committed_history_tests {
 
     const PARENT_CLOSE: i64 = 1_000;
 
+    fn no_wm() -> crate::share_batch::ProposerWatermarks {
+        crate::share_batch::ProposerWatermarks::new()
+    }
+
     fn parent() -> ShareBatch {
         ShareBatch {
             seq: 0,
@@ -1267,6 +1675,7 @@ mod committed_history_tests {
             proposer: [0u8; 32],
             shares: vec![],
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![([1u8; 32], 5)],
             state_root: compute_state_root(&BTreeMap::new(), 0, PARENT_CLOSE),
             truncated: false,
@@ -1287,6 +1696,7 @@ mod committed_history_tests {
             proposer,
             shares,
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: p.node_shares.clone(),
             state_root: compute_state_root(&after, p.seq + 1, close_ts),
             truncated: false,
@@ -1318,14 +1728,14 @@ mod committed_history_tests {
         for step in 2..12u32 {
             let later = PARENT_CLOSE + (STALL_ESCALATION_SECS * step as i64);
             if matches!(
-                verify_batch(&b, &p, &balances, &s, later, &AllGood),
+                verify_batch(&b, &p, &balances, &no_wm(), &s, later, &AllGood),
                 BatchVerdict::Defer(DeferReason::ProposerNotDue)
             ) {
                 rejected_somewhere = true;
                 // And at that very same instant the committed path must accept it.
                 assert!(
                     matches!(
-                        verify_committed_batch(&b, &p, &balances, &AllGood),
+                        verify_committed_batch(&b, &p, &balances, &no_wm(), &AllGood),
                         BatchVerdict::Valid { .. }
                     ),
                     "certified history must adopt at step {step}, where the rota rejects it"
@@ -1339,7 +1749,7 @@ mod committed_history_tests {
 
         assert!(
             matches!(
-                verify_committed_batch(&b, &p, &balances, &AllGood),
+                verify_committed_batch(&b, &p, &balances, &no_wm(), &AllGood),
                 BatchVerdict::Valid { .. }
             ),
             "a batch already proved committed must not be re-judged on whose turn it was"
@@ -1357,21 +1767,21 @@ mod committed_history_tests {
         let mut orphan = child(&p, due);
         orphan.prev_batch_hash = [0xFF; 32];
         assert!(matches!(
-            verify_committed_batch(&orphan, &p, &balances, &AllGood),
+            verify_committed_batch(&orphan, &p, &balances, &no_wm(), &AllGood),
             BatchVerdict::Defer(DeferReason::ParentMismatch)
         ));
 
         let mut wrong = child(&p, due);
         wrong.state_root = [0xFF; 32];
         assert!(matches!(
-            verify_committed_batch(&wrong, &p, &balances, &AllGood),
+            verify_committed_batch(&wrong, &p, &balances, &no_wm(), &AllGood),
             BatchVerdict::Fault(FaultReason::StateRootMismatch { .. })
         ));
 
         let mut rewritten = child(&p, due);
         rewritten.node_shares.push(([0xEE; 32], 5));
         assert!(matches!(
-            verify_committed_batch(&rewritten, &p, &balances, &AllGood),
+            verify_committed_batch(&rewritten, &p, &balances, &no_wm(), &AllGood),
             BatchVerdict::Fault(FaultReason::MembershipChanged { .. })
         ));
     }

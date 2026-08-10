@@ -34,7 +34,10 @@ use ghost_common::batch_quarantine::Quarantine;
 use ghost_common::batch_two_phase::SeqConsensus;
 use ghost_common::error::GhostResult;
 use ghost_common::identity::NodeIdentity;
-use ghost_common::share_batch::{compute_state_root, fold_shares, pack_batch, ShareBatch};
+use ghost_common::share_batch::{
+    advance_watermarks, compute_state_root, creditable_difficulty, fold_shares, pack_batch,
+    ProposerWatermarks, ShareBatch,
+};
 use ghost_common::types::ShareProof;
 use ghost_storage::database::Database;
 use ghost_storage::sbc_store::ChainHead;
@@ -116,6 +119,13 @@ pub struct ShadowChain {
     /// Running balances after the head. Plaintext address -> integer micro-work, exactly the
     /// form `fold_shares` and `compute_state_root` take.
     balances: RwLock<BTreeMap<String, i64>>,
+    /// Per-proposer high-water marks after the head — the cross-batch replay guard.
+    ///
+    /// Adopted state exactly like `balances`: derived from the adopted chain, advanced in
+    /// `finalise`, persisted in the SAME transaction as the balances (a watermark ahead of the
+    /// balances would fault honest proposers; behind, it would re-credit), and snapshotted under
+    /// the `adoption` guard wherever a batch is judged.
+    watermarks: RwLock<ProposerWatermarks>,
     /// Peers quarantined this process, with the outcome the driver decided.
     quarantine: Mutex<Quarantine>,
     /// Peers quarantined in an EARLIER process, restored from the database.
@@ -222,6 +232,7 @@ impl ShadowChain {
     pub fn load(identity: Arc<NodeIdentity>, db: Arc<Database>) -> GhostResult<Self> {
         let head = db.sbc_head()?;
         let balances = db.sbc_load_balances()?;
+        let watermarks = db.sbc_load_watermarks()?;
         info!(
             seq = head.as_ref().map(|h| h.seq),
             addresses = balances.len(),
@@ -292,6 +303,7 @@ impl ShadowChain {
             pending_dropped: std::sync::atomic::AtomicU64::new(0),
             head: RwLock::new(head),
             balances: RwLock::new(balances),
+            watermarks: RwLock::new(watermarks),
             quarantine: Mutex::new(Quarantine::new()),
             restored_quarantine: RwLock::new(restored),
             vote_lock: Mutex::new(SeqVoteLock::new()),
@@ -315,6 +327,11 @@ impl ShadowChain {
     /// must not mutate the adopted state while doing it.
     pub fn balances(&self) -> BTreeMap<String, i64> {
         self.balances.read().clone()
+    }
+
+    /// The per-proposer replay watermarks — a copy, for the same reason as [`Self::balances`].
+    pub fn watermarks(&self) -> ProposerWatermarks {
+        self.watermarks.read().clone()
     }
 
     pub fn pending_count(&self) -> usize {
@@ -421,16 +438,6 @@ impl ShadowChain {
     /// failed to reach quorum — see [`ShadowChain::finalise`], which drains what was actually
     /// adopted.
     pub fn build_batch(&self, close_ts: i64, budget_bytes: usize) -> Option<ShareBatch> {
-        let pending: Vec<ShareProof> = self.pending.lock().values().cloned().collect();
-        if pending.is_empty() {
-            return None;
-        }
-
-        let packed = pack_batch(&pending, budget_bytes);
-        if packed.included.is_empty() {
-            return None;
-        }
-
         // Before genesis there is nothing to build on. The caller must run the genesis ceremony
         // first; proposing seq 0 from here would be starting a chain from nothing, which is a
         // chain anybody could start.
@@ -443,11 +450,67 @@ impl ShadowChain {
         // Same consistent snapshot as the judging path. A torn read here emits a batch whose
         // `prev_batch_hash` names one head while its `state_root` was computed from another's
         // balances — self-inconsistent, and every peer still on the old head FAULTS it, so this
-        // node quarantines itself across the fleet for its own race.
-        let (head, balances_snapshot) = {
+        // node quarantines itself across the fleet for its own race. The watermark is part of the
+        // same snapshot for the same reason.
+        let (head, balances_snapshot, my_watermark) = {
             let _snapshot = self.adoption.read();
-            (self.head()?, self.balances())
+            let head = self.head()?;
+            let my_watermark = self
+                .watermarks
+                .read()
+                .get(&self.identity.node_id())
+                .copied();
+            (head, self.balances(), my_watermark)
         };
+
+        // A batch containing an ineligible share is a TERMINAL fault at every peer, and shares
+        // pack in canonical order — so one bad share at the head of the pool would sit at the
+        // front of every batch this node ever proposes, quarantining it fleet-wide. Two classes:
+        //
+        // - PERMANENTLY ineligible — at or before our own adopted watermark (already credited),
+        //   past the D10 age bound (only gets older), or an uncreditable difficulty. Dropped from
+        //   the pool: they can never be proposed, and holding them wedges the proposer.
+        // - Not eligible YET — timestamped after this batch's close. Held in the pool and left
+        //   out of this batch; a later close covers them.
+        let pending: Vec<ShareProof> = {
+            let mut pool = self.pending.lock();
+            let before = pool.len();
+            pool.retain(|_, s| {
+                let replayed = my_watermark.is_some_and(|wm| (s.timestamp, s.share_hash) <= wm);
+                let too_old = match i64::try_from(s.timestamp) {
+                    // A timestamp that does not fit i64 can never satisfy the D10 bound.
+                    Err(_) => true,
+                    Ok(ts) => {
+                        close_ts.saturating_sub(ts)
+                            > ghost_common::batch_consensus::MAX_SHARE_AGE_SECS
+                    }
+                };
+                !(replayed || too_old || !creditable_difficulty(s.difficulty))
+            });
+            let discarded = before - pool.len();
+            if discarded > 0 {
+                // Loud: dropped work is work a miner is never credited for, and it should read as
+                // "these shares could not legally be proposed", not as a miner leaving.
+                warn!(
+                    discarded,
+                    "SBC: discarding pending shares no batch could ever carry \
+                     (replayed, past the age bound, or uncreditable difficulty)"
+                );
+            }
+            pool.values()
+                .filter(|s| i64::try_from(s.timestamp).is_ok_and(|ts| ts <= close_ts))
+                .cloned()
+                .collect()
+        };
+        if pending.is_empty() {
+            return None;
+        }
+
+        let packed = pack_batch(&pending, budget_bytes);
+        if packed.included.is_empty() {
+            return None;
+        }
+
         let (seq, prev_batch_hash) = (head.seq + 1, head.batch_hash);
 
         let mut balances = balances_snapshot;
@@ -461,6 +524,8 @@ impl ShadowChain {
             proposer: self.identity.node_id(),
             shares: packed.included,
             settled_blocks: Vec::new(),
+            // The undo channel is carried empty until WP-6 folds settlements.
+            reversed_blocks: Vec::new(),
             // Carried forward, never re-derived. `verify_batch` faults any change.
             node_shares: self.membership.read().clone(),
             state_root,
@@ -579,9 +644,11 @@ impl ShadowChain {
         };
 
         let balances = self.balances();
+        let watermarks = self.watermarks();
         let ctx = BatchContext {
             parent: &parent,
             parent_balances: &balances,
+            watermarks: &watermarks,
             schedule,
             checks,
             now,
@@ -638,17 +705,18 @@ impl ShadowChain {
         // race. Via the propose loop's self-judge the victim can be this node.
         //
         // Released before `quarantine`/`consensus` are taken, so `adoption` stays outermost.
-        let (parent, balances) = {
+        let (parent, balances, watermarks) = {
             let _snapshot = self.adoption.read();
             let parent = match self.parent_for(batch.seq) {
                 Ok(p) => p,
                 Err(reason) => return PhaseAction::Hold { reason },
             };
-            (parent, self.balances())
+            (parent, self.balances(), self.watermarks())
         };
         let ctx = BatchContext {
             parent: &parent,
             parent_balances: &balances,
+            watermarks: &watermarks,
             schedule,
             checks,
             now,
@@ -997,7 +1065,7 @@ impl ShadowChain {
 
         // Same consistent snapshot as the judging path, and released before `finalise` — which
         // takes the exclusive side, so a read guard held across it would deadlock.
-        let (parent, balances) = {
+        let (parent, balances, watermarks) = {
             let _snapshot = self.adoption.read();
             let parent = match self.parent_for(batch.seq) {
                 Ok(p) => p,
@@ -1010,9 +1078,9 @@ impl ShadowChain {
                     return Ok(None);
                 }
             };
-            (parent, self.balances())
+            (parent, self.balances(), self.watermarks())
         };
-        match verify_committed_batch(batch, &parent, &balances, checks) {
+        match verify_committed_batch(batch, &parent, &balances, &watermarks, checks) {
             BatchVerdict::Valid { .. } => self.finalise(batch, now).map(Some),
             other => {
                 warn!(
@@ -1177,7 +1245,14 @@ impl ShadowChain {
             ghost_common::error::GhostError::Serialization(format!("batch {}: {e}", batch.seq))
         })?;
 
-        self.db.sbc_save_balances(&balances, batch.seq)?;
+        // Advance the proposer's replay watermark past this batch. Adopted state exactly like the
+        // balances, persisted in the same transaction — torn apart, a watermark ahead faults
+        // honest proposers and one behind re-credits adopted shares.
+        let mut watermarks = self.watermarks();
+        advance_watermarks(&mut watermarks, batch);
+
+        self.db
+            .sbc_save_balances(&balances, &watermarks, batch.seq)?;
         self.db.sbc_store_batch(
             batch.seq,
             batch_hash,
@@ -1196,6 +1271,7 @@ impl ShadowChain {
         {
             let _adopting = self.adoption.write();
             *self.balances.write() = balances;
+            *self.watermarks.write() = watermarks;
             *self.head.write() = Some(ChainHead {
                 seq: batch.seq,
                 batch_hash,
@@ -1337,7 +1413,10 @@ impl ShadowChain {
         let batch_json = serde_json::to_string(batch)
             .map_err(|e| ghost_common::error::GhostError::Serialization(format!("genesis: {e}")))?;
 
-        self.db.sbc_save_balances(&balances, batch.seq)?;
+        // Genesis carries no shares, so it sets no watermark — the guard starts empty and grows
+        // with the first real batch from each proposer.
+        self.db
+            .sbc_save_balances(&balances, &ProposerWatermarks::new(), batch.seq)?;
         self.db.sbc_store_batch(
             batch.seq,
             batch_hash,
@@ -1356,6 +1435,9 @@ impl ShadowChain {
         *self.membership.write() = batch.node_shares.clone();
 
         *self.balances.write() = balances;
+        // Mirror what was just persisted: genesis opens with no watermarks, and the in-memory map
+        // must agree with the table or the first judgement after a re-genesis uses ghosts.
+        *self.watermarks.write() = ProposerWatermarks::new();
         *self.head.write() = Some(ChainHead {
             seq: batch.seq,
             batch_hash,
@@ -1379,8 +1461,6 @@ mod tests {
     use super::*;
     use ghost_common::share_batch::micro_work;
 
-    const REACHABLE_DIFFICULTY: f64 = 1e-9;
-
     fn chain(identity: &Arc<NodeIdentity>) -> ShadowChain {
         let db = Arc::new(Database::in_memory().expect("db"));
         db.set_encryption_key([0x42u8; 32]);
@@ -1388,6 +1468,17 @@ mod tests {
     }
 
     fn share(identity: &NodeIdentity, addr: &str, work: f64, salt: u8) -> ShareProof {
+        // Below every close_ts these tests use (genesis closes at 500, batches at ~600), and
+        // comfortably inside the D10 age bound.
+        share_at(identity, addr, work, salt, 100 + salt as u64)
+    }
+
+    /// Like [`share`], with an explicit timestamp — for tests whose chain runs at a real epoch.
+    ///
+    /// `difficulty == work`, as the production ingest path stamps them, because the fold credits
+    /// the PoW-verified difficulty; a fixture claiming a different difficulty than it "works"
+    /// would test a share production cannot produce.
+    fn share_at(identity: &NodeIdentity, addr: &str, work: f64, salt: u8, ts: u64) -> ShareProof {
         let mut header = vec![0u8; 80];
         header[0] = salt;
         let real_hash = {
@@ -1397,10 +1488,10 @@ mod tests {
         let mut s = ShareProof {
             round_id: 1,
             miner_id: [2u8; 32],
-            difficulty: REACHABLE_DIFFICULTY,
+            difficulty: work,
             work,
             share_hash: real_hash,
-            timestamp: 1_000 + salt as u64,
+            timestamp: ts,
             received_by: identity.node_id(),
             template_id: Some([3u8; 32]),
             payout_address: Some(addr.to_string()),
@@ -1420,6 +1511,7 @@ mod tests {
             proposer: [0u8; 32],
             shares: Vec::new(),
             settled_blocks: Vec::new(),
+            reversed_blocks: Vec::new(),
             node_shares: Vec::new(),
             state_root,
             truncated: false,
@@ -1647,6 +1739,7 @@ mod tests {
             proposer: bad.node_id(),
             shares: Vec::new(),
             settled_blocks: Vec::new(),
+            reversed_blocks: Vec::new(),
             node_shares: Vec::new(),
             state_root: [0u8; 32],
             truncated: false,
@@ -1683,9 +1776,16 @@ mod tests {
             .expect("converted");
 
         // A single-node schedule makes every turn ours.
-        // `build_batch` refuses an empty pool, so give it something to pack.
+        // `build_batch` refuses an empty pool, so give it something to pack — timestamped near
+        // the checkpoint cutoff this chain's clock runs at, inside the D10 window.
         for salt in 0..3u8 {
-            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+            chain.record_received(share_at(
+                &id,
+                "bc1qalice",
+                1.0,
+                salt,
+                1_786_228_000 + salt as u64,
+            ));
         }
 
         let schedule = ProposerSchedule::new([id.node_id()]);
@@ -1724,7 +1824,13 @@ mod tests {
             .expect("converted");
 
         for salt in 0..3u8 {
-            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+            chain.record_received(share_at(
+                &id,
+                "bc1qalice",
+                1.0,
+                salt,
+                1_786_228_000 + salt as u64,
+            ));
         }
 
         let schedule = ProposerSchedule::new([id.node_id()]);
@@ -1768,7 +1874,7 @@ mod tests {
                 .expect("bootstrap")
                 .expect("converted");
             let head = chain.head().expect("head");
-            db.sbc_save_balances(&chain.balances(), head.seq + 1)
+            db.sbc_save_balances(&chain.balances(), &ProposerWatermarks::new(), head.seq + 1)
                 .expect("save ahead");
         }
 
@@ -1780,7 +1886,13 @@ mod tests {
         );
 
         for salt in 0..3u8 {
-            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+            chain.record_received(share_at(
+                &id,
+                "bc1qalice",
+                1.0,
+                salt,
+                1_786_228_000 + salt as u64,
+            ));
         }
         let schedule = ProposerSchedule::new(chain.voter_ids());
         let head = chain.head().expect("head");
@@ -1799,6 +1911,7 @@ mod tests {
             proposer: id.node_id(),
             shares: Vec::new(),
             settled_blocks: Vec::new(),
+            reversed_blocks: Vec::new(),
             node_shares: Vec::new(),
             state_root: [0u8; 32],
             truncated: false,
@@ -2007,7 +2120,13 @@ mod tests {
 
         // A batch we build carries it forward rather than re-deriving it.
         for salt in 0..3u8 {
-            chain.record_received(share(&id, "bc1qalice", 1.0, salt));
+            chain.record_received(share_at(
+                &id,
+                "bc1qalice",
+                1.0,
+                salt,
+                1_786_228_000 + salt as u64,
+            ));
         }
         let schedule = ProposerSchedule::new(chain.voter_ids());
         let head = chain.head().expect("head");
@@ -2064,6 +2183,7 @@ mod tests {
             &child,
             &parent,
             &chain.balances(),
+            &chain.watermarks(),
             &schedule,
             child.close_ts,
             &checks,
@@ -2117,6 +2237,7 @@ mod tests {
                 proposer: id.node_id(),
                 shares: Vec::new(),
                 settled_blocks: Vec::new(),
+                reversed_blocks: Vec::new(),
                 node_shares: Vec::new(),
                 state_root: [0u8; 32],
                 truncated: false,
@@ -2169,6 +2290,7 @@ mod tests {
             proposer: id.node_id(),
             shares: Vec::new(),
             settled_blocks: Vec::new(),
+            reversed_blocks: Vec::new(),
             node_shares: Vec::new(),
             state_root: [0u8; 32],
             truncated: false,
@@ -2248,6 +2370,7 @@ mod tests {
                 proposer: [n; 32],
                 shares: Vec::new(),
                 settled_blocks: Vec::new(),
+                reversed_blocks: Vec::new(),
                 node_shares: Vec::new(),
                 state_root: [0u8; 32],
                 truncated: false,
@@ -2318,6 +2441,7 @@ mod tests {
             proposer: id.node_id(),
             shares: Vec::new(),
             settled_blocks: Vec::new(),
+            reversed_blocks: Vec::new(),
             node_shares: Vec::new(),
             state_root: [0u8; 32],
             truncated: false,
@@ -2371,6 +2495,7 @@ mod tests {
             proposer: bad.node_id(),
             shares: Vec::new(),
             settled_blocks: Vec::new(),
+            reversed_blocks: Vec::new(),
             node_shares: Vec::new(),
             state_root: [0u8; 32],
             truncated: false,
@@ -2403,6 +2528,7 @@ mod tests {
             proposer: peer.node_id(),
             shares: Vec::new(),
             settled_blocks: Vec::new(),
+            reversed_blocks: Vec::new(),
             node_shares: Vec::new(),
             state_root: [0u8; 32],
             truncated: false,
@@ -2918,5 +3044,116 @@ mod tests {
             Some(&micro_work(3.0)),
             "the other share must still be credited"
         );
+    }
+
+    /// **The cross-batch replay guard, end to end.** In-batch dedup covers one batch; nothing
+    /// covered the same share re-recorded AFTER its batch was adopted — the next build would have
+    /// re-proposed it, every peer's watermark check would fault it, and this node would be
+    /// quarantined fleet-wide for re-offering work it was already credited for.
+    #[test]
+    fn an_adopted_share_is_never_batched_again_even_across_a_restart() {
+        let id = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+
+        let adopted = {
+            let chain = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("load");
+            genesis(&chain, BTreeMap::new());
+            let s = share(&id, "bc1qa", 2.0, 1);
+            chain.record_received(s.clone());
+            let batch = chain.build_batch(600, 1_000_000).expect("batch");
+            chain.finalise(&batch, 0).expect("finalise");
+
+            // The share recorder can fire again for an already-adopted share.
+            chain.record_received(s.clone());
+            assert!(
+                chain.build_batch(700, 1_000_000).is_none(),
+                "an adopted share must not be proposable again — peers would fault it as a replay"
+            );
+            assert_eq!(
+                chain.pending_count(),
+                0,
+                "and it must be discarded, not retried at the head of every future batch"
+            );
+            s
+        };
+
+        // The watermark is adopted state: it must survive a restart, or every deploy would reopen
+        // the replay window.
+        let resumed = ShadowChain::load(Arc::clone(&id), Arc::clone(&db)).expect("reload");
+        assert_eq!(
+            resumed.watermarks().get(&id.node_id()),
+            Some(&(adopted.timestamp, adopted.share_hash)),
+            "the watermark must resume with the chain"
+        );
+        resumed.record_received(adopted);
+        assert!(
+            resumed.build_batch(800, 1_000_000).is_none(),
+            "a restart must not forget what was adopted"
+        );
+
+        // And the guard must not over-block: a strictly later share from the same node builds.
+        let later = share_at(&id, "bc1qa", 1.0, 9, 550);
+        resumed.record_received(later);
+        let next = resumed
+            .build_batch(900, 1_000_000)
+            .expect("later work builds");
+        assert_eq!(next.shares.len(), 1);
+    }
+
+    /// A share no batch could legally carry — uncreditable difficulty here — must be discarded at
+    /// build time rather than proposed. Shares pack in canonical order, so a poisoned share at the
+    /// pool's head would otherwise front EVERY future batch this node proposes, and each proposal
+    /// is a terminal fault at every peer.
+    #[test]
+    fn an_uncreditable_share_is_discarded_rather_than_proposed() {
+        let id = Arc::new(NodeIdentity::generate());
+        let chain = chain(&id);
+        genesis(&chain, BTreeMap::new());
+
+        let mut poisoned = share(&id, "bc1qa", 1.0, 1);
+        poisoned.difficulty = f64::INFINITY;
+        chain.record_received(poisoned);
+        chain.record_received(share(&id, "bc1qb", 3.0, 2));
+
+        let batch = chain
+            .build_batch(600, 1_000_000)
+            .expect("the good share builds");
+        assert_eq!(
+            batch.shares.len(),
+            1,
+            "the uncreditable share must not be proposed"
+        );
+        assert_eq!(
+            batch.shares[0].payout_address.as_deref(),
+            Some("bc1qb"),
+            "and the share that remains is the creditable one"
+        );
+        assert_eq!(
+            chain.pending_count(),
+            1,
+            "the poisoned share is discarded, not retried forever"
+        );
+    }
+
+    /// A share timestamped after the batch close is HELD for a later batch, not lost: it becomes
+    /// eligible as soon as a close covers it. Only permanently illegal shares are discarded.
+    #[test]
+    fn a_future_share_is_held_for_a_later_close_not_lost() {
+        let id = Arc::new(NodeIdentity::generate());
+        let chain = chain(&id);
+        genesis(&chain, BTreeMap::new());
+
+        chain.record_received(share_at(&id, "bc1qa", 1.0, 1, 5_000));
+        assert!(
+            chain.build_batch(600, 1_000_000).is_none(),
+            "a share after the close cannot be in this batch — peers would fault it under D10"
+        );
+        assert_eq!(chain.pending_count(), 1, "but it must stay pending");
+
+        let batch = chain
+            .build_batch(5_000, 1_000_000)
+            .expect("a later close covers it");
+        assert_eq!(batch.shares.len(), 1);
     }
 }

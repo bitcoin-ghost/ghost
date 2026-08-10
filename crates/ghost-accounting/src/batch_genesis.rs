@@ -116,6 +116,7 @@ pub fn genesis_batch(
         proposer,
         shares: Vec::new(),
         settled_blocks: Vec::new(),
+        reversed_blocks: Vec::new(),
         node_shares,
         state_root,
         truncated: false,

@@ -19,6 +19,7 @@ use rusqlite::params;
 use sha2::{Digest, Sha256};
 
 use ghost_common::error::{GhostError, GhostResult};
+use ghost_common::share_batch::ProposerWatermarks;
 
 use crate::database::Database;
 
@@ -129,15 +130,27 @@ impl Database {
         Ok(balances)
     }
 
-    /// Replace the balances with the state after `seq`.
+    /// Replace the balances — and the per-proposer replay watermarks — with the state after `seq`.
     ///
-    /// One transaction: a partially-written balance set is a state root nothing can reproduce, and
-    /// a crash mid-write would leave the node silently disagreeing with the fleet forever.
+    /// One transaction, both tables: a partially-written balance set is a state root nothing can
+    /// reproduce, and the watermarks are the same kind of running fold state — torn apart from the
+    /// balances, a watermark AHEAD would fault honest proposers for shares that were never
+    /// credited, and one BEHIND would re-credit shares that were. Writing them together also means
+    /// the existing balances-past-head crash detection (`sbc_balances_seq`) covers both.
     ///
-    /// Addresses absent from `balances` are DELETED rather than left behind. A stale row would keep
+    /// Rows absent from the maps are DELETED rather than left behind. A stale row would keep
     /// contributing to `sbc_load_balances` and therefore to the next state root, which is how a
     /// node ends up internally consistent and externally wrong.
-    pub fn sbc_save_balances(&self, balances: &BTreeMap<String, i64>, seq: u64) -> GhostResult<()> {
+    ///
+    /// The watermark timestamp is stored as `i64`: a share whose timestamp exceeds `i64::MAX`
+    /// cannot be adopted at all (the D10 age bound faults it against any real `close_ts`), so
+    /// every adoptable watermark fits.
+    pub fn sbc_save_balances(
+        &self,
+        balances: &BTreeMap<String, i64>,
+        watermarks: &ProposerWatermarks,
+        seq: u64,
+    ) -> GhostResult<()> {
         let encrypted: Vec<(Vec<u8>, String, i64)> = balances
             .iter()
             .map(|(addr, micro)| Ok((address_key(addr), self.encrypt_address(addr)?, *micro)))
@@ -158,6 +171,21 @@ impl Database {
                     )
                     .map_err(|e| GhostError::Database(e.to_string()))?;
                 }
+                conn.execute("DELETE FROM sbc_watermarks", [])
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                for (proposer, (ts, share_hash)) in watermarks {
+                    conn.execute(
+                        "INSERT INTO sbc_watermarks (proposer, ts, share_hash, updated_seq) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            proposer.to_vec(),
+                            *ts as i64,
+                            share_hash.to_vec(),
+                            seq as i64
+                        ],
+                    )
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                }
                 Ok(())
             })();
 
@@ -170,6 +198,36 @@ impl Database {
                     Err(e)
                 }
             }
+        })
+    }
+
+    /// Load the per-proposer replay watermarks, the adopted-state companion to
+    /// [`Database::sbc_load_balances`].
+    pub fn sbc_load_watermarks(&self) -> GhostResult<ProposerWatermarks> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT proposer, ts, share_hash FROM sbc_watermarks")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let mut out = BTreeMap::new();
+            for (proposer, ts, hash) in rows {
+                out.insert(
+                    blob32(proposer, "watermark proposer")?,
+                    (ts as u64, blob32(hash, "watermark share_hash")?),
+                );
+            }
+            Ok(out)
         })
     }
 
@@ -448,7 +506,8 @@ mod tests {
             ("bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h", -42),
         ]);
 
-        db.sbc_save_balances(&before, 7).expect("save");
+        db.sbc_save_balances(&before, &BTreeMap::new(), 7)
+            .expect("save");
         let after = db.sbc_load_balances().expect("load");
 
         assert_eq!(
@@ -457,14 +516,44 @@ mod tests {
         );
     }
 
+    /// Watermarks are adopted state: they must survive a restart exactly, in the same save as the
+    /// balances, and a save must replace rather than merge them. A watermark that survived only in
+    /// memory would reopen the cross-batch replay window at every deploy.
+    #[test]
+    fn watermarks_round_trip_and_replace_with_the_balances() {
+        let db = db();
+        let mut wm: BTreeMap<[u8; 32], (u64, [u8; 32])> = BTreeMap::new();
+        wm.insert([1u8; 32], (1_786_228_093, [0xAA; 32]));
+        wm.insert([2u8; 32], (7, [0x00; 32]));
+
+        db.sbc_save_balances(&bal(&[("addr_a", 10)]), &wm, 3)
+            .expect("save");
+        assert_eq!(
+            db.sbc_load_watermarks().expect("load"),
+            wm,
+            "watermarks must survive the round trip exactly"
+        );
+
+        // The next save replaces: a proposer dropped from the map must not linger.
+        let mut wm2: BTreeMap<[u8; 32], (u64, [u8; 32])> = BTreeMap::new();
+        wm2.insert([1u8; 32], (1_786_228_100, [0xBB; 32]));
+        db.sbc_save_balances(&bal(&[("addr_a", 12)]), &wm2, 4)
+            .expect("save 2");
+        assert_eq!(
+            db.sbc_load_watermarks().expect("load 2"),
+            wm2,
+            "a save must replace the watermark set, not merge it"
+        );
+    }
+
     /// A save must REPLACE, not merge. A balance that has gone to zero and been dropped from the
     /// map must not linger in the table, or it keeps contributing to the next state root.
     #[test]
     fn saving_replaces_rather_than_merges() {
         let db = db();
-        db.sbc_save_balances(&bal(&[("addr_a", 10), ("addr_b", 20)]), 1)
+        db.sbc_save_balances(&bal(&[("addr_a", 10), ("addr_b", 20)]), &BTreeMap::new(), 1)
             .expect("first save");
-        db.sbc_save_balances(&bal(&[("addr_a", 30)]), 2)
+        db.sbc_save_balances(&bal(&[("addr_a", 30)]), &BTreeMap::new(), 2)
             .expect("second save");
 
         let after = db.sbc_load_balances().expect("load");

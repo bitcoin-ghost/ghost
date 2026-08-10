@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 51;
+const SCHEMA_VERSION: u32 = 52;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -128,6 +128,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (49, migrate_v49),
         (50, migrate_v50),
         (51, migrate_v51),
+        (52, migrate_v52),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2616,6 +2617,33 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
 ///
 /// Small and immutable: one row per committed sequence, a few hundred bytes of signatures, written
 /// once and never updated. Bounded by the same retention as the batch window.
+/// v52: `sbc_watermarks` — the share-batch chain's per-proposer replay guard.
+///
+/// One row per proposer: the canonical position `(ts, share_hash)` of the last share that
+/// proposer has had adopted. `verify_batch` requires a batch's shares to sort strictly after this
+/// mark, which is what stops the same share being credited in two batches — WITHOUT a per-share
+/// index, which this schema deliberately does not have (payable state is O(addresses), and the
+/// guard is O(proposers): 8 rows).
+///
+/// Written in the same transaction as `sbc_balances` because both are the fold's running state:
+/// a watermark ahead of the balances would fault honest proposers for shares never actually
+/// credited, and one behind would re-credit what already was.
+fn migrate_v52(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v52: sbc_watermarks");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sbc_watermarks (
+            proposer    BLOB    PRIMARY KEY,
+            ts          INTEGER NOT NULL,
+            share_hash  BLOB    NOT NULL,
+            updated_seq INTEGER NOT NULL
+         );",
+    )
+    .map_err(|e| GhostError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
 fn migrate_v51(conn: &Connection) -> GhostResult<()> {
     debug!("Running migration v51: sbc_certs");
 

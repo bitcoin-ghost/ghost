@@ -52,6 +52,9 @@ pub struct BatchContext<'a, C: BatchChecks> {
     pub parent: &'a ShareBatch,
     /// Running balances after the parent.
     pub parent_balances: &'a std::collections::BTreeMap<String, i64>,
+    /// Per-proposer high-water marks after the parent — the cross-batch replay guard. Adopted
+    /// state exactly like the balances, and snapshotted under the same guard by the caller.
+    pub watermarks: &'a crate::share_batch::ProposerWatermarks,
     /// The voter set.
     pub schedule: &'a ProposerSchedule,
     /// Share and signature checks.
@@ -79,6 +82,7 @@ pub fn on_batch<C: BatchChecks>(
         batch,
         ctx.parent,
         ctx.parent_balances,
+        ctx.watermarks,
         ctx.schedule,
         ctx.now,
         ctx.checks,
@@ -201,6 +205,7 @@ mod tests {
             proposer: voter(1),
             shares: vec![],
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root: [0x22; 32],
             truncated: false,
@@ -211,14 +216,17 @@ mod tests {
 
     fn a_child(parent: &ShareBatch, schedule: &ProposerSchedule) -> ShareBatch {
         let balances: BTreeMap<String, i64> = BTreeMap::new();
+        let proposer = schedule.proposer_at(parent.seq + 1, 0).unwrap();
+        let close_ts = parent.close_ts + 30;
         let mut shares = vec![ShareProof {
             round_id: 1,
             miner_id: [1u8; 32],
             difficulty: 1.0,
             work: 1.0,
             share_hash: [1u8; 32],
-            timestamp: 1000,
-            received_by: [0u8; 32],
+            // Inside the D10 window, and received by the proposer — verification checks both.
+            timestamp: parent.close_ts as u64 + 10,
+            received_by: proposer,
             template_id: None,
             payout_address: Some("bc1qalice".into()),
             header: None,
@@ -227,14 +235,14 @@ mod tests {
         crate::share_batch::canonical_sort(&mut shares);
         let mut after = balances.clone();
         fold_shares(&mut after, &shares);
-        let close_ts = parent.close_ts + 30;
         ShareBatch {
             seq: parent.seq + 1,
             prev_batch_hash: parent.batch_hash(),
             close_ts,
-            proposer: schedule.proposer_at(parent.seq + 1, 0).unwrap(),
+            proposer,
             shares,
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root: compute_state_root(&after, parent.seq + 1, close_ts),
             truncated: false,
@@ -246,12 +254,14 @@ mod tests {
     fn ctx<'a>(
         parent: &'a ShareBatch,
         balances: &'a BTreeMap<String, i64>,
+        watermarks: &'a crate::share_batch::ProposerWatermarks,
         schedule: &'a ProposerSchedule,
         checks: &'a AllGood,
     ) -> BatchContext<'a, AllGood> {
         BatchContext {
             parent,
             parent_balances: balances,
+            watermarks,
             schedule,
             checks,
             now: PARENT_CLOSE + 1,
@@ -261,8 +271,9 @@ mod tests {
     #[test]
     fn a_valid_batch_is_voted_for() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let batch = a_child(&parent, &schedule);
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
 
         assert_eq!(
             on_batch(&batch, &c, &mut Quarantine::new(), &mut SeqVoteLock::new()),
@@ -279,6 +290,7 @@ mod tests {
     #[test]
     fn a_quarantined_proposer_is_not_even_judged() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let batch = a_child(&parent, &schedule);
 
         let mut q = Quarantine::new();
@@ -290,7 +302,7 @@ mod tests {
             &schedule,
         );
 
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
         assert_eq!(
             on_batch(&batch, &c, &mut q, &mut SeqVoteLock::new()),
             Action::ProposerQuarantined
@@ -302,11 +314,12 @@ mod tests {
     #[test]
     fn a_defective_batch_quarantines_its_proposer() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let mut batch = a_child(&parent, &schedule);
         batch.state_root = [0xAB; 32];
 
         let mut q = Quarantine::new();
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
         match on_batch(&batch, &c, &mut q, &mut SeqVoteLock::new()) {
             Action::Quarantine { reason, outcome } => {
                 assert!(matches!(reason, FaultReason::StateRootMismatch { .. }));
@@ -327,11 +340,12 @@ mod tests {
     #[test]
     fn an_out_of_position_batch_only_holds() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let mut batch = a_child(&parent, &schedule);
         batch.seq = parent.seq + 7;
 
         let mut q = Quarantine::new();
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
         assert!(matches!(
             on_batch(&batch, &c, &mut q, &mut SeqVoteLock::new()),
             Action::Hold { .. }
@@ -345,6 +359,7 @@ mod tests {
     #[test]
     fn a_second_valid_batch_at_one_sequence_is_refused_without_blame() {
         let (schedule, parent, checks, balances) = (eight(), a_parent(), AllGood, BTreeMap::new());
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let first = a_child(&parent, &schedule);
         let mut second = a_child(&parent, &schedule);
         second.close_ts += 1; // a different, equally valid batch
@@ -356,7 +371,7 @@ mod tests {
 
         let mut q = Quarantine::new();
         let mut lock = SeqVoteLock::new();
-        let c = ctx(&parent, &balances, &schedule, &checks);
+        let c = ctx(&parent, &balances, &wm, &schedule, &checks);
 
         assert!(matches!(
             on_batch(&first, &c, &mut q, &mut lock),
@@ -482,6 +497,7 @@ pub fn on_batch_phase<C: BatchChecks>(
         batch,
         ctx.parent,
         ctx.parent_balances,
+        ctx.watermarks,
         ctx.schedule,
         ctx.now,
         ctx.checks,
@@ -673,6 +689,7 @@ mod phase_driver_tests {
             proposer: [0u8; 32],
             shares: vec![],
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root: compute_state_root(&BTreeMap::new(), 0, PARENT_CLOSE),
             truncated: false,
@@ -684,14 +701,17 @@ mod phase_driver_tests {
     /// A child proposed by whoever is due at `escalation`, so the driver's reported round can be
     /// checked against a known value rather than assumed.
     fn a_child_at(parent: &ShareBatch, schedule: &ProposerSchedule, escalation: u32) -> ShareBatch {
+        let proposer = schedule.proposer_at(parent.seq + 1, escalation).unwrap();
+        let close_ts = parent.close_ts + 30;
         let mut shares = vec![ShareProof {
             round_id: 1,
             miner_id: [1u8; 32],
             difficulty: 1.0,
             work: 1.0,
             share_hash: [1u8; 32],
-            timestamp: 1000,
-            received_by: [0u8; 32],
+            // Inside the D10 window, and received by the proposer — verification checks both.
+            timestamp: parent.close_ts as u64 + 10,
+            received_by: proposer,
             template_id: None,
             payout_address: Some("bc1qalice".into()),
             header: None,
@@ -700,14 +720,14 @@ mod phase_driver_tests {
         crate::share_batch::canonical_sort(&mut shares);
         let mut after: BTreeMap<String, i64> = BTreeMap::new();
         fold_shares(&mut after, &shares);
-        let close_ts = parent.close_ts + 30;
         ShareBatch {
             seq: parent.seq + 1,
             prev_batch_hash: parent.batch_hash(),
             close_ts,
-            proposer: schedule.proposer_at(parent.seq + 1, escalation).unwrap(),
+            proposer,
             shares,
             settled_blocks: vec![],
+            reversed_blocks: vec![],
             node_shares: vec![],
             state_root: compute_state_root(&after, parent.seq + 1, close_ts),
             truncated: false,
@@ -734,9 +754,11 @@ mod phase_driver_tests {
         let now =
             PARENT_CLOSE + (crate::batch_consensus::STALL_ESCALATION_SECS * escalation as i64);
 
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let ctx = BatchContext {
             parent: &parent,
             parent_balances: &balances,
+            watermarks: &wm,
             schedule: &s,
             checks: &checks,
             now,
@@ -771,9 +793,11 @@ mod phase_driver_tests {
         let locked_value = [0xEE; 32];
         consensus.apply_polka(0, locked_value);
 
+        let wm = crate::share_batch::ProposerWatermarks::new();
         let ctx = BatchContext {
             parent: &parent,
             parent_balances: &balances,
+            watermarks: &wm,
             schedule: &s,
             checks: &checks,
             now: PARENT_CLOSE,
