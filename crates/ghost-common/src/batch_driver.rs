@@ -230,6 +230,7 @@ mod tests {
             template_id: None,
             payout_address: Some("bc1qalice".into()),
             header: None,
+            tier_log2: None,
             signature: None,
         }];
         crate::share_batch::canonical_sort(&mut shares);
@@ -715,6 +716,7 @@ mod phase_driver_tests {
             template_id: None,
             payout_address: Some("bc1qalice".into()),
             header: None,
+            tier_log2: None,
             signature: None,
         }];
         crate::share_batch::canonical_sort(&mut shares);

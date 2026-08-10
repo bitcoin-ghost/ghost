@@ -870,6 +870,11 @@ pub struct ShareNotification {
     /// Content address of the coinbase skeleton this share was mined against, hex.
     #[serde(default)]
     pub skeleton_id: Option<String>,
+    /// The power-of-two difficulty tier (`log2`) this share's job COMMITTED to in its coinbase
+    /// (SHARE_TIER_BIND). `None` from any emitter predating the tier era — which today is every
+    /// emitter, so the field is absent on the wire while the gate is dormant.
+    #[serde(default)]
+    pub tier_log2: Option<u32>,
 }
 
 /// Data for a single share in a batch (from SRI Pool native webhook)
@@ -911,6 +916,12 @@ pub struct ShareData {
     /// [`ShareBatch::skeletons`].
     #[serde(default)]
     pub skeleton_id: Option<String>,
+    /// The power-of-two difficulty tier (`log2`) this share's job COMMITTED to in its coinbase
+    /// (SHARE_TIER_BIND). Absent from any `pool_sv2` predating the tier era — which today is
+    /// every `pool_sv2`: the emitting side (per-tier jobs in the SRI layer) is not built yet,
+    /// so this deserialises as `None` on every live batch while the gate is dormant.
+    #[serde(default)]
+    pub tier_log2: Option<u32>,
 }
 
 /// A coinbase skeleton, carried once per job rather than once per share.
@@ -1289,6 +1300,13 @@ pub struct VerificationState {
     start_time: Instant,
     /// Block height getter (callback)
     get_block_height: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// `SHARE_TIER_BIND_HEIGHT`, injected by ghost-pool at startup (`with_share_tier_bind_height`).
+    ///
+    /// A copy rather than a call into ghost-pool because the dependency points the other way —
+    /// ghost-pool links this crate. The authority stays `ghost_pool::share_tier_bind_height()`;
+    /// this field only carries the resolved value across the crate boundary, defaulting to the
+    /// dormant `u64::MAX` so an unwired caller can never turn the tier requirement on early.
+    share_tier_bind_height: u64,
     /// Round ID getter (callback)
     get_round_id: Box<dyn Fn() -> u64 + Send + Sync>,
     /// Miner count getter (callback)
@@ -1626,6 +1644,15 @@ pub struct GhostPayInfo {
 /// `sha256d(header).to_byte_array()`, which is internal order. A version of this that skipped the
 /// reverse rejected EVERY share carrying a header, in production, for 30 minutes.
 ///
+/// **Tier era (SHARE_TIER_BIND).** When `tier_bound` is true and the share carries its committed
+/// `tier_log2`, the header must justify the TIER and the claimed work must BE the tier's target —
+/// the post-hoc numeric claim stops being the credit. A tier-less share under `tier_bound` falls
+/// back to the legacy check rather than being refused, the same deliberate leniency as the
+/// header-less case above: this is the LOCAL ingest path, where dropping shares silently unpays
+/// this node's own miners while the SRI layer rolls; the mesh-facing paths (`round.rs`,
+/// `sbc_checks.rs`) are the strict ones. `tier_bound` is false while the gate is dormant, so
+/// today every call takes the legacy branch.
+///
 /// Extracted rather than left inline so a test can drive the real decision from the same hex
 /// strings the webhook carries. Testing `verify_pow_preimage` alone cannot catch an ordering bug in
 /// its caller — that is exactly how the outage got through review.
@@ -1633,6 +1660,8 @@ pub(crate) fn share_pow_is_acceptable(
     header_hex: Option<&str>,
     share_hash_hex: &str,
     claimed_work: f64,
+    tier_log2: Option<u32>,
+    tier_bound: bool,
 ) -> bool {
     let Some(hdr_hex) = header_hex else {
         return true;
@@ -1647,6 +1676,18 @@ pub(crate) fn share_pow_is_acceptable(
     ) else {
         return true;
     };
+    if tier_bound {
+        if let Some(tier) = tier_log2 {
+            return match ghost_accounting::DifficultyCalculator::verify_pow_preimage_tier(
+                &h80, &h32, tier,
+            ) {
+                // Same 0.01% (M-9) tolerance as `handle_share_proof`, so the local verdict
+                // cannot drift from the one peers will reach on the gossiped proof.
+                Some(credited) => (claimed_work - credited).abs() <= credited * 0.0001,
+                None => false,
+            };
+        }
+    }
     ghost_accounting::DifficultyCalculator::verify_pow_preimage(&h80, &h32, claimed_work)
 }
 
@@ -1680,6 +1721,7 @@ impl VerificationState {
             capabilities,
             start_time: Instant::now(),
             get_block_height: Box::new(|| 0),
+            share_tier_bind_height: u64::MAX,
             get_round_id: Box::new(|| 0),
             get_miner_count: Box::new(|| 0),
             get_peer_count: Box::new(|| 0),
@@ -1858,6 +1900,17 @@ impl VerificationState {
         self
     }
 
+    /// Inject the resolved `SHARE_TIER_BIND_HEIGHT` (SHARE_TIER_BIND).
+    ///
+    /// ghost-pool calls this at startup with `ghost_pool::share_tier_bind_height()`, which stays
+    /// the single authority; this only carries the value across the crate boundary (ghost-pool
+    /// links this crate, so this crate cannot ask it). Left unset, the default `u64::MAX` keeps
+    /// the tier requirement off — an unwired embedder can never arm it by accident.
+    pub fn with_share_tier_bind_height(mut self, height: u64) -> Self {
+        self.share_tier_bind_height = height;
+        self
+    }
+
     /// Set share recording callback (for SRI Pool share notifications)
     pub fn with_share_recorder<F>(mut self, recorder: F) -> Self
     where
@@ -1930,6 +1983,13 @@ impl VerificationState {
         let mut recorded = 0;
         let mut blocks_found = 0;
 
+        // SHARE_TIER_BIND: whether shares at the current height commit to a difficulty tier.
+        // Same dormant-safe sense as `RoundManager::handle_share_proof` — an unestablished
+        // height (0) must NOT activate a dormant gate on restart. The height field is the value
+        // ghost-pool injected at startup; unwired, it stays `u64::MAX` and this is always false.
+        let tip = (self.get_block_height)();
+        let tier_bound = tip > 0 && tip >= self.share_tier_bind_height;
+
         for share in batch.shares {
             // Parse user_identity to extract payout address and worker name
             // Format: <payout_address>.<worker_name>
@@ -1964,6 +2024,8 @@ impl VerificationState {
                 share.header.as_deref(),
                 &share.share_hash,
                 share.share_work,
+                share.tier_log2,
+                tier_bound,
             ) {
                 tracing::warn!(
                     miner_id = %miner_id,
@@ -1991,6 +2053,7 @@ impl VerificationState {
                 header: share.header.clone(),
                 extranonce: share.extranonce.clone(),
                 skeleton_id: share.skeleton_id.clone(),
+                tier_log2: share.tier_log2,
             };
 
             if let Err(e) = self.record_share(notification) {
@@ -3459,18 +3522,70 @@ mod tests {
         );
 
         assert!(
-            share_pow_is_acceptable(Some(&header_hex), &wire_hex, achieved * 0.5),
+            share_pow_is_acceptable(Some(&header_hex), &wire_hex, achieved * 0.5, None, false),
             "a genuine share must be ADMITTED — this is the assertion that would have caught the \
              outage: without the reverse, it is rejected"
         );
         assert!(
-            !share_pow_is_acceptable(Some(&header_hex), &wire_hex, achieved * 100.0),
+            !share_pow_is_acceptable(Some(&header_hex), &wire_hex, achieved * 100.0, None, false),
             "a share claiming 100x its proven work must be refused"
         );
         assert!(
-            share_pow_is_acceptable(None, &wire_hex, achieved * 100.0),
+            share_pow_is_acceptable(None, &wire_hex, achieved * 100.0, None, false),
             "a header-less share must pass — an older translator must not go unpaid"
         );
+    }
+
+    /// SHARE_TIER_BIND on the local ingest path, driven from the wire format like the test above.
+    ///
+    /// Deterministic real PoW: the Bitcoin genesis header achieves difficulty ~2536, i.e. tier 11
+    /// (target 2048) and no higher — no mining in the test, no 1-in-256 flake.
+    #[test]
+    fn share_pow_is_acceptable_judges_the_committed_tier_when_bound() {
+        use bitcoin::consensus::Encodable;
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut header = Vec::new();
+        genesis.header.consensus_encode(&mut header).unwrap();
+        let header_hex = hex::encode(&header);
+        // Wire format: Display order, exactly what pool_sv2 puts on the webhook.
+        let wire_hex = genesis.header.block_hash().to_string();
+
+        // Dormant (tier_bound = false): a tier riding along changes nothing — the legacy
+        // numeric claim is still what is judged. This is the below-gate no-behaviour-change pin.
+        assert!(share_pow_is_acceptable(
+            Some(&header_hex),
+            &wire_hex,
+            2048.0,
+            Some(11),
+            false
+        ));
+
+        // Bound: committed tier 11, work stated as exactly 2^11 — admitted.
+        assert!(
+            share_pow_is_acceptable(Some(&header_hex), &wire_hex, 2048.0, Some(11), true),
+            "real PoW at its committed tier must be admitted"
+        );
+        // Bound: the post-hoc claim — real hash, but work stated as the achieved ~2536 rather
+        // than the committed tier's 2048 — refused. This is the attack the gate closes.
+        assert!(
+            !share_pow_is_acceptable(Some(&header_hex), &wire_hex, 2536.0, Some(11), true),
+            "credit must be the committed tier's target, not the achieved difficulty"
+        );
+        // Bound: a tier the hash does not reach earns nothing.
+        assert!(
+            !share_pow_is_acceptable(Some(&header_hex), &wire_hex, 4096.0, Some(12), true),
+            "a committed tier the hash misses must be refused"
+        );
+        // Bound but tier-less: falls back to the legacy check (deliberate local-path leniency,
+        // mirroring the header-less case — the strict paths are round.rs and sbc_checks.rs).
+        assert!(share_pow_is_acceptable(
+            Some(&header_hex),
+            &wire_hex,
+            2048.0,
+            None,
+            true
+        ));
     }
 
     /// #591. `ValidationStats` was incremented on every rejected mesh message and read by nobody —

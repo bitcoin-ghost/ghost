@@ -24,6 +24,64 @@ enum AggregatedSnapshot {
     NoDownstreams,
 }
 
+/// Floor tier exponent for difficulty quantisation (SHARE_TIER_BIND): no assigned difficulty may
+/// sit below `2^10 = 1024`.
+///
+/// ⚠ AUTHORITY: `ghost_common::coinbase_tags::MIN_DIFFICULTY_TIER_LOG2`. Duplicated here as a
+/// literal because this crate is an SRI fork that deliberately does not link the ghost workspace
+/// crates. If the authority moves (it is re-derived against the live vardiff floor before the
+/// gate arms), this constant MUST move with it — the arming checklist on
+/// `SHARE_TIER_BIND_HEIGHT` (ghost-pool `lib.rs`) is what enforces the coupling.
+pub(crate) const MIN_DIFFICULTY_TIER_LOG2: u32 = 10;
+
+/// Ceiling tier exponent, clamping the shift below. Mirrors
+/// `ghost_common::coinbase_tags::MAX_DIFFICULTY_TIER_LOG2`.
+pub(crate) const MAX_DIFFICULTY_TIER_LOG2: u32 = 63;
+
+/// The exact target of a difficulty tier: `diff1_target / 2^tier` = `0xFFFF * 2^(208 - tier)`.
+///
+/// Built directly in bytes rather than through floats: `0xFFFF * 2^208` and every power of two
+/// are exact, so the tier target is the same 32 bytes on every platform — which matters, because
+/// these bytes end up committed inside a hashed coinbase.
+fn tier_target(tier_log2: u32) -> Target {
+    let tier = tier_log2.min(MAX_DIFFICULTY_TIER_LOG2);
+    // 0xFFFF occupies bits s..s+16 of the 256-bit target, where s = 208 - tier ∈ [145, 208].
+    let s = (208 - tier) as usize;
+    let v: u32 = 0xFFFFu32 << (s % 8);
+    let idx = s / 8;
+    let mut le = [0u8; 32];
+    le[idx] = (v & 0xFF) as u8;
+    le[idx + 1] = ((v >> 8) & 0xFF) as u8;
+    le[idx + 2] = ((v >> 16) & 0xFF) as u8;
+    Target::from_le_bytes(le)
+}
+
+/// Quantise a vardiff-computed target to its power-of-two difficulty tier (SHARE_TIER_BIND).
+///
+/// Difficulty rounds DOWN to `2^floor(log2(d))` — the target gets easier, never harder, so a
+/// miner sized by vardiff keeps finding shares — except below the floor tier, which rounds UP to
+/// `2^MIN_DIFFICULTY_TIER_LOG2`: the floor is the smallest tier any node may assign, and it sits
+/// just below the smallest difficulty the fleet serves, so in practice nothing lands there.
+///
+/// This mirrors `ghost_common::coinbase_tags::difficulty_to_tier_log2` (the verifying side's
+/// derivation); the two must agree or a share would be assigned one tier and credited another.
+pub(crate) fn quantise_target_to_tier(target: &Target) -> Target {
+    let d = target.difficulty_float();
+    let tier = if !d.is_finite() || d < 1.0 {
+        MIN_DIFFICULTY_TIER_LOG2
+    } else {
+        let raw = d.log2().floor();
+        if !raw.is_finite() || raw < MIN_DIFFICULTY_TIER_LOG2 as f64 {
+            MIN_DIFFICULTY_TIER_LOG2
+        } else if raw >= MAX_DIFFICULTY_TIER_LOG2 as f64 {
+            MAX_DIFFICULTY_TIER_LOG2
+        } else {
+            raw as u32
+        }
+    };
+    tier_target(tier)
+}
+
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Sv1Server {
     /// Spawns the variable difficulty adjustment loop.
@@ -131,6 +189,15 @@ impl Sv1Server {
                             continue;
                         }
                     };
+                // SHARE_TIER_BIND: snap the retargeted difficulty to its power-of-two tier, so
+                // the difficulty a share is assigned is a tier its coinbase can commit to.
+                // Dormant: `quantise_to_tiers` defaults false and ships false until the gate
+                // arms, leaving every target byte-identical to today's.
+                let new_target = if self.config.downstream_difficulty_config.quantise_to_tiers {
+                    quantise_target_to_tier(&new_target)
+                } else {
+                    new_target
+                };
                 // Always update the downstream's pending target and hashrate
                 if let Some(d) = self.downstreams.get(downstream_id) {
                     _ = d.downstream_data.safe_lock(|data| {
@@ -556,5 +623,90 @@ impl Sv1Server {
                 e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tier_quantisation_tests {
+    use super::*;
+
+    /// A tier's target must be EXACT: `0xFFFF * 2^(208 - tier)`, whose difficulty is exactly
+    /// `2^tier`. Both factors are exact in f64, so equality here is legitimate, not tolerance.
+    #[test]
+    fn tier_targets_are_exact_powers_of_two() {
+        for tier in [MIN_DIFFICULTY_TIER_LOG2, 11, 13, 16, 20, 33, 40, 63] {
+            let d = tier_target(tier).difficulty_float();
+            assert_eq!(
+                d,
+                2.0_f64.powi(tier as i32),
+                "tier {tier} target must stand for exactly 2^{tier}"
+            );
+        }
+    }
+
+    /// Quantisation floors difficulty to the tier below (the target gets easier, never harder),
+    /// and a tier target is a fixed point.
+    #[test]
+    fn quantisation_rounds_difficulty_down_and_is_idempotent() {
+        // ~1.5x the tier-13 target's hashrate: difficulty lands between 2^13 and 2^14.
+        // hash_rate_to_target(h, spm) sizes difficulty ∝ hashrate, so pick a hashrate whose
+        // difficulty is comfortably inside a tier rather than on its boundary.
+        let raw = hash_rate_to_target(6.0e11, 6.0).expect("valid inputs");
+        let d_raw = raw.difficulty_float();
+        assert!(
+            d_raw > 1024.0,
+            "fixture must sit above the floor tier, got {d_raw}"
+        );
+
+        let q = quantise_target_to_tier(&raw);
+        let d_q = q.difficulty_float();
+        let expected = 2.0_f64.powi(d_raw.log2().floor() as i32);
+        assert_eq!(d_q, expected, "must floor to the tier below");
+        assert!(
+            d_q <= d_raw,
+            "quantised difficulty must never exceed the assigned one"
+        );
+        assert!(
+            q >= raw,
+            "the quantised target must be easier (larger), never harder"
+        );
+
+        // Idempotent: a tier is its own tier.
+        assert_eq!(quantise_target_to_tier(&q), q);
+    }
+
+    /// The floor: nothing may be assigned below `2^10 = 1024`.
+    ///
+    /// ⚠ 1024 is `ghost_common::coinbase_tags::MIN_DIFFICULTY_TIER_LOG2`'s target; this crate
+    /// cannot link that crate, so this test pins the duplicated constant to the agreed value.
+    #[test]
+    fn sub_floor_difficulties_clamp_up_to_the_floor_tier() {
+        // A tiny hashrate produces a difficulty far below 1024.
+        let raw = hash_rate_to_target(1.0e6, 6.0).expect("valid inputs");
+        assert!(raw.difficulty_float() < 1024.0);
+        let q = quantise_target_to_tier(&raw);
+        assert_eq!(
+            q.difficulty_float(),
+            1024.0,
+            "sub-floor difficulty must clamp UP to the floor tier"
+        );
+        assert_eq!(
+            tier_target(MIN_DIFFICULTY_TIER_LOG2).difficulty_float(),
+            1024.0
+        );
+    }
+
+    /// The production shape: a ~500 GH/s bitaxe at the live vardiff floor lands near difficulty
+    /// ~1164 (see `ACTIVE_MINER_WINDOW_SECS` in ghost-common), which must quantise to the floor
+    /// tier itself — the coupling `MIN_DIFFICULTY_TIER_LOG2` was chosen for.
+    #[test]
+    fn the_smallest_fleet_difficulty_lands_on_the_floor_tier() {
+        let raw = hash_rate_to_target(5.0e11, 6.0).expect("valid inputs");
+        let d = raw.difficulty_float();
+        assert!(
+            (1024.0..2048.0).contains(&d),
+            "expected the bitaxe-shaped difficulty in tier 10's band, got {d}"
+        );
+        assert_eq!(quantise_target_to_tier(&raw).difficulty_float(), 1024.0);
     }
 }

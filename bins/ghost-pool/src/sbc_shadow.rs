@@ -1496,6 +1496,7 @@ mod tests {
             template_id: Some([3u8; 32]),
             payout_address: Some(addr.to_string()),
             header: Some(header),
+            tier_log2: None,
             signature: None,
         };
         s.sign(identity);
@@ -1747,7 +1748,7 @@ mod tests {
             proposer_signature: Vec::new(),
         };
         let schedule = ProposerSchedule::new([id.node_id(), bad.node_id()]);
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
 
         assert_eq!(
             chain.on_proposal(&batch, &schedule, &checks, 600),
@@ -1918,7 +1919,7 @@ mod tests {
             pending_count: 0,
             proposer_signature: Vec::new(),
         };
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
         assert!(
             matches!(
                 chain.on_proposal_phase(&batch, &schedule, &checks, head.close_ts + 30),
@@ -2178,7 +2179,7 @@ mod tests {
             .proposer_at(child.seq, escalation)
             .expect("a due proposer");
 
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
         let verdict = verify_batch(
             &child,
             &parent,
@@ -2219,7 +2220,7 @@ mod tests {
 
         let head = chain.head().expect("head");
         let seq = head.seq + 1;
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
 
         // Every degraded view the query can actually return.
         for n in 0..3usize {
@@ -2298,7 +2299,7 @@ mod tests {
             proposer_signature: Vec::new(),
         };
         let schedule = ProposerSchedule::new([id.node_id()]);
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
 
         let action = chain.on_proposal_phase(&batch, &schedule, &checks, 600);
         assert!(
@@ -2449,7 +2450,7 @@ mod tests {
             proposer_signature: Vec::new(),
         };
         let schedule = ProposerSchedule::new([id.node_id()]);
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
 
         let single = chain.on_proposal(&batch, &schedule, &checks, 600);
         let two = chain.on_proposal_phase(&batch, &schedule, &checks, 600);
@@ -2503,7 +2504,7 @@ mod tests {
             proposer_signature: Vec::new(),
         };
         let schedule = ProposerSchedule::new([id.node_id(), bad.node_id()]);
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
 
         assert_ne!(
             chain.on_proposal(&batch, &schedule, &checks, 600),
@@ -2536,7 +2537,7 @@ mod tests {
             proposer_signature: Vec::new(),
         };
         let schedule = ProposerSchedule::new([id.node_id(), peer.node_id()]);
-        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true);
+        let checks = crate::sbc_checks::NodeBatchChecks::new(None, true, false);
 
         assert!(
             matches!(

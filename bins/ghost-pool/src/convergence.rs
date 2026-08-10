@@ -643,6 +643,7 @@ mod tests {
     fn signed_share(signer: &NodeIdentity, nonce: u64) -> ShareProof {
         let mut p = ShareProof {
             header: None,
+            tier_log2: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,
@@ -1021,6 +1022,7 @@ mod tests {
         let remote_signer = NodeIdentity::generate();
         let mut remote = ShareProof {
             header: None,
+            tier_log2: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,
@@ -1051,6 +1053,7 @@ mod tests {
         rm_local.set_template_id(TPL);
         let mut local = ShareProof {
             header: None,
+            tier_log2: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,
@@ -1096,6 +1099,7 @@ mod tests {
 
         let mut p = ShareProof {
             header: None,
+            tier_log2: None,
             round_id: 1,
             miner_id: [9u8; 32],
             difficulty: 1.0,

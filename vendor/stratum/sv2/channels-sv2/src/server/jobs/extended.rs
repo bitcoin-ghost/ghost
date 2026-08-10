@@ -32,6 +32,19 @@ pub struct ExtendedJob<'a> {
     coinbase_tx_prefix_with_bip141: Vec<u8>,
     coinbase_tx_suffix_with_bip141: Vec<u8>,
     job_message: NewExtendedMiningJob<'a>,
+    /// The factory's extra scriptSig pushes in force when THIS job was built (empty below the
+    /// tier gate). Captured per job because the factory's value moves between builds, and
+    /// reassembling this job's coinbase with a later value would produce a transaction the
+    /// miner never hashed.
+    extra_script_sig: Vec<u8>,
+    /// The power-of-two difficulty tier (`log2`) this job's coinbase committed to via its
+    /// tier-bound node tag, when built at/above `SHARE_TIER_BIND`. `None` below the gate.
+    ///
+    /// Captured AT BUILD, deliberately not derived from `job_id_to_target` at share time: the
+    /// coinbase is built when the (usually future) job is created, but `job_id_to_target` binds
+    /// at ACTIVATION — by which point vardiff may have moved the channel target, and the tier
+    /// read back would not be the one the coinbase committed to.
+    tier_log2: Option<u32>,
 }
 
 impl Job for ExtendedJob<'_> {
@@ -73,6 +86,8 @@ impl<'a> ExtendedJob<'a> {
             coinbase_tx_prefix_with_bip141: coinbase_tx_prefix,
             coinbase_tx_suffix_with_bip141: coinbase_tx_suffix,
             job_message,
+            extra_script_sig: Vec::new(),
+            tier_log2: None,
         })
     }
     /// Creates a new extended job from a custom mining job message.
@@ -93,6 +108,10 @@ impl<'a> ExtendedJob<'a> {
             coinbase_tx_prefix_with_bip141: coinbase_tx_prefix,
             coinbase_tx_suffix_with_bip141: coinbase_tx_suffix,
             job_message,
+            // A custom job's coinbase comes assembled from the declaring client; no factory
+            // extras and no tier commitment apply.
+            extra_script_sig: Vec::new(),
+            tier_log2: None,
         }
     }
 
@@ -131,13 +150,18 @@ impl<'a> ExtendedJob<'a> {
             min_ntime: self.get_min_ntime(),
         };
 
-        let standard_job = StandardJob::from_template(
+        let mut standard_job = StandardJob::from_template(
             template.clone(),
             extranonce_prefix,
             self.get_coinbase_outputs().clone(),
             standard_job_message,
         )
         .map_err(|_| ExtendedJobError::FailedToConvertToStandardJob)?;
+        // The standard job is the SAME coinbase seen through a different channel type, so both
+        // build-time captures carry over: the extra pushes (reassembly must reproduce these
+        // bytes) and the tier the coinbase committed to.
+        standard_job.set_extra_script_sig(self.extra_script_sig.clone());
+        standard_job.set_tier_log2(self.tier_log2);
 
         Ok(standard_job)
     }
@@ -172,6 +196,23 @@ impl<'a> ExtendedJob<'a> {
     /// Returns the extranonce prefix used for this job.
     pub fn get_extranonce_prefix(&self) -> &Vec<u8> {
         &self.extranonce_prefix
+    }
+    /// The factory extra scriptSig pushes captured when this job was built.
+    pub fn get_extra_script_sig(&self) -> &[u8] {
+        &self.extra_script_sig
+    }
+    /// Records the factory extra scriptSig pushes this job's coinbase was built with.
+    pub fn set_extra_script_sig(&mut self, extra: Vec<u8>) {
+        self.extra_script_sig = extra;
+    }
+    /// The difficulty tier (`log2`) this job's coinbase committed to, if any.
+    pub fn get_tier_log2(&self) -> Option<u32> {
+        self.tier_log2
+    }
+    /// Labels this job with the tier its coinbase committed to. Set at build time by the channel
+    /// that chose the tier; the tag bytes themselves travel in `extra_script_sig`.
+    pub fn set_tier_log2(&mut self, tier_log2: Option<u32>) {
+        self.tier_log2 = tier_log2;
     }
     /// Returns all coinbase outputs for this job.
     pub fn get_coinbase_outputs(&self) -> &Vec<TxOut> {

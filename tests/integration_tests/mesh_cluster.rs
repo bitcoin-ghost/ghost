@@ -146,6 +146,10 @@ impl TestMeshCluster {
             template_id: Some(TEST_TEMPLATE_ID),
             payout_address: None,
             header: None,
+            // Below `SHARE_TIER_BIND_HEIGHT`, exactly as a pre-tier proof on the wire: an absent
+            // tier keeps `signing_bytes` byte-identical, which is what these mesh forgery tests
+            // assume when they check signatures across nodes.
+            tier_log2: None,
             signature: None,
         }
     }

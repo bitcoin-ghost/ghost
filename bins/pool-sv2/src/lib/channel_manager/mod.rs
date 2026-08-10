@@ -106,6 +106,10 @@ pub struct ChannelManager {
     job_declarator: Option<JobDeclarator>,
     /// Optional ghost share webhook sender. When Some, every validated share is posted.
     pub(crate) share_webhook_sender: Option<crate::share_webhook::ShareWebhookSender>,
+    /// SHARE_TIER_BIND: this pool's half of the difficulty-tier commitment, when configured.
+    /// `None` — the default and only shipped state — is dormant: one group job per template,
+    /// byte-identical to before the field existed. See `tier_binding.rs`.
+    pub(crate) tier_binding: Option<Arc<crate::tier_binding::TierBinding>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -161,6 +165,26 @@ impl ChannelManager {
             downstream_receiver,
         };
 
+        // SHARE_TIER_BIND: resolve the tier-binding half of the gate, if configured. A malformed
+        // node id refuses startup — stamping tags derived from the wrong identity would have
+        // every tier-era share silently rejected by its binding check.
+        let tier_binding = match config.share_tier_binding() {
+            None => None,
+            Some(cfg) => {
+                let tb = crate::tier_binding::TierBinding::from_config(cfg)
+                    .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+                warn!(
+                    activation_height = tb.activation_height(),
+                    "SHARE_TIER_BIND: per-tier job generation is CONFIGURED. This is one half of \
+                     a two-part gate: ghost-pool's SHARE_TIER_BIND_HEIGHT must equal this height \
+                     and the translator must run with quantise_to_tiers = true, all in the same \
+                     release — a desync means rejected shares (pool-on/translator-off) or \
+                     unchecked tier-shaped difficulties (translator-on/pool-off)"
+                );
+                Some(Arc::new(tb))
+            }
+        };
+
         let channel_manager = ChannelManager {
             channel_manager_data,
             channel_manager_channel,
@@ -172,6 +196,7 @@ impl ChannelManager {
             required_extensions: config.required_extensions().to_vec(),
             job_declarator,
             share_webhook_sender,
+            tier_binding,
         };
 
         Ok(channel_manager)
@@ -512,6 +537,7 @@ impl ChannelManager {
         channel_state: &mut ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
+        tier_binding: Option<&crate::tier_binding::TierBinding>,
     ) {
         let (hashrate, target, shares_per_minute) = (
             channel_state.get_nominal_hashrate(),
@@ -531,6 +557,16 @@ impl ChannelManager {
 
         match channel_state.update_channel(new_hashrate, None) {
             Ok(()) => {
+                // SHARE_TIER_BIND: in tiered mode the announced target must BE a tier's exact
+                // target, or the coinbase can only commit to (and the miner only be credited)
+                // up to half the difficulty it actually mines at.
+                if let Some(tb) = tier_binding {
+                    let q = tb.quantise_target(
+                        channel_state.get_target(),
+                        channel_state.get_requested_max_target(),
+                    );
+                    channel_state.set_target(q);
+                }
                 let updated_target = channel_state.get_target();
                 updates.push(
                     (
@@ -557,6 +593,7 @@ impl ChannelManager {
         channel: &mut StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
+        tier_binding: Option<&crate::tier_binding::TierBinding>,
     ) {
         let hashrate = channel.get_nominal_hashrate();
         let target = channel.get_target();
@@ -571,6 +608,15 @@ impl ChannelManager {
         if let Some(new_hashrate) = new_hashrate_opt {
             match channel.update_channel(new_hashrate, None) {
                 Ok(()) => {
+                    // SHARE_TIER_BIND: in tiered mode the announced target must BE a tier's
+                    // exact target — see the extended-channel twin above.
+                    if let Some(tb) = tier_binding {
+                        let q = tb.quantise_target(
+                            channel.get_target(),
+                            channel.get_requested_max_target(),
+                        );
+                        channel.set_target(q);
+                    }
                     let updated_target = channel.get_target();
                     updates.push(
                         (
@@ -621,6 +667,14 @@ impl ChannelManager {
         let mut messages: Vec<RouteMessageTo> = vec![];
         self.channel_manager_data
             .super_safe_lock(|channel_manager_data| {
+                // SHARE_TIER_BIND: quantise retargets only while the chain (as seen through the
+                // last future template's BIP34 height) is at/above the activation height.
+                let tier_binding = self.tier_binding.as_deref().filter(|tb| {
+                    channel_manager_data
+                        .last_future_template
+                        .as_ref()
+                        .is_some_and(|t| tb.template_is_tiered(t))
+                });
                 for (vardiff_key, vardiff_state) in channel_manager_data.vardiff.iter_mut() {
                     let downstream_id = &vardiff_key.downstream_id;
                     let channel_id = &vardiff_key.channel_id;
@@ -637,6 +691,7 @@ impl ChannelManager {
                                 standard_channel,
                                 vardiff_state,
                                 &mut messages,
+                                tier_binding,
                             );
                         }
                         if let Some(extended_channel) = data.extended_channels.get_mut(channel_id) {
@@ -646,6 +701,7 @@ impl ChannelManager {
                                 extended_channel,
                                 vardiff_state,
                                 &mut messages,
+                                tier_binding,
                             );
                         }
                     });

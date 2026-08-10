@@ -87,10 +87,18 @@ pub struct JobFactory {
     miner_tag_string: Option<String>,
     /// Extra scriptSig pushes appended after the pool/miner tag, opaque to this factory.
     ///
-    /// Ghost puts its payout-identity and node-identity tags here. They are passed in already
-    /// encoded — including their `OP_PUSHBYTES` opcodes — rather than built here, because they are
-    /// Ghost semantics and this is vendored upstream code: keeping the meaning out of the fork
-    /// keeps the rebase diff to the budget arithmetic, which is the part upstream would want too.
+    /// Honest accounting of what actually travels where (2026-08-10): Ghost's payout-identity
+    /// (`GHPP`) and node-identity (`GHNT`) tags normally arrive INSIDE the template's
+    /// `coinbase_prefix` — ghost-pool stamps them ahead of the TDP hand-off — not through this
+    /// field, and below `SHARE_TIER_BIND` this field has no production caller at all. Its one
+    /// production use is the difficulty-tier commitment: at/above the gate the pool layer strips
+    /// the plain node tag out of the template prefix and re-stamps a tier-bound tag
+    /// (`sha256(node_id ‖ tier)[..20]`, same 21 encoded bytes) here, one per per-tier job.
+    ///
+    /// The bytes are passed in already encoded — including their `OP_PUSHBYTES` opcodes — rather
+    /// than built here, because they are Ghost semantics and this is vendored upstream code:
+    /// keeping the meaning out of the fork keeps the rebase diff to the budget arithmetic, which
+    /// is the part upstream would want too.
     ///
     /// What the factory *does* owe them is room. See [`Self::pool_miner_tag_budget`].
     extra_script_sig: Vec<u8>,
@@ -130,6 +138,21 @@ impl JobFactory {
         self
     }
 
+    /// Change the extra scriptSig pushes on a live factory, WITHOUT resetting job-id state.
+    ///
+    /// The builder form above can only run at construction, but the tier commitment changes with
+    /// the channel's difficulty tier between jobs — and rebuilding the factory to change it would
+    /// restart the job-id counter, colliding new job ids with ones miners still hold. Same
+    /// budget behaviour as the builder: the bytes come out of the shared 100, measured on the
+    /// assembled scriptSig at build time.
+    ///
+    /// Jobs built by this factory each capture the extra bytes in force AT THEIR BUILD
+    /// (`new_standard_job` / `new_extended_job` stamp them onto the job), so mutating this
+    /// between builds cannot retroactively change what an outstanding job's coinbase carries.
+    pub fn set_extra_script_sig(&mut self, extra: Vec<u8>) {
+        self.extra_script_sig = extra;
+    }
+
     /// How many bytes the pool+miner tag may occupy, given everything else in the scriptSig.
     ///
     /// Derived rather than written down. This was a literal `61` with the arithmetic in a comment
@@ -140,11 +163,17 @@ impl JobFactory {
     /// Saturating, so an extra push large enough to consume the whole budget yields zero rather
     /// than wrapping to an enormous allowance.
     pub fn pool_miner_tag_budget(&self, full_extranonce_size: usize) -> usize {
+        self.pool_miner_tag_budget_with(full_extranonce_size, self.extra_script_sig.len())
+    }
+
+    /// [`Self::pool_miner_tag_budget`] against an explicit extra-push length — the reassembly
+    /// paths budget against the extra a JOB was built with, not whatever the factory holds now.
+    fn pool_miner_tag_budget_with(&self, full_extranonce_size: usize, extra_len: usize) -> usize {
         MAX_COINBASE_SCRIPT_SIG
             .saturating_sub(BIP34_HEIGHT_RESERVE)
             .saturating_sub(1) // OP_PUSHBYTES for the pool/miner tag
             .saturating_sub(1 + full_extranonce_size)
-            .saturating_sub(self.extra_script_sig.len())
+            .saturating_sub(extra_len)
     }
 
     /// Everything in the scriptSig before the extranonce bytes themselves, including the
@@ -162,9 +191,33 @@ impl JobFactory {
         template_coinbase_prefix: &[u8],
         full_extranonce_size: usize,
     ) -> Result<Vec<u8>, JobFactoryError> {
+        self.script_sig_before_extranonce_with(
+            template_coinbase_prefix,
+            full_extranonce_size,
+            &self.extra_script_sig,
+        )
+    }
+
+    /// [`Self::script_sig_before_extranonce`], but with the extra pushes passed explicitly.
+    ///
+    /// For REASSEMBLING the scriptSig of a job built earlier: the factory's own
+    /// `extra_script_sig` is whatever the LAST build set, but the coinbase a miner hashed carries
+    /// the pushes in force at ITS build — each job records them (`get_extra_script_sig`). Using
+    /// the factory's current state to rebuild an older job's coinbase would produce a different
+    /// transaction than the one whose hash was submitted, and the block-found path would then
+    /// assemble a block the network rejects. The budget check is unchanged: it measures the
+    /// assembled bytes, whichever extra was passed.
+    pub fn script_sig_before_extranonce_with(
+        &self,
+        template_coinbase_prefix: &[u8],
+        full_extranonce_size: usize,
+        extra_script_sig: &[u8],
+    ) -> Result<Vec<u8>, JobFactoryError> {
         let mut script_sig = template_coinbase_prefix.to_vec();
-        script_sig.extend_from_slice(&self.op_pushbytes_pool_miner_tag(full_extranonce_size)?);
-        script_sig.extend_from_slice(&self.extra_script_sig);
+        script_sig.extend_from_slice(
+            &self.op_pushbytes_pool_miner_tag_with(full_extranonce_size, extra_script_sig.len())?,
+        );
+        script_sig.extend_from_slice(extra_script_sig);
         // The extranonce stays last: the prefix/suffix split is "everything before it" and
         // "everything after it", so anything appended behind would land on the wrong side.
         script_sig.push(full_extranonce_size as u8);
@@ -195,6 +248,15 @@ impl JobFactory {
         &self,
         full_extranonce_size: usize,
     ) -> Result<Vec<u8>, JobFactoryError> {
+        self.op_pushbytes_pool_miner_tag_with(full_extranonce_size, self.extra_script_sig.len())
+    }
+
+    /// [`Self::op_pushbytes_pool_miner_tag`] budgeted against an explicit extra-push length.
+    fn op_pushbytes_pool_miner_tag_with(
+        &self,
+        full_extranonce_size: usize,
+        extra_len: usize,
+    ) -> Result<Vec<u8>, JobFactoryError> {
         let mut pool_miner_tag = vec![];
         pool_miner_tag.extend_from_slice(b"/");
         if let Some(pool_tag_string) = &self.pool_tag_string {
@@ -210,7 +272,7 @@ impl JobFactory {
         // caller-supplied: a long one plus the extra pushes would otherwise pass a stale literal
         // and produce a scriptSig over the 100-byte consensus limit. That is only discoverable on
         // a won block.
-        let budget = self.pool_miner_tag_budget(full_extranonce_size);
+        let budget = self.pool_miner_tag_budget_with(full_extranonce_size, extra_len);
         let op_pushbytes = match pool_miner_tag.len() {
             len if (1..=budget).contains(&len) => len as u8,
             _ => return Err(JobFactoryError::CoinbaseTxPrefixError),
@@ -302,13 +364,16 @@ impl JobFactory {
             }
         };
 
-        let job = StandardJob::from_template(
+        let mut job = StandardJob::from_template(
             template,
             extranonce_prefix,
             additional_coinbase_outputs,
             job_message,
         )
         .map_err(|_| JobFactoryError::DeserializeCoinbaseOutputsError)?;
+        // Capture the extra pushes in force at THIS build. Reassembly (skeleton, block-found)
+        // must reproduce this job's coinbase even after the factory's extra has moved on.
+        job.set_extra_script_sig(self.extra_script_sig.clone());
 
         Ok(job)
     }
@@ -401,7 +466,7 @@ impl JobFactory {
             }
         };
 
-        let job = ExtendedJob::from_template(
+        let mut job = ExtendedJob::from_template(
             template,
             extranonce_prefix,
             additional_coinbase_outputs,
@@ -410,6 +475,9 @@ impl JobFactory {
             job_message,
         )
         .map_err(|_| JobFactoryError::DeserializeCoinbaseOutputsError)?;
+        // Capture the extra pushes in force at THIS build. Reassembly (skeleton, block-found)
+        // must reproduce this job's coinbase even after the factory's extra has moved on.
+        job.set_extra_script_sig(self.extra_script_sig.clone());
 
         Ok(job)
     }
@@ -920,6 +988,61 @@ mod tests {
         let f = JobFactory::new(true, Some("p".into()), None).with_extra_script_sig(vec![0u8; 500]);
         assert_eq!(f.pool_miner_tag_budget(20), 0);
         assert!(f.op_pushbytes_pool_miner_tag(20).is_err());
+    }
+
+    /// `set_extra_script_sig` must not reset the job-id counter (a rebuilt factory would), and
+    /// each job must capture the extra in force at ITS build — that capture is what reassembly
+    /// reads, so a later mutation must not leak backwards.
+    #[test]
+    fn mutating_the_extra_keeps_job_ids_and_captures_per_build() {
+        let mut factory = JobFactory::new(true, Some("pool".to_string()), None);
+        let template = NewTemplate {
+            template_id: 1,
+            future_template: true,
+            version: 536870912,
+            coinbase_tx_version: 2,
+            coinbase_prefix: vec![82, 0].try_into().unwrap(),
+            coinbase_tx_input_sequence: 4294967295,
+            coinbase_tx_value_remaining: 5000000000,
+            coinbase_tx_outputs_count: 1,
+            coinbase_tx_outputs: vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 38, 106, 36, 170, 33, 169, 237, 226, 246, 28, 63, 113, 209,
+                222, 253, 63, 169, 153, 223, 163, 105, 83, 117, 92, 105, 6, 137, 121, 153, 98, 180,
+                139, 235, 216, 54, 151, 78, 140, 249,
+            ]
+            .try_into()
+            .unwrap(),
+            coinbase_tx_locktime: 0,
+            merkle_path: vec![].try_into().unwrap(),
+        };
+        let outputs = || {
+            vec![TxOut {
+                value: Amount::from_sat(5000000000),
+                script_pubkey: ScriptBuf::from(vec![0u8, 1, 0xAA]),
+            }]
+        };
+
+        let first = factory
+            .new_extended_job(1, None, vec![], template.clone(), outputs(), 32)
+            .unwrap();
+        assert_eq!(first.get_job_id(), 1);
+        assert!(first.get_extra_script_sig().is_empty());
+
+        let push = vec![0x02, 0xBE, 0xEF];
+        factory.set_extra_script_sig(push.clone());
+        let second = factory
+            .new_extended_job(1, None, vec![], template, outputs(), 32)
+            .unwrap();
+        assert_eq!(
+            second.get_job_id(),
+            2,
+            "the id counter must survive the setter"
+        );
+        assert_eq!(second.get_extra_script_sig(), push.as_slice());
+        assert!(
+            first.get_extra_script_sig().is_empty(),
+            "an earlier job's capture must not move"
+        );
     }
 
     #[test]

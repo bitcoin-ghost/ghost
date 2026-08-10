@@ -437,6 +437,7 @@ mod tests {
             template_id: None,
             payout_address: Some(addr.to_string()),
             header: None,
+            tier_log2: None,
             signature: None,
         }
     }

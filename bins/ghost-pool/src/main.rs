@@ -2965,13 +2965,11 @@ async fn main() -> Result<()> {
         mining_mode,
         solo_payout_address: config.network.solo_payout_address.clone(),
         coinbase_extra: coinbase_tag,
-        node_commitment: {
-            // sha256(node_id)[..20] — see TemplateConfig::node_commitment.
-            let digest = ghost_common::identity::hash_message(&identity.node_id());
-            let mut c = [0u8; 20];
-            c.copy_from_slice(&digest[..20]);
-            Some(c)
-        },
+        // The identity itself, not a pre-hashed commitment: the scriptSig builder derives the
+        // tag per build — `node_commitment_plain` below SHARE_TIER_BIND_HEIGHT (byte-identical
+        // to the sha256(node_id)[..20] always stamped), `node_commitment_for_tier` above it for
+        // builds that know their tier. See TemplateConfig::node_id.
+        node_id: Some(identity.node_id()),
         min_fee_rate: template_min_fee_rate,
         enforce_custom_policy_fields,
         // Block-priority lever (max_fee default | payments_first). Resolved once
@@ -3809,6 +3807,7 @@ async fn main() -> Result<()> {
                     rm_c.current_height(),
                     rm_c.addr_bind_activation_round(),
                     ghost_pool::share_pow_verify_height(),
+                    ghost_pool::share_tier_bind_height(),
                 )
             })
         };
@@ -6980,6 +6979,12 @@ async fn main() -> Result<()> {
     // Report the node's real configured chain on the status/info endpoints
     // (dashboard + wallets) instead of the historical hardcoded "signet".
     verification_state = verification_state.with_network(config.bitcoin.network);
+    // SHARE_TIER_BIND: hand the webhook ingest the resolved tier gate so its H-13 check can
+    // switch to tier-credit judging at the same block as everything else. The authority stays
+    // `share_tier_bind_height()` here in ghost-pool; verification only receives the value
+    // (its default is the dormant u64::MAX, so an unwired embedder cannot arm early).
+    verification_state =
+        verification_state.with_share_tier_bind_height(ghost_pool::share_tier_bind_height());
     // A-2b: hand the verification server the same warm block-hash oracle the payout
     // checkpoint uses, so /api/v1/qualification/scoped-set can compute the
     // assignment-scoped set (the convergence proof for arming CHALLENGER_ASSIGNMENT).
@@ -7675,6 +7680,27 @@ async fn main() -> Result<()> {
             None
         };
 
+        // SHARE_TIER_BIND: at/above the gate the proof carries the tier its job's coinbase
+        // committed to, so peers judge and credit exactly that tier. Below the gate it stays
+        // None → signing_bytes byte-identical to today, mirroring `header` above. The tier
+        // comes from the SRI layer (which stamped the coinbase); a missing tier at/above the
+        // gate means the emitting side is behind, and the proof will be rejected by peers —
+        // warned here so the deploy-order fault is visible at its source.
+        let tier_log2 = if ghost_pool::binds_difficulty_tier(rm_for_shares.current_height()) {
+            let t = share.tier_log2;
+            if t.is_none() {
+                tracing::warn!(
+                    miner_id = %share.miner_id,
+                    share_hash = %share.share_hash,
+                    "SHARE_TIER_BIND active but SRI submission carried no committed tier; \
+                     proof will not verify at peers (upgrade pool_sv2/translator)"
+                );
+            }
+            t
+        } else {
+            None
+        };
+
         let mut proof = ghost_common::types::ShareProof {
             round_id,
             miner_id: miner_hash,
@@ -7686,6 +7712,7 @@ async fn main() -> Result<()> {
             template_id: rm_for_shares.current_template_id(),
             payout_address: share.payout_address.clone(),
             header,
+            tier_log2,
             signature: None,
         };
         // GHOST-09: sign as the receiving node so peers can authenticate the
@@ -7726,7 +7753,9 @@ async fn main() -> Result<()> {
         // skeleton, which travels once per job — so a share can legitimately arrive first, and a
         // share we cannot judge yet must be recorded rather than given a verdict it did not earn.
         //
-        // Dark: nothing acts on the verdict below `SHARE_ADDR_BIND_HEIGHT`, which is unarmed.
+        // Advisory here: a failed binding is logged, and an unjudgeable one deferred — this path
+        // rejects nothing either way. Note `SHARE_ADDR_BIND_HEIGHT` is ARMED (961_100); an earlier
+        // note here called it unarmed, which stopped being true when the gate was set.
         if let (Some(sid_hex), Some(extranonce_hex), Some(header_hex)) = (
             share.skeleton_id.as_deref(),
             share.extranonce.as_deref(),
@@ -7738,12 +7767,22 @@ async fn main() -> Result<()> {
                 hex::decode(header_hex),
             ) {
                 (Some(skeleton_id), Ok(extranonce), Ok(header)) => {
-                    let expected = {
-                        let digest =
-                            ghost_common::identity::hash_message(&identity_for_shares.node_id());
-                        let mut c = [0u8; ghost_common::coinbase_tags::NODE_ID_LEN];
-                        c.copy_from_slice(&digest[..ghost_common::coinbase_tags::NODE_ID_LEN]);
-                        c
+                    // The commitment this node's coinbase stamped for this share's job: plain
+                    // below SHARE_TIER_BIND_HEIGHT, tier-bound at/above it (the tier folds into
+                    // the same 20 bytes — see `node_commitment_for_tier`). Computed HERE and
+                    // stored with the deferral, so the recheck pass judges the share against
+                    // the rule in force when it was mined, not whenever its skeleton arrives.
+                    let expected = match (
+                        ghost_pool::binds_difficulty_tier(rm_for_shares.current_height()),
+                        tier_log2,
+                    ) {
+                        (true, Some(t)) => ghost_common::coinbase_tags::node_commitment_for_tier(
+                            &identity_for_shares.node_id(),
+                            t,
+                        ),
+                        _ => ghost_common::coinbase_tags::node_commitment_plain(
+                            &identity_for_shares.node_id(),
+                        ),
                     };
 
                     match db_for_shares.get_skeleton(&skeleton_id) {

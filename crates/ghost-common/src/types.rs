@@ -278,6 +278,17 @@ pub struct ShareProof {
     /// verifiers require `len()==80`.
     #[serde(default)]
     pub header: Option<Vec<u8>>,
+    /// Difficulty-tier commitment: the power-of-two tier (`log2`) this share's coinbase
+    /// COMMITTED to before the hash existed, so the share is credited exactly
+    /// `2^tier_log2` rather than a difficulty claimed after the hash is known (see
+    /// `coinbase_tags::node_commitment_for_tier` and
+    /// `DifficultyCalculator::verify_pow_preimage_tier`). `None` below
+    /// `SHARE_TIER_BIND_HEIGHT` (populated only at/above the gate, so while dormant
+    /// `signing_bytes` is byte-identical to pre-tier proofs and a mixed-version fleet
+    /// stays compatible — the same contract as `header` above). Bound by the GHOST-09
+    /// signature when present, so it can't be stripped or swapped in flight.
+    #[serde(default)]
+    pub tier_log2: Option<u32>,
     /// GHOST-09: ed25519 signature by `received_by` over [`ShareProof::signing_bytes`].
     /// Authenticates the node-reward credit recipient so a relayed proof can't be
     /// re-credited to a different node. `None` on pre-GHOST-09 proofs, which fail
@@ -334,6 +345,14 @@ impl ShareProof {
         // pre-header proofs, keeping a mixed-version fleet's signatures compatible.
         if let Some(ref h) = self.header {
             m.extend_from_slice(h);
+        }
+        // Bind the committed difficulty tier when present (populated at/above
+        // SHARE_TIER_BIND_HEIGHT), so a relay can't strip it (downgrading the share to the
+        // post-hoc numeric claim) or swap it (re-rating the credit). Absent while the gate is
+        // dormant → byte-identical to pre-tier proofs, keeping a mixed-version fleet's
+        // signatures compatible — the same contract as `header` above.
+        if let Some(t) = self.tier_log2 {
+            m.extend_from_slice(&t.to_le_bytes());
         }
         m
     }
@@ -932,6 +951,7 @@ mod tests {
             template_id: Some([9u8; 32]),
             payout_address: Some("bcrt1qexample".to_string()),
             header: None,
+            tier_log2: None,
             signature: None,
         };
         proof.sign(&id);
@@ -962,6 +982,7 @@ mod tests {
             template_id: Some([3u8; 32]),
             payout_address: Some("bc1qx".to_string()),
             header: None,
+            tier_log2: None,
             signature: None,
         };
 
@@ -995,6 +1016,101 @@ mod tests {
         );
     }
 
+    /// Difficulty-tier commitment (SHARE_TIER_BIND): while the gate is dormant no proof carries
+    /// `tier_log2`, and an absent tier MUST leave `signing_bytes` byte-identical to the pre-tier
+    /// encoding — that is what keeps a mixed-version fleet validating each other's signatures
+    /// during the roll. Pinned against a hand-built copy of the pre-tier encoding rather than
+    /// against `signing_bytes` itself, so a change to the encoding cannot silently agree with
+    /// itself.
+    #[test]
+    fn an_absent_tier_leaves_signing_bytes_byte_identical_to_the_pre_tier_encoding() {
+        let id = crate::identity::NodeIdentity::generate();
+        let p = ShareProof {
+            round_id: 7,
+            miner_id: [3u8; 32],
+            difficulty: 4096.0,
+            work: 4096.0,
+            share_hash: [5u8; 32],
+            timestamp: 1_781_964_482,
+            received_by: id.node_id(),
+            template_id: Some([9u8; 32]),
+            payout_address: Some("bcrt1qexample".to_string()),
+            header: Some(vec![0xab; 80]),
+            tier_log2: None,
+            signature: None,
+        };
+
+        // The pre-tier encoding, reproduced field by field from the v1 spec in
+        // `signing_bytes`'s doc: round_id ‖ miner_id ‖ work ‖ share_hash ‖ timestamp ‖
+        // received_by ‖ template_id? ‖ header?.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&p.round_id.to_le_bytes());
+        expected.extend_from_slice(&p.miner_id);
+        expected.extend_from_slice(&canonical_json_f64(p.work).to_le_bytes());
+        expected.extend_from_slice(&p.share_hash);
+        expected.extend_from_slice(&p.timestamp.to_le_bytes());
+        expected.extend_from_slice(&p.received_by);
+        expected.extend_from_slice(&p.template_id.unwrap());
+        expected.extend_from_slice(p.header.as_ref().unwrap());
+
+        assert_eq!(
+            p.signing_bytes(),
+            expected,
+            "a tier-less proof must sign the exact pre-tier bytes, or the dormant gate is not \
+             dormant and a mixed-version fleet splits"
+        );
+    }
+
+    /// Once a proof carries a tier it is signature-bound: stripping it (downgrading the share to
+    /// the post-hoc numeric claim) or swapping it (re-rating the credit) must invalidate the
+    /// signature — the same contract as `header`.
+    #[test]
+    fn a_present_tier_is_bound_by_the_signature() {
+        let id = crate::identity::NodeIdentity::generate();
+        let mut signed = ShareProof {
+            round_id: 1,
+            miner_id: [1u8; 32],
+            difficulty: 8192.0,
+            work: 8192.0,
+            share_hash: [2u8; 32],
+            timestamp: 100,
+            received_by: id.node_id(),
+            template_id: Some([3u8; 32]),
+            payout_address: Some("bc1qx".to_string()),
+            header: Some(vec![0xab; 80]),
+            tier_log2: Some(13),
+            signature: None,
+        };
+        signed.sign(&id);
+        assert!(signed.has_valid_received_by_signature(), "valid as signed");
+
+        let mut stripped = signed.clone();
+        stripped.tier_log2 = None;
+        assert!(
+            !stripped.has_valid_received_by_signature(),
+            "stripping the committed tier must invalidate the signature"
+        );
+
+        let mut swapped = signed.clone();
+        swapped.tier_log2 = Some(20);
+        assert!(
+            !swapped.has_valid_received_by_signature(),
+            "re-rating the committed tier must invalidate the signature"
+        );
+
+        // The bound (v2) encoding appends the address AFTER the tier, so the tier is bound
+        // under that signature format too.
+        let mut v2 = signed.clone();
+        v2.sign_bound(&id);
+        assert!(v2.has_valid_bound_signature());
+        let mut v2_swapped = v2.clone();
+        v2_swapped.tier_log2 = Some(20);
+        assert!(
+            !v2_swapped.has_valid_bound_signature(),
+            "the tier must be bound under the address-bound signature as well"
+        );
+    }
+
     /// The hole this closes: today a relayed proof's payout address can be rewritten and the
     /// signature still verifies, because v1 does not cover the field payouts are grouped by.
     ///
@@ -1015,6 +1131,7 @@ mod tests {
             template_id: Some([5u8; 32]),
             payout_address: Some("bc1qhonestminer".to_string()),
             header: Some(vec![0xab; 80]),
+            tier_log2: None,
             signature: None,
         };
 
@@ -1073,6 +1190,7 @@ mod tests {
             template_id: None,
             payout_address: None,
             header: None,
+            tier_log2: None,
             signature: None,
         };
         assert_eq!(p.signing_bytes(), p.signing_bytes_bound());
@@ -1476,6 +1594,7 @@ mod tests {
             template_id: Some([4u8; 32]),
             payout_address: None,
             header: None,
+            tier_log2: None,
             signature: None,
         }
     }

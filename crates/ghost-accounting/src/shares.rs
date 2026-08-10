@@ -466,6 +466,47 @@ impl DifficultyCalculator {
         // Reuse the 0.1% difficulty tolerance of the numeric check.
         Self::difficulty_from_hash(&computed) >= claimed_difficulty * 0.999
     }
+
+    /// Tier-bound PoW check: the tier-committed counterpart to [`Self::verify_pow_preimage`].
+    ///
+    /// [`Self::verify_pow_preimage`] credits `claimed_difficulty`, a figure supplied alongside the
+    /// share rather than derived from anything a remote node can recompute. This function instead
+    /// credits a tier the share committed to inside its hashed coinbase (see
+    /// [`ghost_common::share_binding::verify_share_tier_binding`]), fixed before the hash exists, and
+    /// credits **exactly that committed tier** — never the achieved difficulty.
+    ///
+    /// Given the raw header, its expected internal-order hash, and the committed
+    /// `claimed_tier_log2`, this returns `Some(tier_target)` — the difficulty `2^claimed_tier_log2`
+    /// to credit — iff:
+    ///   1. `sha256d(header) == expected_hash` (the hash is this header's real PoW, not fabricated),
+    ///      and
+    ///   2. the achieved difficulty is at least the tier's target (the header genuinely met the tier
+    ///      it committed to).
+    ///
+    /// Otherwise `None`.
+    ///
+    /// Callers must ALSO verify the binding — that the coinbase actually committed to this
+    /// `(node_id, claimed_tier_log2)` — via `verify_share_tier_binding`. This function judges the
+    /// PoW and fixes the credit; the binding proves the tier was chosen up front. Both are required:
+    /// without the binding, `claimed_tier_log2` would once again be a free post-hoc choice.
+    pub fn verify_pow_preimage_tier(
+        header80: &[u8; 80],
+        expected_hash: &[u8; 32],
+        claimed_tier_log2: u32,
+    ) -> Option<f64> {
+        use bitcoin::hashes::{sha256d, Hash};
+        let computed = sha256d::Hash::hash(header80).to_byte_array();
+        if &computed != expected_hash {
+            return None; // the supplied hash is not this header's PoW — fabricated/relayed
+        }
+        let tier_target = ghost_common::coinbase_tags::tier_target_difficulty(claimed_tier_log2);
+        // Reuse the 0.1% tolerance the numeric checks carry for f64 imprecision.
+        if Self::difficulty_from_hash(&computed) >= tier_target * 0.999 {
+            Some(tier_target)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +766,104 @@ mod tests {
         assert!(
             !DifficultyCalculator::verify_pow_preimage(&header80, &real_hash, 1e12),
             "must reject work claimed far above the header's actual difficulty"
+        );
+    }
+
+    /// A REAL header for the tier tests: the Bitcoin genesis header, which meets difficulty ~1
+    /// (tier 0 → target 1.0) and no higher.
+    fn genesis_header() -> ([u8; 80], [u8; 32]) {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::Hash;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut bytes = Vec::new();
+        genesis.header.consensus_encode(&mut bytes).unwrap();
+        let header80: [u8; 80] = bytes.try_into().unwrap();
+        let real_hash: [u8; 32] = genesis.header.block_hash().to_byte_array();
+        (header80, real_hash)
+    }
+
+    /// The tier-bound credit is the COMMITTED tier, not the achieved difficulty — which is what
+    /// removes the post-hoc-claim advantage. Genesis achieves difficulty ~2536, but a share
+    /// committed to tier 11 (target 2048) is credited exactly 2048, NOT the 2536 it happened to
+    /// reach. Under the legacy numeric check that same header could claim ~2536; here it earns the
+    /// tier it committed to before hashing.
+    #[test]
+    fn tier_credit_is_the_committed_tier_not_the_achieved_difficulty() {
+        let (header80, real_hash) = genesis_header();
+
+        let achieved = DifficultyCalculator::difficulty_from_hash(&real_hash);
+        assert!(
+            (2048.0..4096.0).contains(&achieved),
+            "genesis is expected to achieve ~2536 (tier 11); got {achieved}"
+        );
+
+        // Committed to tier 11 → credited EXACTLY 2^11 = 2048, strictly below the achieved 2536.
+        assert_eq!(
+            DifficultyCalculator::verify_pow_preimage_tier(&header80, &real_hash, 11),
+            Some(2048.0),
+            "credit is the committed tier (2048), not the achieved difficulty (~2536)"
+        );
+        // The legacy check would have credited the full achieved difficulty for the same header.
+        assert!(
+            DifficultyCalculator::verify_pow_preimage(&header80, &real_hash, 2048.0)
+                && achieved > 2048.0,
+            "the legacy path credits more than the tier for the identical work"
+        );
+    }
+
+    /// A share cannot be credited a tier it did not achieve: genesis reaches ~2536, so tier 12
+    /// (target 4096) and above earn nothing. Committing to a fat tier up front only pays if the work
+    /// is genuinely there.
+    #[test]
+    fn a_tier_above_the_achieved_difficulty_is_refused() {
+        let (header80, real_hash) = genesis_header();
+        assert_eq!(
+            DifficultyCalculator::verify_pow_preimage_tier(&header80, &real_hash, 12),
+            None,
+            "genesis does not achieve tier 12 (difficulty 4096), so it earns no credit at that tier"
+        );
+        // And a wildly high tier is likewise refused.
+        assert_eq!(
+            DifficultyCalculator::verify_pow_preimage_tier(&header80, &real_hash, 40),
+            None
+        );
+    }
+
+    /// Fabrication is still impossible in the tier path: a hash that is not the header's real
+    /// `sha256d` earns nothing, exactly as in the numeric-claim path.
+    #[test]
+    fn tier_path_rejects_a_fabricated_hash() {
+        let (header80, real_hash) = genesis_header();
+        let mut fabricated = real_hash;
+        fabricated[0] ^= 0x01;
+        assert_eq!(
+            DifficultyCalculator::verify_pow_preimage_tier(&header80, &fabricated, 0),
+            None,
+            "a hash that isn't the header's preimage must earn no credit"
+        );
+    }
+
+    /// **Below-gate no-change proof (accounting layer).** Adding the tier path must not perturb the
+    /// legacy `verify_pow_preimage`, which is the function used below the tier gate. Its verdicts on
+    /// a real header — accept at achievable difficulty, reject a fabrication, reject an
+    /// over-claim — are exactly as before the tier work landed.
+    #[test]
+    fn the_legacy_pow_preimage_check_is_unchanged() {
+        let (header80, real_hash) = genesis_header();
+
+        assert!(
+            DifficultyCalculator::verify_pow_preimage(&header80, &real_hash, 1.0),
+            "legacy check still accepts a real header at an achievable difficulty"
+        );
+        let mut fabricated = real_hash;
+        fabricated[0] ^= 0x01;
+        assert!(
+            !DifficultyCalculator::verify_pow_preimage(&header80, &fabricated, 1.0),
+            "legacy check still rejects a fabricated hash"
+        );
+        assert!(
+            !DifficultyCalculator::verify_pow_preimage(&header80, &real_hash, 1e12),
+            "legacy check still rejects an over-claim"
         );
     }
 }

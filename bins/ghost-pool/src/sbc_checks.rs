@@ -48,13 +48,26 @@ pub struct NodeBatchChecks {
     /// an unestablished height takes the STRONGER check, because a freshly restarted node's height
     /// is 0 and 0 sorts below every gate, which silently selected the weaker check in #597.
     pow_preimage_required: bool,
+    /// Whether shares must carry a committed difficulty tier and are judged against exactly that
+    /// tier (SHARE_TIER_BIND). Mirrors the live path's `height_established &&
+    /// binds_difficulty_tier(height)` — note the sense is NOT the pow gate's fail-closed one: an
+    /// unestablished height takes the pow-preimage check but NOT the tier requirement, because
+    /// applying a DORMANT gate at height 0 would activate it on every restart. The residual once
+    /// armed is bounded the same way as the live path's: the preimage check still runs, only the
+    /// tier-credit selection waits for an established height.
+    tier_bound: bool,
 }
 
 impl NodeBatchChecks {
-    pub fn new(addr_bind_activation_round: Option<RoundId>, pow_preimage_required: bool) -> Self {
+    pub fn new(
+        addr_bind_activation_round: Option<RoundId>,
+        pow_preimage_required: bool,
+        tier_bound: bool,
+    ) -> Self {
         Self {
             addr_bind_activation_round,
             pow_preimage_required,
+            tier_bound,
         }
     }
 
@@ -64,11 +77,13 @@ impl NodeBatchChecks {
         height: u64,
         addr_bind_activation_round: Option<RoundId>,
         pow_verify_height: u64,
+        tier_bind_height: u64,
     ) -> Self {
         let height_established = height > 0;
         Self::new(
             addr_bind_activation_round,
             !height_established || height >= pow_verify_height,
+            height_established && height >= tier_bind_height,
         )
     }
 
@@ -109,6 +124,25 @@ impl NodeBatchChecks {
         };
         if computed != share.share_hash {
             return false;
+        }
+
+        // SHARE_TIER_BIND: at/above the gate a share is judged against the tier its coinbase
+        // committed to, and its stated difficulty must BE that tier's target — mirroring the
+        // live ingest path in `handle_share_proof`, which is the contract of this module. A
+        // share with no tier in the tier era does not prove itself.
+        if self.tier_bound {
+            let Some(tier) = share.tier_log2 else {
+                return false;
+            };
+            let Some(credited) = ghost_accounting::DifficultyCalculator::verify_pow_preimage_tier(
+                &header80,
+                &share.share_hash,
+                tier,
+            ) else {
+                return false;
+            };
+            // Same 0.01% (M-9) tolerance as the live path, so the two verdicts cannot drift.
+            return (share.difficulty - credited).abs() <= credited * 0.0001;
         }
 
         ghost_accounting::DifficultyCalculator::verify_pow_preimage(
@@ -177,6 +211,7 @@ mod tests {
             template_id: Some([3u8; 32]),
             payout_address: Some("bc1qtest".to_string()),
             header: Some(header),
+            tier_log2: None,
             signature: None,
         };
         share.sign(identity);
@@ -184,7 +219,7 @@ mod tests {
     }
 
     fn checks() -> NodeBatchChecks {
-        NodeBatchChecks::new(None, true)
+        NodeBatchChecks::new(None, true, false)
     }
 
     #[test]
@@ -250,7 +285,7 @@ mod tests {
     fn signature_format_is_judged_by_the_shares_round_not_the_current_height() {
         let id = NodeIdentity::generate();
         let activation: RoundId = 100;
-        let checks = NodeBatchChecks::new(Some(activation), true);
+        let checks = NodeBatchChecks::new(Some(activation), true, false);
 
         // Pre-activation round, signed in the pre-activation format: valid.
         let old = provable_share(&id, activation - 1);
@@ -297,7 +332,7 @@ mod tests {
     /// window a node ingests its backfill burst.
     #[test]
     fn an_unestablished_height_takes_the_stronger_check() {
-        let strict = NodeBatchChecks::at_height(0, None, 1_000_000);
+        let strict = NodeBatchChecks::at_height(0, None, 1_000_000, u64::MAX);
         let id = NodeIdentity::generate();
         let mut fabricated = provable_share(&id, 1);
         fabricated.share_hash = [0xAB; 32];
@@ -305,6 +340,96 @@ mod tests {
         assert!(
             !strict.share_is_valid(&fabricated),
             "height 0 must not select the weaker check"
+        );
+    }
+
+    /// SHARE_TIER_BIND, dormant safety: while `tier_bound` is false (everywhere below the gate,
+    /// which today is everywhere), a share carrying no tier is judged exactly as before, and the
+    /// verdict for the existing fixture set does not move.
+    #[test]
+    fn below_the_tier_gate_a_tierless_share_is_judged_exactly_as_before() {
+        let id = NodeIdentity::generate();
+        let share = provable_share(&id, 1);
+        assert!(share.tier_log2.is_none(), "fixture predates the tier era");
+        assert!(NodeBatchChecks::new(None, true, false).share_is_valid(&share));
+        assert!(
+            NodeBatchChecks::at_height(1, None, 0, u64::MAX).share_is_valid(&share),
+            "a dormant gate must leave the verdict untouched at any real height"
+        );
+    }
+
+    /// A dormant gate must not fire during the height-0 window either — that is the deliberate
+    /// asymmetry with the pow gate's fail-closed sense, documented on `tier_bound`.
+    #[test]
+    fn an_unestablished_height_does_not_activate_a_dormant_tier_gate() {
+        let id = NodeIdentity::generate();
+        let share = provable_share(&id, 1);
+        assert!(
+            NodeBatchChecks::at_height(0, None, 1_000_000, u64::MAX).share_is_valid(&share),
+            "height 0 must not turn the dormant tier requirement on"
+        );
+    }
+
+    /// A share with REAL PoW at a known tier: the Bitcoin genesis header, which deterministically
+    /// achieves difficulty ~2536 — i.e. tier 11 (target 2048) and no higher. Real work, no mining
+    /// in the test, no 1-in-256 flake.
+    fn genesis_tier_share(identity: &NodeIdentity, tier_log2: u32, difficulty: f64) -> ShareProof {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::Hash;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let mut header = Vec::new();
+        genesis.header.consensus_encode(&mut header).unwrap();
+        let real_hash: [u8; 32] = genesis.header.block_hash().to_byte_array();
+        let mut share = ShareProof {
+            round_id: 1,
+            miner_id: [2u8; 32],
+            difficulty,
+            work: difficulty,
+            share_hash: real_hash,
+            timestamp: 0,
+            received_by: identity.node_id(),
+            template_id: Some([3u8; 32]),
+            payout_address: Some("bc1qtest".to_string()),
+            header: Some(header),
+            tier_log2: Some(tier_log2),
+            signature: None,
+        };
+        share.sign(identity);
+        share
+    }
+
+    /// Once tier-bound, a share proves itself only by committing to a tier its hash actually
+    /// reaches and stating exactly that tier's difficulty.
+    #[test]
+    fn in_the_tier_era_a_share_is_judged_against_its_committed_tier() {
+        let id = NodeIdentity::generate();
+        let tier_bound = NodeBatchChecks::new(None, true, true);
+
+        // Genesis committed to tier 11 and stating exactly 2^11: proves itself.
+        assert!(
+            tier_bound.share_is_valid(&genesis_tier_share(&id, 11, 2048.0)),
+            "real PoW at its committed tier, credited exactly the tier, must verify"
+        );
+
+        // No tier: does not prove itself in the tier era.
+        let tierless = provable_share(&id, 1);
+        assert!(
+            !tier_bound.share_is_valid(&tierless),
+            "a tier-less share must not pass once the gate is in force"
+        );
+
+        // A committed tier the hash does not reach: genesis achieves ~2536, tier 12 needs 4096.
+        assert!(
+            !tier_bound.share_is_valid(&genesis_tier_share(&id, 12, 4096.0)),
+            "a hash that misses its committed tier must not verify"
+        );
+
+        // Real hash, reachable committed tier, but the numeric difficulty states something other
+        // than the tier's target — the post-hoc claim this whole gate exists to refuse. Under the
+        // legacy check 2500.0 would pass (genesis achieves ~2536); the tier era refuses it.
+        assert!(
+            !tier_bound.share_is_valid(&genesis_tier_share(&id, 11, 2500.0)),
+            "credit must be exactly the committed tier's target, never the achieved difficulty"
         );
     }
 
