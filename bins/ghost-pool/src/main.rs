@@ -10202,8 +10202,23 @@ async fn main() -> Result<()> {
                                         Some((miner_work, node_shares))
                                             if !miner_work.is_empty() =>
                                         {
-                                            let (_, fees, _) =
-                                                tp_for_template_events.get_current_block_info();
+                                            // #601: NOT `get_current_block_info()`. This branch
+                                            // runs off the EMPTY fast-path template published at
+                                            // the tip change, whose total_fees is structurally
+                                            // 0 — so the ratified proposal carried no fees, the
+                                            // 1% was levied on the subsidy alone, and the whole
+                                            // real fee fell to the treasury as drift. Carry the
+                                            // last filled observation instead.
+                                            let (fees, fees_estimated) =
+                                                tp_for_template_events.payout_fee_estimate();
+                                            if fees_estimated {
+                                                info!(
+                                                    height,
+                                                    fees,
+                                                    "Tip-change payout: template not filled yet — \
+                                                     carrying the last filled fee observation (#601)"
+                                                );
+                                            }
                                             // Audit H-2: this hardcoded `None` while every
                                             // validator loaded the stored threshold. The decay
                                             // schedule keys on it, so once the treasury crosses
