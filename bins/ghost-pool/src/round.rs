@@ -302,6 +302,8 @@ pub struct RoundManager {
     current_height: RwLock<u64>,
     /// First round at or above SHARE_ADDR_BIND_HEIGHT — the signature-format boundary.
     addr_bind_activation_round: RwLock<Option<RoundId>>,
+    /// First round at or above SHARE_TIER_BIND_HEIGHT — the tier-commitment boundary.
+    tier_bind_activation_round: RwLock<Option<RoundId>>,
     /// Wall-clock start of the current round (reset on every `start_round`,
     /// i.e. each new-work / template event). Monotonic `Instant` so the
     /// reported elapsed time is immune to system clock adjustments. Read by
@@ -385,6 +387,7 @@ impl RoundManager {
             current_round: RwLock::new(0),
             current_height: RwLock::new(0),
             addr_bind_activation_round: RwLock::new(None),
+            tier_bind_activation_round: RwLock::new(None),
             current_round_start: RwLock::new(std::time::Instant::now()),
             rounds: RwLock::new(HashMap::new()),
             difficulty: RwLock::new(difficulty),
@@ -445,6 +448,38 @@ impl RoundManager {
         }
     }
 
+    /// The round at which tier binding took effect here, if it has.
+    pub fn tier_bind_activation_round(&self) -> Option<RoundId> {
+        *self.tier_bind_activation_round.read()
+    }
+
+    /// Record the tier-binding activation round, keeping the EARLIEST seen. Same reasoning as
+    /// [`Self::note_addr_bind_activation`]: the first round at or above the gate is the boundary,
+    /// and a restart that re-derived a later one would wrongly treat genuinely post-gate shares as
+    /// historical.
+    pub fn note_tier_bind_activation(&self, round_id: RoundId) {
+        let mut a = self.tier_bind_activation_round.write();
+        if a.is_none_or(|existing| round_id < existing) {
+            *a = Some(round_id);
+        }
+    }
+
+    /// Whether a share from `share_round_id` must carry its committed difficulty tier.
+    ///
+    /// Judged by the share's OWN round, not the current height — a share mined before the gate
+    /// never had a tier to commit to, and cannot acquire one retrospectively. Reading the current
+    /// height instead is what re-armed the #639 replay loop: at the moment the fleet crossed the
+    /// gate, every pre-gate share still awaiting repair became permanently unrecordable, because
+    /// it was refused before it could be written and the sweep therefore replayed it forever.
+    ///
+    /// Unknown activation round means the gate has not fired here, so nothing is bound yet.
+    pub fn requires_tier_binding(&self, share_round_id: RoundId) -> bool {
+        match self.tier_bind_activation_round() {
+            Some(activation) => share_round_id >= activation,
+            None => false,
+        }
+    }
+
     /// Seed the chain height at startup, before any template has arrived.
     ///
     /// `current_height` is otherwise 0 from process start until the first template, and every
@@ -476,6 +511,9 @@ impl RoundManager {
         // captured as a round the first time the height crosses it.
         if block_height >= crate::share_addr_bind_height() {
             self.note_addr_bind_activation(round_id);
+        }
+        if block_height >= crate::share_tier_bind_height() {
+            self.note_tier_bind_activation(round_id);
         }
         // Reset the round timer so `current_round_duration_secs` measures time
         // spent working THIS template, not the pool's total uptime.
@@ -733,16 +771,20 @@ impl RoundManager {
         // across the fleet over hours, so every share genuinely in flight carries its header.
         let height = self.current_height();
         let height_established = height > 0;
-        // SHARE_TIER_BIND: whether shares at this height commit to a difficulty tier and are
-        // credited exactly that tier. Deliberately NOT the pow gate's fail-closed
-        // `!height_established ||` sense: that sense turns a check ON while the height is
-        // unknown, which is right for the ARMED pow gate but would activate this DORMANT one on
-        // every restart (height reads 0 until the first template) — a below-gate behaviour
-        // change. The residual once armed is bounded: during the height-0 window the pow
-        // preimage check below still runs (its fail-closed sense unchanged), so a fabricated
-        // hash cannot enter; only the tier-credit selection waits for an established height,
-        // during which a share is judged by the legacy numeric claim exactly as below the gate.
-        let tier_bound = height_established && crate::binds_difficulty_tier(height);
+        // SHARE_TIER_BIND: whether a share commits to a difficulty tier and is credited exactly
+        // that tier.
+        //
+        // Judged by the SHARE's round, not the current height. A share mined before the gate
+        // carries `tier_log2: None` and can never acquire a tier retrospectively, so testing it
+        // against the CURRENT height means that the instant the fleet crosses the gate, every
+        // pre-gate share still awaiting repair is refused here — before it can be recorded — and
+        // the GHOST-03 sweep therefore replays it forever. That is the #639 loop re-arming one
+        // check further down, and it would have frozen the residual unpaid drift permanently.
+        //
+        // The activation round is None until the gate actually fires here, which also gives the
+        // dormant-gate and height-0-after-restart behaviour the old `height_established` guard was
+        // reaching for — by construction rather than by a separate condition.
+        let tier_bound = self.requires_tier_binding(proof.round_id);
         if !height_established || height >= crate::share_pow_verify_height() {
             let header80 = match proof.header.as_deref() {
                 Some(h) if h.len() == 80 => {
@@ -2406,6 +2448,84 @@ mod tests {
             "the boundary round is bound"
         );
         assert!(manager.requires_bound_signature(501));
+    }
+
+    /// The tier gate is an admission-rule change, so a share is judged by the era it was MINED
+    /// in, not by where the tip happens to be — the same rule the address-bind gate above already
+    /// follows, and for the same reason.
+    #[test]
+    fn a_pre_tier_gate_share_stays_recordable_after_the_gate_fires() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        assert_eq!(manager.tier_bind_activation_round(), None);
+        assert!(
+            !manager.requires_tier_binding(1),
+            "nothing is tier-bound before the gate has ever fired"
+        );
+
+        manager.note_tier_bind_activation(500);
+
+        assert!(
+            !manager.requires_tier_binding(499),
+            "a share mined before the boundary carries no tier and must stay recordable for ever"
+        );
+        assert!(
+            manager.requires_tier_binding(500),
+            "the boundary round is bound"
+        );
+        assert!(manager.requires_tier_binding(501));
+    }
+
+    /// Restart safety, mirroring `the_earliest_activation_round_wins`: re-deriving a LATER round
+    /// would treat genuinely post-gate shares as historical and let them skip the tier commitment.
+    #[test]
+    fn the_earliest_tier_activation_round_wins() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.note_tier_bind_activation(500);
+        manager.note_tier_bind_activation(900);
+        assert_eq!(manager.tier_bind_activation_round(), Some(500));
+        assert!(
+            manager.requires_tier_binding(600),
+            "a post-gate share must not be let off the tier commitment by a late re-derivation"
+        );
+    }
+
+    /// The #639 regression this exists to prevent, end to end: a node PAST the tier gate must
+    /// still be able to record a pre-gate share replayed by the GHOST-03 sweep. Judging by the
+    /// current tip refused it before it could be written, so the sweep saw it still missing and
+    /// replayed it for ever — freezing the residual unpaid drift permanently.
+    #[test]
+    fn a_node_past_the_tier_gate_still_records_a_replayed_pre_gate_share() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        // Rounds 1 and 2 are mined BELOW the gate, so they carry no tier.
+        manager.start_round(crate::SHARE_TIER_BIND_HEIGHT - 1);
+        manager.start_round(crate::SHARE_TIER_BIND_HEIGHT - 1);
+        assert_eq!(
+            manager.tier_bind_activation_round(),
+            None,
+            "the gate has not fired yet"
+        );
+
+        // The tip crosses the gate. Round 3 is the boundary.
+        manager.start_round(crate::SHARE_TIER_BIND_HEIGHT);
+        assert_eq!(manager.tier_bind_activation_round(), Some(3));
+
+        // The sweep replays a share mined in round 2, which has no `tier_log2` and never could.
+        assert!(
+            manager
+                .handle_share_proof(genesis_proof(2, 1.0, None))
+                .is_ok(),
+            "a pre-gate share must remain recordable after the gate fires — refusing it is what \
+             re-armed the #639 replay loop one check further down"
+        );
+
+        // The commitment is still enforced for shares mined at or after the boundary.
+        assert!(
+            matches!(
+                manager.handle_share_proof(genesis_proof(3, 1.0, None)),
+                Err(ShareError::InvalidShareHash)
+            ),
+            "a post-gate share with no committed tier must still be refused"
+        );
     }
 
     /// A restart re-derives the activation from the first template it sees, which is LATER than

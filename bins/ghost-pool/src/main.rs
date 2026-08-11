@@ -2910,6 +2910,19 @@ async fn main() -> Result<()> {
         Err(e) => warn!(error = %e, "could not read address-bind activation round"),
     }
 
+    // Restore the tier-commitment era boundary, for the same reason.
+    match db.kv_get(ghost_pool::TIER_BIND_ACTIVATION_KEY) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(r) => {
+                round_manager.note_tier_bind_activation(r);
+                info!(activation_round = r, "Restored tier-commitment era boundary");
+            }
+            Err(e) => warn!(value = %v, error = %e, "unparseable tier-bind activation round"),
+        },
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "could not read tier-bind activation round"),
+    }
+
     // Register our own node's capabilities so we're included in node reward calculations
     // This is critical - without this, our shares won't be counted for node rewards
     round_manager.register_node(identity.node_id(), capabilities);
@@ -10070,6 +10083,31 @@ async fn main() -> Result<()> {
                                 info!(
                                     activation_round = activation,
                                     "Recorded the address-bind signature era boundary"
+                                );
+                            }
+                        }
+                    }
+
+                    // Same for the tier-commitment boundary. A pre-gate share carries no
+                    // `tier_log2`, so losing this round on restart would re-derive a later one and
+                    // make genuinely pre-gate shares unrecordable — refused before they can be
+                    // written, hence replayed for ever by the sweep (#639).
+                    if let Some(activation) = rm_notify.tier_bind_activation_round() {
+                        let stored = db_for_rounds
+                            .kv_get(ghost_pool::TIER_BIND_ACTIVATION_KEY)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse::<u64>().ok());
+                        if stored != Some(activation) {
+                            if let Err(e) = db_for_rounds.kv_set(
+                                ghost_pool::TIER_BIND_ACTIVATION_KEY,
+                                &activation.to_string(),
+                            ) {
+                                warn!(error = %e, "could not persist tier-bind activation round");
+                            } else {
+                                info!(
+                                    activation_round = activation,
+                                    "Recorded the tier-commitment era boundary"
                                 );
                             }
                         }
