@@ -2915,7 +2915,10 @@ async fn main() -> Result<()> {
         Ok(Some(v)) => match v.parse::<u64>() {
             Ok(r) => {
                 round_manager.note_tier_bind_activation(r);
-                info!(activation_round = r, "Restored tier-commitment era boundary");
+                info!(
+                    activation_round = r,
+                    "Restored tier-commitment era boundary"
+                );
             }
             Err(e) => warn!(value = %v, error = %e, "unparseable tier-bind activation round"),
         },
