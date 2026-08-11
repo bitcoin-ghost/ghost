@@ -43,10 +43,15 @@ pub struct NodeBatchChecks {
     /// spellings of the same predicate is how a signer and a verifier drift apart, and here that
     /// would reject every share signed under the other encoding.
     addr_bind_activation_round: Option<RoundId>,
-    /// Whether the PoW preimage check is in force. Mirrors the live path's
-    /// `!height_established || height >= share_pow_verify_height()` — note the fail-CLOSED sense:
-    /// an unestablished height takes the STRONGER check, because a freshly restarted node's height
-    /// is 0 and 0 sorts below every gate, which silently selected the weaker check in #597.
+    /// The round at which the PoW-header requirement took effect, if known. Mirrors
+    /// `RoundManager::requires_pow_header`: judged by the share's own round, so a header-less
+    /// share mined below the boundary stays provable by the numeric rule of its era (#650).
+    pow_verify_activation_round: Option<RoundId>,
+    /// Whether the PoW preimage check is in force when NO activation round is known. Mirrors the
+    /// live path's fallback `height == 0 || height >= share_pow_verify_height()` — note the
+    /// fail-CLOSED sense: an unestablished height takes the STRONGER check, because a freshly
+    /// restarted node's height is 0 and 0 sorts below every gate, which silently selected the
+    /// weaker check in #597.
     pow_preimage_required: bool,
     /// Whether shares must carry a committed difficulty tier and are judged against exactly that
     /// tier (SHARE_TIER_BIND). Mirrors the live path's `height_established &&
@@ -66,25 +71,28 @@ impl NodeBatchChecks {
     ) -> Self {
         Self {
             addr_bind_activation_round,
+            pow_verify_activation_round: None,
             pow_preimage_required,
             tier_bound,
         }
     }
 
-    /// Build from a height and activation round, applying the same fail-closed rule as the live
-    /// ingest path.
+    /// Build from a height and the known activation rounds, applying the same fail-closed
+    /// fallback rule as the live ingest path.
     pub fn at_height(
         height: u64,
         addr_bind_activation_round: Option<RoundId>,
+        pow_verify_activation_round: Option<RoundId>,
         pow_verify_height: u64,
         tier_bind_height: u64,
     ) -> Self {
         let height_established = height > 0;
-        Self::new(
+        Self {
             addr_bind_activation_round,
-            !height_established || height >= pow_verify_height,
-            height_established && height >= tier_bind_height,
-        )
+            pow_verify_activation_round,
+            pow_preimage_required: !height_established || height >= pow_verify_height,
+            tier_bound: height_established && height >= tier_bind_height,
+        }
     }
 
     /// Does the share carry a signature valid under the rules in force for ITS round?
@@ -160,7 +168,14 @@ impl BatchChecks for NodeBatchChecks {
         if !self.signature_ok(share) {
             return false;
         }
-        if self.pow_preimage_required && !self.pow_ok(share) {
+        // Era-aware, like the live path (`RoundManager::requires_pow_header`): when the boundary
+        // round is known the share's OWN round decides whether a header is demanded of it; the
+        // height-derived fallback governs only the boundary-less case.
+        let pow_required = match self.pow_verify_activation_round {
+            Some(activation) => share.round_id >= activation,
+            None => self.pow_preimage_required,
+        };
+        if pow_required && !self.pow_ok(share) {
             return false;
         }
         true
@@ -332,7 +347,7 @@ mod tests {
     /// window a node ingests its backfill burst.
     #[test]
     fn an_unestablished_height_takes_the_stronger_check() {
-        let strict = NodeBatchChecks::at_height(0, None, 1_000_000, u64::MAX);
+        let strict = NodeBatchChecks::at_height(0, None, None, 1_000_000, u64::MAX);
         let id = NodeIdentity::generate();
         let mut fabricated = provable_share(&id, 1);
         fabricated.share_hash = [0xAB; 32];
@@ -340,6 +355,35 @@ mod tests {
         assert!(
             !strict.share_is_valid(&fabricated),
             "height 0 must not select the weaker check"
+        );
+    }
+
+    /// Era-awareness for the header requirement, mirroring `RoundManager::requires_pow_header`
+    /// (#650): once the boundary round is known, the share's OWN round decides whether a header
+    /// is demanded of it — a header-less share mined below the boundary never had one and stays
+    /// provable by its era's numeric rule, however far past the gate the tip is.
+    #[test]
+    fn the_header_requirement_is_judged_by_the_shares_round() {
+        let id = NodeIdentity::generate();
+        let boundary: RoundId = 100;
+        // Tip far past the gate; boundary known.
+        let checks =
+            NodeBatchChecks::at_height(2_000_000, None, Some(boundary), 1_000_000, u64::MAX);
+
+        let mut old = provable_share(&id, boundary - 1);
+        old.header = None;
+        old.sign(&id);
+        assert!(
+            checks.share_is_valid(&old),
+            "a pre-boundary share has no header and must stay provable under its own era's rules"
+        );
+
+        let mut new_round = provable_share(&id, boundary);
+        new_round.header = None;
+        new_round.sign(&id);
+        assert!(
+            !checks.share_is_valid(&new_round),
+            "at/above the boundary a header-less share must not prove itself"
         );
     }
 
@@ -353,7 +397,7 @@ mod tests {
         assert!(share.tier_log2.is_none(), "fixture predates the tier era");
         assert!(NodeBatchChecks::new(None, true, false).share_is_valid(&share));
         assert!(
-            NodeBatchChecks::at_height(1, None, 0, u64::MAX).share_is_valid(&share),
+            NodeBatchChecks::at_height(1, None, None, 0, u64::MAX).share_is_valid(&share),
             "a dormant gate must leave the verdict untouched at any real height"
         );
     }
@@ -365,7 +409,7 @@ mod tests {
         let id = NodeIdentity::generate();
         let share = provable_share(&id, 1);
         assert!(
-            NodeBatchChecks::at_height(0, None, 1_000_000, u64::MAX).share_is_valid(&share),
+            NodeBatchChecks::at_height(0, None, None, 1_000_000, u64::MAX).share_is_valid(&share),
             "height 0 must not turn the dormant tier requirement on"
         );
     }

@@ -2926,6 +2926,39 @@ async fn main() -> Result<()> {
         Err(e) => warn!(error = %e, "could not read tier-bind activation round"),
     }
 
+    // Restore the PoW-header era boundary. Unlike the two gates above, this one fired BEFORE
+    // boundaries were being recorded, so alongside the persisted key the boundary is DERIVED from
+    // the rounds table — rounds are persisted with their block height at round start, so the
+    // lowest round at/above the gate height IS the boundary (see `POW_VERIFY_ACTIVATION_KEY`).
+    // Both are noted; `note_pow_verify_activation` keeps the earliest. The derivation runs on
+    // every start (it is one index seek) so a value that was persisted too late self-corrects
+    // for as long as the sub-gate rounds survive in storage.
+    match db.kv_get(ghost_pool::POW_VERIFY_ACTIVATION_KEY) {
+        Ok(Some(v)) => match v.parse::<u64>() {
+            Ok(r) => {
+                round_manager.note_pow_verify_activation(r);
+                info!(activation_round = r, "Restored PoW-header era boundary");
+            }
+            Err(e) => warn!(value = %v, error = %e, "unparseable pow-verify activation round"),
+        },
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "could not read pow-verify activation round"),
+    }
+    match db.first_round_at_or_above_height(ghost_pool::share_pow_verify_height()) {
+        Ok(Some(r)) => {
+            round_manager.note_pow_verify_activation(r);
+            info!(
+                activation_round = r,
+                gate_height = ghost_pool::share_pow_verify_height(),
+                "Derived PoW-header era boundary from persisted rounds"
+            );
+        }
+        // No round at/above the gate on record: either a fresh database or the gate has not
+        // fired here. `requires_pow_header` falls back to the current height (fail-closed).
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "could not derive pow-verify activation round from rounds"),
+    }
+
     // Register our own node's capabilities so we're included in node reward calculations
     // This is critical - without this, our shares won't be counted for node rewards
     round_manager.register_node(identity.node_id(), capabilities);
@@ -3822,6 +3855,7 @@ async fn main() -> Result<()> {
                 ghost_pool::sbc_checks::NodeBatchChecks::at_height(
                     rm_c.current_height(),
                     rm_c.addr_bind_activation_round(),
+                    rm_c.pow_verify_activation_round(),
                     ghost_pool::share_pow_verify_height(),
                     ghost_pool::share_tier_bind_height(),
                 )
@@ -10111,6 +10145,31 @@ async fn main() -> Result<()> {
                                 info!(
                                     activation_round = activation,
                                     "Recorded the tier-commitment era boundary"
+                                );
+                            }
+                        }
+                    }
+
+                    // And the PoW-header boundary. For this gate the value is usually the one
+                    // DERIVED from the rounds table at startup (the gate fired before boundaries
+                    // were recorded, #650); persisting it means the boundary outlives the
+                    // eventual pruning of the sub-gate rounds it was derived from.
+                    if let Some(activation) = rm_notify.pow_verify_activation_round() {
+                        let stored = db_for_rounds
+                            .kv_get(ghost_pool::POW_VERIFY_ACTIVATION_KEY)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse::<u64>().ok());
+                        if stored != Some(activation) {
+                            if let Err(e) = db_for_rounds.kv_set(
+                                ghost_pool::POW_VERIFY_ACTIVATION_KEY,
+                                &activation.to_string(),
+                            ) {
+                                warn!(error = %e, "could not persist pow-verify activation round");
+                            } else {
+                                info!(
+                                    activation_round = activation,
+                                    "Recorded the PoW-header era boundary"
                                 );
                             }
                         }

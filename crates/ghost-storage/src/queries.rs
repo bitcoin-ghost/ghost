@@ -2961,6 +2961,32 @@ impl Database {
         })
     }
 
+    /// The lowest `round_id` whose `block_height` is at or above `height`, if any round at or
+    /// above that height has been recorded.
+    ///
+    /// This is the retrospective derivation of a height gate's activation ROUND: rounds are
+    /// persisted with their block height at round start, so the first round at/above a gate
+    /// height is the boundary between the pre-gate and post-gate share eras — even for a gate
+    /// that fired before anyone thought to record its boundary (`SHARE_POW_VERIFY_HEIGHT`,
+    /// #650). `prune_old_rounds` deletes a round only when it is terminal AND share-free, so any
+    /// round still owed a share — exactly the rounds era-aware repair exists for — pins its row;
+    /// if pruning has removed rows the derived boundary can only land LATER than the truth,
+    /// which fails toward the stricter post-gate rule, never toward exempting post-gate shares.
+    ///
+    /// Uses `idx_rounds_height`, so this is an index seek, not a table scan.
+    pub fn first_round_at_or_above_height(&self, height: u64) -> GhostResult<Option<u64>> {
+        self.with_connection(|conn| {
+            let round: Option<u64> = conn
+                .query_row(
+                    "SELECT MIN(round_id) FROM rounds WHERE block_height >= ?1",
+                    [height],
+                    |row| row.get(0),
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(round)
+        })
+    }
+
     /// Update round with block found
     pub fn update_round_block_found(
         &self,
@@ -12699,6 +12725,30 @@ mod tests {
 
         let removed = db.prune_payout_proposals(now - 24 * 3600).unwrap();
         assert_eq!(removed, 0, "a proposal inside the window must survive");
+    }
+
+    /// The retrospective era-boundary derivation (#650): rounds are persisted with their block
+    /// height at round start, so the lowest `round_id` at/above a gate height IS the round the
+    /// gate activated in — even for a gate that fired before boundaries were being recorded.
+    #[test]
+    fn first_round_at_or_above_height_finds_the_era_boundary() {
+        let db = Database::in_memory().unwrap();
+        let now_s = ledger_now_s();
+        // Rounds 1..=10 at heights 800_001..=800_010 (ledger_round maps id → 800_000 + id).
+        for id in 1..=10 {
+            db.create_round(&ledger_round(id, PayoutStatus::Active, now_s))
+                .unwrap();
+        }
+
+        // A gate at height 800_006 activated at round 6 — the LOWEST round at/above it.
+        assert_eq!(db.first_round_at_or_above_height(800_006).unwrap(), Some(6));
+        // A gate below all recorded history activated at the first recorded round.
+        assert_eq!(db.first_round_at_or_above_height(1).unwrap(), Some(1));
+        // A gate the chain has not reached yields nothing; the caller keeps its fallback.
+        assert_eq!(db.first_round_at_or_above_height(900_000).unwrap(), None);
+        // An empty table derives nothing rather than something.
+        let empty = Database::in_memory().unwrap();
+        assert_eq!(empty.first_round_at_or_above_height(0).unwrap(), None);
     }
 
     /// A PAID share older than the retention window is pruned (harmless audit

@@ -215,6 +215,11 @@ pub const COINBASE_FEE_SPLIT_HEIGHT: u64 = 959_290;
 /// signed numeric claim — see `DifficultyCalculator::verify_pow_preimage`. Below it, the
 /// legacy numeric check stands (correct for a single-operator fleet trusting its own SRI).
 ///
+/// Verification is era-aware, keyed on the round recorded in [`POW_VERIFY_ACTIVATION_KEY`]
+/// rather than on the current height, so a header-less share mined below the boundary stays
+/// verifiable (by the legacy numeric rule it was mined under) for ever. Judging by the tip made
+/// every pre-gate share unrepairable the instant the gate fired (#639, #650).
+///
 /// A share's PoW binding is consensus-visible (it decides which shares are creditable and
 /// so the coinbase split), hence a height gate: the header is populated into proofs and
 /// required by verifiers only at/above this block, so a mixed-version fleet computes
@@ -379,6 +384,28 @@ pub const ADDR_BIND_ACTIVATION_KEY: &str = "addr_bind_activation_round";
 /// fires. It is then refused before it can be written, so the GHOST-03 sweep replays it for ever
 /// (#639) and the residual unpaid drift freezes permanently.
 pub const TIER_BIND_ACTIVATION_KEY: &str = "tier_bind_activation_round";
+
+/// `kv_store` key holding the round in which [`SHARE_POW_VERIFY_HEIGHT`] first took effect.
+///
+/// Same reasoning again — a share mined below the gate carries `header: None` and can never
+/// acquire one, so judging it by the tip refuses it before it can be recorded and the GHOST-03
+/// sweep replays it for ever (#639, #650) — with one difference: this gate fired BEFORE any
+/// boundary was being recorded, so no live `start_round` ever noted it. #650 called that
+/// unfixable. It is not: the boundary is DERIVED retrospectively at startup from the persisted
+/// rounds (`rounds.round_id` → `rounds.block_height`, written at every round start since long
+/// before the gate) as the lowest `round_id` whose `block_height` is at or above the gate.
+/// Measured on the fleet 2026-08-11: vm5's rounds table spans 73_536..121_144 and yields boundary
+/// 92_002 with 92_001 the last sub-gate round — contiguous, no ambiguity; vm1 likewise (91_999).
+///
+/// The mapping is trustworthy for this purpose because `prune_old_rounds` deletes a round only
+/// when it is terminal AND share-free — a round still owed a share (exactly the rounds repair
+/// cares about) pins its row. If pruning has removed rows between the true boundary and the
+/// lowest surviving post-gate round, the derived boundary lands LATER than the truth, which fails
+/// toward REQUIRING the header — never toward exempting a genuinely post-gate share.
+///
+/// Persisted (earliest-wins) so that when the sub-gate rounds do eventually age out of the
+/// `rounds` table, the boundary survives rather than re-deriving later and later.
+pub const POW_VERIFY_ACTIVATION_KEY: &str = "pow_verify_activation_round";
 
 /// Settle a won block by observing it on-chain, on every node rather than only the submitter.
 ///
