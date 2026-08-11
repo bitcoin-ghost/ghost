@@ -189,9 +189,9 @@ fi
 # ---------------------------------------------------------------------------
 eval "$(sed -n '/^throughput_regressed()/,/^}/p' "$DEPLOY")"
 
-verdict_case() {  # label baseline post want_regressed
-    local label="$1" baseline="$2" post="$3" want="$4" got=no
-    throughput_regressed "$baseline" "$post" && got=yes
+verdict_case() {  # label baseline post conns want_regressed
+    local label="$1" baseline="$2" post="$3" conns="$4" want="$5" got=no
+    throughput_regressed "$baseline" "$post" "$conns" && got=yes
     if [ "$got" = "$want" ]; then
         printf "  [ok ] %s\n" "$label"
         pass=$((pass+1))
@@ -201,18 +201,52 @@ verdict_case() {  # label baseline post want_regressed
     fi
 }
 
-# The outage itself: traffic before, silence after. Nothing else in the deploy path sees this.
-verdict_case "traffic before the swap and none after -> ROLL BACK" 52 0 yes
-verdict_case "traffic before and after -> proceed"                 52 47 no
+# The outage itself: traffic before, silence after, miners still CONNECTED and feeding work into
+# the void. Nothing else in the deploy path sees this.
+verdict_case "traffic before, silence after, miners still attached -> ROLL BACK" 52 0 3 yes
+verdict_case "traffic before and after -> proceed"                               52 47 3 no
 # A single share is enough to prove the path is credited; this must not gate on a rate.
-verdict_case "one share after a busy baseline -> proceed"          52 1 no
+verdict_case "one share after a busy baseline -> proceed"                        52 1 3 no
+# THE 2026-08-11 CASE. All eight nodes are in the mining DNS, so the swap's own restart sheds
+# every miner the node had and they rehome elsewhere within seconds (measured: avalonQ's first
+# share on vm2 landed 24s after its last on vm3). Silence with NO miners attached is the
+# expected aftermath of the restart, not H-13 — four healthy binaries (vm6, vm3, vm1 twice)
+# were rolled back for it in one night.
+verdict_case "silence after, but the restart shed every miner -> proceed"        52 0 0 no
 # A canary with no miners must not be able to PASS this either — silence there is "not measured".
-verdict_case "no baseline, no post -> not measurable, proceed"      0 0 no
-verdict_case "no baseline but shares appear -> proceed"             0 9 no
-# The count comes off a remote sqlite3 through ssh; an empty or failed read must not read as an
-# outage and trigger a spurious rollback of a healthy binary.
-verdict_case "unreadable baseline -> not measurable, proceed"      "" "" no
-verdict_case "unreadable post with a real baseline -> proceed"     52 "" no
+verdict_case "no baseline, no post -> not measurable, proceed"                    0 0 0 no
+verdict_case "no baseline but shares appear -> proceed"                           0 9 1 no
+# The counts come off a remote sqlite3/ss through ssh; an empty or failed read must not read as
+# an outage and trigger a spurious rollback of a healthy binary.
+verdict_case "unreadable baseline -> not measurable, proceed"                    "" "" "" no
+verdict_case "unreadable post with a real baseline -> proceed"                   52 "" 3 no
+verdict_case "unreadable connection count with silence -> proceed"               52 0 "" no
+
+# ---------------------------------------------------------------------------
+# 9. The remote-read validator. Its predecessor was `tr -cd '0-9'`, which cannot fail: any
+#    stray stdout line has its digits CONCATENATED into the count, so a read that half-worked
+#    came back as a confident wrong number instead of as "unreadable".
+# ---------------------------------------------------------------------------
+eval "$(sed -n '/^one_clean_integer()/,/^}/p' "$DEPLOY")"
+
+int_case() {  # label input want_output ("" = must be unreadable)
+    local label="$1" input="$2" want="$3" got
+    got="$(one_clean_integer "$input")" || got=""
+    if [ "$got" = "$want" ]; then
+        printf "  [ok ] %s\n" "$label"
+        pass=$((pass+1))
+    else
+        printf "  [BAD] %s (wanted '%s', got '%s')\n" "$label" "$want" "$got"
+        fail=$((fail+1))
+    fi
+}
+
+int_case "a clean count passes through"                          "55" "55"
+int_case "surrounding whitespace and newline are stripped"       $' 55\n' "55"
+int_case "an empty read is unreadable, not zero"                 "" ""
+int_case "banner junk sharing the pipe is unreadable, not 2555"  $'motd 2 you\n55' ""
+int_case "an error line with digits is unreadable, not a count"  "Error: near line 1" ""
+int_case "two result rows are unreadable, not welded into 55"    $'5\n5' ""
 
 echo
 if [ "$fail" -ne 0 ]; then
