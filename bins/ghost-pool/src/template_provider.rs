@@ -914,6 +914,9 @@ async fn handle_submit_solution(
         // The payout this block's coinbase actually pays — the snapshot the template was built
         // against, not whatever happens to be approved by the time the notification lands.
         payout_snapshot: work_state.payout_snapshot,
+        // #601: the coinbase as mined, so settlement credits the fee-adjusted amounts the chain
+        // actually paid rather than the ratified proposal's.
+        coinbase: coinbase_non_witness,
     });
 
     info!(

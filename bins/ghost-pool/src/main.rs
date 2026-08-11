@@ -8200,6 +8200,26 @@ async fn main() -> Result<()> {
                 if let Some(snapshot) = info.payout_snapshot {
                     match tp_for_block.get_proposal(&snapshot) {
                         Some(paid) => {
+                            // #601: settle from the coinbase that was actually MINED, not from
+                            // the ratified proposal — this node's coinbase carries its own
+                            // fee-drift adjustment, so the treasury amount the chain paid is not
+                            // the one the fleet ratified. Every observing node derives the same
+                            // amounts from the same on-chain coinbase, so the fleet still
+                            // converges. A parse failure falls back to the ratified amounts
+                            // (loudly) rather than not settling at all — under-settling is the
+                            // double-payment path.
+                            let mined_outputs =
+                                ghost_pool::coinbase_verifier::CoinbaseOutput::parse_from_coinbase(
+                                    &info.coinbase,
+                                )
+                                .map_err(|e| {
+                                    error!(
+                                        error = %e,
+                                        "could not parse our own submitted coinbase — settling \
+                                         from the ratified proposal instead"
+                                    );
+                                })
+                                .ok();
                             // The block hash keys the settlement, so this node's immediate settle
                             // and the same block's later observation by every other node collapse
                             // onto one row instead of applying twice.
@@ -8208,6 +8228,7 @@ async fn main() -> Result<()> {
                                 &paid,
                                 PAYOUT_ADDRESS_GROUPING_HEIGHT,
                                 &hex::encode(info.block_hash),
+                                mined_outputs.as_deref(),
                             ) {
                                 error!(
                                     error = %e,

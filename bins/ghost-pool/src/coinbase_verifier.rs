@@ -101,7 +101,11 @@ const COINBASE_OUTPUTS_DOMAIN: &[u8] = b"CoinbaseOutputs/v1";
 /// Convert bech32 address string bytes to script pubkey bytes.
 /// PayoutEntry.address stores bech32 strings as raw bytes;
 /// this converts them to match the script pubkey format in actual coinbase outputs.
-fn address_to_script_pubkey(address_bytes: &[u8]) -> Option<Vec<u8>> {
+///
+/// `pub(crate)` because settlement (#601) needs the same conversion to measure what a mined
+/// coinbase actually paid an address — a second implementation of this mapping is how H-8
+/// happened, so there must only ever be this one.
+pub(crate) fn address_to_script_pubkey(address_bytes: &[u8]) -> Option<Vec<u8>> {
     let addr_str = std::str::from_utf8(address_bytes).ok()?;
     let addr = addr_str
         .parse::<bitcoin::Address<NetworkUnchecked>>()
@@ -315,6 +319,15 @@ impl CoinbaseCommitment {
     ) -> Result<[u8; 32], CoinbaseVerificationError> {
         let outputs = CoinbaseOutput::parse_from_coinbase(coinbase_bytes)?;
         Ok(Self::compute_outputs_hash(&outputs))
+    }
+
+    /// Hash already-parsed coinbase outputs under `CoinbaseOutputs/v1`.
+    ///
+    /// The parsed-outputs twin of [`Self::outputs_hash_from_raw_coinbase`], for callers that
+    /// already hold the outputs (settlement, #601). Same single implementation underneath, for
+    /// the same H-8 reason.
+    pub fn outputs_hash(outputs: &[CoinbaseOutput]) -> [u8; 32] {
+        Self::compute_outputs_hash(outputs)
     }
 }
 

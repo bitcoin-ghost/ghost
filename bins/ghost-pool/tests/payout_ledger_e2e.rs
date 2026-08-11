@@ -516,11 +516,14 @@ fn block_win_is_ratified_and_pays_every_miner_the_ledger_owes() {
     );
 
     // --- The block is mined and accepted; its coinbase carries this payout. NOW settle.
+    // No mined coinbase exists in this fixture — the legacy ratified-amount path (warned about
+    // in production; see #601).
     ghost_pool::payout::settle_paid_block(
         &node.db,
         &proposal,
         PAYOUT_ADDRESS_GROUPING_HEIGHT,
         "e2e_block_hash",
+        None,
     )
     .expect("settle the paid block");
 
@@ -595,6 +598,7 @@ fn share_arriving_after_the_cutoff_does_not_break_ratification() {
         &proposal,
         PAYOUT_ADDRESS_GROUPING_HEIGHT,
         "e2e_block_hash_multi",
+        None,
     )
     .expect("settle the paid block");
 
