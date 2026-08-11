@@ -152,9 +152,14 @@ type CoinbaseBuildResult = (
 /// coinbase; settlement: measure from the mined outputs instead).
 ///
 /// Post-gate (`prop.block_height >= coinbase_fee_split_height()`):
-/// surplus fees go to the treasury; a shortfall comes out of the treasury first, then the node
-/// pool largest-entry-first (ties broken by address, so every node reduces the same entries in
-/// the same order). Miner entries are NEVER touched in either direction.
+/// surplus fees go to the treasury, capped at the treasury's own RATIFIED allocation (drift can
+/// at most double what the decay schedule granted it); overflow above the cap — including the
+/// whole surplus once the decay schedule has driven the ratified treasury to zero — is shared
+/// into the node pool pro rata to the ratified node amounts, remainder to the top entry, the
+/// same shape `calculate_node_payouts` gives the pool itself. A shortfall comes out of the
+/// treasury first, then the node pool largest-entry-first (ties broken by address, so every node
+/// reduces the same entries in the same order). Miner entries are NEVER touched in either
+/// direction.
 /// Pre-gate: the legacy block-finder adjustment with the H-04 2x cap.
 pub(crate) fn adjust_proposal_for_available_fees(
     mut prop: PayoutProposal,
@@ -180,7 +185,73 @@ pub(crate) fn adjust_proposal_for_available_fees(
         if prop.block_height >= crate::coinbase_fee_split_height() {
             if available_fees > original_fees {
                 let extra = available_fees - original_fees;
-                prop.treasury_amount = prop.treasury_amount.saturating_add(extra);
+
+                // #601 DRIFT CAP: the treasury's take is bounded by its own RATIFIED
+                // allocation — drift can at most DOUBLE what the decay schedule granted
+                // the treasury for this block. The cap must not be a multiple of
+                // `original_fees` (H-04's mistake: post-#652 the ratified fees can
+                // legitimately be small, and pre-#652 they were zero, making 2x a
+                // useless bound), and it cannot be read from `TreasuryState` (node-local
+                // DB state, not part of the ratified checkpoint — using it would fork
+                // the coinbase across nodes). `prop.treasury_amount` is itself the
+                // decay-schedule split of the ratified checkpoint, so the cap is a pure
+                // function of the checkpoint, scales with halvings and fee levels, and
+                // goes to ZERO exactly when the decay schedule retires the treasury —
+                // which is precisely when the operator wants every drift satoshi in the
+                // node pool instead.
+                let to_treasury = extra.min(prop.treasury_amount);
+                prop.treasury_amount = prop.treasury_amount.saturating_add(to_treasury);
+
+                // Overflow above the cap is shared into the NODE POOL, mirroring the
+                // shortfall path's fallback in the opposite direction and the decay
+                // schedule's end state (node pool inherits what the treasury no longer
+                // takes). Pro rata to the RATIFIED amounts — the same proportions
+                // `calculate_node_payouts` derived from capability shares — with the
+                // integer-division remainder going to the top entry (largest amount,
+                // ties broken by address), exactly where `calculate_node_payouts` sends
+                // its own dust and rounding remainder. Sorted first so every node adds
+                // to the same entries in the same order.
+                let overflow = extra - to_treasury;
+                if overflow > 0 {
+                    let node_total: u64 = prop
+                        .node_payouts
+                        .iter()
+                        .fold(0u64, |acc, e| acc.saturating_add(e.amount));
+                    if node_total == 0 {
+                        warn!(
+                            overflow,
+                            height,
+                            "Fee-drift surplus exceeds the treasury cap and there is no \
+                             node pool to absorb it — using fallback coinbase"
+                        );
+                        return None;
+                    }
+
+                    prop.node_payouts
+                        .sort_by(|a, b| b.amount.cmp(&a.amount).then(a.address.cmp(&b.address)));
+                    let ratified: Vec<u64> = prop.node_payouts.iter().map(|e| e.amount).collect();
+                    let mut allocated: u64 = 0;
+                    for (entry, base) in prop.node_payouts.iter_mut().zip(ratified) {
+                        let add = ((overflow as u128).saturating_mul(base as u128)
+                            / node_total as u128) as u64;
+                        entry.amount = entry.amount.saturating_add(add);
+                        allocated = allocated.saturating_add(add);
+                    }
+                    let remainder = overflow.saturating_sub(allocated);
+                    if remainder > 0 {
+                        if let Some(top) = prop.node_payouts.first_mut() {
+                            top.amount = top.amount.saturating_add(remainder);
+                        }
+                    }
+                    info!(
+                        extra,
+                        to_treasury,
+                        overflow,
+                        height,
+                        "Fee-drift surplus exceeded the treasury cap — overflow shared \
+                         into the node pool pro rata"
+                    );
+                }
             } else {
                 let mut shortfall = original_fees - available_fees;
 
@@ -6399,13 +6470,22 @@ mod tests {
         }
     }
 
-    /// Post-gate surplus lands on the treasury; the miner and node splits are untouched. This is
-    /// the function settlement re-applies to reconstruct a winner's coinbase (#601), so its
-    /// determinism is a money property, not a style one.
+    /// Sum of every output the adjusted proposal would emit — must equal `total_value` exactly
+    /// for the coinbase to balance.
+    fn adj_total(prop: &ghost_common::types::PayoutProposal) -> u64 {
+        prop.miner_payouts.iter().map(|e| e.amount).sum::<u64>()
+            + prop.node_payouts.iter().map(|e| e.amount).sum::<u64>()
+            + prop.treasury_amount
+    }
+
+    /// Post-gate surplus UNDER the drift cap lands on the treasury; the miner and node splits are
+    /// untouched. This is the function settlement re-applies to reconstruct a winner's coinbase
+    /// (#601), so its determinism is a money property, not a style one.
     #[test]
     fn post_gate_surplus_lands_on_the_treasury_and_touches_nothing_else() {
         let prop = adj_proposal(312_500_000, 500_000, 1_000_000);
-        let adjusted = adjust_proposal_for_available_fees(prop, 312_500_000 + 800_000, 960_000)
+        let total_value = 312_500_000 + 800_000;
+        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
             .expect("surplus must be absorbable");
         assert_eq!(adjusted.treasury_amount, 1_300_000);
         assert_eq!(
@@ -6417,6 +6497,131 @@ mod tests {
             "nodes untouched"
         );
         assert_eq!(adjusted.tx_fees, 800_000);
+        assert_eq!(
+            adj_total(&adjusted),
+            total_value,
+            "outputs must balance exactly to subsidy + available fees"
+        );
+    }
+
+    /// #601 drift cap: the treasury's take is bounded by its own ratified allocation (it can at
+    /// most double); the overflow above the cap is shared into the node pool, and the outputs
+    /// still balance exactly.
+    #[test]
+    fn a_surplus_above_the_cap_overflows_into_the_node_pool() {
+        // Ratified: treasury 1_000_000, one node entry 12_000_000. Extra = 1_700_000: the cap
+        // admits 1_000_000 (treasury doubles), the remaining 700_000 belongs to the node pool.
+        let prop = adj_proposal(312_500_000, 500_000, 1_000_000);
+        let total_value = 312_500_000 + 2_200_000;
+        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
+            .expect("surplus must be absorbable");
+        assert_eq!(adjusted.treasury_amount, 2_000_000, "capped at 2x ratified");
+        assert_eq!(
+            adjusted.node_payouts[0].amount, 12_700_000,
+            "overflow lands on the node pool"
+        );
+        assert_eq!(
+            adjusted.miner_payouts[0].amount, 300_000_000,
+            "miners untouched"
+        );
+        assert_eq!(
+            adj_total(&adjusted),
+            total_value,
+            "outputs must balance exactly at and beyond the cap"
+        );
+    }
+
+    /// Exactly AT the cap boundary the treasury takes the whole surplus, the node pool is
+    /// untouched, and the sum still balances exactly.
+    #[test]
+    fn at_the_cap_boundary_the_sum_still_balances_exactly() {
+        let prop = adj_proposal(312_500_000, 500_000, 1_000_000);
+        let total_value = 312_500_000 + 1_500_000; // extra == ratified treasury == the cap
+        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
+            .expect("surplus must be absorbable");
+        assert_eq!(adjusted.treasury_amount, 2_000_000);
+        assert_eq!(
+            adjusted.node_payouts[0].amount, 12_000_000,
+            "nothing overflows at the boundary"
+        );
+        assert_eq!(adj_total(&adjusted), total_value);
+    }
+
+    /// Once the decay schedule has driven the ratified treasury to ZERO it cannot be relied on:
+    /// the cap is zero, so the WHOLE surplus is shared into the node pool and no treasury output
+    /// is resurrected.
+    #[test]
+    fn a_decayed_zero_treasury_sends_the_whole_surplus_to_the_node_pool() {
+        // Balanced ratified split with no treasury: 300M miner + 12M node == 311.5M + 500k fees.
+        let prop = adj_proposal(311_500_000, 500_000, 0);
+        let total_value = 311_500_000 + 1_300_000;
+        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
+            .expect("surplus must be absorbable");
+        assert_eq!(
+            adjusted.treasury_amount, 0,
+            "a decayed treasury must not be resurrected by drift"
+        );
+        assert_eq!(
+            adjusted.node_payouts[0].amount, 12_800_000,
+            "the node pool takes every surplus satoshi"
+        );
+        assert_eq!(adj_total(&adjusted), total_value);
+    }
+
+    /// Overflow above the cap is shared pro rata to the RATIFIED node amounts — deterministic
+    /// order (amount descending, address ascending) with the integer-division remainder on the
+    /// top entry, so every node builds a byte-identical coinbase from the same checkpoint.
+    #[test]
+    fn overflow_is_shared_pro_rata_with_the_remainder_on_the_top_entry() {
+        let mk = |addr: &str, amount: u64, id: u8| ghost_common::types::PayoutEntry {
+            address: addr.as_bytes().to_vec(),
+            amount,
+            recipient_id: [id; 32],
+            payout_type: ghost_common::types::PayoutType::NodeReward,
+        };
+        let mut prop = adj_proposal(312_500_000, 500_000, 1_000_000);
+        // 300M miner + (6M + 3M + 3M) nodes + 1M treasury == 312.5M subsidy + 500k fees.
+        prop.node_payouts = vec![
+            mk("bc1q-node-c", 3_000_000, 5),
+            mk("bc1q-node-a", 6_000_000, 3),
+            mk("bc1q-node-b", 3_000_000, 4),
+        ];
+
+        // Extra = 2_000_003: the cap admits 1_000_000, overflow = 1_000_003.
+        // Pro rata on 12M: a (6M) +500_001, b (3M) +250_000, c (3M) +250_000; the remainder of 2
+        // goes to the top entry (a).
+        let total_value = 312_500_000 + 2_500_003;
+        let adjusted = adjust_proposal_for_available_fees(prop, total_value, 960_000)
+            .expect("surplus must be absorbable");
+
+        assert_eq!(adjusted.treasury_amount, 2_000_000);
+        let by_addr: Vec<(&str, u64)> = adjusted
+            .node_payouts
+            .iter()
+            .map(|e| (std::str::from_utf8(&e.address).unwrap(), e.amount))
+            .collect();
+        assert_eq!(
+            by_addr,
+            vec![
+                ("bc1q-node-a", 6_500_003),
+                ("bc1q-node-b", 3_250_000),
+                ("bc1q-node-c", 3_250_000),
+            ],
+            "pro-rata shares, remainder on the top entry, ties broken by address"
+        );
+        assert_eq!(adj_total(&adjusted), total_value);
+    }
+
+    /// A surplus beyond the cap with NO node pool to absorb it cannot be placed: fail closed
+    /// (fallback coinbase) rather than breach the cap or build an unbalanced coinbase.
+    #[test]
+    fn a_capped_surplus_with_no_node_pool_fails_closed() {
+        let mut prop = adj_proposal(312_500_000, 500_000, 1_000_000);
+        prop.node_payouts.clear();
+        assert!(
+            adjust_proposal_for_available_fees(prop, 312_500_000 + 2_500_000, 960_000).is_none(),
+            "2M of drift against a 1M cap with no node pool must fall back"
+        );
     }
 
     /// Post-gate shortfall drains the treasury first, then the node pool largest-first; miners
