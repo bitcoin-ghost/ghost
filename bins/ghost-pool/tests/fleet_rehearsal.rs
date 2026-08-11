@@ -474,12 +474,22 @@ async fn divergent_fleet_is_reconciled_ratifies_and_pays_its_miners_on_a_real_ch
         coinbase.output.len()
     );
 
-    // ---- 7. NOW the ledger settles — the coins exist.
+    // ---- 7. NOW the ledger settles — the coins exist. Settled from the coinbase the chain
+    // accepted (#601), exactly as the submitter and every observer do in production.
+    let mined_outputs: Vec<ghost_pool::coinbase_verifier::CoinbaseOutput> = coinbase
+        .output
+        .iter()
+        .map(|o| ghost_pool::coinbase_verifier::CoinbaseOutput {
+            value: o.value.to_sat(),
+            script_pubkey: o.script_pubkey.as_bytes().to_vec(),
+        })
+        .collect();
     settle_paid_block(
         &node.db,
         &proposal,
         PAYOUT_ADDRESS_GROUPING_HEIGHT,
         "rehearsal_block_hash",
+        Some(&mined_outputs),
     )
     .expect("settle");
     assert!(

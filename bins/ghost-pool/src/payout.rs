@@ -525,15 +525,21 @@ pub fn make_proposal_validator(
 /// Thin wrapper over [`apply_settlement`]: the node that submits a winning block settles it
 /// immediately, every other node settles the same block when it observes it on-chain, and both
 /// must go through one implementation or they will drift.
+///
+/// `mined_outputs` is the coinbase the chain actually accepted; see [`apply_settlement`] for why
+/// settling without it credits amounts the chain never paid (#601).
 pub fn settle_paid_block(
     db: &ghost_storage::Database,
     proposal: &PayoutProposal,
     grouping_height: u64,
     block_hash: &str,
+    mined_outputs: Option<&[crate::coinbase_verifier::CoinbaseOutput]>,
 ) -> GhostResult<usize> {
-    Ok(apply_settlement(db, proposal, grouping_height, block_hash)?
-        .map(|applied| applied.shares_marked)
-        .unwrap_or(0))
+    Ok(
+        apply_settlement(db, proposal, grouping_height, block_hash, mined_outputs)?
+            .map(|applied| applied.shares_marked)
+            .unwrap_or(0),
+    )
 }
 
 /// Resolve which local `miner_id`s a proposal's payout entries refer to.
@@ -590,12 +596,137 @@ pub fn resolve_paid_miner_ids(
     Ok(matched)
 }
 
+/// What settlement decided to credit and record, and on what evidence.
+///
+/// Split out of [`apply_settlement`] so the money decision — WHAT the treasury is credited and
+/// WHICH outputs hash the settlement records — is a pure function of the ratified proposal and
+/// the mined coinbase, testable without a database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettlementAmounts {
+    /// Satoshis the treasury is credited.
+    pub treasury_amount: u64,
+    /// The outputs hash recorded on the settlement row.
+    pub outputs_hash: [u8; 32],
+    /// True when the mined outputs were PROVEN to be the deterministic fee-drift adjustment of
+    /// the ratified proposal (hash match). False means the amounts were measured directly from
+    /// the mined outputs because reconstruction did not verify — alarmed by the caller.
+    pub verified: bool,
+}
+
+/// Derive what settlement should credit from the coinbase the chain actually accepted.
+///
+/// #601: the mined coinbase is built from a per-node fee-drift adjustment of the ratified
+/// proposal (`template::adjust_proposal_for_available_fees`), so the treasury and node amounts
+/// the chain PAID differ from the ones the fleet RATIFIED — on the live fleet by the entire fee
+/// value of the block (`original_fees=0, available_fees≈4M sats` on every template). Crediting
+/// `proposal.treasury_amount` books money that never existed on-chain.
+///
+/// Two paths, in order of preference:
+///
+/// 1. **Reconstruct and prove.** The adjustment is deterministic in (ratified proposal, total
+///    mined value), so re-apply it and require the commitment of the result to hash-match the
+///    mined outputs — the same `CoinbaseOutputs/v1` commitment M-28 verified before submission.
+///    On a match the adjusted `treasury_amount` is exactly what the treasury output carries.
+/// 2. **Measure.** If reconstruction does not verify (a winner on different code, a tampered
+///    coinbase, or a rehearsal block mined outside the builder), fall back to summing the mined
+///    outputs that pay the treasury script directly. Exact unless another payout entry shares
+///    the treasury address, which is logged. The share marking is unaffected either way — miner
+///    entries are never touched by any version of the adjustment.
+///
+/// In both paths the recorded `outputs_hash` is the hash of the MINED outputs, so the settlement
+/// row describes the chain rather than the proposal.
+pub fn settlement_amounts_from_mined_coinbase(
+    proposal: &PayoutProposal,
+    mined: &[crate::coinbase_verifier::CoinbaseOutput],
+) -> SettlementAmounts {
+    use crate::coinbase_verifier::{address_to_script_pubkey, CoinbaseCommitment};
+
+    let mined_hash = CoinbaseCommitment::outputs_hash(mined);
+    let mined_total: u64 = mined
+        .iter()
+        .filter(|o| o.value > 0)
+        .map(|o| o.value)
+        .fold(0u64, u64::saturating_add);
+
+    // Path 1: reconstruct the winner's adjustment and prove it against the mined outputs.
+    if let Some(adjusted) = crate::template::adjust_proposal_for_available_fees(
+        proposal.clone(),
+        mined_total,
+        proposal.block_height,
+    ) {
+        let treasury_addr = if !adjusted.treasury_address.is_empty() {
+            adjusted.treasury_address.clone()
+        } else {
+            Vec::new()
+        };
+        let commitment = CoinbaseCommitment::from_proposal(&adjusted, &treasury_addr);
+        if commitment.verify(mined).is_ok() {
+            return SettlementAmounts {
+                treasury_amount: adjusted.treasury_amount,
+                outputs_hash: mined_hash,
+                verified: true,
+            };
+        }
+    }
+
+    // Path 2: the block is provably ours (it carries the payout tag) but its outputs are not the
+    // deterministic adjustment of the proposal we hold. Credit what the chain measurably paid the
+    // treasury script — never the ratified figure, which the chain did not pay.
+    let treasury_spk = address_to_script_pubkey(&proposal.treasury_address)
+        .unwrap_or_else(|| proposal.treasury_address.clone());
+    let measured: u64 = if treasury_spk.is_empty() {
+        0
+    } else {
+        mined
+            .iter()
+            .filter(|o| o.value > 0 && o.script_pubkey == treasury_spk)
+            .map(|o| o.value)
+            .fold(0u64, u64::saturating_add)
+    };
+
+    // If a miner or node entry pays the treasury address too, the direct sum includes their
+    // outputs — say so, because the credit is then an upper bound.
+    let treasury_addr_shared = proposal
+        .miner_payouts
+        .iter()
+        .chain(proposal.node_payouts.iter())
+        .any(|e| {
+            address_to_script_pubkey(&e.address).unwrap_or_else(|| e.address.clone())
+                == treasury_spk
+        });
+    if treasury_addr_shared && measured > 0 {
+        warn!(
+            measured,
+            "#601: treasury address is also a payout entry address — the measured treasury \
+             credit is an upper bound, not exact"
+        );
+    }
+
+    SettlementAmounts {
+        treasury_amount: measured,
+        outputs_hash: mined_hash,
+        verified: false,
+    }
+}
+
 /// Settle a won block: mark its shares paid, bump the treasury, record the win — once, atomically.
 ///
 /// `Ok(None)` means the block was already settled and nothing changed. Three paths reach this for
 /// the same block — the submitting node when it submits, every other node when it observes the
 /// block on-chain, and the startup rescan — and they must converge on a single application rather
 /// than crediting the treasury once per caller.
+///
+/// `mined_outputs` is the coinbase the chain actually accepted. When present, the treasury credit
+/// and the recorded outputs hash come from IT (#601, via
+/// [`settlement_amounts_from_mined_coinbase`]) — the ratified `proposal.treasury_amount` is what
+/// the fleet agreed to, not what the winner's fee-adjusted coinbase paid, and the two differ on
+/// every block with fee drift. `None` preserves the old ratified-amount behaviour for callers
+/// that genuinely have no coinbase in hand (some tests); production callers all pass the mined
+/// outputs, and settling without them is warned about because the treasury ledger then diverges
+/// from the chain by the drift.
+///
+/// The share marking is identical in every case: miner entries are never touched by the fee
+/// adjustment, so WHO gets marked paid depends only on the ratified proposal.
 ///
 /// The share marking, the won-block record and the treasury bump all land in one transaction. They
 /// used to be three separate writes, so a crash between them could leave shares marked paid by a
@@ -605,24 +736,66 @@ pub fn apply_settlement(
     proposal: &PayoutProposal,
     grouping_height: u64,
     block_hash: &str,
+    mined_outputs: Option<&[crate::coinbase_verifier::CoinbaseOutput]>,
 ) -> GhostResult<Option<ghost_storage::queries::SettlementApplied>> {
     let cutoff_ts = proposal.timestamp as i64;
     let matched = resolve_paid_miner_ids(db, proposal, grouping_height)?;
 
-    let outputs_hash = crate::coinbase_verifier::CoinbaseCommitment::from_proposal(
-        proposal,
-        &proposal.treasury_address,
-    )
-    .output_hash;
+    let amounts = match mined_outputs {
+        Some(mined) => {
+            let amounts = settlement_amounts_from_mined_coinbase(proposal, mined);
+            if !amounts.verified {
+                error!(
+                    block_hash,
+                    height = proposal.block_height,
+                    ratified_treasury = proposal.treasury_amount,
+                    measured_treasury = amounts.treasury_amount,
+                    "#601: mined coinbase is NOT the deterministic fee adjustment of the \
+                     ratified proposal — settling the measured treasury amount and alarming. \
+                     A winner on different code, a tampered coinbase, or a hand-mined block."
+                );
+            } else if amounts.treasury_amount != proposal.treasury_amount {
+                info!(
+                    block_hash,
+                    height = proposal.block_height,
+                    ratified_treasury = proposal.treasury_amount,
+                    paid_treasury = amounts.treasury_amount,
+                    "#601: fee drift — the chain paid the treasury a different amount than \
+                     ratified; settling what was paid"
+                );
+            }
+            amounts
+        }
+        None => {
+            // Legacy path: no coinbase in hand. The ratified amounts are the only thing to
+            // credit, and they are known-wrong by the drift — say so.
+            warn!(
+                block_hash,
+                height = proposal.block_height,
+                treasury = proposal.treasury_amount,
+                "#601: settling WITHOUT the mined coinbase — crediting the ratified treasury \
+                 amount, which differs from what the chain paid by this block's fee drift"
+            );
+            SettlementAmounts {
+                treasury_amount: proposal.treasury_amount,
+                outputs_hash: crate::coinbase_verifier::CoinbaseCommitment::from_proposal(
+                    proposal,
+                    &proposal.treasury_address,
+                )
+                .output_hash,
+                verified: false,
+            }
+        }
+    };
 
     let applied = db.settle_block_atomic(
         block_hash,
         proposal.block_height,
         &proposal.proposal_hash,
-        &outputs_hash,
+        &amounts.outputs_hash,
         &matched,
         cutoff_ts,
-        proposal.treasury_amount,
+        amounts.treasury_amount,
         ghost_reconciliation::fee_distribution::TREASURY_THRESHOLD_SATS,
     )?;
 
@@ -633,6 +806,7 @@ pub fn apply_settlement(
             height = proposal.block_height,
             treasury_sats = a.treasury_bumped,
             threshold_crossed = a.threshold_crossed,
+            verified_against_chain = amounts.verified,
             block_hash,
             "Ledger settled: shares marked paid because a block carrying this payout was accepted"
         ),
@@ -4540,5 +4714,225 @@ mod tests {
 
         // Total should still be correct
         assert!(dist.verify(subsidy, tx_fees));
+    }
+
+    // ---- #601: settlement credits what the chain paid, not what the fleet ratified ----
+
+    const P2WPKH: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const P2WSH: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+
+    fn spk_601(addr: &str) -> Vec<u8> {
+        crate::coinbase_verifier::address_to_script_pubkey(addr.as_bytes())
+            .expect("test address must convert")
+    }
+
+    /// A ratified post-gate proposal: miner 3.0, node 0.12, treasury `treasury`, fees `tx_fees`.
+    fn ratified_601(tx_fees: u64, treasury: u64) -> PayoutProposal {
+        PayoutProposal {
+            proposal_hash: [0x60; 32],
+            round_id: 1,
+            block_hash: [0u8; 32],
+            block_height: 960_000, // post COINBASE_FEE_SPLIT_HEIGHT (959_290)
+            proposer: [1u8; 32],
+            miner_payouts: vec![ghost_common::types::PayoutEntry {
+                address: P2WPKH.as_bytes().to_vec(),
+                amount: 300_000_000,
+                recipient_id: [2u8; 32],
+                payout_type: ghost_common::types::PayoutType::Mining,
+            }],
+            node_payouts: vec![ghost_common::types::PayoutEntry {
+                address: P2WPKH.as_bytes().to_vec(),
+                amount: 12_000_000,
+                recipient_id: [3u8; 32],
+                payout_type: ghost_common::types::PayoutType::NodeReward,
+            }],
+            treasury_amount: treasury,
+            treasury_address: P2WSH.as_bytes().to_vec(),
+            tx_fees,
+            subsidy: 312_500_000,
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            tx_fees_unallocated: 0,
+        }
+    }
+
+    /// The outputs a winner's coinbase carries, in builder order: miners, nodes, treasury.
+    fn mined_601(
+        miner: u64,
+        node: u64,
+        treasury: u64,
+    ) -> Vec<crate::coinbase_verifier::CoinbaseOutput> {
+        let mut v = Vec::new();
+        if miner > 0 {
+            v.push(crate::coinbase_verifier::CoinbaseOutput {
+                value: miner,
+                script_pubkey: spk_601(P2WPKH),
+            });
+        }
+        if node > 0 {
+            v.push(crate::coinbase_verifier::CoinbaseOutput {
+                value: node,
+                script_pubkey: spk_601(P2WPKH),
+            });
+        }
+        if treasury > 0 {
+            v.push(crate::coinbase_verifier::CoinbaseOutput {
+                value: treasury,
+                script_pubkey: spk_601(P2WSH),
+            });
+        }
+        v
+    }
+
+    /// **The #601 defect, pinned.** The fleet ratified treasury 0.01 with fees 0.005; the winner's
+    /// template had fees 0.008, so its coinbase paid treasury 0.013. Settlement must credit the
+    /// 0.013 the chain paid — crediting the ratified 0.01 books money that never existed.
+    #[test]
+    fn surplus_fee_drift_credits_the_treasury_amount_the_chain_paid() {
+        let ratified = ratified_601(500_000, 1_000_000);
+        let mined = mined_601(300_000_000, 12_000_000, 1_300_000); // winner saw 800_000 fees
+
+        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
+        assert!(
+            amounts.verified,
+            "the mined outputs ARE the deterministic adjustment"
+        );
+        assert_eq!(amounts.treasury_amount, 1_300_000, "credit what was paid");
+        assert_ne!(
+            amounts.treasury_amount, ratified.treasury_amount,
+            "the ratified amount is precisely what must NOT be credited"
+        );
+        assert_eq!(
+            amounts.outputs_hash,
+            crate::coinbase_verifier::CoinbaseCommitment::outputs_hash(&mined),
+            "the settlement row must describe the chain, not the proposal"
+        );
+    }
+
+    /// Shortfall: winner's fees fell to zero, so the drift drained the treasury then the largest
+    /// node entry. Settlement follows the same deterministic path and credits what remains.
+    #[test]
+    fn shortfall_fee_drift_drains_treasury_then_nodes_and_settles_what_remains() {
+        // Shortfall 500_000 absorbed entirely by the 1_000_000 treasury.
+        let ratified = ratified_601(500_000, 1_000_000);
+        let mined = mined_601(300_000_000, 12_000_000, 500_000);
+        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
+        assert!(amounts.verified);
+        assert_eq!(amounts.treasury_amount, 500_000);
+
+        // Shortfall 2_000_000 empties the treasury and takes 1_000_000 from the node entry.
+        let ratified = ratified_601(2_000_000, 1_000_000);
+        let mined = mined_601(300_000_000, 11_000_000, 0);
+        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
+        assert!(amounts.verified);
+        assert_eq!(
+            amounts.treasury_amount, 0,
+            "the chain paid the treasury nothing"
+        );
+    }
+
+    /// A 0-value witness commitment output rides along on every real coinbase and must not
+    /// disturb verification.
+    #[test]
+    fn witness_commitment_output_does_not_break_verification() {
+        let ratified = ratified_601(500_000, 1_000_000);
+        let mut mined = mined_601(300_000_000, 12_000_000, 1_300_000);
+        mined.push(crate::coinbase_verifier::CoinbaseOutput {
+            value: 0,
+            script_pubkey: vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed],
+        });
+        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
+        assert!(amounts.verified);
+        assert_eq!(amounts.treasury_amount, 1_300_000);
+    }
+
+    /// A tagged block whose outputs are NOT the deterministic adjustment — a winner on different
+    /// code, a tampered coinbase, or a hand-mined rehearsal block. The treasury credit falls back
+    /// to direct measurement of the treasury script, never to the ratified figure.
+    #[test]
+    fn an_unreconstructable_coinbase_is_measured_not_trusted() {
+        let ratified = ratified_601(500_000, 1_000_000);
+
+        // Fallback-shaped block: one big output to the miner script, 750_000 to the treasury.
+        let mined = vec![
+            crate::coinbase_verifier::CoinbaseOutput {
+                value: 200_000_000,
+                script_pubkey: spk_601(P2WPKH),
+            },
+            crate::coinbase_verifier::CoinbaseOutput {
+                value: 750_000,
+                script_pubkey: spk_601(P2WSH),
+            },
+        ];
+        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
+        assert!(
+            !amounts.verified,
+            "this is not the adjustment of the ratified proposal"
+        );
+        assert_eq!(
+            amounts.treasury_amount, 750_000,
+            "credit what the treasury script received"
+        );
+
+        // No treasury output at all: credit nothing, not the ratified 1_000_000.
+        let mined = vec![crate::coinbase_verifier::CoinbaseOutput {
+            value: 312_500_000,
+            script_pubkey: spk_601(P2WPKH),
+        }];
+        let amounts = settlement_amounts_from_mined_coinbase(&ratified, &mined);
+        assert!(!amounts.verified);
+        assert_eq!(amounts.treasury_amount, 0);
+    }
+
+    /// End to end through the database: `apply_settlement` books the ADJUSTED treasury amount,
+    /// and reversal restores exactly what was booked — the recorded amounts, not the ratified.
+    #[test]
+    fn apply_settlement_books_the_mined_amounts_and_reversal_inverts_them() {
+        let db = ghost_storage::Database::in_memory().expect("db");
+        let ratified = ratified_601(500_000, 1_000_000);
+        let mined = mined_601(300_000_000, 12_000_000, 1_300_000);
+
+        let applied = apply_settlement(
+            &db,
+            &ratified,
+            crate::PAYOUT_ADDRESS_GROUPING_HEIGHT,
+            "601_block",
+            Some(&mined),
+        )
+        .expect("settle")
+        .expect("applied");
+        assert_eq!(
+            applied.treasury_bumped, 1_300_000,
+            "the ledger must book what the chain paid, not the ratified 1_000_000"
+        );
+        assert_eq!(db.get_treasury_balance().expect("balance"), 1_300_000);
+
+        let reversed = db
+            .reverse_settlement("601_block")
+            .expect("reverse")
+            .expect("was settled");
+        assert_eq!(reversed.treasury_bumped, 1_300_000);
+        assert_eq!(
+            db.get_treasury_balance().expect("balance"),
+            0,
+            "reversal must debit exactly what settlement credited"
+        );
+    }
+
+    /// Without the mined coinbase in hand, behaviour is unchanged from before #601: the ratified
+    /// amounts are booked. This is the legacy path some tests rely on, and production warns on it.
+    #[test]
+    fn settling_without_the_mined_coinbase_books_the_ratified_amounts_unchanged() {
+        let db = ghost_storage::Database::in_memory().expect("db");
+        let ratified = ratified_601(500_000, 1_000_000);
+        let applied = apply_settlement(
+            &db,
+            &ratified,
+            crate::PAYOUT_ADDRESS_GROUPING_HEIGHT,
+            "601_legacy",
+            None,
+        )
+        .expect("settle")
+        .expect("applied");
+        assert_eq!(applied.treasury_bumped, 1_000_000);
     }
 }

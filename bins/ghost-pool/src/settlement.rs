@@ -13,6 +13,11 @@
 //! The tag is necessary because the outputs alone are not enough — the mined coinbase is built from
 //! a fee-adjusted proposal whose treasury and node amounts absorb that node's own fee drift, so it
 //! matches no stored proposal. Naming the payout turns a guess into a lookup.
+//!
+//! That same drift is why settlement credits from the MINED outputs, not the stored proposal
+//! (#601): the ratified `treasury_amount` is what the fleet agreed to, the coinbase pays the
+//! winner's adjusted amount, and booking the former records money the chain never moved. The
+//! tag answers WHICH payout a block paid; the outputs answer HOW MUCH.
 
 use std::sync::Arc;
 
@@ -84,8 +89,15 @@ impl SettlementObserver {
         self
     }
 
-    /// Pull the coinbase scriptSig out of a block.
-    async fn coinbase_scriptsig(&self, block_hash: &str) -> GhostResult<Vec<u8>> {
+    /// Pull the coinbase scriptSig and outputs out of a block.
+    ///
+    /// Both come from the same coinbase: the scriptSig carries the tag naming the payout, the
+    /// outputs are what the chain actually paid — which is what settlement credits (#601), since
+    /// the mined amounts carry the winner's fee-drift adjustment and the stored proposal does not.
+    async fn coinbase_parts(
+        &self,
+        block_hash: &str,
+    ) -> GhostResult<(Vec<u8>, Vec<crate::coinbase_verifier::CoinbaseOutput>)> {
         // Normalise to display order first. `BlockEvent` hashes arrive in internal order despite
         // the parser's doc claiming otherwise (observed on vm5, 2026-08-01: every settlement probe
         // got "Block not found" for a block that existed). Settlement is the first consumer to
@@ -115,7 +127,15 @@ impl SettlementObserver {
             .script_sig
             .as_bytes()
             .to_vec();
-        Ok(script_sig)
+        let outputs = coinbase
+            .output
+            .iter()
+            .map(|o| crate::coinbase_verifier::CoinbaseOutput {
+                value: o.value.to_sat(),
+                script_pubkey: o.script_pubkey.as_bytes().to_vec(),
+            })
+            .collect();
+        Ok((script_sig, outputs))
     }
 
     /// Settle a block if its coinbase names a payout this node holds.
@@ -123,26 +143,28 @@ impl SettlementObserver {
     /// Every block the node sees passes through here, including everyone else's, so the common
     /// path must be cheap and must say `NotOurs` rather than doing anything.
     pub async fn on_block_connected(&self, block_hash: &str, height: u64) -> SettleOutcome {
-        let scriptsig = match self.coinbase_scriptsig(block_hash).await {
-            Ok(s) => s,
+        let (scriptsig, outputs) = match self.coinbase_parts(block_hash).await {
+            Ok(parts) => parts,
             Err(e) => {
                 warn!(block_hash, error = %e, "could not read a block's coinbase; not settling it");
                 return SettleOutcome::NotOurs;
             }
         };
-        self.settle_from_scriptsig(block_hash, height, &scriptsig)
+        self.settle_from_coinbase(block_hash, height, &scriptsig, &outputs)
     }
 
-    /// Decide and apply, given a coinbase scriptSig already in hand.
+    /// Decide and apply, given a coinbase's scriptSig and outputs already in hand.
     ///
     /// Split from the fetch so the decision path is testable without a live Core: everything that
-    /// can be wrong — reading the tag, finding the proposal, settling the right shares — is here,
-    /// while the fetch above is a thin wrapper worth exercising only against a real node.
-    pub fn settle_from_scriptsig(
+    /// can be wrong — reading the tag, finding the proposal, settling the right shares, crediting
+    /// what the chain paid rather than what was ratified (#601) — is here, while the fetch above
+    /// is a thin wrapper worth exercising only against a real node.
+    pub fn settle_from_coinbase(
         &self,
         block_hash: &str,
         height: u64,
         scriptsig: &[u8],
+        mined_outputs: &[crate::coinbase_verifier::CoinbaseOutput],
     ) -> SettleOutcome {
         let Some(payout_id) = ghost_common::coinbase_tags::extract_payout_tag(scriptsig) else {
             return SettleOutcome::NotOurs;
@@ -215,8 +237,13 @@ impl SettlementObserver {
             return SettleOutcome::DryRunMatch { payout_id };
         }
 
-        match crate::payout::apply_settlement(&self.db, &proposal, self.grouping_height, block_hash)
-        {
+        match crate::payout::apply_settlement(
+            &self.db,
+            &proposal,
+            self.grouping_height,
+            block_hash,
+            Some(mined_outputs),
+        ) {
             Ok(Some(applied)) => SettleOutcome::Settled(Box::new(applied)),
             Ok(None) => SettleOutcome::AlreadySettled,
             Err(e) => {
@@ -559,6 +586,21 @@ mod tests {
         s
     }
 
+    fn spk(addr: &str) -> Vec<u8> {
+        crate::coinbase_verifier::address_to_script_pubkey(addr.as_bytes())
+            .expect("test address must convert to a script pubkey")
+    }
+
+    /// The outputs the winning block actually paid — for the fixture proposal (no fee drift:
+    /// mined total below subsidy makes available fees 0, matching `tx_fees: 0`), exactly its
+    /// single miner output, so #601's reconstruction verifies.
+    fn winning_coinbase_outputs() -> Vec<crate::coinbase_verifier::CoinbaseOutput> {
+        vec![crate::coinbase_verifier::CoinbaseOutput {
+            value: 100_000_000,
+            script_pubkey: spk(ADDRESS),
+        }]
+    }
+
     /// **The point of the whole package.** A node that did not submit the winning block settles it
     /// anyway, from the chain.
     ///
@@ -573,8 +615,12 @@ mod tests {
         let (unpaid_before, _) = db.get_miner_unpaid_stats(MINER).expect("stats");
         assert_eq!(unpaid_before, 4, "fixture should start with unpaid work");
 
-        let outcome =
-            observer.settle_from_scriptsig("0000won", 960_001, &winning_coinbase_scriptsig());
+        let outcome = observer.settle_from_coinbase(
+            "0000won",
+            960_001,
+            &winning_coinbase_scriptsig(),
+            &winning_coinbase_outputs(),
+        );
 
         match outcome {
             SettleOutcome::Settled(applied) => {
@@ -603,11 +649,21 @@ mod tests {
         let scriptsig = winning_coinbase_scriptsig();
 
         assert!(matches!(
-            observer.settle_from_scriptsig("0000won", 960_001, &scriptsig),
+            observer.settle_from_coinbase(
+                "0000won",
+                960_001,
+                &scriptsig,
+                &winning_coinbase_outputs()
+            ),
             SettleOutcome::Settled(_)
         ));
         assert_eq!(
-            observer.settle_from_scriptsig("0000won", 960_001, &scriptsig),
+            observer.settle_from_coinbase(
+                "0000won",
+                960_001,
+                &scriptsig,
+                &winning_coinbase_outputs()
+            ),
             SettleOutcome::AlreadySettled
         );
 
@@ -625,7 +681,7 @@ mod tests {
         foreign.extend_from_slice(b"/SomeOtherPool/");
 
         assert_eq!(
-            observer.settle_from_scriptsig("0000foreign", 960_001, &foreign),
+            observer.settle_from_coinbase("0000foreign", 960_001, &foreign, &[]),
             SettleOutcome::NotOurs
         );
 
@@ -643,7 +699,7 @@ mod tests {
         s.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xEE; 16]));
 
         assert_eq!(
-            observer.settle_from_scriptsig("0000unknown", 960_001, &s),
+            observer.settle_from_coinbase("0000unknown", 960_001, &s, &[]),
             SettleOutcome::ProposalMissing {
                 payout_id: [0xEE; 16]
             }
@@ -664,7 +720,7 @@ mod tests {
 
         let mut s = vec![0x03, 0x40, 0x1f, 0x0e];
         s.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xEE; 16]));
-        observer.settle_from_scriptsig("0000unknown", 960_001, &s);
+        observer.settle_from_coinbase("0000unknown", 960_001, &s, &[]);
 
         assert_eq!(
             db.list_deferred_settlements().expect("deferred"),
@@ -688,7 +744,12 @@ mod tests {
         .expect("defer");
 
         assert!(matches!(
-            observer.settle_from_scriptsig("0000won", 960_001, &winning_coinbase_scriptsig()),
+            observer.settle_from_coinbase(
+                "0000won",
+                960_001,
+                &winning_coinbase_scriptsig(),
+                &winning_coinbase_outputs()
+            ),
             SettleOutcome::Settled(_)
         ));
         assert!(
@@ -705,8 +766,8 @@ mod tests {
 
         let mut s = vec![0x03, 0x40, 0x1f, 0x0e];
         s.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xEE; 16]));
-        observer.settle_from_scriptsig("0000unknown", 960_001, &s);
-        observer.settle_from_scriptsig("0000unknown", 960_001, &s);
+        observer.settle_from_coinbase("0000unknown", 960_001, &s, &[]);
+        observer.settle_from_coinbase("0000unknown", 960_001, &s, &[]);
 
         assert_eq!(db.list_deferred_settlements().expect("deferred").len(), 1);
     }
@@ -751,7 +812,12 @@ mod tests {
             scriptsig.len()
         );
 
-        match observer.settle_from_scriptsig("0000real", 960_001, &scriptsig) {
+        match observer.settle_from_coinbase(
+            "0000real",
+            960_001,
+            &scriptsig,
+            &winning_coinbase_outputs(),
+        ) {
             SettleOutcome::Settled(applied) => assert_eq!(applied.shares_marked, 4),
             other => panic!("the real builder's coinbase did not settle: {other:?}"),
         }
@@ -771,7 +837,12 @@ mod tests {
         let scriptsig = scriptsig_from_the_real_builder(PROPOSAL_HASH);
 
         assert!(matches!(
-            observer.settle_from_scriptsig("0000reorg", 960_001, &scriptsig),
+            observer.settle_from_coinbase(
+                "0000reorg",
+                960_001,
+                &scriptsig,
+                &winning_coinbase_outputs()
+            ),
             SettleOutcome::Settled(_)
         ));
         assert_eq!(db.get_miner_unpaid_stats(MINER).expect("stats").0, 0);
@@ -797,7 +868,12 @@ mod tests {
 
         // And back on the main chain.
         assert!(matches!(
-            observer.settle_from_scriptsig("0000reorg", 960_001, &scriptsig),
+            observer.settle_from_coinbase(
+                "0000reorg",
+                960_001,
+                &scriptsig,
+                &winning_coinbase_outputs()
+            ),
             SettleOutcome::Settled(_)
         ));
         assert_eq!(
@@ -824,11 +900,51 @@ mod tests {
         let mut id = [0u8; 16];
         id.copy_from_slice(&PROPOSAL_HASH[..16]);
         assert_eq!(
-            gated.settle_from_scriptsig("0000won", 960_001, &winning_coinbase_scriptsig()),
+            gated.settle_from_coinbase(
+                "0000won",
+                960_001,
+                &winning_coinbase_scriptsig(),
+                &winning_coinbase_outputs()
+            ),
             SettleOutcome::DryRunMatch { payout_id: id }
         );
 
         let (unpaid, _) = db.get_miner_unpaid_stats(MINER).expect("stats");
         assert_eq!(unpaid, 3, "a dry run must not change the ledger");
+    }
+
+    /// **#601, at the observer.** A tagged block whose outputs are NOT the deterministic
+    /// adjustment of the held proposal — a hand-mined rehearsal block, a winner on different
+    /// code — still settles the SHARES (under-settling is the double-payment path), but credits
+    /// the treasury only what the treasury script measurably received: here, nothing.
+    #[test]
+    fn a_hand_mined_block_settles_shares_but_credits_only_what_it_paid() {
+        let (db, observer) = non_submitting_node(3);
+
+        // One big output to a script unrelated to the fixture's treasury address.
+        let foreign_outputs = vec![crate::coinbase_verifier::CoinbaseOutput {
+            value: 5_000_000_000,
+            script_pubkey: spk("bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"),
+        }];
+
+        match observer.settle_from_coinbase(
+            "0000hand",
+            960_001,
+            &winning_coinbase_scriptsig(),
+            &foreign_outputs,
+        ) {
+            SettleOutcome::Settled(applied) => {
+                assert_eq!(applied.shares_marked, 3, "the shares must still be marked");
+                assert_eq!(
+                    applied.treasury_bumped, 0,
+                    "the treasury script received nothing, so nothing is credited — \
+                     NOT the ratified amount"
+                );
+            }
+            other => panic!("a tagged block must settle even when unreconstructable: {other:?}"),
+        }
+
+        let (unpaid, _) = db.get_miner_unpaid_stats(MINER).expect("stats");
+        assert_eq!(unpaid, 0);
     }
 }

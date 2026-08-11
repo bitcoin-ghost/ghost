@@ -108,6 +108,13 @@ pub struct BlockSubmittedInfo {
     /// exist — not when consensus approved it, because approval merely arms the coinbase of some
     /// FUTURE block. `None` means this block paid the fallback coinbase and settles nothing.
     pub payout_snapshot: Option<[u8; 32]>,
+    /// The actually-mined coinbase transaction (non-witness serialisation), exactly as submitted.
+    ///
+    /// #601: settlement must credit what the chain PAID, not what the fleet ratified — the mined
+    /// coinbase carries this node's fee-drift adjustment, so its treasury and node outputs differ
+    /// from the stored proposal's. The submitter parses these bytes and settles from them, the
+    /// same way every observing node settles from the coinbase it reads off the chain.
+    pub coinbase: Vec<u8>,
 }
 
 /// Type alias for coinbase build result:
@@ -120,6 +127,207 @@ type CoinbaseBuildResult = (
     u32,
     Option<CoinbaseCommitment>,
 );
+
+/// Deterministically adjust a ratified payout proposal to the fees actually available in a
+/// template (`total_value` = subsidy + available fees).
+///
+/// The BFT-approved proposal baked in `tx_fees` at creation time, but template filtering
+/// (Reaper/BUDS/mempool changes) and RBF change available fees before any coinbase is built, and
+/// they change them DIFFERENTLY on every node. The mined coinbase must still spend exactly
+/// subsidy + the winner's own available fees, so the winner's coinbase pays these ADJUSTED
+/// amounts — not the ratified ones.
+///
+/// One function, two callers, deliberately (#601):
+///
+/// - the coinbase builder (`build_coinbase_parts_with_payout_snapshot`) applies it before
+///   emitting outputs, and the M-28 commitment is computed from the result;
+/// - settlement (`payout::apply_settlement`) re-applies it to the ratified proposal using the
+///   mined block's total output value, then proves the reconstruction against the mined outputs
+///   before crediting anything.
+///
+/// If these two computations ever diverged, every node would settle a treasury amount the chain
+/// never paid — which is exactly the defect this function was extracted to close. Do not fork it.
+///
+/// `None` means the drift cannot be absorbed and the caller must fall back (builder: fallback
+/// coinbase; settlement: measure from the mined outputs instead).
+///
+/// Post-gate (`prop.block_height >= coinbase_fee_split_height()`):
+/// surplus fees go to the treasury; a shortfall comes out of the treasury first, then the node
+/// pool largest-entry-first (ties broken by address, so every node reduces the same entries in
+/// the same order). Miner entries are NEVER touched in either direction.
+/// Pre-gate: the legacy block-finder adjustment with the H-04 2x cap.
+pub(crate) fn adjust_proposal_for_available_fees(
+    mut prop: PayoutProposal,
+    total_value: u64,
+    height: u64,
+) -> Option<PayoutProposal> {
+    let available_fees = total_value.saturating_sub(prop.subsidy);
+    let original_fees = prop.tx_fees;
+
+    if available_fees != original_fees {
+        // POST-GATE: there is no block finder. The fees were already shared into the
+        // node reward pool when the mesh ratified this payout at tip change — that is
+        // precisely what makes the coinbase determinable before the block is won.
+        //
+        // What remains is DRIFT: the gap between the fees the mesh ratified and the fees
+        // actually available in THIS node's template. The mempool moves, RBF replaces
+        // transactions, and each node's Reaper/BUDS filtering drops a different set — so
+        // every node sees slightly different fees, and the coinbase must still spend
+        // exactly subsidy + its own available fees.
+        //
+        // The drift lands on the TREASURY (GHOST-13 precedent: tx-fee dust already goes
+        // there), which keeps the miner split and the node split untouched.
+        if prop.block_height >= crate::coinbase_fee_split_height() {
+            if available_fees > original_fees {
+                let extra = available_fees - original_fees;
+                prop.treasury_amount = prop.treasury_amount.saturating_add(extra);
+            } else {
+                let mut shortfall = original_fees - available_fees;
+
+                // 1) Treasury absorbs what it can.
+                let from_treasury = shortfall.min(prop.treasury_amount);
+                prop.treasury_amount -= from_treasury;
+                shortfall -= from_treasury;
+
+                // 2) Under the decay schedule the treasury's share eventually reaches
+                //    ZERO, so it cannot be relied on to cover a shortfall. Fall back to
+                //    the node pool — largest entry first, ties broken by address, so
+                //    every node reduces the same entries in the same order.
+                if shortfall > 0 {
+                    prop.node_payouts
+                        .sort_by(|a, b| b.amount.cmp(&a.amount).then(a.address.cmp(&b.address)));
+                    for entry in &mut prop.node_payouts {
+                        if shortfall == 0 {
+                            break;
+                        }
+                        let take = shortfall.min(entry.amount);
+                        entry.amount -= take;
+                        shortfall -= take;
+                    }
+                    prop.node_payouts.retain(|e| e.amount > 0);
+                }
+
+                // 3) Still short: the coinbase cannot balance. Fall back rather than
+                //    build a block the network would reject.
+                if shortfall > 0 {
+                    warn!(
+                        shortfall,
+                        height, "Fee drift exceeds treasury + node pool — using fallback coinbase"
+                    );
+                    return None;
+                }
+            }
+
+            prop.tx_fees = available_fees;
+            info!(
+                original_fees,
+                available_fees,
+                height,
+                "Adjusted payout: fee drift absorbed by the treasury (no block finder)"
+            );
+            return Some(prop);
+        }
+
+        if available_fees < original_fees {
+            // FEES DECREASED: reduce block finder's fee portion
+            let excess = original_fees - available_fees;
+            let mut remaining = excess;
+
+            // Step 1: Reduce TxFees-type entries
+            for entry in &mut prop.node_payouts {
+                if remaining == 0 {
+                    break;
+                }
+                if entry.payout_type == PayoutType::TxFees {
+                    let reduction = remaining.min(entry.amount);
+                    entry.amount -= reduction;
+                    remaining -= reduction;
+                }
+            }
+
+            // Step 2: Reduce proposer's entry (fees merged into NodeReward)
+            if remaining > 0 {
+                for entry in &mut prop.node_payouts {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if entry.recipient_id == prop.proposer {
+                        let reduction = remaining.min(entry.amount);
+                        entry.amount -= reduction;
+                        remaining -= reduction;
+                    }
+                }
+            }
+
+            // Step 3: Fallback if can't absorb
+            if remaining > 0 {
+                warn!(
+                    remaining,
+                    height, "Could not absorb fee decrease — using fallback"
+                );
+                return None;
+            }
+
+            info!(
+                original_fees,
+                available_fees,
+                reduction = excess,
+                height,
+                "Adjusted payout: fees decreased"
+            );
+        } else {
+            // FEES INCREASED (RBF): add extra to block finder
+            // H-04: Cap fee increase at 2x original to prevent disproportionate allocation
+            let raw_extra = available_fees - original_fees;
+            let max_extra = original_fees; // Cap at 2x total (original + original)
+            let extra = raw_extra.min(max_extra);
+            if raw_extra > max_extra {
+                warn!(
+                    raw_extra,
+                    max_extra,
+                    height,
+                    "H-04: Fee increase exceeds 2x cap — capping extra allocation"
+                );
+            }
+            let mut allocated = false;
+
+            for entry in &mut prop.node_payouts {
+                if entry.payout_type == PayoutType::TxFees || entry.recipient_id == prop.proposer {
+                    entry.amount = entry.amount.saturating_add(extra);
+                    allocated = true;
+                    break;
+                }
+            }
+
+            if !allocated {
+                debug!(
+                    extra,
+                    height, "Extra fees unclaimed — no block finder entry"
+                );
+            } else {
+                info!(
+                    original_fees,
+                    available_fees, extra, height, "Adjusted payout: fees increased (RBF)"
+                );
+            }
+        }
+    }
+
+    // Final sanity: must not exceed available value
+    let adjusted_total: u64 = prop.miner_payouts.iter().map(|e| e.amount).sum::<u64>()
+        + prop.node_payouts.iter().map(|e| e.amount).sum::<u64>()
+        + prop.treasury_amount;
+
+    if adjusted_total > total_value {
+        error!(
+            adjusted_total,
+            total_value, height, "CRITICAL: Adjusted proposal exceeds available — using fallback"
+        );
+        return None;
+    }
+
+    Some(prop)
+}
 
 /// The encoded node tag for one coinbase build: which of the two commitment forms is stamped.
 ///
@@ -1103,180 +1311,14 @@ impl TemplateProcessor {
         // creation time, but template filtering (Reaper/BUDS/mempool changes) and RBF can
         // change available fees before the coinbase is built. Adjust the block finder's fee
         // portion to match actual available fees — no BFT re-proposal needed.
-        let proposal = proposal.and_then(|mut prop| {
-            let available_fees = total_value.saturating_sub(prop.subsidy);
-            let original_fees = prop.tx_fees;
-
-            if available_fees != original_fees {
-                // POST-GATE: there is no block finder. The fees were already shared into the
-                // node reward pool when the mesh ratified this payout at tip change — that is
-                // precisely what makes the coinbase determinable before the block is won.
-                //
-                // What remains is DRIFT: the gap between the fees the mesh ratified and the fees
-                // actually available in THIS node's template. The mempool moves, RBF replaces
-                // transactions, and each node's Reaper/BUDS filtering drops a different set — so
-                // every node sees slightly different fees, and the coinbase must still spend
-                // exactly subsidy + its own available fees.
-                //
-                // The drift lands on the TREASURY (GHOST-13 precedent: tx-fee dust already goes
-                // there), which keeps the miner split and the node split untouched.
-                if prop.block_height >= crate::coinbase_fee_split_height() {
-                    if available_fees > original_fees {
-                        let extra = available_fees - original_fees;
-                        prop.treasury_amount = prop.treasury_amount.saturating_add(extra);
-                    } else {
-                        let mut shortfall = original_fees - available_fees;
-
-                        // 1) Treasury absorbs what it can.
-                        let from_treasury = shortfall.min(prop.treasury_amount);
-                        prop.treasury_amount -= from_treasury;
-                        shortfall -= from_treasury;
-
-                        // 2) Under the decay schedule the treasury's share eventually reaches
-                        //    ZERO, so it cannot be relied on to cover a shortfall. Fall back to
-                        //    the node pool — largest entry first, ties broken by address, so
-                        //    every node reduces the same entries in the same order.
-                        if shortfall > 0 {
-                            prop.node_payouts.sort_by(|a, b| {
-                                b.amount.cmp(&a.amount).then(a.address.cmp(&b.address))
-                            });
-                            for entry in &mut prop.node_payouts {
-                                if shortfall == 0 {
-                                    break;
-                                }
-                                let take = shortfall.min(entry.amount);
-                                entry.amount -= take;
-                                shortfall -= take;
-                            }
-                            prop.node_payouts.retain(|e| e.amount > 0);
-                        }
-
-                        // 3) Still short: the coinbase cannot balance. Fall back rather than
-                        //    build a block the network would reject.
-                        if shortfall > 0 {
-                            warn!(
-                                shortfall,
-                                height,
-                                "Fee drift exceeds treasury + node pool — using fallback coinbase"
-                            );
-                            return None;
-                        }
-                    }
-
-                    prop.tx_fees = available_fees;
-                    info!(
-                        original_fees,
-                        available_fees,
-                        height,
-                        "Adjusted payout: fee drift absorbed by the treasury (no block finder)"
-                    );
-                    return Some(prop);
-                }
-
-                if available_fees < original_fees {
-                    // FEES DECREASED: reduce block finder's fee portion
-                    let excess = original_fees - available_fees;
-                    let mut remaining = excess;
-
-                    // Step 1: Reduce TxFees-type entries
-                    for entry in &mut prop.node_payouts {
-                        if remaining == 0 {
-                            break;
-                        }
-                        if entry.payout_type == PayoutType::TxFees {
-                            let reduction = remaining.min(entry.amount);
-                            entry.amount -= reduction;
-                            remaining -= reduction;
-                        }
-                    }
-
-                    // Step 2: Reduce proposer's entry (fees merged into NodeReward)
-                    if remaining > 0 {
-                        for entry in &mut prop.node_payouts {
-                            if remaining == 0 {
-                                break;
-                            }
-                            if entry.recipient_id == prop.proposer {
-                                let reduction = remaining.min(entry.amount);
-                                entry.amount -= reduction;
-                                remaining -= reduction;
-                            }
-                        }
-                    }
-
-                    // Step 3: Fallback if can't absorb
-                    if remaining > 0 {
-                        warn!(
-                            remaining,
-                            height, "Could not absorb fee decrease — using fallback"
-                        );
-                        return None;
-                    }
-
-                    info!(
-                        original_fees,
-                        available_fees,
-                        reduction = excess,
-                        height,
-                        "Adjusted payout: fees decreased"
-                    );
-                } else {
-                    // FEES INCREASED (RBF): add extra to block finder
-                    // H-04: Cap fee increase at 2x original to prevent disproportionate allocation
-                    let raw_extra = available_fees - original_fees;
-                    let max_extra = original_fees; // Cap at 2x total (original + original)
-                    let extra = raw_extra.min(max_extra);
-                    if raw_extra > max_extra {
-                        warn!(
-                            raw_extra,
-                            max_extra,
-                            height,
-                            "H-04: Fee increase exceeds 2x cap — capping extra allocation"
-                        );
-                    }
-                    let mut allocated = false;
-
-                    for entry in &mut prop.node_payouts {
-                        if entry.payout_type == PayoutType::TxFees
-                            || entry.recipient_id == prop.proposer
-                        {
-                            entry.amount = entry.amount.saturating_add(extra);
-                            allocated = true;
-                            break;
-                        }
-                    }
-
-                    if !allocated {
-                        debug!(
-                            extra,
-                            height, "Extra fees unclaimed — no block finder entry"
-                        );
-                    } else {
-                        info!(
-                            original_fees,
-                            available_fees, extra, height, "Adjusted payout: fees increased (RBF)"
-                        );
-                    }
-                }
-            }
-
-            // Final sanity: must not exceed available value
-            let adjusted_total: u64 = prop.miner_payouts.iter().map(|e| e.amount).sum::<u64>()
-                + prop.node_payouts.iter().map(|e| e.amount).sum::<u64>()
-                + prop.treasury_amount;
-
-            if adjusted_total > total_value {
-                error!(
-                    adjusted_total,
-                    total_value,
-                    height,
-                    "CRITICAL: Adjusted proposal exceeds available — using fallback"
-                );
-                return None;
-            }
-
-            Some(prop)
-        });
+        //
+        // #601: this adjustment is PER NODE — every node's coinbase differs from the ratified
+        // proposal by its own fee drift. Settlement therefore reconstructs the same adjustment
+        // from the mined block's total output value (`payout::apply_settlement`), which is why
+        // the logic lives in one shared function: if the builder and settlement ever computed
+        // this differently, every node would credit a treasury amount the chain never paid.
+        let proposal =
+            proposal.and_then(|prop| adjust_proposal_for_available_fees(prop, total_value, height));
 
         // Build coinbase1 - NON-WITNESS format (no marker/flag)
         // Format: version | input_count | prev_txhash | prev_outindex | scriptsig_len | scriptsig_data
@@ -1298,7 +1340,20 @@ impl TemplateProcessor {
         // Script sig: height, the payout commitment, then the pool tag. See coinbase_scriptsig.
         // No tier: this coinbase is built once per TEMPLATE and serves every difficulty; the
         // tier-bound tag can only be stamped where the per-job tier is known (the SRI layer).
-        let scriptsig = self.coinbase_scriptsig(height, payout_snapshot, 8, None)?;
+        //
+        // #601: the tag names the payout THIS coinbase pays, so it is stamped only if the
+        // proposal survived resolution above (stale/M-07/fee-drift fallback all clear it).
+        // Stamping the snapshot regardless — as this used to — put a payout tag on a FALLBACK
+        // coinbase that pays nobody in the proposal, and a won block like that would be
+        // false-settled by every observing node: shares marked paid by a block that paid the
+        // pool fallback address only. (Today M-28/H-11 block such a submission, but the tag
+        // must not lie on-chain regardless of which safety net catches it first.)
+        let effective_snapshot = if proposal.is_some() {
+            payout_snapshot
+        } else {
+            None
+        };
+        let scriptsig = self.coinbase_scriptsig(height, effective_snapshot, 8, None)?;
         coinbase1.push((scriptsig.len() + 8) as u8); // +8 for extranonce space
         coinbase1.extend_from_slice(&scriptsig);
 
@@ -6197,6 +6252,155 @@ mod tests {
             err_msg.contains("quantum") || err_msg.contains("Quantum"),
             "Error should mention quantum vulnerability, got: {}",
             err_msg
+        );
+    }
+
+    // ---- #601: the shared fee-drift adjustment, and the tag on a fallback coinbase ----
+
+    const ADJ_MINER: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADJ_TREASURY: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+
+    fn adj_proposal(
+        subsidy: u64,
+        tx_fees: u64,
+        treasury: u64,
+    ) -> ghost_common::types::PayoutProposal {
+        ghost_common::types::PayoutProposal {
+            proposal_hash: [0x61; 32],
+            round_id: 1,
+            block_hash: [0u8; 32],
+            block_height: 960_000, // post COINBASE_FEE_SPLIT_HEIGHT
+            proposer: [1u8; 32],
+            miner_payouts: vec![ghost_common::types::PayoutEntry {
+                address: ADJ_MINER.as_bytes().to_vec(),
+                amount: 300_000_000,
+                recipient_id: [2u8; 32],
+                payout_type: ghost_common::types::PayoutType::Mining,
+            }],
+            node_payouts: vec![ghost_common::types::PayoutEntry {
+                address: ADJ_MINER.as_bytes().to_vec(),
+                amount: 12_000_000,
+                recipient_id: [3u8; 32],
+                payout_type: ghost_common::types::PayoutType::NodeReward,
+            }],
+            treasury_amount: treasury,
+            treasury_address: ADJ_TREASURY.as_bytes().to_vec(),
+            tx_fees,
+            subsidy,
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            tx_fees_unallocated: 0,
+        }
+    }
+
+    /// Post-gate surplus lands on the treasury; the miner and node splits are untouched. This is
+    /// the function settlement re-applies to reconstruct a winner's coinbase (#601), so its
+    /// determinism is a money property, not a style one.
+    #[test]
+    fn post_gate_surplus_lands_on_the_treasury_and_touches_nothing_else() {
+        let prop = adj_proposal(312_500_000, 500_000, 1_000_000);
+        let adjusted = adjust_proposal_for_available_fees(prop, 312_500_000 + 800_000, 960_000)
+            .expect("surplus must be absorbable");
+        assert_eq!(adjusted.treasury_amount, 1_300_000);
+        assert_eq!(
+            adjusted.miner_payouts[0].amount, 300_000_000,
+            "miners untouched"
+        );
+        assert_eq!(
+            adjusted.node_payouts[0].amount, 12_000_000,
+            "nodes untouched"
+        );
+        assert_eq!(adjusted.tx_fees, 800_000);
+    }
+
+    /// Post-gate shortfall drains the treasury first, then the node pool largest-first; miners
+    /// are never reduced.
+    #[test]
+    fn post_gate_shortfall_drains_treasury_then_nodes_never_miners() {
+        // Winner saw zero fees against ratified 2_000_000: treasury 1_000_000 empties, the node
+        // entry covers the remaining 1_000_000.
+        let prop = adj_proposal(312_500_000, 2_000_000, 1_000_000);
+        let adjusted =
+            adjust_proposal_for_available_fees(prop, 312_500_000, 960_000).expect("absorbable");
+        assert_eq!(adjusted.treasury_amount, 0);
+        assert_eq!(adjusted.node_payouts[0].amount, 11_000_000);
+        assert_eq!(
+            adjusted.miner_payouts[0].amount, 300_000_000,
+            "miners untouched"
+        );
+    }
+
+    /// A shortfall beyond treasury + node pool cannot balance: the caller must fall back.
+    #[test]
+    fn an_unabsorbable_shortfall_returns_none() {
+        let prop = adj_proposal(312_500_000, 20_000_000, 1_000_000);
+        assert!(
+            adjust_proposal_for_available_fees(prop, 312_500_000, 960_000).is_none(),
+            "13M of drift cannot come out of 1M treasury + 12M nodes and the miner split"
+        );
+    }
+
+    /// **The tag must not lie on-chain.** When the proposal cannot be used — here a stale one
+    /// whose subsidy exceeds the coinbase value — the builder falls back to the single-output
+    /// coinbase, and the scriptSig must NOT name the payout: a tagged fallback block would be
+    /// false-settled by every observing node (#601), marking shares paid by a block that paid
+    /// only the pool fallback address.
+    #[test]
+    fn a_fallback_coinbase_carries_no_payout_tag() {
+        let rpc = Arc::new(BitcoinRpc::new("127.0.0.1", 8332, "u", "p").expect("rpc"));
+        let processor = TemplateProcessor::new(
+            TemplateConfig {
+                coinbase_extra: "GHOST PublicPool".to_string(),
+                pool_payout_address: ADJ_MINER.to_string(),
+                ..Default::default()
+            },
+            rpc,
+            ghost_policy::PolicyProfile::permissive(),
+            Default::default(),
+        );
+
+        let scriptsig_of = |coinbase1: &[u8]| -> Vec<u8> {
+            // version(4) + input_count(1) + prevhash(32) + previndex(4) + len(1) = 42
+            coinbase1[42..].to_vec()
+        };
+
+        // Control: a usable proposal stamps the tag.
+        let healthy = adj_proposal(312_500_000, 0, 0);
+        let healthy_hash = healthy.proposal_hash;
+        processor.store_proposal(healthy);
+        let (coinbase1, ..) = processor
+            .build_coinbase_parts_with_payout_snapshot(
+                960_000,
+                312_500_000,
+                &None,
+                Some(healthy_hash),
+            )
+            .expect("build with a healthy proposal");
+        let tag = ghost_common::coinbase_tags::extract_payout_tag(&scriptsig_of(&coinbase1));
+        assert_eq!(
+            tag.as_ref().map(|t| &t[..]),
+            Some(&healthy_hash[..16]),
+            "a coinbase that pays the proposal must name it"
+        );
+
+        // Stale: subsidy exceeds the coinbase value, the proposal is cleared, the outputs are
+        // the fallback — and the tag must be absent.
+        let mut stale = adj_proposal(5_000_000_000, 0, 0);
+        stale.proposal_hash = [0x62; 32];
+        stale.miner_payouts[0].amount = 100_000_000;
+        let stale_hash = stale.proposal_hash;
+        processor.store_proposal(stale);
+        let (coinbase1, ..) = processor
+            .build_coinbase_parts_with_payout_snapshot(
+                960_000,
+                312_500_000,
+                &None,
+                Some(stale_hash),
+            )
+            .expect("fallback build must still succeed");
+        assert_eq!(
+            ghost_common::coinbase_tags::extract_payout_tag(&scriptsig_of(&coinbase1)),
+            None,
+            "a FALLBACK coinbase pays nobody in the proposal and must not carry its name"
         );
     }
 }
