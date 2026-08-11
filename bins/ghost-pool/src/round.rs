@@ -750,18 +750,17 @@ impl RoundManager {
         // function MUST do the same — with the template check gone there is no in-function
         // backstop against a forged `received_by`.
         //
-        // ⚠ LIMITATION (audit of #648): removing the template check unblocks repair only for
-        // shares that pass the LATER gates below, and those are judged by the CURRENT height,
-        // not the share's era. At/above `SHARE_TIER_BIND_HEIGHT` (962,100) every share mined
-        // BELOW the gate carries `tier_log2: None` and is refused at the tier-presence check
-        // (`pow_reject_no_tier`, deliberately not terminal-cached) — refused before it can be
-        // recorded, so the sweep sees it still missing and replays it forever: the SAME loop
-        // this commit removes, resurrected one check further down, for local and remote shares
-        // alike. Header-less shares mined below `SHARE_POW_VERIFY_HEIGHT` are in the same class
-        // today. Any pre-gate share still missing when the fleet crosses 962,100 becomes
-        // unrepairable until those gates are made era-aware by the share's round, the way
-        // `requires_bound_signature` already is. Pinned by
-        // `at_the_tier_gate_a_replayed_pre_gate_share_is_still_refused` below.
+        // The audit of #648 flagged that removing this check unblocks repair only for shares that
+        // then pass the LATER gates below, which were judged by the CURRENT height rather than the
+        // share's era — so crossing `SHARE_TIER_BIND_HEIGHT` would have resurrected this exact loop
+        // one check further down, for local and remote shares alike. The tier gate is now era-aware
+        // (`requires_tier_binding`), which closes that; see
+        // `a_node_past_the_tier_gate_still_records_a_replayed_pre_gate_share`.
+        //
+        // ⚠ STILL OPEN: header-less shares mined below `SHARE_POW_VERIFY_HEIGHT` are in the same
+        // class, and that gate has ALREADY fired — there is no recorded boundary round to key it
+        // to, and inferring one after the fact would be guesswork. Those shares may already be
+        // unrepairable.
 
         let diff_calc = self.difficulty.read();
 
@@ -2371,36 +2370,6 @@ mod tests {
             manager.handle_share_proof(proof).is_err(),
             "the second presentation must be stopped by C5 dedup — the share is now RECORDED, \
              which is what breaks the replay loop"
-        );
-    }
-
-    /// ⚠ CANARY, not an endorsement (audit of #648): pins the KNOWN residual limitation of the
-    /// #639 fix. The tier-presence check is judged by the CURRENT height, not the share's era —
-    /// so once the fleet crosses `SHARE_TIER_BIND_HEIGHT` (962,100), a share mined BELOW the
-    /// gate (`tier_log2: None`) replayed for repair is refused before it can be recorded, and
-    /// the sweep replay loop this branch exists to kill resumes one check further down. This is
-    /// the behaviour that SHIPS; the fix is to make the tier (and header) gates era-aware by
-    /// the share's round, like `requires_bound_signature` — when that lands, this test must be
-    /// inverted, exactly as #648 inverted the template-check tests.
-    #[test]
-    fn at_the_tier_gate_a_replayed_pre_gate_share_is_still_refused() {
-        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
-        manager.start_round(crate::SHARE_TIER_BIND_HEIGHT);
-        assert!(crate::binds_difficulty_tier(manager.current_height()));
-
-        // Our own pre-gate share coming back for repair: no template (irrelevant since #648),
-        // no tier (mined below the gate — the NORMAL case for the whole pre-962100 backlog).
-        let mut proof = genesis_proof(1, 2500.0, None);
-        proof.received_by = [1u8; 32];
-        proof.template_id = None;
-
-        assert!(
-            matches!(
-                manager.handle_share_proof(proof),
-                Err(ShareError::InvalidShareHash)
-            ),
-            "a pre-gate share replayed at/above SHARE_TIER_BIND_HEIGHT is refused for its \
-             missing tier — the #639 replay loop resumes here until the gate is era-aware"
         );
     }
 
