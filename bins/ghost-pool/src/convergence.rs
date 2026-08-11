@@ -1050,6 +1050,10 @@ mod tests {
             ..RoundConfig::default()
         };
         let rm_local = Arc::new(RoundManager::new(local_id.node_id(), cfg));
+        // Needs an explicit round/height like `round_manager()` does: since #597 an unknown height
+        // fails closed. This used to be unnecessary only because the template check refused the
+        // share before anything read the height.
+        rm_local.start_round(crate::share_pow_verify_height().saturating_sub(1));
         rm_local.set_template_id(TPL);
         let mut local = ShareProof {
             header: None,
@@ -1067,11 +1071,9 @@ mod tests {
         };
         local.sign(&local_id);
         assert!(
-            matches!(
-                rm_local.handle_share_proof(local),
-                Err(crate::round::ShareError::StaleTemplate)
-            ),
-            "a LOCAL share (received_by == self) with an unknown template is still stale-rejected"
+            rm_local.handle_share_proof(local).is_ok(),
+            "a LOCAL share (received_by == self) reaching convergence is our own share coming back \
+             for repair, not a fresh submission — an expired template must not refuse it (#639)"
         );
     }
 
