@@ -304,6 +304,11 @@ pub struct RoundManager {
     addr_bind_activation_round: RwLock<Option<RoundId>>,
     /// First round at or above SHARE_TIER_BIND_HEIGHT — the tier-commitment boundary.
     tier_bind_activation_round: RwLock<Option<RoundId>>,
+    /// First round at or above SHARE_POW_VERIFY_HEIGHT — the header-requirement boundary.
+    /// Unlike the two above, this gate fired before boundaries were being recorded, so at startup
+    /// it is DERIVED from the persisted rounds (round_id → block_height) rather than replayed
+    /// from a live `start_round` — see `POW_VERIFY_ACTIVATION_KEY`.
+    pow_verify_activation_round: RwLock<Option<RoundId>>,
     /// Wall-clock start of the current round (reset on every `start_round`,
     /// i.e. each new-work / template event). Monotonic `Instant` so the
     /// reported elapsed time is immune to system clock adjustments. Read by
@@ -388,6 +393,7 @@ impl RoundManager {
             current_height: RwLock::new(0),
             addr_bind_activation_round: RwLock::new(None),
             tier_bind_activation_round: RwLock::new(None),
+            pow_verify_activation_round: RwLock::new(None),
             current_round_start: RwLock::new(std::time::Instant::now()),
             rounds: RwLock::new(HashMap::new()),
             difficulty: RwLock::new(difficulty),
@@ -480,6 +486,45 @@ impl RoundManager {
         }
     }
 
+    /// The round at which the PoW-header requirement took effect here, if known.
+    pub fn pow_verify_activation_round(&self) -> Option<RoundId> {
+        *self.pow_verify_activation_round.read()
+    }
+
+    /// Record the header-requirement activation round, keeping the EARLIEST seen. Same reasoning
+    /// as [`Self::note_addr_bind_activation`]: the first round at or above the gate is the
+    /// boundary, and a late re-derivation (the `rounds` table ages, restarts note the current
+    /// round) must never move it forward and exempt genuinely post-gate shares from the header.
+    pub fn note_pow_verify_activation(&self, round_id: RoundId) {
+        let mut a = self.pow_verify_activation_round.write();
+        if a.is_none_or(|existing| round_id < existing) {
+            *a = Some(round_id);
+        }
+    }
+
+    /// Whether a share from `share_round_id` must carry its 80-byte header and pass the PoW
+    /// preimage re-verification.
+    ///
+    /// Judged by the share's OWN round when the boundary is known: a share mined below the gate
+    /// has `header: None` and can never acquire one, so testing it against the CURRENT height
+    /// refuses it before it can be recorded and the GHOST-03 sweep replays it for ever — the
+    /// #639 loop, re-armed at this gate (#650).
+    ///
+    /// When the boundary is NOT known (fresh database, and nothing derivable from the persisted
+    /// rounds), fall back to the previous behaviour — the current height, failing CLOSED on an
+    /// unestablished height (#597). That keeps the restart/backfill window on the strict check:
+    /// an established node derives its boundary from storage before ingest starts, so the
+    /// fallback only governs nodes with no history, which have no pre-gate shares to repair.
+    pub fn requires_pow_header(&self, share_round_id: RoundId) -> bool {
+        match self.pow_verify_activation_round() {
+            Some(activation) => share_round_id >= activation,
+            None => {
+                let height = self.current_height();
+                height == 0 || height >= crate::share_pow_verify_height()
+            }
+        }
+    }
+
     /// Seed the chain height at startup, before any template has arrived.
     ///
     /// `current_height` is otherwise 0 from process start until the first template, and every
@@ -514,6 +559,9 @@ impl RoundManager {
         }
         if block_height >= crate::share_tier_bind_height() {
             self.note_tier_bind_activation(round_id);
+        }
+        if block_height >= crate::share_pow_verify_height() {
+            self.note_pow_verify_activation(round_id);
         }
         // Reset the round timer so `current_round_duration_secs` measures time
         // spent working THIS template, not the pool's total uptime.
@@ -757,10 +805,12 @@ impl RoundManager {
         // (`requires_tier_binding`), which closes that; see
         // `a_node_past_the_tier_gate_still_records_a_replayed_pre_gate_share`.
         //
-        // ⚠ STILL OPEN: header-less shares mined below `SHARE_POW_VERIFY_HEIGHT` are in the same
-        // class, and that gate has ALREADY fired — there is no recorded boundary round to key it
-        // to, and inferring one after the fact would be guesswork. Those shares may already be
-        // unrepairable.
+        // The last of the three era gates: header-less shares mined below
+        // `SHARE_POW_VERIFY_HEIGHT` were in the same class, and that gate fired before any
+        // boundary was recorded — #650 called them unrepairable. The boundary turned out to be
+        // derivable after the fact: rounds are persisted with their block_height at round start,
+        // so the lowest round_id at/above the gate height IS the boundary, restored at startup
+        // and judged per share below (`requires_pow_header`). See `POW_VERIFY_ACTIVATION_KEY`.
 
         let diff_calc = self.difficulty.read();
 
@@ -776,18 +826,28 @@ impl RoundManager {
         // runs on the GOSSIP + BACKFILL ingest paths (both funnel here), which is exactly where an
         // injected share would enter the converged ledger; a node's own SRI-validated shares are
         // its own trust anchor. Below the gate, the legacy numeric check stands (single-operator).
-        // Fail CLOSED when the height is not yet established. `current_height` is 0 from process
-        // start until the first block template arrives, and 0 is below any activation height — so
-        // a plain `>=` silently selected the weaker legacy check for that whole window, on every
-        // restart. That window is also when a node ingests its backfill burst from peers, i.e. the
-        // highest-volume remote ingest it ever does, and the legacy check cannot tell a real hash
-        // from a fabricated 32-byte value because it never binds the hash to a header. Precisely
-        // the injection this gate exists to stop.
         //
-        // Treating "unknown" as above the gate costs nothing measurable: `missing_header` is 0
-        // across the fleet over hours, so every share genuinely in flight carries its header.
-        let height = self.current_height();
-        let height_established = height > 0;
+        // Judged by the SHARE's round, not the current height — the same era rule as the tier
+        // gate below, and for the same reason (#650): a share mined below the gate carries
+        // `header: None` and can never acquire one, so testing it against the CURRENT height
+        // refuses it before it can be recorded and the sweep replays it for ever. The boundary
+        // round is derived at startup from the persisted rounds and noted live by `start_round`,
+        // earliest-wins — see `POW_VERIFY_ACTIVATION_KEY`.
+        //
+        // When no boundary is known at all, `requires_pow_header` falls back to the current
+        // height, failing CLOSED on an unestablished height (#597): height 0 is the
+        // restart/backfill window, the highest-volume remote ingest a node ever does, and the
+        // legacy check cannot tell a real hash from a fabricated 32-byte value because it never
+        // binds the hash to a header. Precisely the injection this gate exists to stop. An
+        // ESTABLISHED node never reaches the fallback during that window — its boundary is
+        // restored from storage before ingest starts — so the fallback governs only nodes with
+        // no history, which have no pre-gate shares to repair.
+        //
+        // A pre-boundary share is judged by the legacy numeric rule it was mined under. That is
+        // not a new exposure: its era never had headers, its trust anchors (caller-verified
+        // GHOST-09 signature, C5 dedup, the numeric check) are exactly what admitted it the
+        // first time, and the boundary itself comes only from local storage and local
+        // `start_round` — a peer cannot move it.
         // SHARE_TIER_BIND: whether a share commits to a difficulty tier and is credited exactly
         // that tier.
         //
@@ -802,7 +862,7 @@ impl RoundManager {
         // dormant-gate and height-0-after-restart behaviour the old `height_established` guard was
         // reaching for — by construction rather than by a separate condition.
         let tier_bound = self.requires_tier_binding(proof.round_id);
-        if !height_established || height >= crate::share_pow_verify_height() {
+        if self.requires_pow_header(proof.round_id) {
             let header80 = match proof.header.as_deref() {
                 Some(h) if h.len() == 80 => {
                     let mut a = [0u8; 80];
@@ -2503,6 +2563,135 @@ mod tests {
         assert!(
             manager.requires_tier_binding(600),
             "a post-gate share must not be let off the tier commitment by a late re-derivation"
+        );
+    }
+
+    /// The header gate is the third era gate, and the same rule holds: a share mined below the
+    /// boundary never carried a header and cannot acquire one, so it is judged by its own round.
+    #[test]
+    fn a_pre_pow_gate_share_stays_verifiable_after_the_gate_fires() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        assert_eq!(manager.pow_verify_activation_round(), None);
+
+        manager.note_pow_verify_activation(500);
+
+        assert!(
+            !manager.requires_pow_header(499),
+            "a share mined before the boundary has no header and must stay verifiable for ever"
+        );
+        assert!(
+            manager.requires_pow_header(500),
+            "the boundary round requires its header"
+        );
+        assert!(manager.requires_pow_header(501));
+    }
+
+    /// Restart safety for the header boundary. The value is usually DERIVED from the rounds
+    /// table at startup; a derivation that lands later (because old rounds were pruned, or a
+    /// live `start_round` noted the current round first) must never move an established boundary
+    /// forward and exempt genuinely post-gate shares from the header.
+    #[test]
+    fn the_earliest_pow_activation_round_wins() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.note_pow_verify_activation(500);
+        manager.note_pow_verify_activation(900);
+        assert_eq!(manager.pow_verify_activation_round(), Some(500));
+        assert!(
+            manager.requires_pow_header(600),
+            "a post-gate share must not be let off its header by a late re-derivation"
+        );
+    }
+
+    /// The #650 defect, end to end: a node PAST the header gate must still record a header-less
+    /// share mined BELOW it when the sweep replays it. Judging by the current tip refused it
+    /// before it could be written, so the GHOST-03 sweep saw it still missing and replayed it
+    /// for ever — the #639 loop, re-armed at the third gate in the chain.
+    #[test]
+    fn a_node_past_the_pow_gate_still_records_a_replayed_pre_gate_headerless_share() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        // Rounds 1 and 2 are mined BELOW the gate: their shares never carried a header.
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT - 1);
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT - 1);
+        assert_eq!(
+            manager.pow_verify_activation_round(),
+            None,
+            "the gate has not fired yet"
+        );
+
+        // The tip crosses the gate. Round 3 is the boundary.
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+        assert_eq!(manager.pow_verify_activation_round(), Some(3));
+
+        // The sweep replays a share mined in round 2 — no header, and it can never have one.
+        // Its era's legacy numeric rule must judge it.
+        let mut pre_gate = genesis_proof(2, 1.0, None);
+        pre_gate.header = None;
+        assert!(
+            manager.handle_share_proof(pre_gate).is_ok(),
+            "a pre-gate header-less share must remain recordable after the gate fires — \
+             refusing it is what #650 wrongly declared unfixable"
+        );
+
+        // SECURITY: a share mined at/after the boundary still requires its header.
+        let mut post_gate = genesis_proof(3, 1.0, None);
+        post_gate.header = None;
+        assert!(
+            matches!(
+                manager.handle_share_proof(post_gate),
+                Err(ShareError::InvalidShareHash)
+            ),
+            "a post-gate share without its header must still be refused"
+        );
+    }
+
+    /// The boundary restored from storage governs even when the CURRENT height is far past the
+    /// gate — the exact production shape: every node's tip is post-gate, the boundary is derived
+    /// from the rounds table, and repair traffic is all about rounds below it.
+    #[test]
+    fn a_restored_boundary_exempts_older_rounds_even_at_a_post_gate_tip() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        // Startup restore: the derived boundary arrives before any template.
+        manager.note_pow_verify_activation(92_002);
+        manager.seed_height(crate::SHARE_POW_VERIFY_HEIGHT + 5_000);
+
+        let mut historical = genesis_proof(92_001, 1.0, None);
+        historical.header = None;
+        assert!(
+            manager.handle_share_proof(historical).is_ok(),
+            "a sub-boundary share must not be refused for lacking a header it never had"
+        );
+
+        let mut modern = genesis_proof(92_002, 1.0, None);
+        modern.header = None;
+        assert!(
+            matches!(
+                manager.handle_share_proof(modern),
+                Err(ShareError::InvalidShareHash)
+            ),
+            "at/above the boundary the header is still demanded"
+        );
+    }
+
+    /// With NO boundary known the fallback must behave exactly as the code did before the
+    /// boundary existed: an established height below the gate takes the legacy check, and an
+    /// established height at/above it demands the header (`an_unknown_height_uses_the_strict_
+    /// check_not_the_legacy_one` covers the height-0 half).
+    #[test]
+    fn with_no_boundary_the_height_fallback_is_unchanged() {
+        let below = RoundManager::new([1u8; 32], RoundConfig::default());
+        below.start_round(crate::SHARE_POW_VERIFY_HEIGHT - 1);
+        assert_eq!(below.pow_verify_activation_round(), None);
+        assert!(
+            !below.requires_pow_header(1),
+            "below the gate with no boundary the legacy numeric check stands"
+        );
+
+        let above = RoundManager::new([1u8; 32], RoundConfig::default());
+        above.seed_height(crate::SHARE_POW_VERIFY_HEIGHT);
+        assert_eq!(above.pow_verify_activation_round(), None);
+        assert!(
+            above.requires_pow_header(1),
+            "at/above the gate with no boundary at all, fail toward requiring the header"
         );
     }
 
