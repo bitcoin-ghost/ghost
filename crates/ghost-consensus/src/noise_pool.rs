@@ -62,6 +62,31 @@ pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(300); // 5 minutes
 /// Maximum number of connections to maintain
 pub const MAX_CONNECTIONS: usize = 200;
 
+/// Upper bound on ONE send (or handshake) to ONE peer.
+///
+/// There was no bound at all, and `NoiseConnection::send` holds the per-connection transport
+/// mutex across the TCP write — so a single peer whose socket has wedged (accepting bytes at
+/// dribble pace with a persistently full send queue, as vm8→vm3 measured on 2026-08-11: tens of
+/// KB stuck in Send-Q on a retransmission timer for the whole observation window) stalls every
+/// later send to that peer on the mutex, and `Mesh::broadcast`'s join_all waits for that leg.
+/// The broadcast drain tasks (share convergence, L2, payout checkpoint) each drain their channel
+/// ONE message at a time through `broadcast`, so one wedged peer socket backs all of them up
+/// until their bounded channels overflow and every enqueue drops
+/// (`no available capacity`, #647).
+///
+/// The bound is sized for the slowest LEGITIMATE case, not the wedge: the largest convergence
+/// responses are ~1.6 MB (#590), which at the fleet's worst observed inter-node throughput is
+/// seconds, not tens of seconds. A send that cannot finish in 15 s is a liveness signal, and it
+/// is treated exactly like a write error — evict the pooled connection and (once) retry on a
+/// fresh dial, which is the same recovery `send_to` already performs for broken pipes.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound on establishing a connection's Noise handshake. TCP connect was already bounded
+/// (5 s) but the handshake await was not, so a peer that accepts and then never responds — a
+/// half-open firewall state, a hung process — parked the caller for ever with the same blast
+/// radius as an unbounded send.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Pool of established Noise connections to peers
 pub struct NoiseConnectionPool {
     /// OUTBOUND (dialed) connections — the send cache, indexed by peer's Noise public
@@ -81,6 +106,11 @@ pub struct NoisePoolConfig {
     pub max_connections: usize,
     /// Maximum idle time before cleanup
     pub max_idle: Duration,
+    /// Upper bound on one send to one peer (see [`SEND_TIMEOUT`]). A timeout is treated as a
+    /// write failure: evict the pooled connection, retry once on a fresh dial.
+    pub send_timeout: Duration,
+    /// Upper bound on a Noise handshake once TCP is connected (see [`HANDSHAKE_TIMEOUT`]).
+    pub handshake_timeout: Duration,
     /// Noise configuration
     pub noise: NoiseConfig,
 }
@@ -90,6 +120,8 @@ impl Default for NoisePoolConfig {
         Self {
             max_connections: MAX_CONNECTIONS,
             max_idle: MAX_CONNECTION_AGE,
+            send_timeout: SEND_TIMEOUT,
+            handshake_timeout: HANDSHAKE_TIMEOUT,
             noise: NoiseConfig::default(),
         }
     }
@@ -286,7 +318,7 @@ impl NoiseConnectionPool {
     /// restarted becomes reachable on the next message rather than after some later cleanup.
     pub async fn send_to(&self, peer_addr: SocketAddr, data: &[u8]) -> Result<(), NoiseError> {
         let conn = self.get_connection(peer_addr).await?;
-        let Err(first) = conn.send(data).await else {
+        let Err(first) = self.send_bounded(&conn, data).await else {
             return Ok(());
         };
 
@@ -298,12 +330,39 @@ impl NoiseConnectionPool {
         );
 
         let fresh = self.get_connection(peer_addr).await?;
-        if let Err(second) = fresh.send(data).await {
+        if let Err(second) = self.send_bounded(&fresh, data).await {
             // Do not leave this one pooled either.
             self.remove_connection(&fresh.peer_key);
             return Err(second);
         }
         Ok(())
+    }
+
+    /// One send, bounded by `send_timeout` (#647).
+    ///
+    /// A wedged peer socket — accepting bytes at dribble pace, send queue never draining — used
+    /// to park the caller for ever INSIDE the connection's transport mutex, so every subsequent
+    /// send to that peer queued behind it and `Mesh::broadcast` never resolved. That stalled the
+    /// broadcast drain tasks (share convergence, L2, payout checkpoint all funnel through
+    /// `broadcast`), their bounded channels filled, and every enqueue dropped with
+    /// `no available capacity`. A send that cannot finish inside the bound is treated as the
+    /// liveness failure it is; the caller evicts and re-dials exactly as for a broken pipe.
+    ///
+    /// The abandoned send future may have advanced the Noise cipher state or left a frame half
+    /// written, so the connection MUST NOT be reused after a timeout — both callers evict it.
+    /// Tasks already queued on its mutex will fail on the corpse and evict it again, which is
+    /// idempotent (`remove_connection` is keyed and the fresh dial re-pools).
+    async fn send_bounded(&self, conn: &NoiseConnection, data: &[u8]) -> Result<(), NoiseError> {
+        match tokio::time::timeout(self.config.send_timeout, conn.send(data)).await {
+            Ok(result) => result,
+            Err(_) => Err(NoiseError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Noise send to {} timed out after {:?}",
+                    conn.peer_addr, self.config.send_timeout
+                ),
+            ))),
+        }
     }
 
     /// Establish a new connection to a peer (initiator role)
@@ -327,8 +386,22 @@ impl NoiseConnectionPool {
         })?
         .map_err(NoiseError::Io)?;
 
-        // Perform Noise handshake as initiator
-        let (transport, peer_key) = self.manager.wrap_initiator(stream).await?;
+        // Perform Noise handshake as initiator, bounded: TCP connect above was already bounded,
+        // but a peer that accepts and then never responds parked this await for ever (#647).
+        let (transport, peer_key) = tokio::time::timeout(
+            self.config.handshake_timeout,
+            self.manager.wrap_initiator(stream),
+        )
+        .await
+        .map_err(|_| {
+            NoiseError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Noise handshake with {} timed out after {:?}",
+                    peer_addr, self.config.handshake_timeout
+                ),
+            ))
+        })??;
 
         let conn = Arc::new(NoiseConnection::new(peer_key, peer_addr, transport));
 
@@ -365,8 +438,22 @@ impl NoiseConnectionPool {
 
         debug!(peer = %peer_addr, "Accepting Noise connection (responder)");
 
-        // Perform Noise handshake as responder
-        let (transport, peer_key) = self.manager.wrap_responder(stream).await?;
+        // Perform Noise handshake as responder — bounded for the same reason as the initiator
+        // side: a dialer that connects and never handshakes must not park this task for ever.
+        let (transport, peer_key) = tokio::time::timeout(
+            self.config.handshake_timeout,
+            self.manager.wrap_responder(stream),
+        )
+        .await
+        .map_err(|_| {
+            NoiseError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Noise handshake from {} timed out after {:?}",
+                    peer_addr, self.config.handshake_timeout
+                ),
+            ))
+        })??;
 
         let conn = Arc::new(NoiseConnection::new(peer_key, peer_addr, transport));
 
@@ -729,6 +816,118 @@ mod tests {
              (pool still holds {} after 100 sends over ~5s)",
             pool_a.connection_count()
         );
+    }
+
+    /// #647: a peer that accepts TCP and then never speaks Noise must not park the dialer for
+    /// ever. The TCP connect was bounded (5s); the handshake await was not.
+    #[tokio::test]
+    async fn a_silent_accepter_cannot_park_the_handshake_for_ever() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept, then say nothing — holding the socket open, like a half-open firewall state.
+        let hold = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(s);
+        });
+
+        let pool = NoiseConnectionPool::new(
+            NoiseKeypair::generate(),
+            NoisePoolConfig {
+                handshake_timeout: Duration::from_millis(200),
+                ..test_pool_config()
+            },
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let result = pool.get_connection(addr).await;
+        assert!(
+            result.is_err(),
+            "a silent peer must be an error, not a hang"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and the error must arrive within the bound"
+        );
+        assert_eq!(pool.connection_count(), 0, "nothing must be pooled");
+        hold.abort();
+    }
+
+    /// #647, the vm8 shape: a peer whose process stops READING (socket open, send queue never
+    /// draining) must not park a send for ever. `send` holds the connection's transport mutex
+    /// across the TCP write, so before the bound existed one such peer stalled every subsequent
+    /// send to it, `Mesh::broadcast`'s join_all never resolved, the broadcast drain tasks
+    /// stopped draining, and the bounded channels overflowed fleet-visible
+    /// (`no available capacity`).
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_cannot_park_a_send_for_ever() {
+        let pool_a = Arc::new(
+            NoiseConnectionPool::new(
+                NoiseKeypair::generate(),
+                NoisePoolConfig {
+                    send_timeout: Duration::from_millis(300),
+                    ..test_pool_config()
+                },
+            )
+            .unwrap(),
+        );
+        let pool_b = Arc::new(
+            NoiseConnectionPool::new(NoiseKeypair::generate(), test_pool_config()).unwrap(),
+        );
+
+        let lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = lb.local_addr().unwrap();
+        let pb = Arc::clone(&pool_b);
+        // B completes every handshake and then never reads a byte — connections are held open,
+        // so from A's side nothing is ever "dead", it just never drains.
+        let accept_loop = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (s, _) = lb.accept().await.unwrap();
+                if let Ok(c) = pb.accept_connection(s).await {
+                    held.push(c);
+                }
+            }
+        });
+
+        let conn = pool_a.get_connection(b_addr).await.unwrap();
+        let old_ptr = Arc::as_ptr(&conn);
+
+        // Push until the kernel buffers fill and the write genuinely blocks. Each message is
+        // fragmented over many Noise frames; once loopback's socket buffers are full the send
+        // future can make no progress and only the bound can end it.
+        let payload = vec![0u8; 2 * 1024 * 1024];
+        let started = Instant::now();
+        let mut timed_out = false;
+        for _ in 0..64 {
+            if pool_a.send_bounded(&conn, &payload).await.is_err() {
+                timed_out = true;
+                break;
+            }
+        }
+        assert!(
+            timed_out,
+            "a peer that stopped reading must fail the send within the bound, not hang"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the failure must arrive promptly, this took {:?}",
+            started.elapsed()
+        );
+
+        // And through `send_to`, the timeout is treated exactly like a write failure: the wedged
+        // connection is evicted and the retry runs on a FRESH dial. (The retry itself may well
+        // succeed — fresh socket, empty buffers — the property is that the corpse is gone.)
+        let _ = pool_a.send_to(b_addr, &payload).await;
+        let replacement = pool_a.get_connection(b_addr).await.unwrap();
+        assert_ne!(
+            Arc::as_ptr(&replacement),
+            old_ptr,
+            "the wedged connection must have been evicted, not handed back"
+        );
+
+        accept_loop.abort();
     }
 
     #[tokio::test]
