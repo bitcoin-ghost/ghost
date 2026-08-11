@@ -651,13 +651,17 @@ impl RoundManager {
         })
     }
 
-    /// Handle a share proof from the P2P network
+    /// Handle a share proof arriving from the P2P network — either gossiped by a peer or replayed
+    /// by the GHOST-03 convergence sweep. This is NOT the ingest path: a share from our own miner
+    /// is built and recorded in `main.rs` and never passes through here.
     ///
-    /// Security fixes C4, C5, M-MINE-1, and M-6:
+    /// Security fixes C4 and C5:
     /// - C4: Cryptographic verification that share_hash meets claimed difficulty
     /// - C5: Duplicate detection using submitted_shares HashMap
-    /// - M-MINE-1: Template validation to reject stale shares
-    /// - M-6: Require template_id to be present (no bypass via None)
+    ///
+    /// M-6 / M-MINE-1 template validation deliberately does NOT happen here — see the comment
+    /// below. It is enforced at ingest, where the template still exists; applying it to a share
+    /// being replayed for repair can only refuse the shares repair exists to restore (#639).
     pub fn handle_share_proof(&self, proof: ShareProof) -> Result<(), ShareError> {
         // M-6 + M-MINE-1: the template is validated ONLY for shares THIS node received and
         // signed. A gossiped share (received_by = another node) was mined against the SENDER's
@@ -674,27 +678,34 @@ impl RoundManager {
         // in a week, which is what produces the `per-address differences sum to ...` checkpoint
         // rejections (#639).
         //
-        // M-6's bypass guard is preserved exactly where it has meaning: a share claiming to be
-        // ours must name the template it was mined against, or it could skip a validation that
-        // genuinely applies. On the remote path there is no such validation to skip.
-        if proof.received_by == self.our_node_id {
-            let Some(template_id) = proof.template_id else {
-                warn!(
-                    round_id = proof.round_id,
-                    miner = %hex::encode(&proof.miner_id[..8]),
-                    "M-6: locally-received share proof missing required template_id"
-                );
-                return Err(ShareError::MissingTemplateId);
-            };
-            if !self.is_valid_template(&template_id) {
-                warn!(
-                    template_id = %hex::encode(&template_id[..8]),
-                    round_id = proof.round_id,
-                    "Share proof references stale template"
-                );
-                return Err(ShareError::StaleTemplate);
-            }
-        }
+        // The template check does NOT belong here at all — not even on the local branch. Keeping
+        // it there only narrowed the same bug; it did not fix it.
+        //
+        // `handle_share_proof` has exactly two production entry points, and NEITHER is ingest:
+        //   1. `share_handler.rs` — a ShareProof gossiped by a peer.
+        //   2. `convergence.rs`   — the GHOST-03 sweep replaying shares to repair the ledger.
+        // A share submitted by our own miner is built in `main.rs` (where `template_id` is stamped
+        // from `current_template_id()` and the proof is signed) and is recorded directly. It never
+        // reaches this function.
+        //
+        // So `received_by == our_node_id` here means "our own share has come BACK to us" — gossiped
+        // by a peer, or replayed by the sweep. It cannot be a fresh submission, so there is no
+        // ingest validation left to skip. And it is genuinely ours: at/above
+        // `CLUSTER_ENFORCEMENT_HEIGHT` an unsigned or mis-signed proof is dropped in
+        // `share_handler` before it gets here, and only WE can produce our GHOST-09 signature — so
+        // a peer cannot forge `received_by`. Our signature on it IS the record that we already
+        // validated its template, at ingest, when the template still existed.
+        //
+        // Re-checking that template now can therefore only ever FAIL, because by the time a share
+        // is being replayed for repair the template it names is long gone. That is not a safety
+        // check; it is a guaranteed refusal of exactly the shares the repair path exists to
+        // restore. Measured on vm5 after the narrowed version shipped: 6,795 refusals in 20
+        // minutes across just 13 distinct rounds — `round_id=117946` alone refused 5,276 times,
+        // because the share is refused BEFORE it can be recorded, so the sweep sees it still
+        // missing and replays it forever.
+        //
+        // The trust anchors are unchanged and unaffected: the GHOST-09 signature (ours, for our own
+        // shares), C4 PoW re-verification below, and C5 dedup.
 
         let diff_calc = self.difficulty.read();
 
@@ -2248,37 +2259,58 @@ mod tests {
         );
     }
 
-    /// #639 must NOT weaken M-6 where it has meaning: a share claiming WE received it still has
-    /// to name its template, or it could skip a validation that genuinely applies to it.
+    /// Our OWN share coming back to us — gossiped by a peer, or replayed by the GHOST-03 sweep —
+    /// must be admitted. It cannot be a fresh submission (ingest never calls this function), so its
+    /// template was already validated by us when we signed it, and by repair time that template is
+    /// long gone. Refusing it here refuses precisely the shares repair exists to restore (#639).
     #[test]
-    fn a_local_share_without_a_template_id_is_still_refused() {
+    fn our_own_share_replayed_for_repair_is_admitted() {
         let manager = RoundManager::new([1u8; 32], RoundConfig::default());
         manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
 
         let mut proof = genesis_proof(1, 2500.0, None);
         proof.received_by = [1u8; 32]; // ours
+        proof.template_id = None; // a replayed/backfilled proof carries no template
+
+        assert!(
+            manager.handle_share_proof(proof).is_ok(),
+            "a replayed local share must not be refused for a missing template_id — that refusal \
+             is what kept the repair path closed and drifted the unpaid ledger (#639)"
+        );
+
+        // Naming a template we no longer hold is the NORMAL case for a share old enough to need
+        // repair, and must likewise be admitted rather than refused forever.
+        let manager2 = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager2.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+        let mut expired = genesis_proof(1, 2500.0, None);
+        expired.received_by = [1u8; 32];
+        expired.template_id = Some([0xAB; 32]);
+        assert!(
+            manager2.handle_share_proof(expired).is_ok(),
+            "a local share naming an expired template must be admitted, not refused"
+        );
+    }
+
+    /// The regression that made this urgent: a refused share is never recorded, so the sweep sees
+    /// it still missing and replays it forever. One round was refused 5,276 times in 20 minutes on
+    /// vm5. Admitting it means the SECOND presentation is caught by C5 dedup instead of looping.
+    #[test]
+    fn a_replayed_share_is_deduped_on_the_second_presentation_not_refused_forever() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+
+        let mut proof = genesis_proof(1, 2500.0, None);
+        proof.received_by = [1u8; 32];
         proof.template_id = None;
 
         assert!(
-            matches!(
-                manager.handle_share_proof(proof),
-                Err(ShareError::MissingTemplateId)
-            ),
-            "M-6's bypass guard must survive on the path where the template IS validated"
+            manager.handle_share_proof(proof.clone()).is_ok(),
+            "first presentation is admitted and recorded"
         );
-
-        // And naming a template we never issued is still stale, not admitted.
-        let manager2 = RoundManager::new([1u8; 32], RoundConfig::default());
-        manager2.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
-        let mut stale = genesis_proof(1, 2500.0, None);
-        stale.received_by = [1u8; 32];
-        stale.template_id = Some([0xAB; 32]);
         assert!(
-            matches!(
-                manager2.handle_share_proof(stale),
-                Err(ShareError::StaleTemplate)
-            ),
-            "a local share naming an unknown template is still refused"
+            manager.handle_share_proof(proof).is_err(),
+            "the second presentation must be stopped by C5 dedup — the share is now RECORDED, \
+             which is what breaks the replay loop"
         );
     }
 
