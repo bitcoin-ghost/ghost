@@ -371,6 +371,15 @@ pub const SHARE_ADDR_BIND_HEIGHT: u64 = 961_100;
 /// to outlive a restart, or the node re-derives a later one and downgrades post-gate shares.
 pub const ADDR_BIND_ACTIVATION_KEY: &str = "addr_bind_activation_round";
 
+/// `kv_store` key holding the round in which [`SHARE_TIER_BIND_HEIGHT`] first took effect.
+///
+/// Exactly the same reasoning as [`ADDR_BIND_ACTIVATION_KEY`], and for exactly the same reason:
+/// a share mined before the tier gate carries no `tier_log2` and can never acquire one, so judging
+/// it by the tip makes every pre-gate share awaiting repair unrecordable the instant the gate
+/// fires. It is then refused before it can be written, so the GHOST-03 sweep replays it for ever
+/// (#639) and the residual unpaid drift freezes permanently.
+pub const TIER_BIND_ACTIVATION_KEY: &str = "tier_bind_activation_round";
+
 /// Settle a won block by observing it on-chain, on every node rather than only the submitter.
 ///
 /// Today `settle_paid_block` has one reachable call site, in the block-submitted path, so only the
