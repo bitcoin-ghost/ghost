@@ -576,6 +576,18 @@ pub struct WorkState {
     pub commitment_snapshot: Option<CoinbaseCommitment>,
 }
 
+/// The #601 fee-selection rule, kept pure so it is testable without a `WorkState` fixture:
+/// the current template's fees when it has any, otherwise the most recent filled observation
+/// (`estimated = true`). A template with zero fees is indistinguishable from the empty fast-path
+/// template here, and falling back is correct for both — an ancient stale estimate cannot stick,
+/// because every FULL refresh overwrites the observation, zero included.
+fn resolve_payout_fees(current_template_fees: Option<u64>, last_filled_fees: u64) -> (u64, bool) {
+    match current_template_fees {
+        Some(fees) if fees > 0 => (fees, false),
+        _ => (last_filled_fees, true),
+    }
+}
+
 /// Witness data for SegWit coinbase transaction
 /// Kept separate from coinbase1/coinbase2 so miners compute correct TXID for merkle root
 #[derive(Debug, Clone, Default)]
@@ -619,6 +631,12 @@ pub struct TemplateProcessor {
     reaper_stats: Arc<crate::reaper_stats::ReaperStats>,
     /// Current work state
     current_work: RwLock<Option<WorkState>>,
+    /// TX fees of the most recent FILLED template (#601). The tip-change fast path publishes an
+    /// EMPTY template so miners get new work instantly, and the payout proposal for the new
+    /// height is armed off that very template — so it read `total_fees = 0` and the ratified
+    /// proposal carried no fees at all. This remembers the last real fee observation across the
+    /// tip change so the proposal can carry an estimate instead of a structural zero.
+    last_filled_fees: std::sync::atomic::AtomicU64,
     /// Work states by template_id (for SubmitSolution lookup)
     work_states: RwLock<HashMap<u64, WorkState>>,
     /// Job counter
@@ -671,6 +689,7 @@ impl TemplateProcessor {
             reaper_config,
             reaper_stats: crate::reaper_stats::ReaperStats::new(),
             current_work: RwLock::new(None),
+            last_filled_fees: std::sync::atomic::AtomicU64::new(0),
             work_states: RwLock::new(HashMap::new()),
             job_counter: RwLock::new(0),
             event_tx,
@@ -1818,6 +1837,16 @@ impl TemplateProcessor {
         // Calculate total fees and weight
         let total_fees: u64 = filtered_txs.iter().map(|tx| tx.fee).sum();
         let total_weight: u64 = filtered_txs.iter().map(|tx| tx.weight).sum();
+
+        // #601: remember the last REAL fee observation. Only a filled template is one — the empty
+        // fast-path template says nothing about the mempool, and it is exactly the template the
+        // tip-change payout proposal is armed against. A genuinely empty mempool still updates
+        // this on the next full refresh (filtered_txs empty, fees 0), so the estimate tracks
+        // reality rather than sticking at an ancient value.
+        if !empty {
+            self.last_filled_fees
+                .store(total_fees, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Generate new job ID
         let job_id = {
@@ -2971,6 +3000,38 @@ impl TemplateProcessor {
             Some(w) => (w.subsidy, w.total_fees, w.height),
             None => (0, 0, 0),
         }
+    }
+
+    /// TX fees to record in a payout proposal armed at a tip change (#601).
+    ///
+    /// Returns `(fees, estimated)`. The tip-change proposal fires off the EMPTY fast-path
+    /// template (`publish_empty_template` on the new-block ZMQ event), whose `total_fees` is
+    /// structurally 0 — measured on vm5: 197 of 243 ratified proposals carried
+    /// `original_fees=0` while a live mid-block template held 4.6M sats. With `tx_fees=0` the
+    /// 1% levy is computed on the subsidy alone and the ENTIRE real fee lands on the treasury
+    /// as post-gate drift, instead of 99% of it reaching the miners.
+    ///
+    /// So: the current template's fees when it has any, otherwise the most recent FILLED
+    /// observation — normally the last template of the previous height, seconds old at the tip
+    /// change, which is the closest available estimate of what this block will actually collect.
+    ///
+    /// Determinism: the value is read ONCE by the proposer and recorded in the proposal, which
+    /// is what the mesh ratifies and every validator recomputes the split from — validators
+    /// never re-read fees at verification time (they only sanity-bound them, MED-POOL-2). The
+    /// gap between this estimate and the fees actually available when a coinbase is built is
+    /// absorbed deterministically by `adjust_proposal_for_available_fees`, exactly as it is
+    /// today — only the size of that drift changes, from "all of the fees" to the mempool
+    /// movement within one block interval.
+    pub fn payout_fee_estimate(&self) -> (u64, bool) {
+        let current = {
+            let work = self.current_work.read();
+            work.as_ref().map(|w| w.total_fees)
+        };
+        resolve_payout_fees(
+            current,
+            self.last_filled_fees
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Submit a solved block
@@ -4327,6 +4388,52 @@ mod tests {
             sigops: 0,
             weight,
         }
+    }
+
+    /// #601: the tip-change payout proposal must never bake in the empty fast-path template's
+    /// structural zero when a real fee observation exists.
+    #[test]
+    fn payout_fees_carry_the_last_filled_observation_across_the_tip_change() {
+        // The tip-change shape: the current template is the EMPTY fast-path one (fees 0), the
+        // last FILLED template of the previous height saw a real mempool.
+        assert_eq!(
+            resolve_payout_fees(Some(0), 4_605_029),
+            (4_605_029, true),
+            "an empty tip-change template must fall back to the last filled observation"
+        );
+        // Mid-block, filled template: use its own fees, no estimation.
+        assert_eq!(
+            resolve_payout_fees(Some(1_605_164), 4_605_029),
+            (1_605_164, false)
+        );
+        // No template at all (restart window): the observation is all there is.
+        assert_eq!(resolve_payout_fees(None, 1_000), (1_000, true));
+        // Fresh process, nothing observed yet: zero, exactly as before this change.
+        assert_eq!(resolve_payout_fees(None, 0), (0, true));
+        // A genuinely empty mempool zeroes the observation on the next full refresh, so the
+        // estimate follows reality rather than sticking at an ancient value.
+        assert_eq!(resolve_payout_fees(Some(0), 0), (0, true));
+    }
+
+    /// The processor-level wiring of the rule above: a fresh processor estimates zero, and the
+    /// estimate becomes the recorded observation once one exists.
+    #[test]
+    fn payout_fee_estimate_reads_the_recorded_observation() {
+        let processor = test_processor();
+        assert_eq!(
+            processor.payout_fee_estimate(),
+            (0, true),
+            "nothing observed yet — same value the old code sampled, now labelled an estimate"
+        );
+
+        processor
+            .last_filled_fees
+            .store(4_605_029, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            processor.payout_fee_estimate(),
+            (4_605_029, true),
+            "with no current work the last filled observation is the estimate"
+        );
     }
 
     /// Helper to create a TemplateProcessor for sorting tests
