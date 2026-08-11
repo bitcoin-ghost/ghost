@@ -165,6 +165,25 @@ ssh_host_for() {
     ssh -G "$1" 2>/dev/null | awk '/^hostname /{print $2; exit}'
 }
 
+# Validate that a remote read produced ONE clean integer, or say so.
+#
+# The share count used to go through `tr -cd '0-9'`, which cannot fail: any stray line sharing
+# stdout (a banner, a warning, an echoed value) has its digits CONCATENATED into the count, so a
+# read that half-worked comes out looking like a confident number. Anything other than a single
+# integer now reads as "unreadable" (empty, non-zero return), which every caller already treats
+# as not-measurable rather than as zero.
+one_clean_integer() {
+    local out="${1:-}"
+    # Trim LEADING and TRAILING whitespace only. Deleting all whitespace would quietly weld two
+    # output lines into one number — the exact failure this function exists to refuse.
+    out="${out#"${out%%[![:space:]]*}"}"
+    out="${out%"${out##*[![:space:]]}"}"
+    case "$out" in
+        ''|*[!0-9]*) return 1 ;;
+        *) printf '%s\n' "$out" ;;
+    esac
+}
+
 # Count shares this node took from its OWN miners since a unix timestamp.
 #
 # `miner_id like '%.%'` is the discriminator: a locally-submitted share carries a plaintext
@@ -172,10 +191,37 @@ ssh_host_for() {
 # ever see the hashed form. Without that filter a node with no miners still counts its peers'
 # traffic and every throughput check passes vacuously.
 local_shares_since() {
-    timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$1" \
+    local out
+    out=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$1" \
         "sudo -u ghost sqlite3 /home/ghost/.ghost/ghost.db \
          \"select count(*) from shares where timestamp > $2 and miner_id like '%.%';\"" \
-        2>/dev/null | tr -cd '0-9'
+        2>/dev/null) || true
+    one_clean_integer "$out"
+}
+
+# Count ESTABLISHED miner connections on the node's stratum ports (SV1 :3333, farm tier :4444,
+# direct SV2 :34255), excluding loopback peers — the node's own translator holds a permanent
+# 127.0.0.1 connection to pool_sv2 on :34255 and must not read as a miner.
+#
+# This is what separates the two causes of post-swap silence:
+#
+#   * H-13: miners still CONNECTED, work arriving and silently discarded  -> conns > 0
+#   * a shed: ALL EIGHT nodes are in the mining DNS, so the restart this script just issued
+#     drops the node's miners and they rehome on another node in seconds  -> conns == 0
+#
+# Measured on the night of 2026-08-10/11: avalonQ's last share on vm3 landed at 1786408429 and
+# its first on vm2 at 1786408453 — 24 seconds after vm3's restart. Four healthy binaries were
+# rolled back that night (vm6, vm3, vm1 twice) because the silence they left behind was read as
+# the H-13 signature.
+#
+# `wc -l` runs REMOTELY, so a transport failure yields an empty string (unreadable), never 0:
+# "no miners attached" is only ever a genuine measurement.
+miner_connections() {
+    local out
+    out=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$1" \
+        "ss -Htn state established '( sport = :3333 or sport = :4444 or sport = :34255 )' 2>/dev/null \
+         | awk '\$NF !~ /^(127\\.|\\[::1\\])/' | wc -l" 2>/dev/null) || true
+    one_clean_integer "$out"
 }
 
 # The throughput verdict, as a function rather than inline, so the gate self-test can drive it.
@@ -187,7 +233,7 @@ local_shares_since() {
 #
 # 0 = regressed (roll back), 1 = fine or not measurable.
 throughput_regressed() {
-    local baseline="${1:-}" post="${2:-}"
+    local baseline="${1:-}" post="${2:-}" conns="${3:-}"
     # No traffic before the swap: nothing to lose, and nothing to conclude.
     [ -n "$baseline" ] || return 1
     [ "$baseline" -gt 0 ] 2>/dev/null || return 1
@@ -196,9 +242,21 @@ throughput_regressed() {
     # guard treats a failed ssh or sqlite read as an outage and rolls back a healthy binary. The
     # gate self-test caught exactly that.
     [ -n "$post" ] || return 1
-    # Traffic before, none after: work is arriving and not being credited.
-    [ "$post" -eq 0 ] 2>/dev/null && return 0
-    return 1
+    # Shares still being credited: fine, whatever the connection count says.
+    [ "$post" -eq 0 ] 2>/dev/null || return 1
+    # Traffic before and none after is only H-13 if somebody is still SENDING work. All eight
+    # nodes sit in the mining DNS, so the restart this script just issued sheds every miner the
+    # node had, and they rehome elsewhere within seconds — silence with zero miners attached is
+    # the EXPECTED aftermath of the swap, not an outage. On 2026-08-11 four healthy binaries
+    # were rolled back (vm6, vm3, vm1 twice) because this function could not tell the two apart:
+    # the deploy chased one cohort of miners around the fleet all night, and every node they had
+    # just been shed FROM reported the H-13 signature.
+    #
+    # An unreadable connection count gets the same treatment as an unreadable share count: not
+    # measurable, and a binary is not rolled back on evidence that was never collected.
+    [ -n "$conns" ] || return 1
+    [ "$conns" -gt 0 ] 2>/dev/null || return 1
+    return 0
 }
 
 # 4. Canary soak before production. The bugs that hurt were behavioural and only showed
@@ -284,8 +342,16 @@ BIN_PATH="$REPO_ROOT/target/release/$BINARY"
 # was silently discarded. Nothing in the deploy path measured whether work was still being
 # credited, so nothing objected.
 BASELINE_WINDOW="${BASELINE_WINDOW:-300}"
-BASELINE_FROM=$(( $(date +%s) - BASELINE_WINDOW ))
+BASELINE_READ_AT=$(date +%s)
+BASELINE_FROM=$(( BASELINE_READ_AT - BASELINE_WINDOW ))
 BASELINE_SHARES=$(local_shares_since "$NODE" "$BASELINE_FROM" || true)
+NODE_CLOCK=$(timeout "$REMOTE_TIMEOUT" ssh "${SSH_OPTS[@]}" "$NODE" "date +%s" 2>/dev/null || true)
+# Absolute bounds, both clocks, and the RAW value — so a disputed count is diagnosable from the
+# transcript alone. The 2026-08-11 investigation initially concluded this baseline was
+# fabricated, because the verifying query was run against a window an hour adrift of the gate's
+# actual one (the deploy host keeps BST, the nodes keep UTC); with the epochs printed here the
+# same check is a single copy-paste.
+info "baseline window ($BASELINE_FROM, $BASELINE_READ_AT] epoch, node clock ${NODE_CLOCK:-unreadable}, raw count '${BASELINE_SHARES}'"
 if [ "${BASELINE_SHARES:-0}" -gt 0 ] 2>/dev/null; then
     info "baseline: $BASELINE_SHARES local shares in the last $((BASELINE_WINDOW / 60))m — throughput WILL be re-checked after the swap"
 elif [ -z "$BASELINE_SHARES" ]; then
@@ -445,16 +511,24 @@ if [ -z "${ROLLBACK:-}" ] && [ "$BASELINE_SHARES" -gt 0 ] 2>/dev/null; then
     # the read itself failed — a different thing from "no shares", and one that must not roll back
     # a healthy binary. `select count(*)` returning "0" is the only genuine zero.
     POST_SHARES=$(local_shares_since "$NODE" "$SWAP_EPOCH" || true)
+    MINER_CONNS=$(miner_connections "$NODE" || true)
+    info "post-swap window ($SWAP_EPOCH, $(date +%s)] epoch, raw count '${POST_SHARES}', established miner connections '${MINER_CONNS}'"
     if [ -z "$POST_SHARES" ]; then
         info "WARNING: could not read the share count from $NODE — throughput NOT verified"
-    fi
-    if ! throughput_regressed "$BASELINE_SHARES" "$POST_SHARES"; then
-        info "throughput OK: $POST_SHARES local shares credited since the swap (baseline $BASELINE_SHARES/$((BASELINE_WINDOW / 60))m)"
-    else
+    elif throughput_regressed "$BASELINE_SHARES" "$POST_SHARES" "$MINER_CONNS"; then
         echo "NO LOCAL SHARES CREDITED in ${SETTLE}s after the swap, but $BASELINE_SHARES arrived in the" >&2
-        echo "  $((BASELINE_WINDOW / 60))m before it. Miners are connected and their work is being discarded." >&2
-        echo "  This is the H-13 signature. Rolling back." >&2
+        echo "  $((BASELINE_WINDOW / 60))m before it, and $MINER_CONNS miner connection(s) are still ESTABLISHED." >&2
+        echo "  Work is arriving and being discarded. This is the H-13 signature. Rolling back." >&2
         ROLLBACK=1
+    elif [ "$POST_SHARES" -eq 0 ] 2>/dev/null && [ "$MINER_CONNS" = "0" ]; then
+        info "no local shares since the swap, and NO miners are attached: the restart shed them and"
+        info "  they have rehomed via the mining DNS (all eight nodes are in it). Not H-13 —"
+        info "  throughput on this node is UNVERIFIED, not regressed. Proceeding."
+    elif [ "$POST_SHARES" -eq 0 ] 2>/dev/null; then
+        info "WARNING: no shares since the swap and the miner connection count is UNREADABLE —"
+        info "  cannot distinguish H-13 from a routine DNS shed; NOT rolling back on unmeasured evidence"
+    else
+        info "throughput OK: $POST_SHARES local shares credited since the swap (baseline $BASELINE_SHARES/$((BASELINE_WINDOW / 60))m)"
     fi
 fi
 
