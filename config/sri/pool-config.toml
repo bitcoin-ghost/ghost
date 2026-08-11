@@ -74,9 +74,15 @@ max_retries = 3
 #   - the translator shipped with quantise_to_tiers = true (translator-config.toml).
 # At/above the height, jobs are built per channel, each coinbase committing to the channel's
 # power-of-two difficulty tier; below it, behaviour is byte-identical to today.
-# [share_tier_binding]
-# node_id = "<64-hex node id>"
-# activation_height = 99999999
+# SHARE_TIER_BIND: ARMED at 962100. Must equal ghost-pool's SHARE_TIER_BIND_HEIGHT, and the
+# translator must ship quantise_to_tiers = true in the SAME release — all three flip together.
+#
+# node_id is deliberately NOT set: pool_sv2 reads this node's identity from the co-located
+# ghost-pool's /health at startup, so the tags it stamps and the tags ghost-pool verifies cannot
+# disagree. Set it only if ghost-pool is unreachable at startup; when set it is checked against
+# ghost-pool's answer and a mismatch refuses to start.
+[share_tier_binding]
+activation_height = 962100
 
 # Template Provider Configuration
 # Connects to ghost-pool's TDP server

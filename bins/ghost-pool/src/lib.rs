@@ -312,14 +312,31 @@ pub const SHARE_POW_VERIFY_HEIGHT: u64 = 959_030;
 /// rejected (`missing_tier`). No JD client exists on the fleet today; resolve before arming if
 /// one does. (The old direct-SV1 path in ghost-pool is gone — SRI is the only mining path.)
 ///
-/// A concrete height is set only once fleet-wide convergence is proven, like the rest. Arming
-/// checklist, in addition: finalise `MIN_DIFFICULTY_TIER_LOG2` against the then-current vardiff
-/// floor AND update the duplicated floor constant in `translator-sv2::difficulty_manager` (that
-/// crate cannot link ghost-common); in ONE release ship the translator with
-/// `quantise_to_tiers = true` AND pool_sv2 with `[share_tier_binding]` (`node_id` = this node's
-/// identity, `activation_height` = this constant's value); verify on the roll that
-/// `missing_tier`/`tier_credit_mismatch` stay zero.
-pub const SHARE_TIER_BIND_HEIGHT: u64 = u64::MAX;
+/// **ARMED at 962_100.**
+///
+/// Chosen with margin rather than economy: the fleet was at ~961_983 and running ~7 min/block, so
+/// this is ~13 hours out against a roll that takes ~4 (CI, build, canary, a 60-minute soak, then
+/// eight nodes). `SHARE_POW_VERIFY_HEIGHT` was armed with an 8-block margin; that is not a
+/// precedent worth repeating for a gate that changes what work is WORTH.
+///
+/// Every node must carry this build before the height. A node still running an older binary has
+/// `u64::MAX` here and never arms, so a partial roll means the fleet disagrees about credited work
+/// — divergent coinbase splits, GHOST-02 rejections between peers — until the last node lands.
+/// There is no canary for the armed behaviour itself: a height gate flips everywhere at the same
+/// block by construction, so the canary proves the BINARY and the height proves the RULE.
+///
+/// The other two halves ship in this same release: the translator with `quantise_to_tiers = true`,
+/// and `pool_sv2` with `[share_tier_binding] activation_height = 962100`. The identity half is no
+/// longer transcribed — `pool_sv2` reads it from this process's `/health`, so the tags it stamps
+/// and the tags this process verifies cannot disagree.
+///
+/// KNOWN LIMIT carried into arming: `MIN_DIFFICULTY_TIER_LOG2` (10) stays coupled to the vardiff
+/// floor with nothing enforcing it. Verified at arming: the fleet's smallest assigned difficulty is
+/// 2_328 (1 TH/s assumed floor, `shares_per_minute` 6.0), quantising to tier 11 — a full tier above
+/// the floor, so quantisation only ever moves difficulty DOWN, which is the safe direction.
+///
+/// On the roll, watch `missing_tier` and `tier_credit_mismatch`: both must stay zero.
+pub const SHARE_TIER_BIND_HEIGHT: u64 = 962_100;
 
 /// Bind the miner's payout address into the GHOST-09 share signature.
 ///
@@ -882,29 +899,51 @@ mod in_dns_tests {
 
 #[cfg(test)]
 mod tier_gate_tests {
-    use super::{binds_difficulty_tier, share_tier_bind_height, SHARE_TIER_BIND_HEIGHT};
+    use super::{binds_difficulty_tier, SHARE_TIER_BIND_HEIGHT};
 
     /// **The dark-landing proof.** The tier gate ships dormant, so no live height binds a tier and
     /// the credit path is byte-identical to today across the whole mainnet range. The predicate is
     /// still genuinely wired — it fires at/above the resolved gate — so this is not a check that
     /// cannot fail.
     #[test]
-    fn the_tier_gate_is_dormant_and_behaviour_neutral() {
+    fn the_tier_gate_is_armed_at_the_intended_height() {
+        // Pinned to the exact value, not merely "not u64::MAX". The height is the whole contract:
+        // every node must agree on it or the fleet splits on credited work, and a typo here is
+        // indistinguishable from an intended change without this line.
         assert_eq!(
-            SHARE_TIER_BIND_HEIGHT,
-            u64::MAX,
-            "the tier gate must ship dormant — arming it must be a deliberate edit"
+            SHARE_TIER_BIND_HEIGHT, 962_100,
+            "the tier gate height is a fleet-wide agreement — changing it is a deliberate act"
         );
 
-        // Nothing in the mainnet range reaches the dormant gate, so nothing is tier-bound in
-        // production: the coinbase keeps the plain node tag and the legacy credit stands.
-        assert!(!binds_difficulty_tier(960_000));
-        assert!(!binds_difficulty_tier(1_000_000));
-        assert!(!binds_difficulty_tier(u64::MAX - 1));
+        // Below the height nothing is tier-bound: the coinbase keeps the plain node tag and the
+        // legacy credit path stands, byte-identical to the pre-tier build.
+        assert!(!binds_difficulty_tier(962_099));
+        assert!(!binds_difficulty_tier(961_000));
+        assert!(!binds_difficulty_tier(0));
 
-        // But the predicate does fire at/above the resolved gate — proving it is wired to the
-        // height, not hard-coded to false.
-        let gate = share_tier_bind_height();
-        assert!(binds_difficulty_tier(gate));
+        // At and above it, every node flips together.
+        assert!(binds_difficulty_tier(962_100));
+        assert!(binds_difficulty_tier(962_101));
+        assert!(binds_difficulty_tier(u64::MAX));
+    }
+
+    /// The three halves must name the SAME block. `pool_sv2` carries its own
+    /// `activation_height` in config and the translator carries a bare flag, so nothing at compile
+    /// time forces agreement — this records the value the shipped configs must match, so a change
+    /// to one without the others fails here rather than at the height.
+    #[test]
+    fn the_shipped_configs_must_name_this_same_height() {
+        let cfg = include_str!("../../../config/sri/pool-config.toml");
+        assert!(
+            cfg.contains("activation_height = 962100"),
+            "config/sri/pool-config.toml must arm pool_sv2 at the same height as \
+             SHARE_TIER_BIND_HEIGHT ({SHARE_TIER_BIND_HEIGHT})"
+        );
+        let tr = include_str!("../../../config/sri/translator-config.toml");
+        assert!(
+            tr.contains("\nquantise_to_tiers = true"),
+            "config/sri/translator-config.toml must ship quantise_to_tiers = true in the arming \
+             release — the translator has no chain view, so its flag is the third half of the gate"
+        );
     }
 }

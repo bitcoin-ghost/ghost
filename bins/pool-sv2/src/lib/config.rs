@@ -70,9 +70,24 @@ pub struct ShareWebhookConfig {
 /// silently absorbed — see `tier_binding.rs`.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct ShareTierBindingConfig {
-    /// This node's 32-byte identity, hex (64 chars) — MUST equal the `node_id` ghost-pool derives
-    /// its coinbase node tags from, or every tier-stamped share fails its binding check.
-    pub node_id: String,
+    /// This node's 32-byte identity, hex (64 chars).
+    ///
+    /// **Normally omit this.** Left unset, the identity is read from the co-located ghost-pool at
+    /// startup (see `ghost_pool_health_url`), which is the process that actually derives and
+    /// verifies the coinbase node tags — so the two cannot disagree.
+    ///
+    /// It exists only as an override for a node whose ghost-pool cannot be reached at startup.
+    /// Transcribing it by hand is the highest-risk step in arming: `pool_sv2` cannot recover the
+    /// raw id from the template prefix (that carries `sha256(node_id)[..20]`, one-way), so a
+    /// mistyped value is not detectable from the coinbase — it simply makes every tier-era share
+    /// fail its binding check, silently, for that node's miners only. When set, it is CHECKED
+    /// against ghost-pool's own answer and a mismatch refuses startup.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Where to read this node's identity from. Defaults to the co-located ghost-pool's health
+    /// endpoint on loopback.
+    #[serde(default)]
+    pub ghost_pool_health_url: Option<String>,
     /// Block height at/above which per-tier jobs are emitted. MUST equal ghost-pool's
     /// `SHARE_TIER_BIND_HEIGHT` in the same release.
     pub activation_height: u64,
