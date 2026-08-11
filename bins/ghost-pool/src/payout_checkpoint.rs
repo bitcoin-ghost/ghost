@@ -397,6 +397,14 @@ struct PendingEntry {
     /// What each approving voter reported it recomputed (#606), keyed by voter so a node cannot
     /// weight the median by voting twice. Empty below the median-adoption gate.
     reports: HashMap<NodeId, VoterReport>,
+    /// Whether the "too few reports" warning has already been emitted for this (height, hash).
+    ///
+    /// `maybe_finalize` runs on EVERY incoming vote, so without this a height that never reaches
+    /// the reporting threshold re-warns on every subsequent vote — measured at 57-515 lines for a
+    /// single stalled height, and 1,738 in 6h on one node, which is what made this the third
+    /// largest contributor to log volume (#582). Heights that DO finalise warn 1-5 times, so the
+    /// noise is entirely from the stalled ones.
+    warned_low_reports: bool,
 }
 
 struct Pending {
@@ -416,6 +424,7 @@ impl Pending {
             proposal: None,
             approvers: HashSet::new(),
             reports: HashMap::new(),
+            warned_low_reports: false,
         })
     }
 }
@@ -917,14 +926,19 @@ impl PayoutCheckpointManager {
         // Need the proposal BOTH to resolve the voter set (its cutoff) and to persist. If a
         // vote arrived before the proposal, we hold no content yet — the proposal message
         // will arrive and re-trigger this.
-        let (approvers, msg, reports) = {
+        let (approvers, msg, reports, already_warned) = {
             let Some(entry) = p.by_hash.get(&hash) else {
                 return;
             };
             let Some(msg) = entry.proposal.clone() else {
                 return;
             };
-            (entry.approvers.clone(), msg, entry.reports.clone())
+            (
+                entry.approvers.clone(),
+                msg,
+                entry.reports.clone(),
+                entry.warned_low_reports,
+            )
         };
         // Authoritative eligibility + quorum: resolve the voter set at the proposal's cutoff
         // and count ONLY approvers that are in it. Below the ACTIVE_VOTER_SET gate this is
@@ -957,12 +971,43 @@ impl PayoutCheckpointManager {
                 // Refuse rather than silently falling back to the proposer's list — that fallback IS
                 // the vulnerability. A checkpoint that cannot be corroborated does not finalise; the
                 // next height re-proposes.
-                warn!(
-                    height,
-                    reporting,
-                    needed,
-                    "payout checkpoint: too few reports to take a median — not finalising (#606)"
-                );
+                //
+                // Name WHO is missing (#646). `approvals` reliably reaches 7 of 8 while `reporting`
+                // sits at 5-6, so ~2 in-set nodes approve a checkpoint they submit no recomputation
+                // for. Only they can be counted toward quorum without contributing corroboration,
+                // and until now the warning named neither the reporters nor the absentees, so which
+                // nodes they are was pure inference. An approver reports nothing only when its own
+                // `CanonicalPayout` came back with BOTH lists empty (see the guard in `on_vote`),
+                // so a stable absentee set points at nodes holding an empty view rather than at a
+                // gossip or timing fault.
+                if !already_warned {
+                    let mut silent: Vec<String> = voters
+                        .iter()
+                        .filter(|v| approvers.contains(*v) && !reports.contains_key(*v))
+                        .map(|v| hex::encode(&v[..4]))
+                        .collect();
+                    silent.sort();
+                    let mut reported: Vec<String> = voters
+                        .iter()
+                        .filter(|v| reports.contains_key(*v))
+                        .map(|v| hex::encode(&v[..4]))
+                        .collect();
+                    reported.sort();
+                    warn!(
+                        height,
+                        reporting,
+                        needed,
+                        approvals,
+                        approved_but_silent = %silent.join(","),
+                        reported_by = %reported.join(","),
+                        "payout checkpoint: too few reports to take a median — not finalising (#606)"
+                    );
+                    if let Some(p) = pending.get_mut(&height) {
+                        if let Some(e) = p.by_hash.get_mut(&hash) {
+                            e.warned_low_reports = true;
+                        }
+                    }
+                }
                 return;
             }
             let miner_reports: Vec<Vec<(String, u128)>> =
