@@ -5,8 +5,9 @@
 //! per-template decision is derived from the BIP34 height ghost-pool stamps into every
 //! template's `coinbase_prefix`, so with the SAME height configured both binaries flip at the
 //! same block rather than at whichever moment this process restarted. The remaining desync
-//! surface is a mis-copied height or node id, which is why the config carries both explicitly
-//! and why [`TierBinding::from_config`] refuses to start on a malformed id.
+//! surface is a mis-copied height — the identity is no longer transcribed at all, but read from
+//! the co-located ghost-pool at startup ([`TierBinding::resolve`]), which is the process that
+//! derives and verifies the tags, so the two cannot disagree.
 //!
 //! ## What tiered mode changes
 //!
@@ -41,23 +42,127 @@ pub struct TierBinding {
     activation_height: u64,
 }
 
+/// Where this node's identity is read from when the config does not pin one.
+const DEFAULT_HEALTH_URL: &str = "http://127.0.0.1:8080/health";
+
 impl TierBinding {
-    /// Parse the config section. A malformed `node_id` is a refusal to start, not a warning:
-    /// stamping tags derived from the wrong identity would have every tier-era share rejected
-    /// by its binding check, silently, on every share.
-    pub fn from_config(cfg: &crate::config::ShareTierBindingConfig) -> Result<Self, String> {
-        let bytes = hex::decode(cfg.node_id.trim())
+    /// Build from an already-resolved identity.
+    pub fn from_parts(node_id: [u8; 32], activation_height: u64) -> Self {
+        Self {
+            node_id,
+            activation_height,
+        }
+    }
+
+    /// Parse a 64-hex node id. A malformed id is a refusal to start, not a warning: stamping tags
+    /// derived from the wrong identity would have every tier-era share rejected by its binding
+    /// check, silently, on every share.
+    pub fn parse_node_id(s: &str) -> Result<[u8; 32], String> {
+        let bytes = hex::decode(s.trim())
             .map_err(|e| format!("share_tier_binding.node_id is not valid hex: {e}"))?;
-        let node_id: [u8; 32] = bytes.try_into().map_err(|b: Vec<u8>| {
+        bytes.try_into().map_err(|b: Vec<u8>| {
             format!(
                 "share_tier_binding.node_id must be 32 bytes (64 hex chars), got {}",
                 b.len()
             )
-        })?;
-        Ok(Self {
-            node_id,
-            activation_height: cfg.activation_height,
         })
+    }
+
+    /// Pull `response.node_id` out of ghost-pool's health document.
+    pub fn node_id_from_health_json(body: &str) -> Result<[u8; 32], String> {
+        let v: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| format!("ghost-pool health is not JSON: {e}"))?;
+        let id = v
+            .get("response")
+            .and_then(|r| r.get("node_id"))
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| "ghost-pool health has no response.node_id".to_string())?;
+        Self::parse_node_id(id)
+    }
+
+    /// Resolve this node's identity, preferring **ghost-pool's own answer** over anything
+    /// transcribed into config.
+    ///
+    /// `pool_sv2` cannot derive the raw id itself: the template prefix carries
+    /// `sha256(node_id)[..20]`, which is one-way. It previously had to be typed into the config of
+    /// every node individually — a per-node manual step in the consensus-visible path, where a
+    /// single wrong character silently rejects that node's tier-era shares and nothing in the
+    /// coinbase reveals it. Asking the process that derives and verifies those tags removes the
+    /// step entirely, and makes the two impossible to disagree.
+    ///
+    /// A pinned `node_id` is still honoured, but it is CHECKED: a mismatch refuses startup rather
+    /// than letting a stale value quietly win.
+    pub async fn resolve(cfg: &crate::config::ShareTierBindingConfig) -> Result<Self, String> {
+        let url = cfg
+            .ghost_pool_health_url
+            .as_deref()
+            .unwrap_or(DEFAULT_HEALTH_URL);
+        let pinned = cfg
+            .node_id
+            .as_deref()
+            .map(Self::parse_node_id)
+            .transpose()?;
+
+        // ghost-pool may still be starting; the deploy order restarts it first.
+        let mut fetched: Result<[u8; 32], String> = Err("not attempted".into());
+        for attempt in 1..=5u32 {
+            fetched = async {
+                let body = reqwest::Client::new()
+                    .get(url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                    .map_err(|e| format!("cannot reach ghost-pool at {url}: {e}"))?
+                    .text()
+                    .await
+                    .map_err(|e| format!("cannot read ghost-pool health: {e}"))?;
+                Self::node_id_from_health_json(&body)
+            }
+            .await;
+            if fetched.is_ok() {
+                break;
+            }
+            if attempt < 5 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
+        let node_id = match (fetched, pinned) {
+            // Both available: they MUST agree. A mismatch is the exact failure the pin was
+            // supposed to guard against, so it stops the node rather than picking a winner.
+            (Ok(f), Some(p)) if f != p => {
+                return Err(format!(
+                    "share_tier_binding.node_id ({}) does not match the identity ghost-pool \
+                     reports ({}). ghost-pool stamps and verifies the coinbase node tags, so the \
+                     configured value would reject every tier-era share on this node. Remove the \
+                     pin to use ghost-pool's own identity.",
+                    hex::encode(&p[..8]),
+                    hex::encode(&f[..8]),
+                ))
+            }
+            (Ok(f), _) => f,
+            // Unreachable but pinned: honour the operator's value rather than refusing to start
+            // over a health endpoint, but say plainly that it is unverified.
+            (Err(e), Some(p)) => {
+                warn!(
+                    error = %e,
+                    "SHARE_TIER_BIND: could not verify node_id against ghost-pool — using the \
+                     configured value UNVERIFIED. If it is wrong, this node's tier-era shares \
+                     will all fail their binding check."
+                );
+                p
+            }
+            // Nothing to fall back on. Refusing is the safe direction: emitting tags from a
+            // guessed identity is undetectable from the coinbase.
+            (Err(e), None) => {
+                return Err(format!(
+                    "share_tier_binding is configured but this node's identity could not be read \
+                     from ghost-pool ({e}). Start ghost-pool first, or pin node_id explicitly."
+                ))
+            }
+        };
+
+        Ok(Self::from_parts(node_id, cfg.activation_height))
     }
 
     /// The height at/above which per-tier jobs are emitted.
@@ -223,11 +328,7 @@ mod tests {
     use stratum_apps::stratum_core::channels_sv2::target::hash_rate_to_target;
 
     fn a_binding(height: u64) -> TierBinding {
-        TierBinding::from_config(&crate::config::ShareTierBindingConfig {
-            node_id: hex::encode([0x7Au8; 32]),
-            activation_height: height,
-        })
-        .unwrap()
+        TierBinding::from_parts([0x7Au8; 32], height)
     }
 
     fn ghost_prefix(with_node_tag: bool) -> Vec<u8> {
@@ -368,12 +469,42 @@ mod tests {
     #[test]
     fn a_malformed_node_id_is_refused() {
         for bad in ["zz", "abcd", &hex::encode([0u8; 31])[..]] {
+            assert!(TierBinding::parse_node_id(bad).is_err());
+        }
+    }
+
+    /// The identity is read from ghost-pool's real health document, so the manual per-node
+    /// transcription that arming used to require is gone. Shaped exactly as the endpoint answers,
+    /// including the fields around it, so a change to that document fails here rather than at a
+    /// height on mainnet.
+    #[test]
+    fn the_identity_is_read_from_ghost_pools_health_document() {
+        let body = r#"{"response":{"block_height":961983,"capabilities":{"public_mining":true},
+            "healthy":true,"miner_count":2,
+            "node_id":"9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38",
+            "peer_count":7},"signed":"abc"}"#;
+        let got = TierBinding::node_id_from_health_json(body).expect("identity");
+        assert_eq!(
+            hex::encode(got),
+            "9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"
+        );
+    }
+
+    /// A health document that does not carry an identity must be an error, never a default. A
+    /// zeroed or guessed id is undetectable from the coinbase — it simply rejects every tier-era
+    /// share on that node.
+    #[test]
+    fn health_without_an_identity_is_an_error_not_a_default() {
+        for body in [
+            r#"{"response":{"healthy":true}}"#,
+            r#"{"node_id":"9fe860bd"}"#,
+            r#"{"response":{"node_id":"nothex"}}"#,
+            r#"{"response":{"node_id":"9fe860bd"}}"#,
+            "not json at all",
+        ] {
             assert!(
-                TierBinding::from_config(&crate::config::ShareTierBindingConfig {
-                    node_id: bad.to_string(),
-                    activation_height: 0,
-                })
-                .is_err()
+                TierBinding::node_id_from_health_json(body).is_err(),
+                "must not yield an identity from {body}"
             );
         }
     }

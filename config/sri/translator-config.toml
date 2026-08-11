@@ -89,7 +89,7 @@ job_keepalive_interval_secs = 60
 # disagree. When armed, vardiff targets snap down to the tier below (2^n,
 # floored at 2^10 = 1024) so a share's coinbase can commit to the tier it was
 # assigned.
-# quantise_to_tiers = true
+quantise_to_tiers = true
 
 # Upstream SRI Pool connection
 [[upstreams]]

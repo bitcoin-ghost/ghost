@@ -171,7 +171,8 @@ impl ChannelManager {
         let tier_binding = match config.share_tier_binding() {
             None => None,
             Some(cfg) => {
-                let tb = crate::tier_binding::TierBinding::from_config(cfg)
+                let tb = crate::tier_binding::TierBinding::resolve(cfg)
+                    .await
                     .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
                 warn!(
                     activation_height = tb.activation_height(),
