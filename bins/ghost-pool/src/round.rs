@@ -659,38 +659,41 @@ impl RoundManager {
     /// - M-MINE-1: Template validation to reject stale shares
     /// - M-6: Require template_id to be present (no bypass via None)
     pub fn handle_share_proof(&self, proof: ShareProof) -> Result<(), ShareError> {
-        // M-6 SECURITY: Require template_id to be present
-        // Previously, if template_id was None, validation was skipped entirely.
-        // This allowed an attacker to bypass template validation by omitting the field.
-        // Now we REQUIRE template_id for all share proofs.
-        let template_id = match proof.template_id {
-            Some(id) => id,
-            None => {
+        // M-6 + M-MINE-1: the template is validated ONLY for shares THIS node received and
+        // signed. A gossiped share (received_by = another node) was mined against the SENDER's
+        // coinbase template, which this node cannot know or validate; its trust anchors are the
+        // GHOST-09 signature (the signer vouches for the credit), C4 PoW, and C5 dedup, and the
+        // signer already validated its own template before signing.
+        //
+        // The M-6 presence requirement therefore lives INSIDE that branch. It used to sit above
+        // it, unconditional — which made the field required-but-never-read on the remote path,
+        // and refused every share older than the field itself. Measured: ~1,270 rejections per
+        // hour on every node, all of them shares 1,700-13,600 rounds behind the live range,
+        // replayed indefinitely by the GHOST-03 convergence sweep and refused every time. With
+        // the repair path closed the fleet's unpaid ledgers drifted 466 -> 48,753 shares (3.15%)
+        // in a week, which is what produces the `per-address differences sum to ...` checkpoint
+        // rejections (#639).
+        //
+        // M-6's bypass guard is preserved exactly where it has meaning: a share claiming to be
+        // ours must name the template it was mined against, or it could skip a validation that
+        // genuinely applies. On the remote path there is no such validation to skip.
+        if proof.received_by == self.our_node_id {
+            let Some(template_id) = proof.template_id else {
                 warn!(
                     round_id = proof.round_id,
                     miner = %hex::encode(&proof.miner_id[..8]),
-                    "M-6: Share proof missing required template_id"
+                    "M-6: locally-received share proof missing required template_id"
                 );
                 return Err(ShareError::MissingTemplateId);
+            };
+            if !self.is_valid_template(&template_id) {
+                warn!(
+                    template_id = %hex::encode(&template_id[..8]),
+                    round_id = proof.round_id,
+                    "Share proof references stale template"
+                );
+                return Err(ShareError::StaleTemplate);
             }
-        };
-
-        // M-MINE-1: Validate template is current or recent — but ONLY for shares
-        // THIS node received/signed (received_by == our_node_id). A gossiped share
-        // (received_by = another node) was mined against the SENDER's coinbase
-        // template, which this node cannot know or validate; its trust anchors are
-        // the GHOST-09 signature (the signer vouches for the credit), C4 PoW, and
-        // C5 dedup, and the signer already validated its own template before
-        // signing. Enforcing the local-template check on remote shares would drop
-        // every cross-node share as stale and make GHOST-02 reject every payout
-        // once enforcement activates.
-        if proof.received_by == self.our_node_id && !self.is_valid_template(&template_id) {
-            warn!(
-                template_id = %hex::encode(&template_id[..8]),
-                round_id = proof.round_id,
-                "Share proof references stale template"
-            );
-            return Err(ShareError::StaleTemplate);
         }
 
         let diff_calc = self.difficulty.read();
@@ -2215,6 +2218,67 @@ mod tests {
                 .handle_share_proof(genesis_proof(1, 2500.0, Some(11)))
                 .is_ok(),
             "below the gate a present tier field must not be consulted"
+        );
+    }
+
+    /// #639: a REMOTE share without `template_id` must be admitted.
+    ///
+    /// M-6 used to require the field unconditionally, but it is only ever read for shares this
+    /// node received itself — so on the remote path it was required-but-never-read, and refused
+    /// every share older than the field. That closed the GHOST-03 convergence sweep's repair path
+    /// (~1,270 rejections/hour/node) and let the fleet's unpaid ledgers drift 466 -> 48,753 shares
+    /// in a week. The trust anchors for a remote share are unchanged: GHOST-09 signature, C4 PoW,
+    /// C5 dedup.
+    #[test]
+    fn a_remote_share_without_a_template_id_is_admitted() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+
+        let mut proof = genesis_proof(1, 2500.0, None);
+        proof.template_id = None; // as replayed from before the field existed
+        assert_ne!(
+            proof.received_by, [1u8; 32],
+            "this test is only meaningful for a share we did NOT receive"
+        );
+
+        assert!(
+            manager.handle_share_proof(proof).is_ok(),
+            "a gossiped share must not be refused for a field that is never read on that path — \
+             refusing it is what closed the convergence repair path (#639)"
+        );
+    }
+
+    /// #639 must NOT weaken M-6 where it has meaning: a share claiming WE received it still has
+    /// to name its template, or it could skip a validation that genuinely applies to it.
+    #[test]
+    fn a_local_share_without_a_template_id_is_still_refused() {
+        let manager = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+
+        let mut proof = genesis_proof(1, 2500.0, None);
+        proof.received_by = [1u8; 32]; // ours
+        proof.template_id = None;
+
+        assert!(
+            matches!(
+                manager.handle_share_proof(proof),
+                Err(ShareError::MissingTemplateId)
+            ),
+            "M-6's bypass guard must survive on the path where the template IS validated"
+        );
+
+        // And naming a template we never issued is still stale, not admitted.
+        let manager2 = RoundManager::new([1u8; 32], RoundConfig::default());
+        manager2.start_round(crate::SHARE_POW_VERIFY_HEIGHT);
+        let mut stale = genesis_proof(1, 2500.0, None);
+        stale.received_by = [1u8; 32];
+        stale.template_id = Some([0xAB; 32]);
+        assert!(
+            matches!(
+                manager2.handle_share_proof(stale),
+                Err(ShareError::StaleTemplate)
+            ),
+            "a local share naming an unknown template is still refused"
         );
     }
 
