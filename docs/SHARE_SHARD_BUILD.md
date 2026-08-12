@@ -214,12 +214,26 @@ it.
 - Sybil resistance for the node pool is a **precondition for opening the mesh**, not for cutover
   (`SHARE_SHARD.md` §10). The operator's position is that it is not yet complete and will be.
 
-**Which epoch does a share belong to?** Shares carry timestamps; epochs are keyed to block height
-(§12.2 forbids wall-clock). The binding is currently undefined and it is a Stage 2/3 wiring decision.
-The natural answer is the share's **round**, since rounds already rotate with template refresh and
-are anchored to heights — but it must be pinned deliberately, because an ambiguous rule here is a
-fleet split, and using the share timestamp directly would reintroduce the local-clock bug that made
-the sweep's summaries incomparable.
+**~~Which epoch does a share belong to?~~ SETTLED 2026-08-13 — bind via the round's recorded height.**
+
+```
+   epoch(share) = epoch_for_height( rounds[share.round_id].block_height )
+```
+
+No new machinery. `rounds.block_height` is `NOT NULL` and indexed (`idx_rounds_height`),
+`start_round(block_height)` stamps it on every rotation, every share carries `round_id`, and
+`epoch_for_height` is already in `share_shard.rs`. `first_round_at_or_above_height`
+(`queries.rs:2977`) is the inverse and is the same lookup #651 uses to derive the era boundary — so
+this reuses a mapping already proven in production rather than inventing one.
+
+Why the round's height and not the share timestamp: it is the height the share was mined *against*,
+which is the same era key the tier gate judges by, and it is chain-derived. Using the timestamp would
+reintroduce precisely the local-clock bug that made the old sweep's summaries incomparable (§12.2).
+
+Rounds rotate per template refresh (~30 s) so many rounds map to one height, and many heights map to
+one epoch. Many-to-one at each step is what makes the binding total and unambiguous.
+
+*(My call, derived from the code rather than an operator decision — override if you disagree.)*
 
 **Elder revocation** currently rides the payout vote machinery. With voting deleted it needs a
 standalone home or an explicit decision to drop.
