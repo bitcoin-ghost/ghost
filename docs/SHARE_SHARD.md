@@ -178,14 +178,33 @@ Consequence: building the coinbase becomes `ORDER BY work DESC LIMIT N` over a f
 
 ### 4.4 Convergence — the merge rule
 
-Store a counter per **(node, address)**, not one per address:
+**Two quantities, both grow-only.** Nothing in the merged state ever decreases.
 
 ```
-   balance[addr]  =  Σ  counter[node][addr]          ← sum ACROSS nodes
-   merge rule     :  counter[n][addr] = max(mine, theirs)   ← max PER node
+   accrued[node][addr]   grow-only · gossiped · merged per-cell by max
+   settled[addr]         grow-only · derived from the chain · never gossiped
+
+   owed[addr]  =  Σ accrued[·][addr]  −  settled[addr]
 ```
 
-This is a grow-only counter. Merge is idempotent, commutative and associative, so:
+Each node writes **only its own column** of `accrued`.
+
+⚠ **Why not one counter you subtract from.** The first draft of this document made a single counter
+grow-only and had the rebase subtract paid amounts from it. Those two rules are inconsistent, and the
+result is **double payment**:
+
+```
+   A, B, D all hold  accrued[C][addr] = 100
+   block pays addr 60  →  A and B subtract  →  40
+   D was offline, still holds 100
+   D returns, gossips  →  A merges max(40, 100) = 100   ← settled balance resurrected
+```
+
+Splitting into two monotone quantities removes the failure by construction. A stale node
+re-advertising an old `accrued` simply loses the max. `settled` never crosses the mesh at all —
+every node reads it off the chain and derives the identical value with no coordination.
+
+Merge is idempotent, commutative and associative, so:
 
 - out-of-order delivery is irrelevant
 - duplicate delivery is irrelevant
@@ -209,11 +228,18 @@ Nodes do **not** need to agree. Differences are gossip lag and average out acros
 
 ### 4.6 Settlement and rebase
 
-When a block pays out, every node reads the **actual paid amounts off the chain** and subtracts them.
-Identical everywhere, zero messages, zero coordination — the chain is already replicated to every
-node, so anything derived from it is free.
+When a block pays out, every node reads the **actual paid amounts off the chain** and adds them to
+`settled` — which only ever increases (§4.4). Identical everywhere, zero messages, zero coordination.
+The chain is already replicated to every node, so anything derived from it is free.
 
-History before the rebase is **dropped**. Rebase at a confirmation depth, not at the tip (§9).
+Settle at **coinbase maturity (100 blocks)**, never at the tip. The output is unspendable before then,
+so a shallower reorg unwinds the payment anyway and nothing needs undoing. Do not conflate this with
+the legacy tip−6 proposal anchor — different concern, different depth.
+
+Once a block is settled, that epoch's **node-shard evidence is dropped**. Both `accrued` and `settled`
+grow without bound in principle; compaction subtracts a common baseline from both at a chain-anchored
+height, so a node that missed it recomputes the same baseline from the chain it already holds and
+self-heals with no announcement. Compaction is not required for v1.
 
 ## 5. Why this converges when the last one did not
 
