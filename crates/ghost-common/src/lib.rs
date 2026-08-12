@@ -59,6 +59,10 @@ pub mod share_batch;
 
 /// Proving a share was mined to the node that claims it.
 pub mod share_binding;
+
+/// Share shard: the network shard's deterministic core (two grow-only quantities, max-merge,
+/// signed epoch summaries, table root).
+pub mod share_shard;
 pub mod signer;
 pub mod template_verifier;
 pub mod tls;
