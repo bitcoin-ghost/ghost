@@ -38,7 +38,7 @@ Usage:  python3 sv1_handshake_smoke.py [HOST] [PORT] [USER] [TLS_PORT]
         GHOST_TLS_PORT=3334 python3 sv1_handshake_smoke.py   # alternative for the TLS port
 Exit 0 iff all cases pass (the TLS case is skipped, not failed, when no TLS port is set).
 """
-import os, socket, ssl, json, sys, time
+import math, os, socket, ssl, json, sys, time
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 PORT = int(sys.argv[2] if len(sys.argv) > 2 else 3333)
@@ -170,6 +170,25 @@ def _set_difficulty_until(sock, timeout, wanted):
     return out
 
 
+def _tier_floor(d):
+    """The difficulty a TIER-BOUND pool actually serves when asked for `d`.
+
+    SHARE_TIER_BIND armed at block 962,100 (2026-08-12 05:47 UTC) and `quantise_to_tiers = true`
+    is now set fleet-wide, so every difficulty the translator hands a miner is floored to a power
+    of two: a declaration of 1,000,000 is honoured as 2^19 = 524,288, and the hobby floor of
+    ~2,328 is served as 2^11 = 2,048.
+
+    That is the request being MET, not ignored — the share must hash against exactly the tier its
+    coinbase commits to, or ghost-pool rejects it as `tier_credit_mismatch`. But it is up to 47%
+    below the number asked for, so the pre-gate equality checks below read correct behaviour as a
+    refusal. On 2026-08-12 that failed `default-diff`, `pw-difficulty` and `suggest-diff` on a
+    canary and REFUSED the deploy — blocking every ghost-pool roll fleet-wide, hotfixes included.
+    """
+    if d <= 0:
+        return d
+    return 2.0 ** math.floor(math.log2(d))
+
+
 def _declared_difficulty_case(label, requested, pre_subscribe=None, password="x", window=None):
     """Assert a miner-declared difficulty REACHES THE MINER, and say how long it took.
 
@@ -192,9 +211,14 @@ def _declared_difficulty_case(label, requested, pre_subscribe=None, password="x"
         send(s, pre_subscribe)
     send(s, {"id": 1, "method": "mining.subscribe", "params": ["synthtest/1.0"]})
     send(s, {"id": 2, "method": "mining.authorize", "params": [USER, password]})
-    # Allow 1% for the target->difficulty rounding through the SV2 channel.
+    # Allow 1% for the target->difficulty rounding through the SV2 channel, and accept the tier
+    # the gate quantises the request to. Both mean "the declaration reached the miner"; the
+    # failure this case exists to catch — #455, the miner left sitting at the configured floor —
+    # is unaffected, because that floor (2,048) is nowhere near the request's tier (524,288).
+    tier = _tier_floor(requested)
+
     def matches(d):
-        return abs(d - requested) / requested < 0.01
+        return abs(d - requested) / requested < 0.01 or d == tier
 
     seen = _set_difficulty_until(s, window, matches)
     s.close()
@@ -257,8 +281,13 @@ def test_default_difficulty():
     send(s, {"id": 2, "method": "mining.authorize", "params": [USER, "x"]})
     got = _first_set_difficulty(s)
     s.close()
-    ok = got is not None and abs(got - expected) / expected < tol
-    detail = f"pool set {got if got is None else f'{got:,.1f}'} (expected ~{expected:,.0f})"
+    # Post-SHARE_TIER_BIND the floor is served quantised (see `_tier_floor`), so accept either the
+    # nominal value or exactly its tier. A genuinely drifted node still fails: the v1.11.18 case
+    # this covers was 1,164 against 23,283, whose tiers (1,024 vs 16,384) are just as far apart.
+    tier = _tier_floor(expected)
+    ok = got is not None and (abs(got - expected) / expected < tol or got == tier)
+    detail = (f"pool set {got if got is None else f'{got:,.1f}'} "
+              f"(expected ~{expected:,.0f} or its tier {tier:,.0f})")
     if got is not None and not ok:
         detail += " — config drift: this node is not serving the fleet floor"
     print(f"  [default-diff]    {'PASS' if ok else 'FAIL'} — asked for nothing, {detail}")
