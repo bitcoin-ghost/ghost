@@ -220,11 +220,23 @@ this work.
 
 ### 4.5 The coinbase
 
-Top N by unpaid work from the node's own view of the network shard, paid directly in the block.
-Miners below the cut keep accruing and rotate in — nothing is ever lost, they are simply paid less
-often.
+Three components, all deterministic from public data, all paid directly in the block:
 
-Nodes do **not** need to agree. Differences are gossip lag and average out across blocks.
+| component | source | selection |
+|---|---|---|
+| **treasury** | fee split | fixed |
+| **miner pool** | network shard, `owed` | top N by unpaid work |
+| **node pool** | `node_reward_pool` | **top 100 nodes by 5-4-3-2-1 capability shares** |
+
+Miner dust below the floor rolls into the node pool (existing behaviour — keep it).
+
+Miners below the cut keep accruing and rotate in; nothing is ever lost, they are simply paid less
+often. Nodes do **not** need to agree on any of it. Differences are gossip lag and average out across
+blocks.
+
+⚠ **Node rewards are kept** (operator decision 2026-08-13). They are earned by passing capability
+challenges rather than by doing work, which makes the node pool — not the miner pool — where Sybil
+exposure sits under permissionless membership. See §10.
 
 ### 4.6 Settlement and rebase
 
@@ -344,6 +356,25 @@ documentation; do not bury it.
 bounds it: only the unpaid window is tracked, never all history.
 
 **Sampling is probabilistic.** Named in §6, accepted deliberately.
+
+### ⛔ Preconditions for opening the mesh to nodes you do not own
+
+Both of the below are safe to defer while every node belongs to one operator, and both are
+**mandatory before a single foreign node is admitted**. They are the same failure in two places:
+claiming a reward you did not earn.
+
+1. **λ-sampling verifier + evidence broadcast** (§6) — without it, a foreign node's counter is an
+   unverified assertion and share credit can be fabricated.
+2. **Sybil-resistant node-reward qualification** — capability shares are earned by passing
+   challenges, not by doing work, so N cheap identities earn N shares of the node pool for no
+   contribution. Partial defences exist today (capability challenges, distinct-challenger majority,
+   `/24` diversity, the stratum handshake proving a real endpoint rather than an open port), but
+   `/24` is self-reported and subnets are cheap.
+
+   **The strongest available fix uses machinery this design already has: make a node's capability
+   share conditional on verified work it actually served.** A node with no miners earns no node
+   reward, and faking miners costs real hashrate. That is the same PoW-backed Sybil resistance that
+   secures the miner pool, applied one level up.
 
 ## 11. Measured baseline (2026-08-12)
 

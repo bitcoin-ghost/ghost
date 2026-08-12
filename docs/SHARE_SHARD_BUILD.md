@@ -187,11 +187,26 @@ it.
 
 ## Open decisions blocking scope
 
-**Do node rewards survive?** `SHARE_SHARD.md`'s coinbase is "top N by unpaid work" and never mentions
-the 5-4-3-2-1 capability shares. Kill them and another 6–8k lines go (qualification, reverify,
-challenger assignment, four more gates). Keep them and the stratum-handshake rule survives its gate —
-which dovetails with §10's harvest mitigation, since it is already a challenger probing a peer's
-endpoint.
+**~~Do node rewards survive?~~ SETTLED 2026-08-13: they are KEPT.** Consequences:
+
+- `qualification.rs` (~1,858), `verification_reverify.rs` (~1,322), challenger assignment and the
+  **challenge-convergence sweep** all stay. That is ~6–8k lines *not* deleted. ⚠ Do not confuse the
+  challenge-convergence sweep with the GHOST-03 share sweep — different ledger
+  (`verification_ledger`), and only the latter is deleted.
+- Four gates survive **as rules**, losing only their activation heights:
+  `VOTER_SET_QUALIFICATION`, `CHALLENGER_ASSIGNMENT`, `STRATUM_HANDSHAKE_PROOF` (962_000),
+  `ARCHIVE_TX_PROOF` (dormant — decide separately whether the Archive capability is resurrected).
+- The stratum-handshake rule is a **net win**: it is already a challenger probing a peer's stratum
+  endpoint, which is most of the machinery §10's harvest mitigation needs.
+- ⚠ **The genesis snapshot must carry qualification state, not just miner balances.** `node_shares`
+  is read from the checkpoint (`cp.node_shares`), so the Stage-5 conversion has to pin the qualified
+  node set and its capability shares alongside the per-address balances. Verify both are
+  byte-identical fleet-wide at the anchor, not just the ledger root.
+- The payout function `f` covers **three** components — treasury, miner pool, node pool — plus the
+  miner-dust-rolls-into-node-pool rule. All three must be deterministic from public data, or the
+  "exactly one valid payout" property does not hold.
+- Sybil resistance for the node pool is a **precondition for opening the mesh**, not for cutover
+  (`SHARE_SHARD.md` §10). The operator's position is that it is not yet complete and will be.
 
 **Elder revocation** currently rides the payout vote machinery. With voting deleted it needs a
 standalone home or an explicit decision to drop.
