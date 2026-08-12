@@ -1,7 +1,18 @@
+> # ⛔ ARCHIVED 2026-08-12 — SUPERSEDED, DO NOT BUILD FROM THIS
+>
+> **The plan in force is [`docs/SHARE_SHARD.md`](../SHARE_SHARD.md).**
+>
+> This document exists only to solve a problem the new design does not have. Prevote/polka/precommit
+> and the locking rule are machinery for making a **single-leader total order** safe. There is no
+> leader, no rota and no sequence in the new design, so all of it — and
+> `crates/ghost-common/src/batch_two_phase.rs` with it — is deleted rather than fixed.
+>
+> Kept for the safety argument, which is sound for the problem it addresses.
+
 # SBC: two-phase commit for the share-batch chain
 
-Status: design, 2026-08-09. Supersedes the reverted single-phase round proposal
-(`9c003b984`, reverted in `92782196d`).
+Status: **ARCHIVED**. Design 2026-08-09, superseded 2026-08-12. Superseded the reverted
+single-phase round proposal (`9c003b984`, reverted in `92782196d`).
 
 ## The problem this must solve
 

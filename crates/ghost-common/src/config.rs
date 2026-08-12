@@ -2421,7 +2421,7 @@ pub struct PoolConfig {
     /// time, and being able to enable it per node is what makes a canary meaningful. It also means
     /// deploying the binary does not by itself start batch traffic.
     ///
-    /// See `docs/SHARE_BATCH_CHAIN.md`.
+    /// See `docs/archive/SHARE_BATCH_CHAIN.md`.
     #[serde(default)]
     pub share_batch_shadow: bool,
     /// Payout address for node rewards (5-4-3-2-1 capability shares)

@@ -1776,7 +1776,7 @@ impl Database {
     /// shortfall, node payouts are reduced (`bins/ghost-pool/src/template.rs:1045-1095`) — and that
     /// drift is per-node, so the mined outputs differ from the ones the stored proposal described.
     /// A drift-free block matches; a real one generally will not. Identifying a won block needs the
-    /// coinbase to name its proposal outright; see D12 in `docs/SHARE_BATCH_CHAIN.md`.
+    /// coinbase to name its proposal outright; see D12 in `docs/archive/SHARE_BATCH_CHAIN.md`.
     pub fn get_proposal_by_outputs_hash(
         &self,
         outputs_hash: &[u8; 32],

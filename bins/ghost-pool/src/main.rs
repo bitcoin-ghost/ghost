@@ -3747,7 +3747,7 @@ async fn main() -> Result<()> {
         .with_active_voter_set_fn(active_voter_set_fn.clone()),
     );
     // WP-5: the share-batch chain, in shadow. Dark unless `pool.share_batch_shadow` is set — see
-    // docs/SHARE_BATCH_CHAIN.md. It computes, folds and persists its own state and pays nobody;
+    // docs/archive/SHARE_BATCH_CHAIN.md. It computes, folds and persists its own state and pays nobody;
     // the coinbase still reads the ratified checkpoint until WP-6.
     //
     // Constructed here so the share recorder below can hand it what THIS node received. A failure
@@ -3791,7 +3791,7 @@ async fn main() -> Result<()> {
 
     // WP-5: the share-batch chain in shadow. Registered and ticked only when
     // `pool.share_batch_shadow` is set, so a deployed binary puts no batch traffic on the mesh
-    // until a node is deliberately opted in. See docs/SHARE_BATCH_CHAIN.md.
+    // until a node is deliberately opted in. See docs/archive/SHARE_BATCH_CHAIN.md.
     if let Some(ref chain) = sbc_chain {
         // Same channel-plus-relay shape as the checkpoint path: the handler is synchronous and
         // must not await a broadcast while holding consensus state.

@@ -41,7 +41,7 @@ pub const ESCALATION_GRACE_STEPS: u32 = 1;
 
 /// D10: how much older than its batch's `close_ts` a share may be — 30 days.
 ///
-/// From `docs/SHARE_BATCH_CHAIN.md`: "Share age bound is batch-relative:
+/// From `docs/archive/SHARE_BATCH_CHAIN.md`: "Share age bound is batch-relative:
 /// `0 ≤ close_ts − share.timestamp ≤ 30 days`, evaluated identically by every node (never against
 /// local clocks)." Generous on purpose — a tight bound destroys real miner work during a stall,
 /// and this fleet has had a 4-day one. The bound is measured against the batch's OWN `close_ts`,
