@@ -275,11 +275,37 @@ What is structurally different:
 
 ## 6. Verification without heavy compute
 
-A node publishes a signed summary per epoch: per-address deltas plus a Merkle root over the
-network-tier shares backing them. Peers apply the deltas. **They do not receive the shares.**
+A node publishes a signed summary per epoch. Each address row carries **two** numbers:
 
-Peers randomly sample a handful of shares against the root. 20 random samples catch a node faking
-half its work with probability ~10⁻⁶.
+```
+   delta_micro   what this epoch's shares add        ← evidenced by the merkle root
+   total_micro   this node's running cumulative      ← this is what peers max-merge
+```
+
+⚠ **A delta cannot be max-merged.** Deltas are additive, and additive application needs
+exactly-once delivery, which gossip does not provide. Guarding with a per-node epoch watermark is
+worse — it silently *drops* an out-of-order epoch, breaking "behind, never wrong". Carrying the
+running total fixes it by construction: a later total already contains every earlier delta, so
+duplicate, stale and out-of-order delivery are all harmless.
+
+**Verification is layered**, and the two layers answer different questions:
+
+| always, before any merge | needs no shares |
+|---|---|
+| signature valid | — |
+| summary well-formed, deltas consistent with the stated root | — |
+| `total_micro == prev total_micro + delta_micro` against that node's own summary chain | — |
+
+| sampled, asynchronous | needs share evidence |
+|---|---|
+| random leaves pulled against the epoch's merkle root, each checked for PoW + GHOST-09 + binding | yes |
+
+20 random samples catch a node faking half its work with probability ~10⁻⁶.
+
+⚠ **`total_micro` is not statelessly verifiable.** One epoch's evidence proves its delta, not the
+running total. A peer holding a node's *consecutive* summaries can check the chain; a peer joining
+mid-stream cannot, and takes the total on the signature until sampling says otherwise. That is the
+same trust surface as a table sync, and it is what the sampling layer exists to close.
 
 This is probabilistic, not proof — a deliberate trade. Full verification means shipping every share
 to everyone, which is the traffic being eliminated.
