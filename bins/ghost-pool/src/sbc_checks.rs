@@ -8,7 +8,7 @@
 //! ## What "valid" means here is deliberately NARROWER than `handle_share_proof`
 //!
 //! The batch chain asks one question: *does this share prove itself?* Per
-//! `docs/SHARE_BATCH_CHAIN.md`, a `ShareProof` is self-proving — PoW preimage, GHOST-09 signature,
+//! `docs/archive/SHARE_BATCH_CHAIN.md`, a `ShareProof` is self-proving — PoW preimage, GHOST-09 signature,
 //! receiver binding — so a validator checks **validity, not possession**. It needs no prior copy of
 //! the share and no agreement with anyone about what it holds.
 //!

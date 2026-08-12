@@ -2584,7 +2584,7 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
 
 /// v50: share-batch chain persistence (WP-5 shadow run).
 ///
-/// See `docs/SHARE_BATCH_CHAIN.md`. The defect being replaced is stated there in one line:
+/// See `docs/archive/SHARE_BATCH_CHAIN.md`. The defect being replaced is stated there in one line:
 /// **"payable state is O(shares), not O(addresses)"**. Today the payable state is 1.5M unpaid
 /// share rows that every node rescans to produce ~68 numbers. Here it is the ~68 numbers.
 ///
@@ -3654,7 +3654,7 @@ mod tests {
     /// v50 exists to make payable state O(addresses), not O(shares) — so it must NOT provide a
     /// place to archive every share.
     ///
-    /// `docs/SHARE_BATCH_CHAIN.md` names the defect being replaced: today the payable state is
+    /// `docs/archive/SHARE_BATCH_CHAIN.md` names the defect being replaced: today the payable state is
     /// 1.5M unpaid share rows rescanned to produce ~68 numbers. If a future change adds a
     /// share-per-row table here, that problem is rebuilt one layer down and the reason for the
     /// whole programme is quietly lost. Shares live inside a batch, inside a bounded window.

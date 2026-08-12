@@ -1,7 +1,25 @@
+> # ⛔ ARCHIVED 2026-08-12 — SUPERSEDED, DO NOT BUILD FROM THIS
+>
+> **The plan in force is [`docs/SHARE_SHARD.md`](../SHARE_SHARD.md).**
+>
+> The **diagnosis** in this document is still correct and worth reading — private per-node ledgers,
+> an after-the-fact sweep, and a tolerance to absorb what never converged. The **solution** is
+> abandoned: a hash-chained, round-robin, BFT-adopted batch chain imposes a total order on data that
+> commutes, and that ordering was the source of every incident (the seq=1 deadlock, the vote-lock
+> wedge, terminal quarantine, four days of dead chain).
+>
+> **What survives into the new design:** the fold arithmetic (`micro_work`, `canonical_sort`,
+> `fold_shares`, `compute_state_root`), the validity primitives, the storage layer, and the genesis
+> snapshot *method*. Measured 2026-08-12: the fold is correct to 0–1 shares/hour.
+>
+> **What is deleted:** `batch_consensus.rs` (1,789 lines), `batch_two_phase.rs` (635), the global
+> hash-chained sequence, the rota, escalation, and quarantine as a liveness hazard.
+
 # Share-Batch Chain (SBC) — programme plan
 
-Status: **in progress**, started 2026-07-31. Supersedes the convergence-optimisation line of work
-(#568, #569, #576, #577), which made an O(entire-ledger) design cheaper instead of replacing it.
+Status: **ARCHIVED**. Started 2026-07-31, superseded 2026-08-12. Superseded the
+convergence-optimisation line of work (#568, #569, #576, #577), which made an O(entire-ledger)
+design cheaper instead of replacing it.
 
 ## Why
 
