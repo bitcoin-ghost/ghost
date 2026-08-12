@@ -53,10 +53,16 @@ New `crates/ghost-common/src/share_shard.rs`, reusing `micro_work`, `canonical_s
 
 - Counter model exactly as `SHARE_SHARD.md` §4.4 — `accrued` grow-only per `(node, address)` merged
   by per-cell max, `settled` grow-only and chain-derived, `owed = Σaccrued − settled`, signed.
-- Epoch summary: `{epoch (height-keyed), node_id, per-address deltas, merkle root over the epoch's
-  network-tier share hashes, signature}`. Reuse the Merkle tree in `crates/ghost-reconciliation`
-  (the only one in the workspace with membership proofs — single SHA-256, never mix with Bitcoin's
-  sha256d trees). Sign with `NodeIdentity`; `node_id` **is** the pubkey, so no key distribution.
+- Epoch summary: `{epoch (height-keyed), node_id, per-address rows of (delta_micro, total_micro),
+  merkle root over the epoch's network-tier share hashes, signature}` — see `SHARE_SHARD.md` §6 for
+  why both numbers are needed. Sign with `NodeIdentity`; `node_id` **is** the pubkey, so no key
+  distribution.
+- ⚠ **The Merkle tree cannot be imported.** `ghost-reconciliation` depends on `ghost-common`, so a
+  direct call is a dependency cycle. Inject it as a plain `fn` pointer, to which
+  `ghost_reconciliation::compute_merkle_root` coerces, and use a **dev-dependency** (dev-dep cycles
+  are legal in Cargo) so tests can pin the real tree with a golden vector. That pin is load-bearing:
+  it trips if reconciliation's encoding ever changes underneath. Single SHA-256 — never mix it with
+  Bitcoin's sha256d trees.
 - Migration **v53, strictly additive**: `shard_counters`, `shard_settled`, `shard_epochs`. Key on
   `H(plaintext address)`, never the ciphertext — `encrypt_sensitive` draws a fresh nonce per call, so
   a ciphertext key can never be looked up. Leave all `sbc_*` tables alone.
@@ -207,6 +213,13 @@ it.
   "exactly one valid payout" property does not hold.
 - Sybil resistance for the node pool is a **precondition for opening the mesh**, not for cutover
   (`SHARE_SHARD.md` §10). The operator's position is that it is not yet complete and will be.
+
+**Which epoch does a share belong to?** Shares carry timestamps; epochs are keyed to block height
+(§12.2 forbids wall-clock). The binding is currently undefined and it is a Stage 2/3 wiring decision.
+The natural answer is the share's **round**, since rounds already rotate with template refresh and
+are anchored to heights — but it must be pinned deliberately, because an ambiguous rule here is a
+fleet split, and using the share timestamp directly would reintroduce the local-clock bug that made
+the sweep's summaries incomparable.
 
 **Elder revocation** currently rides the payout vote machinery. With voting deleted it needs a
 standalone home or an explicit decision to drop.
