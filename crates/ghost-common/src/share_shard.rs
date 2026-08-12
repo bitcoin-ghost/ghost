@@ -779,16 +779,21 @@ mod tests {
             "per-node attribution must be committed, not just per-address sums"
         );
 
-        // …and address boundaries must be unambiguous under length prefixing.
-        let mut ab_c = ShardTable::new();
-        ab_c.accrue(n1, "ab", 1);
-        ab_c.accrue(n1, "c", 2);
-        let mut a_bc = ShardTable::new();
-        a_bc.accrue(n1, "a", 1);
-        a_bc.accrue(n1, "bc", 2);
+        // …and address boundaries must be unambiguous under length prefixing. This pair is
+        // adversarial: without the length prefix the two tables serialise to the SAME bytes,
+        // because 98 is 0x62 ('b') little-endian and 0x6200000000000000's low bytes are seven
+        // zeros — the value bytes impersonate the neighbouring address bytes exactly. A softer
+        // pair (same addresses re-split, small values) does NOT catch a missing prefix, which a
+        // mutation run proved the hard way.
+        let mut split_one_way = ShardTable::new();
+        split_one_way.accrue(n1, "a", 0x62);
+        split_one_way.accrue(n1, "bc", 5);
+        let mut split_other_way = ShardTable::new();
+        split_other_way.accrue(n1, "ab", 0x6200000000000000);
+        split_other_way.accrue(n1, "c", 5);
         assert_ne!(
-            ab_c.compute_table_root(),
-            a_bc.compute_table_root(),
+            split_one_way.compute_table_root(),
+            split_other_way.compute_table_root(),
             "address boundaries are ambiguous — length prefixing is not working"
         );
     }
