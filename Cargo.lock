@@ -3202,6 +3202,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.17",
+ "ghost-reconciliation",
  "hex",
  "once_cell",
  "parking_lot",
