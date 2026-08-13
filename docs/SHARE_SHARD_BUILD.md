@@ -25,6 +25,9 @@ legacy proposal; the shard observes.
 | Stage 3 payout arithmetic | `shard_miner_payouts` | ✅ mirrors the live path exactly |
 | Stage 3 drift signal | `drift_against_legacy_ledger` | ✅ wired, **once per epoch** |
 | Stage 3 settlement | `settle_matured` | 🔨 in progress |
+| Stage 0 anchor rehearsal | `scripts/shard-anchor-rehearsal.sh` | ✅ written and run against all 8 |
+| Stage 5 genesis conversion | `crates/ghost-accounting/src/shard_genesis.rs` | ✅ 13 tests, dark |
+| Stage 5 reserved-column guard | `ghost-common` + `ghost-storage` | ✅ enforced, not assumed |
 
 **Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
 share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
@@ -243,15 +246,77 @@ vm5+vm6, then all 8. **Gate to pass before cutover:**
 Old and new ledgers run side by side **in one binary**, so this is a data event plus a config flip,
 not a binary big-bang. That is what removes the need for a height gate *and* the need for downtime.
 
-1. **Pick the anchor** — a finalised checkpoint ≥ ~30 blocks behind tip. Run the rehearsal script and
-   require **one distinct `ledger_root` and one distinct `canonical_payout` hash across all 8**. If
-   not unanimous, step back to the previous finalised height.
+1. **Pick the anchor** — a finalised checkpoint ≥ ~30 blocks behind tip. Run
+   `scripts/shard-anchor-rehearsal.sh --survey` then `--height H`, and require **one distinct
+   `ledger_root` and one distinct `canonical_payout` hash across all 8**. If not unanimous, step
+   back to the previous finalised height.
+
+   ⚠⚠ **`ledger_root` unanimity does not imply the adopted bytes agree, and the anchor cannot be
+   picked freely.** Measured across all 8 nodes on 2026-08-13, over the 182 heights every node
+   holds since 961,600:
+
+   | | heights |
+   |---|---|
+   | `ledger_root` unanimous | **180 / 182** |
+   | `canonical_payout` unanimous | **41 / 182** |
+   | both, *after* the #606 gate at 961,700 | **3** |
+
+   The cause is in `payout_checkpoint.rs:1046`: the finalise path persists
+   `ledger_root: msg.ledger_root` — the **proposer's** root over the **proposer's** list — beside
+   `miner_payouts: medians`, the per-address median of `in_set`, which is *the reports that node
+   happened to receive*. Different report sets give different medians, so the persisted bytes
+   diverge while the root, being copied from one broadcast message, stays unanimous.
+
+   At 962,288 that presents as: identical root on all 8, identical 1,316-byte length, identical
+   `cutoff_ts` — and **two distinct blobs**, 5 nodes to 3, differing in three of five payees by
+   0.06–0.26% of their work. A ceremony gated on the root alone reads that as unanimous and seeds
+   eight nodes from divergent balances, which is undetectable afterwards because each node is
+   internally consistent with its own.
+
+   Consequences for the ceremony, in order of how much they change the plan:
+
+   - The rehearsal script gates on the **blob digest**, and treats the root as provenance only.
+     It also refuses a NULL/empty `canonical_payout` outright — sha256 of nothing is identical on
+     all eight, so a pre-adopt-on-finalise row presents as perfect unanimity for a checkpoint with
+     no payees at all.
+   - **Anchor selection is a search, not a choice.** Only ~1.6% of post-gate heights qualify, so
+     "≥30 blocks behind tip" no longer determines the anchor — survey first, then take the newest
+     qualifying height. Budget for the anchor being some hundreds of blocks stale, and therefore
+     for a correspondingly larger step-4 gap-fold.
+   - At every height where the blobs *do* agree, the ratified root also recomputes from them on
+     8/8 — i.e. the median equalled the proposer's list. So a qualifying anchor is strictly
+     stronger than the plan asked for, which is why the script reports that check.
+   - This is a live integrity gap in its own right, not only a ceremony obstacle: `payout.rs`
+     documents the root as the thing making the coinbase "a pure function of the checkpoint", and
+     since #606 it is not. Stage 6 deletes this path, so the fix is the cutover — but until then
+     GHOST-02 recompute-reject rests on a commitment that no longer covers what is paid.
 2. **Pin it.** Convert the checkpoint using the existing `genesis_balances` + `GenesisRounding`
    (truncate, never round up) and its pinned golden vector. ⚠ **Convert the finalised checkpoint —
    never recompute from shares.** Pin the height, `cutoff_ts` and expected opening root as a
    compile-time constant plus golden-vector test. This is a one-time seed pin, not a gate: it names
    the past and never flips future behaviour. Opening balances go in a reserved genesis column so the
    write-your-own-column invariant holds from the first row.
+
+   **Built** — `crates/ghost-accounting/src/shard_genesis.rs`, dark. Anchor currently pinned at
+   **962,008** (verified unanimous on all 8, blob sha `a3f7202f…2bebad62`, 5 payees, 8 node
+   entries, and the ratified root recomputes from those bytes on 8/8). Re-pin to a fresher
+   qualifying height at ceremony time by re-running the survey; the golden vector is the only
+   thing that has to change.
+
+   Two things the build settled that the plan had left implicit:
+
+   - **The reserved column must be shared, not per-node.** `owed()` sums *across* columns, so if
+     each node opened into its own column the first merge would multiply every miner's opening
+     balance by the fleet size — healthy-looking on any single node right up until gossip. All
+     eight write the identical balances into one column, where max-merge is the identity.
+   - ⚠ **`[0u8; 32]` is a loadable ed25519 key.** The first draft argued the reserved id was
+     unclaimable because all-zero bytes are not a valid public key; `VerifyingKey::from_bytes`
+     accepts it as a low-order point, and the test asserting otherwise is what caught it. Left
+     standing, a peer could have max-merged an inflated opening balance that is permanent (merge
+     is a max) and indistinguishable from genesis. The guarantee is now structural, in
+     `ghost-common` beside the invariant: `merge_accrued` skips the column, `verify_stateless`
+     rejects a summary claiming it *before* checking the signature, and the sole writer is
+     `ShardTable::install_genesis`, which no message handler calls.
 3. **Back up all 8 databases.**
 4. **Roll node-by-node, vm5 first.** On flip each node converts its own copy of the byte-identical
    checkpoint, **asserts the computed root equals the pin and refuses to start the shard otherwise**

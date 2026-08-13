@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use rusqlite::{params, params_from_iter, Connection};
 
 use ghost_common::error::{GhostError, GhostResult};
-use ghost_common::share_shard::{AccruedColumns, EpochSummary, ShardTable};
+use ghost_common::share_shard::{AccruedColumns, EpochSummary, ShardTable, GENESIS_NODE_ID};
 use ghost_common::types::NodeId;
 
 use crate::database::Database;
@@ -182,7 +182,15 @@ impl Database {
         }
 
         let mut table = ShardTable::new();
+        // The reserved genesis column is split out and installed directly: `merge_accrued` now
+        // skips it (so a peer can never inflate the opening balances), and reconstructing our own
+        // persisted table through the peer-merge path would therefore silently drop it — every
+        // miner's opening balance, gone on the next restart.
+        let genesis = accrued.remove(&GENESIS_NODE_ID);
         table.merge_accrued(&accrued);
+        if let Some(column) = genesis {
+            table.install_genesis(column);
+        }
         for (enc, micro) in settled {
             table.record_settled(&self.decrypt_address(&enc)?, micro);
         }

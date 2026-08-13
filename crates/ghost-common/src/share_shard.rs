@@ -290,6 +290,13 @@ pub enum SummaryRejection {
     /// equality — a tolerance here would be an admission the mechanism cannot converge (§12.5).
     #[error("per-address deltas do not match the evidence fold")]
     DeltaMismatch,
+    /// The summary claims [`GENESIS_NODE_ID`], the reserved opening-balance column.
+    ///
+    /// Checked before the signature, because the point is that no signature should make this
+    /// admissible: the genesis column is written once locally at the Stage 5 ceremony from a
+    /// compile-time pin and is never a thing a peer tells you.
+    #[error("summary claims the reserved genesis column, which no peer may write")]
+    ReservedColumn,
 }
 
 /// One address row of an epoch summary.
@@ -413,6 +420,11 @@ impl EpochSummary {
     /// Structure is checked before the signature deliberately: malformed is malformed no matter who
     /// signed it, and it is the cheaper test.
     pub fn verify_stateless(&self) -> Result<(), SummaryRejection> {
+        // Before the signature, deliberately: no signature should make the reserved genesis
+        // column admissible, and checking it first says so rather than implying it.
+        if self.node_id == GENESIS_NODE_ID {
+            return Err(SummaryRejection::ReservedColumn);
+        }
         for row in self.deltas.values() {
             if row.delta_micro < 0 || row.total_micro < row.delta_micro {
                 return Err(SummaryRejection::MalformedDeltas);
@@ -502,6 +514,23 @@ fn check_evidence(evidence: &[ShareProof]) -> Result<ScreenedEvidence, SummaryRe
 /// by construction — a zero is represented by absence, so content-equal tables are always
 /// byte-equal and the table root cannot be split by an explicit-zero-versus-absent accident.
 pub type AccruedColumns = BTreeMap<NodeId, BTreeMap<String, i64>>;
+
+/// The reserved column holding the opening balances converted from the genesis checkpoint.
+///
+/// Every node writes the IDENTICAL opening balances here, rather than each into its own column,
+/// because [`ShardTable::owed`] sums across columns: a per-node genesis column would make every
+/// miner's opening balance `fleet_size` times too large the moment two tables merged, and it would
+/// look healthy on any single node until then.
+///
+/// ⚠ **The all-zero id is reserved by enforcement, not by cryptography.** An earlier version of
+/// this reasoned that all-zero bytes are not a valid ed25519 public key and therefore unsignable;
+/// that is **false** — `ed25519_dalek::VerifyingKey::from_bytes([0u8; 32])` succeeds, it is a
+/// low-order point. So the guarantee is made structurally instead: [`ShardTable::merge_accrued`]
+/// skips this column and [`EpochSummary::verify_stateless`] refuses a summary claiming it, so the
+/// only writer is [`ShardTable::install_genesis`], which no network path calls. Left to a key
+/// property that does not hold, a peer could have max-merged an inflated opening balance that is
+/// indistinguishable from genesis and, being a max, permanent.
+pub const GENESIS_NODE_ID: NodeId = [0u8; 32];
 
 /// The network shard: the payable state of the pool, small enough to ship whole (§12.6).
 ///
@@ -598,8 +627,33 @@ impl ShardTable {
     /// deliberately not merged — it never crosses the mesh, so there is nothing to merge and no
     /// stale copy to resurrect. Non-positive incoming cells are skipped: honest tables never
     /// contain them, and merging one could only create a dead cell that splits the table root.
+    /// Install the reserved genesis column — the ONLY writer of [`GENESIS_NODE_ID`].
+    ///
+    /// Called twice in a node's life on paths that are both local: once at the Stage 5 ceremony
+    /// from the pinned conversion, and once per process start when the persisted table is
+    /// reloaded. Deliberately not reachable from any message handler, which is what makes
+    /// "a peer cannot inflate the opening balances" a property of the type rather than a habit.
+    ///
+    /// Replace, not merge: the caller holds the pinned truth, and a max here would let a corrupted
+    /// larger value on disk survive a correction.
+    pub fn install_genesis(&mut self, column: BTreeMap<String, i64>) {
+        let column: BTreeMap<String, i64> =
+            column.into_iter().filter(|(_, v)| *v != 0).collect();
+        if column.is_empty() {
+            self.accrued.remove(&GENESIS_NODE_ID);
+        } else {
+            self.accrued.insert(GENESIS_NODE_ID, column);
+        }
+    }
+
     pub fn merge_accrued(&mut self, other: &AccruedColumns) {
         for (node, column) in other {
+            // The reserved opening-balance column is never taken from a peer. Every node derives
+            // it from the same pinned checkpoint, so there is nothing to learn here and a max
+            // could only ever ratchet it upward — permanently, and disguised as genesis.
+            if *node == GENESIS_NODE_ID {
+                continue;
+            }
             for (addr, &value) in column {
                 let current = self
                     .accrued
@@ -759,6 +813,97 @@ mod tests {
         let summary = EpochSummary::build(epoch, id, prior, &evidence, compute_merkle_root)
             .expect("evidence is legal");
         (summary, evidence)
+    }
+
+    /// The reserved genesis column is not writable by a peer's table.
+    ///
+    /// It holds every miner's opening balance, identically on all eight nodes, and merging is a
+    /// **max** — so a single accepted inflation is permanent and indistinguishable from genesis.
+    /// The protection is this skip, not the id being unsignable: `[0u8; 32]` loads fine as an
+    /// ed25519 low-order point, which the first draft of the genesis module got wrong.
+    #[test]
+    fn a_peer_column_cannot_write_the_reserved_genesis_slot() {
+        let mut table = ShardTable::new();
+        table.install_genesis(BTreeMap::from([("bc1qalice".to_string(), 1_000i64)]));
+        let before = table.compute_table_root();
+
+        let mut hostile: AccruedColumns = BTreeMap::new();
+        hostile.insert(
+            GENESIS_NODE_ID,
+            BTreeMap::from([("bc1qalice".to_string(), i64::MAX)]),
+        );
+        // A legitimate peer column in the same message must still land, or the skip would be a
+        // denial-of-service dressed as a guard.
+        hostile.insert(
+            [7u8; 32],
+            BTreeMap::from([("bc1qbob".to_string(), 500i64)]),
+        );
+        table.merge_accrued(&hostile);
+
+        assert_eq!(
+            table.accrued().get(&GENESIS_NODE_ID),
+            Some(&BTreeMap::from([("bc1qalice".to_string(), 1_000i64)])),
+            "the genesis column must be untouched"
+        );
+        assert_eq!(
+            table.accrued().get(&[7u8; 32]),
+            Some(&BTreeMap::from([("bc1qbob".to_string(), 500i64)])),
+            "an ordinary peer column in the same merge must still be applied"
+        );
+        assert_ne!(before, table.compute_table_root(), "bob's column did land");
+        assert_eq!(table.owed().get("bc1qalice"), Some(&1_000));
+    }
+
+    /// A summary claiming the reserved column is refused BEFORE its signature is examined.
+    ///
+    /// The ordering is the point: the answer must not depend on whether someone can produce a
+    /// signature for the all-zero key, because that is exactly the assumption that turned out to
+    /// be wrong. Asserting the variant is `ReservedColumn` rather than `BadSignature` is what
+    /// pins the ordering — a garbage signature would fail either way.
+    #[test]
+    fn a_summary_claiming_the_reserved_column_is_refused_before_its_signature() {
+        let id = identity();
+        let (mut summary, evidence) = summarise(
+            1,
+            &id,
+            &BTreeMap::new(),
+            vec![share(1_000, 1, "bc1qalice", 1.0)],
+        );
+        summary.node_id = GENESIS_NODE_ID;
+
+        assert_eq!(
+            summary.verify_stateless(),
+            Err(SummaryRejection::ReservedColumn),
+            "must reject as a reserved-column claim, not as a signature failure"
+        );
+
+        let mut table = ShardTable::new();
+        let before = table.compute_table_root();
+        assert_eq!(
+            table.apply_summary(&summary, &evidence, compute_merkle_root),
+            Err(SummaryRejection::ReservedColumn)
+        );
+        assert_eq!(
+            table.compute_table_root(),
+            before,
+            "a rejected summary must leave the table byte-identical"
+        );
+    }
+
+    /// Installing genesis is a replace, not a max — a corrupted larger value on disk must lose to
+    /// the pinned truth, or a self-check could never correct anything.
+    #[test]
+    fn installing_genesis_replaces_rather_than_maxes() {
+        let mut table = ShardTable::new();
+        table.install_genesis(BTreeMap::from([("bc1qalice".to_string(), i64::MAX)]));
+        table.install_genesis(BTreeMap::from([("bc1qalice".to_string(), 1_000i64)]));
+        assert_eq!(table.owed().get("bc1qalice"), Some(&1_000));
+
+        // And an empty install clears the column rather than leaving an empty map behind, so the
+        // canonical "absent == zero" form the table root depends on is preserved.
+        table.install_genesis(BTreeMap::new());
+        assert!(table.accrued().get(&GENESIS_NODE_ID).is_none());
+        assert_eq!(table.compute_table_root(), ShardTable::new().compute_table_root());
     }
 
     /// Epochs come from block height and an epoch length, nothing else — never wall-clock
