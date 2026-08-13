@@ -34,24 +34,16 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
-use ghost_common::coinbase_tags::MIN_DIFFICULTY_TIER_LOG2;
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::share_batch::creditable_difficulty;
 use ghost_common::share_shard::{
-    epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS, RETENTION_EPOCHS,
+    epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS, NETWORK_TIER_LOG2, RETENTION_EPOCHS,
 };
 use ghost_common::types::ShareProof;
 use ghost_reconciliation::batch::compute_merkle_root;
 use ghost_storage::database::Database;
 
-/// The tier floor a share must have committed to before its work enters the shared shard.
-///
-/// Stage 2 ships R = 1: this equals the vardiff floor, so behaviour is byte-for-byte today's, and
-/// raising R later is a coordinated roll of this one constant. Baked into the binary, NEVER read
-/// from local config — a node-local value in an eligibility test is exactly how M-6 split the
-/// fleet (§12.1: validity must be a pure function of the share).
-pub const NETWORK_TIER_LOG2: u32 = MIN_DIFFICULTY_TIER_LOG2;
 
 /// Epochs one tick may fold. Bounds the work done against the shared connection between two
 /// share-ingest writes: a node that is many epochs behind catches up across ticks — resume, not

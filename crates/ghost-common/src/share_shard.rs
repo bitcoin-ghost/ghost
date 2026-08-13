@@ -87,6 +87,43 @@ const _: () = assert!(
     "RETENTION_EPOCHS must be at least twice SAMPLING_WINDOW_EPOCHS"
 );
 
+/// The tier floor a share must have committed to before its work crosses the mesh.
+///
+/// Stage 2 ships **R = 1**: defined as the vardiff floor, so every share that exists today is
+/// network tier and behaviour is byte-for-byte what it is now. Raising R later is a coordinated
+/// roll of this one constant, and it divides mesh traffic, verification compute and memory by R
+/// simultaneously.
+///
+/// Defined in terms of `MIN_DIFFICULTY_TIER_LOG2` rather than repeating its value, because the
+/// coupling to the vardiff floor is real and was previously documented but unenforced — a floor
+/// that moved without this moving would silently drop every share between the two.
+///
+/// Baked into the binary, NEVER read from local config. A node-local value in an eligibility test
+/// is exactly how M-6 split the fleet: validity must be a pure function of the share (§12.1).
+pub const NETWORK_TIER_LOG2: u32 = crate::coinbase_tags::MIN_DIFFICULTY_TIER_LOG2;
+
+/// Whether a share crosses the mesh under the network-tier rule.
+///
+/// ⚠ **A share with no tier is NOT refused.** `tier_log2` is `None` only for shares mined before
+/// the tier gate, and a share must be judged by the rules of the era it was mined in — the lesson
+/// that cost four days and a fleet-wide quarantine when a height-derived predicate was applied to
+/// shares of every era at once. Refusing them here would be M-6 all over again: a receive-side
+/// check rejecting what a peer legitimately sent, deterministically, for ever, which no amount of
+/// retransmission can fix.
+///
+/// Pre-gate shares are excluded from the shard by a different route — the fold's input query
+/// requires a tier — so letting them cross the mesh costs nothing and keeps the legacy ledger
+/// whole.
+///
+/// One spelling, called by the send side and the receive side both. Two copies of a gossip
+/// predicate that disagree is a partition that looks like a bug in something else.
+pub fn crosses_network_tier(tier_log2: Option<u32>) -> bool {
+    match tier_log2 {
+        Some(tier) => tier >= NETWORK_TIER_LOG2,
+        None => true,
+    }
+}
+
 /// Which epoch a block height falls in.
 ///
 /// Height-keyed and nothing else (§12.2). The previous design keyed windows to each node's local
@@ -617,6 +654,31 @@ mod tests {
 
     /// Epochs come from block height and an epoch length, nothing else — never wall-clock
     /// (§12.2). Same height, same epoch, on any node at any time of day.
+    #[test]
+    fn a_share_with_no_tier_crosses_the_mesh_unrefused() {
+        // The failure being pinned is M-6's shape, and M-6 ran at 2,000-2,900 rejections an hour
+        // on every node: a receive-side check that deterministically refuses what a peer
+        // legitimately sent. Retransmission never fixes it, because the rejection is a function of
+        // the share itself, so the two ledgers simply diverge for ever.
+        //
+        // `None` means the share predates the tier gate. It must be judged by the rules of its own
+        // era, not by one armed after it was mined.
+        assert!(
+            crosses_network_tier(None),
+            "a pre-gate share must not be refused by a rule that did not exist when it was mined"
+        );
+
+        // At R = 1 the floor is the vardiff floor, so everything real crosses and the mechanism
+        // ships inert — which is what makes raising R later a one-constant roll rather than a
+        // behaviour change on the money path.
+        assert!(crosses_network_tier(Some(NETWORK_TIER_LOG2)));
+        assert!(crosses_network_tier(Some(NETWORK_TIER_LOG2 + 4)));
+        assert!(
+            !crosses_network_tier(Some(NETWORK_TIER_LOG2 - 1)),
+            "a share carrying a tier below the floor is the one case the filter exists for"
+        );
+    }
+
     #[test]
     fn epochs_are_derived_from_height_alone() {
         let len = NonZeroU64::new(144).expect("non-zero");

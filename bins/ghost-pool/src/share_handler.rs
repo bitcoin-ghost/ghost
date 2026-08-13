@@ -103,6 +103,23 @@ impl ShareProofHandler {
             return Ok(());
         }
 
+        // Network tier: the receive-side mirror of the send-side filter, sharing ONE spelling of
+        // the predicate. Two copies of a gossip rule that disagree is a partition that presents as
+        // a bug in something else entirely.
+        //
+        // A share with no tier is deliberately NOT refused — it predates the tier gate and must be
+        // judged by the rules of its own era. Refusing it here would be M-6 again: a deterministic
+        // receive-side rejection of what a peer legitimately sent, which retransmission can never
+        // fix. Pre-gate shares are kept out of the shard by the fold's input query instead.
+        if !ghost_common::share_shard::crosses_network_tier(proof.tier_log2) {
+            debug!(
+                tier_log2 = ?proof.tier_log2,
+                floor = ghost_common::share_shard::NETWORK_TIER_LOG2,
+                "Rejecting gossiped share below the network tier"
+            );
+            return Ok(());
+        }
+
         // Timestamp freshness check
         let now = Utc::now().timestamp();
         let ts = proof.timestamp as i64;

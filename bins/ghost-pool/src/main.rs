@@ -8028,6 +8028,17 @@ async fn main() -> Result<()> {
                 miner_id = %share.miner_id,
                 "Solo mode: share proof not broadcast (solo cannot touch the public ledger)"
             );
+        } else if !ghost_common::share_shard::crosses_network_tier(proof.tier_log2) {
+            // Stage 2, network tier. At R = 1 this arm is unreachable — the floor equals the
+            // vardiff floor, so every share that exists today crosses — and that is the point:
+            // the mechanism ships inert, and raising R later is a roll of one constant rather
+            // than a change to this path. The share is still recorded locally for vardiff, stats
+            // and the miner's own credit; only the mesh hop is withheld.
+            tracing::trace!(
+                miner_id = %share.miner_id,
+                tier_log2 = ?proof.tier_log2,
+                "Below network tier: recorded locally, not gossiped"
+            );
         } else if let Err(e) = share_broadcast_tx.try_send(proof) {
             tracing::warn!(error = %e, "Share broadcast channel full or closed");
         }
