@@ -101,6 +101,10 @@ pub mod topics {
     pub const SHARD_TABLE_SYNC: &[u8] = b"shdsync";
     /// Share shard: bad-share evidence broadcast (§12.4: rejections are publishable evidence).
     pub const SHARD_EVIDENCE: &[u8] = b"shdevid";
+    /// Share shard: §6 sampling — ask a node for specific leaves of an epoch it summarised.
+    pub const SHARD_SAMPLE_REQUEST: &[u8] = b"shdsreq";
+    /// Share shard: §6 sampling — the requested leaves, each with its Merkle path.
+    pub const SHARD_SAMPLE_RESPONSE: &[u8] = b"shdsrsp";
 }
 
 /// Default TTL for gossip messages (number of hops before message is dropped)
@@ -350,6 +354,23 @@ pub enum MessageType {
     /// carried Merkle path binds the share to that root, and the share fails a validity check any
     /// peer can re-run: everyone reaches the same verdict from the same bytes.
     ShardEvidence,
+    /// Share shard: §6 sampling request (sampler → summarising node).
+    ///
+    /// Without this pair, §6's "sampled, asynchronous" layer is unreachable: a summary's root
+    /// commits to shares nobody can ask for. The request names an epoch, the node that
+    /// summarised it, the exact signed root being audited, and the leaf indices wanted — chosen
+    /// by [`crate::shard_handler::select_sample_indices`] from randomness the responder cannot
+    /// know in advance, which is the whole audit value (a node that can predict its samples
+    /// keeps exactly those leaves honest).
+    ShardSampleRequest,
+    /// Share shard: §6 sampling response (summarising node → sampler).
+    ///
+    /// The requested shares, each with the Merkle path placing it under the signed root the
+    /// request named. Separate from `ShardSampleRequest` rather than multiplexed one type
+    /// (the `ShardTableSync` shape) because their size profiles differ by three orders of
+    /// magnitude — a request is a list of integers, a response carries whole shares — and one
+    /// shared cap would either strangle the response or hand request-flooders a huge budget.
+    ShardSampleResponse,
 }
 
 impl MessageType {
@@ -396,6 +417,8 @@ impl MessageType {
             Self::ShardEpochSummary => topics::SHARD_EPOCH_SUMMARY,
             Self::ShardTableSync => topics::SHARD_TABLE_SYNC,
             Self::ShardEvidence => topics::SHARD_EVIDENCE,
+            Self::ShardSampleRequest => topics::SHARD_SAMPLE_REQUEST,
+            Self::ShardSampleResponse => topics::SHARD_SAMPLE_RESPONSE,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
@@ -446,6 +469,8 @@ impl MessageType {
             Self::ShardEpochSummary => "shdsum",
             Self::ShardTableSync => "shdsync",
             Self::ShardEvidence => "shdevid",
+            Self::ShardSampleRequest => "shdsreq",
+            Self::ShardSampleResponse => "shdsrsp",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
@@ -2353,6 +2378,109 @@ impl ShardEvidenceMessage {
     }
 }
 
+/// Share shard: §6 sampling request (sampler → summarising node).
+///
+/// Deliberately unsigned, like `ShardTableSyncMessage::Request`: a request asserts nothing that
+/// needs a signature to be safe — the response self-authenticates against the ACCUSED's already
+/// signed root, and the mesh envelope authenticates the transport. What the request must pin is
+/// WHICH commitment is being audited, hence `share_root` alongside the epoch: a node that signed
+/// two different summaries for one epoch (equivocation) must not get to choose which tree it
+/// answers from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardSampleRequestMessage {
+    /// The epoch being audited.
+    pub epoch: u64,
+    /// The node whose summary is being audited — the only party holding the leaves, since share
+    /// evidence never leaves its node (§4.3) and is kept `RETENTION_EPOCHS` for exactly this.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub target_node: NodeId,
+    /// The signed `share_root` the requester holds for `(target_node, epoch)`. The response is
+    /// verified against THIS root, not against whatever the responder currently claims.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub share_root: [u8; 32],
+    /// Leaf indices wanted, strictly ascending (the canonical form
+    /// [`crate::shard_handler::select_sample_indices`] emits) — without replacement, each
+    /// `< share_count`. Ascending order leaks nothing: the SET is what was sampled, and by the
+    /// time the responder sees it the root is already signed.
+    pub leaf_indices: Vec<u32>,
+    /// The node asking.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub requesting_node: NodeId,
+}
+
+/// One served leaf: a share and the Merkle path placing it under the audited root.
+///
+/// Deliberately the same `(share, leaf_index, merkle_proof)` triple that rides in
+/// [`ShardEvidenceMessage`] — a leaf that fails validity is republished as evidence VERBATIM,
+/// so there is exactly one evidence format and nothing to translate (or to get wrong) between
+/// "what I sampled" and "what I accuse with".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSampleLeaf {
+    /// Index of `share.share_hash` among the epoch's canonical leaves (< the signed
+    /// `share_count`).
+    pub leaf_index: u32,
+    /// The share exactly as committed under the epoch's root.
+    pub share: ShareProof,
+    /// Sibling path for the injected `verify_merkle_proof`.
+    #[serde(with = "ghost_common::serde_hex::vec_bytes32")]
+    pub merkle_proof: Vec<[u8; 32]>,
+}
+
+/// Share shard: §6 sampling response (summarising node → sampler).
+///
+/// A response MAY answer a subset of the request: the worst-case leaf (a cap-sized share plus a
+/// maximal path) is large enough that a full default-λ sample is not guaranteed to fit one
+/// envelope — see `MAX_SHARD_SAMPLE_RESPONSE_SIZE` for the arithmetic. Unanswered indices are
+/// surfaced by the handler for the caller to chase; they are never silently forgiven.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSampleResponseMessage {
+    /// The epoch served.
+    pub epoch: u64,
+    /// The node answering — necessarily the summarising node, the only holder of the evidence.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub responding_node: NodeId,
+    /// The signed root the served leaves are claimed against — must equal the request's.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub share_root: [u8; 32],
+    /// The served leaves, in the request's (ascending) index order.
+    pub leaves: Vec<ShardSampleLeaf>,
+    /// ed25519 by `responding_node` over [`Self::signing_message`]. The leaves already
+    /// self-authenticate against the signed root, so this signature exists for the OTHER
+    /// direction: it makes a junk response — wrong leaves, unbindable paths — attributable to
+    /// its author instead of deniable as transport noise. `Vec<u8>` because serde's array impls
+    /// stop at 32.
+    pub signature: Vec<u8>,
+}
+
+impl ShardSampleResponseMessage {
+    /// The message the responder signs.
+    ///
+    /// Domain-tagged, every variable-length part length-prefixed (the `compute_state_root`
+    /// discipline), and the share bound by its own canonical `signing_bytes()` — its CONTENT,
+    /// not just its leaf hash — so no two distinct responses can serialise to the same bytes and
+    /// no field can be swapped in flight without breaking the signature.
+    pub fn signing_message(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"ShardSampleResponse/v1");
+        hasher.update(self.epoch.to_le_bytes());
+        hasher.update(self.responding_node);
+        hasher.update(self.share_root);
+        hasher.update((self.leaves.len() as u32).to_le_bytes());
+        for leaf in &self.leaves {
+            hasher.update(leaf.leaf_index.to_le_bytes());
+            let share_bytes = leaf.share.signing_bytes();
+            hasher.update((share_bytes.len() as u32).to_le_bytes());
+            hasher.update(&share_bytes);
+            hasher.update((leaf.merkle_proof.len() as u32).to_le_bytes());
+            for node in &leaf.merkle_proof {
+                hasher.update(node);
+            }
+        }
+        hasher.finalize().into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2726,7 +2854,7 @@ mod tests {
     /// with `topic`. That is what this pins.
     #[test]
     fn shard_message_types_are_fully_and_consistently_registered() {
-        let cases: [(MessageType, &[u8], &str); 3] = [
+        let cases: [(MessageType, &[u8], &str); 5] = [
             (
                 MessageType::ShardEpochSummary,
                 topics::SHARD_EPOCH_SUMMARY,
@@ -2741,6 +2869,16 @@ mod tests {
                 MessageType::ShardEvidence,
                 topics::SHARD_EVIDENCE,
                 "shdevid",
+            ),
+            (
+                MessageType::ShardSampleRequest,
+                topics::SHARD_SAMPLE_REQUEST,
+                "shdsreq",
+            ),
+            (
+                MessageType::ShardSampleResponse,
+                topics::SHARD_SAMPLE_RESPONSE,
+                "shdsrsp",
             ),
         ];
         for (msg_type, topic, expected) in cases {
@@ -2761,7 +2899,7 @@ mod tests {
         // ZMQ subscriptions match by PREFIX: a topic that extends another (or is extended by
         // one) delivers cross-traffic to the wrong subscriber. Check the new topics against
         // every registered topic, both directions.
-        let all: [&[u8]; 33] = [
+        let all: [&[u8]; 35] = [
             topics::SHARE,
             topics::BLOCK,
             topics::PAYOUT_PROPOSAL,
@@ -2795,11 +2933,15 @@ mod tests {
             topics::SHARD_EPOCH_SUMMARY,
             topics::SHARD_TABLE_SYNC,
             topics::SHARD_EVIDENCE,
+            topics::SHARD_SAMPLE_REQUEST,
+            topics::SHARD_SAMPLE_RESPONSE,
         ];
         for new in [
             topics::SHARD_EPOCH_SUMMARY,
             topics::SHARD_TABLE_SYNC,
             topics::SHARD_EVIDENCE,
+            topics::SHARD_SAMPLE_REQUEST,
+            topics::SHARD_SAMPLE_RESPONSE,
         ] {
             for existing in all {
                 if existing == new {

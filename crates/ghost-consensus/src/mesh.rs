@@ -1821,10 +1821,14 @@ impl MeshNetwork {
             // The shard IS the payout ledger — who is owed what, per address. Financial data
             // defaults to Noise here for the same reason the batch chain does: a new financial
             // message that falls to plaintext is the kind of omission that never announces
-            // itself.
+            // itself. The sample pair additionally carries the AUDIT: which leaves are being
+            // pulled must not be readable in flight, or an on-path observer hands the sampled
+            // node its answers early.
             | MessageType::ShardEpochSummary
             | MessageType::ShardTableSync
             | MessageType::ShardEvidence
+            | MessageType::ShardSampleRequest
+            | MessageType::ShardSampleResponse
             | MessageType::ElderUpdate
             | MessageType::ZkBlockProposal
             | MessageType::ZkVote
@@ -2217,6 +2221,8 @@ impl MeshNetwork {
             | MessageType::ShardEpochSummary
             | MessageType::ShardTableSync
             | MessageType::ShardEvidence
+            | MessageType::ShardSampleRequest
+            | MessageType::ShardSampleResponse
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             // GhostGlyph messages use consensus voting port
@@ -3313,6 +3319,8 @@ impl MeshNetwork {
             | MessageType::ShardEpochSummary
             | MessageType::ShardTableSync
             | MessageType::ShardEvidence
+            | MessageType::ShardSampleRequest
+            | MessageType::ShardSampleResponse
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {
@@ -4250,6 +4258,8 @@ mod tests {
                 | MessageType::ShardEpochSummary
                 | MessageType::ShardTableSync
                 | MessageType::ShardEvidence
+                | MessageType::ShardSampleRequest
+                | MessageType::ShardSampleResponse
                 | MessageType::ElderUpdate
                 | MessageType::ZkBlockProposal
                 | MessageType::ZkVote
@@ -4407,6 +4417,14 @@ mod tests {
             message_type_requires_noise(MessageType::ShardEvidence),
             "ShardEvidence must use Noise"
         );
+        assert!(
+            message_type_requires_noise(MessageType::ShardSampleRequest),
+            "ShardSampleRequest must use Noise — the audit's leaf choice must not be readable in flight"
+        );
+        assert!(
+            message_type_requires_noise(MessageType::ShardSampleResponse),
+            "ShardSampleResponse must use Noise"
+        );
     }
 
     /// Registration check for the share-shard message types: they must route to the
@@ -4428,6 +4446,8 @@ mod tests {
             MessageType::ShardEpochSummary,
             MessageType::ShardTableSync,
             MessageType::ShardEvidence,
+            MessageType::ShardSampleRequest,
+            MessageType::ShardSampleResponse,
         ] {
             assert!(
                 mesh.is_valid_msg_type_for_port(msg_type, voting),
