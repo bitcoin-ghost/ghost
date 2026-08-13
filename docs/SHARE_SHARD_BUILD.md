@@ -5,6 +5,33 @@ from the system as it stands to the design, and should be deleted once the cutov
 
 Written 2026-08-13. Target: v1 by **2026-08-31**.
 
+## Status — 2026-08-13
+
+**Stage 1 is complete and independently verified: 974 tests, 0 failures.** All of it is dark; the
+only thing wired into a running path so far is the `pool.share_shard` flag, which defaults false.
+
+| piece | where | state |
+|---|---|---|
+| counter core | `crates/ghost-common/src/share_shard.rs` | ✅ 428 tests |
+| storage + migration v53 | `crates/ghost-storage/src/shard_store.rs` | ✅ 219 tests |
+| mesh types + handlers | `crates/ghost-consensus/src/shard_handler.rs` | ✅ 327 tests |
+| §6 leaf sampling | same | ✅ included above |
+| `pool.share_shard` flag | `crates/ghost-common/src/config.rs` | ✅ committed, dark |
+| epoch runtime | `bins/ghost-pool/src/shard.rs` | 🔨 in progress |
+| `main.rs` wiring | 3 insertion points | 🔨 drafted, held until the runtime lands |
+
+**Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
+share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
+
+**Not started:** Stage 2 network-tier split (ship at R=1), Stage 3 coinbase source and settlement,
+Stage 5 genesis ceremony, Stage 6 deletion.
+
+⚠ **Eight design errors were found by *building* the design, none by re-reading it** — the counter
+double-payment, deltas not being max-mergeable, the §6/§12.3 contradiction, evidence retention on
+the wrong clock, the whole-table scaling ceiling, the merkle dependency direction, two spellings of
+one predicate, and expiry being indistinguishable from refusal. Assume the remaining stages hide
+more of the same, and prefer building a thin slice early over perfecting the document.
+
 ---
 
 ## The three facts that govern the whole plan
