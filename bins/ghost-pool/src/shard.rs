@@ -114,6 +114,22 @@ pub struct ShardRuntime {
     /// solo work into the shared shard, so the gate sits here rather than in the caller, where
     /// one missed call site would leak silently.
     solo: bool,
+    /// Whether this node's shard OWNS the `shares` table — i.e. whether retention may delete from
+    /// it. **False until cutover, and that is a money-safety gate, not a tidiness one.**
+    ///
+    /// Retention deletes evidence from `shares`, which is the same table the legacy payout path
+    /// still computes unpaid balances from. While both ledgers are live, a delete here removes
+    /// work the old machinery would have paid for — so enabling the shard would silently reduce
+    /// what miners are owed, roughly `RETENTION_EPOCHS` after the flag was set.
+    ///
+    /// That breaks the property the whole dark-ship approach rests on: **dark must mean changes
+    /// nothing.** A feature that quietly deletes production rows is not dark, however carefully
+    /// the rest of it is gated.
+    ///
+    /// Stage 5 renames `shares` to `shares_archive` and the shard becomes authoritative; this
+    /// flips there, in the same change, and not before. Until then retention still *computes* its
+    /// expiry and logs it, so the behaviour is observable without being destructive.
+    owns_evidence: bool,
     /// The merged shard table. Guarded by one mutex and held across a fold — fold, persist and
     /// the in-memory credit must be a single observable step, and nothing else takes this lock
     /// while holding another.
@@ -141,18 +157,24 @@ impl ShardRuntime {
     /// the pool down. The shard is an observation, and killing the node because an observation
     /// could not start would make the safer configuration the riskier one to deploy — log it,
     /// carry `None`, keep mining.
-    pub fn load(identity: Arc<NodeIdentity>, db: Arc<Database>, solo: bool) -> GhostResult<Self> {
+    pub fn load(
+        identity: Arc<NodeIdentity>,
+        db: Arc<Database>,
+        solo: bool,
+        owns_evidence: bool,
+    ) -> GhostResult<Self> {
         let table = db.shard_load_table()?;
         let received_by = hex::encode(&identity.node_id()[..8]);
         info!(
             columns = table.accrued().len(),
-            solo, "share shard: runtime loaded"
+            solo, owns_evidence, "share shard: runtime loaded"
         );
         Ok(Self {
             identity,
             db,
             received_by,
             solo,
+            owns_evidence,
             table: Mutex::new(table),
             next_fold: Mutex::new(None),
             last_epoch_seen: AtomicU64::new(0),
@@ -317,9 +339,28 @@ impl ShardRuntime {
         }
 
         let (expired_epoch, expired_hashes) = self.expired_evidence(epoch)?;
-        let evidence_dropped =
-            self.db
-                .shard_fold_epoch(&node, &column, &summary, &expired_hashes)?;
+
+        // Retention is COMPUTED always and ACTED ON only when this shard owns the table. While
+        // the legacy payout path still reads `shares`, deleting from it would reduce what miners
+        // are owed by the machinery that is still paying them — see `owns_evidence`. Logging the
+        // count keeps the behaviour observable during the dark soak without being destructive.
+        let to_delete: &[[u8; 32]] = if self.owns_evidence {
+            &expired_hashes
+        } else {
+            if !expired_hashes.is_empty() {
+                info!(
+                    epoch,
+                    expired_epoch = ?expired_epoch,
+                    would_drop = expired_hashes.len(),
+                    "share shard: retention withheld — the legacy ledger still owns `shares`"
+                );
+            }
+            &[]
+        };
+
+        let evidence_dropped = self
+            .db
+            .shard_fold_epoch(&node, &column, &summary, to_delete)?;
 
         // Only after the transaction has committed does the in-memory table move — a failed
         // fold must leave the counters untouched, or memory and disk drift apart and the next
@@ -403,7 +444,7 @@ mod tests {
         let db = Arc::new(Database::in_memory().expect("db"));
         db.set_encryption_key([0x42u8; 32]);
         let rt =
-            ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), false).expect("load");
+            ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), false, true).expect("load");
         (identity, db, rt)
     }
 
@@ -521,7 +562,7 @@ mod tests {
 
         // And across a restart: the summary row is the durable marker, so a fresh runtime
         // reaches the same verdict.
-        let rt2 = ShardRuntime::load(identity, db, false).expect("reload");
+        let rt2 = ShardRuntime::load(identity, db, false, true).expect("reload");
         assert_eq!(rt2.fold_epoch(100).expect("refold"), FoldOutcome::AlreadyFolded);
         assert_eq!(rt2.owed().get("bc1qalice"), Some(&micro_work(5.0)));
     }
@@ -680,7 +721,7 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let db = Arc::new(Database::in_memory().expect("db"));
         db.set_encryption_key([0x42u8; 32]);
-        let rt = ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), true).expect("load");
+        let rt = ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), true, true).expect("load");
         let rx = our_received_by(&identity);
         seed_round(&db, 1, 602);
         seed_share(&db, 1, 0xA1, "bc1qsolo", 2.0, Some(12), &rx, true);
@@ -744,7 +785,7 @@ mod tests {
         // the walk continues from 102 — including empty epochs, which fold to an empty summary
         // so the walk can advance past them. Bounded: 102..=107 are closed (current is 108),
         // but one tick folds at most MAX_FOLDS_PER_TICK of them.
-        let rt2 = ShardRuntime::load(identity, db, false).expect("reload");
+        let rt2 = ShardRuntime::load(identity, db, false, true).expect("reload");
         let t = rt2.tick(108 * 6 + 2).expect("tick");
         assert_eq!(
             t.folded.iter().map(|r| r.epoch).collect::<Vec<_>>(),
@@ -768,6 +809,51 @@ mod tests {
     /// `note_height` reports each boundary crossing exactly once. The first observation ever
     /// initialises silently (there is no epoch to have crossed FROM), repeats inside an epoch
     /// are false, and a height that steps backwards neither reports nor rewinds the latch.
+    #[test]
+    fn retention_is_withheld_while_the_legacy_ledger_owns_shares() {
+        // The failure this pins is a money bug wearing a tidiness costume. Retention deletes from
+        // `shares`, the same table the legacy payout path computes unpaid balances from. Delete
+        // there while both ledgers are live and miners are silently owed less — roughly
+        // RETENTION_EPOCHS after somebody set a flag they were told was dark. "Dark" has to mean
+        // changes nothing, so the fold must compute its expiry and act on none of it.
+        let identity = Arc::new(NodeIdentity::generate());
+        let db = Arc::new(Database::in_memory().expect("db"));
+        db.set_encryption_key([0x42u8; 32]);
+        // owns_evidence = false: the pre-cutover setting, and the only one that ships until
+        // `shares` has been renamed out from under the legacy path.
+        let rt = ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), false, false)
+            .expect("load");
+        let rx = our_received_by(&identity);
+
+        for epoch in 100u64..=106 {
+            seed_round(&db, epoch, epoch * 6);
+            seed_share(&db, epoch, epoch as u8, "bc1qminer", 2.0, Some(12), &rx, true);
+        }
+        for epoch in 100u64..=105 {
+            rt.fold_epoch(epoch).expect("fold");
+        }
+
+        // Same boundary the sibling test uses: folding 106 expires 100. There, one row goes; here,
+        // the expiry is still COMPUTED — so the behaviour stays observable — and acted on not at all.
+        let FoldOutcome::Folded(r) = rt.fold_epoch(106).expect("fold") else {
+            panic!("must fold");
+        };
+        assert_eq!(
+            r.expired_epoch,
+            Some(106 - RETENTION_EPOCHS),
+            "expiry must still be computed, or the withholding is indistinguishable from a bug"
+        );
+        assert_eq!(
+            r.evidence_dropped, 0,
+            "retention must delete nothing while the legacy ledger still owns `shares`"
+        );
+        assert_eq!(
+            evidence_count(&db, 100, &rx),
+            1,
+            "not one row may leave `shares` before cutover"
+        );
+    }
+
     #[test]
     fn note_height_reports_each_boundary_exactly_once() {
         let (_identity, _db, rt) = runtime();
