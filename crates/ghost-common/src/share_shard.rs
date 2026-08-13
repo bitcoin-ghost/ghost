@@ -173,9 +173,14 @@ pub fn shard_miner_payouts(
         return out;
     }
 
-    // Descending by owed, ascending by address on a tie. The tie-break is what makes this a total
-    // order: without it the result depends on the iteration order of whatever fed us, and two
-    // nodes holding identical balances could still build different coinbases.
+    // Descending by owed, ascending by address on a tie.
+    //
+    // ⚠ The tie-break is LATENT, not load-bearing, and no test can kill it today: the input is a
+    // `BTreeMap`, so it already arrives address-ascending, and a stable sort preserves that even
+    // without the `then_with`. It is defence against the input type changing to something
+    // unordered — a `Vec` or a `HashMap` — at which point the result would start depending on the
+    // caller's iteration order and two nodes with identical balances could build different
+    // coinbases. The live path carries the same latency, documented there as M-8.
     positive.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     positive.truncate(max_outputs);
 
@@ -791,9 +796,14 @@ mod tests {
 
     #[test]
     fn the_order_is_total_so_two_nodes_cannot_differ_on_a_tie() {
-        // Without the address tie-break the result depends on the iteration order of whatever fed
-        // us, and two nodes holding identical balances could build different coinbases — a
-        // divergence with no cause visible in the data.
+        // Pins the OUTPUT property: equal balances come out address-ascending, so two nodes with
+        // identical tables build identical coinbases.
+        //
+        // ⚠ This test cannot kill the explicit tie-break, and saying so is the point. The input is
+        // a `BTreeMap`, so it arrives address-ascending and a stable sort keeps that order with or
+        // without the `then_with`. Removing the tie-break leaves this test green — verified by
+        // mutation. The tie-break guards against the input type changing to something unordered;
+        // a test that appeared to cover it would be worse than one that admits it does not.
         let owed = owed_map(&[("bc1qz", 500), ("bc1qa", 500), ("bc1qm", 500)]);
         let r = shard_miner_payouts(&owed, 30_000, 200, 1);
 
