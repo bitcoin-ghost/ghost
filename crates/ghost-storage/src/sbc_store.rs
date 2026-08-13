@@ -75,7 +75,7 @@ pub struct ChainHead {
     pub finalised_at: i64,
 }
 
-fn blob32(v: Vec<u8>, what: &str) -> GhostResult<[u8; 32]> {
+pub(crate) fn blob32(v: Vec<u8>, what: &str) -> GhostResult<[u8; 32]> {
     <[u8; 32]>::try_from(v.as_slice())
         .map_err(|_| GhostError::Database(format!("{what} is not 32 bytes")))
 }
