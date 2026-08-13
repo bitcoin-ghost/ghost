@@ -351,32 +351,6 @@ impl Database {
     /// `ShardTable::record_settled`, and additive for the same reason: `settled` only ever
     /// grows, and each block's paid amounts arrive as increments read off the chain at coinbase
     /// maturity (§4.6). Non-positive amounts are ignored exactly as the in-memory side ignores
-    /// them, so the two can never drift on an edge case.
-    pub fn shard_record_settled(
-        &self,
-        address: &str,
-        paid_micro: i64,
-        height: u64,
-    ) -> GhostResult<()> {
-        if paid_micro <= 0 {
-            return Ok(());
-        }
-        let key = address_key(address);
-        let enc = self.encrypt_address(address)?;
-        self.with_connection(|conn| {
-            conn.execute(
-                "INSERT INTO shard_settled (address_hash, address_enc, settled_micro, \
-                 last_height) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(address_hash) DO UPDATE SET \
-                 settled_micro = settled_micro + excluded.settled_micro, \
-                 last_height = MAX(last_height, excluded.last_height)",
-                params![key, enc, paid_micro, height as i64],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
     /// Settle one matured pool block: record its hash and credit each address's paid micro-work,
     /// ONE transaction. Returns whether anything was applied — `false` means the block was
     /// already settled and NOTHING moved, which is the caller's cue to leave its in-memory
@@ -770,12 +744,18 @@ mod tests {
     /// persisted and in-memory quantities can never drift on an edge case.
     #[test]
     fn settled_accumulates_and_ignores_non_positive() {
+        // Driven through `shard_settle_block`, which is now the ONLY way settled money is written.
+        // There used to be a second path with the same SQL and no idempotence row; two spellings
+        // of one money write is how the pair drift apart, and the copy without the block hash was
+        // the one that could credit twice.
         let db = db();
-        db.shard_record_settled("bc1qalice", 60, 100).expect("pay");
-        db.shard_record_settled("bc1qalice", 40, 150)
+        db.shard_settle_block("aa", 100, &[("bc1qalice".into(), 60)])
+            .expect("pay");
+        db.shard_settle_block("bb", 150, &[("bc1qalice".into(), 40)])
             .expect("pay again");
-        db.shard_record_settled("bc1qalice", 0, 175).expect("zero");
-        db.shard_record_settled("bc1qalice", -30, 180)
+        db.shard_settle_block("cc", 175, &[("bc1qalice".into(), 0)])
+            .expect("zero");
+        db.shard_settle_block("dd", 180, &[("bc1qalice".into(), -30)])
             .expect("negative");
 
         let mut expected = ShardTable::new();

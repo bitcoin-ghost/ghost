@@ -83,7 +83,18 @@ const MAX_SETTLES_PER_CALL: usize = 4;
 /// Heights one settlement call may examine. Bounds the RPC work of a long catch-up (each height
 /// costs a `getblockhash` and a coinbase fetch); anything further behind carries to the next
 /// call, exactly as the legacy forward scan batches its own catch-up.
-const MAX_SETTLE_SCAN_BLOCKS: u64 = 100;
+/// Heights one call will examine.
+///
+/// This is an RPC-burst bound, not a correctness one. The per-call *settle* bound rarely stops the
+/// walk early, because pool blocks are rare and almost everything examined is somebody else's — so
+/// in practice a call fetches this many full blocks whatever the settle bound says, inline in a
+/// 30 s tick whose `MissedTickBehavior::Skip` would then drop fold ticks behind it.
+///
+/// Twenty per tick still catches up roughly forty times faster than blocks arrive (~8 min each),
+/// so a backlog closes quickly while no single tick spends long in RPC. Chunking the fetch so the
+/// settle bound could halt it early was considered and rejected: it would need a second copy of
+/// the decision walk to interleave with, and duplicated decision paths are what finding 5 was.
+const MAX_SETTLE_SCAN_BLOCKS: u64 = 20;
 
 /// How many consecutive calls may fail to read the same height before it is abandoned.
 ///
@@ -92,6 +103,7 @@ const MAX_SETTLE_SCAN_BLOCKS: u64 = 100;
 /// cursor would never advance past it and every later block would go unsettled, which is the same
 /// loss multiplied by every block after it. So: retry a few times, then step over it loudly.
 const MAX_BLOCK_READ_ATTEMPTS: u32 = 3;
+
 
 /// kv key holding the height the maturity lookback has reached.
 ///
@@ -766,6 +778,7 @@ impl ShardRuntime {
         blocks: &[FetchedCoinbase],
     ) -> GhostResult<SettleReport> {
         let mut report = SettleReport::default();
+        let mut processed_to: Option<u64> = None;
         for (i, block) in blocks.iter().enumerate() {
             if report.settled.len() >= MAX_SETTLES_PER_CALL {
                 report.deferred = blocks.len() - i;
@@ -789,8 +802,17 @@ impl ShardRuntime {
                 SettleBlockOutcome::AlreadySettled => report.already_settled += 1,
                 SettleBlockOutcome::Settled(s) => report.settled.push(s),
             }
-            self.db
-                .kv_set(SETTLE_CURSOR_KEY, &block.height.to_string())?;
+            processed_to = Some(block.height);
+        }
+
+        // ONE cursor write, not one per examined block. The old per-block write meant up to
+        // MAX_SETTLE_SCAN_BLOCKS autocommit fsyncs per call on the connection share ingest is
+        // waiting for — and it bought nothing: the cursor is an economy, never the idempotence
+        // (that is the recorded block hashes), so writing the last processed height once at the
+        // end is exactly equivalent. Blocks the bound deferred are not passed, so they are
+        // re-examined next call rather than skipped.
+        if let Some(height) = processed_to {
+            self.db.kv_set(SETTLE_CURSOR_KEY, &height.to_string())?;
         }
         Ok(report)
     }
