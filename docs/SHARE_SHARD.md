@@ -103,8 +103,9 @@ The gap is the coinbase and the ledger behind it. That is what this document spe
   │ merkle branch        │   │  bc1q…aa          41,203      │
   │  (once per JOB)      │   │  bc1q…7f          38,110      │
   │                      │   │  …                   …        │
-  │ ▸ DELETED each epoch │   │ ▸ KEPT — few hundred rows     │
-  │   = EVIDENCE         │   │   = STATE                     │
+  │ ▸ kept a SAMPLING    │   │ ▸ KEPT — few hundred rows     │
+  │   WINDOW, then gone  │   │   = STATE                     │
+  │   = EVIDENCE         │   │                               │
   └──────────────────────┘   └───────────────────────────────┘
 
 
@@ -137,8 +138,11 @@ The gap is the coinbase and the ledger behind it. That is what this document spe
       ▼             ▼             ▼
    NODE A        NODE B        NODE C
    read paid     read paid     read paid
-   subtract      subtract      subtract
-   drop history  drop history  drop history
+   → settled+    → settled+    → settled+
+   compact       compact       compact
+
+   settled only ever GOES UP. owed = Σaccrued − settled.
+   Nothing is ever subtracted from a counter — see §4.4.
 ```
 
 ### 4.1 Node sovereignty
