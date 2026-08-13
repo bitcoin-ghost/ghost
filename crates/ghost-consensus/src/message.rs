@@ -24,6 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use ghost_common::share_shard::{AccruedColumns, EpochSummary};
 use ghost_common::types::{
     HealthPing, NodeCapabilities, NodeId, PayoutProposal, RoundId, ShareProof,
 };
@@ -89,6 +90,17 @@ pub mod topics {
     pub const L2_SHIELD: &[u8] = b"l2shld";
     /// GhostGlyph visual identity
     pub const GLYPH: &[u8] = b"glyph";
+    /// Share shard: a node's signed per-epoch summary (delta + running total per address).
+    ///
+    /// `shd` prefix, not `sh`: ZMQ subscriptions match by PREFIX, so a topic that extends an
+    /// existing one (e.g. anything starting `share…`) would be delivered to that topic's
+    /// subscribers as well. `shdsum`/`shdsync`/`shdevid` share no prefix relation with any other
+    /// registered topic, or with each other — pinned by a test.
+    pub const SHARD_EPOCH_SUMMARY: &[u8] = b"shdsum";
+    /// Share shard: whole-table sync request/response (§12.6: ship the whole table and compare).
+    pub const SHARD_TABLE_SYNC: &[u8] = b"shdsync";
+    /// Share shard: bad-share evidence broadcast (§12.4: rejections are publishable evidence).
+    pub const SHARD_EVIDENCE: &[u8] = b"shdevid";
 }
 
 /// Default TTL for gossip messages (number of hops before message is dropped)
@@ -315,6 +327,29 @@ pub enum MessageType {
     MeshNodeListCheckpointVote,
     /// Mesh node-list checkpoint sync request/response (node ↔ peer): on-demand backfill.
     MeshNodeListCheckpointSync,
+    /// Share shard: a node's signed epoch summary (node → all).
+    ///
+    /// Carries an `EpochSummary` — per-address `delta_micro` (evidenced by the epoch's Merkle
+    /// root) and `total_micro` (the cumulative counter peers max-merge). The shares themselves
+    /// never ride with it: the signed root commits to them so §6's sampling can audit any epoch
+    /// after the fact. Verification strictly precedes any merge (§12.3) — a max cannot be undone,
+    /// so an unverified counter that reaches the table has already won.
+    ShardEpochSummary,
+    /// Share shard: whole-table sync request/response (node ↔ peer).
+    ///
+    /// §12.6: at a few hundred rows the shard is small enough to ship whole and compare, so drift
+    /// is visible the same day rather than discovered a quarter later. Multiplexes request and
+    /// response in one type by trial-deserialise — the same shape as `ShareBatchSync`.
+    ShardTableSync,
+    /// Share shard: bad-share evidence broadcast (reporter → all), modelled on
+    /// `EquivocationProofMessage`.
+    ///
+    /// §12.4: a rejection must be publishable evidence, never private sampling luck — otherwise
+    /// two nodes can disagree permanently about a third's counter, which is exactly the divergence
+    /// the shard design removes. The accused's own signed summary binds an epoch Merkle root, the
+    /// carried Merkle path binds the share to that root, and the share fails a validity check any
+    /// peer can re-run: everyone reaches the same verdict from the same bytes.
+    ShardEvidence,
 }
 
 impl MessageType {
@@ -358,6 +393,9 @@ impl MessageType {
             Self::MeshNodeListCheckpoint => topics::MESH_NODE_LIST_CHECKPOINT,
             Self::MeshNodeListCheckpointVote => topics::MESH_NODE_LIST_VOTE,
             Self::MeshNodeListCheckpointSync => topics::MESH_NODE_LIST_SYNC,
+            Self::ShardEpochSummary => topics::SHARD_EPOCH_SUMMARY,
+            Self::ShardTableSync => topics::SHARD_TABLE_SYNC,
+            Self::ShardEvidence => topics::SHARD_EVIDENCE,
             Self::L2TreeSync => topics::L2_SYNC,
             Self::L2ShieldBroadcast => topics::L2_SHIELD,
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => topics::GLYPH,
@@ -405,6 +443,9 @@ impl MessageType {
             Self::MeshNodeListCheckpoint => "mnlchk",
             Self::MeshNodeListCheckpointVote => "mnlvote",
             Self::MeshNodeListCheckpointSync => "mnlsync",
+            Self::ShardEpochSummary => "shdsum",
+            Self::ShardTableSync => "shdsync",
+            Self::ShardEvidence => "shdevid",
             Self::L2TreeSync => "l2sync",
             Self::L2ShieldBroadcast => "l2shield",
             Self::GhostGlyphClaim | Self::GhostGlyphRegistered => "glyph",
@@ -2107,6 +2148,211 @@ pub struct GhostGlyphRegisteredMessage {
     pub registered_at: u64,
 }
 
+// =============================================================================
+// SHARE SHARD Messages (docs/SHARE_SHARD.md — §4.4 merge rule, §6 verification,
+// §12.4 publishable rejection, §12.6 ship-the-whole-table)
+// =============================================================================
+
+/// Share shard: a node's signed epoch summary (node → all).
+///
+/// The summary carries its own `node_id` (= the signer's ed25519 verifying key) and signature,
+/// so the mesh envelope's sender adds nothing to its trust story: relaying a THIRD node's
+/// summary is legitimate gossip, and a receiver verifies the summary's own signature, never the
+/// relay's. Pure-handler side: `shard_handler::apply_shard_epoch_summary`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardEpochSummaryMessage {
+    /// The signed summary. Shares never ride with it — `summary.share_root` commits to them for
+    /// §6's asynchronous sampling.
+    pub summary: EpochSummary,
+}
+
+/// One node's column of the accrued table, in wire form.
+///
+/// `AccruedColumns` itself cannot cross the wire: serde_json refuses non-string map keys, and
+/// its keys are 32-byte node ids. The wire form is vectors in CANONICAL order — columns strictly
+/// ascending by `node_id`, cells strictly ascending by address, every value strictly positive —
+/// and the handler rejects anything else, so content-equal tables are byte-equal on the wire
+/// exactly as they are under `ShardTable::compute_table_root`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardColumn {
+    /// The node this column belongs to (= its ed25519 verifying key).
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub node_id: NodeId,
+    /// `(payout_address, accrued micro-work)`, ascending by address, values > 0.
+    pub cells: Vec<(String, i64)>,
+}
+
+/// The wire form of an accrued table. Canonical by construction: `BTreeMap` iteration is
+/// key-ascending on both levels, and zero cells / empty columns are dropped the same way
+/// `compute_table_root` drops them — an explicit zero and an absent cell are the same balance.
+pub fn shard_columns_from_accrued(accrued: &AccruedColumns) -> Vec<ShardColumn> {
+    accrued
+        .iter()
+        .map(|(node, column)| ShardColumn {
+            node_id: *node,
+            cells: column
+                .iter()
+                .filter(|(_, &v)| v != 0)
+                .map(|(addr, &v)| (addr.clone(), v))
+                .collect(),
+        })
+        .filter(|col| !col.cells.is_empty())
+        .collect()
+}
+
+/// Canonical bytes a table-sync response signs: domain tag, responder, root, then every column
+/// with every field length-prefixed, in wire order — the `compute_state_root` discipline, so no
+/// two distinct tables can serialise to the same bytes by running fields together.
+pub fn shard_table_sync_signing_bytes(
+    responding_node: &NodeId,
+    columns: &[ShardColumn],
+    table_root: &[u8; 32],
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(b"ShardTableSync/v1");
+    m.extend_from_slice(responding_node);
+    m.extend_from_slice(table_root);
+    m.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+    for col in columns {
+        m.extend_from_slice(&col.node_id);
+        m.extend_from_slice(&(col.cells.len() as u32).to_le_bytes());
+        for (addr, value) in &col.cells {
+            m.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+            m.extend_from_slice(addr.as_bytes());
+            m.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    m
+}
+
+/// Share shard: whole-table sync (node ↔ peer). One type for both directions, disambiguated on
+/// deserialise — the same shape `ShareBatchSync` and the convergence exchanges already use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ShardTableSyncMessage {
+    /// "Send me your whole table." Carries the requester's own root so the comparison §12.6
+    /// exists for is visible to the responder too — either side can log the drift.
+    Request {
+        /// The node asking.
+        #[serde(with = "ghost_common::serde_hex::bytes32")]
+        requesting_node: NodeId,
+        /// The requester's current whole-table root.
+        #[serde(with = "ghost_common::serde_hex::bytes32")]
+        table_root: [u8; 32],
+    },
+    /// The responder's whole accrued table plus its whole-table root.
+    ///
+    /// Only `accrued` ships: `settled` NEVER crosses the mesh (§4.4) — every node derives it
+    /// from the chain it already holds, and gossiping it would create exactly the stale copy the
+    /// two-quantity split exists to make impossible. The root therefore covers MORE than this
+    /// payload (it commits `settled` too), so it is compared for drift, not recomputed from the
+    /// payload: a mismatch after merge means either accrued the responder has and we lack —
+    /// closed by the merge itself — or a settlement one side has not yet read off the chain,
+    /// and that difference is real.
+    Response {
+        /// The node answering.
+        #[serde(with = "ghost_common::serde_hex::bytes32")]
+        responding_node: NodeId,
+        /// The whole accrued table in canonical wire form ([`shard_columns_from_accrued`]).
+        columns: Vec<ShardColumn>,
+        /// The responder's `ShardTable::compute_table_root()` at the moment of serving.
+        #[serde(with = "ghost_common::serde_hex::bytes32")]
+        table_root: [u8; 32],
+        /// ed25519 by `responding_node` over [`shard_table_sync_signing_bytes`]. The cells are
+        /// not individually signed by their owning nodes (that is §6's summary/sampling trust
+        /// surface); this signature makes the SERVED TABLE attributable — a peer that serves an
+        /// inflated cell has signed the inflation, which is what makes it publishable evidence.
+        /// `Vec<u8>` because serde's array impls stop at 32.
+        signature: Vec<u8>,
+    },
+}
+
+/// Share shard: bad-share evidence (reporter → all), modelled on [`EquivocationProofMessage`].
+///
+/// Self-contained on purpose (§12.4): the verdict must be re-derivable by every peer from the
+/// message alone, with no reliance on the reporter's honesty or the receiver's local state.
+/// The accused's own signed summary binds `(node_id, epoch, share_root, share_count)`; the
+/// Merkle path binds `share` to that root; and the share fails a validity check
+/// (PoW preimage / GHOST-09 / binding) that any peer can re-run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardEvidenceMessage {
+    /// The accused node's signed summary for the epoch, carried whole because the signature
+    /// covers ALL its fields — there is no shorter blob that still proves the accused committed
+    /// to this `share_root` and `share_count`.
+    pub summary: EpochSummary,
+    /// The offending share, exactly as committed under `summary.share_root`.
+    pub share: ShareProof,
+    /// Index of `share.share_hash` among the epoch's canonical leaves (< `summary.share_count`).
+    pub leaf_index: u32,
+    /// Sibling path for `ghost_reconciliation::verify_merkle_proof`. The verifier is injected at
+    /// the handler (`shard_handler::MerkleProofFn`) for the same no-cycle reason as
+    /// `share_shard::MerkleRootFn`.
+    #[serde(with = "ghost_common::serde_hex::vec_bytes32")]
+    pub merkle_proof: Vec<[u8; 32]>,
+    /// The node that found the bad share.
+    #[serde(with = "ghost_common::serde_hex::bytes32")]
+    pub reporter: NodeId,
+    /// Reporter's signature over [`Self::signing_message`].
+    #[serde(with = "ghost_common::serde_hex::bytes64")]
+    pub reporter_signature: [u8; 64],
+    /// Timestamp when the bad share was found (Unix milliseconds).
+    pub timestamp: u64,
+}
+
+impl ShardEvidenceMessage {
+    /// The node this evidence accuses — the summary's signer.
+    pub fn accused(&self) -> NodeId {
+        self.summary.node_id
+    }
+
+    /// The message the reporter signs.
+    ///
+    /// Binds the accused's summary and the share via their own canonical signing bytes — both
+    /// length-prefixed, because both are variable-length and concatenating them raw would let
+    /// two distinct (summary, share) pairs serialise identically. `share.signing_bytes()` covers
+    /// the share's CONTENT (hash, work, header and tier when present), not just its leaf hash,
+    /// so a relay cannot swap share fields while keeping the Merkle path valid.
+    pub fn signing_message(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let summary_bytes = self.summary.signing_bytes();
+        let share_bytes = self.share.signing_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(b"ShardEvidence/v1");
+        hasher.update((summary_bytes.len() as u32).to_le_bytes());
+        hasher.update(&summary_bytes);
+        hasher.update((share_bytes.len() as u32).to_le_bytes());
+        hasher.update(&share_bytes);
+        hasher.update(self.leaf_index.to_le_bytes());
+        hasher.update((self.merkle_proof.len() as u32).to_le_bytes());
+        for node in &self.merkle_proof {
+            hasher.update(node);
+        }
+        hasher.update(self.reporter);
+        hasher.finalize().into()
+    }
+
+    /// Verify the reporter's signature.
+    ///
+    /// SEC-SIG-3: logs errors instead of silently returning false.
+    pub fn verify_reporter_signature(&self) -> bool {
+        let message = self.signing_message();
+        match ghost_common::identity::verify_signature(
+            &self.reporter,
+            &message,
+            &self.reporter_signature,
+        ) {
+            Ok(valid) => valid,
+            Err(e) => {
+                tracing::warn!(
+                    reporter = %hex::encode(&self.reporter[..8]),
+                    error = %e,
+                    "Shard evidence signature verification error"
+                );
+                false
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2469,6 +2715,105 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Registration net for the share-shard message types — the failure this guards is SILENT:
+    /// a subscriber only joins known topics and an unknown variant is dropped at deserialise
+    /// with no error, so a half-registered type simply never arrives.
+    ///
+    /// The exhaustive matches (`topic`, `topic_str`, `max_payload_size`, `should_use_noise`,
+    /// both port matches) are compiler-enforced; what the compiler CANNOT catch is a variant
+    /// registered with the wrong VALUE — a topic that collides, a `topic_str` that disagrees
+    /// with `topic`. That is what this pins.
+    #[test]
+    fn shard_message_types_are_fully_and_consistently_registered() {
+        let cases: [(MessageType, &[u8], &str); 3] = [
+            (
+                MessageType::ShardEpochSummary,
+                topics::SHARD_EPOCH_SUMMARY,
+                "shdsum",
+            ),
+            (
+                MessageType::ShardTableSync,
+                topics::SHARD_TABLE_SYNC,
+                "shdsync",
+            ),
+            (
+                MessageType::ShardEvidence,
+                topics::SHARD_EVIDENCE,
+                "shdevid",
+            ),
+        ];
+        for (msg_type, topic, expected) in cases {
+            assert_eq!(msg_type.topic(), topic, "{msg_type:?} topic constant mismatch");
+            assert_eq!(
+                msg_type.topic_str(),
+                expected,
+                "{msg_type:?} topic_str mismatch"
+            );
+            assert_eq!(
+                msg_type.topic_str().as_bytes(),
+                topic,
+                "{msg_type:?}: topic() and topic_str() must be the same spelling — the \
+                 subscriber matches on one and the M-P2P-1 validation on the other"
+            );
+        }
+
+        // ZMQ subscriptions match by PREFIX: a topic that extends another (or is extended by
+        // one) delivers cross-traffic to the wrong subscriber. Check the new topics against
+        // every registered topic, both directions.
+        let all: [&[u8]; 33] = [
+            topics::SHARE,
+            topics::BLOCK,
+            topics::PAYOUT_PROPOSAL,
+            topics::VOTE,
+            topics::HEALTH,
+            topics::DISCOVERY,
+            topics::ELDER,
+            topics::ZK_PROPOSAL,
+            topics::ZK_VOTE,
+            topics::VERIFICATION,
+            topics::EQUIVOCATION,
+            topics::MPC,
+            topics::L2_TRANSFER,
+            topics::L2_CHECKPOINT,
+            topics::L2_VOTE,
+            topics::L2_SYNC,
+            topics::PAYOUT_LEDGER_CHECKPOINT,
+            topics::PAYOUT_LEDGER_VOTE,
+            topics::PAYOUT_LEDGER_SYNC,
+            topics::PAYOUT_PROPOSAL_SYNC,
+            topics::SHARE_BATCH,
+            topics::SHARE_BATCH_VOTE,
+            topics::SHARE_BATCH_SYNC,
+            topics::SHARE_BATCH_PREVOTE,
+            topics::SHARE_BATCH_PRECOMMIT,
+            topics::MESH_NODE_LIST_CHECKPOINT,
+            topics::MESH_NODE_LIST_VOTE,
+            topics::MESH_NODE_LIST_SYNC,
+            topics::L2_SHIELD,
+            topics::GLYPH,
+            topics::SHARD_EPOCH_SUMMARY,
+            topics::SHARD_TABLE_SYNC,
+            topics::SHARD_EVIDENCE,
+        ];
+        for new in [
+            topics::SHARD_EPOCH_SUMMARY,
+            topics::SHARD_TABLE_SYNC,
+            topics::SHARD_EVIDENCE,
+        ] {
+            for existing in all {
+                if existing == new {
+                    continue;
+                }
+                assert!(
+                    !existing.starts_with(new) && !new.starts_with(existing),
+                    "topic prefix collision: {:?} vs {:?}",
+                    String::from_utf8_lossy(new),
+                    String::from_utf8_lossy(existing)
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_message_serialization() {
