@@ -143,6 +143,21 @@ pub enum FoldOutcome {
     Folded(FoldReport),
 }
 
+/// What arming did — the ceremony's receipt, for the operator's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmReport {
+    /// The anchor height the opening balances were converted from.
+    pub anchor_height: u64,
+    /// The pre-genesis epoch floor. Summaries below it are refused.
+    pub epoch_floor: u64,
+    /// How many accrued columns the ceremony replaced — the soak's state, discarded.
+    pub replaced_columns: usize,
+    /// Addresses in the opening genesis column.
+    pub opening_addresses: usize,
+    /// The table root after arming. Must match on all 8; this is what Stage 5 step 5 compares.
+    pub table_root: [u8; 32],
+}
+
 /// What one tick did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -353,6 +368,93 @@ impl ShardRuntime {
             table: Mutex::new(table),
             next_fold: Mutex::new(None),
             last_epoch_seen: AtomicU64::new(0),
+        })
+    }
+
+    /// Arm the shard from the pinned genesis checkpoint — Stage 5 step 4, the one-time ceremony.
+    ///
+    /// Converts this node's own copy of the byte-identical checkpoint, asserts the result against
+    /// the compile-time pin, and replaces the table with the opening balances. A loud LOCAL
+    /// self-check: no node asks another node anything, so there is no negotiation to partition and
+    /// no quorum to stall, and a node holding the wrong bytes finds out on its own.
+    ///
+    /// **The gap-fold is not a separate mechanism.** The plan describes folding "shares with
+    /// `timestamp ∈ (cutoff_ts, now]`", but a timestamp-range fold would overlap the ordinary epoch
+    /// folds that run from the floor onward, double-crediting every share in the intersection. What
+    /// is actually needed is for the epoch watermark to restart at the floor, after which
+    /// [`ShardRuntime::tick`] catches up epoch by epoch using machinery that is already bounded,
+    /// already idempotent (`shard_epochs` is the durable marker), and already retries a failed
+    /// epoch instead of skipping it. So arming sets the watermark and returns; the catch-up is the
+    /// existing loop, and the 6,499-share lesson is honoured because the fold's input still comes
+    /// from the persisted shares table rather than from anything held in memory.
+    ///
+    /// ⚠ **The floor is the anchor's epoch PLUS ONE, and that under-credits slightly.** Genesis
+    /// credits work up to `cutoff_ts`, which falls partway through the epoch containing the anchor
+    /// height. Folding that epoch would re-credit the part of it genesis already covered, so it is
+    /// skipped entirely — which loses this node's own work in the remainder of that one epoch, at
+    /// most `EPOCH_BLOCKS - 1` heights. Deliberate, and in the same direction as the conversion's
+    /// truncation: under-crediting by a sliver is immaterial, crediting work twice is not.
+    pub fn arm_from_genesis(
+        &self,
+        anchor: &ghost_accounting::shard_genesis::GenesisAnchor,
+        canonical_payout: &[u8],
+    ) -> GhostResult<ArmReport> {
+        let (genesis, rounding) =
+            ghost_accounting::shard_genesis::open_shard_from_checkpoint(canonical_payout, anchor)
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+        let floor = epoch_for_height(anchor.height, EPOCH_BLOCKS) + 1;
+
+        let mut table = self.table.lock();
+
+        // Refuse rather than clear if anything has been settled. The pool has won zero blocks, so
+        // this cannot fire today — but if it ever does, the genesis checkpoint (an UNPAID ledger)
+        // and a non-empty `settled` disagree about history, and silently discarding the settled
+        // side would be the one destructive thing in an otherwise additive ceremony.
+        if !table.settled().is_empty() {
+            return Err(GhostError::Database(format!(
+                "shard: refusing to arm — {} settled balances exist, which the genesis checkpoint \
+                 does not account for; investigate before arming",
+                table.settled().len()
+            )));
+        }
+
+        let replaced_columns = table.accrued().len();
+        *table = genesis;
+        table.set_epoch_floor(floor);
+
+        // Replace semantics: rows absent from the new table are deleted, so the soak's columns do
+        // not survive as stale contributors to the next load's root.
+        self.db.shard_save_table(&table, floor, anchor.height)?;
+
+        let root = table.compute_table_root();
+        drop(table);
+
+        *self.next_fold.lock() = Some(floor);
+
+        info!(
+            anchor_height = anchor.height,
+            floor,
+            replaced_columns,
+            addresses_rounded = rounding.addresses_rounded,
+            addresses_dropped = rounding.addresses_dropped,
+            units_discarded = rounding.units_discarded,
+            root = %hex::encode(&root[..8]),
+            "share shard: ARMED from genesis"
+        );
+
+        Ok(ArmReport {
+            anchor_height: anchor.height,
+            epoch_floor: floor,
+            replaced_columns,
+            opening_addresses: self
+                .table
+                .lock()
+                .accrued()
+                .get(&ghost_accounting::shard_genesis::GENESIS_NODE_ID)
+                .map(|c| c.len())
+                .unwrap_or(0),
+            table_root: root,
         })
     }
 
@@ -1061,6 +1163,114 @@ mod tests {
 
     fn our_received_by(identity: &NodeIdentity) -> String {
         hex::encode(&identity.node_id()[..8])
+    }
+
+    /// The adopted blob for the pinned anchor, reconstructed exactly as production stores it.
+    /// Kept here rather than exported from the accounting crate's tests so this suite exercises
+    /// the same public entry point an operator's ceremony will.
+    fn pinned_canonical_blob() -> Vec<u8> {
+        let miner_payouts: Vec<(String, u128)> = vec![
+            ("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".into(), 57_371_941_344_568_806_473_728),
+            ("bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".into(), 2_609_462_108_645_369_053_184),
+            ("bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".into(), 2_503_874_639_417_892_143_104),
+            ("148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN".into(), 528_968_877_836_852_002_816),
+            ("bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h".into(), 9_741_908_758_669_000_704),
+        ];
+        let hx = |s: &str| -> [u8; 32] {
+            let mut o = [0u8; 32];
+            o.copy_from_slice(&hex::decode(s).unwrap());
+            o
+        };
+        let node_shares: Vec<([u8; 32], i32)> = vec![
+            (hx("46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b"), 6),
+            (hx("fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622"), 10),
+            (hx("849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c"), 10),
+            (hx("e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927"), 10),
+            (hx("9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"), 10),
+            (hx("5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393"), 6),
+            (hx("f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f"), 6),
+            (hx("4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132"), 6),
+        ];
+        serde_json::to_vec(&(&miner_payouts, &node_shares)).expect("encodable")
+    }
+
+    /// Arming replaces the soak's state, opens on the pinned balances, and restarts the epoch
+    /// watermark at the floor — the whole ceremony, on the public entry point.
+    #[test]
+    fn arming_replaces_soak_state_and_restarts_the_watermark_at_the_floor() {
+        let (identity, _db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+
+        // Stand in for the Stage 4 soak: this node has accrued its own work already.
+        {
+            let mut t = rt.table.lock();
+            t.accrue(identity.node_id(), "bc1qsoak", 12_345);
+        }
+        assert_eq!(rt.table.lock().accrued().len(), 1);
+
+        let report = rt
+            .arm_from_genesis(&anchor, &pinned_canonical_blob())
+            .expect("arming must succeed on the pinned bytes");
+
+        assert_eq!(report.anchor_height, anchor.height);
+        assert_eq!(report.opening_addresses, 5);
+        assert_eq!(report.replaced_columns, 1, "the soak's column is discarded");
+        assert_eq!(report.table_root, anchor.table_root);
+
+        let t = rt.table.lock();
+        // The soak's work is gone: it is already inside the genesis balances, and leaving it as a
+        // second column is exactly the double count the floor exists to prevent.
+        assert!(!t.accrued().contains_key(&identity.node_id()));
+        assert!(!t.owed().contains_key("bc1qsoak"));
+        assert_eq!(
+            t.owed().get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
+            Some(&57_371_941_344_568_806)
+        );
+
+        // Floor is the anchor's epoch PLUS ONE — folding the anchor's own epoch would re-credit
+        // the part of it genesis already covers.
+        let expected_floor = epoch_for_height(anchor.height, EPOCH_BLOCKS) + 1;
+        assert_eq!(report.epoch_floor, expected_floor);
+        assert_eq!(t.epoch_floor(), expected_floor);
+        drop(t);
+        assert_eq!(*rt.next_fold.lock(), Some(expected_floor));
+    }
+
+    /// Arming must survive a restart: the ceremony writes through to storage, and the load-time
+    /// self-check must accept what it wrote.
+    #[test]
+    fn an_armed_table_reloads_intact_and_passes_its_own_self_check() {
+        let (identity, db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        let report = rt
+            .arm_from_genesis(&anchor, &pinned_canonical_blob())
+            .expect("arm");
+
+        let reloaded = ShardRuntime::load(identity, Arc::clone(&db), false, true)
+            .expect("an armed table must pass the load-time genesis check");
+        assert_eq!(
+            reloaded.table.lock().compute_table_root(),
+            report.table_root,
+            "the opening root must survive a restart"
+        );
+    }
+
+    /// Bytes the ceremony did not verify must not arm the node, and must leave it untouched.
+    #[test]
+    fn arming_refuses_bytes_that_are_not_the_pinned_anchor() {
+        let (_identity, _db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        let mut wrong = pinned_canonical_blob();
+        wrong.push(b' ');
+
+        let before = rt.table.lock().compute_table_root();
+        assert!(rt.arm_from_genesis(&anchor, &wrong).is_err());
+        assert_eq!(
+            rt.table.lock().compute_table_root(),
+            before,
+            "a refused arming must leave the table byte-identical"
+        );
+        assert_eq!(rt.table.lock().epoch_floor(), 0, "and must not arm the floor");
     }
 
     fn seed_round(db: &Database, round_id: u64, block_height: u64) {
