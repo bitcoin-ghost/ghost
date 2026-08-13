@@ -35,10 +35,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+# `open_shard_from_checkpoint` decodes the adopted blob itself rather than trusting a
+# separately-decoded argument, so this is a real dependency, not a test-only one.
+serde_json = { workspace = true }
 
 [dev-dependencies]
-# The genesis golden vector reconstructs the `canonical_payout` blob production stores and pins
-# its digest, so it needs the same encoder the writer uses (`serde_json::to_vec`) and the key type
-# it asserts the reserved genesis column can never be.
-serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }

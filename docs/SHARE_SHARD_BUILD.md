@@ -303,6 +303,16 @@ not a binary big-bang. That is what removes the need for a height gate *and* the
    qualifying height at ceremony time by re-running the survey; the golden vector is the only
    thing that has to change.
 
+   ⚠ **A reloaded genesis column must be re-asserted against the pin, every start.** Because
+   `merge_accrued` now skips the reserved column, genesis can no longer be re-learned from any
+   peer — so the persisted rows became a single point of silent failure. Lose them (truncation, a
+   partial delete, a backup restored from before the ceremony) and the node opens under-owing
+   every miner, stays internally consistent, and nothing ever contradicts it: the exact failure
+   the module was written to prevent, arriving through the back door.
+   `shard_genesis::verify_loaded_genesis` closes it — absent column is fine (that is every
+   pre-ceremony start), present-and-wrong refuses to start. **Wiring it into the runtime's load
+   path is part of the step-4 arming work, which is not built yet.**
+
    Two things the build settled that the plan had left implicit:
 
    - **The reserved column must be shared, not per-node.** `owed()` sums *across* columns, so if

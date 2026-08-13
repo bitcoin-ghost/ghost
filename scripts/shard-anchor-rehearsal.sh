@@ -28,7 +28,8 @@
 #     would read as unanimous and seed eight nodes from divergent bytes.
 #
 # Usage:
-#   scripts/shard-anchor-rehearsal.sh --survey [N]     list the newest N unanimous candidates
+#   scripts/shard-anchor-rehearsal.sh --survey [N]     newest N heights whose adopted bytes are
+#                                                      byte-identical on every node
 #   scripts/shard-anchor-rehearsal.sh --height H       full verdict for one height
 #   scripts/shard-anchor-rehearsal.sh --height H --emit-json FILE
 #
@@ -63,6 +64,21 @@ done
 
 [[ -n "$MODE" ]] || { echo "need --survey or --height; see the header" >&2; exit 1; }
 
+# Numeric arguments are validated rather than interpolated on trust. Both reach a remote shell and
+# then SQL, and the realistic bad input is not an attack: every height in SHARE_SHARD_BUILD.md is
+# written with thousands separators, so a pasted `962,008` would become a remote sqlite syntax
+# error, get swallowed by the stderr redirect, score all 8 nodes MISSING, and print "step back to
+# an older finalised height" — the exact misdiagnosis this script exists to prevent.
+for pair in "HEIGHT:$HEIGHT" "MIN_LAG:$MIN_LAG" "SURVEY_N:$SURVEY_N"; do
+  name="${pair%%:*}" value="${pair#*:}"
+  [[ -z "$value" ]] && continue
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "$name must be digits only, got '$value' (thousands separators are not accepted)" >&2
+    exit 1
+  fi
+done
+[[ "$MODE" == "height" && -z "$HEIGHT" ]] && { echo "--height needs a block height" >&2; exit 1; }
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -70,15 +86,18 @@ trap 'rm -rf "$WORK"' EXIT
 # Collection. One ssh round trip per node, read-only, no writes and no locks taken on the live DB.
 # ---------------------------------------------------------------------------------------------
 
+# Emits the row on stdout; stderr and the exit status are kept so that "I could not read this
+# node" stays distinguishable from "this node does not hold the height". Conflating them is worse
+# than it sounds: one node down would print MISSING, the operator would be told to step back to an
+# older height, and they would walk the whole checkpoint history without ever seeing the cause.
 collect_height() {
-  local node="$1" h="$2"
-  # Exact height. A missing row yields no line at all, which the reader scores as MISSING.
+  local node="$1" h="$2" err_file="$3"
   timeout "$SSH_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
     "sudo -u ghost sqlite3 -noheader -separator '|' \"file:${DB}?mode=ro\" \
        \"select c.height, c.cutoff_ts, hex(c.ledger_root), coalesce(length(c.canonical_payout),0),
                 coalesce(hex(c.canonical_payout),''), c.proposer_id, c.active_node_count,
-                (select max(block_height) from rounds)
-          from payout_ledger_checkpoints c where c.height = ${h};\"" 2>/dev/null
+                coalesce((select max(block_height) from rounds), -1)
+          from payout_ledger_checkpoints c where c.height = ${h};\"" 2>"$err_file"
 }
 
 # Heights present on a node, newest first, already lag-filtered against that node's own tip.
@@ -109,19 +128,67 @@ if [[ "$MODE" == "survey" ]]; then
   done
 
   # Heights held by EVERY node. sort|uniq -c counting to n_nodes is the intersection.
-  common=$(cat "$WORK"/cand.* | sort -n | uniq -c | awk -v n="$n_nodes" '$1 == n {print $2}' | sort -rn | head -"$SURVEY_N")
+  #
+  # Being held by all 8 is necessary and NOT sufficient — it says nothing about whether the adopted
+  # bytes agree, and since #606 they usually do not (measured: 41 of 182 heights, and only 3 after
+  # the gate). Reporting this list alone would send an operator to a height `--height` then refuses,
+  # almost every time. So the digests are compared here too, over a widened candidate window.
+  local_window=$((SURVEY_N * 8))
+  common=$(cat "$WORK"/cand.* | sort -n | uniq -c \
+    | awk -v n="$n_nodes" '$1 == n {print $2}' | sort -rn | head -"$local_window")
   if [[ -z "$common" ]]; then
     echo "no height is held by all ${n_nodes} nodes at lag >= ${MIN_LAG}" >&2
     exit 2
   fi
+
+  in_list=$(echo "$common" | paste -sd, -)
   echo
-  echo "== newest ${SURVEY_N} heights held by all ${n_nodes} nodes =="
-  for h in $common; do
-    printf "  %s\n" "$h"
+  echo "== comparing adopted bytes across $(echo "$common" | wc -l) candidate heights =="
+  for node in $NODES; do
+    timeout "$SSH_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+      "sudo -u ghost sqlite3 -noheader -separator '|' \"file:${DB}?mode=ro\" \
+         \"select height, coalesce(hex(canonical_payout),'') from payout_ledger_checkpoints
+            where height in (${in_list});\"" 2>/dev/null \
+      | sed "s|^|${node}\||" >> "$WORK/blobs"
   done
-  echo
-  echo "Now run:  $0 --height <one of the above>"
-  exit 0
+
+  REHEARSAL_NODES="$n_nodes" REHEARSAL_TOP="$SURVEY_N" python3 - "$WORK/blobs" <<'PY'
+import binascii, hashlib, os, sys, collections
+
+need = int(os.environ["REHEARSAL_NODES"])
+top = int(os.environ["REHEARSAL_TOP"])
+by_height = collections.defaultdict(dict)
+for line in open(sys.argv[1]):
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    node, height, blob_hex = line.split("|", 2)
+    blob = binascii.unhexlify(blob_hex) if blob_hex else b""
+    # An empty blob is recorded as such, never as a digest: sha256 of nothing is identical on every
+    # node and would present as unanimity for a checkpoint carrying no payees at all.
+    by_height[int(height)][node] = hashlib.sha256(blob).hexdigest() if blob else "EMPTY"
+
+qualifying = []
+for height in sorted(by_height, reverse=True):
+    seen = by_height[height]
+    if len(seen) != need:
+        continue
+    digests = set(seen.values())
+    if len(digests) == 1 and "EMPTY" not in digests:
+        qualifying.append(height)
+
+if not qualifying:
+    print("\nNo candidate height has byte-identical adopted bytes on all "
+          f"{need} nodes. Widen the search (--survey with a larger N) or step further back.")
+    sys.exit(2)
+
+print(f"\n== heights with ONE distinct canonical_payout across all {need} nodes ==")
+for height in qualifying[:top]:
+    print(f"  {height}")
+print(f"\n{len(qualifying)} of {len(by_height)} candidates qualified.")
+print(f"Now run:  --height {qualifying[0]}   (the newest qualifying height)")
+PY
+  exit $?
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -131,15 +198,32 @@ fi
 echo "== anchor rehearsal at height ${HEIGHT} =="
 : > "$WORK/rows"
 missing=0
+unreadable=0
 for node in $NODES; do
-  line=$(collect_height "$node" "$HEIGHT")
+  line=$(collect_height "$node" "$HEIGHT" "$WORK/err.$node")
+  rc=$?
+  if [[ "$rc" -ne 0 || -s "$WORK/err.$node" ]]; then
+    # ssh/sudo/sqlite failed, or sqlite wrote a diagnostic. Either way we did not read this node,
+    # and saying so is the whole point — an unread node is not an absent checkpoint.
+    printf "  %-12s UNREADABLE (exit %s) %s\n" \
+      "$node" "$rc" "$(head -c 200 "$WORK/err.$node" | tr '\n' ' ')"
+    unreadable=$((unreadable + 1))
+    continue
+  fi
   if [[ -z "$line" ]]; then
-    printf "  %-12s MISSING (no checkpoint row at exactly %s)\n" "$node" "$HEIGHT"
+    printf "  %-12s MISSING (read cleanly; no checkpoint row at exactly %s)\n" "$node" "$HEIGHT"
     missing=$((missing + 1))
     continue
   fi
   printf '%s|%s\n' "$node" "$line" >> "$WORK/rows"
 done
+
+if [[ "$unreadable" -gt 0 ]]; then
+  echo
+  echo "REFUSE: ${unreadable} node(s) could not be read. Fix access before judging the anchor —" >&2
+  echo "an unread node is not evidence about the checkpoint either way." >&2
+  exit 3
+fi
 
 if [[ "$missing" -gt 0 ]]; then
   echo

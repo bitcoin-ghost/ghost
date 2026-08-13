@@ -57,6 +57,15 @@ use crate::batch_genesis::{genesis_balances, GenesisRounding};
 /// away from the value it protects.
 pub use ghost_common::share_shard::GENESIS_NODE_ID;
 
+/// The two adopted lists a `canonical_payout` blob carries, in the order it stores them:
+/// `(miner_payouts, node_shares)`, matching `serde_json::to_vec(&(&miner_payouts, &node_shares))`
+/// in `queries.rs::upsert_payout_ledger_checkpoint`.
+///
+/// Named because the pair travels together and that matters: [`GenesisAnchor::canonical_sha256`]
+/// covers **both** halves, which is what makes the pin cover the qualified-node set and not only
+/// the balances — a requirement Stage 5 states and a balances-only pin would quietly miss.
+pub type AdoptedCheckpoint = (Vec<(String, u128)>, Vec<([u8; 32], i32)>);
+
 /// A ceremony pin: the anchor's identity, and what converting it must produce.
 ///
 /// Every field is checked at arming time. They fail in a deliberate order — cheapest and most
@@ -116,13 +125,34 @@ pub enum GenesisError {
          bytes matched, so the conversion or the table-root encoding has moved"
     )]
     RootMismatch { expected: String, found: String },
-    /// The checkpoint carries no payees.
+    /// The bytes matched the pin but are not decodable as `(miner_payouts, node_shares)`.
     ///
-    /// Separated from a root mismatch because it has one overwhelmingly likely cause — a
-    /// pre-adopt-on-finalise row whose `canonical_payout` is NULL — and converting it would open
-    /// the shard owing nobody anything, zeroing every accrued balance in the pool.
+    /// Reachable only if the stored encoding changes shape while its digest is still pinned, which
+    /// is to say almost never — but the alternative is a panic on a money path.
+    #[error("genesis: canonical_payout at height {height} does not decode: {detail}")]
+    Undecodable { height: u64, detail: String },
+    /// The checkpoint decodes but carries no payees.
+    ///
+    /// ⚠ Note what this does NOT catch. The obvious case — a pre-adopt-on-finalise row whose
+    /// `canonical_payout` is NULL — never reaches here, because the digest check runs first and a
+    /// pinned anchor is always over a non-empty blob, so an empty blob fails as
+    /// `CanonicalMismatch`. That is the right verdict and a better message. This variant is the
+    /// backstop for the case where the pin *itself* was taken over a payee-less blob, i.e. the
+    /// ceremony verified something worthless — which the rehearsal script refuses precisely
+    /// because sha256 of nothing is unanimous on all eight nodes.
     #[error("genesis: checkpoint at height {height} carries no miner payouts — refusing to open the shard owing nobody")]
     NoPayees { height: u64 },
+    /// A genesis column loaded from disk does not match the pin.
+    #[error(
+        "genesis: the persisted genesis column for height {height} has root {found}, not the \
+         pinned {expected} — the opening balances on disk are not the ones the ceremony \
+         installed; restore them rather than starting, because merge can no longer re-learn them"
+    )]
+    LoadedGenesisMismatch {
+        height: u64,
+        expected: String,
+        found: String,
+    },
 }
 
 /// Convert a ratified checkpoint's adopted miner set into an opening [`ShardTable`].
@@ -159,13 +189,21 @@ pub fn genesis_column(table: &ShardTable) -> BTreeMap<String, i64> {
 /// pin. No node asks another node anything, so there is no negotiation to be partitioned, no
 /// quorum to stall, and a node holding the wrong bytes discovers it on its own.
 ///
-/// `canonical_payout` is the raw blob as stored; `miner_payouts` is its already-decoded miner
-/// half. Both are taken so the digest is computed over the bytes the database actually holds
-/// rather than over a re-encoding of the decoded form — `serde_json` round-trips are not
-/// guaranteed byte-stable, and a re-encoded digest would be checking the wrong object.
+/// `canonical_payout` is the raw blob exactly as the database holds it, and it is the ONLY input.
+///
+/// The miner list is decoded from that blob here rather than accepted as a second argument. Taking
+/// both would let a caller hash the blob at the anchor height while passing payouts decoded from a
+/// different record — which is easy to do by accident, because the runtime's own lookup is
+/// `get_payout_ledger_checkpoint_at_or_before`, which happily returns an *older* height when the
+/// anchor is absent. The digest would pass, the conversion would run on the wrong list, and the
+/// failure would surface as `RootMismatch`, whose message sends the operator to debug the encoder
+/// instead of the mismatched inputs. One input cannot disagree with itself.
+///
+/// Decoding rather than re-encoding is also why the digest is taken over the stored bytes:
+/// `serde_json` round-trips are not guaranteed byte-stable, so hashing a re-encoding would be
+/// checking a different object from the one the fleet compared.
 pub fn open_shard_from_checkpoint(
     canonical_payout: &[u8],
-    miner_payouts: &[(String, u128)],
     anchor: &GenesisAnchor,
 ) -> Result<(ShardTable, GenesisRounding), GenesisError> {
     let found = Sha256::digest(canonical_payout);
@@ -176,13 +214,20 @@ pub fn open_shard_from_checkpoint(
             found: hex::encode(found),
         });
     }
+
+    let (miner_payouts, _node_shares): AdoptedCheckpoint =
+        serde_json::from_slice(canonical_payout).map_err(|e| GenesisError::Undecodable {
+            height: anchor.height,
+            detail: e.to_string(),
+        })?;
+
     if miner_payouts.is_empty() {
         return Err(GenesisError::NoPayees {
             height: anchor.height,
         });
     }
 
-    let (table, rounding) = shard_genesis_table(miner_payouts);
+    let (table, rounding) = shard_genesis_table(&miner_payouts);
     let root = table.compute_table_root();
     if root != anchor.table_root {
         return Err(GenesisError::RootMismatch {
@@ -191,6 +236,41 @@ pub fn open_shard_from_checkpoint(
         });
     }
     Ok((table, rounding))
+}
+
+/// Re-assert a genesis column loaded from disk against the pin.
+///
+/// `merge_accrued` skips the reserved column, so once a node is armed genesis can no longer be
+/// re-learned from any peer. That makes the persisted rows a single point of silent failure: if
+/// `shard_counters` loses them — truncation, a partial delete, a restored backup taken before the
+/// ceremony — the node opens under-owing every miner, stays internally consistent, and nothing
+/// ever contradicts it. This is exactly the "internally consistent with its own wrong opening
+/// balances" failure the module exists to prevent, arriving through the back door.
+///
+/// **An absent column is not an error.** Before the ceremony there is legitimately no genesis
+/// column, and every dark-mode start is that case, so refusing here would refuse to boot.
+/// Present-and-wrong is the only failure.
+pub fn verify_loaded_genesis(
+    table: &ShardTable,
+    anchor: &GenesisAnchor,
+) -> Result<(), GenesisError> {
+    let Some(loaded) = table.accrued().get(&GENESIS_NODE_ID) else {
+        return Ok(());
+    };
+
+    // Compared as a table root rather than cell by cell so this check and the arming check speak
+    // the same language — one encoding, one pinned value, no second opinion to drift.
+    let mut probe = ShardTable::new();
+    probe.install_genesis(loaded.clone());
+    let root = probe.compute_table_root();
+    if root != anchor.table_root {
+        return Err(GenesisError::LoadedGenesisMismatch {
+            height: anchor.height,
+            expected: hex::encode(anchor.table_root),
+            found: hex::encode(root),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -364,9 +444,10 @@ mod tests {
     #[test]
     fn arming_accepts_the_verified_anchor() {
         let blob = canonical_blob();
-        let (table, _) = open_shard_from_checkpoint(&blob, &ratified_962008(), &anchor_962008())
+        let (table, _) = open_shard_from_checkpoint(&blob, &anchor_962008())
             .expect("the verified anchor must arm");
         assert_eq!(table.compute_table_root(), anchor_962008().table_root);
+        assert_eq!(genesis_column(&table).len(), 5);
     }
 
     /// A node holding different adopted bytes must refuse, and must say so as a byte mismatch
@@ -375,7 +456,7 @@ mod tests {
     fn arming_refuses_bytes_the_ceremony_did_not_verify() {
         let mut blob = canonical_blob();
         blob.push(b' '); // JSON-insignificant, byte-significant: still the wrong object
-        let err = open_shard_from_checkpoint(&blob, &ratified_962008(), &anchor_962008())
+        let err = open_shard_from_checkpoint(&blob, &anchor_962008())
             .expect_err("different bytes must refuse");
         assert!(
             matches!(err, GenesisError::CanonicalMismatch { .. }),
@@ -383,17 +464,32 @@ mod tests {
         );
     }
 
-    /// A checkpoint carrying no payees must refuse loudly. This is the NULL `canonical_payout`
-    /// case, and converting it would zero every miner's accrued balance.
+    /// The NULL `canonical_payout` case — a pre-adopt-on-finalise row — refuses as a BYTE
+    /// mismatch, not as `NoPayees`, because the digest check runs first. Pinned so the error
+    /// taxonomy in the docs matches what the code actually returns.
     #[test]
-    fn arming_refuses_a_checkpoint_with_no_payees() {
-        let empty: Vec<u8> = Vec::new();
+    fn an_empty_blob_refuses_as_a_byte_mismatch_not_as_no_payees() {
+        let err = open_shard_from_checkpoint(&[], &anchor_962008())
+            .expect_err("an empty blob must refuse");
+        assert!(
+            matches!(err, GenesisError::CanonicalMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// `NoPayees` is the backstop for a pin taken over a payee-less blob — the ceremony having
+    /// verified something worthless. Reachable only by constructing exactly that.
+    #[test]
+    fn arming_refuses_a_pin_taken_over_a_payee_less_blob() {
+        let empty_payouts: Vec<(String, u128)> = Vec::new();
+        let empty_nodes: Vec<([u8; 32], i32)> = Vec::new();
+        let blob = serde_json::to_vec(&(&empty_payouts, &empty_nodes)).expect("encodable");
         let anchor = GenesisAnchor {
-            canonical_sha256: Sha256::digest(&empty).into(),
+            canonical_sha256: Sha256::digest(&blob).into(),
             ..anchor_962008()
         };
-        let err = open_shard_from_checkpoint(&empty, &[], &anchor)
-            .expect_err("an empty checkpoint must refuse");
+        let err = open_shard_from_checkpoint(&blob, &anchor)
+            .expect_err("a payee-less anchor must refuse");
         assert!(matches!(err, GenesisError::NoPayees { .. }), "got {err:?}");
     }
 
@@ -406,9 +502,65 @@ mod tests {
             table_root: [0xAB; 32],
             ..anchor_962008()
         };
-        let err = open_shard_from_checkpoint(&blob, &ratified_962008(), &anchor)
+        let err = open_shard_from_checkpoint(&blob, &anchor)
             .expect_err("a moved conversion must refuse");
         assert!(matches!(err, GenesisError::RootMismatch { .. }), "got {err:?}");
+    }
+
+    /// A dark-mode start has no genesis column at all, and must not be refused.
+    #[test]
+    fn verifying_a_table_with_no_genesis_column_is_not_an_error() {
+        assert_eq!(
+            verify_loaded_genesis(&ShardTable::new(), &anchor_962008()),
+            Ok(())
+        );
+    }
+
+    /// The armed, healthy case round-trips.
+    #[test]
+    fn verifying_an_intact_persisted_genesis_column_passes() {
+        let (table, _) =
+            open_shard_from_checkpoint(&canonical_blob(), &anchor_962008()).expect("arms");
+        let mut reloaded = ShardTable::new();
+        reloaded.install_genesis(genesis_column(&table));
+        assert_eq!(verify_loaded_genesis(&reloaded, &anchor_962008()), Ok(()));
+    }
+
+    /// The failure this check exists for: rows lost from `shard_counters`.
+    ///
+    /// `merge_accrued` skips the reserved column, so a peer can never restore it. Without this
+    /// check the node opens under-owing every miner, internally consistent, for ever.
+    #[test]
+    fn verifying_a_truncated_persisted_genesis_column_refuses() {
+        let (table, _) =
+            open_shard_from_checkpoint(&canonical_blob(), &anchor_962008()).expect("arms");
+        let mut lossy = genesis_column(&table);
+        lossy.remove("bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h");
+
+        let mut reloaded = ShardTable::new();
+        reloaded.install_genesis(lossy);
+        let err = verify_loaded_genesis(&reloaded, &anchor_962008())
+            .expect_err("a truncated genesis column must refuse to start");
+        assert!(
+            matches!(err, GenesisError::LoadedGenesisMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// And an inflated one — the same check catches tampering, not only loss.
+    #[test]
+    fn verifying_an_inflated_persisted_genesis_column_refuses() {
+        let (table, _) =
+            open_shard_from_checkpoint(&canonical_blob(), &anchor_962008()).expect("arms");
+        let mut inflated = genesis_column(&table);
+        inflated.insert("bc1qattacker".to_string(), 999_999_999);
+
+        let mut reloaded = ShardTable::new();
+        reloaded.install_genesis(inflated);
+        assert!(matches!(
+            verify_loaded_genesis(&reloaded, &anchor_962008()),
+            Err(GenesisError::LoadedGenesisMismatch { .. })
+        ));
     }
 
     /// ⚠ The reserved id IS a loadable ed25519 key. Pinned as a test because the first version of

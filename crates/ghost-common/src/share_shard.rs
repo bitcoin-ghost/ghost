@@ -620,13 +620,6 @@ impl ShardTable {
         owed
     }
 
-    /// Max-merge a peer's accrued columns — the `ShardTableSync` reconciliation path.
-    ///
-    /// Per-cell max, nothing else: a stale value loses, a duplicate is a no-op, and order cannot
-    /// matter, so shipping the whole table (§12.6) needs no diff protocol. `settled` is
-    /// deliberately not merged — it never crosses the mesh, so there is nothing to merge and no
-    /// stale copy to resurrect. Non-positive incoming cells are skipped: honest tables never
-    /// contain them, and merging one could only create a dead cell that splits the table root.
     /// Install the reserved genesis column — the ONLY writer of [`GENESIS_NODE_ID`].
     ///
     /// Called twice in a node's life on paths that are both local: once at the Stage 5 ceremony
@@ -634,11 +627,20 @@ impl ShardTable {
     /// reloaded. Deliberately not reachable from any message handler, which is what makes
     /// "a peer cannot inflate the opening balances" a property of the type rather than a habit.
     ///
-    /// Replace, not merge: the caller holds the pinned truth, and a max here would let a corrupted
-    /// larger value on disk survive a correction.
+    /// Replace, not merge: a max here would let a corrupted larger value on disk survive a
+    /// correction. ⚠ That puts the burden on the caller to hold the pinned truth — which the
+    /// ceremony caller does and the *reload* caller does not, since it holds whatever is on disk.
+    /// A reloaded column must therefore be re-asserted against the pin
+    /// (`ghost_accounting::shard_genesis::verify_loaded_genesis`); merge can no longer re-learn
+    /// it from a peer, so a truncated or restored-from-backup column would otherwise leave the
+    /// node silently under-owing every miner for ever.
+    ///
+    /// Non-positive cells are dropped, holding the same strictly-positive invariant `accrue` and
+    /// `merge_accrued` keep. A negative cell would otherwise count toward `owed` and the table
+    /// root in memory while `encrypt_cells` silently refuses to persist it, so the node's root
+    /// would change across a restart and the fleet would read that as consensus failure.
     pub fn install_genesis(&mut self, column: BTreeMap<String, i64>) {
-        let column: BTreeMap<String, i64> =
-            column.into_iter().filter(|(_, v)| *v != 0).collect();
+        let column: BTreeMap<String, i64> = column.into_iter().filter(|(_, v)| *v > 0).collect();
         if column.is_empty() {
             self.accrued.remove(&GENESIS_NODE_ID);
         } else {
@@ -646,11 +648,20 @@ impl ShardTable {
         }
     }
 
+    /// Max-merge a peer's accrued columns — the `ShardTableSync` reconciliation path.
+    ///
+    /// Per-cell max, nothing else: a stale value loses, a duplicate is a no-op, and order cannot
+    /// matter, so shipping the whole table (§12.6) needs no diff protocol. `settled` is
+    /// deliberately not merged — it never crosses the mesh, so there is nothing to merge and no
+    /// stale copy to resurrect. Non-positive incoming cells are skipped: honest tables never
+    /// contain them, and merging one could only create a dead cell that splits the table root.
+    ///
+    /// The reserved genesis column is skipped outright — see [`GENESIS_NODE_ID`]. Every node
+    /// derives it from the same pinned checkpoint, so there is nothing to learn from a peer, and
+    /// because merging is a max an accepted inflation would be permanent and indistinguishable
+    /// from genesis.
     pub fn merge_accrued(&mut self, other: &AccruedColumns) {
         for (node, column) in other {
-            // The reserved opening-balance column is never taken from a peer. Every node derives
-            // it from the same pinned checkpoint, so there is nothing to learn here and a max
-            // could only ever ratchet it upward — permanently, and disguised as genesis.
             if *node == GENESIS_NODE_ID {
                 continue;
             }
@@ -904,6 +915,31 @@ mod tests {
         table.install_genesis(BTreeMap::new());
         assert!(table.accrued().get(&GENESIS_NODE_ID).is_none());
         assert_eq!(table.compute_table_root(), ShardTable::new().compute_table_root());
+    }
+
+    /// The reload path feeds `install_genesis` raw database rows, so it must hold the same
+    /// strictly-positive invariant every other mutator does.
+    ///
+    /// A negative cell kept in memory would count toward `owed` and the table root while
+    /// `encrypt_cells` refuses to persist it — so the node's root would change across a restart
+    /// with no write in between, which the fleet reads as consensus failure rather than as the
+    /// bad row it is.
+    #[test]
+    fn installing_genesis_drops_non_positive_cells_like_every_other_mutator() {
+        let mut table = ShardTable::new();
+        table.install_genesis(BTreeMap::from([
+            ("bc1qalice".to_string(), 1_000i64),
+            ("bc1qbob".to_string(), 0i64),
+            ("bc1qcarol".to_string(), -5i64),
+        ]));
+
+        let column = table.accrued().get(&GENESIS_NODE_ID).expect("column");
+        assert_eq!(
+            column,
+            &BTreeMap::from([("bc1qalice".to_string(), 1_000i64)]),
+            "zero and negative cells must not survive into the table"
+        );
+        assert!(!table.owed().contains_key("bc1qcarol"));
     }
 
     /// Epochs come from block height and an epoch length, nothing else — never wall-clock
