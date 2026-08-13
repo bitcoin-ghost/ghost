@@ -168,7 +168,23 @@ epoch averages to zero across many blocks. A node having a quiet epoch is paid n
 ### 4.3 The two shards
 
 **Node shard** (mine, transient). My miners' shares: 80-byte header per share plus the merkle branch
-carried **once per job**. Deleted once the epoch is summarised. This is evidence, not state.
+carried **once per job**. This is evidence, not state.
+
+⚠ **Evidence retention is a sampling window, measured in epochs, and is independent of settlement.**
+Keep it `RETENTION_EPOCHS` — long enough that every peer has received the summary and had a fair
+chance to sample it — then drop it. Bounded by the epoch rate, which is steady.
+
+Two retentions that must not be confused:
+
+| | dropped when | driven by |
+|---|---|---|
+| **evidence** (shares) | `RETENTION_EPOCHS` after its summary | epoch rate — steady |
+| **counter history** | settlement + maturity depth | block discovery — unbounded |
+
+Tying evidence to settlement would be wrong in both directions: the pool has won **zero** blocks, so
+evidence would accumulate for ever and rebuild the O(shares) ledger this design exists to delete; and
+dropping it at summarisation instead would leave nothing for §6 to sample, so no peer could ever
+verify anyone.
 
 **Network shard** (everyone's, permanent-until-rebase). Unpaid work per payout address. A few hundred
 rows. Never holds a share.
@@ -248,10 +264,11 @@ Settle at **coinbase maturity (100 blocks)**, never at the tip. The output is un
 so a shallower reorg unwinds the payment anyway and nothing needs undoing. Do not conflate this with
 the legacy tip−6 proposal anchor — different concern, different depth.
 
-Once a block is settled, that epoch's **node-shard evidence is dropped**. Both `accrued` and `settled`
-grow without bound in principle; compaction subtracts a common baseline from both at a chain-anchored
-height, so a node that missed it recomputes the same baseline from the chain it already holds and
-self-heals with no announcement. Compaction is not required for v1.
+Settlement compacts **counter history**, not evidence — evidence is on its own sampling-window clock
+(§4.3). Both `accrued` and `settled` grow without bound in principle; compaction subtracts a common
+baseline from both at a chain-anchored height, so a node that missed it recomputes the same baseline
+from the chain it already holds and self-heals with no announcement. Compaction is not required for
+v1.
 
 ## 5. Why this converges when the last one did not
 
