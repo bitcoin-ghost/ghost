@@ -1335,6 +1335,20 @@ mod tests {
         assert!(select_sample_indices(&unsigned_summary(0), 20, &entropy).is_empty());
         assert!(select_sample_indices(&summary, 0, &entropy).is_empty());
 
+        // Without-replacement, pinned where replacement CANNOT hide: at λ = n−1 the draw path
+        // (not the ask-for-all shortcut) nearly exhausts the tree, so a selection that fails to
+        // track displaced values collides on almost every seed. λ=20-of-1,000 above cannot see
+        // that bug — a collision there is a ~20% event per seed, and one lucky seed hides it.
+        let dense = unsigned_summary(30);
+        for seed in 0..64u8 {
+            let picked = select_sample_indices(&dense, 29, &[seed; 32]);
+            assert_eq!(picked.len(), 29);
+            assert!(
+                picked.windows(2).all(|w| w[0] < w[1]),
+                "seed {seed}: a repeated index — sampling is replacing"
+            );
+        }
+
         // And the built request pins exactly the summary it audits, indices included.
         let req = build_sample_request([0x77; 32], &summary, 20, &entropy);
         assert_eq!(req.epoch, summary.epoch);
