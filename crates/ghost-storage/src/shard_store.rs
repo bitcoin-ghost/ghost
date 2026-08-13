@@ -98,21 +98,25 @@ fn store_epoch_tx(
     summary_enc: &str,
     published: bool,
 ) -> GhostResult<()> {
-    let existing: Option<(Vec<u8>, Vec<u8>)> = conn
+    // Scoped to (epoch, node_id): a different node's summary at the same epoch is the normal
+    // case and must not collide. A different ROOT under the same (epoch, node_id) is the node
+    // signing two conflicting statements for one epoch — equivocation, not a storage conflict —
+    // so it is refused rather than overwritten, and the held row stays available as evidence.
+    let existing: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT node_id, share_root FROM shard_epochs WHERE epoch = ?1",
-            params![summary.epoch as i64],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT share_root FROM shard_epochs WHERE epoch = ?1 AND node_id = ?2",
+            params![summary.epoch as i64, summary.node_id.to_vec()],
+            |r| r.get(0),
         )
         .ok();
 
-    if let Some((node, root)) = existing {
-        return if node == summary.node_id.to_vec() && root == summary.share_root.to_vec() {
+    if let Some(root) = existing {
+        return if root == summary.share_root.to_vec() {
             Ok(())
         } else {
             Err(GhostError::Database(format!(
-                "epoch {} already holds a different summary — refusing to overwrite a signed \
-                 statement (retry would carry the same root)",
+                "epoch {} already holds a different summary for this node — refusing to overwrite \
+                 a signed statement (equivocation; the held row is the evidence)",
                 summary.epoch
             )))
         };
@@ -388,12 +392,12 @@ impl Database {
     /// Decrypt-then-deserialise: re-serialisation for a peer is harmless because the signature
     /// covers `signing_bytes`, not the JSON encoding — a round-tripped summary still verifies
     /// (unlike `sbc_batches`, whose batch hash covered the stored bytes themselves).
-    pub fn shard_get_epoch(&self, epoch: u64) -> GhostResult<Option<EpochSummary>> {
+    pub fn shard_get_epoch(&self, epoch: u64, node: &NodeId) -> GhostResult<Option<EpochSummary>> {
         let enc: Option<String> = self.with_connection(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT summary_enc FROM shard_epochs WHERE epoch = ?1",
-                    params![epoch as i64],
+                    "SELECT summary_enc FROM shard_epochs WHERE epoch = ?1 AND node_id = ?2",
+                    params![epoch as i64, node.to_vec()],
                     |r| r.get(0),
                 )
                 .ok())
@@ -413,25 +417,29 @@ impl Database {
     /// Mark an epoch's summary as having been broadcast. Returns whether the row existed —
     /// marking a summary that was never stored is a caller bug worth surfacing, not a silent
     /// no-op.
-    pub fn shard_mark_epoch_published(&self, epoch: u64) -> GhostResult<bool> {
+    pub fn shard_mark_epoch_published(&self, epoch: u64, node: &NodeId) -> GhostResult<bool> {
         self.with_connection(|conn| {
             let n = conn
                 .execute(
-                    "UPDATE shard_epochs SET published = 1 WHERE epoch = ?1",
-                    params![epoch as i64],
+                    "UPDATE shard_epochs SET published = 1 WHERE epoch = ?1 AND node_id = ?2",
+                    params![epoch as i64, node.to_vec()],
                 )
                 .map_err(|e| GhostError::Database(e.to_string()))?;
             Ok(n > 0)
         })
     }
 
-    /// Whether the summary for `epoch` has been marked published.
-    pub fn shard_epoch_published(&self, epoch: u64) -> GhostResult<Option<bool>> {
+    /// Whether that node's summary for `epoch` has been marked published.
+    ///
+    /// Published is a property of *our own* broadcast, so this is normally asked about our own
+    /// node id; it takes one anyway rather than assuming, because the table now holds peers' rows
+    /// too and a query that silently matched the wrong node would be invisible.
+    pub fn shard_epoch_published(&self, epoch: u64, node: &NodeId) -> GhostResult<Option<bool>> {
         self.with_connection(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT published FROM shard_epochs WHERE epoch = ?1",
-                    params![epoch as i64],
+                    "SELECT published FROM shard_epochs WHERE epoch = ?1 AND node_id = ?2",
+                    params![epoch as i64, node.to_vec()],
                     |r| r.get::<_, i64>(0),
                 )
                 .ok()
@@ -700,25 +708,44 @@ mod tests {
         db.shard_store_epoch(&s, false)
             .expect("storing the same summary again is a retry, not an error");
 
-        let back = db.shard_get_epoch(5).expect("get").expect("present");
+        let back = db.shard_get_epoch(5, &node).expect("get").expect("present");
         assert_eq!(back.signing_bytes(), s.signing_bytes());
         assert_eq!(back.signature, s.signature);
-        assert!(db.shard_get_epoch(6).expect("get").is_none());
+        assert!(db.shard_get_epoch(6, &node).expect("get").is_none());
 
         // Published is a flag on the stored row, not part of the summary.
-        assert_eq!(db.shard_epoch_published(5).expect("flag"), Some(false));
-        assert!(db.shard_mark_epoch_published(5).expect("mark"));
-        assert_eq!(db.shard_epoch_published(5).expect("flag"), Some(true));
+        assert_eq!(db.shard_epoch_published(5, &node).expect("flag"), Some(false));
+        assert!(db.shard_mark_epoch_published(5, &node).expect("mark"));
+        assert_eq!(db.shard_epoch_published(5, &node).expect("flag"), Some(true));
         assert!(
-            !db.shard_mark_epoch_published(6).expect("mark missing"),
+            !db.shard_mark_epoch_published(6, &node).expect("mark missing"),
             "marking an epoch that was never stored must say so"
         );
 
-        // A different root at the same epoch is a signed statement being rewritten — refused.
+        // The point of keying on (epoch, node_id): a peer's summary for the SAME epoch is the
+        // normal case and must coexist. Keyed on epoch alone this row would have collided, and
+        // the table could only ever have held our own summaries — leaving nothing to make an
+        // accusation out of.
+        let peer = [0x99; 32];
+        let peer_summary = summary(5, peer, [0x66; 32], &[("bc1qcarol", 9, 9)]);
+        db.shard_store_epoch(&peer_summary, false)
+            .expect("a peer's summary at the same epoch must coexist, not collide");
+        assert_eq!(
+            db.shard_get_epoch(5, &peer).expect("get").expect("present").share_root,
+            [0x66; 32]
+        );
+        assert_eq!(
+            db.shard_get_epoch(5, &node).expect("get").expect("present").share_root,
+            [0x44; 32],
+            "storing a peer's summary must not disturb our own"
+        );
+
+        // A different root under the SAME (epoch, node) is that node signing two conflicting
+        // statements for one epoch — equivocation, refused, and the held row is the evidence.
         let conflicting = summary(5, node, [0x55; 32], &[("bc1qalice", 8, 108)]);
         db.shard_store_epoch(&conflicting, false)
-            .expect_err("a different summary at an occupied epoch must be refused");
-        let kept = db.shard_get_epoch(5).expect("get").expect("present");
+            .expect_err("a different summary at an occupied (epoch, node) must be refused");
+        let kept = db.shard_get_epoch(5, &node).expect("get").expect("present");
         assert_eq!(kept.share_root, [0x44; 32], "the original statement stays");
     }
 }

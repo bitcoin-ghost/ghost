@@ -45,14 +45,56 @@ const TABLE_ROOT_DOMAIN: &[u8] = b"ShardTableRoot/v1";
 /// Domain tag for epoch-summary signing bytes. Same versioning rule as the table root.
 const EPOCH_SUMMARY_DOMAIN: &[u8] = b"ShardEpochSummary/v1";
 
+/// How many blocks an epoch spans. Operator decision 2026-08-13.
+///
+/// Six blocks is roughly an hour on this chain, which sets how often work lands in the ledger —
+/// the only one of these numbers anybody actually feels. Shorter epochs mean more summary traffic
+/// for fresher balances; longer means chunkier movement.
+pub const EPOCH_BLOCKS: NonZeroU64 = NonZeroU64::new(6).expect("6 is not zero");
+
+/// How many epochs a node keeps raw shares so peers can sample its claims. Operator decision.
+///
+/// This is squeezed from both sides. Too short and a peer asks for evidence that has already been
+/// dropped — and because that is indistinguishable on the wire from refusing to be audited, an
+/// honest node gets accused for following the rules. Too long and we are hoarding shares again,
+/// which is the whole defect this design exists to delete.
+///
+/// Six epochs is ~6 hours, ~9 MB of shares at current rates, against the 1.7M rows the old ledger
+/// carries. There is room to be generous here and it is the right direction to err: over-retaining
+/// costs megabytes, under-retaining costs a false accusation.
+///
+/// ⚠ **Invariant: this must exceed the sampling window with margin**, so anything an honest
+/// requester could reasonably ask for is still held. Pinned by test below.
+pub const RETENTION_EPOCHS: u64 = 6;
+
+/// How long after publication a summary is still actively being sampled: one epoch for it to
+/// propagate and be sampled, one more for the follow-up requests a subset response forces.
+///
+/// Named rather than left implicit so the retention invariant is something a test can state.
+/// Raising this without raising [`RETENTION_EPOCHS`] is the mistake it exists to catch.
+pub const SAMPLING_WINDOW_EPOCHS: u64 = 2;
+
+/// The retention invariant, enforced by the compiler rather than by a test run.
+///
+/// A relationship between two constants cannot be got wrong at runtime, so it should not be
+/// possible to *build* it wrong either. The failure this prevents is asymmetric: over-retaining
+/// costs megabytes, while under-retaining makes an honest node that correctly dropped expired
+/// evidence indistinguishable on the wire from one refusing to be audited — so it gets accused for
+/// following the rules. Doubling is the margin: a peer must be able to sample, hit a subset
+/// response, and come back, with the evidence still there.
+const _: () = assert!(
+    RETENTION_EPOCHS >= SAMPLING_WINDOW_EPOCHS * 2,
+    "RETENTION_EPOCHS must be at least twice SAMPLING_WINDOW_EPOCHS"
+);
+
 /// Which epoch a block height falls in.
 ///
 /// Height-keyed and nothing else (§12.2). The previous design keyed windows to each node's local
 /// clock, which made summaries incomparable *in principle* — two nodes looking at the same chain
-/// must name the same epoch, and only a function of height alone cannot do otherwise. The epoch
-/// length is an open decision (§9), so it is a parameter rather than a constant baked in
-/// prematurely; `NonZeroU64` because a zero-block epoch is not a smaller choice, it is a
-/// meaningless one, and the type refuses it where a runtime check could be skipped.
+/// must name the same epoch, and only a function of height alone cannot do otherwise. The length
+/// stays a parameter rather than reading [`EPOCH_BLOCKS`] directly so tests can drive small
+/// epochs; `NonZeroU64` because a zero-block epoch is not a smaller choice, it is a meaningless
+/// one, and the type refuses it where a runtime check could be skipped.
 pub fn epoch_for_height(height: u64, epoch_blocks: NonZeroU64) -> u64 {
     height / epoch_blocks.get()
 }
