@@ -799,13 +799,34 @@ impl ShardRuntime {
             }
         }
 
-        // The rate the payment was computed under: both sums over the SAME matched set. A full
-        // proportional payout therefore discharges exactly the owed work; a payout that skipped
-        // an address leaves that address's work owed, untouched.
-        let pool_sats: u64 = matched.iter().map(|(_, _, paid)| *paid).sum();
-        let top_work: i64 = matched
-            .iter()
-            .fold(0i64, |acc, (_, owed, _)| acc.saturating_add(*owed));
+        // ⚠ The rate must be ABSOLUTE, never self-normalising. Summing both sides over the same
+        // matched set makes the ratio cancel:
+        //
+        //     Σ discharged = (Σ paid) × top_work / pool_sats = pool_sats × top_work / pool_sats
+        //
+        // so the total discharged equals the total owed no matter what the block actually paid — a
+        // one-satoshi block would clear every matched balance in full. That inversion is only valid
+        // when the coinbase was BUILT from this node's shard view, and it is not: it is still built
+        // from the legacy proposal, so the equation being inverted does not hold.
+        //
+        // Both terms therefore come from outside the matched set. `pool_sats` is the block's whole
+        // coinbase — an absolute number of satoshis this block paid out — and `top_work` is this
+        // node's entire positively-owed ledger.
+        //
+        // Including the treasury and node-reward outputs in `pool_sats` deliberately UNDER-states
+        // the rate, so payments discharge slightly less work than they bought. That is the safe
+        // direction: under-discharging leaves work owed and the next block pays it, while
+        // over-discharging marks a miner paid for money they never received. When the coinbase
+        // moves to declaring shard state (Stage 5) the two converge and the residual disappears.
+        //
+        // ⚠ `owed` is reused rather than re-locking `self.table`: the guard above is still alive
+        // here and `parking_lot::Mutex` is not reentrant, so a second `lock()` would deadlock the
+        // epoch task outright.
+        let pool_sats: u64 = outputs.iter().map(|o| o.value).sum();
+        let top_work: i64 = owed
+            .values()
+            .filter(|micro| **micro > 0)
+            .fold(0i64, |acc, micro| acc.saturating_add(*micro));
 
         let amounts: Vec<(String, i64)> = matched
             .iter()
@@ -1382,6 +1403,25 @@ mod tests {
     }
 
     /// Coinbase outputs paying the given addresses.
+    /// The block subsidy a real coinbase carries. Fixtures must include it, because the discharge
+    /// rate is `coinbase_total / total_owed` — an absolute number of satoshis against an absolute
+    /// amount of work. A fixture whose only output is the payment makes that ratio cancel, which
+    /// is precisely the self-normalising bug the rate was changed to avoid, reintroduced in the
+    /// test rig instead of the code.
+    const SUBSIDY_SATS: u64 = 312_500_000;
+
+    /// A coinbase shaped like a real one: the named payments, plus the remaining subsidy paid
+    /// somewhere the shard does not credit (treasury, node rewards, whatever is left).
+    fn coinbase(pairs: &[(&str, u64)]) -> Vec<CoinbaseOutput> {
+        let mut outs = pay(pairs);
+        let paid: u64 = pairs.iter().map(|(_, s)| *s).sum();
+        outs.push(CoinbaseOutput {
+            value: SUBSIDY_SATS.saturating_sub(paid),
+            script_pubkey: vec![0x6a],
+        });
+        outs
+    }
+
     fn pay(pairs: &[(&str, u64)]) -> Vec<CoinbaseOutput> {
         pairs
             .iter()
@@ -1554,37 +1594,116 @@ mod tests {
         let rx = our_received_by(&identity);
         accrue(&db, &rt, &rx, &[(ADDR_A, 5.0), (ADDR_B, 3.0)]);
 
-        // Partial: this block pays A only. A's rate is computed over the PAID set alone
-        // (pool = 250_000 sats against A's 5_000_000 micro), so A discharges in full — and B,
-        // unpaid, is untouched.
+        // The rate is ABSOLUTE: `coinbase_total / total_owed`. This block's coinbase carries a
+        // full subsidy and pays A a slice of it, so A discharges that slice's worth of work — not
+        // A's whole balance. B, unpaid, is untouched.
+        //
+        // discharged_A = 250_000 × 8_000_000 / 312_500_000 = 6_400 micro-work.
         let SettleBlockOutcome::Settled(s) = rt
-            .settle_block_from_coinbase(702, "00dd", 602, &tagged_scriptsig(), &pay(&[(ADDR_A, 250_000)]))
+            .settle_block_from_coinbase(
+                702,
+                "00dd",
+                602,
+                &tagged_scriptsig(),
+                &coinbase(&[(ADDR_A, 250_000)]),
+            )
             .expect("partial")
         else {
             panic!("must settle");
         };
         assert_eq!(s.addresses, 1);
-        assert_eq!(s.discharged_micro, micro_work(5.0));
-        assert_eq!(rt.owed().get(ADDR_A), Some(&0));
+        assert_eq!(s.discharged_micro, 6_400, "a slice of the subsidy buys a slice of the work");
+        assert_eq!(
+            rt.owed().get(ADDR_A),
+            Some(&(micro_work(5.0) - 6_400)),
+            "A keeps the work the payment did not buy"
+        );
         assert_eq!(
             rt.owed().get(ADDR_B),
             Some(&micro_work(3.0)),
             "the unpaid address keeps its full remainder owed"
         );
 
-        // The next block pays the remainder: everything owed is now discharged.
+        // A block that pays its WHOLE coinbase to the owed set discharges the whole ledger — and
+        // does so however the split falls, because `Σpaid == coinbase_total` makes the rate exact.
+        // That is the identity the target design relies on once the coinbase is built from the
+        // shard; here it is reached only because this fixture hands out every satoshi.
+        let owed_now = rt.owed();
+        let remaining: i64 = owed_now.values().filter(|m| **m > 0).sum();
+        let a_share = 200_000_000u64;
         let SettleBlockOutcome::Settled(s) = rt
-            .settle_block_from_coinbase(703, "00ee", 603, &tagged_scriptsig(), &pay(&[(ADDR_B, 99_000)]))
+            .settle_block_from_coinbase(
+                703,
+                "00ee",
+                603,
+                &tagged_scriptsig(),
+                &pay(&[(ADDR_A, a_share), (ADDR_B, SUBSIDY_SATS - a_share)]),
+            )
             .expect("remainder")
         else {
             panic!("must settle");
         };
-        assert_eq!(s.discharged_micro, micro_work(3.0));
-        assert_eq!(rt.owed().get(ADDR_B), Some(&0));
+        assert_eq!(
+            s.discharged_micro, remaining,
+            "paying out the entire coinbase discharges the entire ledger"
+        );
+
+        // The TOTAL is exact; the individual residuals are not, because this split does not match
+        // the owed proportions — A was handed more than its share and B less. That is the design
+        // working rather than failing: `owed` is signed and never clamped (§4.4), so the
+        // over-discharged address carries a negative balance and accrues back up while the
+        // under-discharged one stays owed. What must hold is that the two cancel.
+        let after = rt.owed();
+        let a = *after.get(ADDR_A).unwrap_or(&0);
+        let b = *after.get(ADDR_B).unwrap_or(&0);
+        assert!(a < 0, "the over-paid address carries a negative residual, not a clamped zero");
+        assert!(b > 0, "the under-paid address is still owed");
+        assert_eq!(a + b, 0, "and the residuals cancel exactly — no work invented or lost");
     }
 
     /// A block without our tag discharges nothing and is not recorded — every block anyone
     /// mines passes through this path, and the common case must leave no trace at all.
+    #[test]
+    fn a_tiny_payment_cannot_clear_a_large_balance() {
+        // The bug this pins was self-normalisation: with `pool_sats` and `top_work` both summed
+        // over the MATCHED set, the ratio cancels and Σdischarged always equals Σowed — so a
+        // one-satoshi block cleared every matched balance in full, and every miner it touched was
+        // marked paid for money they never received.
+        //
+        // The inversion is only valid when the coinbase was built from this node's shard view. It
+        // is not; it is still built from the legacy proposal. So the rate must be absolute.
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+
+        seed_round(&db, 900, 900 * 6);
+        seed_share(&db, 900, 90, ADDR_A, 1_000.0, Some(12), &rx, true);
+        rt.fold_epoch(900).ok();
+
+        let owed_before = *rt.owed().get(ADDR_A).unwrap_or(&0);
+        assert!(owed_before > 0, "fixture must leave ADDR_A genuinely owed");
+
+        // A block whose entire coinbase is one satoshi to that address.
+        rt.settle_block_from_coinbase(
+            5_502,
+            "00ff",
+            5_402,
+            &tagged_scriptsig(),
+            &coinbase(&[(ADDR_A, 1)]),
+        )
+        .expect("settle");
+
+        let owed_after = *rt.owed().get(ADDR_A).unwrap_or(&0);
+        assert!(
+            owed_after > 0,
+            "one satoshi must not clear a balance of {owed_before} micro-work; owed is now \
+             {owed_after}"
+        );
+        assert!(
+            owed_after < owed_before || owed_before == 0,
+            "a real payment should still discharge something"
+        );
+    }
+
     #[test]
     fn a_foreign_block_neither_discharges_nor_is_recorded() {
         let (identity, db, rt) = runtime();
