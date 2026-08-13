@@ -206,6 +206,33 @@ pub fn shard_miner_payouts(
     out
 }
 
+/// Convert satoshis a matured coinbase actually paid into the micro-work they discharge.
+///
+/// `accrued` and `settled` are micro-work; a coinbase pays satoshis. Discharging a payment means
+/// converting at the rate the payment was computed under: the miner pool was shared out in
+/// proportion to owed work, so `sats : pool_sats` is the same ratio as `discharged : top_work`.
+///
+/// ⚠ **`top_work` is the paying node's own view**, so two nodes whose tables differ by gossip lag
+/// discharge slightly different amounts for the same block. That is deterministic-given-a-table,
+/// not identical-across-nodes, and §4.6 previously overclaimed it. It is safe because [`owed`] is
+/// signed and never clamped: discharge too much and the residual goes negative and accrues back
+/// up; too little and the next block pays it. The differences wash out exactly as payment
+/// differences do.
+///
+/// Returns 0 when the pool is empty — a block that paid miners nothing discharges nothing, rather
+/// than dividing by zero or silently discharging everything.
+///
+/// [`owed`]: ShardTable::owed
+pub fn discharged_micro_work(paid_sats: u64, pool_sats: u64, top_work: i64) -> i64 {
+    if pool_sats == 0 || top_work <= 0 || paid_sats == 0 {
+        return 0;
+    }
+    // u128 throughout: top_work is micro-work across the whole pool and paid_sats is satoshis, so
+    // the product overflows u64 long before either value is unreasonable.
+    let discharged = (paid_sats as u128).saturating_mul(top_work as u128) / pool_sats as u128;
+    discharged.min(i64::MAX as u128) as i64
+}
+
 /// Which epoch a block height falls in.
 ///
 /// Height-keyed and nothing else (§12.2). The previous design keyed windows to each node's local
@@ -841,6 +868,39 @@ mod tests {
         );
         let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
         assert_eq!(paid + r.dust_sats + r.remainder_sats, 1_000_000);
+    }
+
+    #[test]
+    fn a_full_payment_discharges_the_whole_pool_of_work() {
+        // The identity that has to hold: if the coinbase paid out the entire miner pool, then the
+        // work that pool was computed against is fully discharged. Anything else means a block
+        // pays a miner and still leaves them owed for the same work.
+        let top_work = 9_000_000i64;
+        let pool = 1_000_000u64;
+        let a = discharged_micro_work(700_000, pool, top_work);
+        let b = discharged_micro_work(200_000, pool, top_work);
+        let c = discharged_micro_work(100_000, pool, top_work);
+        assert_eq!(a + b + c, top_work, "a full payout discharges the full work");
+    }
+
+    #[test]
+    fn a_partial_payment_discharges_only_its_share() {
+        // Dust and the top-N cut mean the pool is not always fully paid out. What was not paid
+        // must stay owed — that is what makes "miners below the cut rotate in" true rather than
+        // aspirational.
+        let discharged = discharged_micro_work(250_000, 1_000_000, 8_000_000);
+        assert_eq!(discharged, 2_000_000, "a quarter of the pool discharges a quarter of the work");
+    }
+
+    #[test]
+    fn an_empty_pool_discharges_nothing_rather_than_everything() {
+        // The degenerate cases are the dangerous ones: a divide-by-zero here would panic on the
+        // block-connected path, and silently discharging everything would wipe the ledger on a
+        // block that paid miners nothing.
+        assert_eq!(discharged_micro_work(500, 0, 1_000_000), 0);
+        assert_eq!(discharged_micro_work(0, 1_000_000, 1_000_000), 0);
+        assert_eq!(discharged_micro_work(500, 1_000_000, 0), 0);
+        assert_eq!(discharged_micro_work(500, 1_000_000, -5), 0);
     }
 
     #[test]
