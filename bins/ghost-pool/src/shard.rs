@@ -690,6 +690,14 @@ mod tests {
             TickReport::default(),
             "a solo tick folds nothing"
         );
+        // A later tick, with an epoch now closed behind it. This is the call that would reach a
+        // fold if tick's own solo gate were missing — the first tick cannot, because a first run
+        // starts its watermark at the current epoch and has nothing closed to walk.
+        assert_eq!(
+            rt.tick(619).expect("tick"),
+            TickReport::default(),
+            "a solo tick folds nothing even once epochs have closed behind it"
+        );
         rt.fold_epoch(100)
             .expect_err("a direct solo fold must refuse");
         assert_eq!(db.shard_load_table().expect("load"), ShardTable::new());
