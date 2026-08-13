@@ -414,6 +414,23 @@ impl Database {
         }
     }
 
+    /// The highest epoch this node holds a summary for, or `None` if it has never folded.
+    ///
+    /// This is the fold watermark a restart resumes from: the summary row is written in the same
+    /// transaction as the fold itself, so "highest stored epoch" and "highest folded epoch" cannot
+    /// disagree — which is what makes resume-not-restart safe to derive rather than track.
+    pub fn shard_latest_epoch(&self, node: &NodeId) -> GhostResult<Option<u64>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT MAX(epoch) FROM shard_epochs WHERE node_id = ?1",
+                params![node.to_vec()],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+            .map(|opt| opt.map(|v| v as u64))
+        })
+    }
+
     /// Mark an epoch's summary as having been broadcast. Returns whether the row existed —
     /// marking a summary that was never stored is a caller bug worth surfacing, not a silent
     /// no-op.
@@ -747,5 +764,31 @@ mod tests {
             .expect_err("a different summary at an occupied (epoch, node) must be refused");
         let kept = db.shard_get_epoch(5, &node).expect("get").expect("present");
         assert_eq!(kept.share_root, [0x44; 32], "the original statement stays");
+    }
+
+    /// The fold watermark: the highest epoch THIS node has folded, scoped to this node. Peers'
+    /// rows share the table, so an unscoped MAX would resume from a peer's progress — silently
+    /// skipping every epoch between our real watermark and theirs, work this node never folds.
+    #[test]
+    fn latest_epoch_is_scoped_to_the_node_and_absent_when_never_folded() {
+        let db = db();
+        let node = [0x11; 32];
+        let peer = [0x99; 32];
+
+        assert_eq!(
+            db.shard_latest_epoch(&node).expect("query"),
+            None,
+            "a node that never folded has no watermark to resume from"
+        );
+
+        db.shard_store_epoch(&summary(3, node, [0x01; 32], &[]), false)
+            .expect("store");
+        db.shard_store_epoch(&summary(7, node, [0x02; 32], &[]), false)
+            .expect("store");
+        db.shard_store_epoch(&summary(9, peer, [0x03; 32], &[]), false)
+            .expect("peer store");
+
+        assert_eq!(db.shard_latest_epoch(&node).expect("query"), Some(7));
+        assert_eq!(db.shard_latest_epoch(&peer).expect("query"), Some(9));
     }
 }
