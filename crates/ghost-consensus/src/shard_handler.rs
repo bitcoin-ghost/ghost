@@ -108,23 +108,9 @@ pub fn verify_summary_stateless(
     summary: &EpochSummary,
     prior_summary: Option<&EpochSummary>,
 ) -> Result<(), ShardSummaryRejection> {
-    // Structure first — malformed is malformed regardless of who signed it. Same predicate
-    // spelling as `EpochSummary::verify`.
-    for row in summary.deltas.values() {
-        if row.delta_micro < 0 || row.total_micro < row.delta_micro {
-            return Err(SummaryRejection::MalformedDeltas.into());
-        }
-    }
-
-    // Signature second — an unsigned claim does not earn the comparisons below.
-    let sig: [u8; 64] = summary
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| ShardSummaryRejection::Summary(SummaryRejection::BadSignature))?;
-    if !verify_signature(&summary.node_id, &summary.signing_bytes(), &sig).unwrap_or(false) {
-        return Err(SummaryRejection::BadSignature.into());
-    }
+    // Structure then signature, borrowed from the type rather than re-spelled here: two copies of
+    // one predicate drift apart silently, and the weaker copy is the one that decides what merges.
+    summary.verify_stateless()?;
 
     // Chain checks, only against the same node's history.
     if let Some(prior) = prior_summary.filter(|p| p.node_id == summary.node_id) {

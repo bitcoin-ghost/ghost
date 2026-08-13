@@ -215,11 +215,16 @@ impl EpochSummary {
     /// Order: structure, signature, then evidence. The structural check is first because a
     /// malformed summary is malformed regardless of who signed it; the signature is checked before
     /// the evidence because an unsigned claim does not earn the fold's compute.
-    pub fn verify(
-        &self,
-        evidence: &[ShareProof],
-        merkle_root: MerkleRootFn,
-    ) -> Result<(), SummaryRejection> {
+    /// The half of verification that needs no shares: structure, then signature.
+    ///
+    /// This exists as its own function because a *gossiped* summary carries no evidence — peers
+    /// receive summaries, not shares — so the mesh handler has to make exactly these two checks and
+    /// nothing more. Spelling them twice is how two copies of one predicate drift apart, silently,
+    /// with the weaker copy deciding what gets merged. One spelling, two callers.
+    ///
+    /// Structure is checked before the signature deliberately: malformed is malformed no matter who
+    /// signed it, and it is the cheaper test.
+    pub fn verify_stateless(&self) -> Result<(), SummaryRejection> {
         for row in self.deltas.values() {
             if row.delta_micro < 0 || row.total_micro < row.delta_micro {
                 return Err(SummaryRejection::MalformedDeltas);
@@ -234,6 +239,16 @@ impl EpochSummary {
         if !verify_signature(&self.node_id, &self.signing_bytes(), &sig).unwrap_or(false) {
             return Err(SummaryRejection::BadSignature);
         }
+
+        Ok(())
+    }
+
+    pub fn verify(
+        &self,
+        evidence: &[ShareProof],
+        merkle_root: MerkleRootFn,
+    ) -> Result<(), SummaryRejection> {
+        self.verify_stateless()?;
 
         if evidence.len() != self.share_count as usize {
             return Err(SummaryRejection::EvidenceCountMismatch);
