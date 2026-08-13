@@ -124,6 +124,83 @@ pub fn crosses_network_tier(tier_log2: Option<u32>) -> bool {
     }
 }
 
+/// What a miner-pool distribution came to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MinerPayouts {
+    /// `(payout address, satoshis)`, in the order the coinbase should carry them.
+    pub payouts: Vec<(String, u64)>,
+    /// Satoshis that fell below the dust threshold. These are NOT lost — the existing coinbase
+    /// builder rolls miner dust into the node reward pool, and that behaviour is preserved.
+    pub dust_sats: u64,
+    /// Floor-division leftover. Tracked rather than discarded so a caller can assert that every
+    /// satoshi is accounted for; silently dropping it is how a pool leaks money slowly.
+    pub remainder_sats: u64,
+}
+
+/// Distribute a miner pool over the shard's owed balances.
+///
+/// This deliberately mirrors the live `calculate_miner_payouts` **exactly** — same descending
+/// sort with an ascending tie-break, same truncation before the total is recomputed, same floor
+/// division, same dust rule. It has to: this function exists first to be *compared* against the
+/// live path, and any arithmetic difference would make every shadow diff non-zero for reasons that
+/// have nothing to do with drift, which would make the soak signal worthless.
+///
+/// One intended difference: the shard is keyed on **payout address**, where the live path keys on
+/// miner id and resolves an address afterwards. Two miners paying to one address are one row here.
+/// That is the address grouping the design wants, not a discrepancy.
+///
+/// Balances that are zero or **negative** take no part. A negative `owed` means that address has
+/// been overpaid relative to this node's view (§4.4) and is working the debt off; paying it again
+/// would be paying twice for the same work.
+///
+/// Integer arithmetic throughout, in `u128`, because this decides who gets paid what and a float
+/// would make the answer depend on the order the additions happened to be done in.
+pub fn shard_miner_payouts(
+    owed: &BTreeMap<String, i64>,
+    pool_sats: u64,
+    max_outputs: usize,
+    dust_threshold_sats: u64,
+) -> MinerPayouts {
+    let mut out = MinerPayouts::default();
+
+    let mut positive: Vec<(&String, u128)> = owed
+        .iter()
+        .filter(|(_, &micro)| micro > 0)
+        .map(|(addr, &micro)| (addr, micro as u128))
+        .collect();
+    if positive.is_empty() || pool_sats == 0 {
+        out.remainder_sats = pool_sats;
+        return out;
+    }
+
+    // Descending by owed, ascending by address on a tie. The tie-break is what makes this a total
+    // order: without it the result depends on the iteration order of whatever fed us, and two
+    // nodes holding identical balances could still build different coinbases.
+    positive.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    positive.truncate(max_outputs);
+
+    // Recomputed AFTER truncation, exactly as the live path does — the pool is shared among those
+    // actually paid, not diluted by addresses that did not make the cut.
+    let top: u128 = positive.iter().map(|(_, w)| *w).sum();
+    if top == 0 {
+        out.remainder_sats = pool_sats;
+        return out;
+    }
+
+    let mut allocated: u64 = 0;
+    for (addr, work) in positive {
+        let amount = ((pool_sats as u128 * work) / top) as u64;
+        allocated = allocated.saturating_add(amount);
+        if amount < dust_threshold_sats {
+            out.dust_sats = out.dust_sats.saturating_add(amount);
+            continue;
+        }
+        out.payouts.push((addr.clone(), amount));
+    }
+    out.remainder_sats = pool_sats.saturating_sub(allocated);
+    out
+}
+
 /// Which epoch a block height falls in.
 ///
 /// Height-keyed and nothing else (§12.2). The previous design keyed windows to each node's local
@@ -677,6 +754,83 @@ mod tests {
             !crosses_network_tier(Some(NETWORK_TIER_LOG2 - 1)),
             "a share carrying a tier below the floor is the one case the filter exists for"
         );
+    }
+
+    fn owed_map(rows: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        rows.iter().map(|(a, m)| (a.to_string(), *m)).collect()
+    }
+
+    #[test]
+    fn every_satoshi_is_accounted_for_and_none_invented() {
+        // Conservation is the property that matters most here: the coinbase total is fixed by
+        // consensus, so a satoshi this function loses is one a miner is quietly not paid, and a
+        // satoshi it invents is a block the network rejects.
+        let owed = owed_map(&[("bc1qa", 7_000), ("bc1qb", 2_000), ("bc1qc", 1_000)]);
+        let pool = 1_000_000u64;
+        let r = shard_miner_payouts(&owed, pool, 200, 330);
+
+        let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
+        assert_eq!(
+            paid + r.dust_sats + r.remainder_sats,
+            pool,
+            "paid + dust + remainder must equal the pool exactly"
+        );
+    }
+
+    #[test]
+    fn negative_and_zero_balances_take_no_part() {
+        // A negative `owed` means this node's view has that address overpaid — it is working the
+        // debt off (§4.4, balances are signed and never clamped). Paying it again would pay twice
+        // for the same work, and clamping to zero instead would silently forgive the overpayment.
+        let owed = owed_map(&[("bc1qa", 1_000), ("bc1qneg", -5_000), ("bc1qzero", 0)]);
+        let r = shard_miner_payouts(&owed, 100_000, 200, 1);
+
+        let addrs: Vec<&str> = r.payouts.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(addrs, vec!["bc1qa"], "only positive balances are paid");
+    }
+
+    #[test]
+    fn the_order_is_total_so_two_nodes_cannot_differ_on_a_tie() {
+        // Without the address tie-break the result depends on the iteration order of whatever fed
+        // us, and two nodes holding identical balances could build different coinbases — a
+        // divergence with no cause visible in the data.
+        let owed = owed_map(&[("bc1qz", 500), ("bc1qa", 500), ("bc1qm", 500)]);
+        let r = shard_miner_payouts(&owed, 30_000, 200, 1);
+
+        let addrs: Vec<&str> = r.payouts.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(
+            addrs,
+            vec!["bc1qa", "bc1qm", "bc1qz"],
+            "equal balances must order by address, ascending"
+        );
+    }
+
+    #[test]
+    fn the_pool_is_shared_among_those_actually_paid_not_diluted_by_the_cut() {
+        // The total is recomputed AFTER truncation, matching the live path. Diluting by addresses
+        // that did not make the cut would underpay everyone who did and silently grow the
+        // remainder — money going nowhere rather than to the miners entitled to it.
+        let owed = owed_map(&[("bc1qa", 100), ("bc1qb", 100), ("bc1qc", 100), ("bc1qd", 100)]);
+        let r = shard_miner_payouts(&owed, 1_000, 2, 1);
+
+        let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
+        assert_eq!(r.payouts.len(), 2, "only the top two are paid");
+        assert_eq!(paid, 1_000, "and they share the WHOLE pool between them");
+    }
+
+    #[test]
+    fn dust_is_diverted_never_dropped() {
+        // Sub-threshold amounts roll into the node reward pool in the existing builder. Counting
+        // them as dust rather than dropping them is what keeps conservation true.
+        let owed = owed_map(&[("bc1qwhale", 1_000_000), ("bc1qdust", 1)]);
+        let r = shard_miner_payouts(&owed, 1_000_000, 200, 330);
+
+        assert!(
+            r.payouts.iter().all(|(a, _)| a != "bc1qdust"),
+            "a sub-threshold payout must not reach the coinbase"
+        );
+        let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
+        assert_eq!(paid + r.dust_sats + r.remainder_sats, 1_000_000);
     }
 
     #[test]
