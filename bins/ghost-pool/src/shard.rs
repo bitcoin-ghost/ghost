@@ -738,8 +738,28 @@ impl ShardRuntime {
         if height.saturating_add(COINBASE_MATURITY) > tip_height {
             return Ok(SettleBlockOutcome::Immature);
         }
-        if extract_payout_tag(scriptsig).is_none() {
+        // Ownership: the tag's PRESENCE is not enough. `GHPP` says "some Ghost deployment mined
+        // this", not "this pool did" — and the whole design is permissionless, so other Ghost
+        // deployments carrying the same tag is the expected state, not a corner case. A sibling's
+        // block (or a forged tag) that happens to pay an address we also credit would discharge
+        // our miners' owed work against money this pool never received: marked paid, not paid.
+        //
+        // So resolve the 16-byte payout id to a proposal WE hold, exactly as the legacy settlement
+        // path does. That works today because the coinbase is still built from the proposal; when
+        // the coinbase moves to declaring shard state (Stage 5), this ownership test moves with it
+        // and must not be loosened in the meantime.
+        let Some(payout_id) = extract_payout_tag(scriptsig) else {
             return Ok(SettleBlockOutcome::NotOurs);
+        };
+        match self.db.get_proposal_by_hash_prefix(&payout_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(SettleBlockOutcome::NotOurs),
+            Err(e) => {
+                // Cannot prove ownership => do not settle. Failing closed here costs a deferral;
+                // failing open would discharge real balances on an unproven block.
+                warn!(error = %e, "shard: payout id lookup failed — deferring, not settling");
+                return Ok(SettleBlockOutcome::NotOurs);
+            }
         }
         // One spelling of the hash everywhere: the idempotence record only works if every
         // caller writes display order, and the normaliser leaves a display-order hash alone.

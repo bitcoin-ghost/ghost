@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 53;
+const SCHEMA_VERSION: u32 = 54;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -130,6 +130,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (51, migrate_v51),
         (52, migrate_v52),
         (53, migrate_v53),
+        (54, migrate_v54),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2666,8 +2667,27 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
             published    INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (epoch, node_id)
          );
+",
+    )
+    .map_err(|e| GhostError::Database(e.to_string()))?;
 
-         -- Blocks the shard has settled, keyed by DISPLAY-ORDER block hash (the order the RPC
+    Ok(())
+}
+
+/// v54: the shard's settlement record.
+///
+/// ⚠ **This is a separate migration ON PURPOSE, and the reason is worth keeping.** It was first
+/// written into v53 in place, on the reasoning that v53 "has never shipped anywhere" — which was
+/// true of the fleet and irrelevant. A migration is immutable the moment ANY database has run it,
+/// and branch builds run them: this file's own header warns that nodes which have drifted ahead
+/// "skip it while reporting themselves up to date", so the defect "surfaces far from its cause, as
+/// a missing table on two nodes only, and those two are the canaries we deploy to first".
+///
+/// A node whose DB already said 53 would never have received this table, and settlement there would
+/// have failed for ever with no signal. Append, never amend.
+fn migrate_v54(conn: &Connection) -> GhostResult<()> {
+    conn.execute_batch(
+        "-- Blocks the shard has settled, keyed by DISPLAY-ORDER block hash (the order the RPC
          -- speaks; the internal-order trap has cost an outage before). One row per pool block at
          -- coinbase maturity; the primary key is what makes re-settling a block a no-op.
          -- discharged_micro and settled_ts are advisory, for diagnosis — never decision inputs.
