@@ -309,10 +309,39 @@ impl ShardRuntime {
         owns_evidence: bool,
     ) -> GhostResult<Self> {
         let table = db.shard_load_table()?;
+
+        // Re-assert the opening balances against the ceremony pin, every start.
+        //
+        // `merge_accrued` skips the reserved genesis column, so once a node is armed those rows
+        // can never be re-learned from a peer — they are the one part of the table with no
+        // redundancy anywhere in the design. Truncation, a partial delete, or a backup restored
+        // from before the ceremony would leave the node opening under-owing every miner, staying
+        // internally consistent, with nothing to contradict it.
+        //
+        // An ABSENT column is not a failure: that is every pre-ceremony start, which is all of
+        // them today. Present-and-wrong is the only thing refused, and refusing means the shard
+        // does not load while the pool keeps mining (see the call-site contract above) — the
+        // safe direction, because a shard that is not observing costs nothing and a shard
+        // observing from the wrong balances is what the ceremony exists to prevent.
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        if let Err(e) = ghost_accounting::shard_genesis::verify_loaded_genesis(&table, &anchor) {
+            error!(
+                anchor_height = anchor.height,
+                error = %e,
+                "share shard: persisted genesis column does not match the pin — REFUSING to load"
+            );
+            return Err(GhostError::Database(e.to_string()));
+        }
+
         let received_by = hex::encode(&identity.node_id()[..8]);
         info!(
             columns = table.accrued().len(),
-            solo, owns_evidence, "share shard: runtime loaded"
+            genesis_installed = table
+                .accrued()
+                .contains_key(&ghost_accounting::shard_genesis::GENESIS_NODE_ID),
+            solo,
+            owns_evidence,
+            "share shard: runtime loaded"
         );
         Ok(Self {
             identity,

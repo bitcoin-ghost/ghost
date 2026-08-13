@@ -101,6 +101,50 @@ pub struct GenesisAnchor {
     pub table_root: [u8; 32],
 }
 
+/// Height of the pinned genesis anchor.
+///
+/// Chosen 2026-08-13 by `scripts/shard-anchor-rehearsal.sh` from 133 candidates, of which 2
+/// qualified — post-#606 the adopted bytes agree at only ~1.6% of heights, so this is the newest
+/// height that could be used, not the newest that existed. Re-pin by re-running the survey; the
+/// golden vector is the only thing that has to move with it.
+pub const ANCHOR_HEIGHT: u64 = 962_008;
+
+/// `cutoff_ts` of the pinned anchor. Chain-derived, carried for provenance.
+pub const ANCHOR_CUTOFF_TS: i64 = 1_786_453_494;
+
+/// The `ledger_root` the fleet ratified at [`ANCHOR_HEIGHT`] — provenance only, never the gate.
+const ANCHOR_LEDGER_ROOT: &str =
+    "61ae50ab136fcda3e99041cbfc6175e94099db1acfd2abe935c1b67dcd74b93e";
+
+/// SHA-256 of the adopted `canonical_payout` blob — the real fleet-identity check.
+const ANCHOR_CANONICAL_SHA256: &str =
+    "a3f7202f8230893fb5c3c5fe7487b36c3e297000aa3c2fcb1c0848cb2bebad62";
+
+/// `compute_table_root` of the opening table this anchor converts to.
+const ANCHOR_TABLE_ROOT: &str =
+    "ecbbd9ec1abdf97a6f8cb8aea384777382fe9727829e533cf06d340564a80c88";
+
+/// The pinned ceremony anchor.
+///
+/// Panics only if the constants above are not 32 bytes of hex, which
+/// [`tests::the_pinned_anchor_parses`] makes a build-time failure rather than a runtime one.
+pub fn pinned_anchor() -> GenesisAnchor {
+    fn h(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let bytes = hex::decode(s).expect("pinned anchor constant is valid hex");
+        assert_eq!(bytes.len(), 32, "pinned anchor constant must be 32 bytes");
+        out.copy_from_slice(&bytes);
+        out
+    }
+    GenesisAnchor {
+        height: ANCHOR_HEIGHT,
+        cutoff_ts: ANCHOR_CUTOFF_TS,
+        ledger_root: h(ANCHOR_LEDGER_ROOT),
+        canonical_sha256: h(ANCHOR_CANONICAL_SHA256),
+        table_root: h(ANCHOR_TABLE_ROOT),
+    }
+}
+
 /// Why a node refused to open its shard.
 ///
 /// Every variant is a refusal to start, never a warning. A node that opens on the wrong balances
@@ -318,17 +362,6 @@ mod tests {
         ]
     }
 
-    fn anchor_962008() -> GenesisAnchor {
-        GenesisAnchor {
-            height: 962_008,
-            cutoff_ts: 1_786_453_494,
-            ledger_root: hex_32("61ae50ab136fcda3e99041cbfc6175e94099db1acfd2abe935c1b67dcd74b93e"),
-            canonical_sha256: hex_32(
-                "a3f7202f8230893fb5c3c5fe7487b36c3e297000aa3c2fcb1c0848cb2bebad62",
-            ),
-            table_root: hex_32(GENESIS_TABLE_ROOT_962008),
-        }
-    }
 
     /// Pinned opening root for the 962,008 anchor.
     ///
@@ -430,6 +463,25 @@ mod tests {
         );
     }
 
+    /// The pinned constants must parse, and must be the anchor the golden vector was taken over.
+    ///
+    /// `pinned_anchor` panics on malformed hex; this makes that a test failure at build time
+    /// rather than a node refusing to start in the middle of a ceremony.
+    #[test]
+    fn the_pinned_anchor_parses() {
+        let anchor = pinned_anchor();
+        assert_eq!(anchor.height, 962_008);
+        assert_eq!(anchor.cutoff_ts, 1_786_453_494);
+        assert_eq!(
+            hex::encode(anchor.canonical_sha256),
+            "a3f7202f8230893fb5c3c5fe7487b36c3e297000aa3c2fcb1c0848cb2bebad62"
+        );
+        // The pin must agree with the conversion it claims to describe — otherwise the runtime
+        // would check itself against a number nothing produced.
+        let (table, _) = shard_genesis_table(&ratified_962008());
+        assert_eq!(table.compute_table_root(), anchor.table_root);
+    }
+
     /// Golden vector: the opening root for the chosen anchor.
     #[test]
     fn genesis_table_root_for_the_962008_anchor_is_pinned() {
@@ -444,9 +496,9 @@ mod tests {
     #[test]
     fn arming_accepts_the_verified_anchor() {
         let blob = canonical_blob();
-        let (table, _) = open_shard_from_checkpoint(&blob, &anchor_962008())
+        let (table, _) = open_shard_from_checkpoint(&blob, &pinned_anchor())
             .expect("the verified anchor must arm");
-        assert_eq!(table.compute_table_root(), anchor_962008().table_root);
+        assert_eq!(table.compute_table_root(), pinned_anchor().table_root);
         assert_eq!(genesis_column(&table).len(), 5);
     }
 
@@ -456,7 +508,7 @@ mod tests {
     fn arming_refuses_bytes_the_ceremony_did_not_verify() {
         let mut blob = canonical_blob();
         blob.push(b' '); // JSON-insignificant, byte-significant: still the wrong object
-        let err = open_shard_from_checkpoint(&blob, &anchor_962008())
+        let err = open_shard_from_checkpoint(&blob, &pinned_anchor())
             .expect_err("different bytes must refuse");
         assert!(
             matches!(err, GenesisError::CanonicalMismatch { .. }),
@@ -469,7 +521,7 @@ mod tests {
     /// taxonomy in the docs matches what the code actually returns.
     #[test]
     fn an_empty_blob_refuses_as_a_byte_mismatch_not_as_no_payees() {
-        let err = open_shard_from_checkpoint(&[], &anchor_962008())
+        let err = open_shard_from_checkpoint(&[], &pinned_anchor())
             .expect_err("an empty blob must refuse");
         assert!(
             matches!(err, GenesisError::CanonicalMismatch { .. }),
@@ -486,7 +538,7 @@ mod tests {
         let blob = serde_json::to_vec(&(&empty_payouts, &empty_nodes)).expect("encodable");
         let anchor = GenesisAnchor {
             canonical_sha256: Sha256::digest(&blob).into(),
-            ..anchor_962008()
+            ..pinned_anchor()
         };
         let err = open_shard_from_checkpoint(&blob, &anchor)
             .expect_err("a payee-less anchor must refuse");
@@ -500,7 +552,7 @@ mod tests {
         let blob = canonical_blob();
         let anchor = GenesisAnchor {
             table_root: [0xAB; 32],
-            ..anchor_962008()
+            ..pinned_anchor()
         };
         let err = open_shard_from_checkpoint(&blob, &anchor)
             .expect_err("a moved conversion must refuse");
@@ -511,7 +563,7 @@ mod tests {
     #[test]
     fn verifying_a_table_with_no_genesis_column_is_not_an_error() {
         assert_eq!(
-            verify_loaded_genesis(&ShardTable::new(), &anchor_962008()),
+            verify_loaded_genesis(&ShardTable::new(), &pinned_anchor()),
             Ok(())
         );
     }
@@ -520,10 +572,10 @@ mod tests {
     #[test]
     fn verifying_an_intact_persisted_genesis_column_passes() {
         let (table, _) =
-            open_shard_from_checkpoint(&canonical_blob(), &anchor_962008()).expect("arms");
+            open_shard_from_checkpoint(&canonical_blob(), &pinned_anchor()).expect("arms");
         let mut reloaded = ShardTable::new();
         reloaded.install_genesis(genesis_column(&table));
-        assert_eq!(verify_loaded_genesis(&reloaded, &anchor_962008()), Ok(()));
+        assert_eq!(verify_loaded_genesis(&reloaded, &pinned_anchor()), Ok(()));
     }
 
     /// The failure this check exists for: rows lost from `shard_counters`.
@@ -533,13 +585,13 @@ mod tests {
     #[test]
     fn verifying_a_truncated_persisted_genesis_column_refuses() {
         let (table, _) =
-            open_shard_from_checkpoint(&canonical_blob(), &anchor_962008()).expect("arms");
+            open_shard_from_checkpoint(&canonical_blob(), &pinned_anchor()).expect("arms");
         let mut lossy = genesis_column(&table);
         lossy.remove("bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h");
 
         let mut reloaded = ShardTable::new();
         reloaded.install_genesis(lossy);
-        let err = verify_loaded_genesis(&reloaded, &anchor_962008())
+        let err = verify_loaded_genesis(&reloaded, &pinned_anchor())
             .expect_err("a truncated genesis column must refuse to start");
         assert!(
             matches!(err, GenesisError::LoadedGenesisMismatch { .. }),
@@ -551,14 +603,14 @@ mod tests {
     #[test]
     fn verifying_an_inflated_persisted_genesis_column_refuses() {
         let (table, _) =
-            open_shard_from_checkpoint(&canonical_blob(), &anchor_962008()).expect("arms");
+            open_shard_from_checkpoint(&canonical_blob(), &pinned_anchor()).expect("arms");
         let mut inflated = genesis_column(&table);
         inflated.insert("bc1qattacker".to_string(), 999_999_999);
 
         let mut reloaded = ShardTable::new();
         reloaded.install_genesis(inflated);
         assert!(matches!(
-            verify_loaded_genesis(&reloaded, &anchor_962008()),
+            verify_loaded_genesis(&reloaded, &pinned_anchor()),
             Err(GenesisError::LoadedGenesisMismatch { .. })
         ));
     }
