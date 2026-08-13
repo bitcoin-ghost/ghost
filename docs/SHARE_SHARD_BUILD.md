@@ -263,6 +263,16 @@ one epoch. Many-to-one at each step is what makes the binding total and unambigu
 
 *(My call, derived from the code rather than an operator decision — override if you disagree.)*
 
+**Table-sync paging is unwritten.** The envelope ceiling is ~2,800 cells; the target scale is orders
+of magnitude past that (§12.6). Not needed for an 8-node fleet, so it is not a cutover blocker — but
+it *is* a precondition for the network growing, and it should be designed before anyone advertises
+that it can.
+
+**One spelling of the summary predicate.** `ShardTable::apply_summary` requires full share evidence,
+but a gossiped summary carries none (§6), so `shard_handler.rs` re-spells the structure-and-signature
+half. Add `EpochSummary::verify_stateless()` in `share_shard.rs` and have both call it — two spellings
+of one predicate drift apart, and the drift is silent.
+
 **Elder revocation** currently rides the payout vote machinery. With voting deleted it needs a
 standalone home or an explicit decision to drop.
 

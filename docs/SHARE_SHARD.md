@@ -227,8 +227,9 @@ Merge is idempotent, commutative and associative, so:
 - **a missing message makes you behind, never wrong**
 - there is no state requiring repair
 
-Reconciliation is trivial because the shard is ~15 KB: ship the whole table and merge it. No diff
-protocol needed.
+Reconciliation needs no diff protocol at today's size — the shard is ~15 KB, so a peer can send the
+whole table and the receiver merges it. ⚠ That holds only while the table fits one message; see
+§12.6 for the ceiling and why detection must key on the root rather than the table.
 
 **Balances must be signed.** If node A overpays relative to node B's view, B's residual goes negative
 and the miner accrues back up from there. Clamping at zero destroys exactly the correction that makes
@@ -450,5 +451,13 @@ keep and expensive to recover from.
 4. **Rejections must be publishable evidence**, never private sampling luck (§6).
 5. **Never add a tolerance.** A tolerance is an admission that the mechanism cannot converge. If the
    numbers disagree, find out why.
-6. **Ship the whole table and compare it.** At ~15 KB there is no excuse for not knowing whether the
-   network has drifted. Drift must be visible the same day, not discovered a quarter later.
+6. **Compare roots every epoch; ship the table only to repair.** A 32-byte root answers "have we
+   drifted?" and costs nothing at any fleet size. Detection must be continuous and drift visible the
+   same day, not discovered a quarter later through a tolerance somebody added to stop the numbers
+   arguing.
+
+   ⚠ **Do not ship the whole table as the detection mechanism.** Measured while building the mesh
+   layer: the message envelope ceiling is ~2,800 cells once JSON expansion is accounted for. The
+   table is `nodes × addresses`, so §10's own 100-node × 500-address case is 50,000 cells ≈ 4.5 MB —
+   a whole-table message becomes impossible long before the network reaches target scale. Repair
+   must page, and the paging design is **not yet written**.
