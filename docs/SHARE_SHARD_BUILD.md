@@ -17,14 +17,42 @@ only thing wired into a running path so far is the `pool.share_shard` flag, whic
 | mesh types + handlers | `crates/ghost-consensus/src/shard_handler.rs` | ✅ 327 tests |
 | §6 leaf sampling | same | ✅ included above |
 | `pool.share_shard` flag | `crates/ghost-common/src/config.rs` | ✅ committed, dark |
-| epoch runtime | `bins/ghost-pool/src/shard.rs` | 🔨 in progress |
-| `main.rs` wiring | 3 insertion points | 🔨 drafted, held until the runtime lands |
+| epoch runtime | `bins/ghost-pool/src/shard.rs` | ✅ folds, retention, `note_height` |
+| `main.rs` wiring | 3 insertion points | ✅ construction, epoch task, boundary log |
+| Stage 2 network tier | `crosses_network_tier` | ✅ shipped **inert at R = 1** |
+| Stage 3 payout arithmetic | `shard_miner_payouts` | ✅ mirrors the live path exactly |
+| Stage 3 drift signal | `drift_against_legacy_ledger` | ✅ wired, **once per epoch** |
+| Stage 3 settlement | `settle_matured` | 🔨 in progress |
 
 **Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
 share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
 
 **Not started:** Stage 2 network-tier split (ship at R=1), Stage 3 coinbase source and settlement,
 Stage 5 genesis ceremony, Stage 6 deletion.
+
+### ⚠ Rehearsing settlement on regtest is not straightforward — check before planning around it
+
+The advice to "rehearse on regtest" is easy to write and hard to do, and the obstacle is structural
+rather than fiddly.
+
+`template.rs` refuses block submission without a verified coinbase commitment (**H-11**), and the
+only source of a commitment today is a **BFT-ratified payout proposal**. A single-node regtest has
+no quorum, so no proposal is ever ratified, so `commitment_snapshot` stays `None` and **no block can
+be submitted at all** — this is exactly why the earlier regtest chain sat stuck at height 101, which
+was environmental to the rig and not a bug in what was being tested.
+
+So a pool block cannot simply be won on a one-node regtest, and settlement cannot be exercised the
+obvious way. The options, in ascending order of honesty about cost:
+
+1. **Feed `settle_matured` a hand-constructed coinbase.** Achievable today and worth doing — but it
+   is a *test*, not a rehearsal: it exercises the arithmetic and the idempotence, and proves nothing
+   about the RPC path, the parsing of a real block, or the maturity lookback against a live chain.
+2. **Multi-node regtest with real quorum.** A genuine rehearsal, and substantially more rig.
+3. **Wait for mainnet.** Not a plan — `won_blocks` is empty, so the first real exercise of this code
+   would be a live block carrying real money.
+
+Whichever is chosen, say which one it was. "Rehearsed on regtest" covering only option 1 would be
+the kind of claim that reads as coverage and is not.
 
 ⚠ **Eight design errors were found by *building* the design, none by re-reading it** — the counter
 double-payment, deltas not being max-mergeable, the §6/§12.3 contradiction, evidence retention on
