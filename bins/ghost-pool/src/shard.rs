@@ -887,6 +887,18 @@ impl ShardRuntime {
         let mut table = self.table.lock();
         let owed = table.owed();
 
+        // ⚠ This lock is held across the storage transaction ON PURPOSE, and it is a trade, not an
+        // oversight. Releasing it to shorten the window would mean computing the discharge from one
+        // table state and applying it to another: the rate would be one nobody computed, against
+        // balances that had moved. Since the whole point of `settled` is that it discharges exactly
+        // what the rate was derived from, that is the wrong thing to give up.
+        //
+        // What it costs: root, owed, drift and fold readers wait for the duration of a short
+        // transaction, and a `SQLITE_BUSY` aborts the call (which retries next tick, harmlessly).
+        // Reviewed and accepted rather than fixed — lock ORDER was verified, so there is no
+        // deadlock, only latency. If this ever shows up as contention, the fix is to make the
+        // storage call cheaper, not to widen the gap between computing a rate and applying it.
+        //
         // The matched set: positively-owed addresses this coinbase actually paid. Outputs to
         // anything else — the treasury, node rewards, an address already at or below zero —
         // discharge nothing, because there is no owed work to attribute them to.
