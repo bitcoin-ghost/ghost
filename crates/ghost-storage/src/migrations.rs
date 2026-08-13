@@ -2645,13 +2645,20 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
          -- reconstruct one — encrypted at rest because the deltas are keyed by plaintext payout
          -- address. Unlike sbc_batches' verbatim JSON, re-serialisation is harmless here: the
          -- signature covers the canonical signing bytes, not the JSON encoding.
+         -- Keyed on (epoch, node_id), not epoch alone: an epoch has one summary PER NODE, and
+         -- keying on epoch alone would make this table hold only our own. Peers' signed summaries
+         -- are what an accusation is made of — without them a node can never prove what someone
+         -- else claimed, and evidence-based rejection is how this design polices cheating without
+         -- a vote. Two rows differing only by node_id are the normal case; a *second* row for the
+         -- same (epoch, node_id) with a different root is equivocation, which is the point.
          CREATE TABLE IF NOT EXISTS shard_epochs (
-            epoch        INTEGER PRIMARY KEY,
+            epoch        INTEGER NOT NULL,
             node_id      BLOB    NOT NULL,
             share_root   BLOB    NOT NULL,
             share_count  INTEGER NOT NULL,
             summary_enc  TEXT    NOT NULL,
-            published    INTEGER NOT NULL DEFAULT 0
+            published    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (epoch, node_id)
          );",
     )
     .map_err(|e| GhostError::Database(e.to_string()))?;
