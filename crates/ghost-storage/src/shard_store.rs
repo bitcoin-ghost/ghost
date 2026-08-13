@@ -493,6 +493,32 @@ impl Database {
         })
     }
 
+    /// Drop this node's own epoch summaries at or above `from_epoch`. Returns how many went.
+    ///
+    /// **Only the Stage 5 arming ceremony calls this**, and it is load-bearing there rather than
+    /// tidy-up. Arming replaces the whole table with the genesis balances, which discards the
+    /// columns the Stage 4 soak accrued — but the summary rows the soak wrote would survive, and
+    /// `shard_fold_epoch`'s idempotence gate reads exactly those rows. The catch-up would then see
+    /// every epoch between the anchor and the moment of arming as `AlreadyFolded`, credit nothing,
+    /// and every miner's work across that window would vanish with no error anywhere.
+    ///
+    /// Scoped to `from_epoch` (the arming floor) and to this node's own column: summaries below
+    /// the floor are pre-genesis and their work is already inside the genesis balances, so
+    /// re-folding them would double-count, and another node's summaries are not ours to delete.
+    pub fn shard_clear_own_epochs_from(
+        &self,
+        node: &NodeId,
+        from_epoch: u64,
+    ) -> GhostResult<usize> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM shard_epochs WHERE node_id = ?1 AND epoch >= ?2",
+                params![node.to_vec(), from_epoch as i64],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     /// Mark an epoch's summary as having been broadcast. Returns whether the row existed —
     /// marking a summary that was never stored is a caller bug worth surfacing, not a silent
     /// no-op.

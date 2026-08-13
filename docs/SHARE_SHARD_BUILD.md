@@ -369,6 +369,32 @@ not a binary big-bang. That is what removes the need for a height gate *and* the
    marker: identical on every armed node, absent on every unarmed one, already in the payload, so no
    new protocol field. Both-absent matches, leaving every pre-ceremony sync unchanged.
 
+   ⛔ **OPEN, AND A BLOCKER FOR STEP 4: `total_micro` is cumulative, so the epoch floor does not
+   fully contain the mixed window.** The floor rejects summaries for epochs *below* it. But a
+   summary at an epoch **at or above** the floor, sent by a node that has **not yet armed**, carries
+   a running total that still spans pre-genesis work — `total_micro` is cumulative by design (§6,
+   and it must be, or deltas could not be max-merged). An armed node max-merging that total credits
+   pre-genesis work a second time on top of the genesis column, and because merge is a max it is
+   permanent.
+
+   The table-sync path is already closed (the genesis column is the generation marker). The summary
+   path is not, because a summary carries no genesis marker to compare. Candidate fixes, none built:
+
+   - carry the genesis root, or an `armed` flag, in `EpochSummary` and refuse a mismatch — the same
+     rule as table sync, but it is a wire-format change and wants the version field Stage 2 already
+     put in place;
+   - have arming also discard **peers'** stored columns and refuse any peer summary until that peer
+     has itself restarted its chain at/above the floor;
+   - arm all 8 close enough together that the window never carries a summary — an operational
+     mitigation, not a fix, and it re-introduces the simultaneity the rolling design avoids.
+
+   Related and smaller: arming empties this node's own column, so its next summary restarts
+   `total_micro` from the delta alone, and a peer holding the immediately preceding summary rejects
+   it as `ChainMismatch` in `verify_summary_stateless` — an honest summary refused at the seam.
+
+   **Do not roll step 4 until this is resolved.** The rest of step 4 is built and tested; this is
+   the one part that is not, and it is on the money path.
+
    Arming also **refuses if anything is already settled**. It cannot fire today (zero blocks won),
    but a genesis checkpoint is an *unpaid* ledger, so a non-empty `settled` disagrees with it about
    history and silently discarding that would be the one destructive act in an additive ceremony.

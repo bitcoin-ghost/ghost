@@ -152,6 +152,8 @@ pub struct ArmReport {
     pub epoch_floor: u64,
     /// How many accrued columns the ceremony replaced — the soak's state, discarded.
     pub replaced_columns: usize,
+    /// Epoch summary rows cleared so the catch-up can genuinely re-fold them.
+    pub cleared_epochs: usize,
     /// Addresses in the opening genesis column.
     pub opening_addresses: usize,
     /// The table root after arming. Must match on all 8; this is what Stage 5 step 5 compares.
@@ -348,12 +350,30 @@ impl ShardRuntime {
             return Err(GhostError::Database(e.to_string()));
         }
 
+        // Re-derive the pre-genesis floor rather than persisting it.
+        //
+        // ⚠ It is NOT enough to set the floor at arming. `shard_save_table` stamps `updated_epoch`
+        // on rows but that is diagnosis only, and `shard_load_table` rebuilds from an empty table —
+        // so without this the floor would last exactly one process lifetime, and the first restart
+        // of an armed node would re-open both merge paths to pre-genesis summaries from unarmed
+        // peers. Merging is a max, so that inflation is permanent, and `compute_table_root` does
+        // not cover the floor, so the fleet root comparison could not see it either.
+        //
+        // Derived from the pin, not stored: the pin is in the binary, the genesis column says
+        // whether we are armed, and state that can be derived is state that cannot drift.
+        let mut table = table;
+        let armed = table
+            .accrued()
+            .contains_key(&ghost_accounting::shard_genesis::GENESIS_NODE_ID);
+        if armed {
+            table.set_epoch_floor(epoch_for_height(anchor.height, EPOCH_BLOCKS) + 1);
+        }
+
         let received_by = hex::encode(&identity.node_id()[..8]);
         info!(
             columns = table.accrued().len(),
-            genesis_installed = table
-                .accrued()
-                .contains_key(&ghost_accounting::shard_genesis::GENESIS_NODE_ID),
+            genesis_installed = armed,
+            epoch_floor = table.epoch_floor(),
             solo,
             owns_evidence,
             "share shard: runtime loaded"
@@ -399,13 +419,43 @@ impl ShardRuntime {
         anchor: &ghost_accounting::shard_genesis::GenesisAnchor,
         canonical_payout: &[u8],
     ) -> GhostResult<ArmReport> {
+        // The load-time self-check compares against the PINNED anchor, so arming with any other
+        // would install a genesis column this node refuses to load on its next restart — an armed
+        // node whose shard never comes back. Re-pinning at ceremony time is a source change and a
+        // new binary, not a runtime argument.
+        if *anchor != ghost_accounting::shard_genesis::pinned_anchor() {
+            return Err(GhostError::Database(
+                "shard: refusing to arm from an anchor that is not the compile-time pin — the \
+                 load-time self-check would reject the result on the next restart"
+                    .to_string(),
+            ));
+        }
+
         let (genesis, rounding) =
             ghost_accounting::shard_genesis::open_shard_from_checkpoint(canonical_payout, anchor)
                 .map_err(|e| GhostError::Database(e.to_string()))?;
 
         let floor = epoch_for_height(anchor.height, EPOCH_BLOCKS) + 1;
 
+        // Held across the whole ceremony, INCLUDING the watermark write. Dropping it early would
+        // let a `tick` blocked on this lock fold an epoch into the just-replaced table and then
+        // have its watermark overwritten underneath it.
         let mut table = self.table.lock();
+        let mut next_fold = self.next_fold.lock();
+
+        // Arming is once. A re-run — a retried rollout, a script invoked twice — would discard
+        // every column accrued since the first arming, and (because the epoch markers below are
+        // already cleared and re-folded) that work would not come back.
+        if table
+            .accrued()
+            .contains_key(&ghost_accounting::shard_genesis::GENESIS_NODE_ID)
+        {
+            return Err(GhostError::Database(
+                "shard: already armed — the genesis column is installed; refusing to re-run the \
+                 ceremony"
+                    .to_string(),
+            ));
+        }
 
         // Refuse rather than clear if anything has been settled. The pool has won zero blocks, so
         // this cannot fire today — but if it ever does, the genesis checkpoint (an UNPAID ledger)
@@ -420,22 +470,39 @@ impl ShardRuntime {
         }
 
         let replaced_columns = table.accrued().len();
+
+        // Persist BEFORE mutating memory, like every other money path in this file. If the write
+        // fails, the operator is told arming failed and the live runtime is still holding the
+        // pre-ceremony table — rather than being told it failed while running wiped and armed
+        // against an unchanged database.
+        //
+        // Two writes, and the order between them matters more than their atomicity: clearing the
+        // epoch markers is what lets the catch-up re-credit, so it must not be left undone if the
+        // table write succeeds. Doing it first means the worst interleaving re-folds epochs into a
+        // table that still holds the soak's columns — visible, and corrected by re-running arming
+        // (which is refused only once the genesis column is actually installed).
+        let cleared_epochs = self
+            .db
+            .shard_clear_own_epochs_from(&self.identity.node_id(), floor)?;
+        self.db.shard_save_table(&genesis, floor, anchor.height)?;
+
         *table = genesis;
         table.set_epoch_floor(floor);
-
-        // Replace semantics: rows absent from the new table are deleted, so the soak's columns do
-        // not survive as stale contributors to the next load's root.
-        self.db.shard_save_table(&table, floor, anchor.height)?;
-
         let root = table.compute_table_root();
-        drop(table);
+        *next_fold = Some(floor);
 
-        *self.next_fold.lock() = Some(floor);
+        let opening_addresses = table
+            .accrued()
+            .get(&ghost_accounting::shard_genesis::GENESIS_NODE_ID)
+            .map(|c| c.len())
+            .unwrap_or(0);
 
         info!(
             anchor_height = anchor.height,
             floor,
             replaced_columns,
+            cleared_epochs,
+            opening_addresses,
             addresses_rounded = rounding.addresses_rounded,
             addresses_dropped = rounding.addresses_dropped,
             units_discarded = rounding.units_discarded,
@@ -447,13 +514,8 @@ impl ShardRuntime {
             anchor_height: anchor.height,
             epoch_floor: floor,
             replaced_columns,
-            opening_addresses: self
-                .table
-                .lock()
-                .accrued()
-                .get(&ghost_accounting::shard_genesis::GENESIS_NODE_ID)
-                .map(|c| c.len())
-                .unwrap_or(0),
+            cleared_epochs,
+            opening_addresses,
             table_root: root,
         })
     }
@@ -567,6 +629,21 @@ impl ShardRuntime {
                 n
             }
         };
+
+        // Clamp the watermark to the arming floor.
+        //
+        // `next_fold` is in-memory, so a restart re-derives it as `shard_latest_epoch + 1` — which
+        // sits BELOW the floor for any node whose watermark lagged the anchor when it armed
+        // (downtime, `share_shard` enabled late, a backlog longer than MAX_FOLDS_PER_TICK). It
+        // would then fold pre-genesis epochs into its own column on top of the genesis column:
+        // exactly the double count the floor exists to stop, arriving by the one path the floor
+        // did not cover, because `fold_epoch` credits locally rather than merging a summary.
+        let floor = self.table.lock().epoch_floor();
+        if next < floor {
+            debug!(next, floor, "share shard: watermark below the arming floor — clamping");
+            next = floor;
+            *next_guard = Some(next);
+        }
 
         for _ in 0..MAX_FOLDS_PER_TICK {
             if next >= current {
@@ -1253,6 +1330,132 @@ mod tests {
             report.table_root,
             "the opening root must survive a restart"
         );
+    }
+
+    /// The floor must survive a restart, or arming's protection lasts one process lifetime.
+    ///
+    /// `shard_save_table` stamps `updated_epoch` for diagnosis only and `shard_load_table` rebuilds
+    /// from an empty table, so a floor that is merely set in memory is gone on the next start —
+    /// re-opening both merge paths to pre-genesis summaries from unarmed peers. Merging is a max,
+    /// so that inflation is permanent, and the table root does not cover the floor, so the fleet
+    /// comparison could not detect it either.
+    #[test]
+    fn the_arming_floor_survives_a_restart() {
+        let (identity, db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        let report = rt
+            .arm_from_genesis(&anchor, &pinned_canonical_blob())
+            .expect("arm");
+        assert!(report.epoch_floor > 0);
+
+        let reloaded = ShardRuntime::load(identity, Arc::clone(&db), false, true).expect("load");
+        assert_eq!(
+            reloaded.table.lock().epoch_floor(),
+            report.epoch_floor,
+            "an armed node must come back armed"
+        );
+    }
+
+    /// An UNARMED node must not acquire a floor from the pin — it has no genesis column, so every
+    /// epoch is legitimately foldable and mergeable.
+    #[test]
+    fn an_unarmed_node_has_no_floor() {
+        let (_identity, _db, rt) = runtime();
+        assert_eq!(rt.table.lock().epoch_floor(), 0);
+    }
+
+    /// Arming must clear its own epoch markers, or the catch-up credits nothing.
+    ///
+    /// The soak folds epochs and writes `shard_epochs` rows. Arming replaces the columns but those
+    /// rows would survive, and `fold_epoch`'s idempotence gate reads exactly them — so every epoch
+    /// between the anchor and the moment of arming would return `AlreadyFolded`, and every miner's
+    /// work across that window would vanish with no error anywhere.
+    #[test]
+    fn arming_lets_the_catch_up_re_fold_the_soaks_epochs() {
+        let (identity, db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        let floor = epoch_for_height(anchor.height, EPOCH_BLOCKS) + 1;
+
+        // The soak folds an epoch at/above the floor and marks it.
+        let height = floor * EPOCH_BLOCKS.get();
+        seed_round(&db, 9_001, height);
+        seed_share(
+            &db,
+            9_001,
+            77,
+            "bc1qgap",
+            4.0,
+            Some(NETWORK_TIER_LOG2),
+            &our_received_by(&identity),
+            true,
+        );
+        rt.fold_epoch(floor).expect("soak fold");
+        assert!(
+            rt.table.lock().owed().contains_key("bc1qgap"),
+            "precondition: the soak credited this work"
+        );
+        assert!(db.shard_get_epoch(floor, &identity.node_id()).unwrap().is_some());
+
+        let report = rt
+            .arm_from_genesis(&anchor, &pinned_canonical_blob())
+            .expect("arm");
+        assert_eq!(report.cleared_epochs, 1, "the soak's marker must be cleared");
+
+        // Now the catch-up must genuinely re-credit it.
+        rt.tick(height + EPOCH_BLOCKS.get() * 2).expect("tick");
+        assert_eq!(
+            rt.table.lock().owed().get("bc1qgap"),
+            Some(&(micro_work(4.0) as i64)),
+            "work between the anchor and arming must be re-credited, not silently lost"
+        );
+    }
+
+    /// A watermark left below the floor by a restart must be clamped, not folded from.
+    ///
+    /// `fold_epoch` credits this node's column directly, so the floor's merge-path checks do not
+    /// cover it — a node whose watermark lagged the anchor would fold pre-genesis epochs on top of
+    /// the genesis column, which is the double count the floor exists to stop.
+    #[test]
+    fn a_watermark_below_the_floor_is_clamped_before_folding() {
+        let (_identity, _db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        let report = rt
+            .arm_from_genesis(&anchor, &pinned_canonical_blob())
+            .expect("arm");
+
+        // Simulate a restart that re-derived a stale watermark from an old summary.
+        *rt.next_fold.lock() = Some(report.epoch_floor - 50);
+        rt.tick(anchor.height + EPOCH_BLOCKS.get() * 4).expect("tick");
+        assert!(
+            rt.next_fold.lock().unwrap() >= report.epoch_floor,
+            "the watermark must never sit below the arming floor"
+        );
+    }
+
+    /// Arming is once. A re-run would discard everything accrued since the first one.
+    #[test]
+    fn arming_twice_is_refused() {
+        let (_identity, _db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        rt.arm_from_genesis(&anchor, &pinned_canonical_blob())
+            .expect("first arming");
+        assert!(
+            rt.arm_from_genesis(&anchor, &pinned_canonical_blob()).is_err(),
+            "a second arming must be refused"
+        );
+    }
+
+    /// Arming from anything but the compile-time pin would install a genesis column this node
+    /// refuses to load on its next restart.
+    #[test]
+    fn arming_from_an_unpinned_anchor_is_refused() {
+        let (_identity, _db, rt) = runtime();
+        let rogue = ghost_accounting::shard_genesis::GenesisAnchor {
+            height: 900_000,
+            ..ghost_accounting::shard_genesis::pinned_anchor()
+        };
+        assert!(rt.arm_from_genesis(&rogue, &pinned_canonical_blob()).is_err());
+        assert_eq!(rt.table.lock().epoch_floor(), 0);
     }
 
     /// Bytes the ceremony did not verify must not arm the node, and must leave it untouched.
