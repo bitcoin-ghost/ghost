@@ -789,7 +789,7 @@ mod tests {
         prior: &BTreeMap<String, i64>,
         evidence: Vec<ShareProof>,
     ) -> (EpochSummary, Vec<ShareProof>) {
-        let summary = EpochSummary::build(epoch, id, prior, &evidence, compute_merkle_root)
+        let summary = EpochSummary::build(epoch, id, prior, &evidence, compute_merkle_root, None)
             .expect("evidence is legal");
         (summary, evidence)
     }
@@ -1264,6 +1264,7 @@ mod tests {
             epoch: 7,
             node_id: [0x42; 32],
             deltas: BTreeMap::new(),
+            genesis_marker: None,
             share_count,
             share_root: [0x24; 32],
             signature: Vec::new(),

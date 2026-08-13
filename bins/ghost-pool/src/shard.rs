@@ -726,12 +726,16 @@ impl ShardRuntime {
         // Each node writes only its own column (§4.4): the summary's totals continue this
         // node's column and nothing else.
         let prior: BTreeMap<String, i64> = table.accrued().get(&node).cloned().unwrap_or_default();
+        // Stamped with which genesis this node is running, so a peer can tell an armed summary
+        // from an unarmed one. Taken from the table rather than the pin: the pin is what we SHOULD
+        // be running, the table is what we ARE, and a peer needs the latter.
         let summary = EpochSummary::build(
             epoch,
             &self.identity,
             &prior,
             &evidence,
             compute_merkle_root,
+            table.genesis_marker(),
         )
         .map_err(|e| {
             GhostError::Internal(format!(

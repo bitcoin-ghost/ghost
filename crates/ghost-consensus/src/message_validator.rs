@@ -1206,6 +1206,7 @@ mod tests {
                 epoch: u64::MAX,
                 node_id: [0xAB; 32],
                 deltas,
+                genesis_marker: None,
                 share_count: u32::MAX,
                 share_root: [0xCD; 32],
                 signature: vec![0xEE; 64],

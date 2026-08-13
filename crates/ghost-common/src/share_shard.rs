@@ -296,6 +296,13 @@ pub enum SummaryRejection {
     /// double-count. Expected during the rolling cutover, from peers not yet armed.
     #[error("summary is for a pre-genesis epoch, below the arming floor")]
     PreGenesisEpoch,
+    /// The summary was produced under a different genesis than ours — one side is not armed.
+    ///
+    /// Not misbehaviour, and expected throughout the rolling cutover. Refusing matters because
+    /// `total_micro` is cumulative: an unarmed peer's total spans pre-genesis work, which the
+    /// epoch floor cannot catch once the epoch itself is at or above the floor.
+    #[error("summary was produced under a different genesis — one side is not yet armed")]
+    GenesisMismatch,
     /// The summary claims [`GENESIS_NODE_ID`], the reserved opening-balance column.
     ///
     /// Checked before the signature, because the point is that no signature should make this
@@ -345,6 +352,23 @@ pub struct EpochSummary {
     /// Merkle root over the epoch's network-tier share hashes, in canonical share order.
     #[serde(with = "crate::serde_hex::bytes32")]
     pub share_root: [u8; 32],
+    /// Which genesis this node is running, or `None` if it has not been armed.
+    ///
+    /// ⚠ This closes a hole the epoch floor could not. The floor rejects epochs *below* it, but
+    /// `total_micro` is **cumulative** by design (§6 — it must be, or deltas could not be
+    /// max-merged), so a summary at an epoch at or *above* the floor from a not-yet-armed node
+    /// still carries pre-genesis work. An armed node max-merging that total credits pre-genesis
+    /// work a second time on top of the genesis column, and because merge is a max it is
+    /// permanent. Comparing markers refuses that summary outright.
+    ///
+    /// The value is the table root of the genesis column alone — the same quantity the ceremony
+    /// pins and `verify_loaded_genesis` checks, so armed nodes agree on it by construction and
+    /// there is no new thing to keep in sync.
+    ///
+    /// `serde(default)` so a summary written before this field existed decodes as `None`, which is
+    /// exactly what an unarmed node means.
+    #[serde(default)]
+    pub genesis_marker: Option<[u8; 32]>,
     /// ed25519 signature by `node_id` over [`EpochSummary::signing_bytes`].
     pub signature: Vec<u8>,
 }
@@ -356,12 +380,14 @@ impl EpochSummary {
     /// column (§4.4), so the totals are `prior + delta` and nothing else. The evidence is screened
     /// with the same checks [`EpochSummary::verify`] applies, so a node can never sign a summary
     /// its peers would refuse: one spelling of the predicate on both sides.
+    /// `genesis_marker` is this node's [`ShardTable::genesis_marker`] — `None` until armed.
     pub fn build(
         epoch: u64,
         identity: &NodeIdentity,
         prior_column: &BTreeMap<String, i64>,
         evidence: &[ShareProof],
         merkle_root: MerkleRootFn,
+        genesis_marker: Option<[u8; 32]>,
     ) -> Result<Self, SummaryRejection> {
         let screened = check_evidence(evidence)?;
 
@@ -383,6 +409,7 @@ impl EpochSummary {
             deltas,
             share_count: screened.hashes.len() as u32,
             share_root: merkle_root(&screened.hashes),
+            genesis_marker,
             signature: Vec::new(),
         };
         summary.signature = identity.sign(&summary.signing_bytes()).to_vec();
@@ -407,6 +434,19 @@ impl EpochSummary {
         }
         m.extend_from_slice(&self.share_count.to_le_bytes());
         m.extend_from_slice(&self.share_root);
+        // Appended ONLY when armed, and that asymmetry is deliberate rather than lazy.
+        //
+        // An unarmed node's signing bytes are byte-identical to what every binary produced before
+        // this field existed, so its summaries stay verifiable by any peer — which is what makes
+        // the armed/unarmed window of the rolling cutover survivable. An armed node's bytes differ,
+        // and only armed peers need to verify those: by arming time the whole fleet is on this
+        // binary, because Stage 4 deploys and Stage 5 merely flips config.
+        //
+        // Covered by the signature rather than left bare: an unsigned marker could be stripped by
+        // anyone on the wire, turning an armed node's summary back into one an armed peer accepts.
+        if let Some(marker) = &self.genesis_marker {
+            m.extend_from_slice(marker);
+        }
         m
     }
 
@@ -665,6 +705,9 @@ impl ShardTable {
         if summary.epoch < self.epoch_floor {
             return Err(SummaryRejection::PreGenesisEpoch);
         }
+        if summary.genesis_marker != self.genesis_marker() {
+            return Err(SummaryRejection::GenesisMismatch);
+        }
         let column: BTreeMap<String, i64> = summary
             .deltas
             .iter()
@@ -675,6 +718,19 @@ impl ShardTable {
         one.insert(summary.node_id, column);
         self.merge_accrued(&one);
         Ok(())
+    }
+
+    /// Which genesis this table was opened from — `None` if it has not been armed.
+    ///
+    /// The root of the genesis column *alone*, so it is stable against everything else the table
+    /// accrues afterwards. Armed nodes converted identical bytes, so they agree on it by
+    /// construction, and it is the same quantity the ceremony pins — one value, three uses
+    /// (the pin, the load-time self-check, and the marker peers compare).
+    pub fn genesis_marker(&self) -> Option<[u8; 32]> {
+        let column = self.accrued.get(&GENESIS_NODE_ID)?;
+        let mut probe = ShardTable::new();
+        probe.install_genesis(column.clone());
+        Some(probe.compute_table_root())
     }
 
     /// Whether a peer's table was opened from the same genesis as ours.
@@ -767,6 +823,9 @@ impl ShardTable {
         // column, and full evidence for it makes it no less of a double count.
         if summary.epoch < self.epoch_floor {
             return Err(SummaryRejection::PreGenesisEpoch);
+        }
+        if summary.genesis_marker != self.genesis_marker() {
+            return Err(SummaryRejection::GenesisMismatch);
         }
         summary.verify(evidence, merkle_root)?;
 
@@ -896,7 +955,18 @@ mod tests {
         prior: &BTreeMap<String, i64>,
         evidence: Vec<ShareProof>,
     ) -> (EpochSummary, Vec<ShareProof>) {
-        let summary = EpochSummary::build(epoch, id, prior, &evidence, compute_merkle_root)
+        summarise_under(epoch, id, prior, evidence, None)
+    }
+
+    /// Same, but stamped with a specific genesis marker — the armed/unarmed distinction.
+    fn summarise_under(
+        epoch: u64,
+        id: &NodeIdentity,
+        prior: &BTreeMap<String, i64>,
+        evidence: Vec<ShareProof>,
+        marker: Option<[u8; 32]>,
+    ) -> (EpochSummary, Vec<ShareProof>) {
+        let summary = EpochSummary::build(epoch, id, prior, &evidence, compute_merkle_root, marker)
             .expect("evidence is legal");
         (summary, evidence)
     }
@@ -1074,6 +1144,142 @@ mod tests {
                 "floor={floor} epoch={epoch}"
             );
         }
+    }
+
+    /// The hole the epoch floor could NOT close, and the reason the marker exists.
+    ///
+    /// `total_micro` is cumulative (§6 — it must be, or deltas could not be max-merged), so a
+    /// summary at an epoch at or *above* the floor, from a node that has not armed, still carries
+    /// pre-genesis work in its running total. Merging it credits that work a second time on top of
+    /// the genesis column, and because merge is a max it is permanent. The floor cannot see it: the
+    /// epoch is legal, only the total is not.
+    #[test]
+    fn an_unarmed_peers_post_floor_summary_is_refused_by_an_armed_node() {
+        let id = identity();
+        let genesis = BTreeMap::from([("bc1qalice".to_string(), 1_000i64)]);
+
+        let mut armed = ShardTable::new();
+        armed.install_genesis(genesis.clone());
+        armed.set_epoch_floor(10);
+
+        // Epoch 12 is comfortably ABOVE the floor, so the floor admits it — but the peer is
+        // unarmed, and its cumulative total spans work already inside the genesis column.
+        let (unarmed_summary, evidence) = summarise_under(
+            12,
+            &id,
+            &BTreeMap::from([("bc1qalice".to_string(), 5_000i64)]),
+            vec![share(1_000, 1, "bc1qalice", 1.0)],
+            None,
+        );
+
+        let before = armed.compute_table_root();
+        assert_eq!(
+            armed.merge_verified_summary(&unarmed_summary),
+            Err(SummaryRejection::GenesisMismatch),
+            "an armed node must refuse an unarmed peer's summary, floor or no floor"
+        );
+        assert_eq!(
+            armed.apply_summary(&unarmed_summary, &evidence, compute_merkle_root),
+            Err(SummaryRejection::GenesisMismatch)
+        );
+        assert_eq!(armed.compute_table_root(), before);
+
+        // And the same summary, stamped with the same genesis, is accepted — the gate is a gate,
+        // not a wall.
+        let marker = armed.genesis_marker();
+        assert!(marker.is_some());
+        let (armed_summary, _) = summarise_under(
+            12,
+            &id,
+            &BTreeMap::from([("bc1qalice".to_string(), 5_000i64)]),
+            vec![share(1_000, 1, "bc1qalice", 1.0)],
+            marker,
+        );
+        assert_eq!(armed.merge_verified_summary(&armed_summary), Ok(()));
+    }
+
+    /// The mirror case: an unarmed node must refuse an armed peer's summary too, or it would take
+    /// on totals computed against a ledger it is not running.
+    #[test]
+    fn an_unarmed_node_refuses_an_armed_peers_summary() {
+        let id = identity();
+        let mut armed = ShardTable::new();
+        armed.install_genesis(BTreeMap::from([("bc1qalice".to_string(), 1_000i64)]));
+
+        let (armed_summary, _) = summarise_under(
+            3,
+            &id,
+            &BTreeMap::new(),
+            vec![share(1_000, 1, "bc1qalice", 1.0)],
+            armed.genesis_marker(),
+        );
+
+        let mut unarmed = ShardTable::new();
+        assert_eq!(
+            unarmed.merge_verified_summary(&armed_summary),
+            Err(SummaryRejection::GenesisMismatch)
+        );
+    }
+
+    /// An UNARMED node's signing bytes must be byte-identical to what a pre-marker binary
+    /// produced, or the rolling cutover breaks every summary on the wire.
+    ///
+    /// The marker is appended only when `Some`, precisely so this holds: unarmed summaries stay
+    /// verifiable by any peer, and only armed nodes — which by arming time are the whole fleet,
+    /// since Stage 4 deploys the binary and Stage 5 only flips config — see the longer bytes.
+    #[test]
+    fn an_unarmed_summarys_signing_bytes_are_unchanged_and_the_marker_is_signed() {
+        let id = identity();
+        let (unarmed, _) = summarise_under(
+            5,
+            &id,
+            &BTreeMap::new(),
+            vec![share(1_000, 1, "bc1qalice", 1.0)],
+            None,
+        );
+        let (armed, _) = summarise_under(
+            5,
+            &id,
+            &BTreeMap::new(),
+            vec![share(1_000, 1, "bc1qalice", 1.0)],
+            Some([0xAB; 32]),
+        );
+
+        assert_eq!(
+            armed.signing_bytes().len(),
+            unarmed.signing_bytes().len() + 32,
+            "the marker must be covered by the signature, not left bare on the wire"
+        );
+        assert_eq!(
+            armed.signing_bytes()[..unarmed.signing_bytes().len()],
+            unarmed.signing_bytes()[..],
+            "an unarmed summary's bytes must be a prefix — old peers must still verify them"
+        );
+
+        // Stripping the marker on the wire must invalidate the signature, or the gate is bypassable.
+        let mut stripped = armed.clone();
+        stripped.genesis_marker = None;
+        assert_eq!(
+            stripped.verify_stateless(),
+            Err(SummaryRejection::BadSignature)
+        );
+        assert_eq!(unarmed.verify_stateless(), Ok(()));
+        assert_eq!(armed.verify_stateless(), Ok(()));
+    }
+
+    /// A summary encoded before the field existed must decode as unarmed, not fail — mixed-fleet
+    /// safety at the serde layer.
+    #[test]
+    fn a_summary_without_the_marker_field_decodes_as_unarmed() {
+        let id = identity();
+        let (summary, _) = summarise(5, &id, &BTreeMap::new(), vec![share(1_000, 1, "bc1qa", 1.0)]);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("genesis_marker");
+
+        let decoded: EpochSummary = serde_json::from_value(value).expect("must decode");
+        assert_eq!(decoded.genesis_marker, None);
+        assert_eq!(decoded.verify_stateless(), Ok(()));
     }
 
     /// Table sync carries no epoch, so the genesis column is the generation marker.
@@ -1629,7 +1835,7 @@ mod tests {
             share(20, 6, "bc1qalice", 0.5),
         ];
         let prior = BTreeMap::from([("bc1qalice".to_string(), 1_000_000_i64)]);
-        let summary = EpochSummary::build(7, &id, &prior, &evidence, compute_merkle_root)
+        let summary = EpochSummary::build(7, &id, &prior, &evidence, compute_merkle_root, None)
             .expect("legal evidence");
 
         // Totals continue the node's own column: prior + this epoch's fold.
@@ -1717,7 +1923,8 @@ mod tests {
         // Same share twice: same hash, double the credit.
         let duplicated = vec![good[0].clone(), good[0].clone()];
         assert_eq!(
-            EpochSummary::build(3, &id, &BTreeMap::new(), &duplicated, compute_merkle_root).err(),
+            EpochSummary::build(3, &id, &BTreeMap::new(), &duplicated, compute_merkle_root, None)
+                .err(),
             Some(SummaryRejection::DuplicateEvidence)
         );
 

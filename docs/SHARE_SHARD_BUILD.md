@@ -369,31 +369,33 @@ not a binary big-bang. That is what removes the need for a height gate *and* the
    marker: identical on every armed node, absent on every unarmed one, already in the payload, so no
    new protocol field. Both-absent matches, leaving every pre-ceremony sync unchanged.
 
-   ⛔ **OPEN, AND A BLOCKER FOR STEP 4: `total_micro` is cumulative, so the epoch floor does not
-   fully contain the mixed window.** The floor rejects summaries for epochs *below* it. But a
-   summary at an epoch **at or above** the floor, sent by a node that has **not yet armed**, carries
-   a running total that still spans pre-genesis work — `total_micro` is cumulative by design (§6,
-   and it must be, or deltas could not be max-merged). An armed node max-merging that total credits
-   pre-genesis work a second time on top of the genesis column, and because merge is a max it is
-   permanent.
+   **(d) The epoch floor alone did not contain the mixed window — `total_micro` is cumulative.**
+   The floor rejects epochs *below* it, but a summary at an epoch **at or above** the floor from a
+   node that has **not yet armed** still carries pre-genesis work in its running total (§6 requires
+   the total to be cumulative, or deltas could not be max-merged). An armed node merging that total
+   credits pre-genesis work a second time on top of the genesis column, permanently, and the floor
+   cannot see it: the epoch is legal, only the total is not.
 
-   The table-sync path is already closed (the genesis column is the generation marker). The summary
-   path is not, because a summary carries no genesis marker to compare. Candidate fixes, none built:
+   **Fixed** — `EpochSummary` now carries `genesis_marker: Option<[u8; 32]>`, the root of the
+   genesis column alone, and both merge paths refuse a mismatch. It is the same quantity the
+   ceremony pins and `verify_loaded_genesis` checks, so armed nodes agree by construction. Three
+   properties make it mixed-fleet safe, each pinned by a test:
 
-   - carry the genesis root, or an `armed` flag, in `EpochSummary` and refuse a mismatch — the same
-     rule as table sync, but it is a wire-format change and wants the version field Stage 2 already
-     put in place;
-   - have arming also discard **peers'** stored columns and refuse any peer summary until that peer
-     has itself restarted its chain at/above the floor;
-   - arm all 8 close enough together that the window never carries a summary — an operational
-     mitigation, not a fix, and it re-introduces the simultaneity the rolling design avoids.
+   - the marker is **appended to the signing bytes only when `Some`**, so an unarmed node's bytes
+     are byte-identical to what a pre-marker binary produced and stay verifiable by any peer;
+   - it **is** covered by the signature when present, so stripping it on the wire — which would turn
+     an armed summary back into one an armed peer accepts — invalidates it;
+   - `serde(default)` means a summary encoded before the field existed decodes as `None`, which is
+     exactly what "unarmed" means.
 
-   Related and smaller: arming empties this node's own column, so its next summary restarts
+   The asymmetry is safe because by arming time the whole fleet is on this binary: Stage 4 deploys,
+   Stage 5 only flips config.
+
+   ⚠ **Still open, smaller:** arming empties this node's own column, so its next summary restarts
    `total_micro` from the delta alone, and a peer holding the immediately preceding summary rejects
-   it as `ChainMismatch` in `verify_summary_stateless` — an honest summary refused at the seam.
-
-   **Do not roll step 4 until this is resolved.** The rest of step 4 is built and tested; this is
-   the one part that is not, and it is on the money path.
+   it as `ChainMismatch` in `verify_summary_stateless` — an honest summary refused at the seam. It
+   self-corrects once both sides are armed (the marker refuses the stale chain anyway), but it will
+   log rejections during the roll, and the roll should not be read as healthy until they stop.
 
    Arming also **refuses if anything is already settled**. It cannot fire today (zero blocks won),
    but a genesis checkpoint is an *unpaid* ledger, so a non-empty `settled` disagrees with it about

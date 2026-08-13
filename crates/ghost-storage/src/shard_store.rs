@@ -592,6 +592,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            genesis_marker: None,
             share_count: rows.len() as u32,
             share_root: root,
             signature: vec![0xAB; 64],
