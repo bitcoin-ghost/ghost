@@ -53,45 +53,56 @@ pub struct NodeBatchChecks {
     /// restarted node's height is 0 and 0 sorts below every gate, which silently selected the
     /// weaker check in #597.
     pow_preimage_required: bool,
-    /// Whether shares must carry a committed difficulty tier and are judged against exactly that
-    /// tier (SHARE_TIER_BIND). Mirrors the live path's `height_established &&
-    /// binds_difficulty_tier(height)` — note the sense is NOT the pow gate's fail-closed one: an
-    /// unestablished height takes the pow-preimage check but NOT the tier requirement, because
-    /// applying a DORMANT gate at height 0 would activate it on every restart. The residual once
-    /// armed is bounded the same way as the live path's: the preimage check still runs, only the
-    /// tier-credit selection waits for an established height.
-    tier_bound: bool,
+    /// The round at which the difficulty-tier commitment took effect, if known (SHARE_TIER_BIND).
+    /// Mirrors `RoundManager::requires_tier_binding`: judged by the share's OWN round, because a
+    /// share mined before the gate carries `tier_log2: None` and can never acquire a tier
+    /// retrospectively.
+    ///
+    /// This was a node-wide `bool` derived from the current height, and that was a live defect: the
+    /// instant the fleet crossed the gate, every pre-gate share in a pending pool became
+    /// `InvalidShare`, so the first batch carrying one got its proposer QUARANTINED fleet-wide —
+    /// terminally, operator-release-only. Observed 2026-08-12: vm5 quarantined on all 8 at seq=2
+    /// for a round-121233 share, ~7 hours after the gate fired at round 121703.
+    ///
+    /// `None` means the gate has not fired here, which also gives the dormant-gate and
+    /// height-0-after-restart behaviour the old `height_established` guard was reaching for — by
+    /// construction rather than by a separate condition, exactly as `round.rs` does.
+    tier_bind_activation_round: Option<RoundId>,
 }
 
 impl NodeBatchChecks {
     pub fn new(
         addr_bind_activation_round: Option<RoundId>,
         pow_preimage_required: bool,
-        tier_bound: bool,
+        tier_bind_activation_round: Option<RoundId>,
     ) -> Self {
         Self {
             addr_bind_activation_round,
             pow_verify_activation_round: None,
             pow_preimage_required,
-            tier_bound,
+            tier_bind_activation_round,
         }
     }
 
     /// Build from a height and the known activation rounds, applying the same fail-closed
     /// fallback rule as the live ingest path.
+    ///
+    /// Only the PoW-preimage fallback is height-derived, and only because it has no boundary round
+    /// to fall back on. The tier gate takes its activation ROUND, never the height: a height
+    /// predicate here is applied to shares of every era at once.
     pub fn at_height(
         height: u64,
         addr_bind_activation_round: Option<RoundId>,
         pow_verify_activation_round: Option<RoundId>,
         pow_verify_height: u64,
-        tier_bind_height: u64,
+        tier_bind_activation_round: Option<RoundId>,
     ) -> Self {
         let height_established = height > 0;
         Self {
             addr_bind_activation_round,
             pow_verify_activation_round,
             pow_preimage_required: !height_established || height >= pow_verify_height,
-            tier_bound: height_established && height >= tier_bind_height,
+            tier_bind_activation_round,
         }
     }
 
@@ -138,7 +149,15 @@ impl NodeBatchChecks {
         // committed to, and its stated difficulty must BE that tier's target — mirroring the
         // live ingest path in `handle_share_proof`, which is the contract of this module. A
         // share with no tier in the tier era does not prove itself.
-        if self.tier_bound {
+        //
+        // Judged by the SHARE's round, like `signature_ok` and the header predicate beside it. A
+        // pre-gate share is judged by the numeric rule of its era; demanding a tier of it would
+        // make it permanently unbatchable, and the proposer that carried it a quarantined node.
+        let tier_bound = match self.tier_bind_activation_round {
+            Some(activation) => share.round_id >= activation,
+            None => false,
+        };
+        if tier_bound {
             let Some(tier) = share.tier_log2 else {
                 return false;
             };
@@ -234,7 +253,7 @@ mod tests {
     }
 
     fn checks() -> NodeBatchChecks {
-        NodeBatchChecks::new(None, true, false)
+        NodeBatchChecks::new(None, true, None)
     }
 
     #[test]
@@ -300,7 +319,7 @@ mod tests {
     fn signature_format_is_judged_by_the_shares_round_not_the_current_height() {
         let id = NodeIdentity::generate();
         let activation: RoundId = 100;
-        let checks = NodeBatchChecks::new(Some(activation), true, false);
+        let checks = NodeBatchChecks::new(Some(activation), true, None);
 
         // Pre-activation round, signed in the pre-activation format: valid.
         let old = provable_share(&id, activation - 1);
@@ -347,7 +366,7 @@ mod tests {
     /// window a node ingests its backfill burst.
     #[test]
     fn an_unestablished_height_takes_the_stronger_check() {
-        let strict = NodeBatchChecks::at_height(0, None, None, 1_000_000, u64::MAX);
+        let strict = NodeBatchChecks::at_height(0, None, None, 1_000_000, None);
         let id = NodeIdentity::generate();
         let mut fabricated = provable_share(&id, 1);
         fabricated.share_hash = [0xAB; 32];
@@ -367,8 +386,7 @@ mod tests {
         let id = NodeIdentity::generate();
         let boundary: RoundId = 100;
         // Tip far past the gate; boundary known.
-        let checks =
-            NodeBatchChecks::at_height(2_000_000, None, Some(boundary), 1_000_000, u64::MAX);
+        let checks = NodeBatchChecks::at_height(2_000_000, None, Some(boundary), 1_000_000, None);
 
         let mut old = provable_share(&id, boundary - 1);
         old.header = None;
@@ -395,9 +413,9 @@ mod tests {
         let id = NodeIdentity::generate();
         let share = provable_share(&id, 1);
         assert!(share.tier_log2.is_none(), "fixture predates the tier era");
-        assert!(NodeBatchChecks::new(None, true, false).share_is_valid(&share));
+        assert!(NodeBatchChecks::new(None, true, None).share_is_valid(&share));
         assert!(
-            NodeBatchChecks::at_height(1, None, None, 0, u64::MAX).share_is_valid(&share),
+            NodeBatchChecks::at_height(1, None, None, 0, None).share_is_valid(&share),
             "a dormant gate must leave the verdict untouched at any real height"
         );
     }
@@ -409,7 +427,7 @@ mod tests {
         let id = NodeIdentity::generate();
         let share = provable_share(&id, 1);
         assert!(
-            NodeBatchChecks::at_height(0, None, None, 1_000_000, u64::MAX).share_is_valid(&share),
+            NodeBatchChecks::at_height(0, None, None, 1_000_000, None).share_is_valid(&share),
             "height 0 must not turn the dormant tier requirement on"
         );
     }
@@ -447,7 +465,7 @@ mod tests {
     #[test]
     fn in_the_tier_era_a_share_is_judged_against_its_committed_tier() {
         let id = NodeIdentity::generate();
-        let tier_bound = NodeBatchChecks::new(None, true, true);
+        let tier_bound = NodeBatchChecks::new(None, true, Some(0));
 
         // Genesis committed to tier 11 and stating exactly 2^11: proves itself.
         assert!(
@@ -475,6 +493,44 @@ mod tests {
             !tier_bound.share_is_valid(&genesis_tier_share(&id, 11, 2500.0)),
             "credit must be exactly the committed tier's target, never the achieved difficulty"
         );
+    }
+
+    /// ⚠ RED BEFORE 2026-08-12. The tier predicate was a node-wide `bool` derived from the CURRENT
+    /// height, so the instant the fleet crossed the gate every pre-gate share in a pending pool
+    /// became `InvalidShare` — and the first proposer to carry one was QUARANTINED fleet-wide,
+    /// terminally and operator-release-only. Measured live: vm5 quarantined on all 8 at seq=2 over
+    /// a round-121233 share, hours after the gate fired at round 121703.
+    ///
+    /// The gate is a share-FORMAT change, so it is judged by the share's own round — exactly as
+    /// `signature_ok` and the header predicate beside it already were. Both directions are pinned:
+    /// making the predicate constantly true fails the first assert, constantly false the second.
+    #[test]
+    fn a_pre_gate_share_stays_batchable_after_the_tier_gate_fires() {
+        let id = NodeIdentity::generate();
+        const ACTIVATION: RoundId = 121_703;
+        let checks = NodeBatchChecks::new(None, true, Some(ACTIVATION));
+
+        // Mined before the gate: carries no tier and can never acquire one retrospectively.
+        assert!(
+            checks.share_is_valid(&provable_share(&id, ACTIVATION - 1)),
+            "a share from before the tier gate must stay provable by the numeric rule of its era"
+        );
+
+        // The gate still bites where it should: same shape, mined in the tier era, refused.
+        assert!(
+            !checks.share_is_valid(&provable_share(&id, ACTIVATION)),
+            "a tier-less share mined at or above the boundary must not prove itself"
+        );
+    }
+
+    /// A dormant gate must not be armed by a restart: with no activation round known, no share of
+    /// any era is asked for a tier.
+    #[test]
+    fn a_dormant_tier_gate_demands_no_tier_of_any_share() {
+        let id = NodeIdentity::generate();
+        let checks = NodeBatchChecks::new(None, true, None);
+        assert!(checks.share_is_valid(&provable_share(&id, 1)));
+        assert!(checks.share_is_valid(&provable_share(&id, 999_999)));
     }
 
     #[test]

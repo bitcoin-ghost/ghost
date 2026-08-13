@@ -3857,7 +3857,7 @@ async fn main() -> Result<()> {
                     rm_c.addr_bind_activation_round(),
                     rm_c.pow_verify_activation_round(),
                     ghost_pool::share_pow_verify_height(),
-                    ghost_pool::share_tier_bind_height(),
+                    rm_c.tier_bind_activation_round(),
                 )
             })
         };
