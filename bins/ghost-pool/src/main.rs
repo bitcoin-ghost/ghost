@@ -3786,6 +3786,45 @@ async fn main() -> Result<()> {
             None
         };
 
+    // The network shard (docs/SHARE_SHARD.md). Dark unless `pool.share_shard` is set.
+    //
+    // A load failure is deliberately NOT fatal, same as the SBC shadow above: the shard folds and
+    // persists its own state and pays nobody yet, so taking the pool down because an observation
+    // could not start would make the safer configuration the riskier one to deploy.
+    //
+    // `owns_evidence` is passed FALSE explicitly rather than defaulted. Retention deletes from
+    // `shares`, which the legacy payout path still reads — it may only become true in the same
+    // change that renames that table out from under it (Stage 5). Spelled at the call site because
+    // a defaulted money-safety gate is one nobody reads.
+    let shard: Option<Arc<ghost_pool::shard::ShardRuntime>> = if config.pool.share_shard {
+        let solo = matches!(
+            config.network.mining_mode,
+            ghost_common::config::MiningMode::PrivateSolo
+        );
+        match ghost_pool::shard::ShardRuntime::load(
+            Arc::clone(&identity),
+            Arc::clone(&db),
+            solo,
+            false,
+        ) {
+            Ok(rt) => {
+                info!(
+                    epoch_blocks = ghost_common::share_shard::EPOCH_BLOCKS.get(),
+                    retention_epochs = ghost_common::share_shard::RETENTION_EPOCHS,
+                    solo,
+                    "shard: enabled"
+                );
+                Some(Arc::new(rt))
+            }
+            Err(e) => {
+                error!(error = %e, "shard: could not load — continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
@@ -3989,6 +4028,43 @@ async fn main() -> Result<()> {
             });
         }
     }
+    // The shard's epoch task. Folds each epoch once it has CLOSED.
+    //
+    // Shaped on the tip-6 loop below, which it eventually replaces. `MissedTickBehavior::Skip` is
+    // load-bearing rather than decoration: without it a fold that runs long queues ticks, and the
+    // backlog then folds back-to-back against the same `Mutex<Connection>` that share ingest uses.
+    // Skipping costs nothing here because the work is idempotent and driven by height, not by how
+    // many times we looked.
+    if let Some(ref rt) = shard {
+        let rt = Arc::clone(rt);
+        let rpc_c = Arc::clone(&rpc);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                // The tip comes from this node's own RPC, never from a peer: an epoch boundary
+                // must be a function of the chain this node has actually validated.
+                let tip = match rpc_c.get_block_count().await {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                match rt.tick(tip) {
+                    Ok(report) if !report.folded.is_empty() => info!(
+                        tip,
+                        folded = report.folded.len(),
+                        remaining = report.remaining,
+                        "shard: folded closed epochs"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, tip, "shard: epoch tick failed — retrying next tick")
+                    }
+                }
+            }
+        });
+    }
+
     // Propose cadence: every ~30s the deterministic proposer for (tip - LAG)
     // proposes that checkpoint. LAG keeps the anchor far enough behind the tip that
     // the share/qualification ledgers have converged there (else validators reject).
@@ -10088,6 +10164,7 @@ async fn main() -> Result<()> {
     // (a +/-1000 block window). It needs to be told the tip advances, or that check runs
     // against height 0 and falls back to a permissive default — see below.
     let vote_handler_for_tips = Arc::clone(&vote_handler);
+    let shard_for_rounds = shard.clone();
 
     tokio::spawn(async move {
         // The last chain height we proposed a payout for. `NewWork` fires on every template
@@ -10099,6 +10176,25 @@ async fn main() -> Result<()> {
                 TemplateEvent::NewWork { job_id: _, height } => {
                     // Start new round (SRI gets jobs via TDP automatically)
                     let round_id = rm_notify.start_round(height);
+
+                    // Observation only: an integer compare and a log. The fold runs in the epoch
+                    // task, never here — `NewWork` fires per template refresh (~30s, not per
+                    // block) and shares this path with the ZMQ handler that publishes the empty
+                    // template sub-second so miners get work instantly at a tip change. Nothing
+                    // heavy may live on either. This exists so a boundary crossing is visible when
+                    // it happens rather than up to 30s later, which is the difference between
+                    // diagnosing a stuck fold and guessing at one.
+                    if let Some(ref rt) = shard_for_rounds {
+                        if rt.note_height(height) {
+                            info!(
+                                epoch = ghost_common::share_shard::epoch_for_height(
+                                    height,
+                                    ghost_common::share_shard::EPOCH_BLOCKS
+                                ),
+                                height, round_id, "shard: epoch boundary — fold due next tick"
+                            );
+                        }
+                    }
 
                     // Persist the address-bind era boundary the first time it is established.
                     // Without this a restart loses it and re-derives a LATER round from the next
