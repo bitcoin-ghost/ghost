@@ -7,8 +7,10 @@ Written 2026-08-13. Target: v1 by **2026-08-31**.
 
 ## Status — 2026-08-13
 
-**Stage 1 is complete and independently verified: 974 tests, 0 failures.** All of it is dark; the
-only thing wired into a running path so far is the `pool.share_shard` flag, which defaults false.
+**Stage 1, the runtime, the wiring, Stage 2, and most of Stage 3 are done and independently
+verified** — every suite run rather than taken from a report. It is all dark: `pool.share_shard`
+defaults false, and **nothing changes what a block pays.** The coinbase is still built from the
+legacy proposal; the shard observes.
 
 | piece | where | state |
 |---|---|---|
@@ -27,8 +29,12 @@ only thing wired into a running path so far is the `pool.share_shard` flag, whic
 **Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
 share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
 
-**Not started:** Stage 2 network-tier split (ship at R=1), Stage 3 coinbase source and settlement,
-Stage 5 genesis ceremony, Stage 6 deletion.
+**Not started:** the Stage 3 coinbase-source flip (deliberately deferred to Stage 5 step 6 — the
+build here is the *shadow comparison*, not the switch), Stage 5 genesis ceremony, Stage 6 deletion.
+
+⚠⚠ **`owns_evidence` is false and must stay false until Stage 5.** The fold's retention deletes
+from `shares`, which the legacy payout path still reads; enabling it would quietly reduce what
+miners are owed about six hours after someone set a flag they were told was dark.
 
 ### ⚠ Rehearsing settlement on regtest is not straightforward — check before planning around it
 
@@ -54,11 +60,16 @@ obvious way. The options, in ascending order of honesty about cost:
 Whichever is chosen, say which one it was. "Rehearsed on regtest" covering only option 1 would be
 the kind of claim that reads as coverage and is not.
 
-⚠ **Eight design errors were found by *building* the design, none by re-reading it** — the counter
+⚠ **Nine design errors were found by *building* the design, none by re-reading it** — the counter
 double-payment, deltas not being max-mergeable, the §6/§12.3 contradiction, evidence retention on
 the wrong clock, the whole-table scaling ceiling, the merkle dependency direction, two spellings of
-one predicate, and expiry being indistinguishable from refusal. Assume the remaining stages hide
+one predicate, expiry being indistinguishable from refusal, and §4.6 claiming settlement is
+identical across nodes when it is only deterministic given a table. Assume the remaining stages hide
 more of the same, and prefer building a thin slice early over perfecting the document.
+
+⚠ **Three tests passed for the wrong reason and only mutation caught them.** One is *unkillable*
+while its input is a `BTreeMap` and is documented as latent rather than dressed up. Budget for this:
+a green suite is evidence the tests ran, not that they can fail.
 
 ---
 
