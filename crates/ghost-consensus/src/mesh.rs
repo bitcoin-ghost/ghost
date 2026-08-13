@@ -1818,6 +1818,13 @@ impl MeshNetwork {
             | MessageType::MeshNodeListCheckpoint
             | MessageType::MeshNodeListCheckpointVote
             | MessageType::MeshNodeListCheckpointSync
+            // The shard IS the payout ledger — who is owed what, per address. Financial data
+            // defaults to Noise here for the same reason the batch chain does: a new financial
+            // message that falls to plaintext is the kind of omission that never announces
+            // itself.
+            | MessageType::ShardEpochSummary
+            | MessageType::ShardTableSync
+            | MessageType::ShardEvidence
             | MessageType::ElderUpdate
             | MessageType::ZkBlockProposal
             | MessageType::ZkVote
@@ -2204,6 +2211,12 @@ impl MeshNetwork {
             | MessageType::MeshNodeListCheckpoint
             | MessageType::MeshNodeListCheckpointVote
             | MessageType::MeshNodeListCheckpointSync
+            // Share shard: the consensus/voting port, like the payout-ledger machinery it
+            // replaces — the summaries and table decide who gets paid, and reusing the port
+            // means no fleet-wide firewall change before a single summary can flow.
+            | MessageType::ShardEpochSummary
+            | MessageType::ShardTableSync
+            | MessageType::ShardEvidence
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             // GhostGlyph messages use consensus voting port
@@ -3295,6 +3308,11 @@ impl MeshNetwork {
             | MessageType::MeshNodeListCheckpoint
             | MessageType::MeshNodeListCheckpointVote
             | MessageType::MeshNodeListCheckpointSync
+            // Share shard rides the consensus/voting port — must mirror the endpoint match
+            // above, or Noise-delivered shard messages get rejected as cross-channel injection.
+            | MessageType::ShardEpochSummary
+            | MessageType::ShardTableSync
+            | MessageType::ShardEvidence
             | MessageType::L2TreeSync
             | MessageType::L2ShieldBroadcast => self.config.ports.consensus_voting,
             MessageType::VerificationResult | MessageType::ChallengeConvergence => {
@@ -4229,6 +4247,9 @@ mod tests {
                 | MessageType::MeshNodeListCheckpoint
                 | MessageType::MeshNodeListCheckpointVote
                 | MessageType::MeshNodeListCheckpointSync
+                | MessageType::ShardEpochSummary
+                | MessageType::ShardTableSync
+                | MessageType::ShardEvidence
                 | MessageType::ElderUpdate
                 | MessageType::ZkBlockProposal
                 | MessageType::ZkVote
@@ -4372,6 +4393,56 @@ mod tests {
             message_type_requires_noise(MessageType::MpcParametersResponse),
             "MpcParametersResponse must use Noise"
         );
+
+        // Share shard (MUST use Noise — the shard IS the payout ledger)
+        assert!(
+            message_type_requires_noise(MessageType::ShardEpochSummary),
+            "ShardEpochSummary must use Noise"
+        );
+        assert!(
+            message_type_requires_noise(MessageType::ShardTableSync),
+            "ShardTableSync must use Noise"
+        );
+        assert!(
+            message_type_requires_noise(MessageType::ShardEvidence),
+            "ShardEvidence must use Noise"
+        );
+    }
+
+    /// Registration check for the share-shard message types: they must route to the
+    /// consensus/voting port on BOTH port matches (outbound endpoint and inbound M-9
+    /// validation). A variant missing from either match cannot compile — the matches are
+    /// exhaustive — but a variant added to the WRONG arm compiles fine and strands the
+    /// message on a port nobody serves, which is exactly the silent failure this pins.
+    #[test]
+    fn shard_messages_route_to_the_consensus_voting_port() {
+        let identity = Arc::new(NodeIdentity::generate());
+        let mut config = MeshConfig::default();
+        config.noise_enabled = false;
+        config.noise_required = false;
+        let mesh = MeshNetwork::try_new(identity, config).expect("mesh construct");
+
+        let voting = mesh.config.ports.consensus_voting;
+        let health = mesh.config.ports.health_monitoring;
+        for msg_type in [
+            MessageType::ShardEpochSummary,
+            MessageType::ShardTableSync,
+            MessageType::ShardEvidence,
+        ] {
+            assert!(
+                mesh.is_valid_msg_type_for_port(msg_type, voting),
+                "{msg_type:?} must be accepted on the consensus/voting port"
+            );
+            assert!(
+                !mesh.is_valid_msg_type_for_port(msg_type, health),
+                "{msg_type:?} must be rejected on any other port"
+            );
+            let endpoint = mesh.endpoint_for_message("203.0.113.7", msg_type);
+            assert!(
+                endpoint.ends_with(&format!(":{voting}")),
+                "{msg_type:?} outbound endpoint must target the consensus/voting port, got {endpoint}"
+            );
+        }
     }
 
     #[test]
