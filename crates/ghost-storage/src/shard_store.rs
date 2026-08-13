@@ -377,6 +377,86 @@ impl Database {
         })
     }
 
+    /// Settle one matured pool block: record its hash and credit each address's paid micro-work,
+    /// ONE transaction. Returns whether anything was applied — `false` means the block was
+    /// already settled and NOTHING moved, which is the caller's cue to leave its in-memory
+    /// `settled` untouched too.
+    ///
+    /// The block row is the idempotence record (`shard_settled_blocks`, keyed on block hash), and
+    /// it is written in the SAME transaction as the credits, because the seam between them is
+    /// money: a block recorded before its credits landed is a payment silently never discharged
+    /// (the work is owed forever and the next coinbase pays it again), and credits landing before
+    /// the record means a crash between the two discharges the same block twice on replay.
+    /// Deliberately NOT the legacy `settled_blocks` table — the two ledgers settle independently,
+    /// and a shared record is how one silently starts depending on the other.
+    ///
+    /// `block_hash` must be DISPLAY order — the caller normalises, because the idempotence key
+    /// only works if every caller spells the hash the same way (the internal-order trap has cost
+    /// an outage before). `amounts` are per-address micro-work increments; non-positive entries
+    /// are ignored exactly as [`Database::shard_record_settled`] ignores them. An empty `amounts`
+    /// still records the block: a pool block that paid no currently-owed address discharges
+    /// nothing, but must never be re-examined as though it were new.
+    pub fn shard_settle_block(
+        &self,
+        block_hash: &str,
+        height: u64,
+        amounts: &[(String, i64)],
+    ) -> GhostResult<bool> {
+        // Encrypted outside the connection lock, same rationale as `encrypt_cells`.
+        let cells: Vec<EncryptedCell> = amounts
+            .iter()
+            .filter(|(_, micro)| *micro > 0)
+            .map(|(addr, micro)| Ok((address_key(addr), self.encrypt_address(addr)?, *micro)))
+            .collect::<GhostResult<Vec<_>>>()?;
+        let discharged_total: i64 = cells.iter().map(|(_, _, m)| *m).sum();
+        let settled_ts = chrono::Utc::now().timestamp();
+
+        self.with_connection(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+
+            let result = (|| -> GhostResult<bool> {
+                // The idempotence gate, first: if the hash is already recorded nothing else in
+                // this transaction may run, so a re-examined block cannot discharge twice.
+                let inserted = conn
+                    .execute(
+                        "INSERT OR IGNORE INTO shard_settled_blocks \
+                         (block_hash, block_height, discharged_micro, settled_ts) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![block_hash, height as i64, discharged_total, settled_ts],
+                    )
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                if inserted == 0 {
+                    return Ok(false);
+                }
+                for (key, enc, micro) in &cells {
+                    conn.execute(
+                        "INSERT INTO shard_settled (address_hash, address_enc, settled_micro, \
+                         last_height) VALUES (?1, ?2, ?3, ?4) \
+                         ON CONFLICT(address_hash) DO UPDATE SET \
+                         settled_micro = settled_micro + excluded.settled_micro, \
+                         last_height = MAX(last_height, excluded.last_height)",
+                        params![key, enc, micro, height as i64],
+                    )
+                    .map_err(|e| GhostError::Database(e.to_string()))?;
+                }
+                Ok(true)
+            })();
+
+            match result {
+                Ok(applied) => {
+                    conn.execute_batch("COMMIT")
+                        .map_err(|e| GhostError::Database(e.to_string()))?;
+                    Ok(applied)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
     /// Persist a summary outside an epoch fold — e.g. one rebuilt for a peer that asked before
     /// the fold's own write was needed. Same guard as the in-fold path: idempotent on the same
     /// root, refuses a different one.
@@ -705,6 +785,45 @@ mod tests {
             expected,
             "60 + 40, with zero and negative ignored"
         );
+    }
+
+    /// A settled block is settled once: the block row and the per-address credits are one
+    /// transaction, and the recorded hash is the idempotence key. A second call with the same
+    /// hash — a rewound scan cursor, a restart replaying the same lookback — must apply nothing,
+    /// and must say so, because the caller's in-memory `settled` follows this verdict.
+    #[test]
+    fn settling_a_block_applies_once_and_a_repeat_applies_nothing() {
+        let db = db();
+
+        let amounts = vec![("bc1qalice".to_string(), 5_000_000i64)];
+        assert!(
+            db.shard_settle_block("00aa", 961_700, &amounts).expect("settle"),
+            "the first settlement of a block must apply"
+        );
+        assert!(
+            !db.shard_settle_block("00aa", 961_700, &amounts).expect("repeat"),
+            "a re-settled block must be a no-op, and say so"
+        );
+
+        let mut expected = ShardTable::new();
+        expected.record_settled("bc1qalice", 5_000_000);
+        assert_eq!(
+            db.shard_load_table().expect("load"),
+            expected,
+            "the credit must have landed exactly once"
+        );
+
+        // A DIFFERENT block paying the same address accumulates — per-block idempotence must not
+        // become per-address idempotence.
+        assert!(db.shard_settle_block("00bb", 961_800, &amounts).expect("settle 2"));
+        expected.record_settled("bc1qalice", 5_000_000);
+        assert_eq!(db.shard_load_table().expect("load"), expected);
+
+        // A pool block that discharged nothing is still recorded, so it is never re-examined as
+        // new — but it credits nobody.
+        assert!(db.shard_settle_block("00cc", 961_900, &[]).expect("empty"));
+        assert!(!db.shard_settle_block("00cc", 961_900, &[]).expect("empty repeat"));
+        assert_eq!(db.shard_load_table().expect("load"), expected);
     }
 
     /// A stored summary must read back exactly — same signing bytes, same signature — because a

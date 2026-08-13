@@ -16,16 +16,28 @@
 //!
 //! ## Lifecycle
 //!
-//! Nothing here spawns. The caller owns the schedule and calls three entry points:
+//! Nothing here spawns. The caller owns the schedule and calls four entry points:
 //!
 //! - `ShardRuntime::note_height` on the template-refresh path — an integer compare that
 //!   reports an epoch boundary, and nothing else;
 //! - `ShardRuntime::tick` from the epoch task — folds closed epochs, bounded per call;
+//! - `ShardRuntime::settle_matured` from the same epoch task — settles pool blocks that have
+//!   reached coinbase maturity, bounded per call;
 //! - `ShardRuntime::fold_epoch` if a single epoch needs folding by hand.
 //!
 //! Storage is a single `Mutex<Connection>` shared with share ingest, so every call does bounded
 //! work: a tick folds at most `MAX_FOLDS_PER_TICK` epochs, an epoch's input is bounded by the
-//! epoch length, and evidence deletes are chunked inside the storage layer's one transaction.
+//! epoch length, evidence deletes are chunked inside the storage layer's one transaction, and a
+//! settlement call settles at most `MAX_SETTLES_PER_CALL` blocks.
+//!
+//! ## Why settlement lives here and not on the block-connected path
+//!
+//! `settlement.rs` settles at the TIP and has to carry reorg reversal, because it acts on a
+//! block that may still be undone. The shard settles at **coinbase maturity** (§4.6): a block
+//! 100 deep is past any reorg this code contemplates, so there is no reversal to handle, and
+//! nothing hooks `on_block_connected` at all — the epoch task that already ticks looks back to
+//! `tip − 100` and settles what it has not settled yet. Idempotence comes from recording which
+//! block hashes have been settled, not from transaction gymnastics on a hot path.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,21 +46,51 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
+use ghost_common::coinbase_tags::extract_payout_tag;
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
+use ghost_common::rpc::BitcoinRpc;
 use ghost_common::share_batch::creditable_difficulty;
 use ghost_common::share_shard::{
-    epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS, NETWORK_TIER_LOG2, RETENTION_EPOCHS,
+    discharged_micro_work, epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS,
+    NETWORK_TIER_LOG2, RETENTION_EPOCHS,
 };
 use ghost_common::types::ShareProof;
+use ghost_common::zmq::block_hash_to_display_order;
 use ghost_reconciliation::batch::compute_merkle_root;
 use ghost_storage::database::Database;
+
+use crate::coinbase_verifier::{address_to_script_pubkey, CoinbaseOutput};
 
 
 /// Epochs one tick may fold. Bounds the work done against the shared connection between two
 /// share-ingest writes: a node that is many epochs behind catches up across ticks — resume, not
 /// a stall — rather than holding the storage mutex for the whole backlog at once.
 const MAX_FOLDS_PER_TICK: usize = 4;
+
+/// Coinbase maturity: the depth at which a coinbase output becomes spendable, and therefore the
+/// depth the shard settles at (§4.6). A block this deep is past any reorg this code contemplates
+/// (`RETENTION_FLOOR_BLOCKS` is also 100), which is exactly what removes the need for reversal.
+/// Never settle shallower — a shallower block's payment can still be undone, and the shard
+/// carries no undo.
+const COINBASE_MATURITY: u64 = 100;
+
+/// Pool blocks one settlement call may settle. Same rationale as [`MAX_FOLDS_PER_TICK`]: each
+/// settlement is one bounded transaction against the connection share ingest also uses, so a
+/// node returning from downtime discharges its backlog across calls — resume, not a stall.
+const MAX_SETTLES_PER_CALL: usize = 4;
+
+/// Heights one settlement call may examine. Bounds the RPC work of a long catch-up (each height
+/// costs a `getblockhash` and a coinbase fetch); anything further behind carries to the next
+/// call, exactly as the legacy forward scan batches its own catch-up.
+const MAX_SETTLE_SCAN_BLOCKS: u64 = 100;
+
+/// kv key holding the height the maturity lookback has reached.
+///
+/// The cursor is an ECONOMY, never the idempotence: it only spares re-fetching coinbases already
+/// examined. Correctness — a block settling exactly once — rests on the recorded block hashes in
+/// `shard_settled_blocks`, so a lost or rewound cursor re-reads blocks and changes nothing.
+const SETTLE_CURSOR_KEY: &str = "shard.settle_height";
 
 /// What one epoch's fold did, for logs and for the caller's soak checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +135,61 @@ pub struct TickReport {
     /// Closed epochs still unfolded when the per-tick bound stopped the walk. Non-zero means
     /// the next tick continues the catch-up.
     pub remaining: u64,
+}
+
+/// One block's fetched coinbase, ready for the settlement decision path.
+///
+/// Fetch and decision are split the way `settlement.rs` splits them: everything that can be
+/// wrong — the tag, the maturity guard, matching outputs to owed addresses, the discharge
+/// arithmetic — is testable without a live Core, while the fetch is a thin wrapper.
+#[derive(Debug, Clone)]
+struct FetchedCoinbase {
+    block_hash: String,
+    height: u64,
+    scriptsig: Vec<u8>,
+    outputs: Vec<CoinbaseOutput>,
+}
+
+/// What settling one matured block came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSettlement {
+    /// The block, display-order hex — the same spelling its idempotence record carries.
+    pub block_hash: String,
+    /// Its height.
+    pub height: u64,
+    /// Addresses credited with a positive discharge.
+    pub addresses: usize,
+    /// Total micro-work discharged.
+    pub discharged_micro: i64,
+}
+
+/// One matured block's settlement outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SettleBlockOutcome {
+    /// No payout tag in the coinbase — someone else's block, the overwhelmingly common case.
+    NotOurs,
+    /// Not yet [`COINBASE_MATURITY`] deep. Refused, never recorded: an immature block's payment
+    /// can still be undone by a reorg, and the shard carries no undo.
+    Immature,
+    /// Already recorded in `shard_settled_blocks`. Nothing moved — a re-run is a no-op, never a
+    /// second discharge.
+    AlreadySettled,
+    /// Settled: block recorded and `settled` credited, one storage transaction.
+    Settled(BlockSettlement),
+}
+
+/// What one [`ShardRuntime::settle_matured`] call did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettleReport {
+    /// Blocks settled this call, in height order.
+    pub settled: Vec<BlockSettlement>,
+    /// Blocks examined that carry no payout tag.
+    pub not_ours: usize,
+    /// Pool blocks found already settled (a rewound cursor — harmless).
+    pub already_settled: usize,
+    /// Blocks handed to this call but left for the next one by the per-call bound. Non-zero
+    /// means the next call continues the catch-up.
+    pub deferred: usize,
 }
 
 /// How far the shard's balances have drifted from the legacy ledger's.
@@ -486,6 +583,249 @@ impl ShardRuntime {
             Some(expired),
             evidence.iter().map(|s| s.share_hash).collect(),
         ))
+    }
+
+    /// Settle pool blocks that have reached coinbase maturity (§4.6), bounded per call.
+    ///
+    /// Called from the epoch task — NEVER the block-connected or template-refresh paths. At
+    /// maturity there is no reversal to handle (the block is past reorg range), so the whole
+    /// mechanism is a lookback: walk the chain from where the last call stopped up to
+    /// `tip − 100`, and for each block carrying our payout tag, credit `settled` with what its
+    /// coinbase actually paid. The chain is already replicated to every node, so this needs
+    /// zero messages and zero coordination.
+    ///
+    /// This changes what nobody is paid: the coinbase is still built from the legacy proposal,
+    /// and the shard is observing what it paid.
+    ///
+    /// The fetch stops at the first RPC gap rather than skipping it — the cursor only ever
+    /// advances over blocks actually examined, so a gap is retried next call rather than lost.
+    pub async fn settle_matured(
+        &self,
+        rpc: &BitcoinRpc,
+        tip_height: u64,
+    ) -> GhostResult<SettleReport> {
+        if self.solo {
+            // A solo node's blocks pay by the solo path and its work never entered the shared
+            // shard, so there is nothing here its payments could legitimately discharge.
+            debug!("share shard: solo mode — no maturity settlement");
+            return Ok(SettleReport::default());
+        }
+        let Some((from, to)) = self.settle_window(tip_height)? else {
+            return Ok(SettleReport::default());
+        };
+
+        let mut blocks = Vec::new();
+        for height in from..=to {
+            let hash = match rpc.get_block_hash(height).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(height, error = %e, "share shard: settlement stopped at an unreadable \
+                          block hash — resuming next call");
+                    break;
+                }
+            };
+            match crate::settlement::fetch_coinbase_parts(rpc, &hash).await {
+                Ok((scriptsig, outputs)) => blocks.push(FetchedCoinbase {
+                    block_hash: hash,
+                    height,
+                    scriptsig,
+                    outputs,
+                }),
+                Err(e) => {
+                    warn!(height, error = %e, "share shard: settlement stopped at an unreadable \
+                          coinbase — resuming next call");
+                    break;
+                }
+            }
+        }
+        self.settle_fetched(tip_height, &blocks)
+    }
+
+    /// The height range the next settlement call should examine, or `None` if there is nothing
+    /// to do. Initialises the cursor on the first call ever: history that matured before the
+    /// shard ran belongs to the legacy ledger — the shard accrued nothing for it, so its
+    /// payments have nothing here to discharge — which mirrors the fold watermark starting at
+    /// the current epoch.
+    fn settle_window(&self, tip_height: u64) -> GhostResult<Option<(u64, u64)>> {
+        let mature = tip_height.saturating_sub(COINBASE_MATURITY);
+        if mature == 0 {
+            return Ok(None);
+        }
+        let cursor: Option<u64> = self
+            .db
+            .kv_get(SETTLE_CURSOR_KEY)?
+            .and_then(|v| v.parse().ok());
+        let Some(cursor) = cursor else {
+            // No cursor (first run, or an unreadable value): start observing from today's
+            // maturity boundary. Overlap from a rewound cursor is harmless either way — the
+            // recorded block hashes are the idempotence, not this.
+            self.db.kv_set(SETTLE_CURSOR_KEY, &mature.to_string())?;
+            return Ok(None);
+        };
+        if cursor >= mature {
+            return Ok(None);
+        }
+        // Catch-up is bounded per call, exactly as the legacy forward scan bounds its own.
+        Ok(Some((cursor + 1, mature.min(cursor + MAX_SETTLE_SCAN_BLOCKS))))
+    }
+
+    /// Walk fetched blocks in height order, settling at most [`MAX_SETTLES_PER_CALL`] of them.
+    ///
+    /// The cursor advances only past blocks actually processed, so blocks the bound defers are
+    /// re-examined next call rather than silently skipped — and a deferred POOL block is the
+    /// case that matters, because skipping one is unpaid work never discharged.
+    fn settle_fetched(
+        &self,
+        tip_height: u64,
+        blocks: &[FetchedCoinbase],
+    ) -> GhostResult<SettleReport> {
+        let mut report = SettleReport::default();
+        for (i, block) in blocks.iter().enumerate() {
+            if report.settled.len() >= MAX_SETTLES_PER_CALL {
+                report.deferred = blocks.len() - i;
+                break;
+            }
+            let outcome = self.settle_block_from_coinbase(
+                tip_height,
+                &block.block_hash,
+                block.height,
+                &block.scriptsig,
+                &block.outputs,
+            )?;
+            match outcome {
+                SettleBlockOutcome::Immature => {
+                    // The window never hands this path an immature block; a caller that does
+                    // gets it deferred, cursor untouched, so it is revisited once it matures.
+                    report.deferred = blocks.len() - i;
+                    break;
+                }
+                SettleBlockOutcome::NotOurs => report.not_ours += 1,
+                SettleBlockOutcome::AlreadySettled => report.already_settled += 1,
+                SettleBlockOutcome::Settled(s) => report.settled.push(s),
+            }
+            self.db
+                .kv_set(SETTLE_CURSOR_KEY, &block.height.to_string())?;
+        }
+        Ok(report)
+    }
+
+    /// Decide and apply one block's settlement, given its coinbase already in hand.
+    ///
+    /// Credits from the MINED outputs — what the chain actually paid, never a stored proposal —
+    /// which is #601's correction carried over: the mined coinbase absorbs the winner's fee
+    /// drift, so any stored amount records money the chain never moved.
+    ///
+    /// The satoshi→micro-work conversion is [`discharged_micro_work`] at the rate the payment
+    /// was computed under: `pool_sats` is what the coinbase paid the matched addresses and
+    /// `top_work` is THIS NODE'S owed total across those same addresses (§4.6). That is
+    /// deterministic given a table, not identical across nodes, and it is safe because `owed`
+    /// is signed and never clamped: over-discharge leaves a negative residual that accrues back
+    /// up, under-discharge leaves work the next block pays.
+    ///
+    /// `settled` only ever increases. Nothing here touches `accrued` — subtracting from it is
+    /// the single-counter model, and it double-pays the moment a node that slept through the
+    /// settlement re-advertises its pre-settlement column (§4.4).
+    fn settle_block_from_coinbase(
+        &self,
+        tip_height: u64,
+        block_hash: &str,
+        height: u64,
+        scriptsig: &[u8],
+        outputs: &[CoinbaseOutput],
+    ) -> GhostResult<SettleBlockOutcome> {
+        // The maturity guard, first: settling shallower than the coinbase's own spendability is
+        // settling a payment a reorg can still undo, and the shard carries no undo.
+        if height.saturating_add(COINBASE_MATURITY) > tip_height {
+            return Ok(SettleBlockOutcome::Immature);
+        }
+        if extract_payout_tag(scriptsig).is_none() {
+            return Ok(SettleBlockOutcome::NotOurs);
+        }
+        // One spelling of the hash everywhere: the idempotence record only works if every
+        // caller writes display order, and the normaliser leaves a display-order hash alone.
+        let block_hash = block_hash_to_display_order(block_hash);
+
+        // What the coinbase paid, per script — summed first, because a coinbase may carry more
+        // than one output to the same script and each satoshi discharges work exactly once.
+        let mut paid_by_script: BTreeMap<&[u8], u64> = BTreeMap::new();
+        for out in outputs {
+            let paid = paid_by_script.entry(out.script_pubkey.as_slice()).or_insert(0);
+            *paid = paid.saturating_add(out.value);
+        }
+
+        // Held across the storage call, like the fold: the discharge is computed against this
+        // table, and crediting a table that moved in between would discharge at a rate nobody
+        // computed.
+        let mut table = self.table.lock();
+        let owed = table.owed();
+
+        // The matched set: positively-owed addresses this coinbase actually paid. Outputs to
+        // anything else — the treasury, node rewards, an address already at or below zero —
+        // discharge nothing, because there is no owed work to attribute them to.
+        let mut matched: Vec<(&String, i64, u64)> = Vec::new();
+        for (addr, &owed_micro) in &owed {
+            if owed_micro <= 0 {
+                continue;
+            }
+            let Some(spk) = address_to_script_pubkey(addr.as_bytes()) else {
+                debug!(address = %addr, "share shard: owed address does not convert to a \
+                       script — cannot match coinbase outputs to it");
+                continue;
+            };
+            if let Some(&paid) = paid_by_script.get(spk.as_slice()) {
+                if paid > 0 {
+                    matched.push((addr, owed_micro, paid));
+                }
+            }
+        }
+
+        // The rate the payment was computed under: both sums over the SAME matched set. A full
+        // proportional payout therefore discharges exactly the owed work; a payout that skipped
+        // an address leaves that address's work owed, untouched.
+        let pool_sats: u64 = matched.iter().map(|(_, _, paid)| *paid).sum();
+        let top_work: i64 = matched
+            .iter()
+            .fold(0i64, |acc, (_, owed, _)| acc.saturating_add(*owed));
+
+        let amounts: Vec<(String, i64)> = matched
+            .iter()
+            .map(|(addr, _, paid)| {
+                (
+                    (*addr).clone(),
+                    discharged_micro_work(*paid, pool_sats, top_work),
+                )
+            })
+            .collect();
+
+        // One transaction: the block's idempotence record and its credits land together, and
+        // `false` means the block was already settled — in which case the in-memory table must
+        // not move either.
+        if !self.db.shard_settle_block(&block_hash, height, &amounts)? {
+            debug!(block_hash = %block_hash, height, "share shard: block already settled — no-op");
+            return Ok(SettleBlockOutcome::AlreadySettled);
+        }
+
+        // Only after the transaction has committed does the in-memory table move — the fold's
+        // rule, for the fold's reason.
+        let mut discharged_total = 0i64;
+        for (addr, micro) in &amounts {
+            table.record_settled(addr, *micro);
+            discharged_total = discharged_total.saturating_add((*micro).max(0));
+        }
+        let settlement = BlockSettlement {
+            block_hash,
+            height,
+            addresses: amounts.iter().filter(|(_, micro)| *micro > 0).count(),
+            discharged_micro: discharged_total,
+        };
+        info!(
+            block_hash = %settlement.block_hash,
+            height,
+            addresses = settlement.addresses,
+            discharged_micro = settlement.discharged_micro,
+            "share shard: settled a matured pool block"
+        );
+        Ok(SettleBlockOutcome::Settled(settlement))
     }
 }
 
@@ -987,6 +1327,290 @@ mod tests {
             1,
             "not one row may leave `shares` before cutover"
         );
+    }
+
+    // ---- maturity settlement ----------------------------------------------------------------
+    //
+    // Real bech32 addresses, because settlement matches owed addresses to coinbase outputs by
+    // script — the fold tests' "bc1qalice" has no script to match.
+    const ADDR_A: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const ADDR_B: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
+
+    /// A coinbase scriptSig carrying our payout tag: BIP34 height push, tag, pool text.
+    fn tagged_scriptsig() -> Vec<u8> {
+        let mut s = vec![0x03, 0x40, 0x1f, 0x0e];
+        s.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xAB; 16]));
+        s.extend_from_slice(b"GHOST PublicPool");
+        s
+    }
+
+    /// Coinbase outputs paying the given addresses.
+    fn pay(pairs: &[(&str, u64)]) -> Vec<CoinbaseOutput> {
+        pairs
+            .iter()
+            .map(|(addr, sats)| CoinbaseOutput {
+                value: *sats,
+                script_pubkey: address_to_script_pubkey(addr.as_bytes())
+                    .expect("test address must convert to a script pubkey"),
+            })
+            .collect()
+    }
+
+    /// Accrue owed work for settlement tests: one epoch-100 round, one share per (address,
+    /// work) pair, folded — so `owed` holds real folded balances, not hand-planted ones.
+    fn accrue(db: &Database, rt: &ShardRuntime, rx: &str, work_by_addr: &[(&str, f64)]) {
+        seed_round(db, 1, 602);
+        for (i, (addr, work)) in work_by_addr.iter().enumerate() {
+            seed_share(db, 1, 0xC0 + i as u8, addr, *work, Some(12), rx, true);
+        }
+        let FoldOutcome::Folded(_) = rt.fold_epoch(100).expect("fold") else {
+            panic!("the accrual fold must fold");
+        };
+    }
+
+    /// How many settled-block records exist — the idempotence ledger, directly.
+    fn settled_block_count(db: &Database) -> i64 {
+        db.with_connection(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM shard_settled_blocks", [], |r| r.get(0))
+                .map_err(|e| GhostError::Database(e.to_string()))
+        })
+        .expect("count")
+    }
+
+    /// THE money property of settlement: a matured pool block settles exactly once. The re-run —
+    /// same process or after a restart — is a no-op: same owed, same root, never a second
+    /// discharge. A second discharge is the same payment shrinking the same debt twice.
+    #[test]
+    fn a_matured_pool_block_settles_exactly_once_and_a_rerun_is_a_noop() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+        assert_eq!(rt.owed().get(ADDR_A), Some(&micro_work(5.0)));
+
+        let sig = tagged_scriptsig();
+        let outs = pay(&[(ADDR_A, 250_000)]);
+        // Block at 602, tip at 702: exactly COINBASE_MATURITY deep.
+        let outcome = rt
+            .settle_block_from_coinbase(702, "00aa", 602, &sig, &outs)
+            .expect("settle");
+        let SettleBlockOutcome::Settled(s) = outcome else {
+            panic!("a matured pool block must settle, got {outcome:?}");
+        };
+        assert_eq!(
+            s.discharged_micro,
+            micro_work(5.0),
+            "the sole paid address's full owed work discharges"
+        );
+        assert_eq!(rt.owed().get(ADDR_A), Some(&0), "paid work is no longer owed");
+
+        let root_after = rt.table_root();
+        assert_eq!(
+            rt.settle_block_from_coinbase(702, "00aa", 602, &sig, &outs)
+                .expect("re-run"),
+            SettleBlockOutcome::AlreadySettled,
+            "a re-run must be a no-op"
+        );
+        assert_eq!(rt.owed().get(ADDR_A), Some(&0));
+        assert_eq!(rt.table_root(), root_after);
+        assert_eq!(settled_block_count(&db), 1);
+
+        // Across a restart: the recorded block hash is the durable marker, so a fresh runtime
+        // reaches the same verdict from the same chain.
+        let rt2 = ShardRuntime::load(identity, db, false, true).expect("reload");
+        assert_eq!(rt2.owed().get(ADDR_A), Some(&0));
+        assert_eq!(rt2.table_root(), root_after);
+        assert_eq!(
+            rt2.settle_block_from_coinbase(702, "00aa", 602, &sig, &outs)
+                .expect("re-run after restart"),
+            SettleBlockOutcome::AlreadySettled
+        );
+    }
+
+    /// A block below maturity depth is NOT settled — its payment can still be undone by a reorg
+    /// and the shard carries no undo, so settling it would need the reversal machinery this
+    /// design exists to not need. Nothing is recorded either: once the block matures it settles
+    /// in full through the same path.
+    #[test]
+    fn a_block_below_maturity_depth_is_not_settled() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+
+        let sig = tagged_scriptsig();
+        let outs = pay(&[(ADDR_A, 250_000)]);
+        // Block at 602, tip at 701: 99 deep — one short.
+        assert_eq!(
+            rt.settle_block_from_coinbase(701, "00bb", 602, &sig, &outs)
+                .expect("attempt"),
+            SettleBlockOutcome::Immature
+        );
+        assert_eq!(
+            rt.owed().get(ADDR_A),
+            Some(&micro_work(5.0)),
+            "an immature block must discharge nothing"
+        );
+        assert_eq!(
+            settled_block_count(&db),
+            0,
+            "an immature block must not be recorded — it is not settled, not settled-with-zero"
+        );
+
+        // One block later it is exactly at maturity, and settles in full.
+        let SettleBlockOutcome::Settled(s) = rt
+            .settle_block_from_coinbase(702, "00bb", 602, &sig, &outs)
+            .expect("settle at maturity")
+        else {
+            panic!("the block must settle once mature");
+        };
+        assert_eq!(s.discharged_micro, micro_work(5.0));
+        assert_eq!(rt.owed().get(ADDR_A), Some(&0));
+    }
+
+    /// The discharge arithmetic (§4.6): `settled` increases by the payment converted at
+    /// `top_work / pool_sats`, and `owed` falls by exactly that — signed, never clamped. Equal
+    /// payments against unequal balances leave one address still owed and the other negative,
+    /// which IS the correction that makes independent payout views converge.
+    #[test]
+    fn settled_increases_and_owed_falls_by_the_discharged_amount() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0), (ADDR_B, 3.0)]);
+
+        // Equal payments: pool_sats = 800_000 over top_work = 8_000_000, so each 400_000-sat
+        // payment discharges 4_000_000 micro-work regardless of who was owed what.
+        let outs = pay(&[(ADDR_A, 400_000), (ADDR_B, 400_000)]);
+        let SettleBlockOutcome::Settled(s) = rt
+            .settle_block_from_coinbase(702, "00cc", 602, &tagged_scriptsig(), &outs)
+            .expect("settle")
+        else {
+            panic!("must settle");
+        };
+        assert_eq!(s.addresses, 2);
+        assert_eq!(s.discharged_micro, 8_000_000);
+
+        let owed = rt.owed();
+        assert_eq!(
+            owed.get(ADDR_A),
+            Some(&1_000_000),
+            "A was owed 5.0 and discharged 4.0 — the remainder stays owed"
+        );
+        assert_eq!(
+            owed.get(ADDR_B),
+            Some(&-1_000_000),
+            "B was owed 3.0 and discharged 4.0 — the overpayment goes NEGATIVE, never clamped"
+        );
+
+        // The persisted table agrees cell for cell: settled grew by exactly the discharge, and
+        // a restart resumes from the same truth this runtime holds.
+        let loaded = db.shard_load_table().expect("load");
+        assert_eq!(loaded.settled().get(ADDR_A), Some(&4_000_000));
+        assert_eq!(loaded.settled().get(ADDR_B), Some(&4_000_000));
+        assert_eq!(loaded.compute_table_root(), rt.table_root());
+    }
+
+    /// A full payout discharges the full work; a partial payout — the coinbase paid only some
+    /// of the owed addresses — leaves the rest owed, untouched, for the next block to pay. The
+    /// unpaid address must play no part in the paid one's rate.
+    #[test]
+    fn a_full_payout_discharges_all_and_a_partial_leaves_the_remainder_owed() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0), (ADDR_B, 3.0)]);
+
+        // Partial: this block pays A only. A's rate is computed over the PAID set alone
+        // (pool = 250_000 sats against A's 5_000_000 micro), so A discharges in full — and B,
+        // unpaid, is untouched.
+        let SettleBlockOutcome::Settled(s) = rt
+            .settle_block_from_coinbase(702, "00dd", 602, &tagged_scriptsig(), &pay(&[(ADDR_A, 250_000)]))
+            .expect("partial")
+        else {
+            panic!("must settle");
+        };
+        assert_eq!(s.addresses, 1);
+        assert_eq!(s.discharged_micro, micro_work(5.0));
+        assert_eq!(rt.owed().get(ADDR_A), Some(&0));
+        assert_eq!(
+            rt.owed().get(ADDR_B),
+            Some(&micro_work(3.0)),
+            "the unpaid address keeps its full remainder owed"
+        );
+
+        // The next block pays the remainder: everything owed is now discharged.
+        let SettleBlockOutcome::Settled(s) = rt
+            .settle_block_from_coinbase(703, "00ee", 603, &tagged_scriptsig(), &pay(&[(ADDR_B, 99_000)]))
+            .expect("remainder")
+        else {
+            panic!("must settle");
+        };
+        assert_eq!(s.discharged_micro, micro_work(3.0));
+        assert_eq!(rt.owed().get(ADDR_B), Some(&0));
+    }
+
+    /// A block without our tag discharges nothing and is not recorded — every block anyone
+    /// mines passes through this path, and the common case must leave no trace at all.
+    #[test]
+    fn a_foreign_block_neither_discharges_nor_is_recorded() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+
+        // A plausible foreign coinbase — height push, someone else's text — that even pays an
+        // address we hold owed work for. Without the tag it is not the pool paying a debt.
+        let mut foreign = vec![0x03, 0x40, 0x1f, 0x0e];
+        foreign.extend_from_slice(b"/SomeOtherPool/");
+        assert_eq!(
+            rt.settle_block_from_coinbase(702, "00ff", 602, &foreign, &pay(&[(ADDR_A, 250_000)]))
+                .expect("attempt"),
+            SettleBlockOutcome::NotOurs
+        );
+        assert_eq!(rt.owed().get(ADDR_A), Some(&micro_work(5.0)));
+        assert_eq!(settled_block_count(&db), 0);
+    }
+
+    /// The per-call bound: one call settles at most MAX_SETTLES_PER_CALL blocks and defers the
+    /// rest to the next call — storage is one `Mutex<Connection>` shared with share ingest, and
+    /// a node catching up must resume, not stall the pool. Deferred blocks are NOT lost: the
+    /// next call settles them.
+    #[test]
+    fn the_per_call_settle_bound_holds_and_deferred_blocks_carry_over() {
+        let (identity, db, rt) = runtime();
+        let rx = our_received_by(&identity);
+        accrue(&db, &rt, &rx, &[(ADDR_A, 5.0)]);
+
+        // Six matured pool blocks. The first fully discharges A; the rest are pool blocks that
+        // pay an address no longer positively owed, which still settle (recorded, zero credit).
+        let blocks: Vec<FetchedCoinbase> = (0..6u64)
+            .map(|i| FetchedCoinbase {
+                block_hash: format!("b{i}"),
+                height: 602 + i,
+                scriptsig: tagged_scriptsig(),
+                outputs: pay(&[(ADDR_A, 100_000)]),
+            })
+            .collect();
+
+        let report = rt.settle_fetched(800, &blocks).expect("first call");
+        assert_eq!(
+            report.settled.len(),
+            MAX_SETTLES_PER_CALL,
+            "one call settles at most the bound"
+        );
+        assert_eq!(report.deferred, 2, "the rest is deferred, not dropped");
+        assert_eq!(settled_block_count(&db), MAX_SETTLES_PER_CALL as i64);
+
+        // The next call finds the settled four already recorded and settles the deferred two.
+        let report = rt.settle_fetched(800, &blocks).expect("second call");
+        assert_eq!(report.already_settled, 4);
+        assert_eq!(report.settled.len(), 2);
+        assert_eq!(report.deferred, 0);
+        assert_eq!(settled_block_count(&db), 6);
+
+        // A third call has nothing left to do.
+        let report = rt.settle_fetched(800, &blocks).expect("third call");
+        assert_eq!(report.already_settled, 6);
+        assert!(report.settled.is_empty());
+
+        // And across all of it, A's work discharged exactly once.
+        assert_eq!(rt.owed().get(ADDR_A), Some(&0));
     }
 
     #[test]

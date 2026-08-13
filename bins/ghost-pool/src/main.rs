@@ -4084,6 +4084,23 @@ async fn main() -> Result<()> {
                         warn!(error = %e, tip, "shard: epoch tick failed — retrying next tick")
                     }
                 }
+
+                // Maturity settlement (§4.6) rides the same task, deliberately: a block 100 deep
+                // is past reorg range, so this is a lookback with no reversal to handle, and it
+                // must NEVER move to the block-connected or template-refresh paths — those must
+                // stay sub-second at a tip change. Bounded per call; a backlog resumes next tick.
+                match rt.settle_matured(&rpc_c, tip).await {
+                    Ok(r) if !r.settled.is_empty() => info!(
+                        tip,
+                        blocks = r.settled.len(),
+                        deferred = r.deferred,
+                        "shard: settled matured pool blocks"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, tip, "shard: maturity settlement failed — retrying next tick")
+                    }
+                }
             }
         });
     }

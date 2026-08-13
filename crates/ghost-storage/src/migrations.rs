@@ -2599,6 +2599,12 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
 ///   gossiped, so there is no stale copy anywhere to resurrect (§4.4).
 /// - `shard_epochs` — this node's own signed per-epoch summaries, kept so a syncing peer can be
 ///   answered and so a folded epoch is durably marked as folded.
+/// - `shard_settled_blocks` — which blocks the shard has settled, keyed by block hash. This is
+///   the settlement path's idempotence record: crediting `shard_settled` and recording the block
+///   commit in one transaction, so a re-examined block (a restart, a rewound scan cursor) is a
+///   no-op rather than a second discharge. Deliberately NOT the legacy `settled_blocks` table —
+///   the two ledgers settle independently, and sharing a record is how one silently starts
+///   depending on the other.
 ///
 /// KEYED BY `H(plaintext address)`, NEVER THE CIPHERTEXT — the `sbc_balances` rationale holds
 /// unchanged: `encrypt_sensitive` draws a fresh random nonce per call, so the same address
@@ -2659,6 +2665,17 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
             summary_enc  TEXT    NOT NULL,
             published    INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (epoch, node_id)
+         );
+
+         -- Blocks the shard has settled, keyed by DISPLAY-ORDER block hash (the order the RPC
+         -- speaks; the internal-order trap has cost an outage before). One row per pool block at
+         -- coinbase maturity; the primary key is what makes re-settling a block a no-op.
+         -- discharged_micro and settled_ts are advisory, for diagnosis — never decision inputs.
+         CREATE TABLE IF NOT EXISTS shard_settled_blocks (
+            block_hash       TEXT    PRIMARY KEY,
+            block_height     INTEGER NOT NULL,
+            discharged_micro INTEGER NOT NULL,
+            settled_ts       INTEGER NOT NULL
          );",
     )
     .map_err(|e| GhostError::Database(e.to_string()))?;
@@ -3864,6 +3881,15 @@ mod tests {
                     "published",
                 ],
             ),
+            (
+                "shard_settled_blocks",
+                &[
+                    "block_hash",
+                    "block_height",
+                    "discharged_micro",
+                    "settled_ts",
+                ],
+            ),
         ];
         let check_shape = |conn: &Connection, when: &str| {
             let tables = get_table_names(conn);
@@ -3907,7 +3933,8 @@ mod tests {
 
         // Clean v52 case: no shard tables at all, exactly what the fleet's databases hold today.
         conn.execute_batch(
-            "DROP TABLE shard_counters; DROP TABLE shard_settled; DROP TABLE shard_epochs;",
+            "DROP TABLE shard_counters; DROP TABLE shard_settled; DROP TABLE shard_epochs; \
+             DROP TABLE shard_settled_blocks;",
         )
         .expect("drop");
         conn.execute("PRAGMA user_version = 52", [])
