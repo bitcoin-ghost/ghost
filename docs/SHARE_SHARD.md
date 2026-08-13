@@ -271,6 +271,35 @@ baseline from both at a chain-anchored height, so a node that missed it recomput
 from the chain it already holds and self-heals with no announcement. Compaction is not required for
 v1.
 
+### 4.7 Reconciliation at scale — three tiers, not one message
+
+The whole-table exchange works today and breaks well before target scale (§12.6). It generalises
+cleanly because **a column is the natural unit**: each node writes only its own column, and columns
+merge independently by per-cell max.
+
+| tier | costs | answers |
+|---|---|---|
+| **1. table root** | 32 bytes, every epoch | *have we drifted at all?* |
+| **2. column digests** | 32 bytes × nodes | *whose column differs?* |
+| **3. column fetch** | one differing column | *repair it* |
+
+Tier 1 is the standing check and never grows. Tier 2 runs only when roots disagree: at 100 nodes it
+is 3.2 KB, at 1,000 nodes 32 KB — still comfortably one message, and it localises by **node** rather
+than by cell, so the cost tracks fleet size rather than address count. Tier 3 fetches only what
+actually differs.
+
+Two properties worth keeping:
+
+- **`compute_table_root` does not change.** Column digests sit alongside it, so the pinned golden
+  vector survives and detection stays exactly as it is today.
+- **Repair is idempotent.** A fetched column is merged by max like any other, so a redundant or
+  out-of-order repair is harmless — the same property that makes ordinary gossip safe.
+
+**The next ceiling, named rather than solved:** a single node whose own column exceeds one message
+(~2,800 cells) needs paging *within* a column, by address range. That is one operator with thousands
+of distinct payout addresses — far past anything the fleet resembles — but it is where this design
+runs out, and it should be written before it is needed rather than after.
+
 ## 5. Why this converges when the last one did not
 
 The old design drifted despite sending *more* data, which is the key evidence that volume was never
@@ -460,4 +489,4 @@ keep and expensive to recover from.
    layer: the message envelope ceiling is ~2,800 cells once JSON expansion is accounted for. The
    table is `nodes × addresses`, so §10's own 100-node × 500-address case is 50,000 cells ≈ 4.5 MB —
    a whole-table message becomes impossible long before the network reaches target scale. Repair
-   must page, and the paging design is **not yet written**.
+   pages by column — see §4.7.
