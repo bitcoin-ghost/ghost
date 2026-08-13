@@ -104,6 +104,32 @@ New `crates/ghost-common/src/share_shard.rs`, reusing `micro_work`, `canonical_s
 - **Sampling verifier (λ = 20)** with `ShardEvidence` broadcast on failure. First thing to cut if
   time runs short — see below.
 
+### Where the epoch task actually goes (surveyed 2026-08-13, read from the code)
+
+This is the wiring that is deliberately **not** delegated — it is where this project has historically
+come unstuck, and it is three specific decisions:
+
+**1. Copy the tip−6 loop's shape — it is the thing being replaced.** `main.rs:3998`:
+`tokio::spawn` + `tokio::time::interval(30s)` + **`MissedTickBehavior::Skip`**. The `Skip` is
+load-bearing: without it a fold that runs long queues ticks and the backlog folds back-to-back
+against the same connection mutex that share ingest uses.
+
+**2. Detect the boundary cheaply where rounds already rotate; fold somewhere else.**
+`start_round(height)` sits in the `TemplateEvent::NewWork` handler (`main.rs:10101`), which fires on
+**every template refresh (~30 s), not per block**, and already persists era-boundary state — so the
+precedent for a small write there exists. Compare `epoch_for_height(height)` against the last epoch
+(an integer compare) and signal the epoch task. **Never fold inline here.**
+
+**3. Nothing heavy in the ZMQ path.** `publish_empty_template()` (`main.rs:9860`) must stay
+sub-second on a new block; that is what gives miners instant work at a tip change. The fold and its
+deletes never touch this path.
+
+Two invariants that follow from storage being one `Mutex<Connection>` shared with
+`insert_share_with_proof` (`main.rs:7882`): the fold's deletes must be **bounded batches**, and the
+fold must read its input **from the persisted shares table by height range**, never from an
+in-memory accumulator — the prior design lost 6,499 pending shares on a restart for exactly that
+reason.
+
 ## Stage 4 — canary dark soak
 
 Deploy fleet-wide (canaries vm5–8, 60-min soak, then vm1–4). Flip `pool.share_shard = true` on
