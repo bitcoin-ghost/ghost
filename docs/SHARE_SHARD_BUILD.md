@@ -28,6 +28,10 @@ legacy proposal; the shard observes.
 | Stage 0 anchor rehearsal | `scripts/shard-anchor-rehearsal.sh` | ✅ written and run against all 8 |
 | Stage 5 genesis conversion | `crates/ghost-accounting/src/shard_genesis.rs` | ✅ 13 tests, dark |
 | Stage 5 reserved-column guard | `ghost-common` + `ghost-storage` | ✅ enforced, not assumed |
+| Stage 5 anchor pin + load self-check | `pinned_anchor` / `ShardRuntime::load` | ✅ checked every start |
+| Stage 5 pre-genesis epoch floor | `ghost-common` + `shard_handler` | ✅ both merge paths + table sync |
+| Stage 5 arming + gap-fold | `ShardRuntime::arm_from_genesis` | ✅ 3 tests, dark |
+| Stage 0 ceremony backup | `scripts/shard-ceremony-backup.sh` | ✅ all 8 verified |
 
 **Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
 share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
@@ -330,11 +334,44 @@ not a binary big-bang. That is what removes the need for a height gate *and* the
 3. **Back up all 8 databases.**
 4. **Roll node-by-node, vm5 first.** On flip each node converts its own copy of the byte-identical
    checkpoint, **asserts the computed root equals the pin and refuses to start the shard otherwise**
-   — a loud local self-check, not a fleet negotiation. Then it **gap-folds**: its own locally-received
-   valid network-tier shares with `timestamp ∈ (cutoff_ts, now]` into its own column. Because columns
-   are per-node and the checkpoint already credited everything up to `cutoff_ts`, there is no double
-   count and no coordination. The mixed-fleet window costs nothing — shares landing on not-yet-cut
-   nodes are gap-folded when that node flips.
+   — a loud local self-check, not a fleet negotiation.
+
+   **Built** as `ShardRuntime::arm_from_genesis`. ⚠ **Two things in the paragraph this replaces were
+   wrong, and only building it showed that.**
+
+   **(a) The gap-fold must not be a timestamp range.** "Shares with `timestamp ∈ (cutoff_ts, now]`"
+   fails twice: it overlaps the ordinary epoch folds that run from the floor onward, double-crediting
+   every share in the intersection; and `now` is a local clock, which is the §12.2 trap that made the
+   old sweep's summaries incomparable in principle. What is actually needed is for the **epoch
+   watermark to restart at the floor**, after which `tick` catches up epoch by epoch on machinery
+   that is already bounded, already idempotent (`shard_epochs` is the durable marker) and already
+   retries a failed epoch rather than skipping it. No new fold code, and the input still comes from
+   the persisted shares table.
+
+   **(b) "There is no double count" was false.** The Stage 4 soak accrues each node's own work into
+   its own column and gossips it; genesis then credits that same work again for the whole fleet, and
+   `owed()` sums across columns. Narrowing the fold range cannot fix it — the overlap is already in
+   the column. Resetting the column cannot either — a not-yet-armed peer re-advertises the higher
+   value and wins the max. So arming replaces the table wholesale and sets a **pre-genesis epoch
+   floor** at `epoch_for_height(ANCHOR_HEIGHT) + 1`; summaries below it are refused on **both** merge
+   paths. The floor derives from the pin every node carries, so it is chain-derived and identical
+   fleet-wide. It does not break "behind, never wrong": those epochs are pre-genesis, so their work
+   is already in the genesis column.
+
+   The floor is the anchor's epoch **plus one** because `cutoff_ts` falls partway through the
+   anchor's own epoch; folding it would re-credit what genesis covered. That under-credits this
+   node's work across at most `EPOCH_BLOCKS - 1` heights — deliberate, same direction as the
+   conversion's truncation.
+
+   **(c) The mixed-fleet window does NOT cost nothing.** A whole-table sync carries no epoch, so the
+   floor cannot gate it — and it is exactly the path that resurrects an unarmed peer's pre-genesis
+   column, permanently, because merging is a max. The genesis column is itself the generation
+   marker: identical on every armed node, absent on every unarmed one, already in the payload, so no
+   new protocol field. Both-absent matches, leaving every pre-ceremony sync unchanged.
+
+   Arming also **refuses if anything is already settled**. It cannot fire today (zero blocks won),
+   but a genesis checkpoint is an *unpaid* ledger, so a non-empty `settled` disagrees with it about
+   history and silently discarding that would be the one destructive act in an additive ceremony.
 5. **Converge and verify** — one full-table sync, one distinct root fleet-wide, and spot-check the top
    addresses against the old query while both are still computable.
 6. **Flip the coinbase source** fleet-wide, same day. Until this moment the coinbase stays armed from
