@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 52;
+const SCHEMA_VERSION: u32 = 53;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -129,6 +129,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (50, migrate_v50),
         (51, migrate_v51),
         (52, migrate_v52),
+        (53, migrate_v53),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2582,6 +2583,82 @@ fn migrate_v49(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v53: the network shard's persistent state (`SHARE_SHARD.md` §4.3/§4.4, build Stage 1).
+///
+/// Strictly additive and dormant: nothing reads these tables until the shard is wired behind
+/// `pool.share_shard`, so a node on the old path is unaffected and a rollback to the previous
+/// binary simply ignores them. Every `sbc_*` table is left untouched — the SBC layer is deleted
+/// in a later release, not this one, and this migration must not depend on it either way.
+///
+/// Three tables, mirroring `ghost_common::share_shard::ShardTable`:
+///
+/// - `shard_counters` — one row per `accrued[node][address]` cell. Grow-only in merged state;
+///   this node's own column is the only one written additively, remote columns land here after
+///   a verified max-merge.
+/// - `shard_settled` — `settled[address]`, read off the chain at coinbase maturity. Never
+///   gossiped, so there is no stale copy anywhere to resurrect (§4.4).
+/// - `shard_epochs` — this node's own signed per-epoch summaries, kept so a syncing peer can be
+///   answered and so a folded epoch is durably marked as folded.
+///
+/// KEYED BY `H(plaintext address)`, NEVER THE CIPHERTEXT — the `sbc_balances` rationale holds
+/// unchanged: `encrypt_sensitive` draws a fresh random nonce per call, so the same address
+/// encrypts differently every time and a ciphertext key could never be looked up. Every write
+/// would insert a new row and one miner's balance would scatter across duplicates. The hash is
+/// deterministic, and portable between nodes where the per-node ciphertext is not. Never
+/// `GROUP BY` the encrypted column.
+///
+/// `*_micro` columns are INTEGER because the in-memory type is `i64` micro-work
+/// (`share_batch::fold_shares`); storing TEXT would let the persisted type drift from the type
+/// the table root is computed over, and the root is what nodes compare.
+///
+/// No VACUUM here or in any accessor: it needs 2× the database size free, and vm1 does not
+/// have it.
+fn migrate_v53(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v53: shard_counters, shard_settled, shard_epochs");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS shard_counters (
+            node_id       BLOB    NOT NULL,
+            address_hash  BLOB    NOT NULL,
+            -- Encrypted plaintext, decrypted on load: the table root commits to PLAINTEXT
+            -- addresses, so plaintext is what has to reach the in-memory table.
+            address_enc   TEXT    NOT NULL,
+            total_micro   INTEGER NOT NULL,
+            -- Which epoch last wrote this cell. Advisory, for diagnosis — never a decision
+            -- input (the close_ts/finalised_at lesson).
+            updated_epoch INTEGER NOT NULL,
+            PRIMARY KEY (node_id, address_hash)
+         );
+         CREATE INDEX IF NOT EXISTS idx_shard_counters_epoch
+             ON shard_counters(updated_epoch);
+
+         CREATE TABLE IF NOT EXISTS shard_settled (
+            address_hash  BLOB    PRIMARY KEY,
+            address_enc   TEXT    NOT NULL,
+            settled_micro INTEGER NOT NULL,
+            -- The highest block height whose settlement touched this row. Advisory.
+            last_height   INTEGER NOT NULL
+         );
+
+         -- One row per epoch: this node's OWN summary (each node writes only its own column,
+         -- §4.4, so it only ever signs its own). The full summary is kept — root alone cannot
+         -- reconstruct one — encrypted at rest because the deltas are keyed by plaintext payout
+         -- address. Unlike sbc_batches' verbatim JSON, re-serialisation is harmless here: the
+         -- signature covers the canonical signing bytes, not the JSON encoding.
+         CREATE TABLE IF NOT EXISTS shard_epochs (
+            epoch        INTEGER PRIMARY KEY,
+            node_id      BLOB    NOT NULL,
+            share_root   BLOB    NOT NULL,
+            share_count  INTEGER NOT NULL,
+            summary_enc  TEXT    NOT NULL,
+            published    INTEGER NOT NULL DEFAULT 0
+         );",
+    )
+    .map_err(|e| GhostError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
 /// v50: share-batch chain persistence (WP-5 shadow run).
 ///
 /// See `docs/archive/SHARE_BATCH_CHAIN.md`. The defect being replaced is stated there in one line:
@@ -3738,5 +3815,98 @@ mod tests {
             "kv_store missing 'value' column. Found columns: {:?}",
             columns
         );
+    }
+
+    /// v53 must apply cleanly on a v52 database, be idempotent against tables that already
+    /// exist (the vm6/vm8 drifted-node case: a branch build ran, the binary rolled back, and
+    /// the tables outlived it), and be strictly additive — every `sbc_*` table survives.
+    #[test]
+    fn v53_applies_on_v52_and_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("conn");
+        run_migrations(&conn).expect("migrate");
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "shard_counters",
+                &[
+                    "node_id",
+                    "address_hash",
+                    "address_enc",
+                    "total_micro",
+                    "updated_epoch",
+                ],
+            ),
+            (
+                "shard_settled",
+                &[
+                    "address_hash",
+                    "address_enc",
+                    "settled_micro",
+                    "last_height",
+                ],
+            ),
+            (
+                "shard_epochs",
+                &[
+                    "epoch",
+                    "node_id",
+                    "share_root",
+                    "share_count",
+                    "summary_enc",
+                    "published",
+                ],
+            ),
+        ];
+        let check_shape = |conn: &Connection, when: &str| {
+            let tables = get_table_names(conn);
+            for (table, cols) in expected {
+                assert!(
+                    tables.contains(&table.to_string()),
+                    "{table} missing {when}. Found tables: {tables:?}"
+                );
+                let have = get_column_names(conn, table);
+                for col in *cols {
+                    assert!(
+                        have.contains(&col.to_string()),
+                        "{table} missing `{col}` {when}. Found columns: {have:?}"
+                    );
+                }
+            }
+        };
+        check_shape(&conn, "after a clean migration");
+
+        // Additive: the sbc_* tables this release explicitly does NOT touch are all present.
+        let tables = get_table_names(&conn);
+        for sbc in [
+            "sbc_balances",
+            "sbc_batches",
+            "sbc_certs",
+            "sbc_quarantine",
+            "sbc_watermarks",
+        ] {
+            assert!(
+                tables.contains(&sbc.to_string()),
+                "v53 must leave `{sbc}` alone. Found tables: {tables:?}"
+            );
+        }
+
+        // Drifted-node case: the DB claims v52 but the shard tables already exist. Re-running
+        // must not error and must land back on the current version.
+        conn.execute("PRAGMA user_version = 52", [])
+            .expect("rewind");
+        run_migrations(&conn).expect("v53 must tolerate existing tables");
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Clean v52 case: no shard tables at all, exactly what the fleet's databases hold today.
+        conn.execute_batch(
+            "DROP TABLE shard_counters; DROP TABLE shard_settled; DROP TABLE shard_epochs;",
+        )
+        .expect("drop");
+        conn.execute("PRAGMA user_version = 52", [])
+            .expect("rewind");
+        run_migrations(&conn).expect("v53 must apply on a v52 database");
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        check_shape(&conn, "after migrating a v52 database");
     }
 }
