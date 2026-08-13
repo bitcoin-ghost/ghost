@@ -131,6 +131,36 @@ New `crates/ghost-common/src/share_shard.rs`, reusing `micro_work`, `canonical_s
 - **Sampling verifier (λ = 20)** with `ShardEvidence` broadcast on failure. First thing to cut if
   time runs short — see below.
 
+### Shard settlement does NOT belong on the block-connected path
+
+`settlement.rs` (950 lines) settles at the **tip** and carries reorg reversal through
+`on_block_disconnected` — it has to, because it acts on a block that may still be undone.
+
+The shard settles at **coinbase maturity**, and that difference removes the whole problem rather
+than requiring the machinery to be reused:
+
+- a block 100 deep is past any reorg this code contemplates (`RETENTION_FLOOR_BLOCKS` is also 100),
+  so **there is no reversal to handle** — nothing was settled while it could still be undone;
+- so nothing needs to hook `on_block_connected` at all. The **epoch task already ticks**: it can
+  look back to `tip − 100` and settle any pool block it has not settled yet;
+- idempotence comes from recording which block hashes have been settled, not from transaction
+  gymnastics on a hot path.
+
+So the wiring is a lookback in the task that already exists, not a change to the tip path. Reuse
+`settlement.rs`'s **coinbase parsing** (it already extracts mined outputs and fixed the
+internal-vs-display hash-order trap, and #601's credit-from-*mined*-outputs correction lives there)
+— but not its lifecycle.
+
+⚠ Two things to get right when it is built:
+
+1. **Convert with `discharged_micro_work`.** `settled` is micro-work and the coinbase pays satoshis;
+   the rate is `top_work / pool_sats` from the paying node's view. See §4.6 — this is
+   deterministic-given-a-table, not identical across nodes, and that is fine because `owed` is
+   signed.
+2. **`won_blocks` is empty — this path has never once run in production.** Whatever ships will be
+   exercised for the first time by a real block carrying real money. Rehearse it on regtest, and
+   treat a first live settlement as an event to watch rather than a step that completed.
+
 ### Where the epoch task actually goes (surveyed 2026-08-13, read from the code)
 
 This is the wiring that is deliberately **not** delegated — it is where this project has historically
