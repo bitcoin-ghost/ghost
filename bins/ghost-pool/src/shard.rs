@@ -879,6 +879,10 @@ mod tests {
         db.set_encryption_key([0x42u8; 32]);
         let rt =
             ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), false, true).expect("load");
+        // Fixtures that stamp the payout tag are only OURS if its id resolves to a proposal we
+        // hold — tag presence alone is a sibling deployment's block. Seeded here so the tagged
+        // fixtures mean what they read as; the foreign-block test stamps no tag and is unaffected.
+        seed_owning_proposal(&db);
         (identity, db, rt)
     }
 
@@ -1357,6 +1361,19 @@ mod tests {
     const ADDR_B: &str = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3";
 
     /// A coinbase scriptSig carrying our payout tag: BIP34 height push, tag, pool text.
+    /// Seed a payout proposal this node holds, whose hash prefix matches [`tagged_scriptsig`].
+    ///
+    /// Ownership is not "the block carries a GHPP tag" — that only says *some* Ghost deployment
+    /// mined it. It is "the tag's payout id resolves to a proposal WE hold". A fixture that stamps
+    /// a tag without seeding the proposal is a foreign block, and settling it would discharge our
+    /// miners against money this pool never received.
+    fn seed_owning_proposal(db: &Database) {
+        let mut hash = [0u8; 32];
+        hash[..16].copy_from_slice(&[0xAB; 16]);
+        db.store_payout_proposal(&hash, 1, 600, "{}")
+            .expect("seed the proposal that makes the tagged fixtures ours");
+    }
+
     fn tagged_scriptsig() -> Vec<u8> {
         let mut s = vec![0x03, 0x40, 0x1f, 0x0e];
         s.extend_from_slice(&ghost_common::coinbase_tags::encode_payout_tag(&[0xAB; 16]));
