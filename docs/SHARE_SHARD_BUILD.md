@@ -145,7 +145,9 @@ not a binary big-bang. That is what removes the need for a height gate *and* the
    defensible split. After the flip, the tip−6 propose loop and the GHOST-03 sweep switch off behind
    the same flag. *(The sweep has no config switch today; adding one is part of Stage 1.)*
 7. **Quarantine history, do not destroy it.** Rename `shares` to `shares_archive` and stop writing
-   payable state to it.
+   payable state to it. ⚠ **`shard_fold_epoch` deletes evidence from `shares`** — Stage 1 defines no
+   separate node-shard table, so the fold's DELETE target must move with the rename in the same
+   change, or evidence stops being collected the moment the table is renamed.
 
 **Rollback:** before step 6, per node — restore the `.bak` binary and flag off; the old machinery
 never stopped. After step 6 — flip the source and the loops back on; the old ledger resumes where it
