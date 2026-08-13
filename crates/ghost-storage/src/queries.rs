@@ -48,6 +48,22 @@ fn to_hash32(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The fold's input for one epoch, plus what was screened away on the way — see
+/// [`Database::shard_epoch_shares`].
+///
+/// The counts exist because a filter that cannot be observed cannot be trusted: sub-tier shares
+/// are expected and merely tallied, while an undecodable proof is an anomaly the caller should
+/// say out loud rather than fold past.
+#[derive(Debug, Clone)]
+pub struct ShardFoldInput {
+    /// Eligible network-tier proofs, ready to fold and to commit under the summary's Merkle root.
+    pub shares: Vec<ghost_common::types::ShareProof>,
+    /// Rows whose proof carried no tier or a tier below the network floor — local-only work.
+    pub below_tier: usize,
+    /// Rows whose proof blob would not deserialise. Damaged data, never silently dropped.
+    pub undecodable: usize,
+}
+
 /// Exactly what a settlement applied — or, from `reverse_settlement`, exactly what it undid.
 ///
 /// Recorded rather than recomputed so a reorg inverts the original amounts. By the time a reorg
@@ -636,6 +652,92 @@ impl Database {
             }
             Ok((proofs, unservable, truncated))
         })
+    }
+
+    /// Shares eligible for one epoch's shard fold (`SHARE_SHARD.md` §4.3, build Stage 3), read
+    /// from the persisted `shares` table — NEVER from an in-memory accumulator, which is how the
+    /// prior design lost 6,499 pending shares on a restart.
+    ///
+    /// A share belongs to the epoch of the height its round was mined against:
+    ///
+    /// ```text
+    ///    epoch(share) = epoch_for_height( rounds[share.round_id].block_height )
+    /// ```
+    ///
+    /// That is the settled binding (decision 2026-08-13): `rounds.block_height` is stamped at
+    /// every rotation, is `NOT NULL` and indexed, and it is the same era key the tier gate judges
+    /// by. The share's own `timestamp` is deliberately NOT consulted — a wall-clock key is what
+    /// made the old sweep's summaries incomparable in principle (§12.2).
+    ///
+    /// Eligibility, all load-bearing:
+    /// - `received_by` = this node. A node folds only what it received; folding a gossiped share
+    ///   would credit the same work twice the moment its receiver's summary is also merged.
+    /// - `valid = 1` — invalid shares are evidence of nothing.
+    /// - a stored proof, because the fold's input IS the `ShareProof` (payout address and tier
+    ///   live inside it, and the share hash under the summary's Merkle root comes from it).
+    /// - network tier only: `tier_log2 >= min_tier_log2`. Sub-tier and pre-tier-gate shares stay
+    ///   local for vardiff and stats; they never enter the shared shard (§4.2).
+    ///
+    /// The tier filter runs here in Rust rather than in SQL because `tier_log2` lives inside the
+    /// proof JSON, and the proof has to be deserialised anyway to be returned — one decode, one
+    /// spelling of the predicate, no reliance on SQLite's JSON support.
+    ///
+    /// Bounded by construction: one epoch spans `epoch_blocks` heights, so the join walks
+    /// `idx_rounds_height` to a handful of rounds and `idx_shares_round` to their shares.
+    pub fn shard_epoch_shares(
+        &self,
+        epoch: u64,
+        epoch_blocks: std::num::NonZeroU64,
+        received_by: &str,
+        min_tier_log2: u32,
+    ) -> GhostResult<ShardFoldInput> {
+        let lo = epoch.saturating_mul(epoch_blocks.get());
+        let hi = lo.saturating_add(epoch_blocks.get() - 1);
+
+        let blobs: Vec<Vec<u8>> = self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.proof FROM shares s
+                     JOIN rounds r ON r.round_id = s.round_id
+                     WHERE r.block_height >= ?1 AND r.block_height <= ?2
+                       AND s.received_by = ?3
+                       AND s.valid = 1
+                       AND s.proof IS NOT NULL AND length(s.proof) > 0
+                     ORDER BY s.id",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![lo as i64, hi as i64, received_by], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| GhostError::Database(e.to_string()))?);
+            }
+            Ok(out)
+        })?;
+
+        let mut input = ShardFoldInput {
+            shares: Vec::new(),
+            below_tier: 0,
+            undecodable: 0,
+        };
+        for blob in blobs {
+            match serde_json::from_slice::<ghost_common::types::ShareProof>(&blob) {
+                // An absent tier is a pre-gate share: it committed to no tier before the hash
+                // existed, so there is no `2^tier_log2` to credit and it cannot be network tier.
+                Ok(proof) => match proof.tier_log2 {
+                    Some(t) if t >= min_tier_log2 => input.shares.push(proof),
+                    _ => input.below_tier += 1,
+                },
+                // Counted, not silently skipped and not fatal: one damaged blob must neither
+                // vanish invisibly nor wedge the epoch's fold forever. The caller decides how
+                // loudly to say it.
+                Err(_) => input.undecodable += 1,
+            }
+        }
+        Ok(input)
     }
 
     /// Export every unpaid share, with its miner's payout address DECRYPTED.
@@ -12749,6 +12851,147 @@ mod tests {
         // An empty table derives nothing rather than something.
         let empty = Database::in_memory().unwrap();
         assert_eq!(empty.first_round_at_or_above_height(0).unwrap(), None);
+    }
+
+    /// A round at an explicit height — the shard fold binds shares to epochs through this.
+    fn shard_round(round_id: u64, block_height: u64) -> RoundRecord {
+        RoundRecord {
+            round_id,
+            block_height,
+            block_hash: None,
+            start_time: 1_000,
+            end_time: None,
+            total_shares: 0,
+            total_work: 0.0,
+            winning_miner: None,
+            found_by_node: None,
+            payout_status: PayoutStatus::Active,
+            subsidy_sats: None,
+            tx_fees_sats: None,
+        }
+    }
+
+    /// A share row plus its proof blob, the way ingest stores them: hex `share_hash` in the row,
+    /// canonical `ShareProof` JSON in `proof`, with the tier and payout address inside the proof.
+    fn shard_share(
+        round_id: u64,
+        hash_byte: u8,
+        tier: Option<u32>,
+        received_by: &str,
+        valid: bool,
+        timestamp: i64,
+    ) -> (ShareRecord, Vec<u8>) {
+        let proof = ghost_common::types::ShareProof {
+            round_id,
+            miner_id: [7u8; 32],
+            difficulty: 2.0,
+            work: 2.0,
+            share_hash: [hash_byte; 32],
+            timestamp: timestamp as u64,
+            received_by: [0u8; 32],
+            template_id: None,
+            payout_address: Some("bc1qshard".to_string()),
+            header: None,
+            tier_log2: tier,
+            signature: None,
+        };
+        let record = ShareRecord {
+            id: None,
+            round_id,
+            miner_id: "shardminer".to_string(),
+            difficulty: 2.0,
+            work: 2.0,
+            share_hash: hex::encode([hash_byte; 32]),
+            timestamp,
+            received_by: received_by.to_string(),
+            valid,
+        };
+        let blob = serde_json::to_vec(&proof).expect("proof serialises");
+        (record, blob)
+    }
+
+    /// Which share hashes an epoch query returned, as their leading bytes.
+    fn returned_bytes(input: &crate::queries::ShardFoldInput) -> Vec<u8> {
+        let mut v: Vec<u8> = input.shares.iter().map(|s| s.share_hash[0]).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The shard fold's eligibility filters, each with a row that fails ONLY that filter: a
+    /// gossiped share (peer `received_by`), an invalid share, a sub-tier share, a pre-tier-gate
+    /// share, a proofless row and a damaged blob. Folding any of them is a money bug — a peer's
+    /// share double-credits once its receiver's summary merges, and sub-tier work is local by
+    /// design (§4.2) — so each must be excluded for its own reason, visibly where it matters.
+    #[test]
+    fn shard_epoch_shares_folds_only_own_valid_network_tier_shares() {
+        let db = Database::in_memory().unwrap();
+        let blocks = std::num::NonZeroU64::new(6).unwrap();
+        // Epoch 100 spans heights 600..=605.
+        db.create_round(&shard_round(1, 602)).unwrap();
+
+        let ours = "aabbccdd00112233";
+        for (record, blob) in [
+            shard_share(1, 0xA1, Some(12), ours, true, 50), // eligible
+            shard_share(1, 0xA2, Some(10), ours, true, 51), // eligible, exactly at the floor
+            shard_share(1, 0xB1, Some(12), "eeff001122334455", true, 52), // peer's — theirs to fold
+            shard_share(1, 0xB2, Some(12), ours, false, 53), // invalid
+            shard_share(1, 0xB3, Some(9), ours, true, 54),  // below the network tier
+            shard_share(1, 0xB4, None, ours, true, 55),     // pre-gate: committed to no tier
+        ] {
+            db.insert_share_with_proof(&record, &blob).unwrap();
+        }
+        // A proofless row (pre-v41 shape): nothing to fold, nothing to put under the root.
+        let (proofless, _) = shard_share(1, 0xB5, Some(12), ours, true, 56);
+        db.insert_share(&proofless).unwrap();
+        // A damaged blob: counted, never silently dropped, never fatal.
+        let (damaged, _) = shard_share(1, 0xB6, Some(12), ours, true, 57);
+        db.insert_share_with_proof(&damaged, b"not a proof").unwrap();
+
+        let input = db.shard_epoch_shares(100, blocks, ours, 10).unwrap();
+        assert_eq!(
+            returned_bytes(&input),
+            vec![0xA1, 0xA2],
+            "exactly the own-received, valid, network-tier, provable shares"
+        );
+        assert_eq!(input.below_tier, 2, "sub-tier and pre-gate shares are tallied");
+        assert_eq!(input.undecodable, 1, "a damaged blob is counted out loud");
+    }
+
+    /// The share→epoch binding is the round's recorded HEIGHT, never the share's timestamp
+    /// (§12.2 — a wall-clock key made the old sweep's summaries incomparable in principle).
+    /// Timestamps here are adversarial: every share's clock disagrees with its round's epoch, so
+    /// any timestamp-shaped selection picks the wrong rows. Both edges of the range are exercised
+    /// on adjacent rounds one height apart.
+    #[test]
+    fn shard_epoch_shares_binds_by_round_height_not_timestamp() {
+        let db = Database::in_memory().unwrap();
+        let blocks = std::num::NonZeroU64::new(6).unwrap();
+        let ours = "aabbccdd00112233";
+
+        db.create_round(&shard_round(1, 599)).unwrap(); // last height of epoch 99
+        db.create_round(&shard_round(2, 600)).unwrap(); // first height of epoch 100
+        db.create_round(&shard_round(3, 605)).unwrap(); // last height of epoch 100
+        db.create_round(&shard_round(4, 606)).unwrap(); // first height of epoch 101
+
+        for (record, blob) in [
+            shard_share(1, 0x99, Some(12), ours, true, 600), // ts says epoch 100; round says 99
+            shard_share(2, 0xAA, Some(12), ours, true, 9_999),
+            shard_share(3, 0xAB, Some(12), ours, true, 1),
+            shard_share(4, 0xCC, Some(12), ours, true, 603), // ts says epoch 100; round says 101
+        ] {
+            db.insert_share_with_proof(&record, &blob).unwrap();
+        }
+
+        let e99 = db.shard_epoch_shares(99, blocks, ours, 10).unwrap();
+        let e100 = db.shard_epoch_shares(100, blocks, ours, 10).unwrap();
+        let e101 = db.shard_epoch_shares(101, blocks, ours, 10).unwrap();
+        assert_eq!(returned_bytes(&e99), vec![0x99]);
+        assert_eq!(
+            returned_bytes(&e100),
+            vec![0xAA, 0xAB],
+            "both edges of the height range belong to the epoch, whatever their clocks say"
+        );
+        assert_eq!(returned_bytes(&e101), vec![0xCC]);
     }
 
     /// A PAID share older than the retention window is pruned (harmless audit
