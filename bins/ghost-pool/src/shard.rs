@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use ghost_common::coinbase_tags::extract_payout_tag;
 use ghost_common::error::{GhostError, GhostResult};
@@ -84,6 +84,14 @@ const MAX_SETTLES_PER_CALL: usize = 4;
 /// costs a `getblockhash` and a coinbase fetch); anything further behind carries to the next
 /// call, exactly as the legacy forward scan batches its own catch-up.
 const MAX_SETTLE_SCAN_BLOCKS: u64 = 100;
+
+/// How many consecutive calls may fail to read the same height before it is abandoned.
+///
+/// A transient RPC hiccup must not skip a block — a skipped POOL block is work never discharged,
+/// paid twice later. But a DURABLY unreadable height must not wedge the walk for ever either: the
+/// cursor would never advance past it and every later block would go unsettled, which is the same
+/// loss multiplied by every block after it. So: retry a few times, then step over it loudly.
+const MAX_BLOCK_READ_ATTEMPTS: u32 = 3;
 
 /// kv key holding the height the maturity lookback has reached.
 ///
@@ -185,6 +193,14 @@ pub struct SettleReport {
     pub settled: Vec<BlockSettlement>,
     /// Blocks examined that carry no payout tag.
     pub not_ours: usize,
+    /// The height the walk could not read, if it stopped early. **A stall must be visible**: a
+    /// settlement that has silently stopped looks exactly like one with nothing to do, and the
+    /// difference is unpaid work accruing behind a cursor that never moves.
+    pub stalled_at: Option<u64>,
+    /// Heights abandoned as durably unreadable after [`MAX_BLOCK_READ_ATTEMPTS`]. Skipping is the
+    /// lesser evil — one block's payments undischarged beats every later block never settling —
+    /// but it is never silent.
+    pub skipped_unreadable: Vec<u64>,
     /// Pool blocks found already settled (a rewound cursor — harmless).
     pub already_settled: usize,
     /// Blocks handed to this call but left for the next one by the per-call bound. Non-zero
@@ -253,6 +269,10 @@ pub struct ShardRuntime {
     /// it. In-memory only: the durable truth is the summary rows the fold writes, from which a
     /// restart re-derives this — state that can be derived is state that cannot drift.
     next_fold: Mutex<Option<u64>>,
+    /// The height the walk last failed to read, and how many consecutive calls have failed on it.
+    /// In memory only: a restart is itself a reason to retry, and persisting a give-up decision
+    /// would outlive the condition that caused it.
+    read_failures: Mutex<Option<(u64, u32)>>,
     /// The last epoch [`ShardRuntime::note_height`] saw, stored as `epoch + 1` so zero can mean
     /// "never" (an epoch is `height / EPOCH_BLOCKS`, so `+ 1` cannot wrap). Atomic because it is
     /// read on the template-refresh path, which must never wait on a fold in progress.
@@ -290,6 +310,7 @@ impl ShardRuntime {
             received_by,
             solo,
             owns_evidence,
+            read_failures: Mutex::new(None),
             table: Mutex::new(table),
             next_fold: Mutex::new(None),
             last_epoch_seen: AtomicU64::new(0),
@@ -614,31 +635,83 @@ impl ShardRuntime {
             return Ok(SettleReport::default());
         };
 
+        // Three outcomes, not one. A read failure used to `break` unconditionally, which meant a
+        // DURABLY unreadable height wedged the walk for ever: the cursor never advanced past it and
+        // every later block went unsettled — one block's loss multiplied by every block after it.
+        // Retrying for ever is not the alternative either, because a transient hiccup must not skip
+        // a pool block. So: retry a bounded number of times, then step over it loudly.
         let mut blocks = Vec::new();
+        let mut stalled_at = None;
+        let mut skipped_unreadable = Vec::new();
         for height in from..=to {
-            let hash = match rpc.get_block_hash(height).await {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(height, error = %e, "share shard: settlement stopped at an unreadable \
-                          block hash — resuming next call");
-                    break;
-                }
+            let read = match rpc.get_block_hash(height).await {
+                Ok(hash) => crate::settlement::fetch_coinbase_parts(rpc, &hash)
+                    .await
+                    .map(|(scriptsig, outputs)| FetchedCoinbase {
+                        block_hash: hash,
+                        height,
+                        scriptsig,
+                        outputs,
+                    }),
+                Err(e) => Err(e),
             };
-            match crate::settlement::fetch_coinbase_parts(rpc, &hash).await {
-                Ok((scriptsig, outputs)) => blocks.push(FetchedCoinbase {
-                    block_hash: hash,
-                    height,
-                    scriptsig,
-                    outputs,
-                }),
+            match read {
+                Ok(fetched) => {
+                    *self.read_failures.lock() = None;
+                    blocks.push(fetched);
+                }
                 Err(e) => {
-                    warn!(height, error = %e, "share shard: settlement stopped at an unreadable \
-                          coinbase — resuming next call");
+                    let attempts = {
+                        let mut f = self.read_failures.lock();
+                        let n = match *f {
+                            Some((h, n)) if h == height => n + 1,
+                            _ => 1,
+                        };
+                        *f = Some((height, n));
+                        n
+                    };
+                    if attempts >= MAX_BLOCK_READ_ATTEMPTS {
+                        error!(
+                            height,
+                            attempts,
+                            error = %e,
+                            "share shard: block is durably unreadable — SKIPPING it so settlement \
+                             can continue. Its payments discharge nothing and that work stays owed"
+                        );
+                        skipped_unreadable.push(height);
+                        *self.read_failures.lock() = None;
+                        continue;
+                    }
+                    warn!(
+                        height,
+                        attempts,
+                        error = %e,
+                        "share shard: settlement stalled on an unreadable block — retrying next call"
+                    );
+                    stalled_at = Some(height);
                     break;
                 }
             }
         }
-        self.settle_fetched(tip_height, &blocks)
+
+        let mut report = self.settle_fetched(tip_height, &blocks)?;
+        report.stalled_at = stalled_at;
+
+        // Guarantee forward progress past a skipped height. `settle_fetched` advances the cursor
+        // only past blocks it processed, so a skip at the END of a batch would otherwise be
+        // retried for ever and the walk would never move.
+        if let Some(&highest) = skipped_unreadable.iter().max() {
+            let cursor: u64 = self
+                .db
+                .kv_get(SETTLE_CURSOR_KEY)?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if highest > cursor {
+                self.db.kv_set(SETTLE_CURSOR_KEY, &highest.to_string())?;
+            }
+        }
+        report.skipped_unreadable = skipped_unreadable;
+        Ok(report)
     }
 
     /// The height range the next settlement call should examine, or `None` if there is nothing
@@ -651,14 +724,27 @@ impl ShardRuntime {
         if mature == 0 {
             return Ok(None);
         }
-        let cursor: Option<u64> = self
-            .db
-            .kv_get(SETTLE_CURSOR_KEY)?
-            .and_then(|v| v.parse().ok());
+        // ABSENT and UNPARSEABLE are different facts and must not share a branch. Absent is a
+        // first run, and fast-forwarding to today's boundary is right: history that matured before
+        // the shard existed belongs to the legacy ledger. Unparseable is CORRUPTION of a cursor
+        // that once had a value — fast-forwarding there silently skips every pool block between
+        // the real position and now, and unpaid work is exactly what nobody notices.
+        let raw = self.db.kv_get(SETTLE_CURSOR_KEY)?;
+        let cursor: Option<u64> = match raw.as_deref() {
+            None => None,
+            Some(v) => match v.parse() {
+                Ok(h) => Some(h),
+                Err(_) => {
+                    error!(
+                        value = %v,
+                        "share shard: settle cursor is unreadable — refusing to fast-forward past \
+                         blocks that may be unsettled. Settlement is HALTED until it is repaired"
+                    );
+                    return Ok(None);
+                }
+            },
+        };
         let Some(cursor) = cursor else {
-            // No cursor (first run, or an unreadable value): start observing from today's
-            // maturity boundary. Overlap from a rewound cursor is harmless either way — the
-            // recorded block hashes are the idempotence, not this.
             self.db.kv_set(SETTLE_CURSOR_KEY, &mature.to_string())?;
             return Ok(None);
         };
@@ -1663,6 +1749,36 @@ mod tests {
 
     /// A block without our tag discharges nothing and is not recorded — every block anyone
     /// mines passes through this path, and the common case must leave no trace at all.
+    #[test]
+    fn a_corrupt_cursor_halts_rather_than_fast_forwarding_past_unsettled_blocks() {
+        // ABSENT and UNPARSEABLE shared a branch, and the difference is unpaid work. Absent is a
+        // first run: fast-forwarding to today's boundary is correct, because history that matured
+        // before the shard existed belongs to the legacy ledger. Unparseable is corruption of a
+        // cursor that HAD a position — fast-forwarding there skips every pool block between the
+        // real position and now, discharges nothing for them, and says nothing.
+        let (_identity, db, rt) = runtime();
+        let tip = 10_000u64;
+
+        // Absent: initialise, settle nothing this call, and leave a usable cursor behind.
+        assert_eq!(rt.settle_window(tip).expect("absent"), None);
+        let initialised = db.kv_get(SETTLE_CURSOR_KEY).expect("get").expect("set");
+        assert_eq!(initialised, (tip - COINBASE_MATURITY).to_string());
+
+        // Corrupt: refuse to run at all. Halting is loud and recoverable; fast-forwarding is
+        // silent and is not.
+        db.kv_set(SETTLE_CURSOR_KEY, "not-a-height").expect("corrupt");
+        assert_eq!(
+            rt.settle_window(tip).expect("corrupt"),
+            None,
+            "a corrupt cursor must halt settlement"
+        );
+        assert_eq!(
+            db.kv_get(SETTLE_CURSOR_KEY).expect("get").as_deref(),
+            Some("not-a-height"),
+            "and must NOT be overwritten with a fast-forward that hides what was skipped"
+        );
+    }
+
     #[test]
     fn a_tiny_payment_cannot_clear_a_large_balance() {
         // The bug this pins was self-normalisation: with `pool_sats` and `top_work` both summed

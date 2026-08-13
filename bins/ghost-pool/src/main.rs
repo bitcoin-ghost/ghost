@@ -4090,6 +4090,18 @@ async fn main() -> Result<()> {
                 // must NEVER move to the block-connected or template-refresh paths — those must
                 // stay sub-second at a tip change. Bounded per call; a backlog resumes next tick.
                 match rt.settle_matured(&rpc_c, tip).await {
+                    // A STALL must be louder than a success, and must not depend on whether
+                    // anything happened to settle. Logging only the non-empty case meant a node
+                    // whose cursor had stopped moving looked exactly like one with nothing to do —
+                    // and the difference between those two is unpaid work piling up unnoticed.
+                    Ok(r) if r.stalled_at.is_some() || !r.skipped_unreadable.is_empty() => warn!(
+                        tip,
+                        stalled_at = ?r.stalled_at,
+                        skipped = ?r.skipped_unreadable,
+                        settled = r.settled.len(),
+                        deferred = r.deferred,
+                        "shard: settlement did NOT complete its window"
+                    ),
                     Ok(r) if !r.settled.is_empty() => info!(
                         tip,
                         blocks = r.settled.len(),
