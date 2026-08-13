@@ -4050,12 +4050,35 @@ async fn main() -> Result<()> {
                     Err(_) => continue,
                 };
                 match rt.tick(tip) {
-                    Ok(report) if !report.folded.is_empty() => info!(
-                        tip,
-                        folded = report.folded.len(),
-                        remaining = report.remaining,
-                        "shard: folded closed epochs"
-                    ),
+                    Ok(report) if !report.folded.is_empty() => {
+                        info!(
+                            tip,
+                            folded = report.folded.len(),
+                            remaining = report.remaining,
+                            "shard: folded closed epochs"
+                        );
+
+                        // The soak signal, run ONCE PER EPOCH because a fold happens once per
+                        // epoch — never on the tick itself. It scans the legacy unpaid ledger,
+                        // which is the ~1.6 s query already running at ~40% duty on the propose
+                        // and vote paths; hourly it is lost in the noise, every 30 s it would
+                        // rebuild the load this design exists to remove.
+                        match rt.drift_against_legacy_ledger(chrono::Utc::now().timestamp()) {
+                            Ok(d) if d.is_clean() => info!(
+                                agreeing = d.agreeing,
+                                "shard: balances agree with the legacy ledger exactly"
+                            ),
+                            Ok(d) => warn!(
+                                agreeing = d.agreeing,
+                                differing = d.differing.len(),
+                                only_shard = d.only_shard.len(),
+                                only_ledger = d.only_ledger.len(),
+                                net_micro = d.net_micro,
+                                "shard: DRIFT against the legacy ledger"
+                            ),
+                            Err(e) => warn!(error = %e, "shard: drift comparison failed"),
+                        }
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         warn!(error = %e, tip, "shard: epoch tick failed — retrying next tick")
