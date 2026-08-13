@@ -2424,6 +2424,20 @@ pub struct PoolConfig {
     /// See `docs/archive/SHARE_BATCH_CHAIN.md`.
     #[serde(default)]
     pub share_batch_shadow: bool,
+    /// Run the network shard: fold this node's own network-tier shares into its counter column
+    /// each epoch, and persist the result.
+    ///
+    /// A config flag rather than a height gate, for the same reason as `share_batch_shadow` above
+    /// and for one more: gates exist so that shares already in the ledger stay valid across a rule
+    /// change, and the shard is seeded from a snapshot with no history behind it, so there is
+    /// nothing to activate around. A flag is also safe one node at a time, which is what makes a
+    /// canary mean anything.
+    ///
+    /// Dark by default: deploying the binary must not by itself start folding.
+    ///
+    /// See `docs/SHARE_SHARD.md`.
+    #[serde(default)]
+    pub share_shard: bool,
     /// Payout address for node rewards (5-4-3-2-1 capability shares)
     /// Broadcast in health pings so peers know where to send node reward payouts.
     /// Must be a valid bech32 address for the configured network.
@@ -2511,6 +2525,8 @@ impl Default for PoolConfig {
             payout_interval_blocks: 100,
             // Dark by default: deploying the binary must not start batch traffic.
             share_batch_shadow: false,
+            // Same rule: deploying the binary must not by itself start folding.
+            share_shard: false,
             node_payout_address: None,
             pool_name: None,
             coinbase_extra: None,
