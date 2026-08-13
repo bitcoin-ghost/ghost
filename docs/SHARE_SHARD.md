@@ -190,6 +190,17 @@ evidence would accumulate for ever and rebuild the O(shares) ledger this design 
 dropping it at summarisation instead would leave nothing for §6 to sample, so no peer could ever
 verify anyone.
 
+⚠ **Expiry must be publicly computable, or dropping old evidence looks like refusing to answer.**
+Because epochs are keyed to block height, any node derives the retention boundary from the chain it
+already holds — so "that epoch is past retention" is a fact both sides compute independently, not a
+claim one side makes. A requester should not ask beyond the boundary, and silence beyond it is
+**expected, never suspicious**.
+
+Get this wrong and an honest node that correctly dropped expired evidence is indistinguishable on the
+wire from one refusing to be audited — which turns a retention policy into a false-accusation engine.
+`RETENTION_EPOCHS` must therefore exceed the sampling window by a **stated margin**, so anything an
+honest requester could reasonably ask for is still held.
+
 **Network shard** (everyone's, permanent-until-rebase). Unpaid work per payout address. A few hundred
 rows. Never holds a share.
 
@@ -352,6 +363,13 @@ duplicate, stale and out-of-order delivery are all harmless.
 | random leaves pulled against the epoch's merkle root, each checked for PoW + GHOST-09 + binding | yes |
 
 20 random samples catch a node faking half its work with probability ~10⁻⁶.
+
+**A sample may be answered in parts.** A worst case of λ cap-sized shares does not fit one message
+(measured: ~17 guaranteed, against λ=20), so a subset response plus follow-ups is the contract, and
+unanswered indices are surfaced rather than forgiven. **Leaf selection must be unpredictable to the
+node being sampled** — derived from entropy the requester draws privately — or it precomputes which
+leaves to keep honest. Deriving the seed from anything the responder can compute (the summary hash,
+chain data, a fixed per-node seed) defeats the whole mechanism.
 
 ⚠ **`total_micro` is not statelessly verifiable.** One epoch's evidence proves its delta, not the
 running total. A peer holding a node's *consecutive* summaries can check the chain; a peer joining
