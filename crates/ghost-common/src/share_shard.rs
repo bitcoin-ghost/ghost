@@ -290,6 +290,12 @@ pub enum SummaryRejection {
     /// equality — a tolerance here would be an admission the mechanism cannot converge (§12.5).
     #[error("per-address deltas do not match the evidence fold")]
     DeltaMismatch,
+    /// The summary is for an epoch below the pre-genesis floor.
+    ///
+    /// Not a fault: the work it carries is already in the genesis column, so merging it would
+    /// double-count. Expected during the rolling cutover, from peers not yet armed.
+    #[error("summary is for a pre-genesis epoch, below the arming floor")]
+    PreGenesisEpoch,
     /// The summary claims [`GENESIS_NODE_ID`], the reserved opening-balance column.
     ///
     /// Checked before the signature, because the point is that no signature should make this
@@ -547,6 +553,19 @@ pub const GENESIS_NODE_ID: NodeId = [0u8; 32];
 pub struct ShardTable {
     accrued: AccruedColumns,
     settled: BTreeMap<String, i64>,
+    /// Epochs strictly below this are pre-genesis and are refused (0 = no floor, the pre-ceremony
+    /// state and every start until arming).
+    ///
+    /// Set at arming from the pinned anchor's height, so it is chain-derived and identical on
+    /// every node with nothing negotiated. It exists because the Stage 4 soak accrues each node's
+    /// own work into its own column *before* the ceremony, and genesis then credits that same work
+    /// again for the whole fleet — so without a floor the overlap is counted twice, and resetting
+    /// the column cannot fix it because a not-yet-armed peer re-advertises the higher value and
+    /// wins the max.
+    ///
+    /// Refusing these epochs does not break "a missing message makes you behind, never wrong":
+    /// they are pre-genesis, so everything they carry is already in the genesis column.
+    epoch_floor: u64,
 }
 
 impl ShardTable {
@@ -618,6 +637,57 @@ impl ShardTable {
             *entry = entry.saturating_sub(paid);
         }
         owed
+    }
+
+    /// The pre-genesis epoch floor. Zero means unarmed: every epoch is acceptable.
+    pub fn epoch_floor(&self) -> u64 {
+        self.epoch_floor
+    }
+
+    /// Arm the floor. Derived from the pinned anchor height, never from a peer or a clock.
+    pub fn set_epoch_floor(&mut self, floor: u64) {
+        self.epoch_floor = floor;
+    }
+
+    /// Merge a summary's totals into its node's column — the gossip path, floor enforced.
+    ///
+    /// The caller has already verified structure, signature and the node's own summary chain; what
+    /// is left is "does this epoch belong to the ledger we are now running". Kept here rather than
+    /// spelled in the handler so the floor cannot be bypassed by a second call site, which is how
+    /// two spellings of one predicate start.
+    ///
+    /// Zero totals are skipped: absence IS zero in the canonical form, and merging one could only
+    /// create a dead cell that splits the table root.
+    pub fn merge_verified_summary(
+        &mut self,
+        summary: &EpochSummary,
+    ) -> Result<(), SummaryRejection> {
+        if summary.epoch < self.epoch_floor {
+            return Err(SummaryRejection::PreGenesisEpoch);
+        }
+        let column: BTreeMap<String, i64> = summary
+            .deltas
+            .iter()
+            .filter(|(_, row)| row.total_micro > 0)
+            .map(|(addr, row)| (addr.clone(), row.total_micro))
+            .collect();
+        let mut one = AccruedColumns::new();
+        one.insert(summary.node_id, column);
+        self.merge_accrued(&one);
+        Ok(())
+    }
+
+    /// Whether a peer's table was opened from the same genesis as ours.
+    ///
+    /// A whole-table sync carries no epoch, so the floor cannot gate it — and it is the path that
+    /// would actually resurrect a not-yet-armed peer's pre-genesis column during the rolling
+    /// cutover. The genesis column itself is the generation marker: identical on every armed node
+    /// by construction, absent on every unarmed one, and already in the payload, so this needs no
+    /// new protocol field.
+    ///
+    /// Both-absent is a match, which keeps every pre-ceremony sync working exactly as it does now.
+    pub fn shares_genesis_with(&self, other: &AccruedColumns) -> bool {
+        self.accrued.get(&GENESIS_NODE_ID) == other.get(&GENESIS_NODE_ID)
     }
 
     /// Install the reserved genesis column — the ONLY writer of [`GENESIS_NODE_ID`].
@@ -693,6 +763,11 @@ impl ShardTable {
         evidence: &[ShareProof],
         merkle_root: MerkleRootFn,
     ) -> Result<(), SummaryRejection> {
+        // Same floor as the gossip path: a pre-genesis epoch's work is already in the genesis
+        // column, and full evidence for it makes it no less of a double count.
+        if summary.epoch < self.epoch_floor {
+            return Err(SummaryRejection::PreGenesisEpoch);
+        }
         summary.verify(evidence, merkle_root)?;
 
         for (addr, row) in &summary.deltas {
@@ -940,6 +1015,93 @@ mod tests {
             "zero and negative cells must not survive into the table"
         );
         assert!(!table.owed().contains_key("bc1qcarol"));
+    }
+
+    /// The double count the floor exists to stop.
+    ///
+    /// The Stage 4 soak accrues a node's own work into its own column. Genesis then credits that
+    /// same work again, for the whole fleet. Without a floor, a not-yet-armed peer re-advertising
+    /// its pre-genesis column wins the max and the overlap is permanent — resetting the column
+    /// locally cannot fix it, because the peer puts it straight back.
+    #[test]
+    fn a_pre_genesis_summary_is_refused_on_both_merge_paths() {
+        let id = identity();
+        let (summary, evidence) = summarise(
+            4,
+            &id,
+            &BTreeMap::new(),
+            vec![share(1_000, 1, "bc1qalice", 1.0)],
+        );
+
+        let mut table = ShardTable::new();
+        table.set_epoch_floor(10);
+        let before = table.compute_table_root();
+
+        assert_eq!(
+            table.merge_verified_summary(&summary),
+            Err(SummaryRejection::PreGenesisEpoch),
+            "gossip path must refuse a pre-genesis epoch"
+        );
+        assert_eq!(
+            table.apply_summary(&summary, &evidence, compute_merkle_root),
+            Err(SummaryRejection::PreGenesisEpoch),
+            "full-evidence path must refuse it too — evidence makes it no less a double count"
+        );
+        assert_eq!(
+            table.compute_table_root(),
+            before,
+            "a refused summary must leave the table byte-identical"
+        );
+    }
+
+    /// The floor must not refuse the epoch it sits on, nor anything after it, nor anything at all
+    /// while unarmed — otherwise arming would quietly stop the shard accruing.
+    #[test]
+    fn the_floor_admits_its_own_epoch_and_everything_after_it() {
+        let id = identity();
+        for (floor, epoch, expect_ok) in [(0u64, 1u64, true), (10, 10, true), (10, 11, true)] {
+            let (summary, _) = summarise(
+                epoch,
+                &id,
+                &BTreeMap::new(),
+                vec![share(1_000, 1, "bc1qalice", 1.0)],
+            );
+            let mut table = ShardTable::new();
+            table.set_epoch_floor(floor);
+            assert_eq!(
+                table.merge_verified_summary(&summary).is_ok(),
+                expect_ok,
+                "floor={floor} epoch={epoch}"
+            );
+        }
+    }
+
+    /// Table sync carries no epoch, so the genesis column is the generation marker.
+    #[test]
+    fn table_sync_matches_only_peers_opened_from_the_same_genesis() {
+        let genesis = BTreeMap::from([("bc1qalice".to_string(), 1_000i64)]);
+
+        let unarmed = ShardTable::new();
+        let mut armed = ShardTable::new();
+        armed.install_genesis(genesis.clone());
+
+        let mut peer_armed = AccruedColumns::new();
+        peer_armed.insert(GENESIS_NODE_ID, genesis.clone());
+        let mut peer_other = AccruedColumns::new();
+        peer_other.insert(
+            GENESIS_NODE_ID,
+            BTreeMap::from([("bc1qalice".to_string(), 999i64)]),
+        );
+        let peer_unarmed = AccruedColumns::new();
+
+        // Both-absent matches, so every pre-ceremony sync keeps working unchanged.
+        assert!(unarmed.shares_genesis_with(&peer_unarmed));
+        assert!(armed.shares_genesis_with(&peer_armed));
+        // The mixed-fleet window, in both directions.
+        assert!(!armed.shares_genesis_with(&peer_unarmed));
+        assert!(!unarmed.shares_genesis_with(&peer_armed));
+        // Same anchor or nothing: a peer armed from different bytes is not a peer.
+        assert!(!armed.shares_genesis_with(&peer_other));
     }
 
     /// Epochs come from block height and an epoch length, nothing else — never wall-clock

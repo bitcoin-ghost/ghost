@@ -165,19 +165,10 @@ pub fn apply_shard_epoch_summary(
         None => {
             verify_summary_stateless(summary, prior_summary)?;
 
-            // Merge the verified totals as one single-node column, per-cell max. Zero totals
-            // are skipped: a zero is represented by absence (the table's canonical-form
-            // invariant), and `merge_accrued` would only skip them again anyway.
-            let column: BTreeMap<String, i64> = summary
-                .deltas
-                .iter()
-                .filter(|(_, row)| row.total_micro > 0)
-                .map(|(addr, row)| (addr.clone(), row.total_micro))
-                .collect();
-            let mut one_column = AccruedColumns::new();
-            one_column.insert(summary.node_id, column);
-            table.merge_accrued(&one_column);
-            Ok(())
+            // The merge itself lives on `ShardTable` so the pre-genesis epoch floor is applied on
+            // exactly one code path rather than re-spelled here — two spellings of one predicate
+            // drift apart, and the drift is silent.
+            table.merge_verified_summary(summary).map_err(Into::into)
         }
     }
 }
@@ -202,6 +193,13 @@ pub enum ShardSyncRejection {
     /// The responder's signature does not verify over the served table and root.
     #[error("signature does not verify against the responding node")]
     BadSignature,
+    /// The peer's table was not opened from the same genesis as ours.
+    ///
+    /// Not misbehaviour — the expected state during the rolling cutover, where an armed node and
+    /// a not-yet-armed one legitimately hold different ledgers. Refusing keeps the armed node from
+    /// max-merging the other's pre-genesis column back in, which no later message could undo.
+    #[error("peer's table has a different genesis column — one side is not yet armed")]
+    GenesisMismatch,
 }
 
 /// What a merged table sync reports back — the §12.6 comparison, made visible.
@@ -311,6 +309,15 @@ pub fn apply_table_sync_response(
     let signed = shard_table_sync_signing_bytes(responding_node, columns, table_root);
     if !verify_signature(responding_node, &signed, &sig).unwrap_or(false) {
         return Err(ShardSyncRejection::BadSignature);
+    }
+
+    // A whole-table sync carries no epoch, so the pre-genesis floor cannot gate it — and this is
+    // the path that would actually resurrect a not-yet-armed peer's pre-genesis column during the
+    // rolling cutover, where a max makes it permanent. The genesis column is the generation
+    // marker: identical on every armed node, absent on every unarmed one, and already in the
+    // payload. Both-absent matches, so every pre-ceremony sync behaves exactly as before.
+    if !table.shares_genesis_with(&accrued) {
+        return Err(ShardSyncRejection::GenesisMismatch);
     }
 
     // Only now is the table touched.
