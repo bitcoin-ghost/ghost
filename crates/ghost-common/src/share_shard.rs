@@ -990,10 +990,7 @@ mod tests {
         );
         // A legitimate peer column in the same message must still land, or the skip would be a
         // denial-of-service dressed as a guard.
-        hostile.insert(
-            [7u8; 32],
-            BTreeMap::from([("bc1qbob".to_string(), 500i64)]),
-        );
+        hostile.insert([7u8; 32], BTreeMap::from([("bc1qbob".to_string(), 500i64)]));
         table.merge_accrued(&hostile);
 
         assert_eq!(
@@ -1059,7 +1056,10 @@ mod tests {
         // canonical "absent == zero" form the table root depends on is preserved.
         table.install_genesis(BTreeMap::new());
         assert!(table.accrued().get(&GENESIS_NODE_ID).is_none());
-        assert_eq!(table.compute_table_root(), ShardTable::new().compute_table_root());
+        assert_eq!(
+            table.compute_table_root(),
+            ShardTable::new().compute_table_root()
+        );
     }
 
     /// The reload path feeds `install_genesis` raw database rows, so it must hold the same
@@ -1272,7 +1272,12 @@ mod tests {
     #[test]
     fn a_summary_without_the_marker_field_decodes_as_unarmed() {
         let id = identity();
-        let (summary, _) = summarise(5, &id, &BTreeMap::new(), vec![share(1_000, 1, "bc1qa", 1.0)]);
+        let (summary, _) = summarise(
+            5,
+            &id,
+            &BTreeMap::new(),
+            vec![share(1_000, 1, "bc1qa", 1.0)],
+        );
         let mut value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
         value.as_object_mut().unwrap().remove("genesis_marker");
@@ -1923,8 +1928,15 @@ mod tests {
         // Same share twice: same hash, double the credit.
         let duplicated = vec![good[0].clone(), good[0].clone()];
         assert_eq!(
-            EpochSummary::build(3, &id, &BTreeMap::new(), &duplicated, compute_merkle_root, None)
-                .err(),
+            EpochSummary::build(
+                3,
+                &id,
+                &BTreeMap::new(),
+                &duplicated,
+                compute_merkle_root,
+                None
+            )
+            .err(),
             Some(SummaryRejection::DuplicateEvidence)
         );
 

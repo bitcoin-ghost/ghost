@@ -113,21 +113,19 @@ pub const ANCHOR_HEIGHT: u64 = 962_008;
 pub const ANCHOR_CUTOFF_TS: i64 = 1_786_453_494;
 
 /// The `ledger_root` the fleet ratified at [`ANCHOR_HEIGHT`] — provenance only, never the gate.
-const ANCHOR_LEDGER_ROOT: &str =
-    "61ae50ab136fcda3e99041cbfc6175e94099db1acfd2abe935c1b67dcd74b93e";
+const ANCHOR_LEDGER_ROOT: &str = "61ae50ab136fcda3e99041cbfc6175e94099db1acfd2abe935c1b67dcd74b93e";
 
 /// SHA-256 of the adopted `canonical_payout` blob — the real fleet-identity check.
 const ANCHOR_CANONICAL_SHA256: &str =
     "a3f7202f8230893fb5c3c5fe7487b36c3e297000aa3c2fcb1c0848cb2bebad62";
 
 /// `compute_table_root` of the opening table this anchor converts to.
-const ANCHOR_TABLE_ROOT: &str =
-    "ecbbd9ec1abdf97a6f8cb8aea384777382fe9727829e533cf06d340564a80c88";
+const ANCHOR_TABLE_ROOT: &str = "ecbbd9ec1abdf97a6f8cb8aea384777382fe9727829e533cf06d340564a80c88";
 
 /// The pinned ceremony anchor.
 ///
 /// Panics only if the constants above are not 32 bytes of hex, which
-/// [`tests::the_pinned_anchor_parses`] makes a build-time failure rather than a runtime one.
+/// `the_pinned_anchor_parses` makes a build-time failure rather than a runtime one.
 pub fn pinned_anchor() -> GenesisAnchor {
     fn h(s: &str) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -215,9 +213,10 @@ pub fn shard_genesis_table(miner_payouts: &[(String, u128)]) -> (ShardTable, Gen
     (table, rounding)
 }
 
-/// The opening balances as a plain column — what [`Database::shard_upsert_column`] persists.
+/// The opening balances as a plain column — what `Database::shard_upsert_column` persists.
 ///
-/// [`Database::shard_upsert_column`]: https://docs.rs/ghost-storage
+/// Not an intra-doc link: `ghost-accounting` does not depend on `ghost-storage`, and the
+/// previous workaround pointed at a docs.rs URL that need not exist for this version.
 pub fn genesis_column(table: &ShardTable) -> BTreeMap<String, i64> {
     table
         .accrued()
@@ -259,8 +258,8 @@ pub fn open_shard_from_checkpoint(
         });
     }
 
-    let (miner_payouts, _node_shares): AdoptedCheckpoint =
-        serde_json::from_slice(canonical_payout).map_err(|e| GenesisError::Undecodable {
+    let (miner_payouts, _node_shares): AdoptedCheckpoint = serde_json::from_slice(canonical_payout)
+        .map_err(|e| GenesisError::Undecodable {
             height: anchor.height,
             detail: e.to_string(),
         })?;
@@ -361,7 +360,6 @@ mod tests {
             ),
         ]
     }
-
 
     /// Pinned opening root for the 962,008 anchor.
     ///
@@ -554,9 +552,12 @@ mod tests {
             table_root: [0xAB; 32],
             ..pinned_anchor()
         };
-        let err = open_shard_from_checkpoint(&blob, &anchor)
-            .expect_err("a moved conversion must refuse");
-        assert!(matches!(err, GenesisError::RootMismatch { .. }), "got {err:?}");
+        let err =
+            open_shard_from_checkpoint(&blob, &anchor).expect_err("a moved conversion must refuse");
+        assert!(
+            matches!(err, GenesisError::RootMismatch { .. }),
+            "got {err:?}"
+        );
     }
 
     /// A dark-mode start has no genesis column at all, and must not be refused.
@@ -675,14 +676,38 @@ mod tests {
     /// The adopted blob exactly as production stores it: `to_vec(&(&miner_payouts, &node_shares))`.
     fn canonical_blob() -> Vec<u8> {
         let node_shares: Vec<([u8; 32], i32)> = vec![
-            (hex_32("46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b"), 6),
-            (hex_32("fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622"), 10),
-            (hex_32("849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c"), 10),
-            (hex_32("e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927"), 10),
-            (hex_32("9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"), 10),
-            (hex_32("5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393"), 6),
-            (hex_32("f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f"), 6),
-            (hex_32("4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132"), 6),
+            (
+                hex_32("46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b"),
+                6,
+            ),
+            (
+                hex_32("fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622"),
+                10,
+            ),
+            (
+                hex_32("849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c"),
+                10,
+            ),
+            (
+                hex_32("e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927"),
+                10,
+            ),
+            (
+                hex_32("9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"),
+                10,
+            ),
+            (
+                hex_32("5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393"),
+                6,
+            ),
+            (
+                hex_32("f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f"),
+                6,
+            ),
+            (
+                hex_32("4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132"),
+                6,
+            ),
         ];
         serde_json::to_vec(&(&ratified_962008(), &node_shares)).expect("encodable")
     }
