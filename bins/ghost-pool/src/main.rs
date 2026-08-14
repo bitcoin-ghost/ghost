@@ -3825,6 +3825,17 @@ async fn main() -> Result<()> {
         None
     };
 
+    // The shard's receive half. Registered only when the shard is enabled, so a dark node puts
+    // no handler on the mesh at all — matching the flag's promise that deploying the binary
+    // starts nothing.
+    if let Some(ref rt) = shard {
+        let h = Arc::new(ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(
+            rt,
+        )));
+        mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+        info!("shard: mesh handler registered");
+    }
+
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
@@ -4036,8 +4047,66 @@ async fn main() -> Result<()> {
     // Skipping costs nothing here because the work is idempotent and driven by height, not by how
     // many times we looked.
     if let Some(ref rt) = shard {
+        // Two handles: one for the relay task, one for the tick task that owns the fold.
+        let rt_publish = Arc::clone(rt);
         let rt = Arc::clone(rt);
         let rpc_c = Arc::clone(&rpc);
+        // Broadcast relay for this node's own summaries. Channel-plus-relay, the same shape the
+        // SBC and checkpoint paths use: the fold holds the storage lock and must never await a
+        // network send while holding it.
+        let (shard_tx, mut shard_rx) =
+            tokio::sync::mpsc::channel::<ghost_common::share_shard::EpochSummary>(64);
+        {
+            let mesh_c = Arc::clone(&mesh);
+            let rt_c = rt_publish;
+            tokio::spawn(async move {
+                while let Some(summary) = shard_rx.recv().await {
+                    let epoch = summary.epoch;
+                    let bytes = match serde_json::to_vec(
+                        &ghost_consensus::message::ShardEpochSummaryMessage { summary },
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, epoch, "shard: summary would not serialise");
+                            continue;
+                        }
+                    };
+                    match mesh_c
+                        .create_envelope_raw(ghost_consensus::MessageType::ShardEpochSummary, bytes)
+                    {
+                        Ok(env) => match mesh_c.broadcast(env).await {
+                            // `broadcast` returns how many peers it reached. ZERO is not success:
+                            // the summary went nowhere, and marking it published would retire the
+                            // only record that it still needs sending. Left pending, it is picked
+                            // up again on a later tick once a peer is reachable.
+                            Ok(0) => {
+                                debug!(epoch, "shard: summary reached no peers — left pending")
+                            }
+                            Ok(peers) => {
+                                // Marked ONLY after the send reached someone — the flag is the sole
+                                // record that an epoch still needs putting on the wire, so marking
+                                // optimistically would lose it silently.
+                                let _ = peers;
+                                match rt_c.mark_broadcast(epoch) {
+                                    Ok(true) => debug!(epoch, peers, "shard: summary broadcast"),
+                                    Ok(false) => warn!(
+                                        epoch,
+                                        "shard: broadcast an epoch with no stored summary row"
+                                    ),
+                                    Err(e) => {
+                                        warn!(error = %e, epoch, "shard: could not mark published")
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, epoch, "shard: broadcast failed — will retry")
+                            }
+                        },
+                        Err(e) => warn!(error = %e, epoch, "shard: envelope failed"),
+                    }
+                }
+            });
+        }
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4057,6 +4126,26 @@ async fn main() -> Result<()> {
                             remaining = report.remaining,
                             "shard: folded closed epochs"
                         );
+
+                        // Hand this node's own unpublished summaries to the relay. Driven from
+                        // the `published` flag rather than from `report`, so a summary folded
+                        // before a restart still reaches the mesh instead of dying with the
+                        // process that folded it. Solo nodes yield nothing here by construction.
+                        match rt.pending_broadcasts(8) {
+                            Ok(pending) => {
+                                for summary in pending {
+                                    if shard_tx.try_send(summary).is_err() {
+                                        // Relay saturated or gone. Not fatal and not lost: the
+                                        // rows stay unpublished and the next fold retries them.
+                                        debug!(
+                                            "shard: broadcast relay busy — summaries stay pending"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "shard: could not read pending summaries"),
+                        }
 
                         // The soak signal, run ONCE PER EPOCH because a fold happens once per
                         // epoch — never on the tick itself. It scans the legacy unpaid ledger,

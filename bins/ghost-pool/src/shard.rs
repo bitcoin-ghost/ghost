@@ -143,6 +143,21 @@ pub enum FoldOutcome {
     Folded(FoldReport),
 }
 
+/// What a gossiped summary did to the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerMergeOutcome {
+    /// Merged into the peer's column; the table root is the §12.6 comparison value.
+    Merged {
+        addresses: usize,
+        table_root: [u8; 32],
+    },
+    /// Our own summary came back to us. Not an error, and not a contribution.
+    OwnEcho,
+    /// Verification refused it. Expected traffic during a rolling cutover (a pre-genesis epoch,
+    /// or a peer running a different genesis), so it is reported rather than treated as a fault.
+    Rejected(String),
+}
+
 /// What arming did — the ceremony's receipt, for the operator's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArmReport {
@@ -518,6 +533,80 @@ impl ShardRuntime {
             opening_addresses,
             table_root: root,
         })
+    }
+
+    /// This node's own summaries still waiting to go on the wire, oldest first.
+    ///
+    /// ⚠ **Solo mode publishes nothing.** A solo node's work is its own (§10); putting its
+    /// summaries on the mesh would fold that work into the shared shard and pay it twice — once
+    /// by the solo node's own coinbase and once by whoever wins from the shared table. The gate
+    /// sits here rather than in the caller for the same reason `tick` and `fold_epoch` carry it:
+    /// one missed call site leaks silently and there is no signal that it happened.
+    pub fn pending_broadcasts(&self, limit: u32) -> GhostResult<Vec<EpochSummary>> {
+        if self.solo {
+            return Ok(Vec::new());
+        }
+        self.db
+            .shard_unpublished_epochs(&self.identity.node_id(), limit)
+    }
+
+    /// Record that a summary reached the mesh, so it is not re-broadcast for ever.
+    ///
+    /// Called only AFTER the broadcast returns Ok. Marking first would lose a summary whose send
+    /// failed, and the flag is the only record that it still needs sending.
+    pub fn mark_broadcast(&self, epoch: u64) -> GhostResult<bool> {
+        self.db
+            .shard_mark_epoch_published(epoch, &self.identity.node_id())
+    }
+
+    /// Merge a peer's verified epoch summary into its own column — the receive half of gossip.
+    ///
+    /// Verification strictly precedes mutation (§12.3): a max cannot be undone, so an unverified
+    /// counter that reaches the table has already won. The chain check needs the peer's PREVIOUS
+    /// summary, which is read from storage; absent, the summary is still admissible — a node
+    /// joining mid-stream cannot have it, and refusing would make "behind" mean "wrong".
+    ///
+    /// On success the peer's column is persisted so the merge survives a restart, and the caller
+    /// gets the table root back for the §12.6 comparison.
+    ///
+    /// The table lock is taken and released here, never held across an await — the handler runs on
+    /// the mesh's task and must not block ingest behind a network round trip.
+    pub fn apply_peer_summary(
+        &self,
+        msg: &ghost_consensus::message::ShardEpochSummaryMessage,
+    ) -> GhostResult<PeerMergeOutcome> {
+        let node = msg.summary.node_id;
+        if node == self.identity.node_id() {
+            // Our own summary echoed back. Merging is harmless (max of equal values) but pointless,
+            // and skipping keeps the counters honest about what gossip actually contributed.
+            return Ok(PeerMergeOutcome::OwnEcho);
+        }
+
+        let prior = self
+            .db
+            .shard_get_epoch(msg.summary.epoch.saturating_sub(1), &node)?;
+
+        let mut table = self.table.lock();
+        match ghost_consensus::shard_handler::apply_shard_epoch_summary(
+            &mut table,
+            msg,
+            prior.as_ref(),
+            None, // gossip path: peers send summaries, not shares
+            compute_merkle_root,
+        ) {
+            Ok(()) => {
+                let column = table.accrued().get(&node).cloned().unwrap_or_default();
+                let root = table.compute_table_root();
+                drop(table);
+                self.db
+                    .shard_upsert_column(&node, &column, msg.summary.epoch)?;
+                Ok(PeerMergeOutcome::Merged {
+                    addresses: column.len(),
+                    table_root: root,
+                })
+            }
+            Err(e) => Ok(PeerMergeOutcome::Rejected(format!("{e}"))),
+        }
     }
 
     /// Compare the shard's balances against the legacy unpaid ledger.

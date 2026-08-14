@@ -519,6 +519,49 @@ impl Database {
         })
     }
 
+    /// This node's OWN summaries that have not yet been broadcast, oldest first.
+    ///
+    /// Drives the gossip relay. Reading from the `published` flag rather than from whatever the
+    /// fold just returned is what makes the broadcast survive a restart: a summary folded and
+    /// persisted but never put on the wire is still pending on the next start, instead of being
+    /// silently lost with the process that folded it.
+    ///
+    /// Bounded by `limit` so a node that has been offline does not try to broadcast a whole
+    /// backlog in one tick — the same lock-fairness reasoning as the fold's bounded batches.
+    pub fn shard_unpublished_epochs(
+        &self,
+        node: &NodeId,
+        limit: u32,
+    ) -> GhostResult<Vec<EpochSummary>> {
+        let rows: Vec<String> = self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT summary_enc FROM shard_epochs \
+                     WHERE node_id = ?1 AND published = 0 ORDER BY epoch ASC LIMIT ?2",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let out = stmt
+                .query_map(params![node.to_vec(), limit as i64], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(out)
+        })?;
+
+        let mut summaries = Vec::with_capacity(rows.len());
+        for enc in rows {
+            // A row that cannot be decrypted or parsed is an ERROR, not a skip: silently dropping
+            // it would leave the epoch permanently unpublished with nothing saying why.
+            let json = self.decrypt_address(&enc)?;
+            summaries.push(serde_json::from_str(&json).map_err(|e| {
+                GhostError::Database(format!("stored epoch summary does not parse: {e}"))
+            })?);
+        }
+        Ok(summaries)
+    }
+
     /// Mark an epoch's summary as having been broadcast. Returns whether the row existed —
     /// marking a summary that was never stored is a caller bug worth surfacing, not a silent
     /// no-op.

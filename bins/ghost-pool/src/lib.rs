@@ -100,6 +100,7 @@ pub mod sbc_handler;
 /// The network shard's runtime: epoch folds, evidence retention, boundary detection
 /// (`SHARE_SHARD.md` §4.3/§4.4). Dark unless `pool.share_shard` is set.
 pub mod shard;
+pub mod shard_mesh;
 
 pub mod round;
 
