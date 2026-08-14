@@ -1,7 +1,21 @@
+> # ⛔ ARCHIVED 2026-08-12 — SUPERSEDED, DO NOT BUILD FROM THIS
+>
+> **The plan in force is [`docs/SHARE_SHARD.md`](../SHARE_SHARD.md).**
+>
+> The problem this document addresses is **dissolved, not solved**. Membership is now permissionless:
+> anyone runs a node, there is no quorum to join, no allowlist, and no threshold that attrition can
+> push out of reach. A node's weight is simply the verified work it publishes, and a node that leaves
+> and returns resumes under the same ID with nothing to reconcile — balances are keyed on payout
+> address, not on node.
+>
+> The v1 multi-operator blocker this document identified is therefore closed by the new design rather
+> than by the staged join/membership/bounding work proposed below.
+
 # SBC: membership change, and how a new node joins
 
-Status: design, 2026-08-10. Written after audit 8 asked the operator's question directly —
-*"can new nodes that join the network join in with the quorum?"* — and the answer today
+Status: **ARCHIVED**. Design 2026-08-10, superseded 2026-08-12. Written after audit 8 asked the
+operator's question directly — *"can new nodes that join the network join in with the quorum?"* —
+and the answer today
 is no.
 
 ## What happens now

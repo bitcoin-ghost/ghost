@@ -1,6 +1,6 @@
 //! Persistence for the share-batch chain (WP-5 shadow run).
 //!
-//! See `docs/SHARE_BATCH_CHAIN.md`. Three things must survive a restart, and nothing else:
+//! See `docs/archive/SHARE_BATCH_CHAIN.md`. Three things must survive a restart, and nothing else:
 //!
 //! - **balances** — the payable state, ~68 rows. This is the whole point: the model exists because
 //!   "payable state is O(shares), not O(addresses)", and here it is O(addresses).
