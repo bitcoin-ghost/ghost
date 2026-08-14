@@ -1249,72 +1249,10 @@ mod tests {
         hex::encode(&identity.node_id()[..8])
     }
 
-    /// The adopted blob for the pinned anchor, reconstructed exactly as production stores it.
-    /// Kept here rather than exported from the accounting crate's tests so this suite exercises
-    /// the same public entry point an operator's ceremony will.
+    /// The adopted blob the genesis pin was taken over — from ghost-accounting's single
+    /// definition, not a copy. A copy here went stale the first time the anchor was re-pinned.
     fn pinned_canonical_blob() -> Vec<u8> {
-        let miner_payouts: Vec<(String, u128)> = vec![
-            (
-                "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".into(),
-                57_371_941_344_568_806_473_728,
-            ),
-            (
-                "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".into(),
-                2_609_462_108_645_369_053_184,
-            ),
-            (
-                "bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".into(),
-                2_503_874_639_417_892_143_104,
-            ),
-            (
-                "148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN".into(),
-                528_968_877_836_852_002_816,
-            ),
-            (
-                "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h".into(),
-                9_741_908_758_669_000_704,
-            ),
-        ];
-        let hx = |s: &str| -> [u8; 32] {
-            let mut o = [0u8; 32];
-            o.copy_from_slice(&hex::decode(s).unwrap());
-            o
-        };
-        let node_shares: Vec<([u8; 32], i32)> = vec![
-            (
-                hx("46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b"),
-                6,
-            ),
-            (
-                hx("fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622"),
-                10,
-            ),
-            (
-                hx("849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c"),
-                10,
-            ),
-            (
-                hx("e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927"),
-                10,
-            ),
-            (
-                hx("9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"),
-                10,
-            ),
-            (
-                hx("5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393"),
-                6,
-            ),
-            (
-                hx("f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f"),
-                6,
-            ),
-            (
-                hx("4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132"),
-                6,
-            ),
-        ];
-        serde_json::to_vec(&(&miner_payouts, &node_shares)).expect("encodable")
+        ghost_accounting::shard_genesis::pinned_canonical_payout_blob()
     }
 
     /// Arming replaces the soak's state, opens on the pinned balances, and restarts the epoch
@@ -1347,7 +1285,7 @@ mod tests {
         assert!(!t.owed().contains_key("bc1qsoak"));
         assert_eq!(
             t.owed().get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
-            Some(&57_371_941_344_568_806)
+            Some(&62_143_408_528_125_167)
         );
 
         // Floor is the anchor's epoch PLUS ONE — folding the anchor's own epoch would re-credit

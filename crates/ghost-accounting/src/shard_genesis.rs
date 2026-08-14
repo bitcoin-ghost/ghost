@@ -103,24 +103,28 @@ pub struct GenesisAnchor {
 
 /// Height of the pinned genesis anchor.
 ///
-/// Chosen 2026-08-13 by `scripts/shard-anchor-rehearsal.sh` from 133 candidates, of which 2
-/// qualified — post-#606 the adopted bytes agree at only ~1.6% of heights, so this is the newest
-/// height that could be used, not the newest that existed. Re-pin by re-running the survey; the
+/// Chosen 2026-08-14 by `scripts/shard-anchor-rehearsal.sh` from 163 candidates, of which 3
+/// qualified — post-#606 the adopted bytes agree at only ~1.8% of heights, so this is the newest
+/// height that COULD be used, not the newest that existed. Re-pin by re-running the survey; the
 /// golden vector is the only thing that has to move with it.
-pub const ANCHOR_HEIGHT: u64 = 962_008;
+///
+/// Replaces 962,008, which was 290 blocks staler. Every block between the anchor and arming is
+/// work the catch-up has to re-fold, so a fresher anchor is a shorter catch-up — nothing more
+/// subtle than that.
+pub const ANCHOR_HEIGHT: u64 = 962_298;
 
 /// `cutoff_ts` of the pinned anchor. Chain-derived, carried for provenance.
-pub const ANCHOR_CUTOFF_TS: i64 = 1_786_453_494;
+pub const ANCHOR_CUTOFF_TS: i64 = 1_786_634_458;
 
 /// The `ledger_root` the fleet ratified at [`ANCHOR_HEIGHT`] — provenance only, never the gate.
-const ANCHOR_LEDGER_ROOT: &str = "61ae50ab136fcda3e99041cbfc6175e94099db1acfd2abe935c1b67dcd74b93e";
+const ANCHOR_LEDGER_ROOT: &str = "8b7b04e5a77996ef0c585a2c2a492aa8a06d83fbe13ecb9d8e752cc277dbc433";
 
 /// SHA-256 of the adopted `canonical_payout` blob — the real fleet-identity check.
 const ANCHOR_CANONICAL_SHA256: &str =
-    "a3f7202f8230893fb5c3c5fe7487b36c3e297000aa3c2fcb1c0848cb2bebad62";
+    "7c22a2fdbf36c90de68285a3972d0d2ce4d39f02ce75768b60d29fbc269db7b4";
 
 /// `compute_table_root` of the opening table this anchor converts to.
-const ANCHOR_TABLE_ROOT: &str = "ecbbd9ec1abdf97a6f8cb8aea384777382fe9727829e533cf06d340564a80c88";
+const ANCHOR_TABLE_ROOT: &str = "a596b397cb12fd2dddfe28a0436b56ac6f2b1ecd36a12348950cc2dd34e1f3c4";
 
 /// The pinned ceremony anchor.
 ///
@@ -141,6 +145,81 @@ pub fn pinned_anchor() -> GenesisAnchor {
         canonical_sha256: h(ANCHOR_CANONICAL_SHA256),
         table_root: h(ANCHOR_TABLE_ROOT),
     }
+}
+
+/// The adopted `canonical_payout` blob the pin was taken over, reconstructed byte-for-byte.
+///
+/// Feature-gated so it never reaches a production binary, but deliberately NOT inside a `#[cfg(test)]`
+/// module: `ghost-pool`'s arming tests need the same bytes, and a second copy over there went stale
+/// the first time the anchor was re-pinned — six tests failing for no reason but duplication. One
+/// spelling, two crates.
+///
+/// Byte-identity is what matters, not shape: `node_shares` is in the blob's OWN order rather than
+/// sorted, because the digest is over the bytes the fleet actually adopted.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn pinned_canonical_payout_blob() -> Vec<u8> {
+    fn hx(s: &str) -> [u8; 32] {
+        let mut o = [0u8; 32];
+        o.copy_from_slice(&hex::decode(s).expect("valid hex"));
+        o
+    }
+    let miner_payouts: Vec<(String, u128)> = vec![
+        (
+            "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
+            62_143_408_528_125_167_927_296,
+        ),
+        (
+            "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".to_string(),
+            2_827_976_214_437_835_046_912,
+        ),
+        (
+            "bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".to_string(),
+            2_503_874_639_417_892_143_104,
+        ),
+        (
+            "148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN".to_string(),
+            532_541_467_700_909_047_808,
+        ),
+        (
+            "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h".to_string(),
+            9_741_908_758_669_000_704,
+        ),
+    ];
+    let node_shares: Vec<([u8; 32], i32)> = vec![
+        (
+            hx("5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393"),
+            6,
+        ),
+        (
+            hx("e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927"),
+            10,
+        ),
+        (
+            hx("fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622"),
+            10,
+        ),
+        (
+            hx("849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c"),
+            10,
+        ),
+        (
+            hx("9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"),
+            10,
+        ),
+        (
+            hx("46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b"),
+            6,
+        ),
+        (
+            hx("f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f"),
+            6,
+        ),
+        (
+            hx("4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132"),
+            6,
+        ),
+    ];
+    serde_json::to_vec(&(&miner_payouts, &node_shares)).expect("encodable")
 }
 
 /// Why a node refused to open its shard.
@@ -336,37 +415,35 @@ mod tests {
     /// Chosen over fresher heights because post-#606 blob unanimity is rare: of the 182 heights
     /// all 8 nodes held since 961,600, only 41 had identical adopted bytes, and only 3 of those
     /// were after the gate armed at 961,700.
-    fn ratified_962008() -> Vec<(String, u128)> {
-        vec![
-            (
-                "bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492".to_string(),
-                57_371_941_344_568_806_473_728,
-            ),
-            (
-                "bc1qhfgc0uj7wv03vmchxe2hn8lhtu6ey9zaf0nre2".to_string(),
-                2_609_462_108_645_369_053_184,
-            ),
-            (
-                "bc1q9z23a6yl44nc83dwm996ntl6wphwcwt9k0q0ej".to_string(),
-                2_503_874_639_417_892_143_104,
-            ),
-            (
-                "148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN".to_string(),
-                528_968_877_836_852_002_816,
-            ),
-            (
-                "bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h".to_string(),
-                9_741_908_758_669_000_704,
-            ),
-        ]
+    /// The adopted per-address totals at height **962,298**, DECODED from the blob rather than
+    /// written out again.
+    ///
+    /// The values used to be duplicated here beside `pinned_canonical_payout_blob`, and re-pinning
+    /// the anchor broke six tests in another crate because a third copy had gone stale. Decoding
+    /// the one definition means a re-pin touches exactly one place, and the fixture cannot drift
+    /// from the bytes whose digest is pinned.
+    ///
+    /// Verified read-only across all 8 nodes on 2026-08-14 by `scripts/shard-anchor-rehearsal.sh`:
+    ///   - `ledger_root` `8B7B04E5…77DBC433` — ONE distinct value fleet-wide
+    ///   - `canonical_payout` 1,316 bytes, sha256 `7c22a2fd…269db7b4`, identical on all 8
+    ///   - the ratified root recomputes from those bytes on 8/8, so the adopted median equals the
+    ///     list the proposer signed
+    ///   - 5 miner payees, 8 node entries, lag 103 blocks behind tip at verification
+    ///
+    /// Chosen from 163 candidates of which 3 qualified: post-#606 the adopted bytes agree at only
+    /// ~1.8% of heights, so this is the newest height that COULD be used.
+    fn ratified_962298() -> Vec<(String, u128)> {
+        let (miners, _nodes): AdoptedCheckpoint =
+            serde_json::from_slice(&pinned_canonical_payout_blob()).expect("pinned blob decodes");
+        miners
     }
 
     /// Pinned opening root for the 962,008 anchor.
     ///
     /// A change here means the conversion or `compute_table_root`'s encoding moved, and either
     /// would hand eight nodes eight different opening balances with no way to notice afterwards.
-    const GENESIS_TABLE_ROOT_962008: &str =
-        "ecbbd9ec1abdf97a6f8cb8aea384777382fe9727829e533cf06d340564a80c88";
+    const GENESIS_TABLE_ROOT_962298: &str =
+        "a596b397cb12fd2dddfe28a0436b56ac6f2b1ecd36a12348950cc2dd34e1f3c4";
 
     fn hex_32(s: &str) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -380,13 +457,13 @@ mod tests {
     /// balance a miner is owed must be what the checkpoint said, NOT eight times it.
     #[test]
     fn eight_nodes_opening_together_do_not_multiply_the_opening_balances() {
-        let (mut merged, _) = shard_genesis_table(&ratified_962008());
+        let (mut merged, _) = shard_genesis_table(&ratified_962298());
         for _ in 0..7 {
-            let (peer, _) = shard_genesis_table(&ratified_962008());
+            let (peer, _) = shard_genesis_table(&ratified_962298());
             merged.merge_accrued(peer.accrued());
         }
 
-        let (solo, _) = shard_genesis_table(&ratified_962008());
+        let (solo, _) = shard_genesis_table(&ratified_962298());
         assert_eq!(
             merged.owed(),
             solo.owed(),
@@ -403,8 +480,8 @@ mod tests {
     /// Merge order must not matter, since gossip provides no ordering.
     #[test]
     fn genesis_merge_is_order_independent() {
-        let forwards = ratified_962008();
-        let mut backwards = ratified_962008();
+        let forwards = ratified_962298();
+        let mut backwards = ratified_962298();
         backwards.reverse();
 
         let (a, _) = shard_genesis_table(&forwards);
@@ -416,7 +493,7 @@ mod tests {
     /// Everything lands in the reserved column and nothing lands anywhere else.
     #[test]
     fn genesis_writes_only_the_reserved_column() {
-        let (table, _) = shard_genesis_table(&ratified_962008());
+        let (table, _) = shard_genesis_table(&ratified_962298());
         let columns: Vec<&ghost_common::types::NodeId> = table.accrued().keys().collect();
         assert_eq!(columns, vec![&GENESIS_NODE_ID]);
         assert_eq!(genesis_column(&table).len(), 5);
@@ -429,14 +506,14 @@ mod tests {
     /// The opening balances must account for the ratified total, less only truncation.
     #[test]
     fn the_anchor_converts_without_losing_a_payee_or_unexplained_work() {
-        let (table, rounding) = shard_genesis_table(&ratified_962008());
+        let (table, rounding) = shard_genesis_table(&ratified_962298());
         let column = genesis_column(&table);
 
         assert_eq!(column.len(), 5, "every payee must survive the conversion");
         assert_eq!(rounding.addresses_dropped, 0);
 
         let opened: i128 = column.values().map(|v| *v as i128).sum();
-        let ratified: u128 = ratified_962008().iter().map(|(_, w)| *w).sum();
+        let ratified: u128 = ratified_962298().iter().map(|(_, w)| *w).sum();
         let expected = (ratified - rounding.units_discarded) / UNITS_PER_MICRO;
         assert_eq!(
             opened as u128, expected,
@@ -457,7 +534,7 @@ mod tests {
         // actually costs someone money.
         assert_eq!(
             column.get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
-            Some(&57_371_941_344_568_806)
+            Some(&62_143_408_528_125_167)
         );
     }
 
@@ -468,25 +545,25 @@ mod tests {
     #[test]
     fn the_pinned_anchor_parses() {
         let anchor = pinned_anchor();
-        assert_eq!(anchor.height, 962_008);
-        assert_eq!(anchor.cutoff_ts, 1_786_453_494);
+        assert_eq!(anchor.height, 962_298);
+        assert_eq!(anchor.cutoff_ts, 1_786_634_458);
         assert_eq!(
             hex::encode(anchor.canonical_sha256),
-            "a3f7202f8230893fb5c3c5fe7487b36c3e297000aa3c2fcb1c0848cb2bebad62"
+            "7c22a2fdbf36c90de68285a3972d0d2ce4d39f02ce75768b60d29fbc269db7b4"
         );
         // The pin must agree with the conversion it claims to describe — otherwise the runtime
         // would check itself against a number nothing produced.
-        let (table, _) = shard_genesis_table(&ratified_962008());
+        let (table, _) = shard_genesis_table(&ratified_962298());
         assert_eq!(table.compute_table_root(), anchor.table_root);
     }
 
     /// Golden vector: the opening root for the chosen anchor.
     #[test]
-    fn genesis_table_root_for_the_962008_anchor_is_pinned() {
-        let (table, _) = shard_genesis_table(&ratified_962008());
+    fn genesis_table_root_for_the_962298_anchor_is_pinned() {
+        let (table, _) = shard_genesis_table(&ratified_962298());
         assert_eq!(
             hex::encode(table.compute_table_root()),
-            GENESIS_TABLE_ROOT_962008
+            GENESIS_TABLE_ROOT_962298
         );
     }
 
@@ -636,7 +713,7 @@ mod tests {
     /// column max-merged in, permanent and indistinguishable from the real thing.
     #[test]
     fn a_peer_cannot_inflate_the_genesis_column() {
-        let (mut table, _) = shard_genesis_table(&ratified_962008());
+        let (mut table, _) = shard_genesis_table(&ratified_962298());
         let before = table.compute_table_root();
 
         let mut hostile: BTreeMap<String, i64> = BTreeMap::new();
@@ -655,7 +732,7 @@ mod tests {
         );
         assert_eq!(
             genesis_column(&table).get("bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492"),
-            Some(&57_371_941_344_568_806)
+            Some(&62_143_408_528_125_167)
         );
     }
 
@@ -664,7 +741,7 @@ mod tests {
     /// entirely — every miner's opening balance gone on the next restart.
     #[test]
     fn reinstalling_a_persisted_genesis_column_round_trips() {
-        let (table, _) = shard_genesis_table(&ratified_962008());
+        let (table, _) = shard_genesis_table(&ratified_962298());
         let persisted = genesis_column(&table);
 
         let mut reloaded = ShardTable::new();
@@ -673,43 +750,9 @@ mod tests {
         assert_eq!(reloaded.owed(), table.owed());
     }
 
-    /// The adopted blob exactly as production stores it: `to_vec(&(&miner_payouts, &node_shares))`.
+    /// The adopted blob, from the ONE definition — see `pinned_canonical_payout_blob`.
     fn canonical_blob() -> Vec<u8> {
-        let node_shares: Vec<([u8; 32], i32)> = vec![
-            (
-                hex_32("46141044f80c99ac01476b3c2d6cd2149f31b5f1b06ffd2dfa3d15d588c7a39b"),
-                6,
-            ),
-            (
-                hex_32("fb71fee87bb0516920fdb673f3068be3c0b9b29fc62e309b99594a0008c25622"),
-                10,
-            ),
-            (
-                hex_32("849bceceb22cc7ebbeec252d824940ebb73ee08c7855c5a90b5661dd21aeb18c"),
-                10,
-            ),
-            (
-                hex_32("e557c97a32335457ed6eceb6f8a9c7ee13f8731ee99dc9f4b7831dcf606d6927"),
-                10,
-            ),
-            (
-                hex_32("9fe860bda96ff81820a2e166f48cb3ae59010fc9e42550a3aeafb5bfef4d1b38"),
-                10,
-            ),
-            (
-                hex_32("5867b555602257bdffa5d4c3577c464416087f2aa04ac478f3986a17e51d3393"),
-                6,
-            ),
-            (
-                hex_32("f0215f1ffd9a711ffc8e476f37bf3e19a2afc18803d146ecedb5d53d4fe9bd4f"),
-                6,
-            ),
-            (
-                hex_32("4c8c2272ae67d76c6c4108f0e4e6dfde7ff864689d3e9b99a35ab1bd46051132"),
-                6,
-            ),
-        ];
-        serde_json::to_vec(&(&ratified_962008(), &node_shares)).expect("encodable")
+        super::pinned_canonical_payout_blob()
     }
 
     /// The blob this test module reconstructs must be the blob production actually holds, or the
@@ -725,7 +768,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(Sha256::digest(&blob)),
-            "a3f7202f8230893fb5c3c5fe7487b36c3e297000aa3c2fcb1c0848cb2bebad62"
+            "7c22a2fdbf36c90de68285a3972d0d2ce4d39f02ce75768b60d29fbc269db7b4"
         );
     }
 }

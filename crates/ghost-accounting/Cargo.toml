@@ -39,5 +39,10 @@ thiserror = { workspace = true }
 # separately-decoded argument, so this is a real dependency, not a test-only one.
 serde_json = { workspace = true }
 
+[features]
+# Exposes `shard_genesis::pinned_canonical_payout_blob` for downstream test suites that must
+# assert against the SAME adopted bytes the pin was taken over. Never enabled in a release build.
+test-fixtures = []
+
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

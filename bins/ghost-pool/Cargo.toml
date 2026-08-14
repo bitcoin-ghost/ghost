@@ -136,3 +136,5 @@ optional = true
 
 [dev-dependencies]
 tempfile = "3.10"
+# The arming tests must use the SAME adopted bytes the genesis pin was taken over, not a copy.
+ghost-accounting = { workspace = true, features = ["test-fixtures"] }
