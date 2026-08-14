@@ -847,7 +847,12 @@ mod tests {
         // The total is recomputed AFTER truncation, matching the live path. Diluting by addresses
         // that did not make the cut would underpay everyone who did and silently grow the
         // remainder — money going nowhere rather than to the miners entitled to it.
-        let owed = owed_map(&[("bc1qa", 100), ("bc1qb", 100), ("bc1qc", 100), ("bc1qd", 100)]);
+        let owed = owed_map(&[
+            ("bc1qa", 100),
+            ("bc1qb", 100),
+            ("bc1qc", 100),
+            ("bc1qd", 100),
+        ]);
         let r = shard_miner_payouts(&owed, 1_000, 2, 1);
 
         let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
@@ -880,7 +885,11 @@ mod tests {
         let a = discharged_micro_work(700_000, pool, top_work);
         let b = discharged_micro_work(200_000, pool, top_work);
         let c = discharged_micro_work(100_000, pool, top_work);
-        assert_eq!(a + b + c, top_work, "a full payout discharges the full work");
+        assert_eq!(
+            a + b + c,
+            top_work,
+            "a full payout discharges the full work"
+        );
     }
 
     #[test]
@@ -889,7 +898,10 @@ mod tests {
         // must stay owed — that is what makes "miners below the cut rotate in" true rather than
         // aspirational.
         let discharged = discharged_micro_work(250_000, 1_000_000, 8_000_000);
-        assert_eq!(discharged, 2_000_000, "a quarter of the pool discharges a quarter of the work");
+        assert_eq!(
+            discharged, 2_000_000,
+            "a quarter of the pool discharges a quarter of the work"
+        );
     }
 
     #[test]

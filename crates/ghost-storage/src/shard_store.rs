@@ -367,7 +367,7 @@ impl Database {
     /// `block_hash` must be DISPLAY order — the caller normalises, because the idempotence key
     /// only works if every caller spells the hash the same way (the internal-order trap has cost
     /// an outage before). `amounts` are per-address micro-work increments; non-positive entries
-    /// are ignored exactly as [`Database::shard_record_settled`] ignores them. An empty `amounts`
+    /// are ignored exactly as [`ShardTable::record_settled`] ignores them. An empty `amounts`
     /// still records the block: a pool block that paid no currently-owed address discharges
     /// nothing, but must never be re-examined as though it were new.
     pub fn shard_settle_block(
@@ -777,11 +777,13 @@ mod tests {
 
         let amounts = vec![("bc1qalice".to_string(), 5_000_000i64)];
         assert!(
-            db.shard_settle_block("00aa", 961_700, &amounts).expect("settle"),
+            db.shard_settle_block("00aa", 961_700, &amounts)
+                .expect("settle"),
             "the first settlement of a block must apply"
         );
         assert!(
-            !db.shard_settle_block("00aa", 961_700, &amounts).expect("repeat"),
+            !db.shard_settle_block("00aa", 961_700, &amounts)
+                .expect("repeat"),
             "a re-settled block must be a no-op, and say so"
         );
 
@@ -795,14 +797,18 @@ mod tests {
 
         // A DIFFERENT block paying the same address accumulates — per-block idempotence must not
         // become per-address idempotence.
-        assert!(db.shard_settle_block("00bb", 961_800, &amounts).expect("settle 2"));
+        assert!(db
+            .shard_settle_block("00bb", 961_800, &amounts)
+            .expect("settle 2"));
         expected.record_settled("bc1qalice", 5_000_000);
         assert_eq!(db.shard_load_table().expect("load"), expected);
 
         // A pool block that discharged nothing is still recorded, so it is never re-examined as
         // new — but it credits nobody.
         assert!(db.shard_settle_block("00cc", 961_900, &[]).expect("empty"));
-        assert!(!db.shard_settle_block("00cc", 961_900, &[]).expect("empty repeat"));
+        assert!(!db
+            .shard_settle_block("00cc", 961_900, &[])
+            .expect("empty repeat"));
         assert_eq!(db.shard_load_table().expect("load"), expected);
     }
 

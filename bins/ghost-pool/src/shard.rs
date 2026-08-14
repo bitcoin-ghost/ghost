@@ -62,7 +62,6 @@ use ghost_storage::database::Database;
 
 use crate::coinbase_verifier::{address_to_script_pubkey, CoinbaseOutput};
 
-
 /// Epochs one tick may fold. Bounds the work done against the shared connection between two
 /// share-ingest writes: a node that is many epochs behind catches up across ticks — resume, not
 /// a stall — rather than holding the storage mutex for the whole backlog at once.
@@ -103,7 +102,6 @@ const MAX_SETTLE_SCAN_BLOCKS: u64 = 20;
 /// cursor would never advance past it and every later block would go unsettled, which is the same
 /// loss multiplied by every block after it. So: retry a few times, then step over it loudly.
 const MAX_BLOCK_READ_ATTEMPTS: u32 = 3;
-
 
 /// kv key holding the height the maturity lookback has reached.
 ///
@@ -209,7 +207,7 @@ pub struct SettleReport {
     /// settlement that has silently stopped looks exactly like one with nothing to do, and the
     /// difference is unpaid work accruing behind a cursor that never moves.
     pub stalled_at: Option<u64>,
-    /// Heights abandoned as durably unreadable after [`MAX_BLOCK_READ_ATTEMPTS`]. Skipping is the
+    /// Heights abandoned as durably unreadable after `MAX_BLOCK_READ_ATTEMPTS`. Skipping is the
     /// lesser evil — one block's payments undischarged beats every later block never settling —
     /// but it is never silent.
     pub skipped_unreadable: Vec<u64>,
@@ -764,7 +762,10 @@ impl ShardRuntime {
             return Ok(None);
         }
         // Catch-up is bounded per call, exactly as the legacy forward scan bounds its own.
-        Ok(Some((cursor + 1, mature.min(cursor + MAX_SETTLE_SCAN_BLOCKS))))
+        Ok(Some((
+            cursor + 1,
+            mature.min(cursor + MAX_SETTLE_SCAN_BLOCKS),
+        )))
     }
 
     /// Walk fetched blocks in height order, settling at most [`MAX_SETTLES_PER_CALL`] of them.
@@ -877,7 +878,9 @@ impl ShardRuntime {
         // than one output to the same script and each satoshi discharges work exactly once.
         let mut paid_by_script: BTreeMap<&[u8], u64> = BTreeMap::new();
         for out in outputs {
-            let paid = paid_by_script.entry(out.script_pubkey.as_slice()).or_insert(0);
+            let paid = paid_by_script
+                .entry(out.script_pubkey.as_slice())
+                .or_insert(0);
             *paid = paid.saturating_add(out.value);
         }
 
@@ -1568,8 +1571,10 @@ mod tests {
     /// How many settled-block records exist — the idempotence ledger, directly.
     fn settled_block_count(db: &Database) -> i64 {
         db.with_connection(|conn| {
-            conn.query_row("SELECT COUNT(*) FROM shard_settled_blocks", [], |r| r.get(0))
-                .map_err(|e| GhostError::Database(e.to_string()))
+            conn.query_row("SELECT COUNT(*) FROM shard_settled_blocks", [], |r| {
+                r.get(0)
+            })
+            .map_err(|e| GhostError::Database(e.to_string()))
         })
         .expect("count")
     }
@@ -1598,7 +1603,11 @@ mod tests {
             micro_work(5.0),
             "the sole paid address's full owed work discharges"
         );
-        assert_eq!(rt.owed().get(ADDR_A), Some(&0), "paid work is no longer owed");
+        assert_eq!(
+            rt.owed().get(ADDR_A),
+            Some(&0),
+            "paid work is no longer owed"
+        );
 
         let root_after = rt.table_root();
         assert_eq!(
@@ -1732,7 +1741,10 @@ mod tests {
             panic!("must settle");
         };
         assert_eq!(s.addresses, 1);
-        assert_eq!(s.discharged_micro, 6_400, "a slice of the subsidy buys a slice of the work");
+        assert_eq!(
+            s.discharged_micro, 6_400,
+            "a slice of the subsidy buys a slice of the work"
+        );
         assert_eq!(
             rt.owed().get(ADDR_A),
             Some(&(micro_work(5.0) - 6_400)),
@@ -1776,9 +1788,16 @@ mod tests {
         let after = rt.owed();
         let a = *after.get(ADDR_A).unwrap_or(&0);
         let b = *after.get(ADDR_B).unwrap_or(&0);
-        assert!(a < 0, "the over-paid address carries a negative residual, not a clamped zero");
+        assert!(
+            a < 0,
+            "the over-paid address carries a negative residual, not a clamped zero"
+        );
         assert!(b > 0, "the under-paid address is still owed");
-        assert_eq!(a + b, 0, "and the residuals cancel exactly — no work invented or lost");
+        assert_eq!(
+            a + b,
+            0,
+            "and the residuals cancel exactly — no work invented or lost"
+        );
     }
 
     /// A block without our tag discharges nothing and is not recorded — every block anyone
@@ -1800,7 +1819,8 @@ mod tests {
 
         // Corrupt: refuse to run at all. Halting is loud and recoverable; fast-forwarding is
         // silent and is not.
-        db.kv_set(SETTLE_CURSOR_KEY, "not-a-height").expect("corrupt");
+        db.kv_set(SETTLE_CURSOR_KEY, "not-a-height")
+            .expect("corrupt");
         assert_eq!(
             rt.settle_window(tip).expect("corrupt"),
             None,
