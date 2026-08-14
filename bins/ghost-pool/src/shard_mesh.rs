@@ -83,6 +83,16 @@ impl ShardMeshHandler {
                           "shard: merged, but could NOT retain the peer's summary");
                 }
             }
+            PeerMergeOutcome::NotAdmitted => {
+                // WARN, not info: on a single-operator fleet every peer should be in the ratified
+                // set, so this means either an unknown node is gossiping at us or our own
+                // checkpoint view has gone stale — both worth looking at rather than scrolling past.
+                warn!(
+                    epoch,
+                    peer = %node,
+                    "shard: sender is not in the ratified node set — summary NOT merged"
+                );
+            }
             PeerMergeOutcome::SoloRefused => {
                 debug!(epoch, peer = %node, "shard: solo mode — peer summary not merged");
             }

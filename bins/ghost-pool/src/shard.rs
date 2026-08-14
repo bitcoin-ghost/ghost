@@ -157,6 +157,9 @@ pub enum PeerMergeOutcome {
     },
     /// Solo mode: the shared shard is not this node's business (§10).
     SoloRefused,
+    /// The sender is not in the fleet's ratified node set. Until §6 sampling exists, an
+    /// unrecognised node's counters are an unverified assertion that a max would make permanent.
+    NotAdmitted,
     /// Our own summary came back to us. Not an error, and not a contribution.
     OwnEcho,
     /// Verification refused it. Expected traffic during a rolling cutover (a pre-genesis epoch,
@@ -577,6 +580,34 @@ impl ShardRuntime {
     ///
     /// The table lock is taken and released here, never held across an await — the handler runs on
     /// the mesh's task and must not block ingest behind a network round trip.
+    /// Whether a peer's counters may enter this node's table at all.
+    ///
+    /// ⚠ **Temporary, and a deliberate narrowing of the permissionless design.** `SHARE_SHARD.md`
+    /// §10 makes the λ-sampling verifier and evidence broadcast a hard precondition for admitting
+    /// a node you do not own, because without them a foreign node's counter is an unverified
+    /// assertion. Sampling is not built yet, and the mesh runs `allow_unknown_peers = true` by
+    /// intent — so anyone completing a Noise handshake could otherwise gossip under N generated
+    /// keypairs, each creating a column. `owed()` sums across columns and merging is a max, so a
+    /// single accepted inflation is permanent and nothing in the runtime can remove it.
+    ///
+    /// Until sampling lands, admission is restricted to the fleet's own BFT-ratified membership:
+    /// the `node_shares` set on the latest payout checkpoint, which is the same set the genesis
+    /// anchor pins. Operator decision, 2026-08-14, for the single-operator window.
+    ///
+    /// **Fails CLOSED.** No checkpoint, or one carrying no node set, admits nobody. A shard that
+    /// cannot converge is a visible, recoverable problem; one that merged a stranger's counters is
+    /// neither.
+    ///
+    /// ⛔ Remove this ONLY together with building §6 sampling — not because it is inconvenient.
+    fn peer_is_admissible(&self, node: &ghost_common::types::NodeId) -> GhostResult<bool> {
+        match self.db.get_latest_payout_ledger_checkpoint()? {
+            Some(cp) if !cp.node_shares.is_empty() => {
+                Ok(cp.node_shares.iter().any(|(id, _)| id == node))
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn apply_peer_summary(
         &self,
         msg: &ghost_consensus::message::ShardEpochSummaryMessage,
@@ -592,6 +623,13 @@ impl ShardRuntime {
         let node = msg.summary.node_id;
         if node == self.identity.node_id() {
             return Ok(PeerMergeOutcome::OwnEcho);
+        }
+
+        // Admission BEFORE verification, deliberately: a summary from a node we do not recognise
+        // should not even earn the signature check's compute, and refusing early keeps a stranger
+        // from probing which of its keys are known.
+        if !self.peer_is_admissible(&node)? {
+            return Ok(PeerMergeOutcome::NotAdmitted);
         }
 
         // The prior summary the chain check needs is NOT always epoch-1.
@@ -1602,6 +1640,47 @@ mod tests {
             .arm_from_genesis(&rogue, &pinned_canonical_blob())
             .is_err());
         assert_eq!(rt.table.lock().epoch_floor(), 0);
+    }
+
+    /// A stranger's summary must not enter the table, and must not do so by DEFAULT.
+    ///
+    /// Fails closed: the fixture DB carries no payout checkpoint, so nobody is admissible. That is
+    /// the state a fresh node is in, and it is the one where a permissive default would be most
+    /// tempting and most wrong — `owed()` sums across columns and a max cannot be undone, so an
+    /// accepted stranger is permanent.
+    #[test]
+    fn an_unratified_peer_is_refused_before_anything_is_merged() {
+        let (_identity, _db, rt) = runtime();
+        let stranger = NodeIdentity::generate();
+        let (summary, _ev) = {
+            let evidence = vec![];
+            let s = ghost_common::share_shard::EpochSummary::build(
+                7,
+                &stranger,
+                &BTreeMap::new(),
+                &evidence,
+                compute_merkle_root,
+                None,
+            )
+            .expect("empty evidence is legal");
+            (s, evidence)
+        };
+        let before = rt.table.lock().compute_table_root();
+
+        let out = rt
+            .apply_peer_summary(&ghost_consensus::message::ShardEpochSummaryMessage { summary })
+            .expect("admission is a verdict, not an error");
+
+        assert_eq!(out, PeerMergeOutcome::NotAdmitted);
+        assert_eq!(
+            rt.table.lock().compute_table_root(),
+            before,
+            "a refused summary must leave the table byte-identical"
+        );
+        assert!(
+            rt.table.lock().accrued().is_empty(),
+            "no column may be created for an unratified sender"
+        );
     }
 
     /// Bytes the ceremony did not verify must not arm the node, and must leave it untouched.
