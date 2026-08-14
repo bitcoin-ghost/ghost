@@ -445,12 +445,6 @@ mod tests {
     const GENESIS_TABLE_ROOT_962298: &str =
         "a596b397cb12fd2dddfe28a0436b56ac6f2b1ecd36a12348950cc2dd34e1f3c4";
 
-    fn hex_32(s: &str) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&hex::decode(s).expect("valid hex"));
-        out
-    }
-
     /// The whole point of the reserved column, stated as a test.
     ///
     /// Eight nodes each open from the same checkpoint. Their tables then meet over gossip. The
