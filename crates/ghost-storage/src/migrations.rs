@@ -131,6 +131,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (52, migrate_v52),
         (53, migrate_v53),
         (54, migrate_v54),
+        (55, migrate_v55),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2685,6 +2686,27 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
 ///
 /// A node whose DB already said 53 would never have received this table, and settlement there would
 /// have failed for ever with no signal. Append, never amend.
+/// v55: index the gossip relay's pending-summary lookup.
+///
+/// `shard_epochs`'s primary key is `(epoch, node_id)`, so
+/// `WHERE node_id = ? AND published = 0 ORDER BY epoch ASC` cannot use it — `node_id` is the
+/// second column, and a prefix scan needs the first. That was tolerable while the query ran once
+/// per fold (~hourly); the relay now drains every tick (~30 s) so that a restart carrying a
+/// backlog does not wait a full epoch to publish, which turns a rare full scan into a constant
+/// one.
+///
+/// Strictly additive: an index, no table or column change, so an older binary is unaffected.
+fn migrate_v55(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v55: idx_shard_epochs_pending");
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_shard_epochs_pending
+         ON shard_epochs (node_id, published, epoch);",
+    )
+    .map_err(|e| GhostError::Database(e.to_string()))?;
+    info!("v55: indexed shard_epochs for the pending-broadcast lookup");
+    Ok(())
+}
+
 fn migrate_v54(conn: &Connection) -> GhostResult<()> {
     conn.execute_batch(
         "-- Blocks the shard has settled, keyed by DISPLAY-ORDER block hash (the order the RPC

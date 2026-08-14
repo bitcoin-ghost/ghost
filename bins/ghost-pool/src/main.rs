@@ -4118,6 +4118,27 @@ async fn main() -> Result<()> {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
+                // Drain pending summaries EVERY tick, not only on a tick that folded.
+                //
+                // This used to sit inside the `folded` arm, which contradicted its own comment: a
+                // node that folded while partitioned and regained peers a minute later waited up
+                // to a full epoch (~1h) to retry, and a restart carrying a backlog published
+                // nothing until the next epoch closed. The flag is the durable record of "still
+                // needs sending", so it should be consulted on the cadence that can act on it.
+                match rt.pending_broadcasts(8) {
+                    Ok(pending) => {
+                        for summary in pending {
+                            if shard_tx.try_send(summary).is_err() {
+                                // Relay saturated. Nothing is lost: the rows stay unpublished and
+                                // the next tick retries them.
+                                debug!("shard: broadcast relay busy — summaries stay pending");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "shard: could not read pending summaries"),
+                }
+
                 match rt.tick(tip) {
                     Ok(report) if !report.folded.is_empty() => {
                         info!(
@@ -4126,26 +4147,6 @@ async fn main() -> Result<()> {
                             remaining = report.remaining,
                             "shard: folded closed epochs"
                         );
-
-                        // Hand this node's own unpublished summaries to the relay. Driven from
-                        // the `published` flag rather than from `report`, so a summary folded
-                        // before a restart still reaches the mesh instead of dying with the
-                        // process that folded it. Solo nodes yield nothing here by construction.
-                        match rt.pending_broadcasts(8) {
-                            Ok(pending) => {
-                                for summary in pending {
-                                    if shard_tx.try_send(summary).is_err() {
-                                        // Relay saturated or gone. Not fatal and not lost: the
-                                        // rows stay unpublished and the next fold retries them.
-                                        debug!(
-                                            "shard: broadcast relay busy — summaries stay pending"
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => warn!(error = %e, "shard: could not read pending summaries"),
-                        }
 
                         // The soak signal, run ONCE PER EPOCH because a fold happens once per
                         // epoch — never on the tick itself. It scans the legacy unpaid ledger,

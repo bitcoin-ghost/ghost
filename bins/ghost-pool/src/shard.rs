@@ -147,10 +147,16 @@ pub enum FoldOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMergeOutcome {
     /// Merged into the peer's column; the table root is the §12.6 comparison value.
+    ///
+    /// `summary_retained` carries the reason the peer's signed summary could NOT be stored, when
+    /// that happens — the counter moved but the evidence next epoch's chain check needs did not.
     Merged {
         addresses: usize,
         table_root: [u8; 32],
+        summary_retained: Option<String>,
     },
+    /// Solo mode: the shared shard is not this node's business (§10).
+    SoloRefused,
     /// Our own summary came back to us. Not an error, and not a contribution.
     OwnEcho,
     /// Verification refused it. Expected traffic during a rolling cutover (a pre-genesis epoch,
@@ -575,17 +581,46 @@ impl ShardRuntime {
         &self,
         msg: &ghost_consensus::message::ShardEpochSummaryMessage,
     ) -> GhostResult<PeerMergeOutcome> {
+        // Solo work is its own (§10). `tick`, `fold_epoch` and `pending_broadcasts` all refuse in
+        // solo mode; the RECEIVE half must too, or a solo node merges the whole fleet's columns
+        // into its table and — once Stage 5 makes the shard authoritative — a solo block pays the
+        // shared shard's miners. Merging is a max, so that cannot be undone afterwards.
+        if self.solo {
+            return Ok(PeerMergeOutcome::SoloRefused);
+        }
+
         let node = msg.summary.node_id;
         if node == self.identity.node_id() {
-            // Our own summary echoed back. Merging is harmless (max of equal values) but pointless,
-            // and skipping keeps the counters honest about what gossip actually contributed.
             return Ok(PeerMergeOutcome::OwnEcho);
         }
 
-        let prior = self
-            .db
-            .shard_get_epoch(msg.summary.epoch.saturating_sub(1), &node)?;
+        // The prior summary the chain check needs is NOT always epoch-1.
+        //
+        // `verify_summary_stateless` uses it two ways: a SAME-epoch prior detects equivocation
+        // (two different signed statements for one epoch), and an epoch-1 prior chains the totals.
+        // Looking up only epoch-1 leaves equivocation permanently undetectable. Same-epoch takes
+        // precedence because a node contradicting itself matters more than one whose totals fail
+        // to chain.
+        let prior = match self.db.shard_get_epoch(msg.summary.epoch, &node)? {
+            Some(same_epoch) => Some(same_epoch),
+            None => match msg.summary.epoch.checked_sub(1) {
+                Some(prev) => self.db.shard_get_epoch(prev, &node)?,
+                None => None,
+            },
+        };
 
+        // ⚠ The lock is held ACROSS the persist, deliberately.
+        //
+        // `shard_upsert_column` is REPLACE semantics (delete the node's rows, re-insert). Each
+        // inbound Noise connection dispatches on its own task, so two summaries from one peer can
+        // interleave: merge N, merge N+1, then write N over N+1 — deleting the fresher rows. In
+        // memory the max still holds, so nothing looks wrong until a restart loads the stale
+        // column and this node's table root silently stops matching the fleet. Holding the lock
+        // serialises merge-and-persist into one step and closes that window. It also keeps a merge
+        // from landing between `arm_from_genesis`'s wipe and its save, which would re-insert a
+        // pre-genesis column that the epoch floor cannot remove because it loads straight off disk.
+        //
+        // This is a synchronous storage call, never an await, so it cannot park the mesh task.
         let mut table = self.table.lock();
         match ghost_consensus::shard_handler::apply_shard_epoch_summary(
             &mut table,
@@ -596,13 +631,41 @@ impl ShardRuntime {
         ) {
             Ok(()) => {
                 let column = table.accrued().get(&node).cloned().unwrap_or_default();
-                let root = table.compute_table_root();
-                drop(table);
+                let addresses = column.len();
+
+                // Persist the merged column, then the peer's signed summary.
+                //
+                // If either write fails the in-memory table is ahead of disk, and a restart loses
+                // this merge. That is "behind, never wrong": the counter is grow-only and the peer
+                // re-gossips a total that already contains this epoch, so the max restores it. The
+                // opposite ordering — disk ahead of memory — has no such recovery.
                 self.db
                     .shard_upsert_column(&node, &column, msg.summary.epoch)?;
+
+                // Retaining the peer's summary is what makes the chain and equivocation checks
+                // work AT ALL for the next epoch, and it is the evidence an accusation is made of
+                // (§6: a rejection must rest on publishable evidence, never private sampling
+                // luck). `published = true` because it is not ours to broadcast.
+                //
+                // A conflicting summary at the same (epoch, node) is REFUSED by the storage layer
+                // rather than overwritten — the held row is the evidence — so that error is
+                // surfaced as a rejection rather than swallowed.
+                if let Err(e) = self.db.shard_store_epoch(&msg.summary, true) {
+                    let root = table.compute_table_root();
+                    drop(table);
+                    return Ok(PeerMergeOutcome::Merged {
+                        addresses,
+                        table_root: root,
+                        summary_retained: Some(format!("{e}")),
+                    });
+                }
+
+                let root = table.compute_table_root();
+                drop(table);
                 Ok(PeerMergeOutcome::Merged {
-                    addresses: column.len(),
+                    addresses,
                     table_root: root,
+                    summary_retained: None,
                 })
             }
             Err(e) => Ok(PeerMergeOutcome::Rejected(format!("{e}"))),

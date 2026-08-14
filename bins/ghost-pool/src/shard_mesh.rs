@@ -14,14 +14,14 @@
 //!
 //! During a rolling cutover an armed node and a not-yet-armed one legitimately disagree — the
 //! epoch floor refuses pre-genesis epochs and the genesis marker refuses summaries produced under
-//! a different genesis. Both are *expected* traffic, not misbehaviour, so they are counted and
-//! logged at debug rather than raised. A roll is healthy when they stop, and reading them as
-//! failures during the window would be reading correct behaviour as a fault.
+//! a different genesis. Both are *expected* traffic, not misbehaviour, so they are logged at INFO
+//! rather than raised as errors. A roll is healthy when they STOP — which is only an actionable
+//! statement if they are visible at the level the fleet actually runs at.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use ghost_common::error::GhostResult;
 use ghost_consensus::mesh::MessageHandler;
@@ -62,18 +62,36 @@ impl ShardMeshHandler {
             PeerMergeOutcome::Merged {
                 addresses,
                 table_root,
+                summary_retained,
             } => {
-                debug!(
+                // INFO, not debug. The question the Stage 4 soak could not answer was "are
+                // summaries arriving and merging at all", and the fleet runs at info unless
+                // RUST_LOG says otherwise — logging the answer at debug would leave the wiring
+                // exactly as unobservable as the gap it was written to close.
+                info!(
                     epoch,
                     peer = %node,
                     addresses,
                     table_root = %hex::encode(&table_root[..8]),
                     "shard: merged a peer's epoch summary"
                 );
+                if let Some(why) = summary_retained {
+                    // The counter moved but the evidence did not. Next epoch's chain check for
+                    // this peer is blind, and a conflicting same-epoch summary is the storage
+                    // layer refusing to overwrite evidence — both are worth saying out loud.
+                    warn!(epoch, peer = %node, reason = %why,
+                          "shard: merged, but could NOT retain the peer's summary");
+                }
+            }
+            PeerMergeOutcome::SoloRefused => {
+                debug!(epoch, peer = %node, "shard: solo mode — peer summary not merged");
             }
             PeerMergeOutcome::OwnEcho => {}
             PeerMergeOutcome::Rejected(why) => {
-                debug!(epoch, peer = %node, reason = %why, "shard: peer summary refused");
+                // INFO for the same reason: during a rolling cutover the epoch floor and the
+                // genesis marker refuse peers legitimately, and "the roll is healthy when these
+                // stop" is only actionable if they are visible.
+                info!(epoch, peer = %node, reason = %why, "shard: peer summary refused");
             }
         }
         Ok(())
