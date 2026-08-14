@@ -4096,7 +4096,7 @@ async fn main() -> Result<()> {
                             // only record that it still needs sending. Left pending, it is picked
                             // up again on a later tick once a peer is reachable.
                             Ok(0) => {
-                                debug!(epoch, "shard: summary reached no peers — left pending")
+                                info!(epoch, "shard: summary reached no peers — left pending")
                             }
                             Ok(peers) => {
                                 // Marked ONLY after the send reached someone — the flag is the sole
@@ -4104,7 +4104,7 @@ async fn main() -> Result<()> {
                                 // optimistically would lose it silently.
                                 let _ = peers;
                                 match rt_c.mark_broadcast(epoch) {
-                                    Ok(true) => debug!(epoch, peers, "shard: summary broadcast"),
+                                    Ok(true) => info!(epoch, peers, "shard: summary broadcast"),
                                     Ok(false) => warn!(
                                         epoch,
                                         "shard: broadcast an epoch with no stored summary row"

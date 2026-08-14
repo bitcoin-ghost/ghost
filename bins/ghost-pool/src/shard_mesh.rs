@@ -17,6 +17,11 @@
 //! a different genesis. Both are *expected* traffic, not misbehaviour, so they are logged at INFO
 //! rather than raised as errors. A roll is healthy when they STOP — which is only an actionable
 //! statement if they are visible at the level the fleet actually runs at.
+//!
+//! The same reasoning applies to the SEND half in `main.rs`: raising only the receive logs left
+//! the fleet able to see summaries arriving but not leaving, which is half-blind in exactly the
+//! way this was meant to fix. "Did my summary go out?" and "did my peer's arrive?" are the two
+//! halves of one question and belong at the same level.
 
 use std::sync::Arc;
 
