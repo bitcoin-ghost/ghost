@@ -165,6 +165,91 @@ pub const MAX_GLYPH_CLAIM_SIZE: usize = 2_000;
 /// GhostGlyph registration (bitmap_hash + ghost_id + txid + timestamp)
 pub const MAX_GLYPH_REGISTERED_SIZE: usize = 1_000;
 
+// ─── Share-shard caps (docs/SHARE_SHARD.md) ──────────────────────────────────
+//
+// All three are DERIVED, not guessed — guessed caps are how #558 happened, and every derivation
+// below is pinned by a `shard_caps_*` test so the arithmetic cannot rot silently.
+//
+// The other half of the derivation is the ENVELOPE: `MessageEnvelope.payload` is `Vec<u8>`, which
+// serde_json writes as decimal integers — ~3.7x for the ASCII JSON these payloads are. A per-type
+// cap the 1 MB envelope cannot carry after that expansion is a message that validates locally and
+// never arrives, so every cap here must satisfy `cap * 4 + overhead <= MAX_ENVELOPE_SIZE`
+// (4 is the conservative ceiling of the measured ~3.1–3.7x).
+
+/// Share-shard epoch summary (`ShardEpochSummaryMessage`).
+///
+/// Per address row of `EpochSummary.deltas` as JSON:
+/// `"<addr>":{"delta_micro":N,"total_micro":N}` with a 62-byte bech32m address and two
+/// 19-digit i64s ≈ 135 bytes; budget 160 with separators. Address budget: 1,000 rows — the live
+/// fleet pays 4 distinct addresses and the design's whole NETWORK shard is "a few hundred rows"
+/// (§4.3), so 1,000 for a single node's single epoch is growth headroom, not a fit.
+/// Fixed fields (node_id as a 32-int array ~128, signature as a 64-int array ~256, hex root 66,
+/// epoch/count/keys ~150) ≈ 600.
+///
+///   1,000 rows × 160 + 600 ≈ 161 KB  →  cap 200 KB (~25% headroom)
+///   envelope: 200 KB × 4 = 800 KB ≤ 1 MB ✓
+pub const MAX_SHARD_SUMMARY_SIZE: usize = 200_000;
+
+/// Share-shard whole-table sync (`ShardTableSyncMessage`).
+///
+/// ⚠ A table sync is `nodes × addresses`, not addresses alone — it grows with fleet size in a
+/// way a summary does not. Per cell as JSON: `["<addr>",N]` ≈ 88 bytes worst case; per column
+/// ~110 bytes of node-id/wrapper overhead.
+///
+/// This cap is set by the ENVELOPE, not by a content budget: the largest raw payload the 1 MB
+/// envelope can deliver after the ~4x `Vec<u8>`-as-integers expansion is
+/// `(1,000,000 − 2,000) / 4 = 249,500`. That carries ≈ 2,800 cells — e.g. the 8-node fleet ×
+/// 350 addresses, or 20 nodes × 140 — against the design's own ~15 KB estimate (§4.4), ~16x
+/// headroom. Beyond ~3,000 cells (§10's 100-node × 500-address scenario is 50,000) a single
+/// §12.6 whole-table message CANNOT fit any envelope and the exchange needs pagination — flagged
+/// in the design review, deliberately not invented here.
+pub const MAX_SHARD_TABLE_SYNC_SIZE: usize = (MAX_ENVELOPE_SIZE - 2_000) / 4;
+
+/// Share-shard bad-share evidence (`ShardEvidenceMessage`).
+///
+/// Carries a whole `EpochSummary`, one share, and a Merkle path, so the cap is the SUM of what
+/// its parts are allowed to be — an evidence message must be able to carry ANY summary that
+/// itself passed `MAX_SHARD_SUMMARY_SIZE`, or the biggest liars would be the ones that cannot
+/// be reported:
+///
+///   summary ≤ 200,000, share ≤ 10,000 (`MAX_SHARE_PROOF_SIZE`), Merkle path ≤ 64 hashes
+///   × 70 hex-encoded = 4,480, reporter/signature/keys ≈ 1,000: together ≈ 215.5 KB
+///   →  cap 240 KB; envelope: 240 KB × 4 = 960 KB ≤ 1 MB ✓
+pub const MAX_SHARD_EVIDENCE_SIZE: usize = 240_000;
+
+/// The most leaf indices one `ShardSampleRequestMessage` may name.
+///
+/// The default sample is λ = 20 (§6/§9), so 4,096 is two orders of magnitude of headroom for
+/// deliberately heavier audits — while "audit EVERY leaf of a large epoch" is a paged exchange
+/// (several requests), not one message, exactly as §12.6 repair is.
+pub const MAX_SAMPLE_REQUEST_INDICES: usize = 4_096;
+
+/// Share-shard sample request (`ShardSampleRequestMessage`).
+///
+/// Per index as JSON: a u32 is ≤ 10 digits plus a separator = 11 bytes, so
+/// [`MAX_SAMPLE_REQUEST_INDICES`] × 11 = 45,056. Fixed fields: two hex node ids ≈ 68 each, hex
+/// root ≈ 68, epoch ≤ 20 digits, keys/braces ≈ 130 — together ≈ 350.
+///
+///   4,096 × 11 + 350 ≈ 45.4 KB  →  cap 50 KB (~10% headroom)
+///   envelope: 50 KB × 4 = 200 KB ≤ 1 MB ✓
+pub const MAX_SHARD_SAMPLE_REQUEST_SIZE: usize = 50_000;
+
+/// Share-shard sample response (`ShardSampleResponseMessage`).
+///
+/// Set by the ENVELOPE, like the table sync: `(1,000,000 − 2,000) / 4 = 249,500` is the largest
+/// raw payload the 1 MB envelope can deliver after the ~4x `Vec<u8>`-as-integers expansion.
+///
+/// What that carries, worst case per leaf — and a response must be able to serve ANY share that
+/// itself passed `MAX_SHARE_PROOF_SIZE`, or the biggest liars would be the ones that cannot be
+/// sampled: share ≤ 10,000, path ≤ 64 × 70 hex = 4,480, index/keys ≈ 120 → ≈ 14,600. Fixed
+/// fields (ids, root, signature, keys) ≈ 700. Guaranteed floor: (249,500 − 700) / 14,600 =
+/// **17 leaves of absolute-worst-case shares**, i.e. a default λ = 20 sample is NOT guaranteed
+/// to fit one message when every share is cap-sized — which is why the response contract allows
+/// answering a subset and the handler surfaces unanswered indices for a follow-up request. At
+/// the measured live share size (~1.3 KB JSON, path ≤ 20 hashes) a λ = 20 response is ≈ 56 KB,
+/// ~4.4x headroom.
+pub const MAX_SHARD_SAMPLE_RESPONSE_SIZE: usize = (MAX_ENVELOPE_SIZE - 2_000) / 4;
+
 /// L-13 SECURITY: Global pending message memory limit (100MB)
 ///
 /// This limits the total memory that can be consumed by pending messages
@@ -478,6 +563,14 @@ pub fn max_payload_size(msg_type: MessageType) -> usize {
         MessageType::MeshNodeListCheckpoint => MAX_PAYOUT_PROPOSAL_SIZE,
         MessageType::MeshNodeListCheckpointVote => MAX_VOTE_SIZE,
         MessageType::MeshNodeListCheckpointSync => MAX_PAYOUT_SYNC_SIZE,
+        // Share shard: each type has its own derived bound — see the constants for the
+        // arithmetic. A type that silently falls into someone else's bound is how a payload
+        // ends up rejected for a reason nobody wrote down.
+        MessageType::ShardEpochSummary => MAX_SHARD_SUMMARY_SIZE,
+        MessageType::ShardTableSync => MAX_SHARD_TABLE_SYNC_SIZE,
+        MessageType::ShardEvidence => MAX_SHARD_EVIDENCE_SIZE,
+        MessageType::ShardSampleRequest => MAX_SHARD_SAMPLE_REQUEST_SIZE,
+        MessageType::ShardSampleResponse => MAX_SHARD_SAMPLE_RESPONSE_SIZE,
         MessageType::L2TreeSync => MAX_L2_TREE_SYNC_SIZE,
         MessageType::L2ShieldBroadcast => 256, // ShieldCommitment: 32-byte commitment + u64 index + u64 height
         MessageType::GhostGlyphClaim => MAX_GLYPH_CLAIM_SIZE,
@@ -1025,6 +1118,268 @@ mod tests {
             "limit {} cannot carry a useful batch (one proof is ~{} bytes encoded)",
             max_payload_size(MessageType::ShareConvergence),
             one_proof
+        );
+    }
+
+    /// Every share-shard type resolves to its OWN derived bound, and the bound is enforced at
+    /// exactly the declared cap. A type that silently falls into someone else's bound is how a
+    /// payload ends up rejected for a reason nobody wrote down (#558).
+    #[test]
+    fn shard_caps_are_dedicated_and_enforced() {
+        let cases = [
+            (MessageType::ShardEpochSummary, MAX_SHARD_SUMMARY_SIZE),
+            (MessageType::ShardTableSync, MAX_SHARD_TABLE_SYNC_SIZE),
+            (MessageType::ShardEvidence, MAX_SHARD_EVIDENCE_SIZE),
+            (
+                MessageType::ShardSampleRequest,
+                MAX_SHARD_SAMPLE_REQUEST_SIZE,
+            ),
+            (
+                MessageType::ShardSampleResponse,
+                MAX_SHARD_SAMPLE_RESPONSE_SIZE,
+            ),
+        ];
+        for (msg_type, cap) in cases {
+            assert_eq!(
+                max_payload_size(msg_type),
+                cap,
+                "{msg_type:?} bound mismatch"
+            );
+            assert!(
+                validate_payload_size(msg_type, cap).is_ok(),
+                "{msg_type:?}: a payload AT the cap must pass"
+            );
+            assert!(
+                validate_payload_size(msg_type, cap + 1).is_err(),
+                "{msg_type:?}: one byte over the cap must be refused"
+            );
+        }
+    }
+
+    /// The other half of #558: `MessageEnvelope.payload` is `Vec<u8>`, serialised as decimal
+    /// integers (~3.7x for ASCII JSON), and the ENVELOPE has its own 1 MB cap. A per-type cap
+    /// the envelope cannot carry after expansion is a message that validates locally and never
+    /// arrives — the sender sees success, the receiver sees `TooLarge`, nobody sees why.
+    #[test]
+    fn shard_caps_survive_the_envelope_expansion() {
+        const CONSERVATIVE_EXPANSION: usize = 4; // ceiling of the measured ~3.1–3.7x
+        const ENVELOPE_OVERHEAD: usize = 2_000; // sender/signature/sequence/keys
+        for (name, cap) in [
+            ("summary", MAX_SHARD_SUMMARY_SIZE),
+            ("table sync", MAX_SHARD_TABLE_SYNC_SIZE),
+            ("evidence", MAX_SHARD_EVIDENCE_SIZE),
+            ("sample request", MAX_SHARD_SAMPLE_REQUEST_SIZE),
+            ("sample response", MAX_SHARD_SAMPLE_RESPONSE_SIZE),
+        ] {
+            assert!(
+                cap * CONSERVATIVE_EXPANSION + ENVELOPE_OVERHEAD <= MAX_ENVELOPE_SIZE,
+                "shard {name} cap {cap} cannot be delivered: {} bytes on the wire against the \
+                 {MAX_ENVELOPE_SIZE} envelope cap",
+                cap * CONSERVATIVE_EXPANSION + ENVELOPE_OVERHEAD
+            );
+        }
+    }
+
+    /// The summary cap is derived from a stated budget — 1,000 addresses, max-length bech32m,
+    /// i64-max values — so MEASURE that budget against the cap instead of trusting the comment's
+    /// arithmetic. If an encoding change inflates rows, this fails here rather than in the fleet.
+    #[test]
+    fn a_budgeted_worst_case_summary_fits_its_cap() {
+        use ghost_common::share_shard::{EpochDelta, EpochSummary};
+        use std::collections::BTreeMap;
+
+        let mut deltas = BTreeMap::new();
+        for i in 0..1_000u32 {
+            // 62-char addresses — the bech32m maximum.
+            let addr = format!("bc1q{:058}", i);
+            assert_eq!(addr.len(), 62);
+            deltas.insert(
+                addr,
+                EpochDelta {
+                    delta_micro: i64::MAX,
+                    total_micro: i64::MAX,
+                },
+            );
+        }
+        let msg = crate::message::ShardEpochSummaryMessage {
+            summary: EpochSummary {
+                epoch: u64::MAX,
+                node_id: [0xAB; 32],
+                deltas,
+                share_count: u32::MAX,
+                share_root: [0xCD; 32],
+                signature: vec![0xEE; 64],
+            },
+        };
+        let payload = serde_json::to_vec(&msg).expect("serialises");
+        assert!(
+            payload.len() <= MAX_SHARD_SUMMARY_SIZE,
+            "budgeted worst-case summary is {} bytes against the {MAX_SHARD_SUMMARY_SIZE} cap",
+            payload.len()
+        );
+    }
+
+    /// Same discipline for the table sync, whose payload is nodes × addresses — it grows with
+    /// fleet size in a way a summary does not. Budget: 8 nodes × 300 max-length addresses at
+    /// i64-max, i.e. today's fleet with ~75x the live payout-address count.
+    #[test]
+    fn a_budgeted_worst_case_table_sync_fits_its_cap() {
+        use crate::message::{ShardColumn, ShardTableSyncMessage};
+
+        let columns: Vec<ShardColumn> = (0..8u8)
+            .map(|n| ShardColumn {
+                node_id: [n; 32],
+                cells: (0..300u32)
+                    .map(|i| (format!("bc1q{:058}", i), i64::MAX))
+                    .collect(),
+            })
+            .collect();
+        let msg = ShardTableSyncMessage::Response {
+            responding_node: [0xAA; 32],
+            columns,
+            table_root: [0xBB; 32],
+            signature: vec![0xCC; 64],
+        };
+        let payload = serde_json::to_vec(&msg).expect("serialises");
+        assert!(
+            payload.len() <= MAX_SHARD_TABLE_SYNC_SIZE,
+            "budgeted worst-case table sync is {} bytes against the {MAX_SHARD_TABLE_SYNC_SIZE} cap",
+            payload.len()
+        );
+    }
+
+    /// An evidence message must be able to carry ANY summary that itself passed the summary
+    /// cap, plus a maximal share and Merkle path — otherwise the biggest liars are exactly the
+    /// ones that cannot be reported.
+    ///
+    /// Deliberately an assertion over constants: the RELATIONSHIP between the caps is the
+    /// invariant, and it must fail here if someone tunes one cap without the others.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_evidence_cap_can_carry_any_capped_summary() {
+        const MAX_MERKLE_PATH_BYTES: usize = 64 * 70; // 64 hashes, hex-encoded with quotes
+        const EVIDENCE_FIXED_OVERHEAD: usize = 1_000; // reporter, signature, index, keys
+        assert!(
+            MAX_SHARD_EVIDENCE_SIZE
+                >= MAX_SHARD_SUMMARY_SIZE
+                    + MAX_SHARE_PROOF_SIZE
+                    + MAX_MERKLE_PATH_BYTES
+                    + EVIDENCE_FIXED_OVERHEAD,
+            "evidence cap cannot carry a cap-sized summary plus its share and path"
+        );
+    }
+
+    /// The sample-request cap is derived from a stated budget — [`MAX_SAMPLE_REQUEST_INDICES`]
+    /// ten-digit indices plus the fixed fields — so MEASURE that budget against the cap instead
+    /// of trusting the comment's arithmetic.
+    #[test]
+    fn a_budgeted_worst_case_sample_request_fits_its_cap() {
+        use crate::message::ShardSampleRequestMessage;
+
+        let msg = ShardSampleRequestMessage {
+            epoch: u64::MAX,
+            target_node: [0xAB; 32],
+            share_root: [0xCD; 32],
+            // Every index at the ten-digit u32 maximum — the widest a legal index serialises.
+            leaf_indices: vec![u32::MAX; MAX_SAMPLE_REQUEST_INDICES],
+            requesting_node: [0xEF; 32],
+        };
+        let payload = serde_json::to_vec(&msg).expect("serialises");
+        assert!(
+            payload.len() <= MAX_SHARD_SAMPLE_REQUEST_SIZE,
+            "budgeted worst-case sample request is {} bytes against the \
+             {MAX_SHARD_SAMPLE_REQUEST_SIZE} cap",
+            payload.len()
+        );
+    }
+
+    /// Both halves of the sample-response derivation, measured:
+    ///
+    /// - the guaranteed floor — 17 leaves each carrying a CAP-SIZED share and a maximal path —
+    ///   must fit, or the biggest liars are exactly the ones that cannot be sampled;
+    /// - a realistic default sample — λ = 20 leaves at live share size — must fit comfortably,
+    ///   or the default exchange needs pagination on day one.
+    #[test]
+    fn a_budgeted_worst_case_sample_response_fits_its_cap() {
+        use crate::message::{ShardSampleLeaf, ShardSampleResponseMessage};
+        use ghost_common::types::ShareProof;
+
+        // A share padded to the single-share cap via its widest variable field. What matters is
+        // total serialised size, not field realism: the cap argument is byte arithmetic.
+        let cap_sized_share = |i: u32| {
+            let mut s = ShareProof {
+                round_id: u64::MAX,
+                miner_id: [0xAA; 32],
+                difficulty: f64::MAX,
+                work: f64::MAX,
+                share_hash: [i as u8; 32],
+                timestamp: u64::MAX,
+                received_by: [0xBB; 32],
+                template_id: Some([0xCC; 32]),
+                payout_address: Some(format!("bc1q{:058}", i)),
+                header: Some(vec![0xDD; 80]),
+                tier_log2: Some(u32::MAX),
+                signature: Some(vec![0xEE; 64]),
+            };
+            // Grow the header until the serialised share reaches MAX_SHARE_PROOF_SIZE.
+            let base = serde_json::to_vec(&s).expect("serialises").len();
+            let room = MAX_SHARE_PROOF_SIZE.saturating_sub(base);
+            // `Vec<u8>` serialises as decimal integers, ≤ 4 bytes per element ("255,").
+            s.header = Some(vec![0xDD; 80 + room / 4]);
+            let got = serde_json::to_vec(&s).expect("serialises").len();
+            assert!(
+                got <= MAX_SHARE_PROOF_SIZE && got > MAX_SHARE_PROOF_SIZE - 200,
+                "padding missed the single-share cap: {got}"
+            );
+            s
+        };
+
+        let worst = ShardSampleResponseMessage {
+            epoch: u64::MAX,
+            responding_node: [0xAB; 32],
+            share_root: [0xCD; 32],
+            leaves: (0..17u32)
+                .map(|i| ShardSampleLeaf {
+                    leaf_index: u32::MAX,
+                    share: cap_sized_share(i),
+                    merkle_proof: vec![[0xEF; 32]; 64],
+                })
+                .collect(),
+            signature: vec![0xFF; 64],
+        };
+        let payload = serde_json::to_vec(&worst).expect("serialises");
+        assert!(
+            payload.len() <= MAX_SHARD_SAMPLE_RESPONSE_SIZE,
+            "17 absolute-worst-case leaves are {} bytes against the \
+             {MAX_SHARD_SAMPLE_RESPONSE_SIZE} cap — the guaranteed floor is broken",
+            payload.len()
+        );
+
+        // The realistic default: λ = 20 live-sized shares (~1.2 KB proof blob measured on the
+        // fleet, 2026-08-12) with 20-hash paths (a million-leaf epoch).
+        let realistic = ShardSampleResponseMessage {
+            epoch: u64::MAX,
+            responding_node: [0xAB; 32],
+            share_root: [0xCD; 32],
+            leaves: (0..20u32)
+                .map(|i| {
+                    let mut share = cap_sized_share(i);
+                    share.header = Some(vec![0xDD; 80]);
+                    ShardSampleLeaf {
+                        leaf_index: i,
+                        share,
+                        merkle_proof: vec![[0xEF; 32]; 20],
+                    }
+                })
+                .collect(),
+            signature: vec![0xFF; 64],
+        };
+        let payload = serde_json::to_vec(&realistic).expect("serialises");
+        assert!(
+            payload.len() * 2 <= MAX_SHARD_SAMPLE_RESPONSE_SIZE,
+            "a realistic λ=20 response is {} bytes — over half the \
+             {MAX_SHARD_SAMPLE_RESPONSE_SIZE} cap, the default exchange has no headroom",
+            payload.len()
         );
     }
 

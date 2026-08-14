@@ -103,8 +103,9 @@ The gap is the coinbase and the ledger behind it. That is what this document spe
   │ merkle branch        │   │  bc1q…aa          41,203      │
   │  (once per JOB)      │   │  bc1q…7f          38,110      │
   │                      │   │  …                   …        │
-  │ ▸ DELETED each epoch │   │ ▸ KEPT — few hundred rows     │
-  │   = EVIDENCE         │   │   = STATE                     │
+  │ ▸ kept a SAMPLING    │   │ ▸ KEPT — few hundred rows     │
+  │   WINDOW, then gone  │   │   = STATE                     │
+  │   = EVIDENCE         │   │                               │
   └──────────────────────┘   └───────────────────────────────┘
 
 
@@ -137,8 +138,11 @@ The gap is the coinbase and the ledger behind it. That is what this document spe
       ▼             ▼             ▼
    NODE A        NODE B        NODE C
    read paid     read paid     read paid
-   subtract      subtract      subtract
-   drop history  drop history  drop history
+   → settled+    → settled+    → settled+
+   compact       compact       compact
+
+   settled only ever GOES UP. owed = Σaccrued − settled.
+   Nothing is ever subtracted from a counter — see §4.4.
 ```
 
 ### 4.1 Node sovereignty
@@ -168,7 +172,34 @@ epoch averages to zero across many blocks. A node having a quiet epoch is paid n
 ### 4.3 The two shards
 
 **Node shard** (mine, transient). My miners' shares: 80-byte header per share plus the merkle branch
-carried **once per job**. Deleted once the epoch is summarised. This is evidence, not state.
+carried **once per job**. This is evidence, not state.
+
+⚠ **Evidence retention is a sampling window, measured in epochs, and is independent of settlement.**
+Keep it `RETENTION_EPOCHS` — long enough that every peer has received the summary and had a fair
+chance to sample it — then drop it. Bounded by the epoch rate, which is steady.
+
+Two retentions that must not be confused:
+
+| | dropped when | driven by |
+|---|---|---|
+| **evidence** (shares) | `RETENTION_EPOCHS` after its summary | epoch rate — steady |
+| **counter history** | settlement + maturity depth | block discovery — unbounded |
+
+Tying evidence to settlement would be wrong in both directions: the pool has won **zero** blocks, so
+evidence would accumulate for ever and rebuild the O(shares) ledger this design exists to delete; and
+dropping it at summarisation instead would leave nothing for §6 to sample, so no peer could ever
+verify anyone.
+
+⚠ **Expiry must be publicly computable, or dropping old evidence looks like refusing to answer.**
+Because epochs are keyed to block height, any node derives the retention boundary from the chain it
+already holds — so "that epoch is past retention" is a fact both sides compute independently, not a
+claim one side makes. A requester should not ask beyond the boundary, and silence beyond it is
+**expected, never suspicious**.
+
+Get this wrong and an honest node that correctly dropped expired evidence is indistinguishable on the
+wire from one refusing to be audited — which turns a retention policy into a false-accusation engine.
+`RETENTION_EPOCHS` must therefore exceed the sampling window by a **stated margin**, so anything an
+honest requester could reasonably ask for is still held.
 
 **Network shard** (everyone's, permanent-until-rebase). Unpaid work per payout address. A few hundred
 rows. Never holds a share.
@@ -211,8 +242,9 @@ Merge is idempotent, commutative and associative, so:
 - **a missing message makes you behind, never wrong**
 - there is no state requiring repair
 
-Reconciliation is trivial because the shard is ~15 KB: ship the whole table and merge it. No diff
-protocol needed.
+Reconciliation needs no diff protocol at today's size — the shard is ~15 KB, so a peer can send the
+whole table and the receiver merges it. ⚠ That holds only while the table fits one message; see
+§12.6 for the ceiling and why detection must key on the root rather than the table.
 
 **Balances must be signed.** If node A overpays relative to node B's view, B's residual goes negative
 and the miner accrues back up from there. Clamping at zero destroys exactly the correction that makes
@@ -248,10 +280,40 @@ Settle at **coinbase maturity (100 blocks)**, never at the tip. The output is un
 so a shallower reorg unwinds the payment anyway and nothing needs undoing. Do not conflate this with
 the legacy tip−6 proposal anchor — different concern, different depth.
 
-Once a block is settled, that epoch's **node-shard evidence is dropped**. Both `accrued` and `settled`
-grow without bound in principle; compaction subtracts a common baseline from both at a chain-anchored
-height, so a node that missed it recomputes the same baseline from the chain it already holds and
-self-heals with no announcement. Compaction is not required for v1.
+Settlement compacts **counter history**, not evidence — evidence is on its own sampling-window clock
+(§4.3). Both `accrued` and `settled` grow without bound in principle; compaction subtracts a common
+baseline from both at a chain-anchored height, so a node that missed it recomputes the same baseline
+from the chain it already holds and self-heals with no announcement. Compaction is not required for
+v1.
+
+### 4.7 Reconciliation at scale — three tiers, not one message
+
+The whole-table exchange works today and breaks well before target scale (§12.6). It generalises
+cleanly because **a column is the natural unit**: each node writes only its own column, and columns
+merge independently by per-cell max.
+
+| tier | costs | answers |
+|---|---|---|
+| **1. table root** | 32 bytes, every epoch | *have we drifted at all?* |
+| **2. column digests** | 32 bytes × nodes | *whose column differs?* |
+| **3. column fetch** | one differing column | *repair it* |
+
+Tier 1 is the standing check and never grows. Tier 2 runs only when roots disagree: at 100 nodes it
+is 3.2 KB, at 1,000 nodes 32 KB — still comfortably one message, and it localises by **node** rather
+than by cell, so the cost tracks fleet size rather than address count. Tier 3 fetches only what
+actually differs.
+
+Two properties worth keeping:
+
+- **`compute_table_root` does not change.** Column digests sit alongside it, so the pinned golden
+  vector survives and detection stays exactly as it is today.
+- **Repair is idempotent.** A fetched column is merged by max like any other, so a redundant or
+  out-of-order repair is harmless — the same property that makes ordinary gossip safe.
+
+**The next ceiling, named rather than solved:** a single node whose own column exceeds one message
+(~2,800 cells) needs paging *within* a column, by address range. That is one operator with thousands
+of distinct payout addresses — far past anything the fleet resembles — but it is where this design
+runs out, and it should be written before it is needed rather than after.
 
 ## 5. Why this converges when the last one did not
 
@@ -275,11 +337,44 @@ What is structurally different:
 
 ## 6. Verification without heavy compute
 
-A node publishes a signed summary per epoch: per-address deltas plus a Merkle root over the
-network-tier shares backing them. Peers apply the deltas. **They do not receive the shares.**
+A node publishes a signed summary per epoch. Each address row carries **two** numbers:
 
-Peers randomly sample a handful of shares against the root. 20 random samples catch a node faking
-half its work with probability ~10⁻⁶.
+```
+   delta_micro   what this epoch's shares add        ← evidenced by the merkle root
+   total_micro   this node's running cumulative      ← this is what peers max-merge
+```
+
+⚠ **A delta cannot be max-merged.** Deltas are additive, and additive application needs
+exactly-once delivery, which gossip does not provide. Guarding with a per-node epoch watermark is
+worse — it silently *drops* an out-of-order epoch, breaking "behind, never wrong". Carrying the
+running total fixes it by construction: a later total already contains every earlier delta, so
+duplicate, stale and out-of-order delivery are all harmless.
+
+**Verification is layered**, and the two layers answer different questions:
+
+| always, before any merge | needs no shares |
+|---|---|
+| signature valid | — |
+| summary well-formed, deltas consistent with the stated root | — |
+| `total_micro == prev total_micro + delta_micro` against that node's own summary chain | — |
+
+| sampled, asynchronous | needs share evidence |
+|---|---|
+| random leaves pulled against the epoch's merkle root, each checked for PoW + GHOST-09 + binding | yes |
+
+20 random samples catch a node faking half its work with probability ~10⁻⁶.
+
+**A sample may be answered in parts.** A worst case of λ cap-sized shares does not fit one message
+(measured: ~17 guaranteed, against λ=20), so a subset response plus follow-ups is the contract, and
+unanswered indices are surfaced rather than forgiven. **Leaf selection must be unpredictable to the
+node being sampled** — derived from entropy the requester draws privately — or it precomputes which
+leaves to keep honest. Deriving the seed from anything the responder can compute (the summary hash,
+chain data, a fixed per-node seed) defeats the whole mechanism.
+
+⚠ **`total_micro` is not statelessly verifiable.** One epoch's evidence proves its delta, not the
+running total. A peer holding a node's *consecutive* summaries can check the chain; a peer joining
+mid-stream cannot, and takes the total on the signature until sampling says otherwise. That is the
+same trust surface as a table sync, and it is what the sampling layer exists to close.
 
 This is probabilistic, not proof — a deliberate trade. Full verification means shipping every share
 to everyone, which is the traffic being eliminated.
@@ -407,5 +502,13 @@ keep and expensive to recover from.
 4. **Rejections must be publishable evidence**, never private sampling luck (§6).
 5. **Never add a tolerance.** A tolerance is an admission that the mechanism cannot converge. If the
    numbers disagree, find out why.
-6. **Ship the whole table and compare it.** At ~15 KB there is no excuse for not knowing whether the
-   network has drifted. Drift must be visible the same day, not discovered a quarter later.
+6. **Compare roots every epoch; ship the table only to repair.** A 32-byte root answers "have we
+   drifted?" and costs nothing at any fleet size. Detection must be continuous and drift visible the
+   same day, not discovered a quarter later through a tolerance somebody added to stop the numbers
+   arguing.
+
+   ⚠ **Do not ship the whole table as the detection mechanism.** Measured while building the mesh
+   layer: the message envelope ceiling is ~2,800 cells once JSON expansion is accounted for. The
+   table is `nodes × addresses`, so §10's own 100-node × 500-address case is 50,000 cells ≈ 4.5 MB —
+   a whole-table message becomes impossible long before the network reaches target scale. Repair
+   pages by column — see §4.7.

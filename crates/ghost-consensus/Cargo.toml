@@ -70,3 +70,7 @@ optional = true
 
 [dev-dependencies]
 tempfile = "3.10"
+# Test-only: the REAL Merkle prover/verifier the shard handlers take by injection at the
+# call sites — same pattern as ghost-common, where a regular dependency would be a cycle
+# (ghost-reconciliation depends on ghost-common, which this crate re-exports types from).
+ghost-reconciliation = { workspace = true }

@@ -5,6 +5,33 @@ from the system as it stands to the design, and should be deleted once the cutov
 
 Written 2026-08-13. Target: v1 by **2026-08-31**.
 
+## Status — 2026-08-13
+
+**Stage 1 is complete and independently verified: 974 tests, 0 failures.** All of it is dark; the
+only thing wired into a running path so far is the `pool.share_shard` flag, which defaults false.
+
+| piece | where | state |
+|---|---|---|
+| counter core | `crates/ghost-common/src/share_shard.rs` | ✅ 428 tests |
+| storage + migration v53 | `crates/ghost-storage/src/shard_store.rs` | ✅ 219 tests |
+| mesh types + handlers | `crates/ghost-consensus/src/shard_handler.rs` | ✅ 327 tests |
+| §6 leaf sampling | same | ✅ included above |
+| `pool.share_shard` flag | `crates/ghost-common/src/config.rs` | ✅ committed, dark |
+| epoch runtime | `bins/ghost-pool/src/shard.rs` | 🔨 in progress |
+| `main.rs` wiring | 3 insertion points | 🔨 drafted, held until the runtime lands |
+
+**Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
+share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
+
+**Not started:** Stage 2 network-tier split (ship at R=1), Stage 3 coinbase source and settlement,
+Stage 5 genesis ceremony, Stage 6 deletion.
+
+⚠ **Eight design errors were found by *building* the design, none by re-reading it** — the counter
+double-payment, deltas not being max-mergeable, the §6/§12.3 contradiction, evidence retention on
+the wrong clock, the whole-table scaling ceiling, the merkle dependency direction, two spellings of
+one predicate, and expiry being indistinguishable from refusal. Assume the remaining stages hide
+more of the same, and prefer building a thin slice early over perfecting the document.
+
 ---
 
 ## The three facts that govern the whole plan
@@ -53,10 +80,16 @@ New `crates/ghost-common/src/share_shard.rs`, reusing `micro_work`, `canonical_s
 
 - Counter model exactly as `SHARE_SHARD.md` §4.4 — `accrued` grow-only per `(node, address)` merged
   by per-cell max, `settled` grow-only and chain-derived, `owed = Σaccrued − settled`, signed.
-- Epoch summary: `{epoch (height-keyed), node_id, per-address deltas, merkle root over the epoch's
-  network-tier share hashes, signature}`. Reuse the Merkle tree in `crates/ghost-reconciliation`
-  (the only one in the workspace with membership proofs — single SHA-256, never mix with Bitcoin's
-  sha256d trees). Sign with `NodeIdentity`; `node_id` **is** the pubkey, so no key distribution.
+- Epoch summary: `{epoch (height-keyed), node_id, per-address rows of (delta_micro, total_micro),
+  merkle root over the epoch's network-tier share hashes, signature}` — see `SHARE_SHARD.md` §6 for
+  why both numbers are needed. Sign with `NodeIdentity`; `node_id` **is** the pubkey, so no key
+  distribution.
+- ⚠ **The Merkle tree cannot be imported.** `ghost-reconciliation` depends on `ghost-common`, so a
+  direct call is a dependency cycle. Inject it as a plain `fn` pointer, to which
+  `ghost_reconciliation::compute_merkle_root` coerces, and use a **dev-dependency** (dev-dep cycles
+  are legal in Cargo) so tests can pin the real tree with a golden vector. That pin is load-bearing:
+  it trips if reconciliation's encoding ever changes underneath. Single SHA-256 — never mix it with
+  Bitcoin's sha256d trees.
 - Migration **v53, strictly additive**: `shard_counters`, `shard_settled`, `shard_epochs`. Key on
   `H(plaintext address)`, never the ciphertext — `encrypt_sensitive` draws a fresh nonce per call, so
   a ciphertext key can never be looked up. Leave all `sbc_*` tables alone.
@@ -97,6 +130,32 @@ New `crates/ghost-common/src/share_shard.rs`, reusing `micro_work`, `canonical_s
   Carry over the #601 credit-from-*mined*-outputs fix.
 - **Sampling verifier (λ = 20)** with `ShardEvidence` broadcast on failure. First thing to cut if
   time runs short — see below.
+
+### Where the epoch task actually goes (surveyed 2026-08-13, read from the code)
+
+This is the wiring that is deliberately **not** delegated — it is where this project has historically
+come unstuck, and it is three specific decisions:
+
+**1. Copy the tip−6 loop's shape — it is the thing being replaced.** `main.rs:3998`:
+`tokio::spawn` + `tokio::time::interval(30s)` + **`MissedTickBehavior::Skip`**. The `Skip` is
+load-bearing: without it a fold that runs long queues ticks and the backlog folds back-to-back
+against the same connection mutex that share ingest uses.
+
+**2. Detect the boundary cheaply where rounds already rotate; fold somewhere else.**
+`start_round(height)` sits in the `TemplateEvent::NewWork` handler (`main.rs:10101`), which fires on
+**every template refresh (~30 s), not per block**, and already persists era-boundary state — so the
+precedent for a small write there exists. Compare `epoch_for_height(height)` against the last epoch
+(an integer compare) and signal the epoch task. **Never fold inline here.**
+
+**3. Nothing heavy in the ZMQ path.** `publish_empty_template()` (`main.rs:9860`) must stay
+sub-second on a new block; that is what gives miners instant work at a tip change. The fold and its
+deletes never touch this path.
+
+Two invariants that follow from storage being one `Mutex<Connection>` shared with
+`insert_share_with_proof` (`main.rs:7882`): the fold's deletes must be **bounded batches**, and the
+fold must read its input **from the persisted shares table by height range**, never from an
+in-memory accumulator — the prior design lost 6,499 pending shares on a restart for exactly that
+reason.
 
 ## Stage 4 — canary dark soak
 
@@ -139,7 +198,9 @@ not a binary big-bang. That is what removes the need for a height gate *and* the
    defensible split. After the flip, the tip−6 propose loop and the GHOST-03 sweep switch off behind
    the same flag. *(The sweep has no config switch today; adding one is part of Stage 1.)*
 7. **Quarantine history, do not destroy it.** Rename `shares` to `shares_archive` and stop writing
-   payable state to it.
+   payable state to it. ⚠ **`shard_fold_epoch` deletes evidence from `shares`** — Stage 1 defines no
+   separate node-shard table, so the fold's DELETE target must move with the rename in the same
+   change, or evidence stops being collected the moment the table is renamed.
 
 **Rollback:** before step 6, per node — restore the `.bak` binary and flag off; the old machinery
 never stopped. After step 6 — flip the source and the loops back on; the old ledger resumes where it
@@ -207,6 +268,37 @@ it.
   "exactly one valid payout" property does not hold.
 - Sybil resistance for the node pool is a **precondition for opening the mesh**, not for cutover
   (`SHARE_SHARD.md` §10). The operator's position is that it is not yet complete and will be.
+
+**~~Which epoch does a share belong to?~~ SETTLED 2026-08-13 — bind via the round's recorded height.**
+
+```
+   epoch(share) = epoch_for_height( rounds[share.round_id].block_height )
+```
+
+No new machinery. `rounds.block_height` is `NOT NULL` and indexed (`idx_rounds_height`),
+`start_round(block_height)` stamps it on every rotation, every share carries `round_id`, and
+`epoch_for_height` is already in `share_shard.rs`. `first_round_at_or_above_height`
+(`queries.rs:2977`) is the inverse and is the same lookup #651 uses to derive the era boundary — so
+this reuses a mapping already proven in production rather than inventing one.
+
+Why the round's height and not the share timestamp: it is the height the share was mined *against*,
+which is the same era key the tier gate judges by, and it is chain-derived. Using the timestamp would
+reintroduce precisely the local-clock bug that made the old sweep's summaries incomparable (§12.2).
+
+Rounds rotate per template refresh (~30 s) so many rounds map to one height, and many heights map to
+one epoch. Many-to-one at each step is what makes the binding total and unambiguous.
+
+*(My call, derived from the code rather than an operator decision — override if you disagree.)*
+
+**Table-sync paging is unwritten.** The envelope ceiling is ~2,800 cells; the target scale is orders
+of magnitude past that (§12.6). Not needed for an 8-node fleet, so it is not a cutover blocker — but
+it *is* a precondition for the network growing, and it should be designed before anyone advertises
+that it can.
+
+**One spelling of the summary predicate.** `ShardTable::apply_summary` requires full share evidence,
+but a gossiped summary carries none (§6), so `shard_handler.rs` re-spells the structure-and-signature
+half. Add `EpochSummary::verify_stateless()` in `share_shard.rs` and have both call it — two spellings
+of one predicate drift apart, and the drift is silent.
 
 **Elder revocation** currently rides the payout vote machinery. With voting deleted it needs a
 standalone home or an explicit decision to drop.

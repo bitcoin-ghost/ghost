@@ -69,3 +69,7 @@ zmq = ["dep:tmq"]
 
 [dev-dependencies]
 tempfile = "3"
+# The epoch-summary Merkle tree is `ghost_reconciliation::compute_merkle_root`, injected at the
+# call sites because a regular dependency would be a cycle (ghost-reconciliation depends on this
+# crate). The dev-dependency lets the tests pin the REAL tree with a cross-crate golden vector.
+ghost-reconciliation = { workspace = true }
