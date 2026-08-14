@@ -4062,6 +4062,22 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 while let Some(summary) = shard_rx.recv().await {
                     let epoch = summary.epoch;
+                    // ⚠ Refuse to send at all if the Noise plane is absent.
+                    //
+                    // `broadcast` falls back to plaintext ZMQ for ANY message type when there is
+                    // no Noise pool, and returns Ok(1) — so the "zero peers is not success" guard
+                    // below could never fire, `mark_broadcast` would retire the pending flag, and
+                    // a summary whose delta map is KEYED BY PAYOUT ADDRESS would have gone out in
+                    // clear. Leaving it pending is strictly better: nothing leaks, and it sends
+                    // the moment Noise is up.
+                    if !mesh_c.noise_available() {
+                        warn!(
+                            epoch,
+                            "shard: Noise unavailable — summary NOT broadcast (payout addresses \
+                             must not go out in clear); staying pending"
+                        );
+                        continue;
+                    }
                     let bytes = match serde_json::to_vec(
                         &ghost_consensus::message::ShardEpochSummaryMessage { summary },
                     ) {

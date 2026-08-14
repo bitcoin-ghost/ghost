@@ -1785,6 +1785,20 @@ impl MeshNetwork {
 
     /// C-1: Check if a message type should use encrypted Noise channels
     ///
+    /// Whether the Noise plane is available at all.
+    ///
+    /// ⚠ `should_use_noise` returns FALSE when the pool is absent, for EVERY message type — and
+    /// `broadcast` then publishes on plaintext ZMQ and returns `Ok(1)`. That is deliberate for
+    /// Discovery and HealthPing, which must keep flowing so a node that aged out its peers can be
+    /// rediscovered. It is NOT acceptable for financial payloads: a caller that must not send in
+    /// clear cannot distinguish "sent to one peer over Noise" from "published in the clear to
+    /// nobody in particular", because both are `Ok(1)`.
+    ///
+    /// Callers carrying payout data check this FIRST and decline to send rather than leak.
+    pub fn noise_available(&self) -> bool {
+        self.noise_pool.is_some()
+    }
+
     /// Sensitive messages go over Noise TCP, broadcast messages stay on ZMQ.
     fn should_use_noise(&self, msg_type: MessageType) -> bool {
         if self.noise_pool.is_none() {
