@@ -12945,7 +12945,8 @@ mod tests {
         db.insert_share(&proofless).unwrap();
         // A damaged blob: counted, never silently dropped, never fatal.
         let (damaged, _) = shard_share(1, 0xB6, Some(12), ours, true, 57);
-        db.insert_share_with_proof(&damaged, b"not a proof").unwrap();
+        db.insert_share_with_proof(&damaged, b"not a proof")
+            .unwrap();
 
         let input = db.shard_epoch_shares(100, blocks, ours, 10).unwrap();
         assert_eq!(
@@ -12953,7 +12954,10 @@ mod tests {
             vec![0xA1, 0xA2],
             "exactly the own-received, valid, network-tier, provable shares"
         );
-        assert_eq!(input.below_tier, 2, "sub-tier and pre-gate shares are tallied");
+        assert_eq!(
+            input.below_tier, 2,
+            "sub-tier and pre-gate shares are tallied"
+        );
         assert_eq!(input.undecodable, 1, "a damaged blob is counted out loud");
     }
 

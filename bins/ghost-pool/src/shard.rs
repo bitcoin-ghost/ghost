@@ -18,13 +18,13 @@
 //!
 //! Nothing here spawns. The caller owns the schedule and calls three entry points:
 //!
-//! - [`ShardRuntime::note_height`] on the template-refresh path — an integer compare that
+//! - `ShardRuntime::note_height` on the template-refresh path — an integer compare that
 //!   reports an epoch boundary, and nothing else;
-//! - [`ShardRuntime::tick`] from the epoch task — folds closed epochs, bounded per call;
-//! - [`ShardRuntime::fold_epoch`] if a single epoch needs folding by hand.
+//! - `ShardRuntime::tick` from the epoch task — folds closed epochs, bounded per call;
+//! - `ShardRuntime::fold_epoch` if a single epoch needs folding by hand.
 //!
 //! Storage is a single `Mutex<Connection>` shared with share ingest, so every call does bounded
-//! work: a tick folds at most [`MAX_FOLDS_PER_TICK`] epochs, an epoch's input is bounded by the
+//! work: a tick folds at most `MAX_FOLDS_PER_TICK` epochs, an epoch's input is bounded by the
 //! epoch length, and evidence deletes are chunked inside the storage layer's one transaction.
 
 use std::collections::BTreeMap;
@@ -300,9 +300,12 @@ impl ShardRuntime {
             return Ok(FoldOutcome::AlreadyFolded);
         }
 
-        let input =
-            self.db
-                .shard_epoch_shares(epoch, EPOCH_BLOCKS, &self.received_by, NETWORK_TIER_LOG2)?;
+        let input = self.db.shard_epoch_shares(
+            epoch,
+            EPOCH_BLOCKS,
+            &self.received_by,
+            NETWORK_TIER_LOG2,
+        )?;
         if input.undecodable > 0 {
             warn!(
                 epoch,
@@ -324,13 +327,18 @@ impl ShardRuntime {
         // Each node writes only its own column (§4.4): the summary's totals continue this
         // node's column and nothing else.
         let prior: BTreeMap<String, i64> = table.accrued().get(&node).cloned().unwrap_or_default();
-        let summary =
-            EpochSummary::build(epoch, &self.identity, &prior, &evidence, compute_merkle_root)
-                .map_err(|e| {
-                    GhostError::Internal(format!(
-                        "share shard: epoch {epoch} evidence failed its own screen: {e}"
-                    ))
-                })?;
+        let summary = EpochSummary::build(
+            epoch,
+            &self.identity,
+            &prior,
+            &evidence,
+            compute_merkle_root,
+        )
+        .map_err(|e| {
+            GhostError::Internal(format!(
+                "share shard: epoch {epoch} evidence failed its own screen: {e}"
+            ))
+        })?;
 
         // The full post-fold column — the storage layer replaces, so it needs the whole truth.
         let mut column = prior;
@@ -411,7 +419,10 @@ impl ShardRuntime {
             NETWORK_TIER_LOG2,
         )?;
         let (evidence, _) = screen(input.shares);
-        Ok((Some(expired), evidence.iter().map(|s| s.share_hash).collect()))
+        Ok((
+            Some(expired),
+            evidence.iter().map(|s| s.share_hash).collect(),
+        ))
     }
 }
 
@@ -563,7 +574,10 @@ mod tests {
         // And across a restart: the summary row is the durable marker, so a fresh runtime
         // reaches the same verdict.
         let rt2 = ShardRuntime::load(identity, db, false, true).expect("reload");
-        assert_eq!(rt2.fold_epoch(100).expect("refold"), FoldOutcome::AlreadyFolded);
+        assert_eq!(
+            rt2.fold_epoch(100).expect("refold"),
+            FoldOutcome::AlreadyFolded
+        );
         assert_eq!(rt2.owed().get("bc1qalice"), Some(&micro_work(5.0)));
     }
 
@@ -576,15 +590,45 @@ mod tests {
         let (identity, db, rt) = runtime();
         let rx = our_received_by(&identity);
         seed_round(&db, 1, 602);
-        seed_share(&db, 1, 0xA1, "bc1qalice", 2.0, Some(NETWORK_TIER_LOG2), &rx, true);
-        seed_share(&db, 1, 0xB1, "bc1qalice", 2.0, Some(12), "eeff001122334455", true);
+        seed_share(
+            &db,
+            1,
+            0xA1,
+            "bc1qalice",
+            2.0,
+            Some(NETWORK_TIER_LOG2),
+            &rx,
+            true,
+        );
+        seed_share(
+            &db,
+            1,
+            0xB1,
+            "bc1qalice",
+            2.0,
+            Some(12),
+            "eeff001122334455",
+            true,
+        );
         seed_share(&db, 1, 0xB2, "bc1qalice", 2.0, Some(12), &rx, false);
-        seed_share(&db, 1, 0xB3, "bc1qalice", 2.0, Some(NETWORK_TIER_LOG2 - 1), &rx, true);
+        seed_share(
+            &db,
+            1,
+            0xB3,
+            "bc1qalice",
+            2.0,
+            Some(NETWORK_TIER_LOG2 - 1),
+            &rx,
+            true,
+        );
 
         let FoldOutcome::Folded(report) = rt.fold_epoch(100).expect("fold") else {
             panic!("must fold");
         };
-        assert_eq!(report.shares_folded, 1, "only the own, valid, network-tier share");
+        assert_eq!(
+            report.shares_folded, 1,
+            "only the own, valid, network-tier share"
+        );
         assert_eq!(report.below_tier, 1);
         assert_eq!(
             rt.owed().get("bc1qalice"),
@@ -675,7 +719,16 @@ mod tests {
         // Epochs 100..=106, one share each.
         for epoch in 100u64..=106 {
             seed_round(&db, epoch, epoch * 6);
-            seed_share(&db, epoch, epoch as u8, "bc1qminer", 2.0, Some(12), &rx, true);
+            seed_share(
+                &db,
+                epoch,
+                epoch as u8,
+                "bc1qminer",
+                2.0,
+                Some(12),
+                &rx,
+                true,
+            );
         }
 
         for epoch in 100u64..=105 {
@@ -721,7 +774,8 @@ mod tests {
         let identity = Arc::new(NodeIdentity::generate());
         let db = Arc::new(Database::in_memory().expect("db"));
         db.set_encryption_key([0x42u8; 32]);
-        let rt = ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), true, true).expect("load");
+        let rt =
+            ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), true, true).expect("load");
         let rx = our_received_by(&identity);
         seed_round(&db, 1, 602);
         seed_share(&db, 1, 0xA1, "bc1qsolo", 2.0, Some(12), &rx, true);
@@ -757,7 +811,16 @@ mod tests {
         let rx = our_received_by(&identity);
         for epoch in 100u64..=101 {
             seed_round(&db, epoch, epoch * 6);
-            seed_share(&db, epoch, epoch as u8, "bc1qminer", 2.0, Some(12), &rx, true);
+            seed_share(
+                &db,
+                epoch,
+                epoch as u8,
+                "bc1qminer",
+                2.0,
+                Some(12),
+                &rx,
+                true,
+            );
         }
 
         // First tick, inside epoch 100: the watermark initialises to the CURRENT epoch and
@@ -821,13 +884,22 @@ mod tests {
         db.set_encryption_key([0x42u8; 32]);
         // owns_evidence = false: the pre-cutover setting, and the only one that ships until
         // `shares` has been renamed out from under the legacy path.
-        let rt = ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), false, false)
-            .expect("load");
+        let rt =
+            ShardRuntime::load(Arc::clone(&identity), Arc::clone(&db), false, false).expect("load");
         let rx = our_received_by(&identity);
 
         for epoch in 100u64..=106 {
             seed_round(&db, epoch, epoch * 6);
-            seed_share(&db, epoch, epoch as u8, "bc1qminer", 2.0, Some(12), &rx, true);
+            seed_share(
+                &db,
+                epoch,
+                epoch as u8,
+                "bc1qminer",
+                2.0,
+                Some(12),
+                &rx,
+                true,
+            );
         }
         for epoch in 100u64..=105 {
             rt.fold_epoch(epoch).expect("fold");

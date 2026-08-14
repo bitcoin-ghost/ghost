@@ -1130,14 +1130,21 @@ mod tests {
             (MessageType::ShardEpochSummary, MAX_SHARD_SUMMARY_SIZE),
             (MessageType::ShardTableSync, MAX_SHARD_TABLE_SYNC_SIZE),
             (MessageType::ShardEvidence, MAX_SHARD_EVIDENCE_SIZE),
-            (MessageType::ShardSampleRequest, MAX_SHARD_SAMPLE_REQUEST_SIZE),
+            (
+                MessageType::ShardSampleRequest,
+                MAX_SHARD_SAMPLE_REQUEST_SIZE,
+            ),
             (
                 MessageType::ShardSampleResponse,
                 MAX_SHARD_SAMPLE_RESPONSE_SIZE,
             ),
         ];
         for (msg_type, cap) in cases {
-            assert_eq!(max_payload_size(msg_type), cap, "{msg_type:?} bound mismatch");
+            assert_eq!(
+                max_payload_size(msg_type),
+                cap,
+                "{msg_type:?} bound mismatch"
+            );
             assert!(
                 validate_payload_size(msg_type, cap).is_ok(),
                 "{msg_type:?}: a payload AT the cap must pass"

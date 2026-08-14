@@ -2882,7 +2882,11 @@ mod tests {
             ),
         ];
         for (msg_type, topic, expected) in cases {
-            assert_eq!(msg_type.topic(), topic, "{msg_type:?} topic constant mismatch");
+            assert_eq!(
+                msg_type.topic(),
+                topic,
+                "{msg_type:?} topic constant mismatch"
+            );
             assert_eq!(
                 msg_type.topic_str(),
                 expected,

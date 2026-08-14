@@ -305,11 +305,8 @@ impl EpochSummary {
             .iter()
             .map(|(addr, row)| (addr, row.delta_micro))
             .collect();
-        let folded: BTreeMap<&String, i64> = screened
-            .folded
-            .iter()
-            .map(|(addr, &v)| (addr, v))
-            .collect();
+        let folded: BTreeMap<&String, i64> =
+            screened.folded.iter().map(|(addr, &v)| (addr, v)).collect();
         if declared != folded {
             return Err(SummaryRejection::DeltaMismatch);
         }
@@ -648,26 +645,38 @@ mod tests {
             &BTreeMap::new(),
             vec![share(10, 1, "bc1qalice", 3.0), share(11, 2, "bc1qbob", 1.0)],
         );
-        let a_col: BTreeMap<String, i64> =
-            a1.deltas.iter().map(|(k, r)| (k.clone(), r.total_micro)).collect();
+        let a_col: BTreeMap<String, i64> = a1
+            .deltas
+            .iter()
+            .map(|(k, r)| (k.clone(), r.total_micro))
+            .collect();
         let (a2, a2_ev) = summarise(2, &a, &a_col, vec![share(20, 3, "bc1qalice", 2.0)]);
 
         let (b1, b1_ev) = summarise(1, &b, &BTreeMap::new(), vec![share(12, 4, "bc1qbob", 5.0)]);
-        let b_col: BTreeMap<String, i64> =
-            b1.deltas.iter().map(|(k, r)| (k.clone(), r.total_micro)).collect();
+        let b_col: BTreeMap<String, i64> = b1
+            .deltas
+            .iter()
+            .map(|(k, r)| (k.clone(), r.total_micro))
+            .collect();
         let (b2, b2_ev) = summarise(2, &b, &b_col, vec![share(21, 5, "bc1qcarol", 4.0)]);
 
         // The reference: one clean in-order application.
         let mut reference = ShardTable::new();
         for (s, ev) in [(&a1, &a1_ev), (&a2, &a2_ev), (&b1, &b1_ev), (&b2, &b2_ev)] {
-            reference.apply_summary(s, ev, compute_merkle_root).expect("verifies");
+            reference
+                .apply_summary(s, ev, compute_merkle_root)
+                .expect("verifies");
         }
         let reference_root = reference.compute_table_root();
 
         // A stale partial snapshot (epoch 1 only) that keeps being re-advertised.
         let mut stale = ShardTable::new();
-        stale.apply_summary(&a1, &a1_ev, compute_merkle_root).expect("verifies");
-        stale.apply_summary(&b1, &b1_ev, compute_merkle_root).expect("verifies");
+        stale
+            .apply_summary(&a1, &a1_ev, compute_merkle_root)
+            .expect("verifies");
+        stale
+            .apply_summary(&b1, &b1_ev, compute_merkle_root)
+            .expect("verifies");
 
         let mut rng = Lcg(0x5AAD);
         for _ in 0..100 {
@@ -678,10 +687,18 @@ mod tests {
             let mut table = ShardTable::new();
             for op in ops {
                 match op {
-                    0 => table.apply_summary(&a1, &a1_ev, compute_merkle_root).map(|_| ()),
-                    1 => table.apply_summary(&a2, &a2_ev, compute_merkle_root).map(|_| ()),
-                    2 => table.apply_summary(&b1, &b1_ev, compute_merkle_root).map(|_| ()),
-                    3 => table.apply_summary(&b2, &b2_ev, compute_merkle_root).map(|_| ()),
+                    0 => table
+                        .apply_summary(&a1, &a1_ev, compute_merkle_root)
+                        .map(|_| ()),
+                    1 => table
+                        .apply_summary(&a2, &a2_ev, compute_merkle_root)
+                        .map(|_| ()),
+                    2 => table
+                        .apply_summary(&b1, &b1_ev, compute_merkle_root)
+                        .map(|_| ()),
+                    3 => table
+                        .apply_summary(&b2, &b2_ev, compute_merkle_root)
+                        .map(|_| ()),
                     4 => {
                         table.merge_accrued(stale.accrued());
                         Ok(())
@@ -722,7 +739,9 @@ mod tests {
         );
 
         let mut table = ShardTable::new();
-        table.apply_summary(&s1, &ev1, compute_merkle_root).expect("verifies");
+        table
+            .apply_summary(&s1, &ev1, compute_merkle_root)
+            .expect("verifies");
         assert_eq!(table.owed().get("bc1qmirror"), Some(&100_000_000));
 
         // D's view of the world, snapshotted before the block lands.
@@ -736,7 +755,9 @@ mod tests {
         // D comes back and re-advertises everything it holds: the old table, the old summary,
         // both more than once. None of it may move `owed` upward.
         table.merge_accrued(&pre_settlement);
-        table.apply_summary(&s1, &ev1, compute_merkle_root).expect("still verifies");
+        table
+            .apply_summary(&s1, &ev1, compute_merkle_root)
+            .expect("still verifies");
         table.merge_accrued(&pre_settlement);
 
         assert_eq!(
@@ -949,7 +970,9 @@ mod tests {
         assert_eq!(table.compute_table_root(), untouched);
 
         // And the sane summary still lands, so the gate is a gate, not a wall.
-        table.apply_summary(&good, &evidence, compute_merkle_root).expect("verifies");
+        table
+            .apply_summary(&good, &evidence, compute_merkle_root)
+            .expect("verifies");
         assert_ne!(table.compute_table_root(), untouched);
     }
 
@@ -1034,7 +1057,11 @@ mod tests {
         // The signature is over the bytes, so it cannot be inside them.
         let mut m = base.clone();
         m.signature = vec![0xEE; 64];
-        assert_eq!(bytes, m.signing_bytes(), "signing the signature would be circular");
+        assert_eq!(
+            bytes,
+            m.signing_bytes(),
+            "signing the signature would be circular"
+        );
     }
 
     /// Evidence is screened before anything is derived from it: duplicated hashes would
@@ -1049,8 +1076,7 @@ mod tests {
         // Same share twice: same hash, double the credit.
         let duplicated = vec![good[0].clone(), good[0].clone()];
         assert_eq!(
-            EpochSummary::build(3, &id, &BTreeMap::new(), &duplicated, compute_merkle_root)
-                .err(),
+            EpochSummary::build(3, &id, &BTreeMap::new(), &duplicated, compute_merkle_root).err(),
             Some(SummaryRejection::DuplicateEvidence)
         );
 

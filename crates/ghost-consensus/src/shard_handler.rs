@@ -386,8 +386,7 @@ pub fn verify_shard_evidence(
         .as_slice()
         .try_into()
         .map_err(|_| ShardEvidenceRejection::BadAccusedSignature)?;
-    if !verify_signature(&summary.node_id, &summary.signing_bytes(), &accused_sig)
-        .unwrap_or(false)
+    if !verify_signature(&summary.node_id, &summary.signing_bytes(), &accused_sig).unwrap_or(false)
     {
         return Err(ShardEvidenceRejection::BadAccusedSignature);
     }
@@ -451,7 +450,11 @@ impl SampleStream {
         h.update(self.counter.to_le_bytes());
         self.counter += 1;
         let digest = h.finalize();
-        u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 digests hold 32 bytes"))
+        u64::from_le_bytes(
+            digest[..8]
+                .try_into()
+                .expect("SHA-256 digests hold 32 bytes"),
+        )
     }
 
     /// Uniform draw in `[0, m)`, `m ≥ 1`.
@@ -499,11 +502,7 @@ impl SampleStream {
 /// binding mixed into the stream below is defence in depth against the reuse case (one leaked
 /// seed does not replay the same pattern across epochs or targets); it is NOT a substitute for
 /// fresh private entropy, because the responder knows its own summary.
-pub fn select_sample_indices(
-    summary: &EpochSummary,
-    lambda: u32,
-    entropy: &[u8; 32],
-) -> Vec<u32> {
+pub fn select_sample_indices(summary: &EpochSummary, lambda: u32, entropy: &[u8; 32]) -> Vec<u32> {
     use sha2::Digest;
 
     let n = summary.share_count;
@@ -809,8 +808,12 @@ mod tests {
     #[test]
     fn all_three_shard_messages_round_trip_through_serde() {
         let id = identity();
-        let (summary, evidence) =
-            summarise(3, &id, &BTreeMap::new(), vec![share(10, 1, "bc1qalice", 2.0)]);
+        let (summary, evidence) = summarise(
+            3,
+            &id,
+            &BTreeMap::new(),
+            vec![share(10, 1, "bc1qalice", 2.0)],
+        );
 
         // Summary message.
         let msg = ShardEpochSummaryMessage {
@@ -852,10 +855,13 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&resp).expect("serialises"))
                 .expect("deserialises");
         let mut fresh = ShardTable::new();
-        let outcome =
-            apply_table_sync_response(&mut fresh, &resp_back).expect("round-tripped response applies");
+        let outcome = apply_table_sync_response(&mut fresh, &resp_back)
+            .expect("round-tripped response applies");
         assert_eq!(fresh.accrued(), table.accrued());
-        assert!(outcome.roots_match, "identical tables must report matching roots");
+        assert!(
+            outcome.roots_match,
+            "identical tables must report matching roots"
+        );
 
         // Evidence message.
         let proof = compute_merkle_proof(&[evidence[0].share_hash], 0);
@@ -893,7 +899,9 @@ mod tests {
         let mut table = ShardTable::new();
         apply_shard_epoch_summary(
             &mut table,
-            &ShardEpochSummaryMessage { summary: s1.clone() },
+            &ShardEpochSummaryMessage {
+                summary: s1.clone(),
+            },
             None,
             None,
             compute_merkle_root,
@@ -903,7 +911,9 @@ mod tests {
 
         apply_shard_epoch_summary(
             &mut table,
-            &ShardEpochSummaryMessage { summary: s2.clone() },
+            &ShardEpochSummaryMessage {
+                summary: s2.clone(),
+            },
             Some(&s1),
             None,
             compute_merkle_root,
@@ -938,11 +948,7 @@ mod tests {
         let (good, _) = summarise(1, &a, &BTreeMap::new(), evidence.clone());
 
         let mut forged = good.clone();
-        forged
-            .deltas
-            .get_mut("bc1qalice")
-            .expect("row")
-            .total_micro = i64::MAX / 2;
+        forged.deltas.get_mut("bc1qalice").expect("row").total_micro = i64::MAX / 2;
 
         let mut table = ShardTable::new();
         table.accrue([0x77; 32], "bc1qcarol", 42);
@@ -998,7 +1004,12 @@ mod tests {
     #[test]
     fn chain_breaks_and_equivocation_are_refused_before_any_merge() {
         let a = identity();
-        let (s1, _) = summarise(1, &a, &BTreeMap::new(), vec![share(10, 1, "bc1qalice", 3.0)]);
+        let (s1, _) = summarise(
+            1,
+            &a,
+            &BTreeMap::new(),
+            vec![share(10, 1, "bc1qalice", 3.0)],
+        );
 
         // Epoch 2 signed over a total that skips ahead of the chain by 1 micro.
         let mut inflated_prior = column_of(&s1);
@@ -1008,7 +1019,9 @@ mod tests {
         let mut table = ShardTable::new();
         apply_shard_epoch_summary(
             &mut table,
-            &ShardEpochSummaryMessage { summary: s1.clone() },
+            &ShardEpochSummaryMessage {
+                summary: s1.clone(),
+            },
             None,
             None,
             compute_merkle_root,
@@ -1045,7 +1058,9 @@ mod tests {
         // An identical re-delivery of the held epoch is NOT equivocation — merge is idempotent.
         apply_shard_epoch_summary(
             &mut table,
-            &ShardEpochSummaryMessage { summary: s1.clone() },
+            &ShardEpochSummaryMessage {
+                summary: s1.clone(),
+            },
             Some(&s1),
             None,
             compute_merkle_root,
@@ -1120,11 +1135,7 @@ mod tests {
         // signer is misbehaving, and non-canonical form must never reach the merge.
         let mut disordered = columns.clone();
         disordered[0].cells.reverse();
-        let signed = shard_table_sync_signing_bytes(
-            &server.node_id(),
-            &disordered,
-            &table_root,
-        );
+        let signed = shard_table_sync_signing_bytes(&server.node_id(), &disordered, &table_root);
         let bad_form = ShardTableSyncMessage::Response {
             responding_node: server.node_id(),
             columns: disordered,
@@ -1301,7 +1312,10 @@ mod tests {
             picked.windows(2).all(|w| w[0] < w[1]),
             "indices must be strictly ascending — sorted AND without replacement"
         );
-        assert!(picked.iter().all(|&i| i < 1_000), "an index escaped the tree");
+        assert!(
+            picked.iter().all(|&i| i < 1_000),
+            "an index escaped the tree"
+        );
         assert_eq!(
             picked,
             select_sample_indices(&summary, 20, &entropy),
@@ -1479,8 +1493,7 @@ mod tests {
         let mut tampered = good.clone();
         tampered.leaves[0].leaf_index = request.leaf_indices[1];
         assert_eq!(
-            check(&tampered)
-            .unwrap_err(),
+            check(&tampered).unwrap_err(),
             ShardSampleRejection::BadResponderSignature
         );
 
@@ -1507,8 +1520,7 @@ mod tests {
         let mut other_tree = good.clone();
         other_tree.share_root = [0xEE; 32];
         assert_eq!(
-            check(&other_tree)
-            .unwrap_err(),
+            check(&other_tree).unwrap_err(),
             ShardSampleRejection::ResponseSummaryMismatch
         );
 
@@ -1583,7 +1595,11 @@ mod tests {
             vec![request.leaf_indices[2]],
             "an unserved requested leaf must be surfaced, not forgiven"
         );
-        assert_eq!(outcome.evidence.len(), 2, "one broadcast per bad committed leaf");
+        assert_eq!(
+            outcome.evidence.len(),
+            2,
+            "one broadcast per bad committed leaf"
+        );
 
         for (ev, &idx) in outcome.evidence.iter().zip(&request.leaf_indices[..2]) {
             assert_eq!(ev.leaf_index, idx);

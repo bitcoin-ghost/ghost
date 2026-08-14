@@ -731,11 +731,18 @@ mod tests {
         assert!(db.shard_get_epoch(6, &node).expect("get").is_none());
 
         // Published is a flag on the stored row, not part of the summary.
-        assert_eq!(db.shard_epoch_published(5, &node).expect("flag"), Some(false));
+        assert_eq!(
+            db.shard_epoch_published(5, &node).expect("flag"),
+            Some(false)
+        );
         assert!(db.shard_mark_epoch_published(5, &node).expect("mark"));
-        assert_eq!(db.shard_epoch_published(5, &node).expect("flag"), Some(true));
+        assert_eq!(
+            db.shard_epoch_published(5, &node).expect("flag"),
+            Some(true)
+        );
         assert!(
-            !db.shard_mark_epoch_published(6, &node).expect("mark missing"),
+            !db.shard_mark_epoch_published(6, &node)
+                .expect("mark missing"),
             "marking an epoch that was never stored must say so"
         );
 
@@ -748,11 +755,17 @@ mod tests {
         db.shard_store_epoch(&peer_summary, false)
             .expect("a peer's summary at the same epoch must coexist, not collide");
         assert_eq!(
-            db.shard_get_epoch(5, &peer).expect("get").expect("present").share_root,
+            db.shard_get_epoch(5, &peer)
+                .expect("get")
+                .expect("present")
+                .share_root,
             [0x66; 32]
         );
         assert_eq!(
-            db.shard_get_epoch(5, &node).expect("get").expect("present").share_root,
+            db.shard_get_epoch(5, &node)
+                .expect("get")
+                .expect("present")
+                .share_root,
             [0x44; 32],
             "storing a peer's summary must not disturb our own"
         );
