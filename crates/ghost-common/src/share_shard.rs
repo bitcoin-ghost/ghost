@@ -87,6 +87,152 @@ const _: () = assert!(
     "RETENTION_EPOCHS must be at least twice SAMPLING_WINDOW_EPOCHS"
 );
 
+/// The tier floor a share must have committed to before its work crosses the mesh.
+///
+/// Stage 2 ships **R = 1**: defined as the vardiff floor, so every share that exists today is
+/// network tier and behaviour is byte-for-byte what it is now. Raising R later is a coordinated
+/// roll of this one constant, and it divides mesh traffic, verification compute and memory by R
+/// simultaneously.
+///
+/// Defined in terms of `MIN_DIFFICULTY_TIER_LOG2` rather than repeating its value, because the
+/// coupling to the vardiff floor is real and was previously documented but unenforced — a floor
+/// that moved without this moving would silently drop every share between the two.
+///
+/// Baked into the binary, NEVER read from local config. A node-local value in an eligibility test
+/// is exactly how M-6 split the fleet: validity must be a pure function of the share (§12.1).
+pub const NETWORK_TIER_LOG2: u32 = crate::coinbase_tags::MIN_DIFFICULTY_TIER_LOG2;
+
+/// Whether a share crosses the mesh under the network-tier rule.
+///
+/// ⚠ **A share with no tier is NOT refused.** `tier_log2` is `None` only for shares mined before
+/// the tier gate, and a share must be judged by the rules of the era it was mined in — the lesson
+/// that cost four days and a fleet-wide quarantine when a height-derived predicate was applied to
+/// shares of every era at once. Refusing them here would be M-6 all over again: a receive-side
+/// check rejecting what a peer legitimately sent, deterministically, for ever, which no amount of
+/// retransmission can fix.
+///
+/// Pre-gate shares are excluded from the shard by a different route — the fold's input query
+/// requires a tier — so letting them cross the mesh costs nothing and keeps the legacy ledger
+/// whole.
+///
+/// One spelling, called by the send side and the receive side both. Two copies of a gossip
+/// predicate that disagree is a partition that looks like a bug in something else.
+pub fn crosses_network_tier(tier_log2: Option<u32>) -> bool {
+    match tier_log2 {
+        Some(tier) => tier >= NETWORK_TIER_LOG2,
+        None => true,
+    }
+}
+
+/// What a miner-pool distribution came to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MinerPayouts {
+    /// `(payout address, satoshis)`, in the order the coinbase should carry them.
+    pub payouts: Vec<(String, u64)>,
+    /// Satoshis that fell below the dust threshold. These are NOT lost — the existing coinbase
+    /// builder rolls miner dust into the node reward pool, and that behaviour is preserved.
+    pub dust_sats: u64,
+    /// Floor-division leftover. Tracked rather than discarded so a caller can assert that every
+    /// satoshi is accounted for; silently dropping it is how a pool leaks money slowly.
+    pub remainder_sats: u64,
+}
+
+/// Distribute a miner pool over the shard's owed balances.
+///
+/// This deliberately mirrors the live `calculate_miner_payouts` **exactly** — same descending
+/// sort with an ascending tie-break, same truncation before the total is recomputed, same floor
+/// division, same dust rule. It has to: this function exists first to be *compared* against the
+/// live path, and any arithmetic difference would make every shadow diff non-zero for reasons that
+/// have nothing to do with drift, which would make the soak signal worthless.
+///
+/// One intended difference: the shard is keyed on **payout address**, where the live path keys on
+/// miner id and resolves an address afterwards. Two miners paying to one address are one row here.
+/// That is the address grouping the design wants, not a discrepancy.
+///
+/// Balances that are zero or **negative** take no part. A negative `owed` means that address has
+/// been overpaid relative to this node's view (§4.4) and is working the debt off; paying it again
+/// would be paying twice for the same work.
+///
+/// Integer arithmetic throughout, in `u128`, because this decides who gets paid what and a float
+/// would make the answer depend on the order the additions happened to be done in.
+pub fn shard_miner_payouts(
+    owed: &BTreeMap<String, i64>,
+    pool_sats: u64,
+    max_outputs: usize,
+    dust_threshold_sats: u64,
+) -> MinerPayouts {
+    let mut out = MinerPayouts::default();
+
+    let mut positive: Vec<(&String, u128)> = owed
+        .iter()
+        .filter(|(_, &micro)| micro > 0)
+        .map(|(addr, &micro)| (addr, micro as u128))
+        .collect();
+    if positive.is_empty() || pool_sats == 0 {
+        out.remainder_sats = pool_sats;
+        return out;
+    }
+
+    // Descending by owed, ascending by address on a tie.
+    //
+    // ⚠ The tie-break is LATENT, not load-bearing, and no test can kill it today: the input is a
+    // `BTreeMap`, so it already arrives address-ascending, and a stable sort preserves that even
+    // without the `then_with`. It is defence against the input type changing to something
+    // unordered — a `Vec` or a `HashMap` — at which point the result would start depending on the
+    // caller's iteration order and two nodes with identical balances could build different
+    // coinbases. The live path carries the same latency, documented there as M-8.
+    positive.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    positive.truncate(max_outputs);
+
+    // Recomputed AFTER truncation, exactly as the live path does — the pool is shared among those
+    // actually paid, not diluted by addresses that did not make the cut.
+    let top: u128 = positive.iter().map(|(_, w)| *w).sum();
+    if top == 0 {
+        out.remainder_sats = pool_sats;
+        return out;
+    }
+
+    let mut allocated: u64 = 0;
+    for (addr, work) in positive {
+        let amount = ((pool_sats as u128 * work) / top) as u64;
+        allocated = allocated.saturating_add(amount);
+        if amount < dust_threshold_sats {
+            out.dust_sats = out.dust_sats.saturating_add(amount);
+            continue;
+        }
+        out.payouts.push((addr.clone(), amount));
+    }
+    out.remainder_sats = pool_sats.saturating_sub(allocated);
+    out
+}
+
+/// Convert satoshis a matured coinbase actually paid into the micro-work they discharge.
+///
+/// `accrued` and `settled` are micro-work; a coinbase pays satoshis. Discharging a payment means
+/// converting at the rate the payment was computed under: the miner pool was shared out in
+/// proportion to owed work, so `sats : pool_sats` is the same ratio as `discharged : top_work`.
+///
+/// ⚠ **`top_work` is the paying node's own view**, so two nodes whose tables differ by gossip lag
+/// discharge slightly different amounts for the same block. That is deterministic-given-a-table,
+/// not identical-across-nodes, and §4.6 previously overclaimed it. It is safe because [`owed`] is
+/// signed and never clamped: discharge too much and the residual goes negative and accrues back
+/// up; too little and the next block pays it. The differences wash out exactly as payment
+/// differences do.
+///
+/// Returns 0 when the pool is empty — a block that paid miners nothing discharges nothing, rather
+/// than dividing by zero or silently discharging everything.
+///
+/// [`owed`]: ShardTable::owed
+pub fn discharged_micro_work(paid_sats: u64, pool_sats: u64, top_work: i64) -> i64 {
+    if pool_sats == 0 || top_work <= 0 || paid_sats == 0 {
+        return 0;
+    }
+    // u128 throughout: top_work is micro-work across the whole pool and paid_sats is satoshis, so
+    // the product overflows u64 long before either value is unreasonable.
+    let discharged = (paid_sats as u128).saturating_mul(top_work as u128) / pool_sats as u128;
+    discharged.min(i64::MAX as u128) as i64
+}
+
 /// Which epoch a block height falls in.
 ///
 /// Height-keyed and nothing else (§12.2). The previous design keyed windows to each node's local
@@ -617,6 +763,158 @@ mod tests {
 
     /// Epochs come from block height and an epoch length, nothing else — never wall-clock
     /// (§12.2). Same height, same epoch, on any node at any time of day.
+    #[test]
+    fn a_share_with_no_tier_crosses_the_mesh_unrefused() {
+        // The failure being pinned is M-6's shape, and M-6 ran at 2,000-2,900 rejections an hour
+        // on every node: a receive-side check that deterministically refuses what a peer
+        // legitimately sent. Retransmission never fixes it, because the rejection is a function of
+        // the share itself, so the two ledgers simply diverge for ever.
+        //
+        // `None` means the share predates the tier gate. It must be judged by the rules of its own
+        // era, not by one armed after it was mined.
+        assert!(
+            crosses_network_tier(None),
+            "a pre-gate share must not be refused by a rule that did not exist when it was mined"
+        );
+
+        // At R = 1 the floor is the vardiff floor, so everything real crosses and the mechanism
+        // ships inert — which is what makes raising R later a one-constant roll rather than a
+        // behaviour change on the money path.
+        assert!(crosses_network_tier(Some(NETWORK_TIER_LOG2)));
+        assert!(crosses_network_tier(Some(NETWORK_TIER_LOG2 + 4)));
+        assert!(
+            !crosses_network_tier(Some(NETWORK_TIER_LOG2 - 1)),
+            "a share carrying a tier below the floor is the one case the filter exists for"
+        );
+    }
+
+    fn owed_map(rows: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        rows.iter().map(|(a, m)| (a.to_string(), *m)).collect()
+    }
+
+    #[test]
+    fn every_satoshi_is_accounted_for_and_none_invented() {
+        // Conservation is the property that matters most here: the coinbase total is fixed by
+        // consensus, so a satoshi this function loses is one a miner is quietly not paid, and a
+        // satoshi it invents is a block the network rejects.
+        let owed = owed_map(&[("bc1qa", 7_000), ("bc1qb", 2_000), ("bc1qc", 1_000)]);
+        let pool = 1_000_000u64;
+        let r = shard_miner_payouts(&owed, pool, 200, 330);
+
+        let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
+        assert_eq!(
+            paid + r.dust_sats + r.remainder_sats,
+            pool,
+            "paid + dust + remainder must equal the pool exactly"
+        );
+    }
+
+    #[test]
+    fn negative_and_zero_balances_take_no_part() {
+        // A negative `owed` means this node's view has that address overpaid — it is working the
+        // debt off (§4.4, balances are signed and never clamped). Paying it again would pay twice
+        // for the same work, and clamping to zero instead would silently forgive the overpayment.
+        let owed = owed_map(&[("bc1qa", 1_000), ("bc1qneg", -5_000), ("bc1qzero", 0)]);
+        let r = shard_miner_payouts(&owed, 100_000, 200, 1);
+
+        let addrs: Vec<&str> = r.payouts.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(addrs, vec!["bc1qa"], "only positive balances are paid");
+    }
+
+    #[test]
+    fn the_order_is_total_so_two_nodes_cannot_differ_on_a_tie() {
+        // Pins the OUTPUT property: equal balances come out address-ascending, so two nodes with
+        // identical tables build identical coinbases.
+        //
+        // ⚠ This test cannot kill the explicit tie-break, and saying so is the point. The input is
+        // a `BTreeMap`, so it arrives address-ascending and a stable sort keeps that order with or
+        // without the `then_with`. Removing the tie-break leaves this test green — verified by
+        // mutation. The tie-break guards against the input type changing to something unordered;
+        // a test that appeared to cover it would be worse than one that admits it does not.
+        let owed = owed_map(&[("bc1qz", 500), ("bc1qa", 500), ("bc1qm", 500)]);
+        let r = shard_miner_payouts(&owed, 30_000, 200, 1);
+
+        let addrs: Vec<&str> = r.payouts.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(
+            addrs,
+            vec!["bc1qa", "bc1qm", "bc1qz"],
+            "equal balances must order by address, ascending"
+        );
+    }
+
+    #[test]
+    fn the_pool_is_shared_among_those_actually_paid_not_diluted_by_the_cut() {
+        // The total is recomputed AFTER truncation, matching the live path. Diluting by addresses
+        // that did not make the cut would underpay everyone who did and silently grow the
+        // remainder — money going nowhere rather than to the miners entitled to it.
+        let owed = owed_map(&[
+            ("bc1qa", 100),
+            ("bc1qb", 100),
+            ("bc1qc", 100),
+            ("bc1qd", 100),
+        ]);
+        let r = shard_miner_payouts(&owed, 1_000, 2, 1);
+
+        let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
+        assert_eq!(r.payouts.len(), 2, "only the top two are paid");
+        assert_eq!(paid, 1_000, "and they share the WHOLE pool between them");
+    }
+
+    #[test]
+    fn dust_is_diverted_never_dropped() {
+        // Sub-threshold amounts roll into the node reward pool in the existing builder. Counting
+        // them as dust rather than dropping them is what keeps conservation true.
+        let owed = owed_map(&[("bc1qwhale", 1_000_000), ("bc1qdust", 1)]);
+        let r = shard_miner_payouts(&owed, 1_000_000, 200, 330);
+
+        assert!(
+            r.payouts.iter().all(|(a, _)| a != "bc1qdust"),
+            "a sub-threshold payout must not reach the coinbase"
+        );
+        let paid: u64 = r.payouts.iter().map(|(_, s)| *s).sum();
+        assert_eq!(paid + r.dust_sats + r.remainder_sats, 1_000_000);
+    }
+
+    #[test]
+    fn a_full_payment_discharges_the_whole_pool_of_work() {
+        // The identity that has to hold: if the coinbase paid out the entire miner pool, then the
+        // work that pool was computed against is fully discharged. Anything else means a block
+        // pays a miner and still leaves them owed for the same work.
+        let top_work = 9_000_000i64;
+        let pool = 1_000_000u64;
+        let a = discharged_micro_work(700_000, pool, top_work);
+        let b = discharged_micro_work(200_000, pool, top_work);
+        let c = discharged_micro_work(100_000, pool, top_work);
+        assert_eq!(
+            a + b + c,
+            top_work,
+            "a full payout discharges the full work"
+        );
+    }
+
+    #[test]
+    fn a_partial_payment_discharges_only_its_share() {
+        // Dust and the top-N cut mean the pool is not always fully paid out. What was not paid
+        // must stay owed — that is what makes "miners below the cut rotate in" true rather than
+        // aspirational.
+        let discharged = discharged_micro_work(250_000, 1_000_000, 8_000_000);
+        assert_eq!(
+            discharged, 2_000_000,
+            "a quarter of the pool discharges a quarter of the work"
+        );
+    }
+
+    #[test]
+    fn an_empty_pool_discharges_nothing_rather_than_everything() {
+        // The degenerate cases are the dangerous ones: a divide-by-zero here would panic on the
+        // block-connected path, and silently discharging everything would wipe the ledger on a
+        // block that paid miners nothing.
+        assert_eq!(discharged_micro_work(500, 0, 1_000_000), 0);
+        assert_eq!(discharged_micro_work(0, 1_000_000, 1_000_000), 0);
+        assert_eq!(discharged_micro_work(500, 1_000_000, 0), 0);
+        assert_eq!(discharged_micro_work(500, 1_000_000, -5), 0);
+    }
+
     #[test]
     fn epochs_are_derived_from_height_alone() {
         let len = NonZeroU64::new(144).expect("non-zero");

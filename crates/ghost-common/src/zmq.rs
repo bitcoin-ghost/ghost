@@ -451,6 +451,16 @@ impl ZmqSubscriber {
 ///
 /// Anything not matching either shape is returned untouched — guessing at an unrecognised shape
 /// would turn a clear "not found" into a silent lookup of the wrong block.
+///
+/// ⚠ **Off mainnet the test is not decisive.** Regtest and signet difficulty need not produce a
+/// zero run of this length, so a hash of either orientation can fall through untouched, and a
+/// lookup against it fails. That is the safe failure and it stays: the shard's settlement walk
+/// bounds such a failure to [`MAX_BLOCK_READ_ATTEMPTS`] retries and then skips the height with a
+/// loud error, rather than the permanent stall it used to cause. So a regtest rehearsal may see
+/// skipped heights where mainnet would see none — that is this heuristic, not a settlement bug,
+/// and it is worth knowing before reading such a log as a failure.
+///
+/// [`MAX_BLOCK_READ_ATTEMPTS`]: https://docs.rs/ghost-pool
 pub fn block_hash_to_display_order(hash: &str) -> String {
     const ZERO_RUN: usize = 8; // 4 bytes; mainnet has far more
     let leading = hash.chars().take_while(|c| *c == '0').count();

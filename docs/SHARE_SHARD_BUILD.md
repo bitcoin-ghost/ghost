@@ -7,8 +7,10 @@ Written 2026-08-13. Target: v1 by **2026-08-31**.
 
 ## Status — 2026-08-13
 
-**Stage 1 is complete and independently verified: 974 tests, 0 failures.** All of it is dark; the
-only thing wired into a running path so far is the `pool.share_shard` flag, which defaults false.
+**Stage 1, the runtime, the wiring, Stage 2, and most of Stage 3 are done and independently
+verified** — every suite run rather than taken from a report. It is all dark: `pool.share_shard`
+defaults false, and **nothing changes what a block pays.** The coinbase is still built from the
+legacy proposal; the shard observes.
 
 | piece | where | state |
 |---|---|---|
@@ -17,20 +19,57 @@ only thing wired into a running path so far is the `pool.share_shard` flag, whic
 | mesh types + handlers | `crates/ghost-consensus/src/shard_handler.rs` | ✅ 327 tests |
 | §6 leaf sampling | same | ✅ included above |
 | `pool.share_shard` flag | `crates/ghost-common/src/config.rs` | ✅ committed, dark |
-| epoch runtime | `bins/ghost-pool/src/shard.rs` | 🔨 in progress |
-| `main.rs` wiring | 3 insertion points | 🔨 drafted, held until the runtime lands |
+| epoch runtime | `bins/ghost-pool/src/shard.rs` | ✅ folds, retention, `note_height` |
+| `main.rs` wiring | 3 insertion points | ✅ construction, epoch task, boundary log |
+| Stage 2 network tier | `crosses_network_tier` | ✅ shipped **inert at R = 1** |
+| Stage 3 payout arithmetic | `shard_miner_payouts` | ✅ mirrors the live path exactly |
+| Stage 3 drift signal | `drift_against_legacy_ledger` | ✅ wired, **once per epoch** |
+| Stage 3 settlement | `settle_matured` | 🔨 in progress |
 
 **Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
 share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
 
-**Not started:** Stage 2 network-tier split (ship at R=1), Stage 3 coinbase source and settlement,
-Stage 5 genesis ceremony, Stage 6 deletion.
+**Not started:** the Stage 3 coinbase-source flip (deliberately deferred to Stage 5 step 6 — the
+build here is the *shadow comparison*, not the switch), Stage 5 genesis ceremony, Stage 6 deletion.
 
-⚠ **Eight design errors were found by *building* the design, none by re-reading it** — the counter
+⚠⚠ **`owns_evidence` is false and must stay false until Stage 5.** The fold's retention deletes
+from `shares`, which the legacy payout path still reads; enabling it would quietly reduce what
+miners are owed about six hours after someone set a flag they were told was dark.
+
+### ⚠ Rehearsing settlement on regtest is not straightforward — check before planning around it
+
+The advice to "rehearse on regtest" is easy to write and hard to do, and the obstacle is structural
+rather than fiddly.
+
+`template.rs` refuses block submission without a verified coinbase commitment (**H-11**), and the
+only source of a commitment today is a **BFT-ratified payout proposal**. A single-node regtest has
+no quorum, so no proposal is ever ratified, so `commitment_snapshot` stays `None` and **no block can
+be submitted at all** — this is exactly why the earlier regtest chain sat stuck at height 101, which
+was environmental to the rig and not a bug in what was being tested.
+
+So a pool block cannot simply be won on a one-node regtest, and settlement cannot be exercised the
+obvious way. The options, in ascending order of honesty about cost:
+
+1. **Feed `settle_matured` a hand-constructed coinbase.** Achievable today and worth doing — but it
+   is a *test*, not a rehearsal: it exercises the arithmetic and the idempotence, and proves nothing
+   about the RPC path, the parsing of a real block, or the maturity lookback against a live chain.
+2. **Multi-node regtest with real quorum.** A genuine rehearsal, and substantially more rig.
+3. **Wait for mainnet.** Not a plan — `won_blocks` is empty, so the first real exercise of this code
+   would be a live block carrying real money.
+
+Whichever is chosen, say which one it was. "Rehearsed on regtest" covering only option 1 would be
+the kind of claim that reads as coverage and is not.
+
+⚠ **Nine design errors were found by *building* the design, none by re-reading it** — the counter
 double-payment, deltas not being max-mergeable, the §6/§12.3 contradiction, evidence retention on
 the wrong clock, the whole-table scaling ceiling, the merkle dependency direction, two spellings of
-one predicate, and expiry being indistinguishable from refusal. Assume the remaining stages hide
+one predicate, expiry being indistinguishable from refusal, and §4.6 claiming settlement is
+identical across nodes when it is only deterministic given a table. Assume the remaining stages hide
 more of the same, and prefer building a thin slice early over perfecting the document.
+
+⚠ **Three tests passed for the wrong reason and only mutation caught them.** One is *unkillable*
+while its input is a `BTreeMap` and is documented as latent rather than dressed up. Budget for this:
+a green suite is evidence the tests ran, not that they can fail.
 
 ---
 
@@ -130,6 +169,36 @@ New `crates/ghost-common/src/share_shard.rs`, reusing `micro_work`, `canonical_s
   Carry over the #601 credit-from-*mined*-outputs fix.
 - **Sampling verifier (λ = 20)** with `ShardEvidence` broadcast on failure. First thing to cut if
   time runs short — see below.
+
+### Shard settlement does NOT belong on the block-connected path
+
+`settlement.rs` (950 lines) settles at the **tip** and carries reorg reversal through
+`on_block_disconnected` — it has to, because it acts on a block that may still be undone.
+
+The shard settles at **coinbase maturity**, and that difference removes the whole problem rather
+than requiring the machinery to be reused:
+
+- a block 100 deep is past any reorg this code contemplates (`RETENTION_FLOOR_BLOCKS` is also 100),
+  so **there is no reversal to handle** — nothing was settled while it could still be undone;
+- so nothing needs to hook `on_block_connected` at all. The **epoch task already ticks**: it can
+  look back to `tip − 100` and settle any pool block it has not settled yet;
+- idempotence comes from recording which block hashes have been settled, not from transaction
+  gymnastics on a hot path.
+
+So the wiring is a lookback in the task that already exists, not a change to the tip path. Reuse
+`settlement.rs`'s **coinbase parsing** (it already extracts mined outputs and fixed the
+internal-vs-display hash-order trap, and #601's credit-from-*mined*-outputs correction lives there)
+— but not its lifecycle.
+
+⚠ Two things to get right when it is built:
+
+1. **Convert with `discharged_micro_work`.** `settled` is micro-work and the coinbase pays satoshis;
+   the rate is `top_work / pool_sats` from the paying node's view. See §4.6 — this is
+   deterministic-given-a-table, not identical across nodes, and that is fine because `owed` is
+   signed.
+2. **`won_blocks` is empty — this path has never once run in production.** Whatever ships will be
+   exercised for the first time by a real block carrying real money. Rehearse it on regtest, and
+   treat a first live settlement as an event to watch rather than a step that completed.
 
 ### Where the epoch task actually goes (surveyed 2026-08-13, read from the code)
 

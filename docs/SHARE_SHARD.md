@@ -273,8 +273,25 @@ exposure sits under permissionless membership. See §10.
 ### 4.6 Settlement and rebase
 
 When a block pays out, every node reads the **actual paid amounts off the chain** and adds them to
-`settled` — which only ever increases (§4.4). Identical everywhere, zero messages, zero coordination.
-The chain is already replicated to every node, so anything derived from it is free.
+`settled` — which only ever increases (§4.4). Zero messages, zero coordination: the chain is already
+replicated to every node, so anything derived from it is free.
+
+⚠ **Correction (2026-08-13): this is deterministic, not identical.** An earlier draft claimed every
+node settles to the same number. It does not, and the reason is a unit conversion. `accrued` and
+`settled` are **micro-work**; a coinbase pays **satoshis**. Discharging a payment means converting
+at the rate that payment was computed under — `top_work / pool_sats` — and `top_work` comes from
+the paying node's own view of the table. Two nodes whose tables differ by gossip lag therefore
+discharge slightly different amounts for the same block.
+
+That is survivable, and for the same reason everything else here is: **`owed` is signed and never
+clamped.** A node that discharges too much leaves a negative residual which accrues back up; one
+that discharges too little leaves work owed that the next block pays. The differences wash out
+across blocks exactly as payment differences do (§4.5).
+
+What it is not is a free lunch — it means settlement inherits the convergence properties of the
+table rather than escaping them via the chain. Stated plainly because the earlier wording implied a
+guarantee the mechanism does not provide, and a guarantee that isn't there is worse than one that
+was never claimed.
 
 Settle at **coinbase maturity (100 blocks)**, never at the tip. The output is unspendable before then,
 so a shallower reorg unwinds the payment anyway and nothing needs undoing. Do not conflate this with

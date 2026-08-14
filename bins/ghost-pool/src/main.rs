@@ -4050,15 +4050,67 @@ async fn main() -> Result<()> {
                     Err(_) => continue,
                 };
                 match rt.tick(tip) {
-                    Ok(report) if !report.folded.is_empty() => info!(
-                        tip,
-                        folded = report.folded.len(),
-                        remaining = report.remaining,
-                        "shard: folded closed epochs"
-                    ),
+                    Ok(report) if !report.folded.is_empty() => {
+                        info!(
+                            tip,
+                            folded = report.folded.len(),
+                            remaining = report.remaining,
+                            "shard: folded closed epochs"
+                        );
+
+                        // The soak signal, run ONCE PER EPOCH because a fold happens once per
+                        // epoch — never on the tick itself. It scans the legacy unpaid ledger,
+                        // which is the ~1.6 s query already running at ~40% duty on the propose
+                        // and vote paths; hourly it is lost in the noise, every 30 s it would
+                        // rebuild the load this design exists to remove.
+                        match rt.drift_against_legacy_ledger(chrono::Utc::now().timestamp()) {
+                            Ok(d) if d.is_clean() => info!(
+                                agreeing = d.agreeing,
+                                "shard: balances agree with the legacy ledger exactly"
+                            ),
+                            Ok(d) => warn!(
+                                agreeing = d.agreeing,
+                                differing = d.differing.len(),
+                                only_shard = d.only_shard.len(),
+                                only_ledger = d.only_ledger.len(),
+                                net_micro = d.net_micro,
+                                "shard: DRIFT against the legacy ledger"
+                            ),
+                            Err(e) => warn!(error = %e, "shard: drift comparison failed"),
+                        }
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         warn!(error = %e, tip, "shard: epoch tick failed — retrying next tick")
+                    }
+                }
+
+                // Maturity settlement (§4.6) rides the same task, deliberately: a block 100 deep
+                // is past reorg range, so this is a lookback with no reversal to handle, and it
+                // must NEVER move to the block-connected or template-refresh paths — those must
+                // stay sub-second at a tip change. Bounded per call; a backlog resumes next tick.
+                match rt.settle_matured(&rpc_c, tip).await {
+                    // A STALL must be louder than a success, and must not depend on whether
+                    // anything happened to settle. Logging only the non-empty case meant a node
+                    // whose cursor had stopped moving looked exactly like one with nothing to do —
+                    // and the difference between those two is unpaid work piling up unnoticed.
+                    Ok(r) if r.stalled_at.is_some() || !r.skipped_unreadable.is_empty() => warn!(
+                        tip,
+                        stalled_at = ?r.stalled_at,
+                        skipped = ?r.skipped_unreadable,
+                        settled = r.settled.len(),
+                        deferred = r.deferred,
+                        "shard: settlement did NOT complete its window"
+                    ),
+                    Ok(r) if !r.settled.is_empty() => info!(
+                        tip,
+                        blocks = r.settled.len(),
+                        deferred = r.deferred,
+                        "shard: settled matured pool blocks"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, tip, "shard: maturity settlement failed — retrying next tick")
                     }
                 }
             }
@@ -8027,6 +8079,17 @@ async fn main() -> Result<()> {
             tracing::trace!(
                 miner_id = %share.miner_id,
                 "Solo mode: share proof not broadcast (solo cannot touch the public ledger)"
+            );
+        } else if !ghost_common::share_shard::crosses_network_tier(proof.tier_log2) {
+            // Stage 2, network tier. At R = 1 this arm is unreachable — the floor equals the
+            // vardiff floor, so every share that exists today crosses — and that is the point:
+            // the mechanism ships inert, and raising R later is a roll of one constant rather
+            // than a change to this path. The share is still recorded locally for vardiff, stats
+            // and the miner's own credit; only the mesh hop is withheld.
+            tracing::trace!(
+                miner_id = %share.miner_id,
+                tier_log2 = ?proof.tier_log2,
+                "Below network tier: recorded locally, not gossiped"
             );
         } else if let Err(e) = share_broadcast_tx.try_send(proof) {
             tracing::warn!(error = %e, "Share broadcast channel full or closed");
