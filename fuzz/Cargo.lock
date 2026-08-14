@@ -1647,6 +1647,10 @@ version = "1.11.22"
 dependencies = [
  "bitcoin",
  "ghost-common",
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
  "tracing",
 ]
 

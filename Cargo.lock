@@ -3163,7 +3163,12 @@ name = "ghost-accounting"
 version = "1.11.22"
 dependencies = [
  "bitcoin",
+ "ed25519-dalek",
  "ghost-common",
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
  "tracing",
 ]
 

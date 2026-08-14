@@ -25,6 +25,13 @@ legacy proposal; the shard observes.
 | Stage 3 payout arithmetic | `shard_miner_payouts` | ✅ mirrors the live path exactly |
 | Stage 3 drift signal | `drift_against_legacy_ledger` | ✅ wired, **once per epoch** |
 | Stage 3 settlement | `settle_matured` | 🔨 in progress |
+| Stage 0 anchor rehearsal | `scripts/shard-anchor-rehearsal.sh` | ✅ written and run against all 8 |
+| Stage 5 genesis conversion | `crates/ghost-accounting/src/shard_genesis.rs` | ✅ 13 tests, dark |
+| Stage 5 reserved-column guard | `ghost-common` + `ghost-storage` | ✅ enforced, not assumed |
+| Stage 5 anchor pin + load self-check | `pinned_anchor` / `ShardRuntime::load` | ✅ checked every start |
+| Stage 5 pre-genesis epoch floor | `ghost-common` + `shard_handler` | ✅ both merge paths + table sync |
+| Stage 5 arming + gap-fold | `ShardRuntime::arm_from_genesis` | ✅ 3 tests, dark |
+| Stage 0 ceremony backup | `scripts/shard-ceremony-backup.sh` | ✅ all 8 verified |
 
 **Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
 share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
@@ -243,23 +250,156 @@ vm5+vm6, then all 8. **Gate to pass before cutover:**
 Old and new ledgers run side by side **in one binary**, so this is a data event plus a config flip,
 not a binary big-bang. That is what removes the need for a height gate *and* the need for downtime.
 
-1. **Pick the anchor** — a finalised checkpoint ≥ ~30 blocks behind tip. Run the rehearsal script and
-   require **one distinct `ledger_root` and one distinct `canonical_payout` hash across all 8**. If
-   not unanimous, step back to the previous finalised height.
+1. **Pick the anchor** — a finalised checkpoint ≥ ~30 blocks behind tip. Run
+   `scripts/shard-anchor-rehearsal.sh --survey` then `--height H`, and require **one distinct
+   `ledger_root` and one distinct `canonical_payout` hash across all 8**. If not unanimous, step
+   back to the previous finalised height.
+
+   ⚠⚠ **`ledger_root` unanimity does not imply the adopted bytes agree, and the anchor cannot be
+   picked freely.** Measured across all 8 nodes on 2026-08-13, over the 182 heights every node
+   holds since 961,600:
+
+   | | heights |
+   |---|---|
+   | `ledger_root` unanimous | **180 / 182** |
+   | `canonical_payout` unanimous | **41 / 182** |
+   | both, *after* the #606 gate at 961,700 | **3** |
+
+   The cause is in `payout_checkpoint.rs:1046`: the finalise path persists
+   `ledger_root: msg.ledger_root` — the **proposer's** root over the **proposer's** list — beside
+   `miner_payouts: medians`, the per-address median of `in_set`, which is *the reports that node
+   happened to receive*. Different report sets give different medians, so the persisted bytes
+   diverge while the root, being copied from one broadcast message, stays unanimous.
+
+   At 962,288 that presents as: identical root on all 8, identical 1,316-byte length, identical
+   `cutoff_ts` — and **two distinct blobs**, 5 nodes to 3, differing in three of five payees by
+   0.06–0.26% of their work. A ceremony gated on the root alone reads that as unanimous and seeds
+   eight nodes from divergent balances, which is undetectable afterwards because each node is
+   internally consistent with its own.
+
+   Consequences for the ceremony, in order of how much they change the plan:
+
+   - The rehearsal script gates on the **blob digest**, and treats the root as provenance only.
+     It also refuses a NULL/empty `canonical_payout` outright — sha256 of nothing is identical on
+     all eight, so a pre-adopt-on-finalise row presents as perfect unanimity for a checkpoint with
+     no payees at all.
+   - **Anchor selection is a search, not a choice.** Only ~1.6% of post-gate heights qualify, so
+     "≥30 blocks behind tip" no longer determines the anchor — survey first, then take the newest
+     qualifying height. Budget for the anchor being some hundreds of blocks stale, and therefore
+     for a correspondingly larger step-4 gap-fold.
+   - At every height where the blobs *do* agree, the ratified root also recomputes from them on
+     8/8 — i.e. the median equalled the proposer's list. So a qualifying anchor is strictly
+     stronger than the plan asked for, which is why the script reports that check.
+   - This is a live integrity gap in its own right, not only a ceremony obstacle: `payout.rs`
+     documents the root as the thing making the coinbase "a pure function of the checkpoint", and
+     since #606 it is not. Stage 6 deletes this path, so the fix is the cutover — but until then
+     GHOST-02 recompute-reject rests on a commitment that no longer covers what is paid.
 2. **Pin it.** Convert the checkpoint using the existing `genesis_balances` + `GenesisRounding`
    (truncate, never round up) and its pinned golden vector. ⚠ **Convert the finalised checkpoint —
    never recompute from shares.** Pin the height, `cutoff_ts` and expected opening root as a
    compile-time constant plus golden-vector test. This is a one-time seed pin, not a gate: it names
    the past and never flips future behaviour. Opening balances go in a reserved genesis column so the
    write-your-own-column invariant holds from the first row.
+
+   **Built** — `crates/ghost-accounting/src/shard_genesis.rs`, dark. Anchor currently pinned at
+   **962,008** (verified unanimous on all 8, blob sha `a3f7202f…2bebad62`, 5 payees, 8 node
+   entries, and the ratified root recomputes from those bytes on 8/8). Re-pin to a fresher
+   qualifying height at ceremony time by re-running the survey; the golden vector is the only
+   thing that has to change.
+
+   ⚠ **A reloaded genesis column must be re-asserted against the pin, every start.** Because
+   `merge_accrued` now skips the reserved column, genesis can no longer be re-learned from any
+   peer — so the persisted rows became a single point of silent failure. Lose them (truncation, a
+   partial delete, a backup restored from before the ceremony) and the node opens under-owing
+   every miner, stays internally consistent, and nothing ever contradicts it: the exact failure
+   the module was written to prevent, arriving through the back door.
+   `shard_genesis::verify_loaded_genesis` closes it — absent column is fine (that is every
+   pre-ceremony start), present-and-wrong refuses to start. **Wiring it into the runtime's load
+   path is part of the step-4 arming work, which is not built yet.**
+
+   Two things the build settled that the plan had left implicit:
+
+   - **The reserved column must be shared, not per-node.** `owed()` sums *across* columns, so if
+     each node opened into its own column the first merge would multiply every miner's opening
+     balance by the fleet size — healthy-looking on any single node right up until gossip. All
+     eight write the identical balances into one column, where max-merge is the identity.
+   - ⚠ **`[0u8; 32]` is a loadable ed25519 key.** The first draft argued the reserved id was
+     unclaimable because all-zero bytes are not a valid public key; `VerifyingKey::from_bytes`
+     accepts it as a low-order point, and the test asserting otherwise is what caught it. Left
+     standing, a peer could have max-merged an inflated opening balance that is permanent (merge
+     is a max) and indistinguishable from genesis. The guarantee is now structural, in
+     `ghost-common` beside the invariant: `merge_accrued` skips the column, `verify_stateless`
+     rejects a summary claiming it *before* checking the signature, and the sole writer is
+     `ShardTable::install_genesis`, which no message handler calls.
 3. **Back up all 8 databases.**
 4. **Roll node-by-node, vm5 first.** On flip each node converts its own copy of the byte-identical
    checkpoint, **asserts the computed root equals the pin and refuses to start the shard otherwise**
-   — a loud local self-check, not a fleet negotiation. Then it **gap-folds**: its own locally-received
-   valid network-tier shares with `timestamp ∈ (cutoff_ts, now]` into its own column. Because columns
-   are per-node and the checkpoint already credited everything up to `cutoff_ts`, there is no double
-   count and no coordination. The mixed-fleet window costs nothing — shares landing on not-yet-cut
-   nodes are gap-folded when that node flips.
+   — a loud local self-check, not a fleet negotiation.
+
+   **Built** as `ShardRuntime::arm_from_genesis`. ⚠ **Two things in the paragraph this replaces were
+   wrong, and only building it showed that.**
+
+   **(a) The gap-fold must not be a timestamp range.** "Shares with `timestamp ∈ (cutoff_ts, now]`"
+   fails twice: it overlaps the ordinary epoch folds that run from the floor onward, double-crediting
+   every share in the intersection; and `now` is a local clock, which is the §12.2 trap that made the
+   old sweep's summaries incomparable in principle. What is actually needed is for the **epoch
+   watermark to restart at the floor**, after which `tick` catches up epoch by epoch on machinery
+   that is already bounded, already idempotent (`shard_epochs` is the durable marker) and already
+   retries a failed epoch rather than skipping it. No new fold code, and the input still comes from
+   the persisted shares table.
+
+   **(b) "There is no double count" was false.** The Stage 4 soak accrues each node's own work into
+   its own column and gossips it; genesis then credits that same work again for the whole fleet, and
+   `owed()` sums across columns. Narrowing the fold range cannot fix it — the overlap is already in
+   the column. Resetting the column cannot either — a not-yet-armed peer re-advertises the higher
+   value and wins the max. So arming replaces the table wholesale and sets a **pre-genesis epoch
+   floor** at `epoch_for_height(ANCHOR_HEIGHT) + 1`; summaries below it are refused on **both** merge
+   paths. The floor derives from the pin every node carries, so it is chain-derived and identical
+   fleet-wide. It does not break "behind, never wrong": those epochs are pre-genesis, so their work
+   is already in the genesis column.
+
+   The floor is the anchor's epoch **plus one** because `cutoff_ts` falls partway through the
+   anchor's own epoch; folding it would re-credit what genesis covered. That under-credits this
+   node's work across at most `EPOCH_BLOCKS - 1` heights — deliberate, same direction as the
+   conversion's truncation.
+
+   **(c) The mixed-fleet window does NOT cost nothing.** A whole-table sync carries no epoch, so the
+   floor cannot gate it — and it is exactly the path that resurrects an unarmed peer's pre-genesis
+   column, permanently, because merging is a max. The genesis column is itself the generation
+   marker: identical on every armed node, absent on every unarmed one, already in the payload, so no
+   new protocol field. Both-absent matches, leaving every pre-ceremony sync unchanged.
+
+   **(d) The epoch floor alone did not contain the mixed window — `total_micro` is cumulative.**
+   The floor rejects epochs *below* it, but a summary at an epoch **at or above** the floor from a
+   node that has **not yet armed** still carries pre-genesis work in its running total (§6 requires
+   the total to be cumulative, or deltas could not be max-merged). An armed node merging that total
+   credits pre-genesis work a second time on top of the genesis column, permanently, and the floor
+   cannot see it: the epoch is legal, only the total is not.
+
+   **Fixed** — `EpochSummary` now carries `genesis_marker: Option<[u8; 32]>`, the root of the
+   genesis column alone, and both merge paths refuse a mismatch. It is the same quantity the
+   ceremony pins and `verify_loaded_genesis` checks, so armed nodes agree by construction. Three
+   properties make it mixed-fleet safe, each pinned by a test:
+
+   - the marker is **appended to the signing bytes only when `Some`**, so an unarmed node's bytes
+     are byte-identical to what a pre-marker binary produced and stay verifiable by any peer;
+   - it **is** covered by the signature when present, so stripping it on the wire — which would turn
+     an armed summary back into one an armed peer accepts — invalidates it;
+   - `serde(default)` means a summary encoded before the field existed decodes as `None`, which is
+     exactly what "unarmed" means.
+
+   The asymmetry is safe because by arming time the whole fleet is on this binary: Stage 4 deploys,
+   Stage 5 only flips config.
+
+   ⚠ **Still open, smaller:** arming empties this node's own column, so its next summary restarts
+   `total_micro` from the delta alone, and a peer holding the immediately preceding summary rejects
+   it as `ChainMismatch` in `verify_summary_stateless` — an honest summary refused at the seam. It
+   self-corrects once both sides are armed (the marker refuses the stale chain anyway), but it will
+   log rejections during the roll, and the roll should not be read as healthy until they stop.
+
+   Arming also **refuses if anything is already settled**. It cannot fire today (zero blocks won),
+   but a genesis checkpoint is an *unpaid* ledger, so a non-empty `settled` disagrees with it about
+   history and silently discarding that would be the one destructive act in an additive ceremony.
 5. **Converge and verify** — one full-table sync, one distinct root fleet-wide, and spot-check the top
    addresses against the old query while both are still computable.
 6. **Flip the coinbase source** fleet-wide, same day. Until this moment the coinbase stays armed from

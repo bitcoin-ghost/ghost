@@ -31,6 +31,7 @@
 
 pub mod batch_genesis;
 pub mod coinbase;
+pub mod shard_genesis;
 pub mod shares;
 
 pub use coinbase::*;
