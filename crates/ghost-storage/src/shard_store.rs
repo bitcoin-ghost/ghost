@@ -505,6 +505,32 @@ impl Database {
     /// Scoped to `from_epoch` (the arming floor) and to this node's own column: summaries below
     /// the floor are pre-genesis and their work is already inside the genesis balances, so
     /// re-folding them would double-count, and another node's summaries are not ours to delete.
+    /// Drop EVERY node's retained summaries at or above `from_epoch`. Returns how many went.
+    ///
+    /// **Only the Stage 5 arming ceremony calls this**, and it must clear peers' rows as well as
+    /// this node's, for a reason that is not obvious until gossip is running.
+    ///
+    /// Arming rewinds the fold watermark to the floor and re-folds every epoch since the anchor —
+    /// dozens of them — with different totals, because the ceremony reset the column. Peers still
+    /// hold this node's PRE-arming summaries for those same epochs. On the next broadcast a peer
+    /// looks up the same epoch, finds a stored summary with different signing bytes, and returns
+    /// `SummaryEquivocation`: the verdict that a node signed two conflicting statements, which §6
+    /// treats as publishable evidence of misbehaviour. An honest node would be accused of
+    /// equivocating BY THE CEREMONY, and `store_epoch_tx` deliberately refuses to overwrite the
+    /// held row, so the stale evidence persists and every re-fold is rejected again.
+    ///
+    /// Those summaries describe a ledger that no longer exists. Genesis is a reset, so the
+    /// evidence of the pre-genesis ledger is cleared with it.
+    pub fn shard_clear_all_epochs_from(&self, from_epoch: u64) -> GhostResult<usize> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM shard_epochs WHERE epoch >= ?1",
+                params![from_epoch as i64],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     pub fn shard_clear_own_epochs_from(
         &self,
         node: &NodeId,
