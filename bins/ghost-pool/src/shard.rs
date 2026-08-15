@@ -143,6 +143,30 @@ pub enum FoldOutcome {
     Folded(FoldReport),
 }
 
+/// What a gossiped summary did to the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerMergeOutcome {
+    /// Merged into the peer's column; the table root is the §12.6 comparison value.
+    ///
+    /// `summary_retained` carries the reason the peer's signed summary could NOT be stored, when
+    /// that happens — the counter moved but the evidence next epoch's chain check needs did not.
+    Merged {
+        addresses: usize,
+        table_root: [u8; 32],
+        summary_retained: Option<String>,
+    },
+    /// Solo mode: the shared shard is not this node's business (§10).
+    SoloRefused,
+    /// The sender is not in the fleet's ratified node set. Until §6 sampling exists, an
+    /// unrecognised node's counters are an unverified assertion that a max would make permanent.
+    NotAdmitted,
+    /// Our own summary came back to us. Not an error, and not a contribution.
+    OwnEcho,
+    /// Verification refused it. Expected traffic during a rolling cutover (a pre-genesis epoch,
+    /// or a peer running a different genesis), so it is reported rather than treated as a fault.
+    Rejected(String),
+}
+
 /// What arming did — the ceremony's receipt, for the operator's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArmReport {
@@ -481,9 +505,15 @@ impl ShardRuntime {
         // table write succeeds. Doing it first means the worst interleaving re-folds epochs into a
         // table that still holds the soak's columns — visible, and corrected by re-running arming
         // (which is refused only once the genesis column is actually installed).
-        let cleared_epochs = self
-            .db
-            .shard_clear_own_epochs_from(&self.identity.node_id(), floor)?;
+        // Clear EVERY node's summaries at/above the floor, not just our own.
+        //
+        // Arming re-folds ~dozens of epochs with different totals. Peers hold our PRE-arming
+        // summaries for those epochs, and a same-epoch lookup with different signing bytes is
+        // `SummaryEquivocation` — an honest node accused of signing two conflicting statements,
+        // by the ceremony itself. `store_epoch_tx` then refuses to overwrite the held row, so the
+        // accusation sticks and every re-fold is rejected again. Those rows describe a
+        // pre-genesis ledger; genesis is a reset, so they go with it.
+        let cleared_epochs = self.db.shard_clear_all_epochs_from(floor)?;
         self.db.shard_save_table(&genesis, floor, anchor.height)?;
 
         *table = genesis;
@@ -518,6 +548,172 @@ impl ShardRuntime {
             opening_addresses,
             table_root: root,
         })
+    }
+
+    /// This node's own summaries still waiting to go on the wire, oldest first.
+    ///
+    /// ⚠ **Solo mode publishes nothing.** A solo node's work is its own (§10); putting its
+    /// summaries on the mesh would fold that work into the shared shard and pay it twice — once
+    /// by the solo node's own coinbase and once by whoever wins from the shared table. The gate
+    /// sits here rather than in the caller for the same reason `tick` and `fold_epoch` carry it:
+    /// one missed call site leaks silently and there is no signal that it happened.
+    pub fn pending_broadcasts(&self, limit: u32) -> GhostResult<Vec<EpochSummary>> {
+        if self.solo {
+            return Ok(Vec::new());
+        }
+        self.db
+            .shard_unpublished_epochs(&self.identity.node_id(), limit)
+    }
+
+    /// Record that a summary reached the mesh, so it is not re-broadcast for ever.
+    ///
+    /// Called only AFTER the broadcast returns Ok. Marking first would lose a summary whose send
+    /// failed, and the flag is the only record that it still needs sending.
+    pub fn mark_broadcast(&self, epoch: u64) -> GhostResult<bool> {
+        self.db
+            .shard_mark_epoch_published(epoch, &self.identity.node_id())
+    }
+
+    /// Merge a peer's verified epoch summary into its own column — the receive half of gossip.
+    ///
+    /// Verification strictly precedes mutation (§12.3): a max cannot be undone, so an unverified
+    /// counter that reaches the table has already won. The chain check needs the peer's PREVIOUS
+    /// summary, which is read from storage; absent, the summary is still admissible — a node
+    /// joining mid-stream cannot have it, and refusing would make "behind" mean "wrong".
+    ///
+    /// On success the peer's column is persisted so the merge survives a restart, and the caller
+    /// gets the table root back for the §12.6 comparison.
+    ///
+    /// The table lock is taken and released here, never held across an await — the handler runs on
+    /// the mesh's task and must not block ingest behind a network round trip.
+    /// Whether a peer's counters may enter this node's table at all.
+    ///
+    /// ⚠ **Temporary, and a deliberate narrowing of the permissionless design.** `SHARE_SHARD.md`
+    /// §10 makes the λ-sampling verifier and evidence broadcast a hard precondition for admitting
+    /// a node you do not own, because without them a foreign node's counter is an unverified
+    /// assertion. Sampling is not built yet, and the mesh runs `allow_unknown_peers = true` by
+    /// intent — so anyone completing a Noise handshake could otherwise gossip under N generated
+    /// keypairs, each creating a column. `owed()` sums across columns and merging is a max, so a
+    /// single accepted inflation is permanent and nothing in the runtime can remove it.
+    ///
+    /// Until sampling lands, admission is restricted to the fleet's own BFT-ratified membership:
+    /// the `node_shares` set on the latest payout checkpoint, which is the same set the genesis
+    /// anchor pins. Operator decision, 2026-08-14, for the single-operator window.
+    ///
+    /// **Fails CLOSED.** No checkpoint, or one carrying no node set, admits nobody. A shard that
+    /// cannot converge is a visible, recoverable problem; one that merged a stranger's counters is
+    /// neither.
+    ///
+    /// ⛔ Remove this ONLY together with building §6 sampling — not because it is inconvenient.
+    fn peer_is_admissible(&self, node: &ghost_common::types::NodeId) -> GhostResult<bool> {
+        match self.db.get_latest_payout_ledger_checkpoint()? {
+            Some(cp) if !cp.node_shares.is_empty() => {
+                Ok(cp.node_shares.iter().any(|(id, _)| id == node))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn apply_peer_summary(
+        &self,
+        msg: &ghost_consensus::message::ShardEpochSummaryMessage,
+    ) -> GhostResult<PeerMergeOutcome> {
+        // Solo work is its own (§10). `tick`, `fold_epoch` and `pending_broadcasts` all refuse in
+        // solo mode; the RECEIVE half must too, or a solo node merges the whole fleet's columns
+        // into its table and — once Stage 5 makes the shard authoritative — a solo block pays the
+        // shared shard's miners. Merging is a max, so that cannot be undone afterwards.
+        if self.solo {
+            return Ok(PeerMergeOutcome::SoloRefused);
+        }
+
+        let node = msg.summary.node_id;
+        if node == self.identity.node_id() {
+            return Ok(PeerMergeOutcome::OwnEcho);
+        }
+
+        // Admission BEFORE verification, deliberately: a summary from a node we do not recognise
+        // should not even earn the signature check's compute, and refusing early keeps a stranger
+        // from probing which of its keys are known.
+        if !self.peer_is_admissible(&node)? {
+            return Ok(PeerMergeOutcome::NotAdmitted);
+        }
+
+        // The prior summary the chain check needs is NOT always epoch-1.
+        //
+        // `verify_summary_stateless` uses it two ways: a SAME-epoch prior detects equivocation
+        // (two different signed statements for one epoch), and an epoch-1 prior chains the totals.
+        // Looking up only epoch-1 leaves equivocation permanently undetectable. Same-epoch takes
+        // precedence because a node contradicting itself matters more than one whose totals fail
+        // to chain.
+        let prior = match self.db.shard_get_epoch(msg.summary.epoch, &node)? {
+            Some(same_epoch) => Some(same_epoch),
+            None => match msg.summary.epoch.checked_sub(1) {
+                Some(prev) => self.db.shard_get_epoch(prev, &node)?,
+                None => None,
+            },
+        };
+
+        // ⚠ The lock is held ACROSS the persist, deliberately.
+        //
+        // `shard_upsert_column` is REPLACE semantics (delete the node's rows, re-insert). Each
+        // inbound Noise connection dispatches on its own task, so two summaries from one peer can
+        // interleave: merge N, merge N+1, then write N over N+1 — deleting the fresher rows. In
+        // memory the max still holds, so nothing looks wrong until a restart loads the stale
+        // column and this node's table root silently stops matching the fleet. Holding the lock
+        // serialises merge-and-persist into one step and closes that window. It also keeps a merge
+        // from landing between `arm_from_genesis`'s wipe and its save, which would re-insert a
+        // pre-genesis column that the epoch floor cannot remove because it loads straight off disk.
+        //
+        // This is a synchronous storage call, never an await, so it cannot park the mesh task.
+        let mut table = self.table.lock();
+        match ghost_consensus::shard_handler::apply_shard_epoch_summary(
+            &mut table,
+            msg,
+            prior.as_ref(),
+            None, // gossip path: peers send summaries, not shares
+            compute_merkle_root,
+        ) {
+            Ok(()) => {
+                let column = table.accrued().get(&node).cloned().unwrap_or_default();
+                let addresses = column.len();
+
+                // Persist the merged column, then the peer's signed summary.
+                //
+                // If either write fails the in-memory table is ahead of disk, and a restart loses
+                // this merge. That is "behind, never wrong": the counter is grow-only and the peer
+                // re-gossips a total that already contains this epoch, so the max restores it. The
+                // opposite ordering — disk ahead of memory — has no such recovery.
+                self.db
+                    .shard_upsert_column(&node, &column, msg.summary.epoch)?;
+
+                // Retaining the peer's summary is what makes the chain and equivocation checks
+                // work AT ALL for the next epoch, and it is the evidence an accusation is made of
+                // (§6: a rejection must rest on publishable evidence, never private sampling
+                // luck). `published = true` because it is not ours to broadcast.
+                //
+                // A conflicting summary at the same (epoch, node) is REFUSED by the storage layer
+                // rather than overwritten — the held row is the evidence — so that error is
+                // surfaced as a rejection rather than swallowed.
+                if let Err(e) = self.db.shard_store_epoch(&msg.summary, true) {
+                    let root = table.compute_table_root();
+                    drop(table);
+                    return Ok(PeerMergeOutcome::Merged {
+                        addresses,
+                        table_root: root,
+                        summary_retained: Some(format!("{e}")),
+                    });
+                }
+
+                let root = table.compute_table_root();
+                drop(table);
+                Ok(PeerMergeOutcome::Merged {
+                    addresses,
+                    table_root: root,
+                    summary_retained: None,
+                })
+            }
+            Err(e) => Ok(PeerMergeOutcome::Rejected(format!("{e}"))),
+        }
     }
 
     /// Compare the shard's balances against the legacy unpaid ledger.
@@ -1450,6 +1646,118 @@ mod tests {
             .arm_from_genesis(&rogue, &pinned_canonical_blob())
             .is_err());
         assert_eq!(rt.table.lock().epoch_floor(), 0);
+    }
+
+    /// Arming must clear PEERS' retained summaries, not only its own.
+    ///
+    /// The failure this pins is a false accusation of misbehaviour, generated by the ceremony
+    /// against an honest node. Arming re-folds every epoch since the anchor with different totals;
+    /// a peer holding the pre-arming summary for one of those epochs sees the same epoch with
+    /// different signing bytes and returns `SummaryEquivocation` — "this node signed two
+    /// conflicting statements", which §6 treats as publishable evidence. `store_epoch_tx` then
+    /// refuses to overwrite the held row, so the accusation sticks and every re-fold is refused
+    /// again.
+    ///
+    /// Invisible until gossip was wired, because nothing compared summaries across nodes, and
+    /// created by retaining peers' summaries — which is itself correct and required for the chain
+    /// check.
+    #[test]
+    fn arming_clears_pre_genesis_summaries_from_every_node_not_just_our_own() {
+        let (identity, db, rt) = runtime();
+        let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+        let floor = epoch_for_height(anchor.height, EPOCH_BLOCKS) + 1;
+
+        // A peer's summary at/above the floor, retained exactly as the gossip path retains it.
+        let peer = NodeIdentity::generate();
+        let peer_summary = ghost_common::share_shard::EpochSummary::build(
+            floor + 3,
+            &peer,
+            &BTreeMap::new(),
+            &[],
+            compute_merkle_root,
+            None,
+        )
+        .expect("legal");
+        db.shard_store_epoch(&peer_summary, true).expect("retain");
+
+        // And one of our own, as a pre-arming fold would have left it.
+        let own_summary = ghost_common::share_shard::EpochSummary::build(
+            floor + 3,
+            &identity,
+            &BTreeMap::new(),
+            &[],
+            compute_merkle_root,
+            None,
+        )
+        .expect("legal");
+        db.shard_store_epoch(&own_summary, true).expect("retain");
+
+        assert!(db
+            .shard_get_epoch(floor + 3, &peer.node_id())
+            .unwrap()
+            .is_some());
+        assert!(db
+            .shard_get_epoch(floor + 3, &identity.node_id())
+            .unwrap()
+            .is_some());
+
+        rt.arm_from_genesis(&anchor, &pinned_canonical_blob())
+            .expect("arm");
+
+        assert!(
+            db.shard_get_epoch(floor + 3, &peer.node_id())
+                .unwrap()
+                .is_none(),
+            "a PEER's pre-genesis summary must be cleared, or re-folding that epoch is refused \
+             as equivocation and an honest node stands accused"
+        );
+        assert!(
+            db.shard_get_epoch(floor + 3, &identity.node_id())
+                .unwrap()
+                .is_none(),
+            "our own pre-genesis summary must be cleared too"
+        );
+    }
+
+    /// A stranger's summary must not enter the table, and must not do so by DEFAULT.
+    ///
+    /// Fails closed: the fixture DB carries no payout checkpoint, so nobody is admissible. That is
+    /// the state a fresh node is in, and it is the one where a permissive default would be most
+    /// tempting and most wrong — `owed()` sums across columns and a max cannot be undone, so an
+    /// accepted stranger is permanent.
+    #[test]
+    fn an_unratified_peer_is_refused_before_anything_is_merged() {
+        let (_identity, _db, rt) = runtime();
+        let stranger = NodeIdentity::generate();
+        let (summary, _ev) = {
+            let evidence = vec![];
+            let s = ghost_common::share_shard::EpochSummary::build(
+                7,
+                &stranger,
+                &BTreeMap::new(),
+                &evidence,
+                compute_merkle_root,
+                None,
+            )
+            .expect("empty evidence is legal");
+            (s, evidence)
+        };
+        let before = rt.table.lock().compute_table_root();
+
+        let out = rt
+            .apply_peer_summary(&ghost_consensus::message::ShardEpochSummaryMessage { summary })
+            .expect("admission is a verdict, not an error");
+
+        assert_eq!(out, PeerMergeOutcome::NotAdmitted);
+        assert_eq!(
+            rt.table.lock().compute_table_root(),
+            before,
+            "a refused summary must leave the table byte-identical"
+        );
+        assert!(
+            rt.table.lock().accrued().is_empty(),
+            "no column may be created for an unratified sender"
+        );
     }
 
     /// Bytes the ceremony did not verify must not arm the node, and must leave it untouched.

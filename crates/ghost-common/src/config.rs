@@ -2438,6 +2438,23 @@ pub struct PoolConfig {
     /// See `docs/SHARE_SHARD.md`.
     #[serde(default)]
     pub share_shard: bool,
+
+    /// Run the Stage 5 genesis ceremony on startup, once.
+    ///
+    /// Dark by default like every other shard flag. Setting it converts THIS node's own copy of
+    /// the pinned anchor checkpoint into the opening balances, asserts the result against the
+    /// compile-time pin, and refuses to start the shard if it does not match — a loud local
+    /// self-check, not a fleet negotiation.
+    ///
+    /// **Idempotent.** Arming refuses once the genesis column exists, so leaving the flag set
+    /// across restarts is safe and is the intended steady state: the ceremony is "a data event
+    /// plus a config flip", and a flag that had to be unset again afterwards would be one more
+    /// thing to get wrong at the worst moment.
+    ///
+    /// ⚠ Requires `share_shard` — arming a runtime that is never constructed does nothing, and
+    /// silently doing nothing is the failure mode this whole design keeps running into.
+    #[serde(default)]
+    pub shard_arm_genesis: bool,
     /// Payout address for node rewards (5-4-3-2-1 capability shares)
     /// Broadcast in health pings so peers know where to send node reward payouts.
     /// Must be a valid bech32 address for the configured network.
@@ -2527,6 +2544,7 @@ impl Default for PoolConfig {
             share_batch_shadow: false,
             // Same rule: deploying the binary must not by itself start folding.
             share_shard: false,
+            shard_arm_genesis: false,
             node_payout_address: None,
             pool_name: None,
             coinbase_extra: None,

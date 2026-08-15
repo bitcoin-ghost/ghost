@@ -9301,6 +9301,29 @@ impl Database {
         })
     }
 
+    /// The RAW `canonical_payout` blob at an EXACT height, as stored.
+    ///
+    /// The genesis ceremony pins a digest over these bytes, so it needs the bytes themselves — a
+    /// decoded-then-re-encoded record is a different object (`serde_json` round-trips are not
+    /// byte-stable) and would fail the pin for no real reason.
+    ///
+    /// ⚠ EXACT height, never at-or-before. `get_payout_ledger_checkpoint_at_or_before` is right
+    /// for the runtime's coinbase lookup and catastrophic here: a node missing the anchor would
+    /// silently convert an OLDER checkpoint, pass its own local checks, and open the shard on
+    /// balances no other node agreed to. Absent must read as absent.
+    pub fn get_payout_ledger_canonical_blob(&self, height: u64) -> GhostResult<Option<Vec<u8>>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT canonical_payout FROM payout_ledger_checkpoints WHERE height = ?1",
+                params![height as i64],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map_err(|e| GhostError::Database(e.to_string()))
+            .map(|opt| opt.flatten())
+        })
+    }
+
     /// The latest finalised payout-ledger checkpoint.
     pub fn get_latest_payout_ledger_checkpoint(
         &self,

@@ -3825,6 +3825,100 @@ async fn main() -> Result<()> {
         None
     };
 
+    // ── Stage 5: the genesis ceremony ────────────────────────────────────────────────────────
+    //
+    // Runs ONCE, on startup, when the operator sets `pool.shard_arm_genesis`. Converts THIS node's
+    // own copy of the pinned anchor checkpoint into the opening balances and asserts the result
+    // against the compile-time pin. A loud LOCAL self-check: no node asks another node anything.
+    //
+    // Idempotent — arming refuses once the genesis column exists — so leaving the flag set across
+    // restarts is the intended steady state, and "already armed" is reported as SUCCESS rather
+    // than as a failure, or every restart of a correctly armed node would log an error saying it
+    // is unarmed.
+    //
+    // ⚠ On a genuine refusal the shard is DROPPED, not merely left unarmed. An earlier version of
+    // this block claimed "the shard simply does not start" and did not implement it: `shard` was
+    // already `Some`, and the mesh handler and fold task below guard on `shard` rather than on
+    // arming state — so a refused ceremony left the shard fully live, folding into an unarmed
+    // column and gossiping summaries with `genesis_marker: None`. The safety argument the whole
+    // block rests on has to be real, so the binding is reassigned.
+    let shard = match (&shard, config.pool.shard_arm_genesis) {
+        (Some(rt), true) => {
+            let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+            match db.get_payout_ledger_canonical_blob(anchor.height) {
+                Ok(Some(blob)) => match rt.arm_from_genesis(&anchor, &blob) {
+                    Ok(report) => {
+                        info!(
+                            anchor_height = report.anchor_height,
+                            epoch_floor = report.epoch_floor,
+                            opening_addresses = report.opening_addresses,
+                            replaced_columns = report.replaced_columns,
+                            cleared_epochs = report.cleared_epochs,
+                            table_root = %hex::encode(&report.table_root[..8]),
+                            "shard: GENESIS CEREMONY COMPLETE"
+                        );
+                        shard
+                    }
+                    Err(e) if e.to_string().contains("already armed") => {
+                        // The steady state, not a fault.
+                        info!(
+                            anchor_height = anchor.height,
+                            "shard: already armed — ceremony skipped"
+                        );
+                        shard
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            anchor_height = anchor.height,
+                            "shard: genesis ceremony REFUSED — DISABLING the shard. A shard that \
+                             failed to open is visible and recoverable; one folding and gossiping \
+                             from balances the ceremony rejected is neither"
+                        );
+                        None
+                    }
+                },
+                // Absent is NOT "convert something near it". A node missing the anchor must not
+                // fall back to an older checkpoint: it would pass its own checks and open on
+                // balances no other node agreed to.
+                Ok(None) => {
+                    error!(
+                        anchor_height = anchor.height,
+                        "shard: no checkpoint at the anchor height — DISABLING the shard; sync it \
+                         before arming"
+                    );
+                    None
+                }
+                Err(e) => {
+                    error!(error = %e, "shard: could not read the anchor checkpoint — DISABLING the shard");
+                    None
+                }
+            }
+        }
+        (None, true) => {
+            // The exact failure `shard_arm_genesis`'s own doc warns about: arming a runtime that
+            // was never constructed. Silence here is how an operator ends up believing a node is
+            // armed when nothing ran at all.
+            warn!(
+                "shard: `shard_arm_genesis` is set but `share_shard` is NOT — nothing to arm, and \
+                 no ceremony ran. Set both, or neither."
+            );
+            shard
+        }
+        _ => shard,
+    };
+
+    // The shard's receive half. Registered only when the shard is enabled, so a dark node puts
+    // no handler on the mesh at all — matching the flag's promise that deploying the binary
+    // starts nothing.
+    if let Some(ref rt) = shard {
+        let h = Arc::new(ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(
+            rt,
+        )));
+        mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+        info!("shard: mesh handler registered");
+    }
+
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
 
@@ -4036,8 +4130,82 @@ async fn main() -> Result<()> {
     // Skipping costs nothing here because the work is idempotent and driven by height, not by how
     // many times we looked.
     if let Some(ref rt) = shard {
+        // Two handles: one for the relay task, one for the tick task that owns the fold.
+        let rt_publish = Arc::clone(rt);
         let rt = Arc::clone(rt);
         let rpc_c = Arc::clone(&rpc);
+        // Broadcast relay for this node's own summaries. Channel-plus-relay, the same shape the
+        // SBC and checkpoint paths use: the fold holds the storage lock and must never await a
+        // network send while holding it.
+        let (shard_tx, mut shard_rx) =
+            tokio::sync::mpsc::channel::<ghost_common::share_shard::EpochSummary>(64);
+        {
+            let mesh_c = Arc::clone(&mesh);
+            let rt_c = rt_publish;
+            tokio::spawn(async move {
+                while let Some(summary) = shard_rx.recv().await {
+                    let epoch = summary.epoch;
+                    // ⚠ Refuse to send at all if the Noise plane is absent.
+                    //
+                    // `broadcast` falls back to plaintext ZMQ for ANY message type when there is
+                    // no Noise pool, and returns Ok(1) — so the "zero peers is not success" guard
+                    // below could never fire, `mark_broadcast` would retire the pending flag, and
+                    // a summary whose delta map is KEYED BY PAYOUT ADDRESS would have gone out in
+                    // clear. Leaving it pending is strictly better: nothing leaks, and it sends
+                    // the moment Noise is up.
+                    if !mesh_c.noise_available() {
+                        warn!(
+                            epoch,
+                            "shard: Noise unavailable — summary NOT broadcast (payout addresses \
+                             must not go out in clear); staying pending"
+                        );
+                        continue;
+                    }
+                    let bytes = match serde_json::to_vec(
+                        &ghost_consensus::message::ShardEpochSummaryMessage { summary },
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, epoch, "shard: summary would not serialise");
+                            continue;
+                        }
+                    };
+                    match mesh_c
+                        .create_envelope_raw(ghost_consensus::MessageType::ShardEpochSummary, bytes)
+                    {
+                        Ok(env) => match mesh_c.broadcast(env).await {
+                            // `broadcast` returns how many peers it reached. ZERO is not success:
+                            // the summary went nowhere, and marking it published would retire the
+                            // only record that it still needs sending. Left pending, it is picked
+                            // up again on a later tick once a peer is reachable.
+                            Ok(0) => {
+                                info!(epoch, "shard: summary reached no peers — left pending")
+                            }
+                            Ok(peers) => {
+                                // Marked ONLY after the send reached someone — the flag is the sole
+                                // record that an epoch still needs putting on the wire, so marking
+                                // optimistically would lose it silently.
+                                let _ = peers;
+                                match rt_c.mark_broadcast(epoch) {
+                                    Ok(true) => info!(epoch, peers, "shard: summary broadcast"),
+                                    Ok(false) => warn!(
+                                        epoch,
+                                        "shard: broadcast an epoch with no stored summary row"
+                                    ),
+                                    Err(e) => {
+                                        warn!(error = %e, epoch, "shard: could not mark published")
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, epoch, "shard: broadcast failed — will retry")
+                            }
+                        },
+                        Err(e) => warn!(error = %e, epoch, "shard: envelope failed"),
+                    }
+                }
+            });
+        }
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4049,6 +4217,27 @@ async fn main() -> Result<()> {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
+                // Drain pending summaries EVERY tick, not only on a tick that folded.
+                //
+                // This used to sit inside the `folded` arm, which contradicted its own comment: a
+                // node that folded while partitioned and regained peers a minute later waited up
+                // to a full epoch (~1h) to retry, and a restart carrying a backlog published
+                // nothing until the next epoch closed. The flag is the durable record of "still
+                // needs sending", so it should be consulted on the cadence that can act on it.
+                match rt.pending_broadcasts(8) {
+                    Ok(pending) => {
+                        for summary in pending {
+                            if shard_tx.try_send(summary).is_err() {
+                                // Relay saturated. Nothing is lost: the rows stay unpublished and
+                                // the next tick retries them.
+                                debug!("shard: broadcast relay busy — summaries stay pending");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "shard: could not read pending summaries"),
+                }
+
                 match rt.tick(tip) {
                     Ok(report) if !report.folded.is_empty() => {
                         info!(

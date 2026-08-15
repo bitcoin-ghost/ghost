@@ -449,6 +449,35 @@ impl Database {
         self.with_connection(|conn| store_epoch_tx(conn, summary, &summary_enc, published))
     }
 
+    /// Drop EVERY node's retained summaries at or above `from_epoch`. Returns how many went.
+    ///
+    /// **Only the Stage 5 arming ceremony calls this**, and it must clear peers' rows as well as
+    /// this node's, for a reason that is not obvious until gossip is running.
+    ///
+    /// Arming rewinds the fold watermark to the floor and re-folds every epoch since the anchor
+    /// with different totals, because the ceremony reset the column. This node's stored copies of
+    /// its OWN pre-arming summaries would otherwise make `store_epoch_tx` refuse the re-folded
+    /// ones as equivocation ("the held row is the evidence"), and its stored copies of PEERS'
+    /// pre-genesis summaries describe a ledger that no longer exists.
+    ///
+    /// ⚠ **This clears only the LOCAL database.** A not-yet-armed PEER still holds this node's
+    /// pre-arming summaries in its own store, and will return `SummaryEquivocation` for every
+    /// re-folded epoch until that peer arms too. That is logged, never escalated to a ban, and
+    /// later epochs' cumulative totals repair the balances by max-merge — but the fleet is
+    /// mutually accusatory for the length of the roll, and the roll is only healthy once those
+    /// rejections stop. A commit message previously called this "fixed"; it is contained, not
+    /// eliminated, and eliminating it needs the whole fleet to arm together or a genesis-aware
+    /// equivocation check.
+    pub fn shard_clear_all_epochs_from(&self, from_epoch: u64) -> GhostResult<usize> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM shard_epochs WHERE epoch >= ?1",
+                params![from_epoch as i64],
+            )
+            .map_err(|e| GhostError::Database(e.to_string()))
+        })
+    }
+
     /// The stored summary for `epoch`, or `None`.
     ///
     /// Decrypt-then-deserialise: re-serialisation for a peer is harmless because the signature
@@ -493,30 +522,47 @@ impl Database {
         })
     }
 
-    /// Drop this node's own epoch summaries at or above `from_epoch`. Returns how many went.
+    /// This node's OWN summaries that have not yet been broadcast, oldest first.
     ///
-    /// **Only the Stage 5 arming ceremony calls this**, and it is load-bearing there rather than
-    /// tidy-up. Arming replaces the whole table with the genesis balances, which discards the
-    /// columns the Stage 4 soak accrued — but the summary rows the soak wrote would survive, and
-    /// `shard_fold_epoch`'s idempotence gate reads exactly those rows. The catch-up would then see
-    /// every epoch between the anchor and the moment of arming as `AlreadyFolded`, credit nothing,
-    /// and every miner's work across that window would vanish with no error anywhere.
+    /// Drives the gossip relay. Reading from the `published` flag rather than from whatever the
+    /// fold just returned is what makes the broadcast survive a restart: a summary folded and
+    /// persisted but never put on the wire is still pending on the next start, instead of being
+    /// silently lost with the process that folded it.
     ///
-    /// Scoped to `from_epoch` (the arming floor) and to this node's own column: summaries below
-    /// the floor are pre-genesis and their work is already inside the genesis balances, so
-    /// re-folding them would double-count, and another node's summaries are not ours to delete.
-    pub fn shard_clear_own_epochs_from(
+    /// Bounded by `limit` so a node that has been offline does not try to broadcast a whole
+    /// backlog in one tick — the same lock-fairness reasoning as the fold's bounded batches.
+    pub fn shard_unpublished_epochs(
         &self,
         node: &NodeId,
-        from_epoch: u64,
-    ) -> GhostResult<usize> {
-        self.with_connection(|conn| {
-            conn.execute(
-                "DELETE FROM shard_epochs WHERE node_id = ?1 AND epoch >= ?2",
-                params![node.to_vec(), from_epoch as i64],
-            )
-            .map_err(|e| GhostError::Database(e.to_string()))
-        })
+        limit: u32,
+    ) -> GhostResult<Vec<EpochSummary>> {
+        let rows: Vec<String> = self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT summary_enc FROM shard_epochs \
+                     WHERE node_id = ?1 AND published = 0 ORDER BY epoch ASC LIMIT ?2",
+                )
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            let out = stmt
+                .query_map(params![node.to_vec(), limit as i64], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(|e| GhostError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| GhostError::Database(e.to_string()))?;
+            Ok(out)
+        })?;
+
+        let mut summaries = Vec::with_capacity(rows.len());
+        for enc in rows {
+            // A row that cannot be decrypted or parsed is an ERROR, not a skip: silently dropping
+            // it would leave the epoch permanently unpublished with nothing saying why.
+            let json = self.decrypt_address(&enc)?;
+            summaries.push(serde_json::from_str(&json).map_err(|e| {
+                GhostError::Database(format!("stored epoch summary does not parse: {e}"))
+            })?);
+        }
+        Ok(summaries)
     }
 
     /// Mark an epoch's summary as having been broadcast. Returns whether the row existed —
