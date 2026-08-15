@@ -191,7 +191,7 @@ async fn a_peer_cannot_raise_this_nodes_own_column() {
         .expect("handled");
 
     assert!(
-        rt.owed().get("bc1qattacker").is_none(),
+        !rt.owed().contains_key("bc1qattacker"),
         "a peer's claim about OUR column must be refused: we are authoritative for it, and a fold \
          would otherwise sign and gossip the inflation as our own"
     );
