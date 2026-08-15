@@ -3825,6 +3825,56 @@ async fn main() -> Result<()> {
         None
     };
 
+    // ── Stage 5: the genesis ceremony ────────────────────────────────────────────────────────
+    //
+    // Runs ONCE, on startup, when the operator sets `pool.shard_arm_genesis`. Converts THIS node's
+    // own copy of the pinned anchor checkpoint into the opening balances and asserts the result
+    // against the compile-time pin. A loud LOCAL self-check: no node asks another node anything,
+    // so there is no negotiation to partition and no quorum to stall, and a node holding the wrong
+    // bytes discovers it alone.
+    //
+    // Idempotent by construction — arming refuses once the genesis column exists — so leaving the
+    // flag set across restarts is the intended steady state rather than something to remember to
+    // undo.
+    //
+    // A failure here does NOT take the pool down, and deliberately does not arm: the shard simply
+    // does not start. A shard that failed to open is visible and recoverable; one that opened on
+    // the wrong balances is neither, because every node would be internally consistent with its
+    // own wrong numbers.
+    if let Some(ref rt) = shard {
+        if config.pool.shard_arm_genesis {
+            let anchor = ghost_accounting::shard_genesis::pinned_anchor();
+            match db.get_payout_ledger_canonical_blob(anchor.height) {
+                Ok(Some(blob)) => match rt.arm_from_genesis(&anchor, &blob) {
+                    Ok(report) => info!(
+                        anchor_height = report.anchor_height,
+                        epoch_floor = report.epoch_floor,
+                        opening_addresses = report.opening_addresses,
+                        replaced_columns = report.replaced_columns,
+                        cleared_epochs = report.cleared_epochs,
+                        table_root = %hex::encode(&report.table_root[..8]),
+                        "shard: GENESIS CEREMONY COMPLETE"
+                    ),
+                    Err(e) => error!(
+                        error = %e,
+                        anchor_height = anchor.height,
+                        "shard: genesis ceremony REFUSED — shard left unarmed (this is the safe \
+                         direction; investigate before retrying)"
+                    ),
+                },
+                // Absent is NOT "convert something near it". A node missing the anchor must not
+                // fall back to an older checkpoint: it would pass its own checks and open on
+                // balances no other node agreed to.
+                Ok(None) => error!(
+                    anchor_height = anchor.height,
+                    "shard: genesis ceremony cannot run — this node holds no checkpoint at the \
+                     anchor height; sync it before arming"
+                ),
+                Err(e) => error!(error = %e, "shard: could not read the anchor checkpoint"),
+            }
+        }
+    }
+
     // The shard's receive half. Registered only when the shard is enabled, so a dark node puts
     // no handler on the mesh at all — matching the flag's promise that deploying the binary
     // starts nothing.

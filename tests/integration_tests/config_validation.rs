@@ -541,6 +541,8 @@ fn test_pool_config_validate_success() {
         share_batch_shadow: false,
         // Share shard (docs/SHARE_SHARD.md): same precedent, dark unless a node opts in.
         share_shard: false,
+        // Stage 5 genesis ceremony: dark until the operator runs it deliberately.
+        shard_arm_genesis: false,
         node_payout_address: None,
         pool_name: None,
         coinbase_extra: None,
