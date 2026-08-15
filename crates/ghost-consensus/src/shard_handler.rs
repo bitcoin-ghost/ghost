@@ -1076,6 +1076,103 @@ mod tests {
         assert_eq!(table.compute_table_root(), before);
     }
 
+    /// A node that has gone QUIET cannot repair a peer's missing column by gossip, and the
+    /// whole-table sync can. This is the property that makes `ShardTableSync` load-bearing rather
+    /// than an optimisation, so it is asserted in both directions.
+    ///
+    /// The failure it pins was live on the fleet (measured 2026-08-15): vm1–4 held 5 columns and
+    /// vm5–8 held 6, byte-identical within each group, with zero refusals logged. The missing
+    /// node folded `share_count = 0` every epoch, so its summaries carried no cells and no amount
+    /// of listening could have closed the gap. `ShardTableSync` existed and was tested, but
+    /// nothing in `ghost-pool` sent, served or applied it.
+    #[test]
+    fn a_quiet_nodes_summary_cannot_repair_a_missed_column_but_a_table_sync_can() {
+        let worker = identity();
+
+        // Epoch 1: the worker credits alice. A peer that is present merges this.
+        let (e1, ev1) = summarise(
+            1,
+            &worker,
+            &BTreeMap::new(),
+            vec![share(10, 1, "bc1qalice", 4.0)],
+        );
+        let mut present = ShardTable::new();
+        present
+            .apply_summary(&e1, &ev1, compute_merkle_root)
+            .expect("verifies");
+        assert_eq!(
+            present.accrued().get(&worker.node_id()).map(|c| c.len()),
+            Some(1),
+            "the present peer holds the worker's column"
+        );
+
+        // Epoch 2: the worker goes quiet — no shares at all. This is the ONLY kind of summary an
+        // idle node emits, and it is what the absent peer will receive from here on.
+        let (e2, ev2) = summarise(2, &worker, &column_of(&e1), vec![]);
+        assert!(
+            e2.deltas.is_empty(),
+            "a quiet epoch's summary carries NO cells — this is the whole problem"
+        );
+
+        // The absent peer missed epoch 1 and now receives every later summary.
+        let mut absent = ShardTable::new();
+        absent
+            .apply_summary(&e2, &ev2, compute_merkle_root)
+            .expect("verifies");
+        assert!(
+            absent
+                .accrued()
+                .get(&worker.node_id())
+                .is_none_or(|c| c.is_empty()),
+            "gossip CANNOT repair the gap: the quiet summary carried none of the worker's totals"
+        );
+
+        // Replaying many further quiet epochs changes nothing — it is frozen, not slow.
+        //
+        // `prior` stays the worker's FULL cumulative column throughout. That is what a real quiet
+        // node passes: `fold_epoch` reads it out of the table, not out of the last summary.
+        // Re-deriving it with `column_of` would collapse it to empty after the first quiet epoch
+        // and the loop would then be replaying a node with no history rather than one whose
+        // history is frozen — which is the case actually being demonstrated.
+        let prior = column_of(&e1);
+        assert!(!prior.is_empty(), "the worker's history is non-empty");
+        for epoch in 3..8 {
+            let (e, ev) = summarise(epoch, &worker, &prior, vec![]);
+            assert!(e.deltas.is_empty(), "every quiet epoch carries no cells");
+            absent
+                .apply_summary(&e, &ev, compute_merkle_root)
+                .expect("verifies");
+        }
+        assert!(
+            absent
+                .accrued()
+                .get(&worker.node_id())
+                .is_none_or(|c| c.is_empty()),
+            "still empty after five more epochs — waiting is not a fix"
+        );
+
+        // The repair path: a peer that DOES hold the column serves its whole table.
+        let server = identity();
+        let resp = build_table_sync_response(&server, &present);
+        let outcome = apply_table_sync_response(&mut absent, &resp).expect("applies");
+
+        assert_eq!(
+            absent.accrued().get(&worker.node_id()),
+            present.accrued().get(&worker.node_id()),
+            "table sync recovered the column gossip could not"
+        );
+        assert!(outcome.roots_match, "and the tables now agree");
+
+        // Idempotent: applying it again is a no-op, so a retry cannot double-count.
+        let before = absent.accrued().clone();
+        apply_table_sync_response(&mut absent, &resp).expect("applies");
+        assert_eq!(
+            &before,
+            absent.accrued(),
+            "per-cell max makes a repeat a no-op"
+        );
+    }
+
     /// The §12.6 exchange end to end: a built response applies cleanly; a tampered or
     /// non-canonical one is refused with the table byte-identical; and the root comparison
     /// surfaces a settlement difference instead of hiding it.

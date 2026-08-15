@@ -29,11 +29,18 @@ use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
 use ghost_common::error::GhostResult;
+use ghost_common::types::NodeId;
 use ghost_consensus::mesh::MessageHandler;
-use ghost_consensus::message::{MessageEnvelope, ShardEpochSummaryMessage};
+use ghost_consensus::message::{MessageEnvelope, ShardEpochSummaryMessage, ShardTableSyncMessage};
 use ghost_consensus::MessageType;
 
-use crate::shard::{PeerMergeOutcome, ShardRuntime};
+use crate::shard::{PeerMergeOutcome, ShardRuntime, TableSyncMerge};
+
+/// Where a served table-sync response is handed off to be sent.
+///
+/// The handler cannot send it itself: `MessageHandler::handle_message` has no access to the mesh,
+/// and giving it one would make the shard handler own a reference to the thing dispatching to it.
+pub type SyncResponder = tokio::sync::mpsc::Sender<(NodeId, ShardTableSyncMessage)>;
 
 /// Routes gossiped shard messages into the runtime.
 ///
@@ -41,11 +48,37 @@ use crate::shard::{PeerMergeOutcome, ShardRuntime};
 /// rest of the shard uses — there is no second way into the counters.
 pub struct ShardMeshHandler {
     shard: Arc<ShardRuntime>,
+    /// Outbound queue for table-sync responses. `None` leaves the node able to REQUEST and to
+    /// merge what it is sent, but unable to serve — which is a silent half-wiring, so it is
+    /// logged when a request arrives with nothing to answer it.
+    sync_out: Option<SyncResponder>,
+    /// When each peer was last SERVED a whole table.
+    ///
+    /// Serving is expensive — a DB read for admission, the table lock, a full clone and
+    /// canonicalisation, and an ed25519 signature — and it runs inline on the mesh receive path,
+    /// which dispatches handlers sequentially. Without a cooldown one peer looping requests would
+    /// stall this node's inbound votes, checkpoints and summaries behind it. The asker's hourly
+    /// cadence is self-imposed and therefore not a limit on anyone else's behaviour.
+    last_served: parking_lot::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
 }
+
+/// Minimum gap between whole-table syncs served to the SAME peer. Well under the hourly ask
+/// cadence, so an honest peer never trips it — including one that restarts and asks early.
+const SERVE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl ShardMeshHandler {
     pub fn new(shard: Arc<ShardRuntime>) -> Self {
-        Self { shard }
+        Self {
+            shard,
+            sync_out: None,
+            last_served: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Wire the responder half, so this node can SERVE whole-table syncs as well as request them.
+    pub fn with_sync_responder(mut self, tx: SyncResponder) -> Self {
+        self.sync_out = Some(tx);
+        self
     }
 
     fn handle_summary(&self, envelope: &MessageEnvelope) -> GhostResult<()> {
@@ -111,18 +144,178 @@ impl ShardMeshHandler {
         }
         Ok(())
     }
+
+    /// Whole-table sync (§12.6), both directions.
+    ///
+    /// This is the ONLY path that can repair a column a node missed entirely: epoch summaries
+    /// carry just the addresses active in that epoch, so a node which has gone quiet gossips
+    /// nothing, and a peer that was absent while it worked stays permanently short. Handling
+    /// `ShardEpochSummary` alone — which is all this handler used to do — left that gap open.
+    ///
+    /// Returns the response to send back, when the message was a Request.
+    fn handle_table_sync(
+        &self,
+        envelope: &MessageEnvelope,
+    ) -> GhostResult<Option<ShardTableSyncMessage>> {
+        let msg: ShardTableSyncMessage = match serde_json::from_slice(&envelope.payload) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!(error = %e, "shard: undeserialisable table sync dropped");
+                return Ok(None);
+            }
+        };
+
+        match &msg {
+            ShardTableSyncMessage::Request {
+                requesting_node,
+                table_root,
+            } => {
+                let peer = hex::encode(&envelope.sender[..4]);
+
+                // ⚠ Admission is checked against `envelope.sender`, NEVER `requesting_node`.
+                //
+                // `ShardTableSyncMessage::Request` is deliberately unsigned, so `requesting_node`
+                // is an unauthenticated assertion by whoever sent the bytes — only
+                // `envelope.sender` is bound by `validate_and_verify`. Checking the payload field
+                // would let any node whose envelopes we accept name a ratified id and receive the
+                // whole accrued table, with payout addresses in the clear inside the envelope,
+                // unicast back to ITS address. That is precisely the harvest this check exists to
+                // stop, so a mismatch between the two is refused outright rather than tolerated.
+                if *requesting_node != envelope.sender {
+                    warn!(
+                        sender = %peer,
+                        claimed = %hex::encode(&requesting_node[..4]),
+                        "shard: table sync request claims a different node id than it was signed by — NOT served"
+                    );
+                    return Ok(None);
+                }
+
+                // Cooldown BEFORE the admission DB read and the signing, so a flood costs this
+                // node a hashmap lookup rather than a table clone per message.
+                {
+                    let mut seen = self.last_served.lock();
+                    let now = std::time::Instant::now();
+                    if let Some(prev) = seen.get(&envelope.sender) {
+                        if now.duration_since(*prev) < SERVE_COOLDOWN {
+                            debug!(peer = %peer, "shard: table sync request within cooldown — not served");
+                            return Ok(None);
+                        }
+                    }
+                    // Bound the map: it is keyed by peer, and only ratified peers get this far in
+                    // the normal case, but an unbounded map fed by envelope.sender is a memory
+                    // sink an attacker controls.
+                    if seen.len() > 256 {
+                        seen.retain(|_, t| now.duration_since(*t) < SERVE_COOLDOWN);
+                    }
+                    seen.insert(envelope.sender, now);
+                }
+
+                match self.shard.table_sync_response_for(&envelope.sender)? {
+                    Some(response) => {
+                        // Read the root out of the response we are actually sending. Re-reading it
+                        // from the runtime would take the lock a third time and could pick up a
+                        // fold that landed in between, making `agree=` describe a table the peer
+                        // never received — misleading on the very divergence this log exists for.
+                        let ours = match &response {
+                            ShardTableSyncMessage::Response { table_root, .. } => *table_root,
+                            ShardTableSyncMessage::Request { table_root, .. } => *table_root,
+                        };
+                        info!(
+                            peer = %peer,
+                            peer_root = %hex::encode(&table_root[..8]),
+                            our_root = %hex::encode(&ours[..8]),
+                            agree = (*table_root == ours),
+                            "shard: serving a whole-table sync request"
+                        );
+                        Ok(Some(response))
+                    }
+                    None => {
+                        warn!(peer = %peer,
+                            "shard: table sync requested by a node outside the ratified set (or we are solo) — NOT served");
+                        Ok(None)
+                    }
+                }
+            }
+            ShardTableSyncMessage::Response {
+                responding_node, ..
+            } => {
+                let peer = hex::encode(&responding_node[..4]);
+                match self.shard.apply_table_sync(&msg)? {
+                    TableSyncMerge::Applied {
+                        columns_gained,
+                        columns_raised,
+                        roots_match,
+                        table_root,
+                    } => {
+                        // Gaining a column is the headline: it is the failure epoch summaries
+                        // cannot fix, so it is logged loudly enough to be seen in a normal roll.
+                        if columns_gained > 0 {
+                            warn!(
+                                peer = %peer, columns_gained, columns_raised, roots_match,
+                                table_root = %hex::encode(&table_root[..8]),
+                                "shard: table sync RECOVERED columns this node was missing"
+                            );
+                        } else {
+                            info!(
+                                peer = %peer, columns_raised, roots_match,
+                                table_root = %hex::encode(&table_root[..8]),
+                                "shard: table sync applied"
+                            );
+                        }
+                        // Roots still differing after a merge is not necessarily a fault: the root
+                        // commits `settled` too, which never crosses the mesh. Worth saying, not
+                        // worth alarming about.
+                        if !roots_match {
+                            debug!(peer = %peer,
+                                "shard: roots still differ after sync (settled is chain-derived, not gossiped)");
+                        }
+                    }
+                    TableSyncMerge::NotAdmitted => {
+                        warn!(peer = %peer, "shard: table sync from a node outside the ratified set — NOT merged");
+                    }
+                    TableSyncMerge::SoloRefused => {
+                        debug!(peer = %peer, "shard: solo mode — table sync not merged");
+                    }
+                    TableSyncMerge::OwnEcho => {}
+                    TableSyncMerge::Rejected(why) => {
+                        info!(peer = %peer, reason = %why, "shard: table sync refused");
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl MessageHandler for ShardMeshHandler {
     async fn handle_message(&self, envelope: Arc<MessageEnvelope>) -> GhostResult<()> {
-        if envelope.msg_type != MessageType::ShardEpochSummary {
-            return Ok(());
-        }
-        // A merge failure must not kill the handler task — the mesh delivers to every handler and
-        // one shard hiccup should not stop the rest of consensus receiving its messages.
-        if let Err(e) = self.handle_summary(&envelope) {
-            warn!(error = %e, "shard: epoch summary handling failed");
+        match envelope.msg_type {
+            MessageType::ShardEpochSummary => {
+                // A merge failure must not kill the handler task — the mesh delivers to every
+                // handler and one shard hiccup should not stop the rest of consensus receiving
+                // its messages.
+                if let Err(e) = self.handle_summary(&envelope) {
+                    warn!(error = %e, "shard: epoch summary handling failed");
+                }
+            }
+            MessageType::ShardTableSync => match self.handle_table_sync(&envelope) {
+                Ok(Some(response)) => {
+                    if let Some(tx) = self.sync_out.as_ref() {
+                        // Bounded channel, and a full one is dropped rather than awaited: the
+                        // requester retries, and blocking the mesh dispatch task to serve a
+                        // sync would delay every other message on the connection.
+                        if tx.try_send((envelope.sender, response)).is_err() {
+                            warn!("shard: table-sync response dropped (send queue full)");
+                        }
+                    } else {
+                        debug!("shard: table-sync request received but no responder channel wired");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "shard: table sync handling failed"),
+            },
+            _ => {}
         }
         Ok(())
     }

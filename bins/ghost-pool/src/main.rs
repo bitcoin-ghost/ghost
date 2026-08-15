@@ -3912,11 +3912,137 @@ async fn main() -> Result<()> {
     // no handler on the mesh at all — matching the flag's promise that deploying the binary
     // starts nothing.
     if let Some(ref rt) = shard {
-        let h = Arc::new(ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(
-            rt,
-        )));
+        // Responder channel for whole-table syncs. The handler cannot send: it has no mesh
+        // reference, so it hands the built response here and this task puts it on the wire.
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel::<(
+            ghost_common::types::NodeId,
+            ghost_consensus::message::ShardTableSyncMessage,
+        )>(16);
+
+        let h = Arc::new(
+            ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(rt))
+                .with_sync_responder(sync_tx),
+        );
         mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
-        info!("shard: mesh handler registered");
+
+        // Serve half: answer a peer's sync request, unicast back to whoever asked.
+        {
+            let mesh_c = Arc::clone(&mesh);
+            tokio::spawn(async move {
+                while let Some((requester, response)) = sync_rx.recv().await {
+                    // Same rule as the summary path: the table is keyed by PAYOUT ADDRESS, so it
+                    // must never go out in clear. A requester that got no answer simply retries.
+                    if !mesh_c.noise_available() {
+                        warn!("shard: Noise unavailable — table sync NOT served (payout addresses must not go out in clear)");
+                        continue;
+                    }
+                    let bytes = match serde_json::to_vec(&response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "shard: table sync response would not serialise");
+                            continue;
+                        }
+                    };
+                    // ⚠ Check the cap HERE, on the way out.
+                    //
+                    // `validate_payload_size` runs only on the inbound side, so an oversized table
+                    // is dropped by the receiver at `debug!` while this node logs a successful
+                    // send. §12.6 would then stop working with nothing in either log naming the
+                    // reason — and it would fail precisely when the table is largest, which is
+                    // when the repair matters most. Saying so loudly is the difference between a
+                    // known limit and a silent one.
+                    let cap = ghost_consensus::message_validator::max_payload_size(
+                        ghost_consensus::MessageType::ShardTableSync,
+                    );
+                    if bytes.len() > cap {
+                        warn!(
+                            bytes = bytes.len(),
+                            cap,
+                            "shard: table sync response EXCEEDS the per-type payload cap — not \
+                             sent; the receiver would drop it silently. §12.6 repair is degraded \
+                             until the table is split or the cap is raised."
+                        );
+                        continue;
+                    }
+                    let env = match mesh_c
+                        .create_envelope_raw(ghost_consensus::MessageType::ShardTableSync, bytes)
+                    {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!(error = %e, "shard: table sync envelope failed");
+                            continue;
+                        }
+                    };
+                    // Unicast: a whole table is large and only the asker needs it.
+                    match mesh_c.peers().get_peer(&requester) {
+                        Some(peer) => {
+                            if let Err(e) = mesh_c.send_to_peer(&peer, &env).await {
+                                debug!(error = %e, "shard: could not send table sync response");
+                            }
+                        }
+                        None => debug!("shard: table sync requester is not a known peer"),
+                    }
+                }
+            });
+        }
+
+        // Ask half: periodically request a whole-table sync from the fleet.
+        //
+        // ⚠ This is NOT redundant with epoch-summary gossip, which is why it has to exist.
+        // `EpochSummary::build` emits only the addresses that had shares in that epoch, so a node
+        // which has gone quiet broadcasts a summary containing nothing, and a peer that was absent
+        // while it was working can never learn its totals from gossip. Measured on the fleet
+        // 2026-08-15: vm1–4 held 5 columns and vm5–8 held 6, byte-identical within each group,
+        // with zero refusals — a gap no amount of listening would have closed.
+        //
+        // Hourly, jittered by node id: the payload is the whole accrued table, and eight nodes
+        // asking in lockstep would serve eight copies of it at the same instant every hour.
+        {
+            let mesh_c = Arc::clone(&mesh);
+            let rt_c = Arc::clone(rt);
+            let self_id = identity.node_id();
+            tokio::spawn(async move {
+                // Spread the first ask across ten minutes so a fleet restarted together does not
+                // synchronise. Derived from the node id, so it is stable across restarts.
+                let jitter = (self_id[0] as u64 * 600) / 256;
+                tokio::time::sleep(std::time::Duration::from_secs(120 + jitter)).await;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if !mesh_c.noise_available() {
+                        continue;
+                    }
+                    // The request carries only our node id and our table root — no addresses —
+                    // but it rides Noise anyway so the root is not a public fingerprint.
+                    // `None` in solo mode: a solo node must not make the fleet build tables for
+                    // an answer it would discard.
+                    let req = match rt_c.table_sync_request() {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let bytes = match serde_json::to_vec(&req) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "shard: table sync request would not serialise");
+                            continue;
+                        }
+                    };
+                    match mesh_c
+                        .create_envelope_raw(ghost_consensus::MessageType::ShardTableSync, bytes)
+                    {
+                        Ok(env) => match mesh_c.broadcast(env).await {
+                            Ok(0) => debug!("shard: table sync request reached no peers"),
+                            Ok(peers) => info!(peers, "shard: requested a whole-table sync"),
+                            Err(e) => debug!(error = %e, "shard: table sync request failed"),
+                        },
+                        Err(e) => warn!(error = %e, "shard: table sync request envelope failed"),
+                    }
+                }
+            });
+        }
+
+        info!("shard: mesh handler registered (summaries + whole-table sync)");
     }
 
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
@@ -11167,8 +11293,13 @@ fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
             .any(|l| l.trim_start().starts_with("public_mining"))
         {
             warn!(
+                // The variants deserialise as snake_case. This message used to name them
+                // in CamelCase, so following it exactly produced `unknown variant
+                // `PublicPool`, expected one of `public_pool`, ...` and the node refused
+                // to start — a deprecation notice that broke the config it was telling
+                // you how to fix.
                 "DEPRECATED: `public_mining` in pool.toml is ignored. \
-                 Use `mining_mode = \"PublicPool\" | \"PrivatePool\" | \"PrivateSolo\"` instead. \
+                 Use `mining_mode = \"public_pool\" | \"private_pool\" | \"private_solo\"` instead. \
                  Remove the `public_mining` line to silence this warning."
             );
         }

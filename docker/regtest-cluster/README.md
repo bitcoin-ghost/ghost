@@ -117,25 +117,48 @@ Only with every box ticked should the gated rolling deploy (`plan` §4) proceed.
 
 ---
 
-### ⛔ Hard blocker found 2026-06-20 — the mesh rejects private IPs by design
+### ✅ RESOLVED — the private-IP blocker was fixed the day it was found
 
-A real-binary cluster **cannot form its consensus mesh on a local/docker/private
-network.** `discovery_handler::validate_peer_address` → `is_private_or_local_ip`
-**rejects every loopback/private peer address** (127.x, 10.x, 172.16/12,
-192.168.x) with `Rejecting invalid peer address from discovery` (same family as
-the M-11 SSRF rule that refuses `127.0.0.1`). So peers never enter each other's
-Noise peer set, MPC contributions broadcast to `sent=0`, the ceremony stalls at
-**Elder #1 only**, and there is no BFT quorum — hence no payout.
+> **The section below described a blocker that no longer exists. It stayed here,
+> unamended, for nearly two months and was read as "a local cluster can never
+> mesh" — which stopped anyone from running the one test that would have shown
+> otherwise. Measured 2026-08-15: all 4 nodes mesh, `peer_count: 3` each, 216+
+> messages validated, 0 bad signatures.**
+>
+> `with_private_peers_allowed(!is_mainnet_round)` was wired into ghost-pool in
+> `56dfe5dd3` on **2026-06-20** — the same day this blocker was written. Mainnet
+> keeps the SSRF/hijack guard; regtest/testnet/signet allow private peers, which
+> is exactly what a docker cluster needs. Nothing needs patching, and the
+> "throwaway patched binary (never ship it)" workaround below is obsolete.
 
-This is *why* the production validation framework (`tests/cluster_chaos`) targets
-the **real VMs with public IPs**, not a local cluster. To run THIS regtest
-cluster to a payout you must either:
-1. give the nodes **public/routable IPs** (4 separate hosts), or
-2. run a **throwaway dry-run binary patched** to allow private IPs in
-   `validate_peer_address` (test-only; never ship it), or
-3. accept that the **in-process harness** (`tests/integration_tests/mesh_cluster.rs`)
-   is the deterministic consensus check, and use this cluster only for the
-   transport/boot smoke test.
+What actually stopped this cluster was four faults in *this directory*, each on
+its own fatal, none of them in consensus code:
+
+| Fault | Symptom |
+|---|---|
+| `[ghost_pay] enabled = false` alone | `missing field virtual_block_secs` — every node died at startup |
+| `public_mining = true` | key was renamed; silently ignored, so the cluster ran in the wrong mining mode |
+| `public_address = "${NODE_NAME}"` | peer addresses must be IPs — a hostname can never mesh |
+| `rpc_host = "bitcoind"` | `TLS required for remote Ghost Core` — the README prescribed a socat sidecar that nothing implemented |
+
+Peer addresses must be **literal IPs** on both sides: the Noise send path parses
+them with `SocketAddr::parse`, which does not resolve DNS, so container names
+produced `Invalid peer address: invalid socket address syntax` on every
+encrypted send. Hence the fixed `172.28.0.0/16` subnet and IP `SEED_NODES` in
+`docker-compose.yml`.
+
+⚠ **`bin/ghost-pool` is a tracked binary and goes stale silently.** It was
+v1.10.22 while the tree was v1.11.22 — a cluster run would have "passed" against
+code months older than the change under test. `docker-compose.yml` now
+bind-mounts it; rebuild before every run:
+
+```bash
+cargo build --release -p ghost-pool && cp target/release/ghost-pool docker/regtest-cluster/bin/ghost-pool
+```
+
+The **in-process harness** (`tests/integration_tests/mesh_cluster.rs`) remains the
+deterministic check for consensus *logic*; this cluster exercises the real
+transport, which the harness cannot.
 
 Also note: the `ghostd` binary used here lacks ZMQ (`getzmqnotifications` →
 method-not-found), so block notifications come via RPC polling only; and the

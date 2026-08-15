@@ -167,6 +167,28 @@ pub enum PeerMergeOutcome {
     Rejected(String),
 }
 
+/// What a whole-table sync did (§12.6 receiving side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableSyncMerge {
+    /// Applied. `columns_gained` counts peer columns this node held NOTHING for before — the
+    /// number that matters, because that is the gap epoch summaries cannot close.
+    Applied {
+        columns_gained: usize,
+        columns_raised: usize,
+        roots_match: bool,
+        table_root: [u8; 32],
+    },
+    /// Solo mode: the shared shard is not this node's business (§10).
+    SoloRefused,
+    /// Our own table came back to us.
+    OwnEcho,
+    /// The responder is not in the fleet's ratified node set. A whole table from a stranger is a
+    /// far larger unverified assertion than a single summary, and a max would make it permanent.
+    NotAdmitted,
+    /// Verification refused it — non-canonical, bad signature, or a different genesis.
+    Rejected(String),
+}
+
 /// What arming did — the ceremony's receipt, for the operator's log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArmReport {
@@ -728,6 +750,222 @@ impl ShardRuntime {
     /// difference here is a real difference and not a rounding artefact of the comparison.
     ///
     /// [`micro_work`]: ghost_common::share_batch::micro_work
+    /// Build this node's §12.6 whole-table sync REQUEST.
+    ///
+    /// Carries our own root so the responder can see the drift too — either side can log it.
+    ///
+    /// `None` in solo mode. A solo node's work is its own (§10), and its `apply_table_sync` would
+    /// discard any answer as `SoloRefused` — so asking would make every peer build, sign and
+    /// unicast a whole table for a reply that is thrown away. Every other transmit path
+    /// (`pending_broadcasts`, `fold_epoch`, `tick`) already refuses in solo mode; this one was the
+    /// exception, which is exactly how a "dark" flag stops meaning dark.
+    pub fn table_sync_request(&self) -> Option<ghost_consensus::message::ShardTableSyncMessage> {
+        if self.solo {
+            return None;
+        }
+        Some(ghost_consensus::message::ShardTableSyncMessage::Request {
+            requesting_node: self.identity.node_id(),
+            table_root: self.table.lock().compute_table_root(),
+        })
+    }
+
+    /// Build the RESPONSE for a specific requester, or `None` if we will not serve them.
+    ///
+    /// Signing makes the served table attributable — a peer that serves an inflated cell has
+    /// signed the inflation, which is what makes it publishable evidence rather than hearsay.
+    ///
+    /// ⚠ **Admission is checked on the SERVE side too, not only on apply.** The response carries
+    /// the whole accrued table, whose cells are keyed by PAYOUT ADDRESS in the clear inside the
+    /// envelope. The mesh authenticates the sender's signature, but authentication is not
+    /// authorisation: without this check any node whose envelopes we accept could ask once an hour
+    /// and harvest every payout address the fleet knows. Serving only the ratified set makes the
+    /// disclosure the same set that already holds this data.
+    ///
+    /// Solo nodes never serve: their work is their own (§10), and the table they would hand over
+    /// is not the shared shard's.
+    pub fn table_sync_response_for(
+        &self,
+        requester: &ghost_common::types::NodeId,
+    ) -> GhostResult<Option<ghost_consensus::message::ShardTableSyncMessage>> {
+        if self.solo {
+            return Ok(None);
+        }
+        if !self.peer_is_admissible(requester)? {
+            return Ok(None);
+        }
+        Ok(Some(
+            ghost_consensus::shard_handler::build_table_sync_response(
+                &self.identity,
+                &self.table.lock(),
+            ),
+        ))
+    }
+
+    /// Apply a peer's whole-table sync response — the repair path for a column this node missed.
+    ///
+    /// ## Why this exists at all
+    ///
+    /// Epoch summaries cannot close a gap. [`EpochSummary::build`] emits only the addresses that
+    /// had shares IN THAT EPOCH, so a node which has gone quiet broadcasts a summary with no cells
+    /// — carrying none of its cumulative totals. A peer that missed the epochs where that node was
+    /// working can therefore never learn those totals from gossip, no matter how long it listens.
+    /// The design's "a missing message makes you behind, never wrong" holds only while the address
+    /// keeps producing shares; once it stops, the gap is frozen.
+    ///
+    /// Measured on the fleet 2026-08-15: vm1–4 held 5 columns and vm5–8 held 6, byte-identical
+    /// within each group, with ZERO refusals logged. The missing node folds `share_count=0` every
+    /// epoch, so nothing in the gossip path could ever have repaired it. This is the path that
+    /// can, and until it was wired the two halves would have computed different payouts for ever.
+    ///
+    /// Merging is per-cell max, so a stale table loses, a duplicate is a no-op and delivery order
+    /// cannot matter. `settled` is never touched: it does not ride in the message and must not.
+    pub fn apply_table_sync(
+        &self,
+        msg: &ghost_consensus::message::ShardTableSyncMessage,
+    ) -> GhostResult<TableSyncMerge> {
+        // Solo work is its own (§10) — the same reasoning as `apply_peer_summary`, and more
+        // pressing here: a whole table is every column at once.
+        if self.solo {
+            return Ok(TableSyncMerge::SoloRefused);
+        }
+
+        let responder = match msg {
+            ghost_consensus::message::ShardTableSyncMessage::Response {
+                responding_node, ..
+            } => *responding_node,
+            // A Request is not something to apply. The caller routes it to `table_sync_response`.
+            ghost_consensus::message::ShardTableSyncMessage::Request { .. } => {
+                return Ok(TableSyncMerge::Rejected("not a response".into()))
+            }
+        };
+
+        if responder == self.identity.node_id() {
+            return Ok(TableSyncMerge::OwnEcho);
+        }
+
+        // Admission before verification, as on the summary path.
+        if !self.peer_is_admissible(&responder)? {
+            return Ok(TableSyncMerge::NotAdmitted);
+        }
+
+        // Lock held across the persist, for the reason `apply_peer_summary` documents at length:
+        // `shard_upsert_column` is REPLACE semantics, and a concurrent merge landing between this
+        // merge and its write would leave disk holding a column the memory table has moved past.
+        let mut table = self.table.lock();
+
+        // Snapshot BEFORE, so the persist can write exactly the columns that changed. Writing all
+        // of them would rewrite every peer's rows on every sync — needless churn on a table the
+        // payout path reads, and it would bump `updated_epoch` on columns nothing touched.
+        let before: BTreeMap<_, _> = table
+            .accrued()
+            .iter()
+            .map(|(node, col)| (*node, col.clone()))
+            .collect();
+
+        // ⚠ Verify on a CLONE, then merge back every column EXCEPT our own.
+        //
+        // This node is authoritative for its own column, and `merge_accrued` maxes every column in
+        // the payload (skipping only `GENESIS_NODE_ID`). A peer serving a table whose cell for our
+        // node id exceeds ours would otherwise raise our own counter permanently — a max cannot be
+        // undone — and it would not stop there: the next `fold_epoch` reads `prior` straight out of
+        // that column and hands it to `EpochSummary::build`, so this node would SIGN
+        // `inflated_prior + delta` and gossip it fleet-wide as its own attributable statement. We
+        // would become the source of the forgery, with our signature on it.
+        //
+        // The summary path structurally cannot do this — `apply_shard_epoch_summary` only ever
+        // touches the sender's own column — which is why the whole-table path needs it said here
+        // rather than assumed. Verification still happens in the library, on the clone, so the
+        // signature is checked over the bytes the peer actually sent.
+        let self_id = self.identity.node_id();
+        let mut probe = table.clone();
+        match ghost_consensus::shard_handler::apply_table_sync_response(&mut probe, msg) {
+            Ok(outcome) => {
+                let mut safe = ghost_common::share_shard::AccruedColumns::new();
+                for (node, column) in probe.accrued() {
+                    if *node == self_id {
+                        continue;
+                    }
+                    safe.insert(*node, column.clone());
+                }
+
+                // A peer that tried to move our own column is misbehaving, not merely stale. It is
+                // refused silently by the filter above, but it must not be invisible.
+                if probe.accrued().get(&self_id) != table.accrued().get(&self_id) {
+                    warn!(
+                        peer = %hex::encode(&responder[..4]),
+                        "shard: peer's table would have CHANGED this node's own column — refused \
+                         (we are authoritative for it); merging the rest"
+                    );
+                }
+
+                table.merge_accrued(&safe);
+
+                let after: BTreeMap<_, _> = table
+                    .accrued()
+                    .iter()
+                    .map(|(node, col)| (*node, col.clone()))
+                    .collect();
+
+                // `updated_epoch` is bookkeeping only; a sync carries no epoch of its own, so
+                // stamp it with the epoch this node last saw rather than inventing one.
+                let stamp = self
+                    .last_epoch_seen
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(1);
+
+                let mut gained = 0usize;
+                let mut raised = 0usize;
+                let mut unpersisted = 0usize;
+                for (node, column) in &after {
+                    match before.get(node) {
+                        Some(prev) if prev == column => continue,
+                        Some(_) => raised += 1,
+                        None => gained += 1,
+                    }
+                    // ⚠ CONTINUE past a write failure, never return.
+                    //
+                    // The in-memory merge has already happened, so the next hourly sync will see
+                    // `prev == column` for every column skipped here and never try to write them
+                    // again for the life of the process. A restart before then loses the recovered
+                    // columns with nothing in the log to say so — the same silent-loss shape as the
+                    // SBC pending pool. Writing every column we can, and counting the ones we
+                    // could not, keeps the failure both bounded and visible.
+                    if let Err(e) = self.db.shard_upsert_column(node, column, stamp) {
+                        unpersisted += 1;
+                        warn!(
+                            peer = %hex::encode(&node[..4]),
+                            error = %e,
+                            "shard: table sync merged but a column could NOT be persisted"
+                        );
+                    }
+                }
+                if unpersisted > 0 {
+                    warn!(
+                        unpersisted,
+                        "shard: table sync left columns in memory only — a restart before the next \
+                         sync will lose them"
+                    );
+                }
+
+                let root = table.compute_table_root();
+                drop(table);
+                // Compare against OUR table after the filtered merge, not the probe's: the probe
+                // may hold a column we deliberately refused, so its root is not ours to report.
+                let roots_match = root == outcome.remote_root;
+                Ok(TableSyncMerge::Applied {
+                    columns_gained: gained,
+                    columns_raised: raised,
+                    roots_match,
+                    table_root: root,
+                })
+            }
+            Err(e) => {
+                drop(table);
+                Ok(TableSyncMerge::Rejected(format!("{:?}", e)))
+            }
+        }
+    }
+
     pub fn drift_against_legacy_ledger(&self, cutoff_ts: i64) -> GhostResult<DriftReport> {
         let ledger = self.db.get_top_unpaid_addresses(cutoff_ts, u32::MAX)?;
         let ledger: BTreeMap<String, i64> = ledger
