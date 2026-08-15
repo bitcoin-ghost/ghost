@@ -65,6 +65,10 @@ prune_height = 0
 # `bitcoin-cli -regtest getnewaddress`.
 treasury_address = "${TREASURY_ADDRESS}"
 treasury_fee_percent = 1.0
+# Construct the share-shard runtime so fold + epoch-summary gossip run over the
+# real transport. NOT `shard_arm_genesis`: that converts the *mainnet* pinned
+# anchor checkpoint into opening balances and would refuse here anyway.
+share_shard = true
 min_payout_sats = 10000
 payout_interval_blocks = 100
 
