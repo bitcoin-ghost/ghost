@@ -29,11 +29,18 @@ use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
 use ghost_common::error::GhostResult;
+use ghost_common::types::NodeId;
 use ghost_consensus::mesh::MessageHandler;
-use ghost_consensus::message::{MessageEnvelope, ShardEpochSummaryMessage};
+use ghost_consensus::message::{MessageEnvelope, ShardEpochSummaryMessage, ShardTableSyncMessage};
 use ghost_consensus::MessageType;
 
-use crate::shard::{PeerMergeOutcome, ShardRuntime};
+use crate::shard::{PeerMergeOutcome, ShardRuntime, TableSyncMerge};
+
+/// Where a served table-sync response is handed off to be sent.
+///
+/// The handler cannot send it itself: `MessageHandler::handle_message` has no access to the mesh,
+/// and giving it one would make the shard handler own a reference to the thing dispatching to it.
+pub type SyncResponder = tokio::sync::mpsc::Sender<(NodeId, ShardTableSyncMessage)>;
 
 /// Routes gossiped shard messages into the runtime.
 ///
@@ -41,11 +48,24 @@ use crate::shard::{PeerMergeOutcome, ShardRuntime};
 /// rest of the shard uses — there is no second way into the counters.
 pub struct ShardMeshHandler {
     shard: Arc<ShardRuntime>,
+    /// Outbound queue for table-sync responses. `None` leaves the node able to REQUEST and to
+    /// merge what it is sent, but unable to serve — which is a silent half-wiring, so it is
+    /// logged when a request arrives with nothing to answer it.
+    sync_out: Option<SyncResponder>,
 }
 
 impl ShardMeshHandler {
     pub fn new(shard: Arc<ShardRuntime>) -> Self {
-        Self { shard }
+        Self {
+            shard,
+            sync_out: None,
+        }
+    }
+
+    /// Wire the responder half, so this node can SERVE whole-table syncs as well as request them.
+    pub fn with_sync_responder(mut self, tx: SyncResponder) -> Self {
+        self.sync_out = Some(tx);
+        self
     }
 
     fn handle_summary(&self, envelope: &MessageEnvelope) -> GhostResult<()> {
@@ -111,18 +131,124 @@ impl ShardMeshHandler {
         }
         Ok(())
     }
+
+    /// Whole-table sync (§12.6), both directions.
+    ///
+    /// This is the ONLY path that can repair a column a node missed entirely: epoch summaries
+    /// carry just the addresses active in that epoch, so a node which has gone quiet gossips
+    /// nothing, and a peer that was absent while it worked stays permanently short. Handling
+    /// `ShardEpochSummary` alone — which is all this handler used to do — left that gap open.
+    ///
+    /// Returns the response to send back, when the message was a Request.
+    fn handle_table_sync(
+        &self,
+        envelope: &MessageEnvelope,
+    ) -> GhostResult<Option<ShardTableSyncMessage>> {
+        let msg: ShardTableSyncMessage = match serde_json::from_slice(&envelope.payload) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!(error = %e, "shard: undeserialisable table sync dropped");
+                return Ok(None);
+            }
+        };
+
+        match &msg {
+            ShardTableSyncMessage::Request {
+                requesting_node,
+                table_root,
+            } => {
+                // Serve it. The requester's root is logged next to ours so a divergence is
+                // visible from either end without correlating two nodes' logs by hand.
+                let ours = self.shard.table_root();
+                info!(
+                    peer = %hex::encode(&requesting_node[..4]),
+                    peer_root = %hex::encode(&table_root[..8]),
+                    our_root = %hex::encode(&ours[..8]),
+                    agree = (*table_root == ours),
+                    "shard: serving a whole-table sync request"
+                );
+                Ok(Some(self.shard.table_sync_response()))
+            }
+            ShardTableSyncMessage::Response {
+                responding_node, ..
+            } => {
+                let peer = hex::encode(&responding_node[..4]);
+                match self.shard.apply_table_sync(&msg)? {
+                    TableSyncMerge::Applied {
+                        columns_gained,
+                        columns_raised,
+                        roots_match,
+                        table_root,
+                    } => {
+                        // Gaining a column is the headline: it is the failure epoch summaries
+                        // cannot fix, so it is logged loudly enough to be seen in a normal roll.
+                        if columns_gained > 0 {
+                            warn!(
+                                peer = %peer, columns_gained, columns_raised, roots_match,
+                                table_root = %hex::encode(&table_root[..8]),
+                                "shard: table sync RECOVERED columns this node was missing"
+                            );
+                        } else {
+                            info!(
+                                peer = %peer, columns_raised, roots_match,
+                                table_root = %hex::encode(&table_root[..8]),
+                                "shard: table sync applied"
+                            );
+                        }
+                        // Roots still differing after a merge is not necessarily a fault: the root
+                        // commits `settled` too, which never crosses the mesh. Worth saying, not
+                        // worth alarming about.
+                        if !roots_match {
+                            debug!(peer = %peer,
+                                "shard: roots still differ after sync (settled is chain-derived, not gossiped)");
+                        }
+                    }
+                    TableSyncMerge::NotAdmitted => {
+                        warn!(peer = %peer, "shard: table sync from a node outside the ratified set — NOT merged");
+                    }
+                    TableSyncMerge::SoloRefused => {
+                        debug!(peer = %peer, "shard: solo mode — table sync not merged");
+                    }
+                    TableSyncMerge::OwnEcho => {}
+                    TableSyncMerge::Rejected(why) => {
+                        info!(peer = %peer, reason = %why, "shard: table sync refused");
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl MessageHandler for ShardMeshHandler {
     async fn handle_message(&self, envelope: Arc<MessageEnvelope>) -> GhostResult<()> {
-        if envelope.msg_type != MessageType::ShardEpochSummary {
-            return Ok(());
-        }
-        // A merge failure must not kill the handler task — the mesh delivers to every handler and
-        // one shard hiccup should not stop the rest of consensus receiving its messages.
-        if let Err(e) = self.handle_summary(&envelope) {
-            warn!(error = %e, "shard: epoch summary handling failed");
+        match envelope.msg_type {
+            MessageType::ShardEpochSummary => {
+                // A merge failure must not kill the handler task — the mesh delivers to every
+                // handler and one shard hiccup should not stop the rest of consensus receiving
+                // its messages.
+                if let Err(e) = self.handle_summary(&envelope) {
+                    warn!(error = %e, "shard: epoch summary handling failed");
+                }
+            }
+            MessageType::ShardTableSync => match self.handle_table_sync(&envelope) {
+                Ok(Some(response)) => {
+                    if let Some(tx) = self.sync_out.as_ref() {
+                        // Bounded channel, and a full one is dropped rather than awaited: the
+                        // requester retries, and blocking the mesh dispatch task to serve a
+                        // sync would delay every other message on the connection.
+                        if tx.try_send((envelope.sender, response)).is_err() {
+                            warn!("shard: table-sync response dropped (send queue full)");
+                        }
+                    } else {
+                        debug!("shard: table-sync request received but no responder channel wired");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "shard: table sync handling failed"),
+            },
+            _ => {}
         }
         Ok(())
     }
