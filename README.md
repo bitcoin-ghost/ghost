@@ -1,3 +1,8 @@
+> # ⚠ MAINNET TESTING — NOT READY FOR PUBLIC USE
+>
+> This software runs on Bitcoin **mainnet** and handles real funds. It is under active
+> development and testing. Do not point hashrate, funds, or production infrastructure at it.
+
 # Bitcoin Ghost
 
 [![CI](https://img.shields.io/github/actions/workflow/status/bitcoin-ghost/ghost/ci.yml?label=CI)](https://github.com/bitcoin-ghost/ghost/actions)
@@ -135,12 +140,27 @@ cargo build --release            # builds the Rust workspace (ghost-pool, ghost-
 Common development commands:
 
 ```sh
-cargo test --workspace                       # full test suite
-cargo test -p ghost-consensus                # a single crate
-cargo clippy --workspace -- -D warnings      # lint (zero-warnings policy)
-cargo fmt --all                              # format
-cargo audit                                  # dependency advisory check
+# The Tauri desktop crates need a built JS frontend before `tauri::generate_context!`
+# will compile, so the pure-Rust commands exclude them — exactly as CI does.
+EXCLUDES="--workspace --exclude wraith-wallet-gui --exclude ghost-tap-desktop"
+
+cargo test $EXCLUDES --lib --bins             # test suite, as CI runs it
+cargo test -p ghost-consensus                 # a single crate
+cargo clippy $EXCLUDES --all-targets --all-features -- -D warnings
+cargo fmt --all                               # format
+cargo audit                                   # dependency advisory check
 ```
+
+`ghost-mpc`'s lifecycle test needs its small-cap harness feature and is run on its own:
+
+```sh
+cargo test -p ghost-mpc --test mpc_lifecycle --features mpc-test-cap
+```
+
+Before opening a PR, `scripts/record-tests.sh` runs the full gate exactly as CI does
+— formatting, clippy with CI's own argument list, docs under `-D warnings`, the fuzz
+targets, and the feature-gated suites — and is the quickest way to find out whether
+CI will be happy.
 
 ## Privacy features
 
