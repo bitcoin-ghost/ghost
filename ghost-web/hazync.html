@@ -317,7 +317,14 @@
     <div class="sidepanel">
       <section class="panel"><div class="ph"><h2>Leaderboard</h2><span class="hint" id="sigmode">signed ledger</span></div><div id="leaderboard"></div>
         <div class="note">Every contribution is signed by the prover's key and recorded in an open ledger, verifiable, and no chain spam. <span class="sig">◈</span> = signature checked.</div></section>
-      <section class="panel"><div class="ph"><h2>Recently verified</h2><span class="hint">live</span></div><div id="recent"></div></section>
+      <section class="panel"><div class="ph"><h2>Recent work</h2><span class="hint">live</span></div>
+        <div class="chips" id="workfilters" aria-label="Filter by kind of work">
+          <button type="button" data-w="all" class="on">All</button>
+          <button type="button" data-w="prove">Proved</button>
+          <button type="button" data-w="fold">Folded</button>
+          <button type="button" data-w="spine">Spine</button>
+        </div>
+        <div id="recent"></div></section>
     </div>
   </div>
     </div>
@@ -557,19 +564,45 @@
     var L=d.leaderboard.filter(function(x){return x.blocks>0});
     $('leaderboard').innerHTML=L.length?L.map(function(x,i){return '<div class="lrow"><span class="rk">'+(i+1)+'</span><span class="who"><span class="hn">'+(x.handle||'anon')+'</span><span class="ky">'+x.id+'… <span class="sig">◈</span></span></span><span class="n">'+fmt(x.blocks)+'<small>blocks</small></span></div>'}).join(''):'<div class="empty">no verified proofs yet, be the first</div>';
     // recent
-    // Say WHAT each row is. The board does two different jobs and the feed showed both as a bare
-    // range id, so "39318" (one block proved) and "733-734" (two proofs folded into one) looked like
+    // Say WHAT each row is. The board does three different jobs and the feed showed them as bare
+    // range ids, so "39318" (one block proved) and "733-734" (two proofs folded into one) looked like
     // the same kind of event. A single id is a block proof; lo-hi is a fold, and its width is how
-    // many blocks that one receipt now covers.
-    $('recent').innerHTML=d.recent.length?d.recent.map(function(s){
-      var p=String(s.range).split('-'), lo=+p[0], hi=p.length>1?+p[1]:lo,
-          n=(hi-lo+1), fold=p.length>1,
-          kind=fold?('folded · '+n+' blocks'):'block proved';
-      return '<div class="frow"><span class="'+(s.verified?'ok':'no')+'">'+(s.verified?'✓':'…')+'</span>'
-           + '<span class="blk">'+s.range+'</span>'
-           + '<span class="by">'+kind+' · '+(s.handle||'anon')+' · '+ago(s.ts)+'</span></div>'
-    }).join(''):'<div class="empty">nothing yet</div>';
+    // many blocks that one receipt now covers; "spine:1-N" is an absorption into the genesis-anchored
+    // head. Spine rows only exist from the coordinator change for hazync#114 onward — before that the
+    // work was verified and then thrown away, so a contributor folding or advancing the spine saw an
+    // empty feed and reasonably concluded it was broken.
+    RECENT=d.recent||[]; renderRecent();
   }
+  // ---- recent work: derive the kind, filter client-side ----
+  // Kind of work, derived from the range id alone: "spine:1-N" absorbed into the head, "lo-hi" folded,
+  // a bare number proved. Derived rather than sent as a field so the board keeps working against a
+  // coordinator that predates hazync#114 — those simply emit no spine rows, and the filter shows none.
+  var RECENT=[], WFILTER='all';
+  function workKind(rid){ rid=String(rid); return rid.indexOf('spine:')===0?'spine':(rid.indexOf('-')>0?'fold':'prove'); }
+  function renderRecent(){
+    var el=$('recent'); if(!el)return;
+    var rows=RECENT.filter(function(s){return WFILTER==='all'||workKind(s.range)===WFILTER;});
+    el.innerHTML=rows.length?rows.map(function(s){
+      var k=workKind(s.range), label, id=String(s.range);
+      if(k==='spine'){
+        // "spine:1-2351" -> show the head it reached, not the raw id: the id is a row key, the head
+        // is the thing a reader can go and download.
+        var hi=id.split('-')[1]||'?';
+        label='spine advanced'; id='genesis → '+fmt(+hi||0);
+      } else {
+        var p=id.split('-'), lo=+p[0], hi2=p.length>1?+p[1]:lo;
+        label=(k==='fold')?('folded · '+fmt(hi2-lo+1)+' blocks'):'block proved';
+      }
+      return '<div class="frow"><span class="'+(s.verified?'ok':'no')+'">'+(s.verified?'✓':'…')+'</span>'
+           + '<span class="blk">'+id+'</span>'
+           + '<span class="by">'+label+' · '+(s.handle||'anon')+' · '+ago(s.ts)+'</span></div>'
+    }).join(''):'<div class="empty">no '+(WFILTER==='all'?'':WFILTER+' ')+'work in the recent window</div>';
+  }
+  (function(){var f=$('workfilters'); if(!f)return;
+    f.addEventListener('click',function(e){var b=e.target.closest('button'); if(!b)return;
+      var bb=this.children; for(var i=0;i<bb.length;i++)bb[i].classList.toggle('on',bb[i]===b);
+      WFILTER=b.getAttribute('data-w'); renderRecent();});})();
+
   // ---- block explorer: single/range · search · slider · filters (all client-side over vranges/claims) ----
   var VIEW={mode:'single',filter:'all',start:0,focus:null,data:null,init:false};
   function tipOf(){return (VIEW.data&&VIEW.data.progress&&VIEW.data.progress.tip)||958301;}
