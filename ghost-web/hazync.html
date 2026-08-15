@@ -548,7 +548,6 @@
     var p=d.progress;
     $('metrics').innerHTML=metric('Proven to block',fmt(p.frontier))+metric('Of chain tip',fmt(p.tip))+metric('Complete','<span class="a">'+p.pct+'%</span>')+metric('Contributors',fmt(p.contributors))+metric('Signatures',d.signatures.indexOf('ed25519')>=0?'ed25519':'dev');
     renderPipeline(d,p);
-    $('frontier').textContent='proven to block '+fmt(p.frontier)+' →';$('tip').textContent='tip · '+fmt(p.tip);
     $('sigmode').textContent=d.signatures.indexOf('ed25519')>=0?'signed ledger':'dev mode';
     // hero chain-state panel, live from the coordinator's genesis-anchored frontier
     var fp=d.frontier_proof;
