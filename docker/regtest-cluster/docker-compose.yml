@@ -23,11 +23,20 @@ x-pool-common: &pool-common
   volumes:
     - ./pool.template.toml:/etc/ghost/pool.template.toml:ro
     - ./entrypoint.sh:/entrypoint.sh:ro
+    # Bind-mount the binary rather than baking it into the image. The image's own
+    # copy silently goes stale — it was v1.10.22 while the tree was v1.11.22, so a
+    # cluster run "passed" against code months older than the change under test.
+    # Refresh with: cargo build --release -p ghost-pool && cp
+    # target/release/ghost-pool docker/regtest-cluster/bin/ghost-pool
+    - ./bin/ghost-pool:/usr/local/bin/ghost-pool:ro
 
 services:
   bitcoind:
     image: bitcoin-ghost/ghostd:regtest    # the ghost-core fork in regtest mode
     container_name: rc-bitcoind
+    networks:
+      rcnet:
+        ipv4_address: 172.28.0.10
     command:
       - -regtest
       - -server=1
@@ -45,9 +54,12 @@ services:
   pool1:
     <<: *pool-common
     container_name: rc-pool1
+    networks:
+      rcnet:
+        ipv4_address: 172.28.0.11
     environment:
       NODE_NAME: pool1
-      SEED_NODES: '"pool2:8555", "pool3:8555", "pool4:8555"'
+      SEED_NODES: '"172.28.0.12:8555", "172.28.0.13:8555", "172.28.0.14:8555"'
       GENESIS_ARG: "--genesis"          # genesis node bootstraps the elder set
       BITCOIN_RPC_USER: ghost
       BITCOIN_RPC_PASSWORD: ghostpass
@@ -58,12 +70,15 @@ services:
   pool2:
     <<: *pool-common
     container_name: rc-pool2
+    networks:
+      rcnet:
+        ipv4_address: 172.28.0.12
     depends_on:
       bitcoind: { condition: service_started }
       pool1:    { condition: service_started }   # start after genesis (≥60s, see README)
     environment:
       NODE_NAME: pool2
-      SEED_NODES: '"pool1:8555", "pool3:8555", "pool4:8555"'
+      SEED_NODES: '"172.28.0.11:8555", "172.28.0.13:8555", "172.28.0.14:8555"'
       BITCOIN_RPC_USER: ghost
       BITCOIN_RPC_PASSWORD: ghostpass
       TREASURY_ADDRESS: ${TREASURY_ADDRESS}
@@ -73,12 +88,15 @@ services:
   pool3:
     <<: *pool-common
     container_name: rc-pool3
+    networks:
+      rcnet:
+        ipv4_address: 172.28.0.13
     depends_on:
       bitcoind: { condition: service_started }
       pool1:    { condition: service_started }
     environment:
       NODE_NAME: pool3
-      SEED_NODES: '"pool1:8555", "pool2:8555", "pool4:8555"'
+      SEED_NODES: '"172.28.0.11:8555", "172.28.0.12:8555", "172.28.0.14:8555"'
       BITCOIN_RPC_USER: ghost
       BITCOIN_RPC_PASSWORD: ghostpass
       TREASURY_ADDRESS: ${TREASURY_ADDRESS}
@@ -88,14 +106,28 @@ services:
   pool4:
     <<: *pool-common
     container_name: rc-pool4
+    networks:
+      rcnet:
+        ipv4_address: 172.28.0.14
     depends_on:
       bitcoind: { condition: service_started }
       pool1:    { condition: service_started }
     environment:
       NODE_NAME: pool4
-      SEED_NODES: '"pool1:8555", "pool2:8555", "pool3:8555"'
+      SEED_NODES: '"172.28.0.11:8555", "172.28.0.12:8555", "172.28.0.13:8555"'
       BITCOIN_RPC_USER: ghost
       BITCOIN_RPC_PASSWORD: ghostpass
       TREASURY_ADDRESS: ${TREASURY_ADDRESS}
     ports:
       - "8083:8080"
+
+# Fixed subnet so each node's `public_address` and every `SEED_NODES` entry can be a
+# literal IP. The Noise send path parses peer addresses with `SocketAddr::parse`,
+# which does NOT resolve DNS — container names produced
+# "Invalid peer address: invalid socket address syntax" on every send, so no
+# encrypted traffic (votes, payouts, shard summaries) could leave a node.
+networks:
+  rcnet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

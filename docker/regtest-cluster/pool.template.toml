@@ -11,27 +11,35 @@ key_path = "/var/lib/ghost/node.key"   # generated on first start, per-node volu
 display_name = "${NODE_NAME}"
 
 [bitcoin]
-rpc_host = "bitcoind"
+# 127.0.0.1, NOT `bitcoind`: a remote Ghost Core requires TLS and this regtest
+# node serves plain RPC, so the entrypoint's socat sidecar forwards loopback to
+# the real host. Pointing these straight at `bitcoind` fails startup outright.
+rpc_host = "127.0.0.1"
 rpc_port = 18443                        # regtest default RPC port
 rpc_user = "${BITCOIN_RPC_USER}"
 rpc_password = "${BITCOIN_RPC_PASSWORD}"
 network = "regtest"                     # regtest → no zk-production / MPC params needed
-zmq_hashblock = "tcp://bitcoind:28332"
-zmq_hashtx = "tcp://bitcoind:28333"
+zmq_hashblock = "tcp://127.0.0.1:28332"
+zmq_hashtx = "tcp://127.0.0.1:28333"
 
 [network]
 # 32-byte hex consensus signing key (required for mining_mode=PublicPool);
 # the entrypoint generates one per node.
 signing_key = "${SIGNING_KEY}"
-# Container DNS name — peers dial this for the mesh.
-public_address = "${NODE_NAME}"
+# The container's docker-assigned IP, filled in by the entrypoint. This must be an
+# IP: a hostname is rejected by peer-address validation, so the DNS name that used
+# to be here could never have formed a mesh.
+public_address = "${NODE_IP}"
 # The OTHER three nodes' discovery endpoints (set per-service in compose).
 seed_nodes = [${SEED_NODES}]
 sv2_port = 34255
 sv1_port = 3333
 http_port = 8080
 max_miners = 1000
-public_mining = true
+# `public_mining` was renamed; the old key is parsed but ignored with a DEPRECATED
+# warning, which meant this cluster ran as whatever the default mode is rather than
+# the public pool the dry-run is meant to exercise.
+mining_mode = "public_pool"
 
 [network.p2p]
 share_propagation = 8555
@@ -60,5 +68,10 @@ treasury_fee_percent = 1.0
 min_payout_sats = 10000
 payout_interval_blocks = 100
 
-[ghost_pay]
-enabled = false   # L2 is out of scope for the cluster (consensus) dry-run
+# NOTE: no `[ghost_pay]` section.
+#
+# `enabled = false` on its own does NOT disable the section — the table is parsed
+# as fully present and the load fails with `missing field virtual_block_secs`, so
+# every node died at startup. The section must be ABSENT (it then defaults to
+# disabled) or fully populated. This file's own README already said so; the
+# template did not match it.

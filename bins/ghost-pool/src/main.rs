@@ -11167,8 +11167,13 @@ fn load_config(path: &std::path::Path) -> Result<NodeConfig> {
             .any(|l| l.trim_start().starts_with("public_mining"))
         {
             warn!(
+                // The variants deserialise as snake_case. This message used to name them
+                // in CamelCase, so following it exactly produced `unknown variant
+                // `PublicPool`, expected one of `public_pool`, ...` and the node refused
+                // to start — a deprecation notice that broke the config it was telling
+                // you how to fix.
                 "DEPRECATED: `public_mining` in pool.toml is ignored. \
-                 Use `mining_mode = \"PublicPool\" | \"PrivatePool\" | \"PrivateSolo\"` instead. \
+                 Use `mining_mode = \"public_pool\" | \"private_pool\" | \"private_solo\"` instead. \
                  Remove the `public_mining` line to silence this warning."
             );
         }
