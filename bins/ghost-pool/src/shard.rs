@@ -753,22 +753,52 @@ impl ShardRuntime {
     /// Build this node's §12.6 whole-table sync REQUEST.
     ///
     /// Carries our own root so the responder can see the drift too — either side can log it.
-    pub fn table_sync_request(&self) -> ghost_consensus::message::ShardTableSyncMessage {
-        ghost_consensus::message::ShardTableSyncMessage::Request {
+    ///
+    /// `None` in solo mode. A solo node's work is its own (§10), and its `apply_table_sync` would
+    /// discard any answer as `SoloRefused` — so asking would make every peer build, sign and
+    /// unicast a whole table for a reply that is thrown away. Every other transmit path
+    /// (`pending_broadcasts`, `fold_epoch`, `tick`) already refuses in solo mode; this one was the
+    /// exception, which is exactly how a "dark" flag stops meaning dark.
+    pub fn table_sync_request(&self) -> Option<ghost_consensus::message::ShardTableSyncMessage> {
+        if self.solo {
+            return None;
+        }
+        Some(ghost_consensus::message::ShardTableSyncMessage::Request {
             requesting_node: self.identity.node_id(),
             table_root: self.table.lock().compute_table_root(),
-        }
+        })
     }
 
-    /// Build the RESPONSE: our whole accrued table, signed.
+    /// Build the RESPONSE for a specific requester, or `None` if we will not serve them.
     ///
     /// Signing makes the served table attributable — a peer that serves an inflated cell has
     /// signed the inflation, which is what makes it publishable evidence rather than hearsay.
-    pub fn table_sync_response(&self) -> ghost_consensus::message::ShardTableSyncMessage {
-        ghost_consensus::shard_handler::build_table_sync_response(
-            &self.identity,
-            &self.table.lock(),
-        )
+    ///
+    /// ⚠ **Admission is checked on the SERVE side too, not only on apply.** The response carries
+    /// the whole accrued table, whose cells are keyed by PAYOUT ADDRESS in the clear inside the
+    /// envelope. The mesh authenticates the sender's signature, but authentication is not
+    /// authorisation: without this check any node whose envelopes we accept could ask once an hour
+    /// and harvest every payout address the fleet knows. Serving only the ratified set makes the
+    /// disclosure the same set that already holds this data.
+    ///
+    /// Solo nodes never serve: their work is their own (§10), and the table they would hand over
+    /// is not the shared shard's.
+    pub fn table_sync_response_for(
+        &self,
+        requester: &ghost_common::types::NodeId,
+    ) -> GhostResult<Option<ghost_consensus::message::ShardTableSyncMessage>> {
+        if self.solo {
+            return Ok(None);
+        }
+        if !self.peer_is_admissible(requester)? {
+            return Ok(None);
+        }
+        Ok(Some(
+            ghost_consensus::shard_handler::build_table_sync_response(
+                &self.identity,
+                &self.table.lock(),
+            ),
+        ))
     }
 
     /// Apply a peer's whole-table sync response — the repair path for a column this node missed.
@@ -832,8 +862,44 @@ impl ShardRuntime {
             .map(|(node, col)| (*node, col.clone()))
             .collect();
 
-        match ghost_consensus::shard_handler::apply_table_sync_response(&mut table, msg) {
+        // ⚠ Verify on a CLONE, then merge back every column EXCEPT our own.
+        //
+        // This node is authoritative for its own column, and `merge_accrued` maxes every column in
+        // the payload (skipping only `GENESIS_NODE_ID`). A peer serving a table whose cell for our
+        // node id exceeds ours would otherwise raise our own counter permanently — a max cannot be
+        // undone — and it would not stop there: the next `fold_epoch` reads `prior` straight out of
+        // that column and hands it to `EpochSummary::build`, so this node would SIGN
+        // `inflated_prior + delta` and gossip it fleet-wide as its own attributable statement. We
+        // would become the source of the forgery, with our signature on it.
+        //
+        // The summary path structurally cannot do this — `apply_shard_epoch_summary` only ever
+        // touches the sender's own column — which is why the whole-table path needs it said here
+        // rather than assumed. Verification still happens in the library, on the clone, so the
+        // signature is checked over the bytes the peer actually sent.
+        let self_id = self.identity.node_id();
+        let mut probe = table.clone();
+        match ghost_consensus::shard_handler::apply_table_sync_response(&mut probe, msg) {
             Ok(outcome) => {
+                let mut safe = ghost_common::share_shard::AccruedColumns::new();
+                for (node, column) in probe.accrued() {
+                    if *node == self_id {
+                        continue;
+                    }
+                    safe.insert(*node, column.clone());
+                }
+
+                // A peer that tried to move our own column is misbehaving, not merely stale. It is
+                // refused silently by the filter above, but it must not be invisible.
+                if probe.accrued().get(&self_id) != table.accrued().get(&self_id) {
+                    warn!(
+                        peer = %hex::encode(&responder[..4]),
+                        "shard: peer's table would have CHANGED this node's own column — refused \
+                         (we are authoritative for it); merging the rest"
+                    );
+                }
+
+                table.merge_accrued(&safe);
+
                 let after: BTreeMap<_, _> = table
                     .accrued()
                     .iter()
@@ -849,38 +915,47 @@ impl ShardRuntime {
 
                 let mut gained = 0usize;
                 let mut raised = 0usize;
+                let mut unpersisted = 0usize;
                 for (node, column) in &after {
                     match before.get(node) {
                         Some(prev) if prev == column => continue,
                         Some(_) => raised += 1,
                         None => gained += 1,
                     }
-                    // A write failure leaves memory ahead of disk — "behind, never wrong" on a
-                    // restart, and recoverable by the next sync. Persisting what we can and
-                    // reporting the failure beats abandoning the merge half-written.
+                    // ⚠ CONTINUE past a write failure, never return.
+                    //
+                    // The in-memory merge has already happened, so the next hourly sync will see
+                    // `prev == column` for every column skipped here and never try to write them
+                    // again for the life of the process. A restart before then loses the recovered
+                    // columns with nothing in the log to say so — the same silent-loss shape as the
+                    // SBC pending pool. Writing every column we can, and counting the ones we
+                    // could not, keeps the failure both bounded and visible.
                     if let Err(e) = self.db.shard_upsert_column(node, column, stamp) {
-                        let root = table.compute_table_root();
-                        drop(table);
+                        unpersisted += 1;
                         warn!(
                             peer = %hex::encode(&node[..4]),
                             error = %e,
                             "shard: table sync merged but a column could NOT be persisted"
                         );
-                        return Ok(TableSyncMerge::Applied {
-                            columns_gained: gained,
-                            columns_raised: raised,
-                            roots_match: outcome.roots_match,
-                            table_root: root,
-                        });
                     }
+                }
+                if unpersisted > 0 {
+                    warn!(
+                        unpersisted,
+                        "shard: table sync left columns in memory only — a restart before the next \
+                         sync will lose them"
+                    );
                 }
 
                 let root = table.compute_table_root();
                 drop(table);
+                // Compare against OUR table after the filtered merge, not the probe's: the probe
+                // may hold a column we deliberately refused, so its root is not ours to report.
+                let roots_match = root == outcome.remote_root;
                 Ok(TableSyncMerge::Applied {
                     columns_gained: gained,
                     columns_raised: raised,
-                    roots_match: outcome.roots_match,
+                    roots_match,
                     table_root: root,
                 })
             }

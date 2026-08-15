@@ -3943,6 +3943,27 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
+                    // ⚠ Check the cap HERE, on the way out.
+                    //
+                    // `validate_payload_size` runs only on the inbound side, so an oversized table
+                    // is dropped by the receiver at `debug!` while this node logs a successful
+                    // send. §12.6 would then stop working with nothing in either log naming the
+                    // reason — and it would fail precisely when the table is largest, which is
+                    // when the repair matters most. Saying so loudly is the difference between a
+                    // known limit and a silent one.
+                    let cap = ghost_consensus::message_validator::max_payload_size(
+                        ghost_consensus::MessageType::ShardTableSync,
+                    );
+                    if bytes.len() > cap {
+                        warn!(
+                            bytes = bytes.len(),
+                            cap,
+                            "shard: table sync response EXCEEDS the per-type payload cap — not \
+                             sent; the receiver would drop it silently. §12.6 repair is degraded \
+                             until the table is split or the cap is raised."
+                        );
+                        continue;
+                    }
                     let env = match mesh_c
                         .create_envelope_raw(ghost_consensus::MessageType::ShardTableSync, bytes)
                     {
@@ -3994,7 +4015,12 @@ async fn main() -> Result<()> {
                     }
                     // The request carries only our node id and our table root — no addresses —
                     // but it rides Noise anyway so the root is not a public fingerprint.
-                    let req = rt_c.table_sync_request();
+                    // `None` in solo mode: a solo node must not make the fleet build tables for
+                    // an answer it would discard.
+                    let req = match rt_c.table_sync_request() {
+                        Some(r) => r,
+                        None => continue,
+                    };
                     let bytes = match serde_json::to_vec(&req) {
                         Ok(b) => b,
                         Err(e) => {

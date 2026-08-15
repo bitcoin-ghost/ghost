@@ -1128,13 +1128,20 @@ mod tests {
         );
 
         // Replaying many further quiet epochs changes nothing — it is frozen, not slow.
-        let mut prior = column_of(&e1);
+        //
+        // `prior` stays the worker's FULL cumulative column throughout. That is what a real quiet
+        // node passes: `fold_epoch` reads it out of the table, not out of the last summary.
+        // Re-deriving it with `column_of` would collapse it to empty after the first quiet epoch
+        // and the loop would then be replaying a node with no history rather than one whose
+        // history is frozen — which is the case actually being demonstrated.
+        let prior = column_of(&e1);
+        assert!(!prior.is_empty(), "the worker's history is non-empty");
         for epoch in 3..8 {
             let (e, ev) = summarise(epoch, &worker, &prior, vec![]);
+            assert!(e.deltas.is_empty(), "every quiet epoch carries no cells");
             absent
                 .apply_summary(&e, &ev, compute_merkle_root)
                 .expect("verifies");
-            prior = column_of(&e);
         }
         assert!(
             absent

@@ -52,13 +52,26 @@ pub struct ShardMeshHandler {
     /// merge what it is sent, but unable to serve — which is a silent half-wiring, so it is
     /// logged when a request arrives with nothing to answer it.
     sync_out: Option<SyncResponder>,
+    /// When each peer was last SERVED a whole table.
+    ///
+    /// Serving is expensive — a DB read for admission, the table lock, a full clone and
+    /// canonicalisation, and an ed25519 signature — and it runs inline on the mesh receive path,
+    /// which dispatches handlers sequentially. Without a cooldown one peer looping requests would
+    /// stall this node's inbound votes, checkpoints and summaries behind it. The asker's hourly
+    /// cadence is self-imposed and therefore not a limit on anyone else's behaviour.
+    last_served: parking_lot::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
 }
+
+/// Minimum gap between whole-table syncs served to the SAME peer. Well under the hourly ask
+/// cadence, so an honest peer never trips it — including one that restarts and asks early.
+const SERVE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl ShardMeshHandler {
     pub fn new(shard: Arc<ShardRuntime>) -> Self {
         Self {
             shard,
             sync_out: None,
+            last_served: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -157,17 +170,71 @@ impl ShardMeshHandler {
                 requesting_node,
                 table_root,
             } => {
-                // Serve it. The requester's root is logged next to ours so a divergence is
-                // visible from either end without correlating two nodes' logs by hand.
-                let ours = self.shard.table_root();
-                info!(
-                    peer = %hex::encode(&requesting_node[..4]),
-                    peer_root = %hex::encode(&table_root[..8]),
-                    our_root = %hex::encode(&ours[..8]),
-                    agree = (*table_root == ours),
-                    "shard: serving a whole-table sync request"
-                );
-                Ok(Some(self.shard.table_sync_response()))
+                let peer = hex::encode(&envelope.sender[..4]);
+
+                // ⚠ Admission is checked against `envelope.sender`, NEVER `requesting_node`.
+                //
+                // `ShardTableSyncMessage::Request` is deliberately unsigned, so `requesting_node`
+                // is an unauthenticated assertion by whoever sent the bytes — only
+                // `envelope.sender` is bound by `validate_and_verify`. Checking the payload field
+                // would let any node whose envelopes we accept name a ratified id and receive the
+                // whole accrued table, with payout addresses in the clear inside the envelope,
+                // unicast back to ITS address. That is precisely the harvest this check exists to
+                // stop, so a mismatch between the two is refused outright rather than tolerated.
+                if *requesting_node != envelope.sender {
+                    warn!(
+                        sender = %peer,
+                        claimed = %hex::encode(&requesting_node[..4]),
+                        "shard: table sync request claims a different node id than it was signed by — NOT served"
+                    );
+                    return Ok(None);
+                }
+
+                // Cooldown BEFORE the admission DB read and the signing, so a flood costs this
+                // node a hashmap lookup rather than a table clone per message.
+                {
+                    let mut seen = self.last_served.lock();
+                    let now = std::time::Instant::now();
+                    if let Some(prev) = seen.get(&envelope.sender) {
+                        if now.duration_since(*prev) < SERVE_COOLDOWN {
+                            debug!(peer = %peer, "shard: table sync request within cooldown — not served");
+                            return Ok(None);
+                        }
+                    }
+                    // Bound the map: it is keyed by peer, and only ratified peers get this far in
+                    // the normal case, but an unbounded map fed by envelope.sender is a memory
+                    // sink an attacker controls.
+                    if seen.len() > 256 {
+                        seen.retain(|_, t| now.duration_since(*t) < SERVE_COOLDOWN);
+                    }
+                    seen.insert(envelope.sender, now);
+                }
+
+                match self.shard.table_sync_response_for(&envelope.sender)? {
+                    Some(response) => {
+                        // Read the root out of the response we are actually sending. Re-reading it
+                        // from the runtime would take the lock a third time and could pick up a
+                        // fold that landed in between, making `agree=` describe a table the peer
+                        // never received — misleading on the very divergence this log exists for.
+                        let ours = match &response {
+                            ShardTableSyncMessage::Response { table_root, .. } => *table_root,
+                            ShardTableSyncMessage::Request { table_root, .. } => *table_root,
+                        };
+                        info!(
+                            peer = %peer,
+                            peer_root = %hex::encode(&table_root[..8]),
+                            our_root = %hex::encode(&ours[..8]),
+                            agree = (*table_root == ours),
+                            "shard: serving a whole-table sync request"
+                        );
+                        Ok(Some(response))
+                    }
+                    None => {
+                        warn!(peer = %peer,
+                            "shard: table sync requested by a node outside the ratified set (or we are solo) — NOT served");
+                        Ok(None)
+                    }
+                }
             }
             ShardTableSyncMessage::Response {
                 responding_node, ..
