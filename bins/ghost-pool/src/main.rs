@@ -3829,51 +3829,84 @@ async fn main() -> Result<()> {
     //
     // Runs ONCE, on startup, when the operator sets `pool.shard_arm_genesis`. Converts THIS node's
     // own copy of the pinned anchor checkpoint into the opening balances and asserts the result
-    // against the compile-time pin. A loud LOCAL self-check: no node asks another node anything,
-    // so there is no negotiation to partition and no quorum to stall, and a node holding the wrong
-    // bytes discovers it alone.
+    // against the compile-time pin. A loud LOCAL self-check: no node asks another node anything.
     //
-    // Idempotent by construction — arming refuses once the genesis column exists — so leaving the
-    // flag set across restarts is the intended steady state rather than something to remember to
-    // undo.
+    // Idempotent — arming refuses once the genesis column exists — so leaving the flag set across
+    // restarts is the intended steady state, and "already armed" is reported as SUCCESS rather
+    // than as a failure, or every restart of a correctly armed node would log an error saying it
+    // is unarmed.
     //
-    // A failure here does NOT take the pool down, and deliberately does not arm: the shard simply
-    // does not start. A shard that failed to open is visible and recoverable; one that opened on
-    // the wrong balances is neither, because every node would be internally consistent with its
-    // own wrong numbers.
-    if let Some(ref rt) = shard {
-        if config.pool.shard_arm_genesis {
+    // ⚠ On a genuine refusal the shard is DROPPED, not merely left unarmed. An earlier version of
+    // this block claimed "the shard simply does not start" and did not implement it: `shard` was
+    // already `Some`, and the mesh handler and fold task below guard on `shard` rather than on
+    // arming state — so a refused ceremony left the shard fully live, folding into an unarmed
+    // column and gossiping summaries with `genesis_marker: None`. The safety argument the whole
+    // block rests on has to be real, so the binding is reassigned.
+    let shard = match (&shard, config.pool.shard_arm_genesis) {
+        (Some(rt), true) => {
             let anchor = ghost_accounting::shard_genesis::pinned_anchor();
             match db.get_payout_ledger_canonical_blob(anchor.height) {
                 Ok(Some(blob)) => match rt.arm_from_genesis(&anchor, &blob) {
-                    Ok(report) => info!(
-                        anchor_height = report.anchor_height,
-                        epoch_floor = report.epoch_floor,
-                        opening_addresses = report.opening_addresses,
-                        replaced_columns = report.replaced_columns,
-                        cleared_epochs = report.cleared_epochs,
-                        table_root = %hex::encode(&report.table_root[..8]),
-                        "shard: GENESIS CEREMONY COMPLETE"
-                    ),
-                    Err(e) => error!(
-                        error = %e,
-                        anchor_height = anchor.height,
-                        "shard: genesis ceremony REFUSED — shard left unarmed (this is the safe \
-                         direction; investigate before retrying)"
-                    ),
+                    Ok(report) => {
+                        info!(
+                            anchor_height = report.anchor_height,
+                            epoch_floor = report.epoch_floor,
+                            opening_addresses = report.opening_addresses,
+                            replaced_columns = report.replaced_columns,
+                            cleared_epochs = report.cleared_epochs,
+                            table_root = %hex::encode(&report.table_root[..8]),
+                            "shard: GENESIS CEREMONY COMPLETE"
+                        );
+                        shard
+                    }
+                    Err(e) if e.to_string().contains("already armed") => {
+                        // The steady state, not a fault.
+                        info!(
+                            anchor_height = anchor.height,
+                            "shard: already armed — ceremony skipped"
+                        );
+                        shard
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            anchor_height = anchor.height,
+                            "shard: genesis ceremony REFUSED — DISABLING the shard. A shard that \
+                             failed to open is visible and recoverable; one folding and gossiping \
+                             from balances the ceremony rejected is neither"
+                        );
+                        None
+                    }
                 },
                 // Absent is NOT "convert something near it". A node missing the anchor must not
                 // fall back to an older checkpoint: it would pass its own checks and open on
                 // balances no other node agreed to.
-                Ok(None) => error!(
-                    anchor_height = anchor.height,
-                    "shard: genesis ceremony cannot run — this node holds no checkpoint at the \
-                     anchor height; sync it before arming"
-                ),
-                Err(e) => error!(error = %e, "shard: could not read the anchor checkpoint"),
+                Ok(None) => {
+                    error!(
+                        anchor_height = anchor.height,
+                        "shard: no checkpoint at the anchor height — DISABLING the shard; sync it \
+                         before arming"
+                    );
+                    None
+                }
+                Err(e) => {
+                    error!(error = %e, "shard: could not read the anchor checkpoint — DISABLING the shard");
+                    None
+                }
             }
         }
-    }
+        (None, true) => {
+            // The exact failure `shard_arm_genesis`'s own doc warns about: arming a runtime that
+            // was never constructed. Silence here is how an operator ends up believing a node is
+            // armed when nothing ran at all.
+            warn!(
+                "shard: `shard_arm_genesis` is set but `share_shard` is NOT — nothing to arm, and \
+                 no ceremony ran. Set both, or neither."
+            );
+            shard
+        }
+        _ => shard,
+    };
 
     // The shard's receive half. Registered only when the shard is enabled, so a dark node puts
     // no handler on the mesh at all — matching the flag's promise that deploying the binary
