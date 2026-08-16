@@ -350,6 +350,37 @@ pub struct ShardRuntime {
     /// "never" (an epoch is `height / EPOCH_BLOCKS`, so `+ 1` cannot wrap). Atomic because it is
     /// read on the template-refresh path, which must never wait on a fold in progress.
     last_epoch_seen: AtomicU64,
+    /// §6 audits this node has sent and not yet resolved, keyed by `(target, epoch)`.
+    ///
+    /// The request and the summary it was drawn against MUST both survive until the response
+    /// arrives: `verify_sample_response` binds all three together, and re-deriving the request
+    /// later would change the leaf indices (the selection is a function of the private entropy).
+    ///
+    /// ⚠ In memory only, and deliberately. The entropy's whole job is to be unpredictable to the
+    /// node being audited, so persisting it widens who can learn it for no benefit — an audit lost
+    /// to a restart costs one sample, which is exactly what a retry is for.
+    pending_samples: Mutex<BTreeMap<(ghost_common::types::NodeId, u64), PendingSample>>,
+    /// Nodes proven, by §12.4 evidence, to have committed a share they cannot back.
+    ///
+    /// ⚠ This does NOT un-credit them. The counters are grow-only and there is no arm for
+    /// "remove a liar's work" — a max cannot be undone, which is the same property that makes the
+    /// merge safe. What quarantine buys is that we stop accepting anything FURTHER from them: no
+    /// new summary, no whole-table sync. Their existing column stands, and correcting it is a
+    /// fleet decision, not something one node does quietly on its own.
+    ///
+    /// In memory only. A restart clears it, and that is the honest behaviour: the evidence is on
+    /// the wire and re-arrives, whereas a persisted accusation would outlive the ability to
+    /// re-derive it and become an unfalsifiable mark on a node's record.
+    quarantined: Mutex<std::collections::BTreeSet<ghost_common::types::NodeId>>,
+}
+
+/// An audit in flight: what we asked, and the commitment we asked it against.
+#[derive(Debug, Clone)]
+struct PendingSample {
+    request: ghost_consensus::message::ShardSampleRequestMessage,
+    summary: EpochSummary,
+    /// When it was sent, so a response that never comes can be expired rather than held for ever.
+    sent_at: std::time::Instant,
 }
 
 impl ShardRuntime {
@@ -434,6 +465,8 @@ impl ShardRuntime {
             table: Mutex::new(table),
             next_fold: Mutex::new(None),
             last_epoch_seen: AtomicU64::new(0),
+            pending_samples: Mutex::new(BTreeMap::new()),
+            quarantined: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -628,6 +661,12 @@ impl ShardRuntime {
     ///
     /// ⛔ Remove this ONLY together with building §6 sampling — not because it is inconvenient.
     fn peer_is_admissible(&self, node: &ghost_common::types::NodeId) -> GhostResult<bool> {
+        // A node proven to have committed work it cannot back is refused everything further: its
+        // summaries, its table syncs, and its sampling requests. Checked FIRST so a quarantined
+        // node cannot be re-admitted by a later ratified set.
+        if self.quarantined.lock().contains(node) {
+            return Ok(false);
+        }
         match self.db.get_latest_payout_ledger_checkpoint()? {
             Some(cp) if !cp.node_shares.is_empty() => {
                 Ok(cp.node_shares.iter().any(|(id, _)| id == node))
@@ -789,6 +828,246 @@ impl ShardRuntime {
         })
     }
 
+    /// Draw a §6 audit against a peer's retained summary, or `None` if there is nothing to audit.
+    ///
+    /// ⚠ **`entropy` must be fresh, private, and never derived from anything the target can
+    /// compute.** The audit's ~10⁻⁶ detection bound rests entirely on the sampled node not knowing
+    /// which leaves will be pulled before it signs: a node that can predict its samples fabricates
+    /// work in the never-sampled leaves, keeps the predicted ones honest, and the bound collapses
+    /// to exactly zero. Deriving it from the summary, chain data, a schedule or a fixed per-node
+    /// seed all break it. The caller passes it in rather than this deriving one, so the source
+    /// stays visible at the call site instead of buried here.
+    ///
+    /// The request is retained under `(target, epoch)` because `verify_sample_response` binds the
+    /// summary, the request and the response together — and the leaf choice cannot be re-derived
+    /// later without the same entropy.
+    pub fn sample_request_for(
+        &self,
+        target: &ghost_common::types::NodeId,
+        entropy: &[u8; 32],
+        lambda: u32,
+    ) -> GhostResult<Option<ghost_consensus::message::ShardSampleRequestMessage>> {
+        if self.solo {
+            return Ok(None);
+        }
+        // Auditing ourselves proves nothing — we would be marking our own homework.
+        if target == &self.identity.node_id() {
+            return Ok(None);
+        }
+        if !self.peer_is_admissible(target)? {
+            return Ok(None);
+        }
+        // Choose among ALL RETAINED epochs that have leaves, not just the latest.
+        //
+        // Auditing only the newest epoch has two failures, and the first makes the sampler inert:
+        // an idle epoch has `share_count = 0`, so on a quiet pool every tick would find nothing to
+        // ask and no audit would ever run. The second is worse — work fabricated in any earlier
+        // retained epoch could never be sampled, because the window had already moved past it. The
+        // evidence is retained for `RETENTION_EPOCHS` precisely so it stays auditable for that long.
+        //
+        // `entropy` is reused as the epoch chooser: it is already fresh, private, and unknown to
+        // the target until the request is sent, which is exactly the property the choice needs. A
+        // predictable epoch choice would let a node fabricate in the epochs it knows will not be
+        // picked — the same collapse as a predictable leaf choice, one level up.
+        let Some(latest) = self.db.shard_latest_epoch(target)? else {
+            return Ok(None);
+        };
+        // RETENTION_EPOCHS - 1: folding `latest` deletes the evidence for
+        // `latest - RETENTION_EPOCHS`, so including it picks an epoch whose leaves are already
+        // gone — the responder rebuilds a short tree, the root check fails, and the audit burns a
+        // pending slot for an hour learning nothing.
+        let oldest = latest.saturating_sub(RETENTION_EPOCHS.saturating_sub(1));
+        let mut candidates = Vec::new();
+        for epoch in oldest..=latest {
+            if Self::epoch_straddles_a_gate(epoch) {
+                // No single era describes this epoch, so no verdict drawn from it can be sound.
+                continue;
+            }
+            if let Some(summary) = self.db.shard_get_epoch(epoch, target)? {
+                if summary.share_count > 0 {
+                    candidates.push(summary);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let pick = u64::from_be_bytes(entropy[..8].try_into().unwrap_or([0u8; 8]))
+            % candidates.len() as u64;
+        let summary = candidates.swap_remove(pick as usize);
+        let epoch = summary.epoch;
+
+        let request = ghost_consensus::shard_handler::build_sample_request(
+            self.identity.node_id(),
+            &summary,
+            lambda,
+            entropy,
+        );
+        self.pending_samples.lock().insert(
+            (*target, epoch),
+            PendingSample {
+                request: request.clone(),
+                summary,
+                sent_at: std::time::Instant::now(),
+            },
+        );
+        Ok(Some(request))
+    }
+
+    /// Verify a §6 sampling response against the audit we sent.
+    ///
+    /// `share_is_valid` must judge a share by ITS OWN era — pass a closure over the era-aware
+    /// `NodeBatchChecks`, never a height-derived predicate. A predicate judged by the current
+    /// height condemns every pre-gate share the moment the fleet crosses a gate, and here that
+    /// does not merely reject a share: it publishes an accusation against an honest node.
+    ///
+    /// Returns `None` when the response answers no audit we are holding — an unsolicited response,
+    /// or one that arrived after its audit expired. That is dropped rather than verified: without
+    /// the original request there is no record of which leaves WE chose, and verifying against a
+    /// request the responder supplied would let it set its own exam.
+    pub fn apply_sample_response(
+        &self,
+        response: &ghost_consensus::message::ShardSampleResponseMessage,
+        share_is_valid: ghost_consensus::shard_handler::ShareValidityFn<'_>,
+        now_ms: u64,
+    ) -> GhostResult<Option<ghost_consensus::shard_handler::ShardSampleOutcome>> {
+        let key = (response.responding_node, response.epoch);
+        // ⚠ Look up WITHOUT removing. Removing first meant a refused response still consumed the
+        // audit, so a peer could enumerate `(target, epoch)` — both public — and spam garbage
+        // responses, evicting every pending audit before the genuine answer arrived. One node
+        // could disable §6 sampling fleet-wide, and the only trace was a `debug!`. The entry is
+        // now dropped only once the response has actually been verified.
+        let Some(pending) = self.pending_samples.lock().get(&key).cloned() else {
+            debug!(
+                epoch = response.epoch,
+                "shard: sampling response answers no audit we are holding — dropped"
+            );
+            return Ok(None);
+        };
+
+        match ghost_consensus::shard_handler::verify_sample_response(
+            &pending.summary,
+            &pending.request,
+            response,
+            &self.identity,
+            now_ms,
+            ghost_reconciliation::batch::verify_merkle_proof,
+            share_is_valid,
+        ) {
+            Ok(outcome) => {
+                // Verified: the audit is answered and may be retired.
+                self.pending_samples.lock().remove(&key);
+                Ok(Some(outcome))
+            }
+            Err(e) => {
+                // A refused response is not evidence of bad WORK — it is a malformed or
+                // unattributable answer — so it is reported, not published as an accusation.
+                info!(
+                    epoch = response.epoch,
+                    peer = %hex::encode(&response.responding_node[..4]),
+                    reason = %e,
+                    "shard: sampling response refused"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drop audits that were never answered, so the map cannot grow without bound.
+    ///
+    /// An expired audit is NOT a verdict. §6 deliberately does not say what refusal-to-serve means,
+    /// and the response cap makes an honest partial answer legal, so silence is surfaced by the
+    /// caller's policy rather than turned into an accusation here.
+    pub fn expire_pending_samples(&self, older_than: std::time::Duration) -> usize {
+        let mut pending = self.pending_samples.lock();
+        let before = pending.len();
+        pending.retain(|_, p| p.sent_at.elapsed() < older_than);
+        before - pending.len()
+    }
+
+    /// Is this node in the ratified set?
+    ///
+    /// Unlike the admission check this ignores quarantine, so a quarantined node's evidence about
+    /// SOMEONE ELSE is still processed — a node being wrong about its own shares does not make it
+    /// unable to witness another's.
+    pub fn peer_is_ratified(&self, node: &ghost_common::types::NodeId) -> GhostResult<bool> {
+        match self.db.get_latest_payout_ledger_checkpoint()? {
+            Some(cp) if !cp.node_shares.is_empty() => {
+                Ok(cp.node_shares.iter().any(|(id, _)| id == node))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Does this epoch straddle a gate, making its shares unjudgeable by any single era?
+    ///
+    /// ⚠ An epoch is `EPOCH_BLOCKS` (6) heights wide and the gates are NOT aligned to it —
+    /// `SHARE_ADDR_BIND_HEIGHT = 961_100` is not a multiple of 6, so epoch 160183 spans
+    /// 961098..961103 with the gate at offset 2. Shares mined at 961100+ in that epoch were
+    /// correctly bound-signed, but judging the epoch by its FIRST height says "pre-bind" and
+    /// demands the legacy signature they cannot produce — a conclusive-looking verdict against an
+    /// honest node.
+    ///
+    /// The addr gate is a FORMAT switch, so neither end of the epoch is a safe conservative
+    /// choice: first-height convicts post-gate shares, last-height convicts pre-gate ones. The
+    /// only correct answer is to draw no verdict from a straddling epoch at all. There are at most
+    /// three such epochs in the chain's history, one per gate.
+    pub fn epoch_straddles_a_gate(epoch: u64) -> bool {
+        let lo = epoch.saturating_mul(EPOCH_BLOCKS.get());
+        let hi = lo.saturating_add(EPOCH_BLOCKS.get() - 1);
+        [
+            crate::share_addr_bind_height(),
+            crate::share_pow_verify_height(),
+            crate::share_tier_bind_height(),
+        ]
+        .iter()
+        .any(|&gate| gate > lo && gate <= hi)
+    }
+
+    /// Quarantine a node proven by §12.4 evidence to have committed an unbackable share.
+    ///
+    /// Returns whether this was new. Idempotent: the same evidence relayed by several peers must
+    /// not read as several offences.
+    pub fn quarantine(&self, node: ghost_common::types::NodeId) -> GhostResult<bool> {
+        // ⚠ Only quarantine a node the fleet actually recognises.
+        //
+        // A verdict needs the ACCUSED's signature, and nothing requires the accused to be anyone
+        // we know: an attacker mints a fresh keypair, signs a summary committing one invalid
+        // share, signs itself as reporter, and every peer re-derives a sound verdict against an
+        // id that has never existed. Repeated, that is an unbounded attacker-chosen set — the
+        // memory sink `last_served` is explicitly bounded against. A stranger is refused by
+        // admission anyway, so recording it buys nothing.
+        //
+        // NOTE this deliberately consults the ratified set directly rather than
+        // `peer_is_admissible`, which would return false for an already-quarantined node and make
+        // re-confirmation look like a stranger.
+        let known = match self.db.get_latest_payout_ledger_checkpoint()? {
+            Some(cp) if !cp.node_shares.is_empty() => {
+                cp.node_shares.iter().any(|(id, _)| id == &node)
+            }
+            _ => false,
+        };
+        if !known {
+            debug!(
+                accused = %hex::encode(&node[..4]),
+                "shard: verdict against a node outside the ratified set — not recorded (admission \
+                 already refuses it, and the set must not be attacker-fillable)"
+            );
+            return Ok(false);
+        }
+        Ok(self.quarantined.lock().insert(node))
+    }
+
+    /// Is this node quarantined?
+    pub fn is_quarantined(&self, node: &ghost_common::types::NodeId) -> bool {
+        self.quarantined.lock().contains(node)
+    }
+
+    /// This node's id — the sampler needs it to exclude itself from audit targets.
+    pub fn node_id(&self) -> ghost_common::types::NodeId {
+        self.identity.node_id()
+    }
+
     /// Serve a §6 sampling request against OUR OWN summary for `req.epoch`.
     ///
     /// The audit only means anything because the sampled node cannot predict which leaves will be
@@ -868,8 +1147,31 @@ impl ShardRuntime {
             return Ok(None);
         }
 
+        // ⚠ Bound the work a single request can demand, and de-duplicate it.
+        //
+        // `compute_merkle_proof` rebuilds the whole level stack per leaf, so serving is
+        // O(indices x N) SHA-256 on top of a full evidence read — and it runs synchronously on the
+        // mesh dispatch task, which processes handlers in turn. Nothing enforced
+        // `MAX_SAMPLE_REQUEST_INDICES` (it was referenced only by a sizing test), and the payload
+        // cap allows far more small indices than its arithmetic assumed, duplicates included. One
+        // ratified peer could therefore wedge this node's inbound votes and checkpoints behind a
+        // single request. The table-sync path guards exactly this with a cooldown; this is the
+        // same guard expressed as a work bound.
+        let mut wanted: Vec<u32> = req.leaf_indices.clone();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.len() > ghost_consensus::message_validator::MAX_SAMPLE_REQUEST_INDICES {
+            warn!(
+                epoch = req.epoch,
+                asked = req.leaf_indices.len(),
+                cap = ghost_consensus::message_validator::MAX_SAMPLE_REQUEST_INDICES,
+                "shard: sampling request asks for more leaves than the cap — not served"
+            );
+            return Ok(None);
+        }
+
         let mut leaves = Vec::new();
-        for &idx in &req.leaf_indices {
+        for &idx in &wanted {
             let Some(share) = evidence.get(idx as usize) else {
                 continue; // out of range for this tree — serve what we can, per §6
             };
