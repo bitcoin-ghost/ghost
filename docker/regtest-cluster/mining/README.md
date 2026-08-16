@@ -31,11 +31,37 @@ The full mining stack works end-to-end against the local cluster. Topology:
    records the share, fires the **block-found callback**, and **creates a payout
    proposal** (correct miner + amount) and submits it to BFT consensus.
 
-## The one remaining gap (cross-elder vote)
-The payout proposal is created correctly but does not yet reach a 4-elder quorum
-in this containerised setup: HealthPings over the ZMQ PUB/SUB data plane aren't
-delivered between containers, so peers age out of `get_connected_peers(60)` and
-the encrypted broadcast reaches `peer_count=0`. The Noise point-to-point path
-(used by the MPC ceremony) works; the PUB/SUB liveness does not. Closing this
-(so the block is submitted and the coinbase pays) is the last step — likely the
-same test-network/transport family as the private-IP discovery fix (PR #53).
+## ✅ The cross-elder vote gap is CLOSED (2026-08-15)
+
+> **The section that used to sit here said the payout proposal "does not yet reach a
+> 4-elder quorum" because HealthPings were not delivered between containers, so peers
+> aged out of `get_connected_peers(60)` and encrypted broadcast reached `peer_count=0`.
+> That is no longer true, and leaving it standing would repeat the mistake the
+> private-IP note in `../README.md` already made: a stale blocker is why nobody re-ran
+> the cluster for two months.**
+
+Measured 2026-08-15 with a v1.11.22 binary: all four nodes mesh at **`peer_count: 3`**,
+21k mesh messages validated over two hours with **0 bad signatures**, and the payout
+path logs **`Checkpoint reached BFT quorum height=92 votes=3`**.
+
+The liveness never needed a transport fix. It was four faults in this directory's own
+config — a partially-populated `[ghost_pay]` table, a renamed `public_mining` key, a
+hostname `public_address` where an IP is required, and a socat sidecar the README
+prescribed but nothing implemented. See `../README.md` for the full list.
+
+**So the full chain is now reachable**, and driving it is the outstanding work:
+
+    sv1_miner.py → share → block found → payout proposal → BFT quorum ✅
+      → verified coinbase commitment → block submitted → 100 blocks maturity
+      → `ShardRuntime::settle_matured` observes the coinbase and discharges `owed`
+
+That last hop is the one thing the shard's settlement path has **never** done against a
+real chain. `bins/ghost-pool/tests/regtest_shard_settlement.rs` covers the RPC round
+trip, block-hash byte order and maturity arithmetic, but explicitly not "a block the
+POOL mined pays what the shard says it should" — because that needed quorum, which is
+this cluster's job and is now possible.
+
+⚠ Still open here: the **MPC elder ceremony** reports `not adequately meshed to
+contribute (connected to 1/3 elders)`. That is a different quorum from the payout BFT
+one above, and whether it blocks block submission on regtest (where the template
+comment says no MPC params are needed) has not been established.
