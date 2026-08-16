@@ -54,6 +54,11 @@ services:
   pool1:
     <<: *pool-common
     container_name: rc-pool1
+    volumes:
+      - ./pool.template.toml:/etc/ghost/pool.template.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./bin/ghost-pool:/usr/local/bin/ghost-pool:ro
+      - pool1-state:/root/.ghost
     networks:
       rcnet:
         ipv4_address: 172.28.0.11
@@ -73,6 +78,11 @@ services:
   pool2:
     <<: *pool-common
     container_name: rc-pool2
+    volumes:
+      - ./pool.template.toml:/etc/ghost/pool.template.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./bin/ghost-pool:/usr/local/bin/ghost-pool:ro
+      - pool2-state:/root/.ghost
     networks:
       rcnet:
         ipv4_address: 172.28.0.12
@@ -91,6 +101,11 @@ services:
   pool3:
     <<: *pool-common
     container_name: rc-pool3
+    volumes:
+      - ./pool.template.toml:/etc/ghost/pool.template.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./bin/ghost-pool:/usr/local/bin/ghost-pool:ro
+      - pool3-state:/root/.ghost
     networks:
       rcnet:
         ipv4_address: 172.28.0.13
@@ -109,6 +124,11 @@ services:
   pool4:
     <<: *pool-common
     container_name: rc-pool4
+    volumes:
+      - ./pool.template.toml:/etc/ghost/pool.template.toml:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./bin/ghost-pool:/usr/local/bin/ghost-pool:ro
+      - pool4-state:/root/.ghost
     networks:
       rcnet:
         ipv4_address: 172.28.0.14
@@ -134,3 +154,18 @@ networks:
     ipam:
       config:
         - subnet: 172.28.0.0/16
+
+# ⚠ Node state MUST be persisted, and at /root/.ghost — not the `db_path` in
+# pool.template.toml. `key_path`/`db_path` are not honoured for generation, so the node
+# writes its identity, database and MPC contributions to $HOME/.ghost regardless.
+#
+# Without these volumes a `docker compose up --force-recreate <node>` silently resets that
+# node: new node id, empty database, zero MPC contributions. Doing it to the genesis node
+# collapses the elder set, and payout voting then fails `BFT requires at least 3 eligible
+# voters` — which reads exactly like a consensus bug and is not one. Measured 2026-08-16:
+# pool1 dropped to 1 contribution after three recreates while pool2-4 still held 4.
+volumes:
+  pool1-state:
+  pool2-state:
+  pool3-state:
+  pool4-state:
