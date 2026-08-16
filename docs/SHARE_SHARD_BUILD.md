@@ -5,80 +5,69 @@ from the system as it stands to the design, and should be deleted once the cutov
 
 Written 2026-08-13. Target: v1 by **2026-08-31**.
 
-## Status — 2026-08-13
+## Status — 2026-08-16
 
-**Stage 1, the runtime, the wiring, Stage 2, and most of Stage 3 are done and independently
-verified** — every suite run rather than taken from a report. It is all dark: `pool.share_shard`
-defaults false, and **nothing changes what a block pays.** The coinbase is still built from the
-legacy proposal; the shard observes.
+⛔ **THE COINBASE NOW PAYS FROM THE SHARD.** `pool.shard_coinbase = true` is set on all 8 nodes,
+running `886d0a77f`. Verified on the wire, not inferred:
 
-| piece | where | state |
+```
+coinbase: miner payouts from the SHARD source="shard" payees=5 dust_sats=0 remainder_sats=3
+```
+
+Stages 0–5 are complete, **step 6 (the cutover flip) included**. The legacy machinery has NOT been
+removed — it still computes, and rollback is `shard_coinbase = false` plus a restart until the first
+block is won.
+
+### Fleet state (measured 2026-08-16)
+
+| | |
+|---|---|
+| binary | `886d0a77f` on all 8 |
+| shard columns | 6, byte-identical fleet-wide |
+| accrued | `74422306406440472` micro-work |
+| `genesis_installed` | true on all 8, `epoch_floor=160384` |
+| `owns_evidence` | **false** on all 8 — see the warning below |
+| `shard_settled_blocks` | **0** — the pool has won no blocks since the flip |
+| drift vs legacy | flat: mean −87.3e12 over 11 folds, slope **+0.93e12/fold** (not growing) |
+
+### What was proven, and how
+
+| claim | evidence |
+|---|---|
+| discharge arithmetic works | regtest: coinbase paid the owed address, `discharged_micro=4,999,500,000` against a 5,000,000,000 balance |
+| settlement identifies pool blocks | tag → held proposal → `settled matured pool blocks blocks=2 deferred=0` |
+| consensus ratifies a shard payout | `Consensus reached: Approved 3/3`, block submitted at height 232 |
+| a missed column can be repaired | `table sync RECOVERED columns this node was missing columns_gained=1` on vm1–4 |
+| drift is not growing | 11 folds, least-squares slope +0.93e12 |
+
+⚠ The folded evidence in the regtest discharge proof was **synthetic** — a regtest share carries
+`work = 2.33e-7`, which is 0.233 micro-work and rounds to **0**, so no real regtest share is ever
+payable. The fold arithmetic, coinbase construction, maturity walk and discharge all ran on real
+code against a real chain; only the input provenance was synthetic.
+
+⚠ `shard_settled_blocks` is still **0 on mainnet**. The discharge path has never run against real
+folded shares. That is the first thing to watch when a block is won.
+
+### What is left
+
+| # | item | state |
 |---|---|---|
-| counter core | `crates/ghost-common/src/share_shard.rs` | ✅ 428 tests |
-| storage + migration v53 | `crates/ghost-storage/src/shard_store.rs` | ✅ 219 tests |
-| mesh types + handlers | `crates/ghost-consensus/src/shard_handler.rs` | ✅ 327 tests |
-| §6 leaf sampling | same | ✅ included above |
-| `pool.share_shard` flag | `crates/ghost-common/src/config.rs` | ✅ committed, dark |
-| epoch runtime | `bins/ghost-pool/src/shard.rs` | ✅ folds, retention, `note_height` |
-| `main.rs` wiring | 3 insertion points | ✅ construction, epoch task, boundary log |
-| Stage 2 network tier | `crosses_network_tier` | ✅ shipped **inert at R = 1** |
-| Stage 3 payout arithmetic | `shard_miner_payouts` | ✅ mirrors the live path exactly |
-| Stage 3 drift signal | `drift_against_legacy_ledger` | ✅ wired, **once per epoch** |
-| Stage 3 settlement | `settle_matured` | 🔨 in progress |
-| Stage 0 anchor rehearsal | `scripts/shard-anchor-rehearsal.sh` | ✅ written and run against all 8 |
-| Stage 5 genesis conversion | `crates/ghost-accounting/src/shard_genesis.rs` | ✅ 13 tests, dark |
-| Stage 5 reserved-column guard | `ghost-common` + `ghost-storage` | ✅ enforced, not assumed |
-| Stage 5 anchor pin + load self-check | `pinned_anchor` / `ShardRuntime::load` | ✅ checked every start |
-| Stage 5 pre-genesis epoch floor | `ghost-common` + `shard_handler` | ✅ both merge paths + table sync |
-| Stage 5 arming + gap-fold | `ShardRuntime::arm_from_genesis` | ✅ 3 tests, dark |
-| Stage 0 ceremony backup | `scripts/shard-ceremony-backup.sh` | ✅ all 8 verified |
+| 7 | rename `shares` → `shares_archive`, move the fold's DELETE target **in the same change**, then flip `owns_evidence` | **not started — see below** |
+| — | Stage 6 deletion release (~26–28k lines) | not started; must NOT ride the cutover binary |
+| — | §6 λ-sampling | built in `ghost-consensus`, and a hard precondition for admitting FOREIGN nodes (v1 multi-operator) |
+| — | MPC ceremony divergence under concurrent contribution | bootstrap-only (`< MPC_BFT_BOOTSTRAP_COUNT = 4`); mainnet has 8 contributors so a join needs 6 approvals and cannot apply unilaterally |
 
-**Settled since this plan was written:** epoch = 6 blocks (~1h), `RETENTION_EPOCHS` = 6 (~6h, ~9 MB),
-share→epoch binding via the round's recorded height, `shard_epochs` keyed on `(epoch, node_id)`.
+⚠⚠ **`owns_evidence` must stay false until step 7 lands, and step 7 should wait for the first won
+block.** Retention deletes from `shares`, which is what the legacy path computes from and what any
+comparison against the shard depends on. Deleting it now — hours after the flip, with zero blocks
+won and `shard_settled_blocks = 0` — destroys the evidence needed to check that the flip pays what
+the old path would have, at exactly the moment that check is most valuable. The rollback note
+("the old ledger resumes where it froze") only holds while `shares` is intact.
 
-**Not started:** the Stage 3 coinbase-source flip (deliberately deferred to Stage 5 step 6 — the
-build here is the *shadow comparison*, not the switch), Stage 5 genesis ceremony, Stage 6 deletion.
-
-⚠⚠ **`owns_evidence` is false and must stay false until Stage 5.** The fold's retention deletes
-from `shares`, which the legacy payout path still reads; enabling it would quietly reduce what
-miners are owed about six hours after someone set a flag they were told was dark.
-
-### ⚠ Rehearsing settlement on regtest is not straightforward — check before planning around it
-
-The advice to "rehearse on regtest" is easy to write and hard to do, and the obstacle is structural
-rather than fiddly.
-
-`template.rs` refuses block submission without a verified coinbase commitment (**H-11**), and the
-only source of a commitment today is a **BFT-ratified payout proposal**. A single-node regtest has
-no quorum, so no proposal is ever ratified, so `commitment_snapshot` stays `None` and **no block can
-be submitted at all** — this is exactly why the earlier regtest chain sat stuck at height 101, which
-was environmental to the rig and not a bug in what was being tested.
-
-So a pool block cannot simply be won on a one-node regtest, and settlement cannot be exercised the
-obvious way. The options, in ascending order of honesty about cost:
-
-1. **Feed `settle_matured` a hand-constructed coinbase.** Achievable today and worth doing — but it
-   is a *test*, not a rehearsal: it exercises the arithmetic and the idempotence, and proves nothing
-   about the RPC path, the parsing of a real block, or the maturity lookback against a live chain.
-2. **Multi-node regtest with real quorum.** A genuine rehearsal, and substantially more rig.
-3. **Wait for mainnet.** Not a plan — `won_blocks` is empty, so the first real exercise of this code
-   would be a live block carrying real money.
-
-Whichever is chosen, say which one it was. "Rehearsed on regtest" covering only option 1 would be
-the kind of claim that reads as coverage and is not.
-
-⚠ **Nine design errors were found by *building* the design, none by re-reading it** — the counter
-double-payment, deltas not being max-mergeable, the §6/§12.3 contradiction, evidence retention on
-the wrong clock, the whole-table scaling ceiling, the merkle dependency direction, two spellings of
-one predicate, expiry being indistinguishable from refusal, and §4.6 claiming settlement is
-identical across nodes when it is only deterministic given a table. Assume the remaining stages hide
-more of the same, and prefer building a thin slice early over perfecting the document.
-
-⚠ **Three tests passed for the wrong reason and only mutation caught them.** One is *unkillable*
-while its input is a `BTreeMap` and is documented as latent rather than dressed up. Budget for this:
-a green suite is evidence the tests ran, not that they can fail.
-
----
+**Expect the first block after the flip to pay ~0.1% less than the legacy path would have.** Drift
+is −87e12 against 74.4e15 accrued — the shard owes slightly less, by design: the genesis conversion
+truncates and never rounds up, and the epoch floor under-credits up to `EPOCH_BLOCKS - 1` heights.
+Both are deliberate and in the same direction.
 
 ## The three facts that govern the whole plan
 
