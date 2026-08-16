@@ -857,7 +857,7 @@ impl ShardRuntime {
         // `latest - RETENTION_EPOCHS`, so including it picks an epoch whose leaves are already
         // gone — the responder rebuilds a short tree, the root check fails, and the audit burns a
         // pending slot for an hour learning nothing.
-        let oldest = latest.saturating_sub(u64::from(RETENTION_EPOCHS).saturating_sub(1));
+        let oldest = latest.saturating_sub(RETENTION_EPOCHS.saturating_sub(1));
         let mut candidates = Vec::new();
         for epoch in oldest..=latest {
             if let Some(summary) = self.db.shard_get_epoch(epoch, target)? {

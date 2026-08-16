@@ -447,7 +447,7 @@ impl MessageHandler for ShardMeshHandler {
                 let _local_checks = checks_fn();
                 let epoch_height = resp
                     .epoch
-                    .saturating_mul(u64::from(ghost_common::share_shard::EPOCH_BLOCKS.get()));
+                    .saturating_mul(ghost_common::share_shard::EPOCH_BLOCKS.get());
                 let checks = crate::sbc_checks::NodeBatchChecks::at_shared_height(epoch_height);
                 let predicate = |share: &ghost_common::types::ShareProof| {
                     use ghost_common::batch_consensus::BatchChecks;
