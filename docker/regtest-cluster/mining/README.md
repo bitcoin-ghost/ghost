@@ -61,7 +61,66 @@ trip, block-hash byte order and maturity arithmetic, but explicitly not "a block
 POOL mined pays what the shard says it should" — because that needed quorum, which is
 this cluster's job and is now possible.
 
-⚠ Still open here: the **MPC elder ceremony** reports `not adequately meshed to
-contribute (connected to 1/3 elders)`. That is a different quorum from the payout BFT
-one above, and whether it blocks block submission on regtest (where the template
-comment says no MPC params are needed) has not been established.
+## Driven end to end 2026-08-16 — two blockers found, both new
+
+The whole stack was brought up and a block **was** mined by the pool. Two things stop it
+reaching a payout, and neither is the PUB/SUB liveness the old text blamed.
+
+Topology that worked (all in pool1's netns so the internal API stays loopback):
+
+```bash
+# pool1 needs EXTRA_ARGS: "--tdp-enabled --tdp-port 8442" in docker-compose.yml
+docker run -d --name rc-poolsv2   --network container:rc-pool1 -v …/pool_sv2:/usr/local/bin/pool_sv2:ro       -v …/pool-sv2.toml:/etc/pool-sv2.toml:ro     --entrypoint /usr/local/bin/pool_sv2     bitcoin-ghost/ghost-pool:regtest -c /etc/pool-sv2.toml
+docker run -d --name rc-translator --network container:rc-pool1 -v …/translator_sv2:/usr/local/bin/translator_sv2:ro -v …/translator.toml:/etc/translator.toml:ro --entrypoint /usr/local/bin/translator_sv2 bitcoin-ghost/ghost-pool:regtest -c /etc/translator.toml
+docker run -d --name rc-miner      --network container:rc-pool1 -v …/sv1_miner.py:/miner.py:ro python:3.11-slim python3 /miner.py 127.0.0.1 3333 "<bcrt1addr>.w1"
+```
+
+⚠ Use a ghost-pool built **without** `--features zk-production`. The production binary
+refuses to start on regtest: `Trusted-setup verification is unconfigured: neither
+ZK_PARAMS_HASH nor ZK_GENESIS_PARAMS_HASH is set`.
+
+Confirmed working: TDP handshake, templates flowing, `💰 Block Found`, the share webhook
+firing with the correct payout address, and the payout proposal being built and stored.
+
+### Blocker 1 — every regtest share is worth ZERO micro-work
+
+`get_top_unpaid_miners` sums `CAST(ROUND(work * 1000000) AS INTEGER)` **per row**. A
+regtest share has `work = 2.33e-7`, i.e. `0.233` micro-work, which rounds to **0**. So a
+miner can submit valid shares indefinitely and remain unpayable, and the proposal fails:
+
+    M-04: Payout cross-check failed: miners(0) + nodes(0) + treasury(50000000)
+          = 50000000 != expected 5000000000
+
+Only treasury's 1% is allocated; the 99% has no one to go to. Raising share difficulty
+~4,300× fixes the arithmetic but makes the CPU miner take hours per share. For a
+settlement rehearsal (where the share path is not what is under test) seed the ledger
+instead — 20 rows at `work = 0.01` gives 200,000 micro-work and the proposal then reports
+`miner_count=1`.
+
+⚠ Note the interaction: on regtest `share_target` is HARDER than `net_target`, so **every
+share is a block**. You cannot accumulate work by mining; the first block always precedes
+any payable history.
+
+### Blocker 2 — the elder set cannot bootstrap, so BFT voting never forms
+
+    CRIT-CONS-2: Cannot create voting session: BFT requires at least 3 eligible voters
+                 round_id=21 voters=1 required=3
+    Failed to create voting session from MPC elders: have=1, need=3
+
+Payout-proposal voting draws voters from the **MPC elder set** — a different quorum from
+the `Checkpoint reached BFT quorum … votes=3` seen elsewhere in the log. The cluster has
+exactly one elder (`rc-pool1`, the `--genesis` node), and it is a closed loop:
+
+- `quorum = mpc_bft_threshold(contributor_count)` → 4 contributions gives **3**;
+- `mpc_contribution_ready() = endpoint_up && connected_elders >= quorum`;
+- only pool1 is an elder, so `connected_elders = 1` on every other node, for ever.
+
+pool2–4 therefore log `not adequately meshed to contribute (connected to 1/3 elders)`
+indefinitely and never become elders, so the voter count never reaches 3. Without a
+ratified proposal there is no verified coinbase commitment, and submission is refused:
+
+    H-11: Cannot submit block without verified coinbase commitment
+
+**This is the last mile for the settlement rehearsal.** Until the cluster can seat three
+elders, no pool-mined block can be submitted, so nothing matures and
+`ShardRuntime::settle_matured` cannot be exercised against a pool-won coinbase.

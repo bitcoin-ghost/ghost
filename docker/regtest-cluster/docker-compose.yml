@@ -59,6 +59,9 @@ services:
         ipv4_address: 172.28.0.11
     environment:
       NODE_NAME: pool1
+      # TDP server: how pool_sv2 gets block templates. Only the node fronting the SV2
+      # stack needs it — see mining/README.md for the full topology.
+      EXTRA_ARGS: "--tdp-enabled --tdp-port 8442"
       SEED_NODES: '"172.28.0.12:8555", "172.28.0.13:8555", "172.28.0.14:8555"'
       GENESIS_ARG: "--genesis"          # genesis node bootstraps the elder set
       BITCOIN_RPC_USER: ghost
