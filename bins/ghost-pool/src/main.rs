@@ -2249,6 +2249,34 @@ async fn ensure_mpc_params_present(
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// The shard's `owed()` balances for the coinbase, or `None` to keep the legacy ledger.
+///
+/// ⛔ Stage 5 step 6. Returns `Some` ONLY when all three hold: the shard is enabled, the operator
+/// set `shard_coinbase`, and **genesis is actually installed**.
+///
+/// That last condition is checked rather than assumed. Without the opening balances the shard owes
+/// nobody the months of work the pool actually owes, so a block would pay only what accrued since
+/// the flag was set — silently, and irreversibly, because a paid block cannot be unpaid. Trusting
+/// an operator to set three flags in the right order is not a safety property.
+fn shard_coinbase_owed(
+    shard: &Option<Arc<ghost_pool::shard::ShardRuntime>>,
+    enabled: bool,
+) -> Option<std::collections::BTreeMap<String, i64>> {
+    if !enabled {
+        return None;
+    }
+    let rt = shard.as_ref()?;
+    if !rt.genesis_installed() {
+        error!(
+            "coinbase: `shard_coinbase` is set but genesis is NOT installed — refusing to pay \
+             from the shard. It would pay only post-flag accrual and omit everything the pool \
+             already owes. Falling back to the legacy ledger."
+        );
+        return None;
+    }
+    Some(rt.owed_snapshot())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -4044,6 +4072,13 @@ async fn main() -> Result<()> {
 
         info!("shard: mesh handler registered (summaries + whole-table sync)");
     }
+
+    // Independent handles for the coinbase source. Made HERE, at top level, because each is
+    // captured by a different `async move` task further down and a single binding would be moved
+    // into whichever spawned first. Cheap: an Option<Arc> clone is a refcount bump.
+    let cb_enabled = config.pool.shard_coinbase;
+    let (shard_cb_a, shard_cb_b, shard_cb_c, shard_cb_d) =
+        (shard.clone(), shard.clone(), shard.clone(), shard.clone());
 
     mesh.register_handler(Arc::clone(&payout_checkpoint_mgr)
         as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
@@ -8440,6 +8475,8 @@ async fn main() -> Result<()> {
         let tp_for_bf = Arc::clone(&template_processor);
         let payout_for_bf = Arc::clone(&payout_handler);
         let identity_for_bf = Arc::clone(&identity);
+        // Cloned per task: the coinbase source is consulted inside several spawned closures, and
+        // a single moved binding would be captured by whichever ran first.
         let db_for_bf = Arc::clone(&db);
         let solo_payout_address_for_bf = config.network.solo_payout_address.clone();
         let metrics_for_bf = Arc::clone(&metrics);
@@ -8626,6 +8663,7 @@ async fn main() -> Result<()> {
                     payout_for_bf.get_treasury_address_snapshot();
 
                 let block_data = BlockFoundData {
+                    shard_owed: shard_coinbase_owed(&shard_cb_a, cb_enabled),
                     round_id,
                     ledger_cutoff_ts: cutoff_ts,
                     block_hash,
@@ -8678,7 +8716,6 @@ async fn main() -> Result<()> {
         let mut block_rx = template_processor
             .take_block_submitted_rx()
             .expect("M-02: block_submitted_rx already taken — startup bug");
-
         tokio::spawn(async move {
             while let Some(info) = block_rx.recv().await {
                 let round_id = rm_for_block.current_round_id();
@@ -8861,6 +8898,7 @@ async fn main() -> Result<()> {
                         payout_for_block.get_treasury_address_snapshot();
 
                     let block_data = BlockFoundData {
+                        shard_owed: shard_coinbase_owed(&shard_cb_b, cb_enabled),
                         round_id,
                         ledger_cutoff_ts: cutoff_ts,
                         block_hash: info.block_hash,
@@ -10543,7 +10581,6 @@ async fn main() -> Result<()> {
     // against height 0 and falls back to a permissive default — see below.
     let vote_handler_for_tips = Arc::clone(&vote_handler);
     let shard_for_rounds = shard.clone();
-
     tokio::spawn(async move {
         // The last chain height we proposed a payout for. `NewWork` fires on every template
         // refresh (~30s), but the tip only moves on a new block, and a payout is per-block.
@@ -10766,6 +10803,10 @@ async fn main() -> Result<()> {
                                                 payout_for_tips.get_treasury_address_snapshot();
 
                                             let data = BlockFoundData {
+                                                shard_owed: shard_coinbase_owed(
+                                                    &shard_cb_c,
+                                                    cb_enabled,
+                                                ),
                                                 round_id,
                                                 ledger_cutoff_ts: cutoff_ts,
                                                 block_hash: tip,
@@ -11064,6 +11105,7 @@ async fn main() -> Result<()> {
                             payout_for_events.get_treasury_address_snapshot();
 
                         let block_data = BlockFoundData {
+                            shard_owed: shard_coinbase_owed(&shard_cb_d, cb_enabled),
                             round_id,
                             ledger_cutoff_ts: cutoff_ts,
                             block_hash,

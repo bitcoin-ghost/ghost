@@ -738,6 +738,26 @@ impl ShardRuntime {
         }
     }
 
+    /// Whether the genesis column is installed — i.e. whether this node has been through the
+    /// Stage 5 ceremony.
+    ///
+    /// The coinbase source checks this before paying from the shard: without genesis the table
+    /// holds only post-arming accrual and would pay a fraction of what is owed.
+    pub fn genesis_installed(&self) -> bool {
+        self.table
+            .lock()
+            .accrued()
+            .contains_key(&ghost_accounting::shard_genesis::GENESIS_NODE_ID)
+    }
+
+    /// A snapshot of `owed()` for the coinbase builder.
+    ///
+    /// Taken under the lock and returned by value so the proposal builder stays a pure function
+    /// of its input and never holds the table lock while building a block.
+    pub fn owed_snapshot(&self) -> BTreeMap<String, i64> {
+        self.table.lock().owed()
+    }
+
     /// Compare the shard's balances against the legacy unpaid ledger.
     ///
     /// ⚠ **Call this once per EPOCH, never per tick.** It runs `get_top_unpaid_addresses`, which is
