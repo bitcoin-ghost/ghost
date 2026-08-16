@@ -3995,6 +3995,10 @@ async fn main() -> Result<()> {
     if let Some(ref rt) = shard {
         // Responder channel for whole-table syncs. The handler cannot send: it has no mesh
         // reference, so it hands the built response here and this task puts it on the wire.
+        // §12.4 evidence produced by our own audits, broadcast to every peer.
+        let (evidence_tx, mut evidence_rx) =
+            tokio::sync::mpsc::channel::<ghost_consensus::message::ShardEvidenceMessage>(16);
+
         // Served §6 sampling responses, same hand-off shape as the sync responder.
         let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<(
             ghost_common::types::NodeId,
@@ -4010,9 +4014,62 @@ async fn main() -> Result<()> {
             ghost_pool::shard_mesh::ShardMeshHandler::new(Arc::clone(rt))
                 .with_sync_responder(sync_tx)
                 .with_sample_responder(sample_tx)
+                .with_evidence_publisher(evidence_tx)
                 .with_share_checks(Arc::clone(&sbc_checks)),
         );
         mesh.register_handler(h as Arc<dyn ghost_consensus::mesh::MessageHandler + Send + Sync>);
+
+        // §12.4 publish half: broadcast evidence our own audits produced.
+        //
+        // BROADCAST, not unicast: the verdict is re-derivable by every peer from the bytes alone,
+        // and a verdict one node keeps to itself protects only that node while the accused keeps
+        // being merged everywhere else.
+        {
+            let mesh_c = Arc::clone(&mesh);
+            tokio::spawn(async move {
+                while let Some(ev) = evidence_rx.recv().await {
+                    if !mesh_c.noise_available() {
+                        warn!("shard: Noise unavailable — §12.4 evidence NOT published");
+                        continue;
+                    }
+                    let bytes = match serde_json::to_vec(&ev) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, "shard: evidence would not serialise");
+                            continue;
+                        }
+                    };
+                    let cap = ghost_consensus::message_validator::max_payload_size(
+                        ghost_consensus::MessageType::ShardEvidence,
+                    );
+                    if bytes.len() > cap {
+                        warn!(
+                            bytes = bytes.len(),
+                            cap, "shard: evidence exceeds the per-type cap — NOT published"
+                        );
+                        continue;
+                    }
+                    match mesh_c
+                        .create_envelope_raw(ghost_consensus::MessageType::ShardEvidence, bytes)
+                    {
+                        Ok(env) => match mesh_c.broadcast(env).await {
+                            Ok(0) => warn!(
+                                "shard: §12.4 evidence reached NO peers — the accused is \
+                                 quarantined here only"
+                            ),
+                            Ok(peers) => warn!(
+                                peers,
+                                accused = %hex::encode(&ev.summary.node_id[..4]),
+                                epoch = ev.summary.epoch,
+                                "shard: published §12.4 evidence"
+                            ),
+                            Err(e) => warn!(error = %e, "shard: evidence broadcast failed"),
+                        },
+                        Err(e) => warn!(error = %e, "shard: evidence envelope failed"),
+                    }
+                }
+            });
+        }
 
         // §6 serve half: unicast a served audit answer back to the node that asked.
         {

@@ -360,6 +360,18 @@ pub struct ShardRuntime {
     /// node being audited, so persisting it widens who can learn it for no benefit — an audit lost
     /// to a restart costs one sample, which is exactly what a retry is for.
     pending_samples: Mutex<BTreeMap<(ghost_common::types::NodeId, u64), PendingSample>>,
+    /// Nodes proven, by §12.4 evidence, to have committed a share they cannot back.
+    ///
+    /// ⚠ This does NOT un-credit them. The counters are grow-only and there is no arm for
+    /// "remove a liar's work" — a max cannot be undone, which is the same property that makes the
+    /// merge safe. What quarantine buys is that we stop accepting anything FURTHER from them: no
+    /// new summary, no whole-table sync. Their existing column stands, and correcting it is a
+    /// fleet decision, not something one node does quietly on its own.
+    ///
+    /// In memory only. A restart clears it, and that is the honest behaviour: the evidence is on
+    /// the wire and re-arrives, whereas a persisted accusation would outlive the ability to
+    /// re-derive it and become an unfalsifiable mark on a node's record.
+    quarantined: Mutex<std::collections::BTreeSet<ghost_common::types::NodeId>>,
 }
 
 /// An audit in flight: what we asked, and the commitment we asked it against.
@@ -454,6 +466,7 @@ impl ShardRuntime {
             next_fold: Mutex::new(None),
             last_epoch_seen: AtomicU64::new(0),
             pending_samples: Mutex::new(BTreeMap::new()),
+            quarantined: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -648,6 +661,12 @@ impl ShardRuntime {
     ///
     /// ⛔ Remove this ONLY together with building §6 sampling — not because it is inconvenient.
     fn peer_is_admissible(&self, node: &ghost_common::types::NodeId) -> GhostResult<bool> {
+        // A node proven to have committed work it cannot back is refused everything further: its
+        // summaries, its table syncs, and its sampling requests. Checked FIRST so a quarantined
+        // node cannot be re-admitted by a later ratified set.
+        if self.quarantined.lock().contains(node) {
+            return Ok(false);
+        }
         match self.db.get_latest_payout_ledger_checkpoint()? {
             Some(cp) if !cp.node_shares.is_empty() => {
                 Ok(cp.node_shares.iter().any(|(id, _)| id == node))
@@ -960,6 +979,19 @@ impl ShardRuntime {
         let before = pending.len();
         pending.retain(|_, p| p.sent_at.elapsed() < older_than);
         before - pending.len()
+    }
+
+    /// Quarantine a node proven by §12.4 evidence to have committed an unbackable share.
+    ///
+    /// Returns whether this was new. Idempotent: the same evidence relayed by several peers must
+    /// not read as several offences.
+    pub fn quarantine(&self, node: ghost_common::types::NodeId) -> bool {
+        self.quarantined.lock().insert(node)
+    }
+
+    /// Is this node quarantined?
+    pub fn is_quarantined(&self, node: &ghost_common::types::NodeId) -> bool {
+        self.quarantined.lock().contains(node)
     }
 
     /// This node's id — the sampler needs it to exclude itself from audit targets.
