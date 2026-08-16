@@ -554,6 +554,20 @@ impl MessageHandler for ShardMeshHandler {
                     return Ok(());
                 }
 
+                // Too old to act on. Bounded by EPOCH against our own tip, not by the message's
+                // `timestamp` — that field is outside `signing_message`, so a relay can rewrite it
+                // and an age bound resting on it would be defeated by the very replay it exists to
+                // stop.
+                if self.shard.evidence_is_too_old(ev.summary.epoch) {
+                    info!(
+                        epoch = ev.summary.epoch,
+                        "shard: §12.4 evidence is older than the retention window — ignored (past \
+                         it the claim is unfalsifiable, and replaying it would re-quarantine a \
+                         node after every restart)"
+                    );
+                    return Ok(());
+                }
+
                 // Refuse evidence from an epoch that straddles a gate: no single era describes
                 // it, so a verdict against it convicts shares that were correct in their own era.
                 if crate::shard::ShardRuntime::epoch_straddles_a_gate(ev.summary.epoch) {
