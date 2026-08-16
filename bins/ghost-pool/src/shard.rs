@@ -58,6 +58,14 @@ use ghost_common::share_shard::{
 use ghost_common::types::ShareProof;
 use ghost_common::zmq::block_hash_to_display_order;
 use ghost_reconciliation::batch::{compute_merkle_proof, compute_merkle_root};
+
+/// How far back §12.4 evidence may reach, in epochs.
+///
+/// Twice `RETENTION_EPOCHS`: far enough that evidence about a still-auditable epoch is always
+/// actionable even if it takes a while to reach us, and short enough that a once-valid proof
+/// cannot be replayed indefinitely to re-quarantine a node after every restart. Past the accused's
+/// own retention the claim is unfalsifiable anyway — the evidence it rests on is gone.
+const EVIDENCE_MAX_AGE_EPOCHS: u64 = RETENTION_EPOCHS * 2;
 use ghost_storage::database::Database;
 
 use crate::coinbase_verifier::{address_to_script_pubkey, CoinbaseOutput};
@@ -368,9 +376,16 @@ pub struct ShardRuntime {
     /// new summary, no whole-table sync. Their existing column stands, and correcting it is a
     /// fleet decision, not something one node does quietly on its own.
     ///
-    /// In memory only. A restart clears it, and that is the honest behaviour: the evidence is on
-    /// the wire and re-arrives, whereas a persisted accusation would outlive the ability to
-    /// re-derive it and become an unfalsifiable mark on a node's record.
+    /// In memory only, and a restart clears it. That is a deliberate choice, not a mechanism:
+    /// nothing re-broadcasts or persists received evidence, so a rolling deploy DOES amnesty every
+    /// quarantine, and a liar that stops answering samples after being caught is not re-convicted
+    /// (refusal to serve is explicitly not a verdict).
+    ///
+    /// The alternative — persisting it — was rejected because the failure it creates is worse: a
+    /// permanent mark with no operator release is the 2026-08-12 fleet-wide terminal quarantine,
+    /// and a false positive under it is unrecoverable. Paired with the age bound in
+    /// [`ShardRuntime::evidence_is_too_old`], a liar has to keep lying inside the retention window
+    /// to stay excluded, and an honest node wrongly accused is freed by the next restart.
     quarantined: Mutex<std::collections::BTreeSet<ghost_common::types::NodeId>>,
 }
 
@@ -997,6 +1012,41 @@ impl ShardRuntime {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Is this evidence too old to act on?
+    ///
+    /// ⚠ Bounded by the accused EPOCH against our own chain tip — deliberately NOT by
+    /// `ShardEvidenceMessage.timestamp`.
+    ///
+    /// That field is not covered by `signing_message`, which hashes the summary, share,
+    /// leaf_index, merkle_proof and reporter and then finalises. A relay can therefore rewrite the
+    /// timestamp freely and the reporter signature still verifies, so an age bound resting on it
+    /// would be defeated by replaying old evidence with a fresh clock reading — which is the exact
+    /// attack the bound exists to stop.
+    ///
+    /// The epoch is inside the summary, signed by the ACCUSED, and maps to a height every node
+    /// derives from the chain. It cannot be moved without breaking the signature that makes the
+    /// evidence evidence at all.
+    ///
+    /// ## Why bound it at all
+    ///
+    /// Quarantine is in-memory and clears on restart, so a verdict is not permanent. But without
+    /// an age bound, once-valid evidence can be re-broadcast for ever, re-quarantining a node
+    /// after every restart with no operator release — the shape of the 2026-08-12 fleet-wide
+    /// terminal quarantine. Bounding it to the retention window also matches what is CHECKABLE:
+    /// past that window the accused has legitimately pruned the evidence, so a fresh audit could
+    /// neither confirm nor refute the claim.
+    ///
+    /// Returns false when no height has been observed yet (`last_epoch_seen == 0`) — a node that
+    /// does not know the tip must not start refusing evidence it cannot date.
+    pub fn evidence_is_too_old(&self, accused_epoch: u64) -> bool {
+        let seen = self.last_epoch_seen.load(Ordering::Relaxed);
+        if seen == 0 {
+            return false;
+        }
+        let current = seen.saturating_sub(1);
+        current.saturating_sub(accused_epoch) > EVIDENCE_MAX_AGE_EPOCHS
     }
 
     /// Does this epoch straddle a gate, making its shares unjudgeable by any single era?
@@ -2086,6 +2136,47 @@ mod tests {
     use ghost_storage::models::{PayoutStatus, RoundRecord, ShareRecord};
 
     /// One runtime over a fresh in-memory database, non-solo.
+    /// Evidence older than the retention window is refused, and the bound does NOT rest on the
+    /// message's own timestamp.
+    ///
+    /// The timestamp is outside `ShardEvidenceMessage::signing_message` — that hashes the summary,
+    /// share, leaf_index, merkle_proof and reporter, then finalises — so a relay can rewrite it
+    /// while the reporter signature still verifies. An age bound reading it would be defeated by
+    /// replaying old evidence with a fresh clock reading, which is the attack the bound exists to
+    /// stop. The epoch is signed by the ACCUSED and maps to chain height, so it cannot be moved.
+    #[test]
+    fn evidence_is_bounded_by_epoch_age_not_by_a_forgeable_timestamp() {
+        let (_id, _db, rt) = runtime();
+
+        // No tip observed yet: a node that cannot date evidence must not start refusing it.
+        assert!(
+            !rt.evidence_is_too_old(0),
+            "with no observed height, nothing is judged too old"
+        );
+
+        // Observe a tip well past the window.
+        let current_epoch = 1_000u64;
+        rt.note_height(current_epoch * EPOCH_BLOCKS.get());
+
+        assert!(
+            !rt.evidence_is_too_old(current_epoch),
+            "evidence about the current epoch is actionable"
+        );
+        assert!(
+            !rt.evidence_is_too_old(current_epoch - EVIDENCE_MAX_AGE_EPOCHS),
+            "the oldest in-window epoch is still actionable"
+        );
+        assert!(
+            rt.evidence_is_too_old(current_epoch - EVIDENCE_MAX_AGE_EPOCHS - 1),
+            "one epoch past the window is refused — otherwise a once-valid proof re-quarantines \
+             a node after every restart, with no operator release"
+        );
+        assert!(
+            rt.evidence_is_too_old(0),
+            "ancient evidence is refused however recent its (unsigned) timestamp claims to be"
+        );
+    }
+
     fn runtime() -> (Arc<NodeIdentity>, Arc<Database>, ShardRuntime) {
         let identity = Arc::new(NodeIdentity::generate());
         let db = Arc::new(Database::in_memory().expect("db"));
