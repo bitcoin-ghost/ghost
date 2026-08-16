@@ -102,6 +102,18 @@ dispatched = set(re.findall(r"MessageType::([A-Za-z0-9]+)", out))
 undispatched = [v for v in variants if v not in dispatched and v not in ALLOWLIST]
 stale = [v for v in ALLOWLIST if v in dispatched]
 
+# ⚠ NOT CHECKED HERE: that the handler carrying these arms is actually REGISTERED with the mesh.
+#
+# That was failure #1 in the header, and it is the obvious next thing to want. A file-level
+# heuristic ("the file constructing the handler also mentions register_handler") was written and
+# then DELETED, because mutating away the real `mesh.register_handler(h)` left it green — main.rs
+# registers several handlers, so the file-level test is satisfied by any of them. Detecting this
+# properly means following the constructed value to the call, which is parsing, not grep.
+#
+# Rather than ship a check that passes when the wiring is absent — the failure mode this file
+# exists to argue against — the gap is stated plainly. An arm that exists but is never reached
+# still needs a human or a real end-to-end test to catch.
+
 print(f"  {len(variants)} Shard message types of {len(all_variants)} total; "
       f"{len(dispatched & set(variants))} dispatched, {len(ALLOWLIST)} allowlisted")
 

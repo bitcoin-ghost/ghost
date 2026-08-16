@@ -148,10 +148,17 @@ impl NodeBatchChecks {
             pow_verify_activation_round: None,
             pow_preimage_required: false,
             tier_bind_activation_round: None,
+            // ⚠ The ACCESSORS, not the consts. `gates::from_env` overrides these off-mainnet,
+            // and that is the documented way to rehearse the real shipping binary with the gates
+            // pulled down. Reading the raw mainnet consts here would judge a regtest fleet — whose
+            // shares above the lowered gate ARE bound-signed — by mainnet heights, take the
+            // pre-bind branch on every leaf, and convict every honest peer. With §6 wired to
+            // quarantine, the whole test fleet would mutually quarantine on the first sampling
+            // tick, each node re-deriving the same wrong verdict.
             era_by_height: Some(EraByHeight {
-                addr_bound: height >= crate::SHARE_ADDR_BIND_HEIGHT,
-                pow_required: height >= crate::SHARE_POW_VERIFY_HEIGHT,
-                tier_bound: height >= crate::SHARE_TIER_BIND_HEIGHT,
+                addr_bound: height >= crate::share_addr_bind_height(),
+                pow_required: height >= crate::share_pow_verify_height(),
+                tier_bound: height >= crate::share_tier_bind_height(),
             }),
         }
     }

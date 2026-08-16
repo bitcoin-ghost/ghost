@@ -879,6 +879,10 @@ impl ShardRuntime {
         let oldest = latest.saturating_sub(RETENTION_EPOCHS.saturating_sub(1));
         let mut candidates = Vec::new();
         for epoch in oldest..=latest {
+            if Self::epoch_straddles_a_gate(epoch) {
+                // No single era describes this epoch, so no verdict drawn from it can be sound.
+                continue;
+            }
             if let Some(summary) = self.db.shard_get_epoch(epoch, target)? {
                 if summary.share_count > 0 {
                     candidates.push(summary);
@@ -981,12 +985,74 @@ impl ShardRuntime {
         before - pending.len()
     }
 
+    /// Is this node in the ratified set? Unlike [`Self::peer_is_admissible`] this ignores
+    /// quarantine, so a quarantined node's evidence about SOMEONE ELSE is still processed.
+    pub fn peer_is_ratified(&self, node: &ghost_common::types::NodeId) -> GhostResult<bool> {
+        match self.db.get_latest_payout_ledger_checkpoint()? {
+            Some(cp) if !cp.node_shares.is_empty() => {
+                Ok(cp.node_shares.iter().any(|(id, _)| id == node))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Does this epoch straddle a gate, making its shares unjudgeable by any single era?
+    ///
+    /// ⚠ An epoch is `EPOCH_BLOCKS` (6) heights wide and the gates are NOT aligned to it —
+    /// `SHARE_ADDR_BIND_HEIGHT = 961_100` is not a multiple of 6, so epoch 160183 spans
+    /// 961098..961103 with the gate at offset 2. Shares mined at 961100+ in that epoch were
+    /// correctly bound-signed, but judging the epoch by its FIRST height says "pre-bind" and
+    /// demands the legacy signature they cannot produce — a conclusive-looking verdict against an
+    /// honest node.
+    ///
+    /// The addr gate is a FORMAT switch, so neither end of the epoch is a safe conservative
+    /// choice: first-height convicts post-gate shares, last-height convicts pre-gate ones. The
+    /// only correct answer is to draw no verdict from a straddling epoch at all. There are at most
+    /// three such epochs in the chain's history, one per gate.
+    pub fn epoch_straddles_a_gate(epoch: u64) -> bool {
+        let lo = epoch.saturating_mul(EPOCH_BLOCKS.get());
+        let hi = lo.saturating_add(EPOCH_BLOCKS.get() - 1);
+        [
+            crate::share_addr_bind_height(),
+            crate::share_pow_verify_height(),
+            crate::share_tier_bind_height(),
+        ]
+        .iter()
+        .any(|&gate| gate > lo && gate <= hi)
+    }
+
     /// Quarantine a node proven by §12.4 evidence to have committed an unbackable share.
     ///
     /// Returns whether this was new. Idempotent: the same evidence relayed by several peers must
     /// not read as several offences.
-    pub fn quarantine(&self, node: ghost_common::types::NodeId) -> bool {
-        self.quarantined.lock().insert(node)
+    pub fn quarantine(&self, node: ghost_common::types::NodeId) -> GhostResult<bool> {
+        // ⚠ Only quarantine a node the fleet actually recognises.
+        //
+        // A verdict needs the ACCUSED's signature, and nothing requires the accused to be anyone
+        // we know: an attacker mints a fresh keypair, signs a summary committing one invalid
+        // share, signs itself as reporter, and every peer re-derives a sound verdict against an
+        // id that has never existed. Repeated, that is an unbounded attacker-chosen set — the
+        // memory sink `last_served` is explicitly bounded against. A stranger is refused by
+        // admission anyway, so recording it buys nothing.
+        //
+        // NOTE this deliberately consults the ratified set directly rather than
+        // `peer_is_admissible`, which would return false for an already-quarantined node and make
+        // re-confirmation look like a stranger.
+        let known = match self.db.get_latest_payout_ledger_checkpoint()? {
+            Some(cp) if !cp.node_shares.is_empty() => {
+                cp.node_shares.iter().any(|(id, _)| id == &node)
+            }
+            _ => false,
+        };
+        if !known {
+            debug!(
+                accused = %hex::encode(&node[..4]),
+                "shard: verdict against a node outside the ratified set — not recorded (admission \
+                 already refuses it, and the set must not be attacker-fillable)"
+            );
+            return Ok(false);
+        }
+        Ok(self.quarantined.lock().insert(node))
     }
 
     /// Is this node quarantined?

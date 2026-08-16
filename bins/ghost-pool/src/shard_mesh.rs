@@ -500,9 +500,17 @@ impl MessageHandler for ShardMeshHandler {
                             // matters because §12.4 evidence is re-derivable by every peer from
                             // the bytes alone — a verdict one node keeps to itself protects only
                             // that node, while the accused keeps being merged everywhere else.
-                            self.shard.quarantine(resp.responding_node);
+                            let _ = self.shard.quarantine(resp.responding_node)?;
+                            // ONE broadcast, not one per failing leaf.
+                            //
+                            // A single conclusive leaf is a complete §12.4 proof and quarantine is
+                            // idempotent, but each message re-carries the whole EpochSummary at up
+                            // to 240 KB. Publishing all λ let the ACCUSED decide how much fan-out
+                            // every auditor emits — serve 20 bad leaves, get 20 x 240 KB x peers
+                            // of broadcast from each. The publish channel holds 16 < λ = 20, so a
+                            // full-failure sample was also guaranteed to log dropped evidence.
                             if let Some(tx) = self.evidence_out.as_ref() {
-                                for ev in outcome.evidence {
+                                if let Some(ev) = outcome.evidence.into_iter().next() {
                                     if tx.try_send(ev).is_err() {
                                         warn!(
                                             "shard: evidence dropped (publish queue full) — the \
@@ -534,6 +542,28 @@ impl MessageHandler for ShardMeshHandler {
                 // bytes, so this re-derives it rather than trusting the reporter. The era is
                 // decided by the accused epoch's HEIGHT for the same reason sampling is: judging
                 // another node's shares by our local rounds would convict an honest one.
+                // Admission first: this arm parses up to 240 KB and runs two ed25519 verifies
+                // plus a PoW recompute, synchronously on the mesh dispatch task. Every
+                // neighbouring shard arm gates before that work; this one gated on nothing, so any
+                // meshed peer could stream evidence and stall dispatch for everyone.
+                if !self.shard.peer_is_ratified(&envelope.sender)? {
+                    debug!(
+                        reporter = %hex::encode(&envelope.sender[..4]),
+                        "shard: evidence from outside the ratified set — ignored"
+                    );
+                    return Ok(());
+                }
+
+                // Refuse evidence from an epoch that straddles a gate: no single era describes
+                // it, so a verdict against it convicts shares that were correct in their own era.
+                if crate::shard::ShardRuntime::epoch_straddles_a_gate(ev.summary.epoch) {
+                    info!(
+                        epoch = ev.summary.epoch,
+                        "shard: §12.4 evidence names an epoch that straddles a gate — no verdict \
+                         is sound for it, nobody quarantined"
+                    );
+                    return Ok(());
+                }
                 let epoch_height = ev
                     .summary
                     .epoch
@@ -552,7 +582,7 @@ impl MessageHandler for ShardMeshHandler {
                         // Quarantine stops anything FURTHER being accepted from the accused. It
                         // does not un-credit their existing column — the counters are grow-only,
                         // and a max cannot be undone.
-                        if self.shard.quarantine(verdict.accused) {
+                        if self.shard.quarantine(verdict.accused)? {
                             warn!(
                                 accused = %hex::encode(&verdict.accused[..4]),
                                 epoch = verdict.epoch,
