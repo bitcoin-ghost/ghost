@@ -350,6 +350,25 @@ pub struct ShardRuntime {
     /// "never" (an epoch is `height / EPOCH_BLOCKS`, so `+ 1` cannot wrap). Atomic because it is
     /// read on the template-refresh path, which must never wait on a fold in progress.
     last_epoch_seen: AtomicU64,
+    /// §6 audits this node has sent and not yet resolved, keyed by `(target, epoch)`.
+    ///
+    /// The request and the summary it was drawn against MUST both survive until the response
+    /// arrives: `verify_sample_response` binds all three together, and re-deriving the request
+    /// later would change the leaf indices (the selection is a function of the private entropy).
+    ///
+    /// ⚠ In memory only, and deliberately. The entropy's whole job is to be unpredictable to the
+    /// node being audited, so persisting it widens who can learn it for no benefit — an audit lost
+    /// to a restart costs one sample, which is exactly what a retry is for.
+    pending_samples: Mutex<BTreeMap<(ghost_common::types::NodeId, u64), PendingSample>>,
+}
+
+/// An audit in flight: what we asked, and the commitment we asked it against.
+#[derive(Debug, Clone)]
+struct PendingSample {
+    request: ghost_consensus::message::ShardSampleRequestMessage,
+    summary: EpochSummary,
+    /// When it was sent, so a response that never comes can be expired rather than held for ever.
+    sent_at: std::time::Instant,
 }
 
 impl ShardRuntime {
@@ -434,6 +453,7 @@ impl ShardRuntime {
             table: Mutex::new(table),
             next_fold: Mutex::new(None),
             last_epoch_seen: AtomicU64::new(0),
+            pending_samples: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -801,6 +821,131 @@ impl ShardRuntime {
     /// and harvest every payout address the fleet knows. Serving only the ratified set makes the
     /// disclosure the same set that already holds this data.
     ///
+    /// This node's id — the sampler needs it to exclude itself from audit targets.
+    pub fn node_id(&self) -> ghost_common::types::NodeId {
+        self.identity.node_id()
+    }
+
+    /// Draw a §6 audit against a peer's retained summary, or `None` if there is nothing to audit.
+    ///
+    /// ⚠ **`entropy` must be fresh, private, and never derived from anything the target can
+    /// compute.** The audit's ~10⁻⁶ detection bound rests entirely on the sampled node not knowing
+    /// which leaves will be pulled before it signs: a node that can predict its samples fabricates
+    /// work in the never-sampled leaves, keeps the predicted ones honest, and the bound collapses
+    /// to exactly zero. Deriving it from the summary, chain data, a schedule or a fixed per-node
+    /// seed all break it. The caller passes it in rather than this deriving one, so the source
+    /// stays visible at the call site instead of buried here.
+    ///
+    /// The request is retained under `(target, epoch)` because `verify_sample_response` binds the
+    /// summary, the request and the response together — and the leaf choice cannot be re-derived
+    /// later without the same entropy.
+    pub fn sample_request_for(
+        &self,
+        target: &ghost_common::types::NodeId,
+        entropy: &[u8; 32],
+        lambda: u32,
+    ) -> GhostResult<Option<ghost_consensus::message::ShardSampleRequestMessage>> {
+        if self.solo {
+            return Ok(None);
+        }
+        // Auditing ourselves proves nothing — we would be marking our own homework.
+        if target == &self.identity.node_id() {
+            return Ok(None);
+        }
+        if !self.peer_is_admissible(target)? {
+            return Ok(None);
+        }
+        let Some(epoch) = self.db.shard_latest_epoch(target)? else {
+            return Ok(None);
+        };
+        let Some(summary) = self.db.shard_get_epoch(epoch, target)? else {
+            return Ok(None);
+        };
+        // Nothing to sample from an empty epoch, and `select_sample_indices` returns no indices
+        // for one — asking would spend a round trip to learn that.
+        if summary.share_count == 0 {
+            return Ok(None);
+        }
+
+        let request = ghost_consensus::shard_handler::build_sample_request(
+            self.identity.node_id(),
+            &summary,
+            lambda,
+            entropy,
+        );
+        self.pending_samples.lock().insert(
+            (*target, epoch),
+            PendingSample {
+                request: request.clone(),
+                summary,
+                sent_at: std::time::Instant::now(),
+            },
+        );
+        Ok(Some(request))
+    }
+
+    /// Verify a §6 sampling response against the audit we sent.
+    ///
+    /// `share_is_valid` must judge a share by ITS OWN era — pass a closure over the era-aware
+    /// `NodeBatchChecks`, never a height-derived predicate. A predicate judged by the current
+    /// height condemns every pre-gate share the moment the fleet crosses a gate, and here that
+    /// does not merely reject a share: it publishes an accusation against an honest node.
+    ///
+    /// Returns `None` when the response answers no audit we are holding — an unsolicited response,
+    /// or one that arrived after its audit expired. That is dropped rather than verified: without
+    /// the original request there is no record of which leaves WE chose, and verifying against a
+    /// request the responder supplied would let it set its own exam.
+    pub fn apply_sample_response(
+        &self,
+        response: &ghost_consensus::message::ShardSampleResponseMessage,
+        share_is_valid: ghost_consensus::shard_handler::ShareValidityFn<'_>,
+        now_ms: u64,
+    ) -> GhostResult<Option<ghost_consensus::shard_handler::ShardSampleOutcome>> {
+        let key = (response.responding_node, response.epoch);
+        let Some(pending) = self.pending_samples.lock().remove(&key) else {
+            debug!(
+                epoch = response.epoch,
+                "shard: sampling response answers no audit we are holding — dropped"
+            );
+            return Ok(None);
+        };
+
+        match ghost_consensus::shard_handler::verify_sample_response(
+            &pending.summary,
+            &pending.request,
+            response,
+            &self.identity,
+            now_ms,
+            ghost_reconciliation::batch::verify_merkle_proof,
+            share_is_valid,
+        ) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(e) => {
+                // A refused response is not evidence of bad WORK — it is a malformed or
+                // unattributable answer — so it is reported, not published as an accusation.
+                info!(
+                    epoch = response.epoch,
+                    peer = %hex::encode(&response.responding_node[..4]),
+                    reason = %e,
+                    "shard: sampling response refused"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Drop audits that were never answered, so the map cannot grow without bound.
+    ///
+    /// An expired audit is NOT a verdict. §6 deliberately does not say what refusal-to-serve means,
+    /// and the response cap makes an honest partial answer legal, so silence is surfaced by the
+    /// caller's policy rather than turned into an accusation here.
+    pub fn expire_pending_samples(&self, older_than: std::time::Duration) -> usize {
+        let mut pending = self.pending_samples.lock();
+        let before = pending.len();
+        pending.retain(|_, p| p.sent_at.elapsed() < older_than);
+        before - pending.len()
+    }
+
     /// Serve a §6 sampling request against OUR OWN summary for `req.epoch`.
     ///
     /// The audit only means anything because the sampled node cannot predict which leaves will be

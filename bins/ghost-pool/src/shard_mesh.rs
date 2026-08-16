@@ -31,7 +31,10 @@ use tracing::{debug, info, warn};
 use ghost_common::error::GhostResult;
 use ghost_common::types::NodeId;
 use ghost_consensus::mesh::MessageHandler;
-use ghost_consensus::message::{MessageEnvelope, ShardEpochSummaryMessage, ShardTableSyncMessage};
+use ghost_consensus::message::{
+    MessageEnvelope, ShardEpochSummaryMessage, ShardSampleRequestMessage,
+    ShardSampleResponseMessage, ShardTableSyncMessage,
+};
 use ghost_consensus::MessageType;
 
 use crate::shard::{PeerMergeOutcome, ShardRuntime, TableSyncMerge};
@@ -41,6 +44,10 @@ use crate::shard::{PeerMergeOutcome, ShardRuntime, TableSyncMerge};
 /// The handler cannot send it itself: `MessageHandler::handle_message` has no access to the mesh,
 /// and giving it one would make the shard handler own a reference to the thing dispatching to it.
 pub type SyncResponder = tokio::sync::mpsc::Sender<(NodeId, ShardTableSyncMessage)>;
+
+/// Where a served §6 sampling response is handed off to be sent, for the same reason as
+/// [`SyncResponder`]: the handler has no mesh reference of its own.
+pub type SampleResponder = tokio::sync::mpsc::Sender<(NodeId, ShardSampleResponseMessage)>;
 
 /// Routes gossiped shard messages into the runtime.
 ///
@@ -60,6 +67,18 @@ pub struct ShardMeshHandler {
     /// stall this node's inbound votes, checkpoints and summaries behind it. The asker's hourly
     /// cadence is self-imposed and therefore not a limit on anyone else's behaviour.
     last_served: parking_lot::Mutex<std::collections::HashMap<NodeId, std::time::Instant>>,
+    /// Outbound queue for served §6 sampling responses. `None` leaves the node able to REQUEST
+    /// audits but unable to answer them, which is a silent half-wiring — so it is logged.
+    sample_out: Option<SampleResponder>,
+    /// The share checks in force RIGHT NOW, reusing the SBC path's `ChecksFn` rather than a second
+    /// spelling of the same predicate.
+    ///
+    /// ⚠ A function, not a value, and era-aware by construction. A share must be judged by its own
+    /// round, not the current height: a height-derived predicate condemns every pre-gate share the
+    /// instant the fleet crosses a gate, which quarantined vm5 fleet-wide on 2026-08-12. Sampling
+    /// turns that into a PUBLISHED accusation against an honest node, so without this the response
+    /// half stays unwired rather than running on a predicate that could frame a peer.
+    checks: Option<crate::sbc_handler::ChecksFn>,
 }
 
 /// Minimum gap between whole-table syncs served to the SAME peer. Well under the hourly ask
@@ -72,7 +91,21 @@ impl ShardMeshHandler {
             shard,
             sync_out: None,
             last_served: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            sample_out: None,
+            checks: None,
         }
+    }
+
+    /// Wire the era-aware share checks, enabling §6 sampling RESPONSES to be verified.
+    pub fn with_share_checks(mut self, checks: crate::sbc_handler::ChecksFn) -> Self {
+        self.checks = Some(checks);
+        self
+    }
+
+    /// Wire the responder half for §6 sampling, so this node can ANSWER audits.
+    pub fn with_sample_responder(mut self, tx: SampleResponder) -> Self {
+        self.sample_out = Some(tx);
+        self
     }
 
     /// Wire the responder half, so this node can SERVE whole-table syncs as well as request them.
@@ -315,6 +348,111 @@ impl MessageHandler for ShardMeshHandler {
                 Ok(None) => {}
                 Err(e) => warn!(error = %e, "shard: table sync handling failed"),
             },
+            MessageType::ShardSampleRequest => {
+                let req: ShardSampleRequestMessage = match serde_json::from_slice(&envelope.payload)
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(error = %e, "shard: undeserialisable sampling request dropped");
+                        return Ok(());
+                    }
+                };
+                // Answer only what the SENDER asked for. `requesting_node` is payload, so a
+                // mismatch means someone is trying to have our evidence delivered elsewhere —
+                // the same unsigned-field trap as the table-sync request.
+                if req.requesting_node != envelope.sender {
+                    warn!(
+                        sender = %hex::encode(&envelope.sender[..4]),
+                        claimed = %hex::encode(&req.requesting_node[..4]),
+                        "shard: sampling request claims a different requester than it was signed \
+                         by — NOT served"
+                    );
+                    return Ok(());
+                }
+                match self.shard.sample_response_for(&req) {
+                    Ok(Some(response)) => {
+                        info!(
+                            epoch = req.epoch,
+                            peer = %hex::encode(&envelope.sender[..4]),
+                            leaves = response.leaves.len(),
+                            asked = req.leaf_indices.len(),
+                            "shard: serving a §6 sampling request"
+                        );
+                        match self.sample_out.as_ref() {
+                            Some(tx) => {
+                                if tx.try_send((envelope.sender, response)).is_err() {
+                                    warn!("shard: sampling response dropped (send queue full)");
+                                }
+                            }
+                            None => debug!(
+                                "shard: sampling request received but no responder channel wired"
+                            ),
+                        }
+                    }
+                    Ok(None) => debug!(
+                        epoch = req.epoch,
+                        "shard: sampling request not served (not ours, not ratified, or no \
+                         matching evidence)"
+                    ),
+                    Err(e) => warn!(error = %e, "shard: sampling request handling failed"),
+                }
+            }
+            MessageType::ShardSampleResponse => {
+                let resp: ShardSampleResponseMessage =
+                    match serde_json::from_slice(&envelope.payload) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(error = %e, "shard: undeserialisable sampling response dropped");
+                            return Ok(());
+                        }
+                    };
+                // Without the era-aware checks there is NO safe predicate to judge against, and a
+                // wrong one publishes an accusation rather than merely rejecting a share. Refuse
+                // to verify rather than guess.
+                let Some(checks_fn) = self.checks.as_ref() else {
+                    warn!(
+                        "shard: sampling response received but the era-aware share checks are not \
+                         wired — NOT verified (a height-derived predicate would risk framing an \
+                         honest peer)"
+                    );
+                    return Ok(());
+                };
+                let checks = checks_fn();
+                let predicate = |share: &ghost_common::types::ShareProof| {
+                    use ghost_common::batch_consensus::BatchChecks;
+                    checks.share_is_valid(share)
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                match self.shard.apply_sample_response(&resp, &predicate, now_ms) {
+                    Ok(Some(outcome)) => {
+                        // Evidence is the headline: it is a publishable accusation that a peer
+                        // committed work it cannot back, which is what §6 exists to produce.
+                        if outcome.evidence.is_empty() {
+                            info!(
+                                epoch = resp.epoch,
+                                peer = %hex::encode(&resp.responding_node[..4]),
+                                verified = outcome.verified.len(),
+                                unanswered = outcome.unanswered.len(),
+                                "shard: §6 audit clean"
+                            );
+                        } else {
+                            warn!(
+                                epoch = resp.epoch,
+                                peer = %hex::encode(&resp.responding_node[..4]),
+                                verified = outcome.verified.len(),
+                                unanswered = outcome.unanswered.len(),
+                                evidence = outcome.evidence.len(),
+                                "shard: §6 audit FAILED — committed leaves do not pass validity"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!(error = %e, "shard: sampling response handling failed"),
+                }
+            }
             _ => {}
         }
         Ok(())
