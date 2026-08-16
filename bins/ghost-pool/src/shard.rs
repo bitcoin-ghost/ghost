@@ -50,14 +50,14 @@ use ghost_common::coinbase_tags::extract_payout_tag;
 use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::share_batch::creditable_difficulty;
+use ghost_common::share_batch::{canonical_sort, creditable_difficulty};
 use ghost_common::share_shard::{
     discharged_micro_work, epoch_for_height, EpochSummary, ShardTable, EPOCH_BLOCKS,
     NETWORK_TIER_LOG2, RETENTION_EPOCHS,
 };
 use ghost_common::types::ShareProof;
 use ghost_common::zmq::block_hash_to_display_order;
-use ghost_reconciliation::batch::compute_merkle_root;
+use ghost_reconciliation::batch::{compute_merkle_proof, compute_merkle_root};
 use ghost_storage::database::Database;
 
 use crate::coinbase_verifier::{address_to_script_pubkey, CoinbaseOutput};
@@ -787,6 +787,104 @@ impl ShardRuntime {
             requesting_node: self.identity.node_id(),
             table_root: self.table.lock().compute_table_root(),
         })
+    }
+
+    /// Serve a §6 sampling request against OUR OWN summary for `req.epoch`.
+    ///
+    /// The audit only means anything because the sampled node cannot predict which leaves will be
+    /// pulled: the requester draws private entropy and keeps it until the request is sent, by which
+    /// time our root is signed and immutable. So this reconstructs the exact tree that root commits
+    /// to and answers the indices asked for — it never chooses which leaves to serve.
+    ///
+    /// ⚠ **Canonical order is the whole contract.** `check_evidence` sorts the evidence with
+    /// [`canonical_sort`] before hashing, so leaf `i` is the `i`-th share in THAT order. Rebuilding
+    /// the tree in storage order would produce paths that do not bind, and the requester would read
+    /// an honest node as serving garbage — an accusation manufactured by our own bug.
+    ///
+    /// Returns `None` when we will not serve: solo mode, a request aimed at another node's summary,
+    /// a requester outside the ratified set, or an epoch we hold no summary for. A subset answer is
+    /// legal (§6) — the response cap means a worst-case λ of shares need not fit one envelope — and
+    /// deciding what persistent silence means is the sampler's policy, not ours.
+    pub fn sample_response_for(
+        &self,
+        req: &ghost_consensus::message::ShardSampleRequestMessage,
+    ) -> GhostResult<Option<ghost_consensus::message::ShardSampleResponseMessage>> {
+        use ghost_consensus::message::ShardSampleLeaf;
+
+        if self.solo {
+            return Ok(None);
+        }
+        // We can only answer for our own commitment: nobody else holds the evidence, and a
+        // response signed by anyone but the summarising node is refused by `verify_sample_response`.
+        if req.target_node != self.identity.node_id() {
+            return Ok(None);
+        }
+        if !self.peer_is_admissible(&req.requesting_node)? {
+            debug!(
+                epoch = req.epoch,
+                "shard: sampling request from outside the ratified set — not served"
+            );
+            return Ok(None);
+        }
+
+        let Some(summary) = self
+            .db
+            .shard_get_epoch(req.epoch, &self.identity.node_id())?
+        else {
+            return Ok(None);
+        };
+        // Answering a root we did not sign would be answering from a different tree — exactly what
+        // the root check in `verify_sample_response` exists to catch. Refuse rather than serve it.
+        if req.share_root != summary.share_root {
+            warn!(
+                epoch = req.epoch,
+                "shard: sampling request names a root we did not sign — not served"
+            );
+            return Ok(None);
+        }
+
+        // Rebuild the committed tree from the retained evidence, in canonical order.
+        let input = self.db.shard_epoch_shares(
+            req.epoch,
+            EPOCH_BLOCKS,
+            &self.received_by,
+            NETWORK_TIER_LOG2,
+        )?;
+        let (mut evidence, _screened) = screen(input.shares);
+        canonical_sort(&mut evidence);
+        let hashes: Vec<[u8; 32]> = evidence.iter().map(|s| s.share_hash).collect();
+
+        // If the rebuilt tree does not reproduce the signed root, our evidence no longer matches
+        // what we committed — retention may have expired it. Serving paths from a different tree
+        // would look like fabrication to the sampler, so say nothing and let the request go
+        // unanswered, which §6 already treats as the sampler's call.
+        if compute_merkle_root(&hashes) != summary.share_root {
+            debug!(
+                epoch = req.epoch,
+                leaves = hashes.len(),
+                "shard: retained evidence no longer reproduces the signed root — sampling request \
+                 left unanswered rather than served from a tree we did not commit"
+            );
+            return Ok(None);
+        }
+
+        let mut leaves = Vec::new();
+        for &idx in &req.leaf_indices {
+            let Some(share) = evidence.get(idx as usize) else {
+                continue; // out of range for this tree — serve what we can, per §6
+            };
+            leaves.push(ShardSampleLeaf {
+                leaf_index: idx,
+                share: share.clone(),
+                merkle_proof: compute_merkle_proof(&hashes, idx as usize),
+            });
+        }
+
+        Ok(Some(ghost_consensus::shard_handler::build_sample_response(
+            &self.identity,
+            &summary,
+            leaves,
+        )))
     }
 
     /// Build the RESPONSE for a specific requester, or `None` if we will not serve them.
