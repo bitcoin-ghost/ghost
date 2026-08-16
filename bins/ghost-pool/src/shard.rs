@@ -809,23 +809,6 @@ impl ShardRuntime {
         })
     }
 
-    /// Build the RESPONSE for a specific requester, or `None` if we will not serve them.
-    ///
-    /// Signing makes the served table attributable — a peer that serves an inflated cell has
-    /// signed the inflation, which is what makes it publishable evidence rather than hearsay.
-    ///
-    /// ⚠ **Admission is checked on the SERVE side too, not only on apply.** The response carries
-    /// the whole accrued table, whose cells are keyed by PAYOUT ADDRESS in the clear inside the
-    /// envelope. The mesh authenticates the sender's signature, but authentication is not
-    /// authorisation: without this check any node whose envelopes we accept could ask once an hour
-    /// and harvest every payout address the fleet knows. Serving only the ratified set makes the
-    /// disclosure the same set that already holds this data.
-    ///
-    /// This node's id — the sampler needs it to exclude itself from audit targets.
-    pub fn node_id(&self) -> ghost_common::types::NodeId {
-        self.identity.node_id()
-    }
-
     /// Draw a §6 audit against a peer's retained summary, or `None` if there is nothing to audit.
     ///
     /// ⚠ **`entropy` must be fresh, private, and never derived from anything the target can
@@ -870,7 +853,11 @@ impl ShardRuntime {
         let Some(latest) = self.db.shard_latest_epoch(target)? else {
             return Ok(None);
         };
-        let oldest = latest.saturating_sub(u64::from(RETENTION_EPOCHS));
+        // RETENTION_EPOCHS - 1: folding `latest` deletes the evidence for
+        // `latest - RETENTION_EPOCHS`, so including it picks an epoch whose leaves are already
+        // gone — the responder rebuilds a short tree, the root check fails, and the audit burns a
+        // pending slot for an hour learning nothing.
+        let oldest = latest.saturating_sub(u64::from(RETENTION_EPOCHS).saturating_sub(1));
         let mut candidates = Vec::new();
         for epoch in oldest..=latest {
             if let Some(summary) = self.db.shard_get_epoch(epoch, target)? {
@@ -964,6 +951,11 @@ impl ShardRuntime {
         let before = pending.len();
         pending.retain(|_, p| p.sent_at.elapsed() < older_than);
         before - pending.len()
+    }
+
+    /// This node's id — the sampler needs it to exclude itself from audit targets.
+    pub fn node_id(&self) -> ghost_common::types::NodeId {
+        self.identity.node_id()
     }
 
     /// Serve a §6 sampling request against OUR OWN summary for `req.epoch`.
@@ -1064,6 +1056,18 @@ impl ShardRuntime {
         )))
     }
 
+    /// Build the RESPONSE for a specific requester, or `None` if we will not serve them.
+    ///
+    /// Signing makes the served table attributable — a peer that serves an inflated cell has
+    /// signed the inflation, which is what makes it publishable evidence rather than hearsay.
+    ///
+    /// ⚠ **Admission is checked on the SERVE side too, not only on apply.** The response carries
+    /// the whole accrued table, whose cells are keyed by PAYOUT ADDRESS in the clear inside the
+    /// envelope. The mesh authenticates the sender's signature, but authentication is not
+    /// authorisation: without this check any node whose envelopes we accept could ask once an hour
+    /// and harvest every payout address the fleet knows. Serving only the ratified set makes the
+    /// disclosure the same set that already holds this data.
+    ///
     /// Solo nodes never serve: their work is their own (§10), and the table they would hand over
     /// is not the shared shard's.
     pub fn table_sync_response_for(
