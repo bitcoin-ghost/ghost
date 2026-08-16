@@ -789,18 +789,6 @@ impl ShardRuntime {
         })
     }
 
-    /// Build the RESPONSE for a specific requester, or `None` if we will not serve them.
-    ///
-    /// Signing makes the served table attributable — a peer that serves an inflated cell has
-    /// signed the inflation, which is what makes it publishable evidence rather than hearsay.
-    ///
-    /// ⚠ **Admission is checked on the SERVE side too, not only on apply.** The response carries
-    /// the whole accrued table, whose cells are keyed by PAYOUT ADDRESS in the clear inside the
-    /// envelope. The mesh authenticates the sender's signature, but authentication is not
-    /// authorisation: without this check any node whose envelopes we accept could ask once an hour
-    /// and harvest every payout address the fleet knows. Serving only the ratified set makes the
-    /// disclosure the same set that already holds this data.
-    ///
     /// Serve a §6 sampling request against OUR OWN summary for `req.epoch`.
     ///
     /// The audit only means anything because the sampled node cannot predict which leaves will be
@@ -899,6 +887,18 @@ impl ShardRuntime {
         )))
     }
 
+    /// Build the RESPONSE for a specific requester, or `None` if we will not serve them.
+    ///
+    /// Signing makes the served table attributable — a peer that serves an inflated cell has
+    /// signed the inflation, which is what makes it publishable evidence rather than hearsay.
+    ///
+    /// ⚠ **Admission is checked on the SERVE side too, not only on apply.** The response carries
+    /// the whole accrued table, whose cells are keyed by PAYOUT ADDRESS in the clear inside the
+    /// envelope. The mesh authenticates the sender's signature, but authentication is not
+    /// authorisation: without this check any node whose envelopes we accept could ask once an hour
+    /// and harvest every payout address the fleet knows. Serving only the ratified set makes the
+    /// disclosure the same set that already holds this data.
+    ///
     /// Solo nodes never serve: their work is their own (§10), and the table they would hand over
     /// is not the shared shard's.
     pub fn table_sync_response_for(
