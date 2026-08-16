@@ -184,8 +184,42 @@ const MPC_READINESS_MAX_WAIT_SECS: u64 = 600;
 /// contribution was applied while we waited), our candidate is built on a stale
 /// head and MUST be regenerated (rebased) onto the new head — its
 /// `prev_params_hash` would otherwise fail hash-chain validation.
-fn cached_contribution_still_valid(cached_count: u32, current_count: u32) -> bool {
-    current_count == cached_count
+///
+/// ⚠ **The count is not sufficient on its own: the base parameters can move while it
+/// stands still.** The genesis node regenerates parameters when it re-runs genesis, and a
+/// re-fetch can replace the applied head, both without the authoritative count changing.
+/// A candidate cached across that is chained onto parameters nobody holds any more, so
+/// every voter answers
+///
+/// ```text
+/// Cryptographic verification failed: Contribution proof verification failed:
+/// tau proof verification failed
+/// ```
+///
+/// and — because the count never advances — the cache is never invalidated, so the node
+/// rebroadcasts the SAME doomed candidate for ever and can never become an elder. Observed
+/// on the regtest cluster 2026-08-16: a node rebroadcast a stale candidate for ~13 hours,
+/// was rejected every time, and only recovered when restarted.
+///
+/// Comparing the base hash as well closes it: `cached_prev` is what the candidate chained
+/// onto, `current_params` is what the ceremony holds now, and any difference means the
+/// candidate must be rebuilt. `None` for either (a legacy row, or state not yet readable)
+/// falls back to the count-only test rather than forcing a needless regeneration — the
+/// moving-target problem that stopped voters converging is real too, so this must not
+/// invalidate on anything less than positive evidence of a change.
+fn cached_contribution_still_valid(
+    cached_count: u32,
+    current_count: u32,
+    cached_prev: Option<[u8; 32]>,
+    current_params: Option<[u8; 32]>,
+) -> bool {
+    if current_count != cached_count {
+        return false;
+    }
+    match (cached_prev, current_params) {
+        (Some(prev), Some(now)) => prev == now,
+        _ => true,
+    }
 }
 
 /// Decide whether to advertise the Archive capability (+5 shares).
@@ -7168,10 +7202,20 @@ async fn main() -> Result<()> {
                     let current_count = db_for_mpc
                         .mpc_contribution_count_authoritative()
                         .unwrap_or(db_count);
+                    // The base the ceremony holds NOW. A candidate chained onto anything
+                    // else can never verify, however many times it is rebroadcast.
+                    let current_params = db_for_mpc
+                        .get_mpc_ceremony_state()
+                        .ok()
+                        .flatten()
+                        .map(|s| s.current_params_hash);
                     let position_advanced = match &cached_msg {
-                        Some((_, cached_count)) => {
-                            !cached_contribution_still_valid(*cached_count, current_count)
-                        }
+                        Some((msg, cached_count)) => !cached_contribution_still_valid(
+                            *cached_count,
+                            current_count,
+                            Some(msg.prev_params_hash),
+                            current_params,
+                        ),
                         // No cached candidate (generation failed this attempt): re-fetch
                         // so the next attempt regenerates on the freshest head.
                         None => true,
@@ -12463,8 +12507,13 @@ mod tests {
         let cached_count = 6u32;
         let current_count = 6u32;
         assert!(
-            cached_contribution_still_valid(cached_count, current_count),
-            "unchanged position must NOT invalidate the cached candidate"
+            cached_contribution_still_valid(
+                cached_count,
+                current_count,
+                Some([1u8; 32]),
+                Some([1u8; 32])
+            ),
+            "unchanged position and unchanged base must NOT invalidate the cached candidate"
         );
     }
 
@@ -12476,7 +12525,12 @@ mod tests {
         let cached_count = 6u32;
         let current_count = 7u32;
         assert!(
-            !cached_contribution_still_valid(cached_count, current_count),
+            !cached_contribution_still_valid(
+                cached_count,
+                current_count,
+                Some([1u8; 32]),
+                Some([1u8; 32])
+            ),
             "advanced position MUST invalidate the cached candidate (rebase)"
         );
     }
@@ -12484,7 +12538,39 @@ mod tests {
     #[test]
     fn cached_contribution_invalid_on_multi_step_advance() {
         // Robust to more than one applied contribution during a long wait.
-        assert!(!cached_contribution_still_valid(6, 9));
+        assert!(!cached_contribution_still_valid(
+            6,
+            9,
+            Some([1u8; 32]),
+            Some([1u8; 32])
+        ));
+    }
+
+    #[test]
+    fn cached_contribution_invalid_when_base_params_moved_under_it() {
+        // THE STALL. The count stands still while the base parameters move — the genesis
+        // node re-runs genesis, or a re-fetch replaces the applied head. A candidate cached
+        // across that is chained onto parameters nobody holds, so every voter answers
+        // "tau proof verification failed"; and because the count never advances, a
+        // count-only test would keep the cache and rebroadcast the same doomed candidate
+        // for ever. Observed on the regtest cluster: ~13 hours of rejections, recovered
+        // only by restarting the node.
+        assert!(
+            !cached_contribution_still_valid(6, 6, Some([1u8; 32]), Some([2u8; 32])),
+            "a moved base MUST invalidate the cached candidate even at an unchanged position"
+        );
+    }
+
+    #[test]
+    fn cached_contribution_falls_back_to_count_when_hashes_unknown() {
+        // Missing hashes are not evidence of a change. Invalidating on absence would
+        // regenerate a fresh candidate every retry — the "moving target" that stopped
+        // voters converging, which is the failure the cache exists to prevent. So an
+        // unknown base keeps the count-only behaviour in BOTH directions.
+        assert!(cached_contribution_still_valid(6, 6, None, Some([2u8; 32])));
+        assert!(cached_contribution_still_valid(6, 6, Some([1u8; 32]), None));
+        assert!(cached_contribution_still_valid(6, 6, None, None));
+        assert!(!cached_contribution_still_valid(6, 7, None, None));
     }
 
     // ── should_claim_archive ─────────────────────────────────────────
