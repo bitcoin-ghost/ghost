@@ -855,17 +855,37 @@ impl ShardRuntime {
         if !self.peer_is_admissible(target)? {
             return Ok(None);
         }
-        let Some(epoch) = self.db.shard_latest_epoch(target)? else {
+        // Choose among ALL RETAINED epochs that have leaves, not just the latest.
+        //
+        // Auditing only the newest epoch has two failures, and the first makes the sampler inert:
+        // an idle epoch has `share_count = 0`, so on a quiet pool every tick would find nothing to
+        // ask and no audit would ever run. The second is worse — work fabricated in any earlier
+        // retained epoch could never be sampled, because the window had already moved past it. The
+        // evidence is retained for `RETENTION_EPOCHS` precisely so it stays auditable for that long.
+        //
+        // `entropy` is reused as the epoch chooser: it is already fresh, private, and unknown to
+        // the target until the request is sent, which is exactly the property the choice needs. A
+        // predictable epoch choice would let a node fabricate in the epochs it knows will not be
+        // picked — the same collapse as a predictable leaf choice, one level up.
+        let Some(latest) = self.db.shard_latest_epoch(target)? else {
             return Ok(None);
         };
-        let Some(summary) = self.db.shard_get_epoch(epoch, target)? else {
-            return Ok(None);
-        };
-        // Nothing to sample from an empty epoch, and `select_sample_indices` returns no indices
-        // for one — asking would spend a round trip to learn that.
-        if summary.share_count == 0 {
+        let oldest = latest.saturating_sub(u64::from(RETENTION_EPOCHS));
+        let mut candidates = Vec::new();
+        for epoch in oldest..=latest {
+            if let Some(summary) = self.db.shard_get_epoch(epoch, target)? {
+                if summary.share_count > 0 {
+                    candidates.push(summary);
+                }
+            }
+        }
+        if candidates.is_empty() {
             return Ok(None);
         }
+        let pick = u64::from_be_bytes(entropy[..8].try_into().unwrap_or([0u8; 8]))
+            % candidates.len() as u64;
+        let summary = candidates.swap_remove(pick as usize);
+        let epoch = summary.epoch;
 
         let request = ghost_consensus::shard_handler::build_sample_request(
             self.identity.node_id(),
