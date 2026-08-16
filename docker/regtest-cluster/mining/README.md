@@ -101,25 +101,51 @@ instead — 20 rows at `work = 0.01` gives 200,000 micro-work and the proposal t
 share is a block**. You cannot accumulate work by mining; the first block always precedes
 any payable history.
 
-### Blocker 2 — the elder set cannot bootstrap, so BFT voting never forms
+### Blocker 0 (FIXED) — recreating a container silently reset the node
+
+The pool services had **no volume at `/root/.ghost`**, which is where a node actually
+writes its identity, database and MPC contributions (`key_path`/`db_path` in
+`pool.template.toml` are not honoured for generation). Any
+`docker compose up --force-recreate <node>` therefore gave that node a new id, an empty
+database and zero contributions — and doing it to the genesis node collapses the elder
+set, which presents as Blocker 2 below and reads exactly like a consensus bug.
+
+Measured 2026-08-16: after three recreates of pool1 (adding TDP flags, swapping binaries)
+it held **1** contribution while pool2–4 still held **4**. Fixed by per-node named volumes;
+verified by recreating pool1 and confirming it kept node id `75f73cdd` and `MPC Elder #1`.
+
+### Blocker 2 — MPC contributions are REJECTED, so only one elder ever exists
 
     CRIT-CONS-2: Cannot create voting session: BFT requires at least 3 eligible voters
                  round_id=21 voters=1 required=3
     Failed to create voting session from MPC elders: have=1, need=3
 
-Payout-proposal voting draws voters from the **MPC elder set** — a different quorum from
-the `Checkpoint reached BFT quorum … votes=3` seen elsewhere in the log. The cluster has
-exactly one elder (`rc-pool1`, the `--genesis` node), and it is a closed loop:
+Payout-proposal voting draws voters from the **MPC elder set** — the set of ACCEPTED
+contributions, which is not the same as the `Registered N elders` peer registry (that one
+reports 4 while voting still sees 1).
 
-- `quorum = mpc_bft_threshold(contributor_count)` → 4 contributions gives **3**;
-- `mpc_contribution_ready() = endpoint_up && connected_elders >= quorum`;
-- only pool1 is an elder, so `connected_elders = 1` on every other node, for ever.
+Rebuilt clean on 2026-08-16 with state persistence in place, the ceremony still stalls:
 
-pool2–4 therefore log `not adequately meshed to contribute (connected to 1/3 elders)`
-indefinitely and never become elders, so the voter count never reaches 3. Without a
-ratified proposal there is no verified coinbase commitment, and submission is refused:
+- pool1 takes position 1 via `MPC genesis: Auto-applying first contribution (no existing
+  contributors to vote)` and becomes Elder #1;
+- pool2–4 **do** build and broadcast contributions for position 2 — Noise works,
+  `MPC contribution broadcast via Noise sent=3`, and pool1 logs
+  `Received MPC contribution position=2` from each;
+- pool1 then **rejects every one**: `Cast MPC verification vote position=2 approve=false`,
+  i.e. `verify_contribution` returned false (or a classified error) in
+  `crates/ghost-consensus/src/mpc_handler.rs`.
 
-    H-11: Cannot submit block without verified coinbase commitment
+So `mpc_contributions` stays at 1 on all four nodes, the elder set never grows, and
+
+    CRIT-CONS-2: Cannot create voting session: BFT requires at least 3 eligible voters
+                 round_id=4 voters=1 required=3
+
+⚠ **Unresolved: why verification fails.** The rejection reason is not logged even at
+`ghost_consensus::mpc_handler=debug`. Worth checking whether the multi-circuit genesis
+(`circuits="note_spend + payout + unshield"`) is being verified against `note_spend`
+alone. Mainnet holds 8 accepted contributions, so this path has worked somewhere — a
+fresh-cluster-only failure is the likeliest reading, but that is a hypothesis, not a
+finding.
 
 **This is the last mile for the settlement rehearsal.** Until the cluster can seat three
 elders, no pool-mined block can be submitted, so nothing matures and
