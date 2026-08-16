@@ -985,8 +985,11 @@ impl ShardRuntime {
         before - pending.len()
     }
 
-    /// Is this node in the ratified set? Unlike [`Self::peer_is_admissible`] this ignores
-    /// quarantine, so a quarantined node's evidence about SOMEONE ELSE is still processed.
+    /// Is this node in the ratified set?
+    ///
+    /// Unlike the admission check this ignores quarantine, so a quarantined node's evidence about
+    /// SOMEONE ELSE is still processed — a node being wrong about its own shares does not make it
+    /// unable to witness another's.
     pub fn peer_is_ratified(&self, node: &ghost_common::types::NodeId) -> GhostResult<bool> {
         match self.db.get_latest_payout_ledger_checkpoint()? {
             Some(cp) if !cp.node_shares.is_empty() => {
